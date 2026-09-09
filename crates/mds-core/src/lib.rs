@@ -57,6 +57,7 @@ pub(crate) mod source_path;
 pub(crate) mod sourcemap;
 pub(crate) mod validator;
 pub(crate) mod value;
+pub(crate) mod vars_json;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
@@ -1162,8 +1163,8 @@ pub fn check_virtual_collecting_warnings(
 /// Lint an MDS source string with default options.
 ///
 /// Runs the check gate (resolve+validate) first: returns `Err(MdsError)` when the
-/// template does not compile. On a clean gate, applies the 9 lint rules and returns
-/// a `LintResult` (empty in S1 — rules arrive in S2).
+/// template does not compile. On a clean gate, applies every registered lint rule
+/// ([`KNOWN_LINT_RULES`]) and returns a `LintResult`.
 ///
 /// # Examples
 ///
@@ -1389,9 +1390,54 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
     Ok(paths.into_iter().collect())
 }
 
+/// The result of loading runtime variables from a JSON `--vars` source, along
+/// with any duplicate object keys found in that source.
+///
+/// Returned by [`load_vars_file_reporting_duplicates`] and
+/// [`load_vars_str_reporting_duplicates`]. `vars` holds the fully-parsed
+/// variables — JSON permits a repeated object key, so when one occurs, the
+/// **last** value for that key wins (the same behavior `load_vars_file` /
+/// `load_vars_str` have always had; this type only adds visibility into it).
+///
+/// `duplicate_keys` lists the path of each key that repeated within its
+/// enclosing object, at any nesting depth, in encounter order: dotted for
+/// object nesting (`x.a`), 0-based bracketed for array-element nesting
+/// (`x[2].a`). Both loading functions above reject a non-object top-level
+/// value before the duplicate scan runs, so a caller only ever observes
+/// paths that start with a key — never the array-root form (`[0].a`) the
+/// internal scanner can otherwise produce. A literal key
+/// containing `.`, `[`, or `]` renders ambiguously with a nesting separator,
+/// and an empty-string key renders as an empty segment — a documented,
+/// accepted limitation. **These paths are structured, untrusted
+/// text** taken directly from the input JSON: a caller that displays one must
+/// escape it first (e.g. with [`sanitize_control_chars_wire`]), exactly as for
+/// any other untrusted identifier.
+///
+/// At most 1,000 duplicate-key paths are recorded; `duplicate_keys_omitted`
+/// counts any further distinct duplicate paths beyond that cap.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values from the functions named above; do not construct via struct
+/// literal in external crates.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarsLoad {
+    /// The loaded variables. When a key repeated in the source, the last value
+    /// for that key wins.
+    pub vars: HashMap<String, Value>,
+    /// Paths of keys that repeated in the source, in encounter order, one entry
+    /// per path (however many times the key repeats), capped at 1,000. See the
+    /// type-level doc for the path grammar and the untrusted-text caveat.
+    pub duplicate_keys: Vec<String>,
+    /// Count of distinct duplicate-key paths beyond the 1,000-path cap.
+    pub duplicate_keys_omitted: usize,
+}
+
 /// Load runtime variables from a JSON file.
 ///
-/// The file must contain a JSON object; each key becomes a variable name.
+/// The file must contain a JSON object; each key becomes a variable name. A
+/// repeated object key is accepted silently (the last value wins) — use
+/// [`load_vars_file_reporting_duplicates`] to also learn which keys repeated.
 ///
 /// # Examples
 ///
@@ -1405,6 +1451,38 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 /// ```
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
+    load_vars_file_reporting_duplicates(path).map(|loaded| loaded.vars)
+}
+
+/// Load runtime variables from a JSON file, additionally reporting any
+/// duplicate object keys found in it.
+///
+/// The file must contain a JSON object; each key becomes a variable name. When
+/// a key repeats — at any nesting depth — the last value wins and every
+/// repeated key's path is reported in [`VarsLoad::duplicate_keys`]; see that
+/// type's doc for the path grammar and cap.
+///
+/// # Errors
+///
+/// Returns `Err(MdsError)` when: the path contains a symlink; the file cannot
+/// be read; the file exceeds the maximum size; the file is not valid UTF-8; the
+/// content is not valid JSON; or the top-level JSON value is not an object.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+///
+/// let loaded = mds::load_vars_file_reporting_duplicates(Path::new("vars.json"))?;
+/// for key in &loaded.duplicate_keys {
+///     eprintln!("warning: key '{key}' is set more than once; the last value wins");
+/// }
+/// let result = mds::compile(Path::new("template.mds"), Some(loaded.vars))?;
+/// let md = result.into_markdown()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the loaded variables and duplicate keys should be used"]
+pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsError> {
     let path_str = path_to_str(path)?;
     // PF-004: guard the vars-file path through the same symlink check that the
     // resolver applies to every imported file — avoids a raw read that bypasses
@@ -1436,14 +1514,29 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
         )));
     };
 
-    map.into_iter()
+    let vars: HashMap<String, Value> = map
+        .into_iter()
         .map(|(key, val)| Value::from_json(val).map(|v| (key, v)))
-        .collect()
+        .collect::<Result<_, _>>()?;
+
+    // D1: the duplicate scan is a second, value-free pass over the same text,
+    // run LAST — after every existing guard and error above has already had its
+    // chance to fire, in its existing order.
+    let dup = vars_json::duplicate_json_keys(&content)
+        .map_err(|e| MdsError::invalid_vars(format!("{path_str}: {e}")))?;
+
+    Ok(VarsLoad {
+        vars,
+        duplicate_keys: dup.paths,
+        duplicate_keys_omitted: dup.omitted,
+    })
 }
 
 /// Load runtime variables from a JSON string.
 ///
-/// The string must contain a JSON object; each key becomes a variable name.
+/// The string must contain a JSON object; each key becomes a variable name. A
+/// repeated object key is accepted silently (the last value wins) — use
+/// [`load_vars_str_reporting_duplicates`] to also learn which keys repeated.
 ///
 /// # Examples
 ///
@@ -1461,6 +1554,32 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 /// ```
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_str(json: &str) -> Result<HashMap<String, Value>, MdsError> {
+    load_vars_str_reporting_duplicates(json).map(|loaded| loaded.vars)
+}
+
+/// Load runtime variables from a JSON string, additionally reporting any
+/// duplicate object keys found in it.
+///
+/// The string must contain a JSON object; each key becomes a variable name.
+/// When a key repeats — at any nesting depth — the last value wins and every
+/// repeated key's path is reported in [`VarsLoad::duplicate_keys`]; see that
+/// type's doc for the path grammar and cap.
+///
+/// # Errors
+///
+/// Returns `Err(MdsError)` when `json` exceeds the maximum size, is not valid
+/// JSON, or its top-level value is not an object.
+///
+/// # Examples
+///
+/// ```rust
+/// let loaded = mds::load_vars_str_reporting_duplicates(r#"{"x": 1, "x": 2}"#)?;
+/// assert_eq!(loaded.duplicate_keys, vec!["x".to_string()]);
+/// assert_eq!(loaded.vars.get("x"), Some(&mds::Value::Number(2.0)));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the loaded variables and duplicate keys should be used"]
+pub fn load_vars_str_reporting_duplicates(json: &str) -> Result<VarsLoad, MdsError> {
     if json.len() as u64 > MAX_FILE_SIZE {
         return Err(MdsError::resource_limit(format!(
             "vars string exceeds maximum size of {} bytes",
@@ -1472,9 +1591,22 @@ pub fn load_vars_str(json: &str) -> Result<HashMap<String, Value>, MdsError> {
     let serde_json::Value::Object(map) = parsed else {
         return Err(MdsError::json_error("vars must be a JSON object"));
     };
-    map.into_iter()
+    let vars: HashMap<String, Value> = map
+        .into_iter()
         .map(|(key, val)| Value::from_json(val).map(|v| (key, v)))
-        .collect()
+        .collect::<Result<_, _>>()?;
+
+    // D1: the duplicate scan is a second, value-free pass over the same text,
+    // run LAST — after every existing guard and error above has already had its
+    // chance to fire, in its existing order.
+    let dup =
+        vars_json::duplicate_json_keys(json).map_err(|e| MdsError::json_error(e.to_string()))?;
+
+    Ok(VarsLoad {
+        vars,
+        duplicate_keys: dup.paths,
+        duplicate_keys_omitted: dup.omitted,
+    })
 }
 
 #[cfg(test)]
@@ -1769,6 +1901,235 @@ mod tests {
         let json = r#"{"name": "World", "count": 42}"#;
         let vars = load_vars_str(json).expect("valid JSON within size limit should succeed");
         assert_eq!(vars.len(), 2);
+    }
+
+    // ── load_vars_str_reporting_duplicates (#326) ─────────────────────────────
+
+    #[test]
+    fn load_vars_str_reporting_duplicates_flat_duplicate() {
+        let loaded = load_vars_str_reporting_duplicates(r#"{"x": 1, "x": 2}"#)
+            .expect("should load duplicate-key vars");
+        assert_eq!(loaded.duplicate_keys, vec!["x".to_string()]);
+        assert_eq!(loaded.vars.get("x"), Some(&Value::Number(2.0)));
+    }
+
+    /// Positive control (PF-013): a clean document reports no duplicates.
+    #[test]
+    fn load_vars_str_reporting_duplicates_clean_input_reports_none() {
+        let loaded = load_vars_str_reporting_duplicates(r#"{"name": "World", "count": 42}"#)
+            .expect("should load clean vars");
+        assert!(
+            loaded.duplicate_keys.is_empty(),
+            "expected no duplicates, got {:?}",
+            loaded.duplicate_keys
+        );
+        assert_eq!(loaded.duplicate_keys_omitted, 0);
+    }
+
+    #[test]
+    fn load_vars_str_reporting_duplicates_nested_and_array_paths() {
+        let loaded =
+            load_vars_str_reporting_duplicates(r#"{"x":{"a":1,"a":2},"y":[{"b":1,"b":2}]}"#)
+                .expect("should load duplicate-key vars");
+        assert_eq!(
+            loaded.duplicate_keys,
+            vec!["x.a".to_string(), "y[0].b".to_string()]
+        );
+    }
+
+    /// Non-vacuity: `vars` matches `load_vars_str` on a 9-key fixture with no
+    /// duplicates — the reporting variant must not silently drop or reorder keys.
+    #[test]
+    fn load_vars_str_reporting_duplicates_vars_matches_load_vars_str() {
+        let json = r#"{"nul":null,"t":true,"f":false,"neg":-1,"big":18446744073709551615,"flt":1.5e300,"s":"a\nbA","arr":[],"obj":{}}"#;
+        let loaded =
+            load_vars_str_reporting_duplicates(json).expect("should load the all-types fixture");
+        let plain = load_vars_str(json).expect("should load via the plain API too");
+        assert_eq!(loaded.vars, plain);
+        assert_eq!(loaded.vars.len(), 9, "expected 9 top-level keys");
+    }
+
+    #[test]
+    fn load_vars_str_reporting_duplicates_rejects_oversized_input() {
+        let oversized = "x".repeat((MAX_FILE_SIZE as usize) + 1);
+        let err = load_vars_str_reporting_duplicates(&oversized)
+            .expect_err("expected error for oversized input");
+        assert!(
+            err.to_string().contains("exceeds maximum size"),
+            "error message should mention size limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_vars_str_reporting_duplicates_rejects_non_object() {
+        let err = load_vars_str_reporting_duplicates("[1,2,3]")
+            .expect_err("expected error for non-object JSON");
+        assert!(
+            err.to_string().contains("vars must be a JSON object"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_vars_str_reporting_duplicates_rejects_malformed_json() {
+        let err = load_vars_str_reporting_duplicates("not json")
+            .expect_err("expected error for malformed JSON");
+        assert!(err.to_string().contains("JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn load_vars_str_reporting_duplicates_omitted_counter_surfaces() {
+        let mut json = String::from("{");
+        for i in 0..1_003usize {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#""k{i}":0,"k{i}":1"#));
+        }
+        json.push('}');
+        let loaded = load_vars_str_reporting_duplicates(&json)
+            .expect("should load the 1003-duplicate fixture");
+        assert_eq!(loaded.duplicate_keys.len(), 1_000);
+        assert_eq!(loaded.duplicate_keys_omitted, 3);
+    }
+
+    // ── load_vars_file_reporting_duplicates (#326) ────────────────────────────
+
+    #[test]
+    fn load_vars_file_reporting_duplicates_flat_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"x": 1, "x": 2}"#).unwrap();
+        let loaded =
+            load_vars_file_reporting_duplicates(&path).expect("should load duplicate-key vars");
+        assert_eq!(loaded.duplicate_keys, vec!["x".to_string()]);
+        assert_eq!(loaded.vars.get("x"), Some(&Value::Number(2.0)));
+    }
+
+    /// Positive control (PF-013): a clean vars file reports no duplicates.
+    #[test]
+    fn load_vars_file_reporting_duplicates_clean_input_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"name": "World", "count": 42}"#).unwrap();
+        let loaded = load_vars_file_reporting_duplicates(&path).expect("should load clean vars");
+        assert!(
+            loaded.duplicate_keys.is_empty(),
+            "expected no duplicates, got {:?}",
+            loaded.duplicate_keys
+        );
+        assert_eq!(loaded.duplicate_keys_omitted, 0);
+    }
+
+    #[test]
+    fn load_vars_file_reporting_duplicates_nested_and_array_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"x":{"a":1,"a":2},"y":[{"b":1,"b":2}]}"#).unwrap();
+        let loaded =
+            load_vars_file_reporting_duplicates(&path).expect("should load duplicate-key vars");
+        assert_eq!(
+            loaded.duplicate_keys,
+            vec!["x.a".to_string(), "y[0].b".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_vars_file_reporting_duplicates_rejects_oversized_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        let oversized = "x".repeat((MAX_FILE_SIZE as usize) + 1);
+        std::fs::write(&path, oversized).unwrap();
+        let err = load_vars_file_reporting_duplicates(&path)
+            .expect_err("expected error for oversized input");
+        let msg = err.to_string();
+        assert!(msg.contains("vars file exceeds maximum size"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_vars_file_reporting_duplicates_rejects_non_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, "[1,2,3]").unwrap();
+        let err = load_vars_file_reporting_duplicates(&path)
+            .expect_err("expected error for non-object JSON");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid vars file"), "got: {msg}");
+        assert!(
+            msg.contains("top-level value is not a JSON object"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_vars_file_reporting_duplicates_rejects_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, "not json").unwrap();
+        let err = load_vars_file_reporting_duplicates(&path)
+            .expect_err("expected error for malformed JSON");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid vars file"), "got: {msg}");
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error should name the vars file path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_vars_file_reporting_duplicates_omitted_counter_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        let mut json = String::from("{");
+        for i in 0..1_003usize {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#""k{i}":0,"k{i}":1"#));
+        }
+        json.push('}');
+        std::fs::write(&path, json).unwrap();
+        let loaded = load_vars_file_reporting_duplicates(&path)
+            .expect("should load the 1003-duplicate fixture");
+        assert_eq!(loaded.duplicate_keys.len(), 1_000);
+        assert_eq!(loaded.duplicate_keys_omitted, 3);
+    }
+
+    /// Mirrors `security.rs:400-422` (mds-cli): the same symlink guard applies to
+    /// the reporting variant, not just the pre-existing `load_vars_file`.
+    #[test]
+    #[cfg(unix)]
+    fn load_vars_file_reporting_duplicates_rejects_symlinked_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_vars = dir.path().join("real_vars.json");
+        std::fs::write(&real_vars, r#"{"name": "Alice"}"#).unwrap();
+        let link_vars = dir.path().join("link_vars.json");
+        std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+
+        let result = load_vars_file_reporting_duplicates(&link_vars);
+        assert!(
+            result.is_err(),
+            "load_vars_file_reporting_duplicates must reject a symlinked vars path"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("symlink") || err.contains("not allowed"),
+            "error must mention symlink restriction; got: {err}"
+        );
+    }
+
+    /// `load_vars_file` must stay a silent, no-frills wrapper: same map as the
+    /// reporting variant, and it exposes nothing else (no duplicate info).
+    #[test]
+    fn load_vars_file_is_a_silent_wrapper_over_the_reporting_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"x": 1, "x": 2}"#).unwrap();
+
+        let plain = load_vars_file(&path).expect("load_vars_file should succeed");
+        let loaded =
+            load_vars_file_reporting_duplicates(&path).expect("reporting variant should succeed");
+        assert_eq!(plain, loaded.vars);
     }
 
     // ── scan_imports tests ────────────────────────────────────────────────────

@@ -20,7 +20,9 @@
 //! - Always kill+wait child in `ChildGuard::drop`.
 
 mod common;
-use common::{mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, StderrTap};
+use common::{
+    dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, StderrTap,
+};
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -4234,6 +4236,383 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
         "I9: after one rebuild, warning must still appear exactly once (guards :1914); \
          got {}; stderr:\n{}",
         count_after_edit, stderr_after_edit
+    );
+
+    drop(child);
+}
+
+// ── I16-I18: duplicate --vars file key warnings under `mds watch` (#326) ─────
+//
+// Unlike I8/I9 (--set/--set-string warn once per SESSION, at startup), a
+// duplicate in the --vars FILE warns at startup AND on every rebuild: ADR-016
+// reloads the vars file on every rebuild, so a duplicate present in it is
+// re-reported each time (D9).
+
+/// I16: mds watch (file mode) with a duplicated top-level key in the vars file
+/// warns at STARTUP and on EVERY rebuild. Guards `watch.rs:936`.
+#[test]
+fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    let stderr_after_start = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&stderr_after_start, &expected),
+        1,
+        "I16: expected exactly 1 warning at startup; stderr:\n{stderr_after_start}"
+    );
+
+    // Edit 1: trigger a rebuild — ADR-016 reloads the vars file, re-reporting the
+    // duplicate.
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I16: rebuild after edit 1 must complete"
+    );
+    let after_edit_1 = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&after_edit_1, &expected),
+        2,
+        "I16: one rebuild must re-report the vars-file duplicate; stderr:\n{after_edit_1}"
+    );
+
+    // Edit 2: trigger another rebuild.
+    std::fs::write(&src, "version 3").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 3", TIMEOUT),
+        "I16: rebuild after edit 2 must complete"
+    );
+    let after_edit_2 = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&after_edit_2, &expected),
+        3,
+        "I16: a second rebuild must report the duplicate again; stderr:\n{after_edit_2}"
+    );
+
+    drop(child);
+}
+
+/// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
+/// rebuild: once at startup (proving the `:2196` dedup-baseline second read does
+/// NOT double-print), and once more per subsequent rebuild (proving exactly one
+/// of `:1793`/`:1919` emits, not both).
+#[test]
+fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src_dir.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // No edits yet: the startup count must be exactly 1, proving the dedup-baseline
+    // second read at :2196 does not also emit.
+    let stderr_startup = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&stderr_startup, &expected),
+        1,
+        "I17: dir-watch startup must emit the vars-file warning exactly once \
+         (guards :2196); stderr:\n{stderr_startup}"
+    );
+
+    // One rebuild: the count must rise to exactly 2, proving exactly one of
+    // :1793/:1919 fires per rebuild (not both).
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I17: rebuild after edit must complete"
+    );
+    let stderr_after_edit = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&stderr_after_edit, &expected),
+        2,
+        "I17: one rebuild must add exactly one more warning (guards a double-emit \
+         between :1793 and :1919); stderr:\n{stderr_after_edit}"
+    );
+
+    drop(child);
+}
+
+/// I18 (user decision, positive control first): a vars file that starts clean
+/// produces no duplicate-key warning at startup or on the first rebuild; a
+/// duplicate introduced mid-session is reported on the NEXT rebuild, naming the
+/// key.
+#[test]
+fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "I18: startup compile must complete"
+    );
+
+    // Positive control (PF-013): no duplicate at startup.
+    let startup_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&startup_stderr, &expected),
+        0,
+        "I18: a clean vars file must not warn at startup; stderr:\n{startup_stderr}"
+    );
+
+    // First rebuild, still clean: still no warning.
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I18: first rebuild must complete"
+    );
+    let clean_rebuild_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&clean_rebuild_stderr, &expected),
+        0,
+        "I18: the first rebuild must still not warn (vars file is still clean); \
+         stderr:\n{clean_rebuild_stderr}"
+    );
+
+    // Introduce a duplicate mid-session, then trigger the next rebuild.
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    std::fs::write(&src, "version 3").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 3", TIMEOUT),
+        "I18: rebuild after introducing the duplicate must complete"
+    );
+    let final_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&final_stderr, &expected),
+        1,
+        "I18: the duplicate introduced mid-session must be reported on the next \
+         rebuild, naming the key; stderr:\n{final_stderr}"
+    );
+
+    drop(child);
+}
+
+// ── I19-I20: liveness self-heal rebuild and --quiet regressions (#326) ───────
+//
+// AC-W2 (`watch_dir_mode_root_delete_recreate_recovers`) proves that a root
+// delete+recreate kills the recursive watch on the old inode, so the create
+// event for a file written into the recreated root is never delivered — only
+// `liveness_probe_dir`'s re-arm + full reconcile finds and compiles it. Before
+// this fix, that self-heal recompile discarded the resolved `RuntimeVars` and
+// never warned about a --vars file duplicate, unlike `handle_fs_event_dir`.
+
+/// I19: a self-heal rebuild driven by the liveness probe (no FS event ever
+/// delivered) must warn about a --vars file duplicate key, same as a genuine
+/// FS-event rebuild does. Guards `liveness_probe_dir`'s content-backstop site.
+#[test]
+fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("watched");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&vars_dir).unwrap();
+    std::fs::write(root.join("a.mds"), "---\nname: A\n---\nOld A\n").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                root.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "100",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Startup: exactly 1 warning (dir-mode startup, unaffected by this fix).
+    let startup_stderr = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&startup_stderr, &expected),
+        1,
+        "I19: dir-watch startup must warn exactly once; stderr:\n{startup_stderr}"
+    );
+    assert!(
+        wait_for_file_contains(&out_dir.join("a.md"), "Old A", TIMEOUT),
+        "I19: initial compile should produce 'Old A'"
+    );
+
+    // Delete the entire watched root — kills the recursive watch on the old inode
+    // (same setup as `watch_dir_mode_root_delete_recreate_recovers`).
+    std::fs::remove_dir_all(&root).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Recreate the root with a brand-new file. On Linux/inotify the create event
+    // above is unobservable (new inode, nothing watching it yet), so only the
+    // liveness probe's re-arm + reconcile self-heal path (`liveness_probe_dir`)
+    // can find and compile it; on macOS FSEvents watches by path, so the create
+    // event IS delivered and `handle_fs_event_dir` may service the self-heal
+    // first instead. Either way, the content-changed gate guarantees exactly one
+    // warning per observable rebuild, which is what the count assertion below
+    // pins.
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("new.mds"),
+        "---\nname: N\n---\nNew file {{name}}\n",
+    )
+    .unwrap();
+
+    assert!(
+        wait_for_file_contains(&out_dir.join("new.md"), "New file N", TICK_TIMEOUT),
+        "I19: watcher must self-heal after root delete+recreate and recompile"
+    );
+
+    // The self-heal recompile must ALSO re-warn about the vars-file duplicate —
+    // proves liveness_probe_dir no longer discards the resolved vars, matching
+    // handle_fs_event_dir's gate (emit iff the rebuild was observable).
+    let final_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&final_stderr, &expected),
+        2,
+        "I19: the liveness self-heal rebuild must warn about the vars-file \
+         duplicate too, not only at startup; stderr:\n{final_stderr}"
+    );
+
+    drop(child);
+}
+
+/// I20: `mds watch --quiet` suppresses the vars-file duplicate-key warning on
+/// every rebuild, not just at startup. Regression guard for the inner
+/// `if quiet { return; }` early-out in `emit_duplicate_vars_file_warnings`:
+/// nothing else stops per-rebuild spam under --quiet on the direct watch call
+/// sites (`rebuild_file`, `handle_fs_event_dir`, `liveness_probe_dir`), since
+/// they call the emitter directly and bypass `emit_duplicate_var_warnings`'s
+/// own quiet early-out (that one only guards the startup call sites).
+#[test]
+fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--quiet",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Positive control (PF-013): the rebuild really happens even though nothing
+    // warns — otherwise "0 occurrences" below would be vacuous.
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "I20: startup compile must complete even under --quiet"
+    );
+    let startup_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&startup_stderr, &expected),
+        0,
+        "I20: --quiet must suppress the startup vars-file duplicate warning; \
+         stderr:\n{startup_stderr}"
+    );
+
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I20: rebuild after edit must complete even under --quiet"
+    );
+
+    let after_edit = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&after_edit, &expected),
+        0,
+        "I20: --quiet must suppress the vars-file duplicate warning on rebuild \
+         too; stderr:\n{after_edit}"
     );
 
     drop(child);

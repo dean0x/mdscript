@@ -1,5 +1,5 @@
 mod common;
-use common::{assert_no_control_chars, fixture, mds_bin};
+use common::{assert_no_control_chars, dup_vars_file_warning, fixture, mds_bin};
 
 #[test]
 fn check_collecting_warnings_returns_warnings_for_empty_include() {
@@ -432,6 +432,303 @@ fn i7_hostile_key_is_wire_escaped_in_warning() {
 
     // Now assert the raw control bytes are absent.
     assert_no_control_chars(&stderr, "I7 stderr");
+}
+
+// ── I10-I15: duplicate --vars file key warnings (#326) ───────────────────────
+
+#[test]
+fn i10_vars_file_duplicate_key_warns_exactly_once_on_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello world").unwrap();
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "I10: build with duplicate vars-file key must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = dup_vars_file_warning("x", &vars);
+    let count = count_occurrences(&stderr, &expected);
+    assert_eq!(
+        count, 1,
+        "I10: expected warning exactly once, found {count} times; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i11_quiet_suppresses_vars_file_duplicate_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello world").unwrap();
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+            "--quiet",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "I11: quiet build must succeed");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.is_empty(),
+        "I11: --quiet must suppress the duplicate vars-file warning, got: {stderr}"
+    );
+}
+
+#[test]
+fn i12_vars_file_duplicate_key_warns_on_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello world").unwrap();
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "check",
+            src.to_str().unwrap(),
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "I12: check must succeed");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = dup_vars_file_warning("x", &vars);
+    assert_eq!(
+        count_occurrences(&stderr, &expected),
+        1,
+        "I12: check must warn exactly once for a duplicate vars-file key; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i13_vars_file_duplicate_key_warns_on_lint() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello world").unwrap();
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "lint",
+            src.to_str().unwrap(),
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "I13: lint must succeed");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = dup_vars_file_warning("x", &vars);
+    assert_eq!(
+        count_occurrences(&stderr, &expected),
+        1,
+        "I13: lint must warn exactly once for a duplicate vars-file key; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i14_vars_file_triple_repeat_warns_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello world").unwrap();
+    std::fs::write(&vars, r#"{"x": 1, "x": 2, "x": 3}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "I14: build must succeed");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = dup_vars_file_warning("x", &vars);
+    assert_eq!(
+        count_occurrences(&stderr, &expected),
+        1,
+        "I14: triple repeat must still produce exactly one warning; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i15_hostile_vars_file_key_is_wire_escaped_in_warning() {
+    // Mirrors i7: a key containing an ESC byte (U+001B) and an RLO (U+202E) must
+    // appear in the warning with those codepoints replaced by their \uXXXX escape
+    // sequences, never as raw control bytes.
+    //
+    // The vars FILE must spell these as JSON \u escapes (a raw control byte is not
+    // legal inside a JSON string). The escape text is built via `format!` with a
+    // hex-formatted integer, never as a literal 4-hex \uXXXX sequence in this
+    // source file, so the editor tool layer has nothing to decode (PF-018).
+    let esc_json_escape = format!("\\u{:04x}", 0x1bu32);
+    let rlo_json_escape = format!("\\u{:04x}", 0x202eu32);
+    let hostile_key_in_json = format!("{esc_json_escape}[31m{rlo_json_escape}");
+
+    // The expected ESCAPED forms as they appear in the sanitized warning output.
+    let expected_esc_form = "\\u001B";
+    let expected_rlo_form = "\\u202E";
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello world").unwrap();
+    let vars_json = format!(r#"{{"{hostile_key_in_json}": 1, "{hostile_key_in_json}": 2}}"#);
+    std::fs::write(&vars, vars_json).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "I15: build with hostile vars-file key must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // PF-013 NON-VACUITY FIRST: assert the escaped form IS present before asserting
+    // absence of raw control bytes.
+    assert!(
+        stderr.contains(expected_esc_form),
+        "I15: expected escaped ESC form '{expected_esc_form}' in stderr; got:\n{stderr:?}"
+    );
+    assert!(
+        stderr.contains(expected_rlo_form),
+        "I15: expected escaped RLO form '{expected_rlo_form}' in stderr; got:\n{stderr:?}"
+    );
+
+    // Now assert the raw control bytes are absent.
+    assert_no_control_chars(&stderr, "I15 stderr");
+}
+
+#[test]
+fn i15b_hostile_vars_file_key_with_newline_is_wire_escaped() {
+    // i15 uses ESC (U+001B) and RLO (U+202E), which HUMAN and WIRE escape
+    // identically (per sanitize_control_chars_wire/sanitize_control_chars:
+    // "everything else escapes identically in both modes" except the newline
+    // character) — so i15 cannot tell `safe_inline(key)` apart from a bare
+    // `key`; the outer `eprint_warning` HUMAN pass masks the difference. The
+    // newline is the one code point where WIRE differs from HUMAN: HUMAN
+    // keeps a real newline byte (a forged second stderr line), WIRE escapes
+    // it to the 6-character uppercase-hex literal form (see
+    // `sanitize_control_chars_wire`'s own doctest, which pins this exact
+    // escaped form for a newline). This test pins that WIRE escaping at the
+    // interpolation site, independently of whatever the outer eprint_warning
+    // pass does.
+    //
+    // The vars file key is written as a raw string containing the JSON escape
+    // sequence \n (two ASCII characters: backslash, n) inside the JSON text —
+    // NOT a real newline byte, and never a literal 4-hex \uXXXX sequence in
+    // this .rs source (PF-018). serde_json decodes that JSON escape to a real
+    // LF byte in the parsed key.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello world").unwrap();
+    std::fs::write(&vars, r#"{"a\nb": 1, "a\nb": 2}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "I15b: build with a newline-in-key vars file must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // PF-013 NON-VACUITY FIRST: the exact pinned warning line, with the key
+    // rendered via the 6-character uppercase-hex escape for the newline
+    // (never a real LF byte), appears exactly once. A weaker check such as
+    // `stderr.contains("\\u000A")` alone would not be specific enough — this
+    // asserts the whole pinned line renders correctly, key and all.
+    let escaped_key = "a\\u000Ab";
+    let expected = dup_vars_file_warning(escaped_key, &vars);
+    assert_eq!(
+        count_occurrences(&stderr, &expected),
+        1,
+        "I15b: expected the exact pinned warning line with the key WIRE-escaped \
+         as {escaped_key:?}; got stderr:\n{stderr:?}"
+    );
+
+    // If a raw LF reached eprint_warning unescaped, the key's real newline
+    // would forge a second stderr line whose text starts with the tail of the
+    // key ("b' is set more than once..."). Assert no real-newline-delimited
+    // line looks like that forged fragment — this fails if a raw LF were
+    // emitted mid-line, independently of the exact-line check above.
+    for line in stderr.lines() {
+        assert!(
+            !line.starts_with("b'"),
+            "I15b: a stderr line looks like the forged tail of a raw-LF-split \
+             hostile key (line: {line:?}); this would only happen if a raw LF \
+             reached eprint_warning unescaped; full stderr:\n{stderr:?}"
+        );
+    }
+
+    assert_no_control_chars(&stderr, "I15b stderr");
 }
 
 // ── R2: @include warning precision ───────────────────────────────────────────

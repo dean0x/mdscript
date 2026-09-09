@@ -2,12 +2,12 @@
 //!
 //! ## Tier contract (T5 / AC-F-18)
 //!
-//! | Tier | Rules                                             | Semantics |
-//! |------|---------------------------------------------------|-----------|
-//! | A    | duplicate-import, duplicate-export,               | Auto-fixable (span-removal); gated by reverify |
-//! |      | unreachable-branch, empty-block                   |           |
-//! | B    | unused-import, unused-function                    | Fixable only when structural-standalone (no imports/extends/partial; reverify applies) |
-//! | C    | unused-variable, redundant-else, shadow-variable  | Report-only; never fixed |
+//! | Tier | Rules                                                     | Semantics |
+//! |------|------------------------------------------------------------|-----------|
+//! | A    | duplicate-import, duplicate-export, unreachable-branch,    | Auto-fixable (span-removal); gated by reverify |
+//! |      | empty-block, legacy-interpolation                          |           |
+//! | B    | unused-import, unused-function                             | Fixable only when structural-standalone (no imports/extends/partial; reverify applies) |
+//! | C    | unused-variable, redundant-else, shadow-variable           | Report-only; never fixed |
 //!
 //! **Tier B nuance:**
 //! - `unused-function` sets `fix_removals` to a whole-block [`FixLineSpan`] and is

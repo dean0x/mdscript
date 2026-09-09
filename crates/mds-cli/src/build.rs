@@ -517,10 +517,8 @@ pub(crate) struct RuntimeVarArgs {
 }
 
 /// Load vars from an optional file path, returning None if no file was given.
-pub(crate) fn load_optional_vars_file(
-    path: Option<PathBuf>,
-) -> Result<Option<HashMap<String, mds::Value>>> {
-    path.map(|p| mds::load_vars_file(&p).map_err(miette::Error::from))
+pub(crate) fn load_optional_vars_file(path: Option<PathBuf>) -> Result<Option<mds::VarsLoad>> {
+    path.map(|p| mds::load_vars_file_reporting_duplicates(&p).map_err(miette::Error::from))
         .transpose()
 }
 
@@ -535,6 +533,16 @@ pub(crate) struct RuntimeVars {
     pub(crate) duplicate_set_keys: Vec<String>,
     /// Keys that appeared more than once inside `--set-string` (same contract).
     pub(crate) duplicate_set_string_keys: Vec<String>,
+    /// Key paths (dotted/bracketed, e.g. `x.a`, `x[2].a`) that appeared more than
+    /// once in the `--vars` JSON file, at any depth (#326). Empty when no `--vars`
+    /// file was given, or when the file had no duplicates.
+    pub(crate) duplicate_vars_file_keys: Vec<String>,
+    /// Count of distinct duplicate key paths beyond `mds::VarsLoad`'s cap that were
+    /// not individually recorded in `duplicate_vars_file_keys` (#326).
+    pub(crate) duplicate_vars_file_keys_omitted: usize,
+    /// The `--vars` file path as passed on the command line, for warning messages
+    /// (#326). `None` when no `--vars` file was given.
+    pub(crate) vars_file: Option<PathBuf>,
 }
 
 /// Collect keys that appear more than once in `pairs`, in first-occurrence order,
@@ -587,7 +595,19 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
     let duplicate_set_keys = duplicate_keys(&set_vars);
     let duplicate_set_string_keys = duplicate_keys(&set_string_vars);
 
-    let mut runtime_vars = load_optional_vars_file(vars)?;
+    // Clone the path BEFORE load_optional_vars_file(vars) moves it (#326).
+    let vars_file = vars.clone();
+    let loaded = load_optional_vars_file(vars)?;
+    let (mut runtime_vars, duplicate_vars_file_keys, duplicate_vars_file_keys_omitted) =
+        match loaded {
+            Some(mds::VarsLoad {
+                vars,
+                duplicate_keys,
+                duplicate_keys_omitted,
+                ..
+            }) => (Some(vars), duplicate_keys, duplicate_keys_omitted),
+            None => (None, Vec::new(), 0),
+        };
     for (key, val) in set_vars {
         runtime_vars
             .get_or_insert_with(HashMap::new)
@@ -602,11 +622,49 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
         vars: runtime_vars,
         duplicate_set_keys,
         duplicate_set_string_keys,
+        duplicate_vars_file_keys,
+        duplicate_vars_file_keys_omitted,
+        vars_file,
     })
 }
 
+/// Emit `warning: key '…' is set more than once in vars file …; the last value wins`
+/// lines for every duplicate key path found in the `--vars` JSON file (#326), at
+/// every depth, plus one tail line when the duplicate count exceeds
+/// [`mds::VarsLoad`]'s cap.
+///
+/// AD-224-3: every untrusted value interpolated into `eprint_warning` must be wrapped
+/// in `safe_inline(…)` / `safe_path(…)` **at the interpolation site** — not hoisted
+/// into a `let` binding first. `key` is raw, untrusted text straight from the JSON
+/// (D4); `Path` is not `Display`, so it goes through `safe_path`, not `safe_inline`.
+///
+/// AD-224-5: no-op when `quiet` is true.
+pub(crate) fn emit_duplicate_vars_file_warnings(resolved: &RuntimeVars, quiet: bool) {
+    if quiet {
+        return;
+    }
+    let Some(path) = resolved.vars_file.as_deref() else {
+        return;
+    };
+    for key in &resolved.duplicate_vars_file_keys {
+        crate::output::eprint_warning(&format!(
+            "warning: key '{}' is set more than once in vars file {}; the last value wins",
+            crate::output::safe_inline(key),
+            crate::output::safe_path(path)
+        ));
+    }
+    if resolved.duplicate_vars_file_keys_omitted > 0 {
+        crate::output::eprint_warning(&format!(
+            "warning: {} more duplicate keys in vars file {} are not listed",
+            crate::output::safe_inline(resolved.duplicate_vars_file_keys_omitted),
+            crate::output::safe_path(path)
+        ));
+    }
+}
+
 /// Emit `warning: variable '…' is set more than once by --set/--set-string` lines
-/// for any duplicate keys found by [`build_runtime_vars`].
+/// for any duplicate keys found by [`build_runtime_vars`], plus (D8 order: file →
+/// `--set` → `--set-string`) the `--vars` file duplicate-key warnings (#326).
 ///
 /// AD-224-3: every untrusted value interpolated into `eprint_warning` must be wrapped
 /// in `safe_inline(…)` **at the interpolation site** — not hoisted into a `let` binding
@@ -618,6 +676,7 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
     if quiet {
         return;
     }
+    emit_duplicate_vars_file_warnings(resolved, quiet);
     for key in &resolved.duplicate_set_keys {
         crate::output::eprint_warning(&format!(
             "warning: variable '{}' is set more than once by --set; the last value wins",
@@ -2261,5 +2320,104 @@ mod tests {
         let map = resolved.vars.expect("non-empty vars");
         assert_eq!(map.get("num"), Some(&mds::Value::Number(42.0)));
         assert_eq!(map.get("id"), Some(&mds::Value::String("007".to_string())));
+    }
+
+    // ── #326: duplicate --vars file keys surface on RuntimeVars ───────────────
+
+    #[test]
+    fn build_runtime_vars_vars_file_duplicate_key_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"x": 1, "x": 2}"#).unwrap();
+
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(path.clone()),
+            set_vars: vec![],
+            set_string_vars: vec![],
+        })
+        .expect("duplicate vars-file key must not error");
+        assert_eq!(resolved.duplicate_vars_file_keys, vec!["x".to_string()]);
+        assert_eq!(resolved.vars_file, Some(path));
+        let map = resolved.vars.expect("non-empty vars");
+        assert_eq!(map.get("x"), Some(&mds::Value::Number(2.0)));
+    }
+
+    #[test]
+    fn build_runtime_vars_vars_file_nested_duplicate_reports_dotted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"cfg":{"a":1,"a":2}}"#).unwrap();
+
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(path),
+            set_vars: vec![],
+            set_string_vars: vec![],
+        })
+        .expect("nested duplicate vars-file key must not error");
+        assert_eq!(resolved.duplicate_vars_file_keys, vec!["cfg.a".to_string()]);
+    }
+
+    /// Positive control (PF-013): a clean vars file reports no duplicates, while
+    /// still populating `vars_file`.
+    #[test]
+    fn build_runtime_vars_vars_file_without_duplicates_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"name": "World"}"#).unwrap();
+
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(path.clone()),
+            set_vars: vec![],
+            set_string_vars: vec![],
+        })
+        .expect("clean vars file must not error");
+        assert!(
+            resolved.duplicate_vars_file_keys.is_empty(),
+            "expected no duplicates, got: {:?}",
+            resolved.duplicate_vars_file_keys
+        );
+        assert_eq!(resolved.duplicate_vars_file_keys_omitted, 0);
+        assert!(resolved.vars_file.is_some(), "vars_file must be populated");
+    }
+
+    #[test]
+    fn build_runtime_vars_no_vars_file_reports_no_duplicates_and_no_path() {
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![("a".to_string(), "1".to_string())],
+            set_string_vars: vec![],
+        })
+        .expect("no vars file must not error");
+        assert!(
+            resolved.duplicate_vars_file_keys.is_empty(),
+            "expected no duplicates when no vars file was given, got: {:?}",
+            resolved.duplicate_vars_file_keys
+        );
+        assert_eq!(resolved.duplicate_vars_file_keys_omitted, 0);
+        assert_eq!(
+            resolved.vars_file, None,
+            "vars_file must be None when --vars was not given"
+        );
+    }
+
+    /// U5 (extended): the cross-flag hard error must precede the vars-file read
+    /// entirely — a nonexistent vars path must not surface a file-not-found error
+    /// when --set and --set-string also collide.
+    #[test]
+    fn build_runtime_vars_cross_flag_error_precedes_the_vars_file_read() {
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(PathBuf::from("/does/not/exist/vars.json")),
+            set_vars: vec![("x".to_string(), "1".to_string())],
+            set_string_vars: vec![("x".to_string(), "2".to_string())],
+        });
+        assert!(
+            result.is_err(),
+            "cross-flag collision must be a hard error even with a nonexistent vars path"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("variable 'x' is set by both --set and --set-string"),
+            "error must be the cross-flag collision, not a file-read error; got: {msg}"
+        );
     }
 }

@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +21,53 @@ pub fn mds_bin() -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mds"));
     cmd.env("NO_COLOR", "1");
     cmd
+}
+
+// ── Duplicate --vars file key warnings (#326) ────────────────────────────────
+
+/// USER-FACING CONTRACT (#326). `{key}` = dotted/bracketed path, `{path}` = the
+/// `--vars` arg as typed on the command line.
+#[allow(dead_code)]
+pub const DUP_VARS_FILE_WARNING_FMT: &str =
+    "warning: key '{key}' is set more than once in vars file {path}; the last value wins";
+
+/// Tail line printed when more distinct duplicate paths exist than the
+/// 1 000-path cap on [`mds::VarsLoad::duplicate_keys`] allows; `{n}` is
+/// [`mds::VarsLoad::duplicate_keys_omitted`] (#326).
+#[allow(dead_code)]
+pub const DUP_VARS_FILE_OMITTED_FMT: &str =
+    "warning: {n} more duplicate keys in vars file {path} are not listed";
+
+/// Render [`DUP_VARS_FILE_WARNING_FMT`] for a given key path and `--vars` path.
+#[allow(dead_code)]
+pub fn dup_vars_file_warning(key: &str, path: &Path) -> String {
+    DUP_VARS_FILE_WARNING_FMT
+        .replace("{key}", key)
+        .replace("{path}", &path.display().to_string())
+}
+
+/// Render [`DUP_VARS_FILE_OMITTED_FMT`] for a given omitted count and `--vars` path.
+#[allow(dead_code)]
+pub fn dup_vars_file_omitted(n: usize, path: &Path) -> String {
+    DUP_VARS_FILE_OMITTED_FMT
+        .replace("{n}", &n.to_string())
+        .replace("{path}", &path.display().to_string())
+}
+
+/// Count non-overlapping occurrences of `needle` in `haystack`.
+///
+/// Same body as the private `count_occurrences` in `warnings.rs` / `cli_watch.rs` —
+/// those files import only the two render helpers above (E0255 otherwise) and keep
+/// their own private copy of this one.
+#[allow(dead_code)]
+pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count += 1;
+        start += pos + needle.len();
+    }
+    count
 }
 
 // ── Watch readiness handshake ────────────────────────────────────────────────

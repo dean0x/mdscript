@@ -377,7 +377,8 @@ pub(crate) fn external_recovery_decision(
 ///
 /// Rejects a symlinked vars file at startup (build parity — PF-004).
 /// Falls back to the raw path when the file does not yet exist (the user may create
-/// it later; the per-rebuild `load_vars_file` will catch it then).
+/// it later; the vars file is reloaded on every rebuild — ADR-016 — so a duplicate
+/// key introduced after startup is caught on the next rebuild, #326).
 pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<PathBuf>, MdsError> {
     match vars {
         Some(p) if p.exists() => {
@@ -746,7 +747,13 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 /// kind cannot change without the template itself changing, which triggers a rebuild).
 struct FileCompileCtx {
     entry: PathBuf,
+    /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
+    /// used for `dirs_to_watch`/`files_of_interest` (never for display, #326).
     vars_path: Option<PathBuf>,
+    /// The `--vars` path exactly as the user typed it, uncanonicalized (#326, D4).
+    /// Used for `RuntimeVarArgs.vars` so the vars-file duplicate-key warning displays
+    /// (and reads) the as-typed path rather than its canonical form.
+    vars_path_raw: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
     /// The `-o <path>` or `--out-dir` argument passed by the user, if any.
@@ -933,19 +940,34 @@ fn rebuild_file(
 ) {
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
     // Print the error, settle mtime to avoid re-fire, and keep watching.
-    let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path.clone(),
+    //
+    // The vars-file duplicate-key warnings (#326) are NOT emitted here
+    // unconditionally: `rebuild_file` is called both from a genuine fs-event
+    // rebuild AND from the liveness probe's unconditional-on-first-tick
+    // self-heal recompile (a documented "worst case: one redundant compile"
+    // that normally dedups to no write, see the comment above this function).
+    // Emitting here would double-report the same duplicate once per session on
+    // every startup. Instead the resolved vars are held and the warning is
+    // emitted below, gated on `content_changed` — the same signal that gates
+    // the "Recompiled" line — so the vars-file duplicate is re-reported exactly
+    // once per OBSERVABLE rebuild (tests I16, I18, I20).
+    let mut resolved = match build_runtime_vars(RuntimeVarArgs {
+        vars: ctx.vars_path_raw.clone(),
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
-        // Flags are fixed for the session; warned once at startup — discard here.
-        Ok(v) => v.vars,
+        Ok(v) => v,
         Err(e) => {
             eprint_error(e);
             state.last_mtimes = snapshot_state(&state.foi);
             return;
         }
     };
+    // Move the map out instead of cloning it: `compile_to_content` takes
+    // `runtime_vars` by value, and the emitter below only ever reads
+    // `resolved.vars_file` / `duplicate_vars_file_keys` /
+    // `duplicate_vars_file_keys_omitted` — none of which need `.vars`.
+    let runtime_vars = resolved.vars.take();
 
     let t0 = Instant::now();
     match compile_to_content(
@@ -989,6 +1011,13 @@ fn rebuild_file(
                 .last_written
                 .get(&output_key)
                 .is_none_or(|prev| *prev != compiled.content);
+
+            // #326: re-report the vars-file duplicate-key warnings exactly when an
+            // observable rebuild happens (same gate as the "Recompiled" line below),
+            // not on the liveness probe's redundant no-op recompile.
+            if content_changed {
+                crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+            }
 
             // ADR-016: always recompute dep set from fresh output.
             let new_dirs =
@@ -1051,6 +1080,14 @@ fn run_watch_file(
     quiet: bool,
     tick: Option<Duration>,
 ) -> Result<()> {
+    // #326: keep the --vars argument as the user typed it, separately from the
+    // canonicalized form below. `vars_path` (canonical) is used for everything that
+    // must match notify's canonicalized event paths (dirs_to_watch, files_of_interest,
+    // event matching); `vars_path_raw` is used only for `RuntimeVarArgs.vars`, so the
+    // vars-file duplicate-key warning (D4: "{path} = the --vars arg as typed") displays
+    // and reads through the same path the user gave — reading a valid, possibly
+    // symlinked path is fine either way, only the DISPLAYED text differs.
+    let vars_path_raw = vars.clone();
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
@@ -1146,7 +1183,7 @@ fn run_watch_file(
     // For the default case (no explicit flag), the path depends on the output kind, which
     // is only known after compilation — so we compile first, then derive.
     let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path.clone(),
+        vars: vars_path_raw.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
@@ -1303,6 +1340,7 @@ fn run_watch_file(
     let ctx = FileCompileCtx {
         entry,
         vars_path,
+        vars_path_raw,
         static_set_vars,
         static_set_string_vars,
         output_arg: output,
@@ -1513,7 +1551,13 @@ struct LivenessState {
 /// once per batch by `process_dir_batch`, over the whole tracked set (#321).
 ///
 /// Compile success/failure is already signalled via `state.errored`; the caller uses
-/// that set rather than this function's return value, so the return type is `()`.
+/// that set for error tracking.
+///
+/// Returns `true` when this call produced an observable, content-changed rebuild
+/// (a real write, not a partial/unchanged/errored compile) — used by
+/// `process_dir_batch`'s callers to gate the `#326` vars-file duplicate-key
+/// warning on an OBSERVABLE rebuild rather than every internal recompute (the
+/// same content-based signal `rebuild_file` uses in single-file mode).
 fn compile_one_source(
     src: &Path,
     root: &Path,
@@ -1521,7 +1565,7 @@ fn compile_one_source(
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
     state: &mut DirWatchState,
-) {
+) -> bool {
     let t0 = Instant::now();
     match compile_to_content(
         src,
@@ -1535,7 +1579,7 @@ fn compile_one_source(
             // Partials (DD2): refresh graph edges but do NOT write output.
             if is_partial(src) {
                 state.record_success(src, dep_paths, root, None, None);
-                return;
+                return false;
             }
 
             // Derive the output path from the compiled kind (intrinsic extension).
@@ -1594,20 +1638,24 @@ fn compile_one_source(
                             Some(&out),
                             Some(compiled.content),
                         );
+                        true
                     }
                     Err(e) => {
                         eprint_error(e);
                         state.record_error(src);
+                        false
                     }
                 }
             } else {
                 // Content unchanged — still refresh graph edges + known_files.
                 state.record_success(src, dep_paths, root, None, None);
+                false
             }
         }
         Err(e) => {
             eprint_error(e);
             state.record_error(src);
+            false
         }
     }
 }
@@ -1629,7 +1677,13 @@ struct DirStartup {
 /// from the extracted helper functions (issue #6 / zero-warnings policy).
 struct DirWatchCtx {
     root: PathBuf,
+    /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
+    /// used for matching/watching (never for display, #326).
     vars_path: Option<PathBuf>,
+    /// The `--vars` path exactly as the user typed it, uncanonicalized (#326, D4).
+    /// Used for `RuntimeVarArgs.vars` so the vars-file duplicate-key warning displays
+    /// (and reads) the as-typed path rather than its canonical form.
+    vars_path_raw: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
     output_base: OutputBase,
@@ -1790,13 +1844,21 @@ fn liveness_probe_dir(
 
     if !batch.is_empty() {
         // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-        let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
-            vars: ctx.vars_path.clone(),
+        let resolved = match build_runtime_vars(RuntimeVarArgs {
+            vars: ctx.vars_path_raw.clone(),
             set_vars: ctx.static_set_vars.clone(),
             set_string_vars: ctx.static_set_string_vars.clone(),
         }) {
-            // Flags are fixed for the session; warned once at startup — discard here.
-            Ok(v) => v.vars,
+            // --set/--set-string are fixed for the session and warned once at
+            // startup — discarded (via `resolved.vars` below). The vars file is
+            // reloaded on every rebuild (ADR-016); this self-heal path emits under
+            // the same content-changed gate as `handle_fs_event_dir`, so one
+            // logical edit observed by both paths still warns once — tests I17 and
+            // I19. Without this, a self-heal recompile driven purely by this
+            // content-backstop/full-reconcile tick (no FS event ever delivered,
+            // e.g. after a root delete+recreate) could print "Recompiled" with no
+            // vars-file duplicate warning at all.
+            Ok(v) => v,
             Err(e) => {
                 eprint_error(e);
                 // Re-baseline so the next tick does not report the same change again
@@ -1805,15 +1867,18 @@ fn liveness_probe_dir(
                 return;
             }
         };
-        process_dir_batch(
+        let any_changed = process_dir_batch(
             &batch,
             false, /* vars_changed */
             &ctx.root,
             &ctx.output_base,
-            &runtime_vars,
+            &resolved.vars,
             ctx.quiet,
             state,
         );
+        if any_changed {
+            crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+        }
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
     // post-batch tracked set, and an empty batch means nothing appeared, was removed, or
@@ -1916,13 +1981,20 @@ fn handle_fs_event_dir(
 
     // ADR-016: reload vars from disk on every rebuild.
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-    let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path.clone(),
+    let resolved = match build_runtime_vars(RuntimeVarArgs {
+        vars: ctx.vars_path_raw.clone(),
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
-        // Flags are fixed for the session; warned once at startup — discard here.
-        Ok(v) => v.vars,
+        // --set/--set-string are fixed for the session and warned once at startup —
+        // discarded (via `resolved.vars` below). The vars file is reloaded on every
+        // rebuild (ADR-016), so its duplicate keys are re-reported too — but only when
+        // this batch produces an OBSERVABLE rebuild (#326, test I17): at
+        // `--debounce 0` a single edit can generate more than one raw FS event, each
+        // reaching this function separately, so the warning is emitted after
+        // `process_dir_batch` reports whether anything actually changed rather than
+        // unconditionally here.
+        Ok(v) => v,
         Err(e) => {
             eprint_error(e);
             // Re-baseline so the idle-tick content backstop does not report the same
@@ -1932,15 +2004,22 @@ fn handle_fs_event_dir(
         }
     };
 
-    process_dir_batch(
+    // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
+    // directly rather than cloning it — `resolved` (and its `.vars_file`,
+    // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
+    // needed below, after this borrow ends, for the warning emission.
+    let any_changed = process_dir_batch(
         &mds_changed,
         vars_changed,
         &ctx.root,
         &ctx.output_base,
-        &runtime_vars,
+        &resolved.vars,
         ctx.quiet,
         state,
     );
+    if any_changed {
+        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+    }
 
     DirEventOutcome::Done
 }
@@ -1967,6 +2046,9 @@ fn dir_watch_startup(
 ) -> Result<DirStartup> {
     // Load config once from the root directory.
     let config = load_config(&root)?;
+    // #326: keep the --vars argument as the user typed it (see FileCompileCtx's
+    // vars_path_raw doc for why) — `vars_path` below stays canonical for matching.
+    let vars_path_raw = vars.clone();
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
@@ -2068,7 +2150,7 @@ fn dir_watch_startup(
     // Startup compile: compile all .mds files found under root.
     let all_files = collect_mds_files(&root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
     let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path.clone(),
+        vars: vars_path_raw.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
@@ -2189,16 +2271,19 @@ fn dir_watch_startup(
 
     // Build the dedup baseline for any source whose startup compile did not record
     // one (partials are skipped above; a failed write leaves no entry).
-    // dir_watch_startup calls build_runtime_vars twice: once above (emit) and once
-    // here (discard) — emitting at both sites would double-print the warning on
-    // directory-watch startup. Test I9 is the sole mechanical guard on this.
+    // dir_watch_startup calls build_runtime_vars twice: once above (emit, including
+    // the #326 vars-file duplicate-key warnings) and once here (discard) — emitting
+    // at both sites would double-print every warning (both the --set/--set-string
+    // ones and the vars-file ones) on directory-watch startup. Test I17 is
+    // the mechanical guard on this.
     {
         let baseline_resolved = build_runtime_vars(RuntimeVarArgs {
-            vars: vars_path.clone(),
+            vars: vars_path_raw.clone(),
             set_vars: static_set_vars.clone(),
             set_string_vars: static_set_string_vars.clone(),
         })?;
-        // Flags are fixed for the session; warned once above at startup — discard here.
+        // Flags and vars-file duplicates alike are already warned above at startup —
+        // discard here (this second read only rebuilds the dedup baseline).
         let baseline_vars = baseline_resolved.vars;
         for source in &all_files {
             let key = graph_key(source);
@@ -2290,6 +2375,7 @@ fn dir_watch_startup(
     let ctx = DirWatchCtx {
         root,
         vars_path,
+        vars_path_raw,
         static_set_vars,
         static_set_string_vars,
         output_base,
@@ -2388,6 +2474,13 @@ fn run_watch_dir(
 ///
 /// Called by both the event path and the reconcile path so the same state
 /// transitions apply uniformly.
+///
+/// Returns `true` when the batch produced at least one observable, content-changed
+/// rebuild (see `compile_one_source`) — callers use this to gate the `#326`
+/// vars-file duplicate-key warning on an OBSERVABLE rebuild, since a single logical
+/// edit can otherwise reach this function more than once (e.g. multiple raw FS
+/// events for one write at `--debounce 0`, or a liveness-probe self-heal tick
+/// racing a real FS event for the same change) and would otherwise double-warn.
 fn process_dir_batch(
     changed: &BTreeSet<PathBuf>,
     vars_changed: bool,
@@ -2396,12 +2489,12 @@ fn process_dir_batch(
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
     state: &mut DirWatchState,
-) {
-    if vars_changed {
-        process_dir_batch_vars_changed(root, output_base, runtime_vars, quiet, state);
+) -> bool {
+    let any_changed = if vars_changed {
+        process_dir_batch_vars_changed(root, output_base, runtime_vars, quiet, state)
     } else {
-        process_dir_batch_incremental(changed, root, output_base, runtime_vars, quiet, state);
-    }
+        process_dir_batch_incremental(changed, root, output_base, runtime_vars, quiet, state)
+    };
 
     // Re-baseline the content backstop over the post-batch tracked set (#321).
     //
@@ -2412,6 +2505,7 @@ fn process_dir_batch(
     // unchanged broken file does not re-fire every tick) and drops keys for sources the
     // batch deleted, which `snapshot_state` achieves by replacing the map outright.
     state.last_mtimes = snapshot_state(&state.tracked_set());
+    any_changed
 }
 
 /// Full recompile of all known files triggered by a vars-file change.
@@ -2425,13 +2519,17 @@ fn process_dir_batch(
 /// (rust.md / reliability issue #3 fix).
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
+///
+/// Returns `true` when at least one source in the batch produced an observable,
+/// content-changed rebuild (see `compile_one_source`).
 fn process_dir_batch_vars_changed(
     root: &Path,
     output_base: &OutputBase,
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
     state: &mut DirWatchState,
-) {
+) -> bool {
+    let mut any_changed = false;
     let all_sources: Vec<PathBuf> = state.known_files.iter().cloned().collect();
 
     // Determine which known sources no longer exist — their output files must be
@@ -2475,13 +2573,14 @@ fn process_dir_batch_vars_changed(
     state.external_dep_dirs.clear();
 
     for src in &all_sources {
-        if src.exists() {
-            compile_one_source(src, root, output_base, runtime_vars, quiet, state);
+        if src.exists() && compile_one_source(src, root, output_base, runtime_vars, quiet, state) {
+            any_changed = true;
         }
     }
 
     // Prune known_files to currently-existing sources.
     state.known_files = all_sources.into_iter().filter(|p| p.exists()).collect();
+    any_changed
 }
 
 /// Incremental recompile: compile only transitive importers of the changed seeds.
@@ -2494,6 +2593,9 @@ fn process_dir_batch_vars_changed(
 /// 5. Delete outputs for removed sources.
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
+///
+/// Returns `true` when at least one affected source produced an observable,
+/// content-changed rebuild (see `compile_one_source`).
 fn process_dir_batch_incremental(
     changed: &BTreeSet<PathBuf>,
     root: &Path,
@@ -2501,7 +2603,9 @@ fn process_dir_batch_incremental(
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
     state: &mut DirWatchState,
-) {
+) -> bool {
+    let mut any_changed = false;
+
     // 1. Partition.
     let (existing, deleted): (BTreeSet<PathBuf>, BTreeSet<PathBuf>) =
         changed.iter().cloned().partition(|p| p.exists());
@@ -2514,7 +2618,7 @@ fn process_dir_batch_incremental(
     }
 
     if seeds.is_empty() {
-        return;
+        return false;
     }
 
     // 3. Affected = seeds ∪ transitive importers (uses start-of-batch graph snapshot).
@@ -2582,7 +2686,9 @@ fn process_dir_batch_incremental(
         }
 
         // In-root source: full compile→dedup→write via shared helper.
-        compile_one_source(src, root, output_base, runtime_vars, quiet, state);
+        if compile_one_source(src, root, output_base, runtime_vars, quiet, state) {
+            any_changed = true;
+        }
     }
 
     // 5. Deletions: after importers recompiled, clean up graph + outputs.
@@ -2634,6 +2740,7 @@ fn process_dir_batch_incremental(
     // (watcher is not in scope here; callers call liveness_probe_dir which re-arms only
     // live dirs — stale dirs simply drop off the set and stop being visited each tick.)
     state.external_dep_dirs = live_ext_dirs;
+    any_changed
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

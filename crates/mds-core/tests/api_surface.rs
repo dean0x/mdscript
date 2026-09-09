@@ -32,6 +32,20 @@ fn public_functions_exist() {
     let _ = mds::check_virtual_collecting_warnings(HashMap::new(), "main.mds", None);
     let _ = mds::load_vars_file(Path::new("nonexistent.json"));
     let _ = mds::load_vars_str("{}");
+    let _ = mds::load_vars_file_reporting_duplicates(Path::new("nonexistent.json"));
+    let _ = mds::load_vars_str_reporting_duplicates("{}");
+}
+
+/// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`
+/// forbids a struct literal, so the type is only obtainable through the load API.
+#[test]
+fn vars_load_fields_are_readable() {
+    let loaded = mds::load_vars_str_reporting_duplicates(r#"{"x": 1, "x": 2}"#)
+        .expect("should load duplicate-key vars");
+    let _: &HashMap<String, Value> = &loaded.vars;
+    let _: &Vec<String> = &loaded.duplicate_keys;
+    let _: usize = loaded.duplicate_keys_omitted;
+    assert_eq!(loaded.duplicate_keys, vec!["x".to_string()]);
 }
 
 #[test]

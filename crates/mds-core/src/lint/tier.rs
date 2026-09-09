@@ -5,12 +5,15 @@
 //! be a circular dependency: `fix.rs` imports `LintResult` from `diagnostic.rs`,
 //! so `diagnostic.rs` cannot import from `fix.rs`.
 //!
-//! | Tier | Rules                                             | Semantics |
-//! |------|---------------------------------------------------|-----------|
-//! | A    | duplicate-import, duplicate-export,               | Auto-fixable; gated by reverify |
-//! |      | unreachable-branch, empty-block                   |           |
-//! | B    | unused-import, unused-function                    | Fixable only when structural-standalone |
-//! | C    | unused-variable, redundant-else, shadow-variable  | Never fixed |
+//! | Tier | Rules                                                       | Semantics |
+//! |------|--------------------------------------------------------------|-----------|
+//! | A    | duplicate-import, duplicate-export, unreachable-branch,      | Auto-fixable; gated by reverify |
+//! |      | empty-block, legacy-interpolation                            |           |
+//! | B    | unused-import, unused-function                               | Fixable only when structural-standalone |
+//! | C    | unused-variable, redundant-else, shadow-variable             | Never fixed |
+//!
+//! This table restates `rule_tier`, which is the authoritative source; `legacy-interpolation`
+//! is the one Tier A rule whose fix is not output-neutral (see `is_output_neutral`).
 //!
 //! ## Terminology (spec §7.5)
 //!
@@ -223,5 +226,90 @@ mod tests {
         assert!(!first_occurrence(&mut map, "a".to_string(), 99));
         // Original offset is preserved.
         assert_eq!(map.get("a"), Some(&0));
+    }
+
+    /// #329: the module-doc Tier table in both `tier.rs` and `fix.rs` must stay in
+    /// sync with `rule_tier`, the authoritative source. Parses the `//! |` table
+    /// rows out of each file's own source (via `include_str!`), extracts every
+    /// token that names a registered rule together with the tier of its row
+    /// (a continuation row with a blank tier column inherits the tier of the row
+    /// above), and asserts the extracted map agrees with `rule_tier` in both
+    /// directions for all 10 rules.
+    #[test]
+    fn module_doc_tier_table_matches_rule_tier() {
+        use super::super::rules::ALL_RULE_NAMES;
+
+        fn extract_tier_table(source: &str) -> std::collections::HashMap<String, char> {
+            let mut map = std::collections::HashMap::new();
+            let mut current_tier: Option<char> = None;
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                let Some(rest) = trimmed.strip_prefix("//! |") else {
+                    continue;
+                };
+                let cells: Vec<&str> = rest.split('|').collect();
+                if cells.len() < 2 {
+                    continue;
+                }
+                let tier_cell = cells[0].trim();
+                if tier_cell.len() == 1 && tier_cell.chars().all(|c| c.is_ascii_uppercase()) {
+                    current_tier = tier_cell.chars().next();
+                }
+                let Some(tier) = current_tier else { continue };
+                for token in cells[1].split(',') {
+                    let name = token.trim();
+                    if ALL_RULE_NAMES.contains(&name) {
+                        map.insert(name.to_string(), tier);
+                    }
+                }
+            }
+            map
+        }
+
+        fn tier_char(tier: FixTier) -> char {
+            match tier {
+                FixTier::A => 'A',
+                FixTier::B => 'B',
+                FixTier::C => 'C',
+            }
+        }
+
+        for (label, source) in [
+            ("tier.rs", include_str!("tier.rs")),
+            ("fix.rs", include_str!("fix.rs")),
+        ] {
+            let extracted = extract_tier_table(source);
+            // Non-vacuity: the parser must actually find all 10 rule names, or the
+            // bidirectional checks below would pass on an empty/partial extraction.
+            assert_eq!(
+                extracted.len(),
+                10,
+                "{label}: expected all 10 rule names to be extracted from the module-doc \
+                 Tier table, got {extracted:?}"
+            );
+            // Direction 1: table → rule_tier.
+            for &name in ALL_RULE_NAMES {
+                let got = *extracted.get(name).unwrap_or_else(|| {
+                    panic!(
+                        "{label}: rule {name:?} is registered but missing from the \
+                         module-doc Tier table"
+                    )
+                });
+                let expected = tier_char(rule_tier(name));
+                assert_eq!(
+                    got, expected,
+                    "{label}: module-doc Tier table says {name:?} is Tier {got}, but \
+                     rule_tier says Tier {expected}"
+                );
+            }
+            // Direction 2: rule_tier → table (every extracted name is registered).
+            for name in extracted.keys() {
+                assert!(
+                    ALL_RULE_NAMES.contains(&name.as_str()),
+                    "{label}: module-doc Tier table names {name:?}, which is not a \
+                     registered rule"
+                );
+            }
+        }
     }
 }
