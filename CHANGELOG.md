@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Warn on duplicate keys in `--vars` JSON files, at every depth, on every `mds watch` rebuild (#326).**
+  `mds build|check|lint|watch --vars f.json` with a repeated JSON object key (e.g.
+  `{"x": 1, "x": 2}`) previously compiled silently with the last value winning —
+  `serde_json`'s map deserializer discards the earlier value with no signal. Now every
+  subcommand prints `warning: key '<path>' is set more than once in vars file <file>;
+  the last value wins` for each duplicate, exit 0, suppressed by `--quiet` (parity with
+  the existing `--set`/`--set-string` duplicate-key warning, #200). Duplicates are
+  detected at **every depth** and reported with a dotted/bracketed key path mirroring
+  `{{a.b}}` interpolation syntax — `x`, `x.a`, `x[2].a`, `[0].a` for an array root
+  (0-based, display-only; a key that itself contains `.`/`[`/`]` renders ambiguously,
+  a known and documented limitation). At most 1 000 distinct duplicate key paths are
+  listed; beyond that a single tail line reports how many more were omitted:
+  `warning: {n} more duplicate keys in vars file <file> are not listed`. `mds watch`
+  reloads the vars file from disk on every rebuild (ADR-016), so its duplicate keys are
+  re-reported on every rebuild too — including a duplicate introduced mid-session by
+  editing the vars file — while `--set`/`--set-string` duplicate warnings keep their
+  existing once-at-startup behaviour. New public `mds-core` API:
+  `mds::VarsLoad { vars, duplicate_keys, duplicate_keys_omitted }` (`#[non_exhaustive]`)
+  and `mds::load_vars_file_reporting_duplicates` /
+  `mds::load_vars_str_reporting_duplicates`, implemented as a second, value-free parse
+  pass over the same JSON text so the already-parsed `vars` map is never re-derived and
+  stays byte-for-byte what the existing parser produced. `load_vars_file`/`load_vars_str`
+  are unchanged in every observable way (same signature, same return type, same errors)
+  and now delegate to the reporting variants. Known limitations: a key containing a
+  literal `.`, `[`, or `]` renders ambiguously in its reported path; the file-load and
+  string-load error codes (`mds::invalid_vars` vs `mds::json`) remain deliberately
+  un-unified (pre-existing split, unchanged).
+- **Fix stale `lint_str` rustdoc and lint-rule Tier tables (#329).** `mds-core`'s
+  `lint_str` rustdoc said "applies the 9 lint rules" after a 10th rule
+  (`legacy-interpolation`) had shipped; the Tier tables in `lint/tier.rs` and
+  `lint/fix.rs` both omitted `legacy-interpolation` from Tier A. Fixed all three, and
+  added a mechanised test (`module_doc_tier_table_matches_rule_tier`) that extracts
+  every rule name and tier from both module-doc tables and asserts they match
+  `rule_tier` for all 10 known rules, so the tables can't drift again silently.
+  `crates/mds-python/tests/test_parity.py:201` still says "9 lint rules" — deliberately
+  left as-is here since fixing it would touch the release-surface Python test path;
+  tracked for a later step.
+
 ### Internal
 
 - Cargo dependency sweep: napi 3.9.0 → 3.12.2, napi-derive 3.5.6 → 3.6.3, napi-build 2.3.2 → 2.4.1 (napi-sys 3.3.0, napi-derive-backend 6.1.2), pyo3 0.29.0 → 0.29.2, clap 4.6.1 → 4.6.6, similar 3.1.1 → 3.2.0, wasm-bindgen 0.2.121 → 0.2.126 (js-sys 0.3.103, wasm-bindgen-futures 0.4.76, wasm-bindgen-test 0.3.76), serde 1.0.228 → 1.0.229, serde_json 1.0.150 → 1.0.151, thiserror 2.0.18 → 2.0.20, libc 0.2.186 → 0.2.189. Supersedes Dependabot #354 #360 #359 #358 #280 #251 #249 #246 #243.

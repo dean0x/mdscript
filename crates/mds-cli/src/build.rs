@@ -517,10 +517,8 @@ pub(crate) struct RuntimeVarArgs {
 }
 
 /// Load vars from an optional file path, returning None if no file was given.
-pub(crate) fn load_optional_vars_file(
-    path: Option<PathBuf>,
-) -> Result<Option<HashMap<String, mds::Value>>> {
-    path.map(|p| mds::load_vars_file(&p).map_err(miette::Error::from))
+pub(crate) fn load_optional_vars_file(path: Option<PathBuf>) -> Result<Option<mds::VarsLoad>> {
+    path.map(|p| mds::load_vars_file_reporting_duplicates(&p).map_err(miette::Error::from))
         .transpose()
 }
 
@@ -535,6 +533,16 @@ pub(crate) struct RuntimeVars {
     pub(crate) duplicate_set_keys: Vec<String>,
     /// Keys that appeared more than once inside `--set-string` (same contract).
     pub(crate) duplicate_set_string_keys: Vec<String>,
+    /// Key paths (dotted/bracketed, e.g. `x.a`, `x[2].a`) that appeared more than
+    /// once in the `--vars` JSON file, at any depth (#326). Empty when no `--vars`
+    /// file was given, or when the file had no duplicates.
+    pub(crate) duplicate_vars_file_keys: Vec<String>,
+    /// Count of distinct duplicate key paths beyond `mds::VarsLoad`'s cap that were
+    /// not individually recorded in `duplicate_vars_file_keys` (#326).
+    pub(crate) duplicate_vars_file_keys_omitted: usize,
+    /// The `--vars` file path as passed on the command line, for warning messages
+    /// (#326). `None` when no `--vars` file was given.
+    pub(crate) vars_file: Option<PathBuf>,
 }
 
 /// Collect keys that appear more than once in `pairs`, in first-occurrence order,
@@ -587,7 +595,19 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
     let duplicate_set_keys = duplicate_keys(&set_vars);
     let duplicate_set_string_keys = duplicate_keys(&set_string_vars);
 
-    let mut runtime_vars = load_optional_vars_file(vars)?;
+    // Clone the path BEFORE load_optional_vars_file(vars) moves it (#326).
+    let vars_file = vars.clone();
+    let loaded = load_optional_vars_file(vars)?;
+    let (mut runtime_vars, duplicate_vars_file_keys, duplicate_vars_file_keys_omitted) =
+        match loaded {
+            Some(mds::VarsLoad {
+                vars,
+                duplicate_keys,
+                duplicate_keys_omitted,
+                ..
+            }) => (Some(vars), duplicate_keys, duplicate_keys_omitted),
+            None => (None, Vec::new(), 0),
+        };
     for (key, val) in set_vars {
         runtime_vars
             .get_or_insert_with(HashMap::new)
@@ -602,11 +622,49 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
         vars: runtime_vars,
         duplicate_set_keys,
         duplicate_set_string_keys,
+        duplicate_vars_file_keys,
+        duplicate_vars_file_keys_omitted,
+        vars_file,
     })
 }
 
+/// Emit `warning: key '…' is set more than once in vars file …; the last value wins`
+/// lines for every duplicate key path found in the `--vars` JSON file (#326), at
+/// every depth, plus one tail line when the duplicate count exceeds
+/// [`mds::VarsLoad`]'s cap.
+///
+/// AD-224-3: every untrusted value interpolated into `eprint_warning` must be wrapped
+/// in `safe_inline(…)` / `safe_path(…)` **at the interpolation site** — not hoisted
+/// into a `let` binding first. `key` is raw, untrusted text straight from the JSON
+/// (D4); `Path` is not `Display`, so it goes through `safe_path`, not `safe_inline`.
+///
+/// AD-224-5: no-op when `quiet` is true.
+pub(crate) fn emit_duplicate_vars_file_warnings(resolved: &RuntimeVars, quiet: bool) {
+    if quiet {
+        return;
+    }
+    let Some(path) = resolved.vars_file.as_deref() else {
+        return;
+    };
+    for key in &resolved.duplicate_vars_file_keys {
+        crate::output::eprint_warning(&format!(
+            "warning: key '{}' is set more than once in vars file {}; the last value wins",
+            crate::output::safe_inline(key),
+            crate::output::safe_path(path)
+        ));
+    }
+    if resolved.duplicate_vars_file_keys_omitted > 0 {
+        crate::output::eprint_warning(&format!(
+            "warning: {} more duplicate keys in vars file {} are not listed",
+            crate::output::safe_inline(resolved.duplicate_vars_file_keys_omitted),
+            crate::output::safe_path(path)
+        ));
+    }
+}
+
 /// Emit `warning: variable '…' is set more than once by --set/--set-string` lines
-/// for any duplicate keys found by [`build_runtime_vars`].
+/// for any duplicate keys found by [`build_runtime_vars`], plus (D8 order: file →
+/// `--set` → `--set-string`) the `--vars` file duplicate-key warnings (#326).
 ///
 /// AD-224-3: every untrusted value interpolated into `eprint_warning` must be wrapped
 /// in `safe_inline(…)` **at the interpolation site** — not hoisted into a `let` binding
@@ -618,6 +676,7 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
     if quiet {
         return;
     }
+    emit_duplicate_vars_file_warnings(resolved, quiet);
     for key in &resolved.duplicate_set_keys {
         crate::output::eprint_warning(&format!(
             "warning: variable '{}' is set more than once by --set; the last value wins",

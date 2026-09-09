@@ -890,7 +890,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 |--------|-------------|
 | `-o, --output <PATH>` | Output file path, or `-` for stdout. Mutually exclusive with `--out-dir`. Rejected for directory input. Warns if the extension contradicts the template kind. |
 | `--out-dir <DIR>` | Output directory. Mirrors subtree (dir mode) or writes `<stem>.<ext>` inside it (file mode). Created if absent. |
-| `--vars <FILE>` | JSON file with runtime variable overrides. |
+| `--vars <FILE>` | JSON file with runtime variable overrides. A key repeated at any depth warns with its dotted/bracketed path (e.g. `x.a`, `x[2].a`); the last value wins. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. Repeating a key emits a warning; the last value wins. |
 | `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). Repeating a key emits a warning; the last value wins. |
 | `--source-map` | Generate a source-map sidecar (`<output>.map`, e.g. `-o out.md` → `out.md.map`). Ignored for messages-mode templates (a warning is emitted and no source map is produced). Conflicts with `--no-source-map`. Also enabled globally via `build.source_map = true` in `mds.json`. |
@@ -971,7 +971,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | `--check` | With `--fix`: never writes; exit is `max(1, residual severity)` — 1 when a fix is pending and the post-fix residual would be clean or warn-only, 2 when findings the fix cannot remove would remain at error severity. The emitted diagnostics stay pre-fix (the preview reports what is wrong now); only the exit code looks through to the residual. Useful for CI. |
 | `--diff` | With `--fix`: print unified diff of pending changes without writing. Exit follows the same `max(1, residual severity)` preview rule as `--check`. |
 | `--format <FORMAT>` | Output format: `human` (default, stderr) or `json` (stdout). |
-| `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
+| `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). A key repeated at any depth warns with its dotted/bracketed path; the last value wins. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. Repeating a key emits a warning; the last value wins. |
 | `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. Repeating a key emits a warning; the last value wins. |
 | `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. (The directory-depth warning — fires on trees deeper than MAX_DEPTH=64 — is emitted regardless of `--quiet`.) |

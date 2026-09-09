@@ -94,6 +94,7 @@ Build/Watch options:
   --out-dir <DIR>             Output directory (build/single-file watch: <stem>.md or <stem>.json;
                               dir-mode watch: mirrors source subtree)
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
+                              A key repeated at any depth warns with its path; the last value wins.
   --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
                               Repeating a key warns; the last value wins.
   --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)

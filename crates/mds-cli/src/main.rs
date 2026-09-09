@@ -56,7 +56,7 @@ enum Commands {
         /// Mutually exclusive with -o/--output.
         #[arg(long = "out-dir", conflicts_with = "output")]
         out_dir: Option<PathBuf>,
-        /// JSON file with runtime variable overrides
+        /// JSON file with runtime variable overrides (a repeated key warns; the last value wins)
         #[arg(long)]
         vars: Option<PathBuf>,
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3; repeating a key warns, last value wins)
@@ -89,7 +89,7 @@ enum Commands {
     Check {
         /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
         input: Option<PathBuf>,
-        /// JSON file with runtime variable overrides
+        /// JSON file with runtime variable overrides (a repeated key warns; the last value wins)
         #[arg(long)]
         vars: Option<PathBuf>,
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3; repeating a key warns, last value wins)
@@ -160,7 +160,7 @@ enum Commands {
         /// Output format: `human` (default, stderr) or `json` (stdout)
         #[arg(long = "format", value_name = "FORMAT", default_value = "human")]
         format: String,
-        /// JSON file with runtime variable overrides
+        /// JSON file with runtime variable overrides (a repeated key warns; the last value wins)
         #[arg(long)]
         vars: Option<PathBuf>,
         /// Set a runtime variable (repeatable, e.g. --set name=Alice; repeating a key warns, last value wins)
@@ -208,7 +208,7 @@ enum Commands {
         /// Mutually exclusive with -o/--output.
         #[arg(long = "out-dir", conflicts_with = "output")]
         out_dir: Option<PathBuf>,
-        /// JSON file with runtime variable overrides (reloaded on each rebuild)
+        /// JSON file with runtime variable overrides (reloaded on each rebuild; a repeated key warns on each rebuild, last value wins)
         #[arg(long)]
         vars: Option<PathBuf>,
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3; repeating a key warns, last value wins)
