@@ -4454,3 +4454,162 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
 
     drop(child);
 }
+
+// ── I19-I20: liveness self-heal rebuild and --quiet regressions (#326) ───────
+//
+// AC-W2 (`watch_dir_mode_root_delete_recreate_recovers`) proves that a root
+// delete+recreate kills the recursive watch on the old inode, so the create
+// event for a file written into the recreated root is never delivered — only
+// `liveness_probe_dir`'s re-arm + full reconcile finds and compiles it. Before
+// this fix, that self-heal recompile discarded the resolved `RuntimeVars` and
+// never warned about a --vars file duplicate, unlike `handle_fs_event_dir`.
+
+/// I19: a self-heal rebuild driven by the liveness probe (no FS event ever
+/// delivered) must warn about a --vars file duplicate key, same as a genuine
+/// FS-event rebuild does. Guards `liveness_probe_dir`'s content-backstop site.
+#[test]
+fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("watched");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&vars_dir).unwrap();
+    std::fs::write(root.join("a.mds"), "---\nname: A\n---\nOld A\n").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                root.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "100",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Startup: exactly 1 warning (dir-mode startup, unaffected by this fix).
+    let startup_stderr = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&startup_stderr, &expected),
+        1,
+        "I19: dir-watch startup must warn exactly once; stderr:\n{startup_stderr}"
+    );
+    assert!(
+        wait_for_file_contains(&out_dir.join("a.md"), "Old A", TIMEOUT),
+        "I19: initial compile should produce 'Old A'"
+    );
+
+    // Delete the entire watched root — kills the recursive watch on the old inode
+    // (same setup as `watch_dir_mode_root_delete_recreate_recovers`).
+    std::fs::remove_dir_all(&root).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Recreate the root with a brand-new file. TICK-DEPENDENT: the create event
+    // above is unobservable (new inode, nothing watching it yet) — only the
+    // liveness probe's re-arm + reconcile self-heal path (`liveness_probe_dir`)
+    // can find and compile it.
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("new.mds"),
+        "---\nname: N\n---\nNew file {{name}}\n",
+    )
+    .unwrap();
+
+    assert!(
+        wait_for_file_contains(&out_dir.join("new.md"), "New file N", TICK_TIMEOUT),
+        "I19: watcher must self-heal after root delete+recreate and recompile"
+    );
+
+    // The self-heal recompile must ALSO re-warn about the vars-file duplicate —
+    // proves liveness_probe_dir no longer discards the resolved vars, matching
+    // handle_fs_event_dir's gate (emit iff the rebuild was observable).
+    let final_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&final_stderr, &expected),
+        2,
+        "I19: the liveness self-heal rebuild must warn about the vars-file \
+         duplicate too, not only at startup; stderr:\n{final_stderr}"
+    );
+
+    drop(child);
+}
+
+/// I20: `mds watch --quiet` suppresses the vars-file duplicate-key warning on
+/// every rebuild, not just at startup. Regression guard for the inner
+/// `if quiet { return; }` early-out in `emit_duplicate_vars_file_warnings`:
+/// nothing else stops per-rebuild spam under --quiet on the direct watch call
+/// sites (`rebuild_file`, `handle_fs_event_dir`, `liveness_probe_dir`), since
+/// they call the emitter directly and bypass `emit_duplicate_var_warnings`'s
+/// own quiet early-out (that one only guards the startup call sites).
+#[test]
+fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--quiet",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Positive control (PF-013): the rebuild really happens even though nothing
+    // warns — otherwise "0 occurrences" below would be vacuous.
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "I20: startup compile must complete even under --quiet"
+    );
+    let startup_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&startup_stderr, &expected),
+        0,
+        "I20: --quiet must suppress the startup vars-file duplicate warning; \
+         stderr:\n{startup_stderr}"
+    );
+
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I20: rebuild after edit must complete even under --quiet"
+    );
+
+    let after_edit = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&after_edit, &expected),
+        0,
+        "I20: --quiet must suppress the vars-file duplicate warning on rebuild \
+         too; stderr:\n{after_edit}"
+    );
+
+    drop(child);
+}

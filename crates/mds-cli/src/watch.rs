@@ -1840,20 +1840,21 @@ fn liveness_probe_dir(
 
     if !batch.is_empty() {
         // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-        let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
+        let resolved = match build_runtime_vars(RuntimeVarArgs {
             vars: ctx.vars_path_raw.clone(),
             set_vars: ctx.static_set_vars.clone(),
             set_string_vars: ctx.static_set_string_vars.clone(),
         }) {
-            // Flags are fixed for the session; warned once at startup — discard here.
-            // The vars-file duplicate-key warnings (#326) are emitted from
-            // `handle_fs_event_dir` instead, not here: this liveness-probe path is a
-            // defensive content-backstop/full-reconcile tick that can race the same
-            // edit's real fs-event delivery (both observing the same changed mtime),
-            // and emitting from both sites double-counts a single rebuild (test I17
-            // guards this — see the module docs on `liveness_probe_dir` and
-            // `handle_fs_event_dir`).
-            Ok(v) => v.vars,
+            // --set/--set-string are fixed for the session and warned once at
+            // startup — discarded (via `resolved.vars` below). The vars file is
+            // reloaded on every rebuild (ADR-016); this self-heal path emits under
+            // the same content-changed gate as `handle_fs_event_dir`, so one
+            // logical edit observed by both paths still warns once — tests I17 and
+            // I19. Without this, a self-heal recompile driven purely by this
+            // content-backstop/full-reconcile tick (no FS event ever delivered,
+            // e.g. after a root delete+recreate) could print "Recompiled" with no
+            // vars-file duplicate warning at all.
+            Ok(v) => v,
             Err(e) => {
                 eprint_error(e);
                 // Re-baseline so the next tick does not report the same change again
@@ -1862,15 +1863,18 @@ fn liveness_probe_dir(
                 return;
             }
         };
-        process_dir_batch(
+        let any_changed = process_dir_batch(
             &batch,
             false, /* vars_changed */
             &ctx.root,
             &ctx.output_base,
-            &runtime_vars,
+            &resolved.vars,
             ctx.quiet,
             state,
         );
+        if any_changed {
+            crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+        }
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
     // post-batch tracked set, and an empty batch means nothing appeared, was removed, or
@@ -1995,14 +1999,17 @@ fn handle_fs_event_dir(
             return DirEventOutcome::Done;
         }
     };
-    let runtime_vars = resolved.vars.clone();
 
+    // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
+    // directly rather than cloning it — `resolved` (and its `.vars_file`,
+    // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
+    // needed below, after this borrow ends, for the warning emission.
     let any_changed = process_dir_batch(
         &mds_changed,
         vars_changed,
         &ctx.root,
         &ctx.output_base,
-        &runtime_vars,
+        &resolved.vars,
         ctx.quiet,
         state,
     );
