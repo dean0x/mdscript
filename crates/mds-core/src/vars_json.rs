@@ -1,10 +1,311 @@
 //! Duplicate JSON object key detection for `--vars` files (#326).
 //!
-//! Implementation arrives in Phase 2 of the v0.4.3 action plan (step C1). This
-//! module currently contains only its test specifications — the items the tests
-//! reference (`duplicate_json_keys`, `DuplicateKeys`, `MAX_DUPLICATE_KEY_PATHS`) do
-//! not exist yet, so the crate's test build is intentionally RED until Phase 2
-//! lands. See `.devflow/docs/handoff-v043-action-plan.md` step C1 for the design.
+//! # Why a second, value-free pass (D1)
+//!
+//! `serde_json`'s own `Value` deserializer (`value/de.rs`, `visit_map`) builds an
+//! object by repeatedly calling `Map::insert` and discarding the previous value on
+//! a repeated key — by the time `serde_json::from_str::<Value>` returns, every
+//! duplicate has already vanished; there is nothing left in the parsed `Value` to
+//! detect a duplicate from. Rather than replace that deserializer with one that
+//! tracks duplicates while also building the value (and re-deriving its numeric
+//! parsing, non-finite-float-to-`Null` handling, and borrowed-vs-owned string
+//! rules along the way), this module runs a SECOND pass over the same JSON text
+//! with a value-free (`Self::Value = ()`) visitor. The two passes are independent:
+//! the first (unchanged, in `lib.rs`) produces the `Value`; this one only records
+//! which key paths repeat. Fidelity of the parsed value is preserved by
+//! construction — this module never constructs or approximates a `Value`.
+//!
+//! # Where the duplicate vanishes
+//!
+//! `serde_json::Value`'s `Deserialize` impl inserts each key into a `Map` via
+//! `Map::insert`, which returns (and drops) the previous value for a repeated
+//! key. `load_vars_file`/`load_vars_str` in `lib.rs` call `duplicate_json_keys`
+//! (this module) as a second pass over the *same* text to recover exactly the
+//! information that first pass already discarded.
+//!
+//! # Path grammar
+//!
+//! A reported path names a JSON key by walking from the document root:
+//! - Object nesting is dotted: `x.a`.
+//! - Array-element nesting uses a 0-based bracket index: `x[2].a`, and an array at
+//!   the document root renders as `[0].a`.
+//! - A literal key containing `.`, `[`, or `]` is **not** escaped — it renders
+//!   ambiguously with an actual nesting separator. This is a documented,
+//!   accepted limitation (display-only; the underlying key is never altered).
+//!
+//! # Cap
+//!
+//! At most [`MAX_DUPLICATE_KEY_PATHS`] paths are recorded; any further distinct
+//! duplicate path is counted in [`DuplicateKeys::omitted`] instead. One path is
+//! recorded per key, however many times that key repeats within its enclosing
+//! object (a key appearing 3 times still yields one path).
+//!
+//! # Recursion bound (D7)
+//!
+//! This module adds no depth cap of its own. `serde_json::Deserializer`'s own
+//! recursion guard (`check_recursion!`, limit 128, not configurable in this
+//! build) bounds the scan's recursion and returns an `Err`, never panics.
+//! `Value::from_json`'s separate `MAX_VALUE_DEPTH = 64` has already rejected any
+//! document deep enough to matter for the parsed `Value` before this scan ever
+//! runs — this module's 128-level ceiling exists only so the scan itself cannot
+//! overflow the stack on adversarial input, and a document between 64 and 128
+//! levels deep fails earlier in `Value::from_json` regardless.
+
+use std::collections::HashSet;
+use std::fmt;
+use std::fmt::Write as _;
+
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
+/// Maximum number of distinct duplicate-key paths recorded by
+/// [`duplicate_json_keys`]. Mirrors the precedent of `MAX_WARNINGS`
+/// (`evaluator.rs`) and `MAX_DIAGNOSTICS` (`limits.rs`): a hostile document with
+/// many thousands of duplicate keys must not produce an unbounded warning flood.
+/// Paths beyond the cap are counted, not recorded — see [`DuplicateKeys::omitted`].
+pub(crate) const MAX_DUPLICATE_KEY_PATHS: usize = 1_000;
+
+/// Result of scanning a JSON document's text for duplicate object keys.
+///
+/// `paths` lists each duplicated key's rendered path (see the module doc's "Path
+/// grammar" section), in encounter order, one entry per path regardless of how
+/// many times the key repeats, capped at [`MAX_DUPLICATE_KEY_PATHS`]. `omitted`
+/// counts any further distinct duplicate paths beyond the cap.
+#[derive(Debug)]
+pub(crate) struct DuplicateKeys {
+    pub(crate) paths: Vec<String>,
+    pub(crate) omitted: usize,
+}
+
+/// One segment of the path to the object currently being scanned: a named object
+/// key, or a 0-based array index.
+enum Seg {
+    Key(String),
+    Index(usize),
+}
+
+/// Scan state threaded through the recursive visitor: the path to the object
+/// currently being visited, the duplicate paths found so far, and the count of
+/// duplicates omitted past the cap.
+struct Scan {
+    path: Vec<Seg>,
+    found: Vec<String>,
+    omitted: usize,
+}
+
+impl Scan {
+    /// Record one duplicate occurrence of `key` inside the object at the current
+    /// `path`. Renders the full path (container path + `key`) into a single
+    /// `String` via `write!`/`push_str` — no per-segment `format!` allocation
+    /// chain. Bounded: once [`MAX_DUPLICATE_KEY_PATHS`] paths have been recorded,
+    /// every further call only increments `omitted`.
+    fn record(&mut self, key: &str) {
+        if self.found.len() >= MAX_DUPLICATE_KEY_PATHS {
+            self.omitted += 1;
+            return;
+        }
+        let mut rendered = String::new();
+        for seg in &self.path {
+            match seg {
+                Seg::Key(k) => {
+                    if !rendered.is_empty() {
+                        rendered.push('.');
+                    }
+                    rendered.push_str(k);
+                }
+                Seg::Index(i) => {
+                    // write! into an existing String never allocates a throwaway
+                    // intermediate — the digits are appended in place.
+                    let _ = write!(rendered, "[{i}]");
+                }
+            }
+        }
+        if !rendered.is_empty() {
+            rendered.push('.');
+        }
+        rendered.push_str(key);
+        self.found.push(rendered);
+    }
+}
+
+/// Value-free visitor/seed pair: recurses through a JSON document recording
+/// duplicate object keys, without building a `Value`. Holds a reborrowed `&mut
+/// Scan` so the same scan state threads through every recursive call.
+struct DupScan<'a> {
+    scan: &'a mut Scan,
+}
+
+impl<'de> DeserializeSeed<'de> for DupScan<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for DupScan<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    // Every leaf shape serde_json's `deserialize_any` can call for a JSON leaf
+    // (de.rs): null, bool, signed/unsigned integer, float, string. None of these
+    // carry nested structure, so each is simply accepted.
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    // Defence only: not reachable via plain serde_json::Deserializer (no
+    // arbitrary-precision integers, no explicit Option variant in JSON — `null`
+    // already routes to `visit_unit`), but spelled out so a future serde_json
+    // configuration change fails loudly via T9 (`invalid_type`) rather than
+    // silently mis-scanning.
+    fn visit_i128<E>(self, _v: i128) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_u128<E>(self, _v: u128) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let Self { scan } = self;
+        let mut i = 0usize;
+        loop {
+            scan.path.push(Seg::Index(i));
+            // Reborrow: `&mut *scan` yields a fresh `&mut Scan` for this element
+            // without moving `scan` out of the outer closure, so the loop can
+            // keep using it on the next iteration.
+            let got = seq.next_element_seed(DupScan { scan: &mut *scan });
+            scan.path.pop();
+            if got?.is_none() {
+                return Ok(());
+            }
+            // Bounded by the document itself (ultimately by MAX_FILE_SIZE on the
+            // caller side): a JSON array literal cannot have more elements than
+            // there are bytes to spell them.
+            i += 1;
+        }
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let Self { scan } = self;
+        let mut seen = HashSet::new();
+        let mut reported = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            // Record once per key per enclosing object: the second occurrence
+            // trips `reported.insert`, later repeats of the same key find
+            // `reported.insert` already false and are skipped.
+            if !seen.insert(key.clone()) && reported.insert(key.clone()) {
+                scan.record(&key);
+            }
+            scan.path.push(Seg::Key(key));
+            let v = map.next_value_seed(DupScan { scan: &mut *scan });
+            scan.path.pop();
+            v?;
+        }
+        Ok(())
+    }
+}
+
+/// Scan `json` for JSON object keys that repeat within their enclosing object, at
+/// any depth, without building a `serde_json::Value`.
+///
+/// Returns the rendered path of each duplicated key (see the module doc's "Path
+/// grammar" section), in encounter order, capped at [`MAX_DUPLICATE_KEY_PATHS`]
+/// with any excess counted in [`DuplicateKeys::omitted`].
+///
+/// # Errors
+///
+/// Returns `Err` when `json` is not valid JSON, or when nesting exceeds
+/// `serde_json`'s built-in recursion limit (128 levels) — never panics. Callers
+/// in this crate pass text a `serde_json::from_str::<Value>` call has already
+/// accepted, so an error here is a divergence between the two passes and is
+/// propagated rather than swallowed.
+pub(crate) fn duplicate_json_keys(json: &str) -> Result<DuplicateKeys, serde_json::Error> {
+    let mut scan = Scan {
+        path: Vec::new(),
+        found: Vec::new(),
+        omitted: 0,
+    };
+    let mut de = serde_json::Deserializer::from_str(json);
+    DupScan { scan: &mut scan }.deserialize(&mut de)?;
+    // Reject trailing garbage after a complete value (e.g. "{} {}") — omitting
+    // this call would silently ignore anything after the first valid value.
+    de.end()?;
+    Ok(DuplicateKeys {
+        paths: scan.found,
+        omitted: scan.omitted,
+    })
+}
 
 #[cfg(test)]
 mod tests {

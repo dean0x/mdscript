@@ -1390,9 +1390,50 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
     Ok(paths.into_iter().collect())
 }
 
+/// The result of loading runtime variables from a JSON `--vars` source, along
+/// with any duplicate object keys found in that source.
+///
+/// Returned by [`load_vars_file_reporting_duplicates`] and
+/// [`load_vars_str_reporting_duplicates`]. `vars` holds the fully-parsed
+/// variables — JSON permits a repeated object key, so when one occurs, the
+/// **last** value for that key wins (the same behavior `load_vars_file` /
+/// `load_vars_str` have always had; this type only adds visibility into it).
+///
+/// `duplicate_keys` lists the path of each key that repeated within its
+/// enclosing object, at any nesting depth, in encounter order: dotted for
+/// object nesting (`x.a`), 0-based bracketed for array-element nesting
+/// (`x[2].a`, or `[0].a` for an array at the document root). A literal key
+/// containing `.`, `[`, or `]` renders ambiguously with a nesting separator —
+/// a documented, accepted limitation. **These paths are structured, untrusted
+/// text** taken directly from the input JSON: a caller that displays one must
+/// escape it first (e.g. with [`sanitize_control_chars_wire`]), exactly as for
+/// any other untrusted identifier.
+///
+/// At most 1,000 duplicate-key paths are recorded; `duplicate_keys_omitted`
+/// counts any further distinct duplicate paths beyond that cap.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values from the load API above; do not construct via struct literal
+/// in external crates.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarsLoad {
+    /// The loaded variables. When a key repeated in the source, the last value
+    /// for that key wins.
+    pub vars: HashMap<String, Value>,
+    /// Paths of keys that repeated in the source, in encounter order, one entry
+    /// per path (however many times the key repeats), capped at 1,000. See the
+    /// type-level doc for the path grammar and the untrusted-text caveat.
+    pub duplicate_keys: Vec<String>,
+    /// Count of distinct duplicate-key paths beyond the 1,000-path cap.
+    pub duplicate_keys_omitted: usize,
+}
+
 /// Load runtime variables from a JSON file.
 ///
-/// The file must contain a JSON object; each key becomes a variable name.
+/// The file must contain a JSON object; each key becomes a variable name. A
+/// repeated object key is accepted silently (the last value wins) — use
+/// [`load_vars_file_reporting_duplicates`] to also learn which keys repeated.
 ///
 /// # Examples
 ///
@@ -1406,6 +1447,38 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 /// ```
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
+    load_vars_file_reporting_duplicates(path).map(|loaded| loaded.vars)
+}
+
+/// Load runtime variables from a JSON file, additionally reporting any
+/// duplicate object keys found in it.
+///
+/// The file must contain a JSON object; each key becomes a variable name. When
+/// a key repeats — at any nesting depth — the last value wins and every
+/// repeated key's path is reported in [`VarsLoad::duplicate_keys`]; see that
+/// type's doc for the path grammar and cap.
+///
+/// # Errors
+///
+/// Returns `Err(MdsError)` when: the path contains a symlink; the file cannot
+/// be read; the file exceeds the maximum size; the file is not valid UTF-8; the
+/// content is not valid JSON; or the top-level JSON value is not an object.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+///
+/// let loaded = mds::load_vars_file_reporting_duplicates(Path::new("vars.json"))?;
+/// for key in &loaded.duplicate_keys {
+///     eprintln!("warning: key '{key}' is set more than once; the last value wins");
+/// }
+/// let result = mds::compile(Path::new("template.mds"), Some(loaded.vars))?;
+/// let md = result.into_markdown()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the loaded variables and duplicate keys should be used"]
+pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsError> {
     let path_str = path_to_str(path)?;
     // PF-004: guard the vars-file path through the same symlink check that the
     // resolver applies to every imported file — avoids a raw read that bypasses
@@ -1437,14 +1510,29 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
         )));
     };
 
-    map.into_iter()
+    let vars: HashMap<String, Value> = map
+        .into_iter()
         .map(|(key, val)| Value::from_json(val).map(|v| (key, v)))
-        .collect()
+        .collect::<Result<_, _>>()?;
+
+    // D1: the duplicate scan is a second, value-free pass over the same text,
+    // run LAST — after every existing guard and error above has already had its
+    // chance to fire, in its existing order.
+    let dup = vars_json::duplicate_json_keys(&content)
+        .map_err(|e| MdsError::invalid_vars(format!("{path_str}: {e}")))?;
+
+    Ok(VarsLoad {
+        vars,
+        duplicate_keys: dup.paths,
+        duplicate_keys_omitted: dup.omitted,
+    })
 }
 
 /// Load runtime variables from a JSON string.
 ///
-/// The string must contain a JSON object; each key becomes a variable name.
+/// The string must contain a JSON object; each key becomes a variable name. A
+/// repeated object key is accepted silently (the last value wins) — use
+/// [`load_vars_str_reporting_duplicates`] to also learn which keys repeated.
 ///
 /// # Examples
 ///
@@ -1462,6 +1550,32 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 /// ```
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_str(json: &str) -> Result<HashMap<String, Value>, MdsError> {
+    load_vars_str_reporting_duplicates(json).map(|loaded| loaded.vars)
+}
+
+/// Load runtime variables from a JSON string, additionally reporting any
+/// duplicate object keys found in it.
+///
+/// The string must contain a JSON object; each key becomes a variable name.
+/// When a key repeats — at any nesting depth — the last value wins and every
+/// repeated key's path is reported in [`VarsLoad::duplicate_keys`]; see that
+/// type's doc for the path grammar and cap.
+///
+/// # Errors
+///
+/// Returns `Err(MdsError)` when `json` exceeds the maximum size, is not valid
+/// JSON, or its top-level value is not an object.
+///
+/// # Examples
+///
+/// ```rust
+/// let loaded = mds::load_vars_str_reporting_duplicates(r#"{"x": 1, "x": 2}"#)?;
+/// assert_eq!(loaded.duplicate_keys, vec!["x".to_string()]);
+/// assert_eq!(loaded.vars.get("x"), Some(&mds::Value::Number(2.0)));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the loaded variables and duplicate keys should be used"]
+pub fn load_vars_str_reporting_duplicates(json: &str) -> Result<VarsLoad, MdsError> {
     if json.len() as u64 > MAX_FILE_SIZE {
         return Err(MdsError::resource_limit(format!(
             "vars string exceeds maximum size of {} bytes",
@@ -1473,9 +1587,22 @@ pub fn load_vars_str(json: &str) -> Result<HashMap<String, Value>, MdsError> {
     let serde_json::Value::Object(map) = parsed else {
         return Err(MdsError::json_error("vars must be a JSON object"));
     };
-    map.into_iter()
+    let vars: HashMap<String, Value> = map
+        .into_iter()
         .map(|(key, val)| Value::from_json(val).map(|v| (key, v)))
-        .collect()
+        .collect::<Result<_, _>>()?;
+
+    // D1: the duplicate scan is a second, value-free pass over the same text,
+    // run LAST — after every existing guard and error above has already had its
+    // chance to fire, in its existing order.
+    let dup =
+        vars_json::duplicate_json_keys(json).map_err(|e| MdsError::json_error(e.to_string()))?;
+
+    Ok(VarsLoad {
+        vars,
+        duplicate_keys: dup.paths,
+        duplicate_keys_omitted: dup.omitted,
+    })
 }
 
 #[cfg(test)]
