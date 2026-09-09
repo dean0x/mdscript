@@ -2262,4 +2262,103 @@ mod tests {
         assert_eq!(map.get("num"), Some(&mds::Value::Number(42.0)));
         assert_eq!(map.get("id"), Some(&mds::Value::String("007".to_string())));
     }
+
+    // ── #326: duplicate --vars file keys surface on RuntimeVars ───────────────
+
+    #[test]
+    fn build_runtime_vars_vars_file_duplicate_key_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"x": 1, "x": 2}"#).unwrap();
+
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(path.clone()),
+            set_vars: vec![],
+            set_string_vars: vec![],
+        })
+        .expect("duplicate vars-file key must not error");
+        assert_eq!(resolved.duplicate_vars_file_keys, vec!["x".to_string()]);
+        assert_eq!(resolved.vars_file, Some(path));
+        let map = resolved.vars.expect("non-empty vars");
+        assert_eq!(map.get("x"), Some(&mds::Value::Number(2.0)));
+    }
+
+    #[test]
+    fn build_runtime_vars_vars_file_nested_duplicate_reports_dotted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"cfg":{"a":1,"a":2}}"#).unwrap();
+
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(path),
+            set_vars: vec![],
+            set_string_vars: vec![],
+        })
+        .expect("nested duplicate vars-file key must not error");
+        assert_eq!(resolved.duplicate_vars_file_keys, vec!["cfg.a".to_string()]);
+    }
+
+    /// Positive control (PF-013): a clean vars file reports no duplicates, while
+    /// still populating `vars_file`.
+    #[test]
+    fn build_runtime_vars_vars_file_without_duplicates_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"name": "World"}"#).unwrap();
+
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(path.clone()),
+            set_vars: vec![],
+            set_string_vars: vec![],
+        })
+        .expect("clean vars file must not error");
+        assert!(
+            resolved.duplicate_vars_file_keys.is_empty(),
+            "expected no duplicates, got: {:?}",
+            resolved.duplicate_vars_file_keys
+        );
+        assert_eq!(resolved.duplicate_vars_file_keys_omitted, 0);
+        assert!(resolved.vars_file.is_some(), "vars_file must be populated");
+    }
+
+    #[test]
+    fn build_runtime_vars_no_vars_file_reports_no_duplicates_and_no_path() {
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![("a".to_string(), "1".to_string())],
+            set_string_vars: vec![],
+        })
+        .expect("no vars file must not error");
+        assert!(
+            resolved.duplicate_vars_file_keys.is_empty(),
+            "expected no duplicates when no vars file was given, got: {:?}",
+            resolved.duplicate_vars_file_keys
+        );
+        assert_eq!(resolved.duplicate_vars_file_keys_omitted, 0);
+        assert_eq!(
+            resolved.vars_file, None,
+            "vars_file must be None when --vars was not given"
+        );
+    }
+
+    /// U5 (extended): the cross-flag hard error must precede the vars-file read
+    /// entirely — a nonexistent vars path must not surface a file-not-found error
+    /// when --set and --set-string also collide.
+    #[test]
+    fn build_runtime_vars_cross_flag_error_precedes_the_vars_file_read() {
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: Some(PathBuf::from("/does/not/exist/vars.json")),
+            set_vars: vec![("x".to_string(), "1".to_string())],
+            set_string_vars: vec![("x".to_string(), "2".to_string())],
+        });
+        assert!(
+            result.is_err(),
+            "cross-flag collision must be a hard error even with a nonexistent vars path"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("variable 'x' is set by both --set and --set-string"),
+            "error must be the cross-flag collision, not a file-read error; got: {msg}"
+        );
+    }
 }

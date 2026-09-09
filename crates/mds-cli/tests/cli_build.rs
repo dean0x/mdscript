@@ -1,5 +1,5 @@
 mod common;
-use common::{fixture, mds_bin};
+use common::{count_occurrences, dup_vars_file_omitted, dup_vars_file_warning, fixture, mds_bin};
 
 #[test]
 fn build_to_file() {
@@ -936,6 +936,207 @@ fn vars_file_non_object_json_error_names_the_file() {
     assert!(
         stderr.contains("mds::invalid_vars"),
         "error code must be mds::invalid_vars; got: {stderr}"
+    );
+}
+
+// ── #326: duplicate --vars file keys warn, last value wins ───────────────────
+
+/// A duplicated top-level key in a `--vars` JSON file warns exactly once, the
+/// last value wins, and the run still exits 0.
+#[test]
+fn vars_file_duplicate_key_warns_and_last_value_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "x={{x}}\n").unwrap();
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a duplicate vars-file key must warn, not error"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("x=2"),
+        "the last value must win; got stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("x=1"),
+        "the first value must not survive; got stdout: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = dup_vars_file_warning("x", &vars);
+    let count = count_occurrences(&stderr, &expected);
+    assert_eq!(
+        count, 1,
+        "expected the duplicate-key warning exactly once, found {count} times; stderr:\n{stderr}"
+    );
+}
+
+/// A duplicated key nested one level deep warns with the dotted path.
+#[test]
+fn vars_file_nested_duplicate_key_warns_with_a_dotted_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(&vars, r#"{"cfg": {"a": 1, "a": 2}}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = dup_vars_file_warning("cfg.a", &vars);
+    assert_eq!(
+        count_occurrences(&stderr, &expected),
+        1,
+        "expected the dotted-path warning exactly once; stderr:\n{stderr}"
+    );
+}
+
+/// A duplicated key inside an array element warns with the bracket-index path.
+#[test]
+fn vars_file_array_nested_duplicate_key_warns_with_a_bracket_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(&vars, r#"{"items": [{"x": 0}, {"a": 1, "a": 2}]}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = dup_vars_file_warning("items[1].a", &vars);
+    assert_eq!(
+        count_occurrences(&stderr, &expected),
+        1,
+        "expected the bracket-index warning exactly once; stderr:\n{stderr}"
+    );
+}
+
+/// Positive control (PF-013) for the three tests above: a vars file with no
+/// duplicates must emit no duplicate-key warning at all, and the value renders
+/// first (i.e. the run really did use this vars file).
+#[test]
+fn vars_file_without_duplicates_emits_no_duplicate_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "x={{x}}\n").unwrap();
+    std::fs::write(&vars, r#"{"x": 1}"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("x=1"),
+        "expected the single value to render first; got stdout: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("is set more than once in vars file"),
+        "a clean vars file must not warn; got stderr: {stderr}"
+    );
+}
+
+/// More than [`mds::VarsLoad::duplicate_keys_omitted`]'s cap (1 000) distinct
+/// duplicate paths prints exactly 1 000 warning lines plus one omitted-count tail
+/// line naming the remainder (D6).
+#[test]
+fn vars_file_more_than_1000_duplicates_prints_a_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello!\n").unwrap();
+
+    let mut json = String::from("{");
+    for i in 0..1_003usize {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(r#""k{i}":0,"k{i}":1"#));
+    }
+    json.push('}');
+    std::fs::write(&vars, json).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning_count = count_occurrences(&stderr, "is set more than once in vars file");
+    assert_eq!(
+        warning_count, 1_000,
+        "expected exactly 1000 warning lines; stderr had {warning_count}"
+    );
+    let tail = dup_vars_file_omitted(3, &vars);
+    assert_eq!(
+        count_occurrences(&stderr, &tail),
+        1,
+        "expected the omitted-count tail line exactly once; stderr:\n{stderr}"
     );
 }
 

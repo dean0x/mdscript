@@ -20,7 +20,9 @@
 //! - Always kill+wait child in `ChildGuard::drop`.
 
 mod common;
-use common::{mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, StderrTap};
+use common::{
+    dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, StderrTap,
+};
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -4234,6 +4236,220 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
         "I9: after one rebuild, warning must still appear exactly once (guards :1914); \
          got {}; stderr:\n{}",
         count_after_edit, stderr_after_edit
+    );
+
+    drop(child);
+}
+
+// ── I16-I18: duplicate --vars file key warnings under `mds watch` (#326) ─────
+//
+// Unlike I8/I9 (--set/--set-string warn once per SESSION, at startup), a
+// duplicate in the --vars FILE warns at startup AND on every rebuild: ADR-016
+// reloads the vars file on every rebuild, so a duplicate present in it is
+// re-reported each time (D9).
+
+/// I16: mds watch (file mode) with a duplicated top-level key in the vars file
+/// warns at STARTUP and on EVERY rebuild. Guards `watch.rs:936`.
+#[test]
+fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    let stderr_after_start = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&stderr_after_start, &expected),
+        1,
+        "I16: expected exactly 1 warning at startup; stderr:\n{stderr_after_start}"
+    );
+
+    // Edit 1: trigger a rebuild — ADR-016 reloads the vars file, re-reporting the
+    // duplicate.
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I16: rebuild after edit 1 must complete"
+    );
+    let after_edit_1 = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&after_edit_1, &expected),
+        2,
+        "I16: one rebuild must re-report the vars-file duplicate; stderr:\n{after_edit_1}"
+    );
+
+    // Edit 2: trigger another rebuild.
+    std::fs::write(&src, "version 3").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 3", TIMEOUT),
+        "I16: rebuild after edit 2 must complete"
+    );
+    let after_edit_2 = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&after_edit_2, &expected),
+        3,
+        "I16: a second rebuild must report the duplicate again; stderr:\n{after_edit_2}"
+    );
+
+    drop(child);
+}
+
+/// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
+/// rebuild: once at startup (proving the `:2196` dedup-baseline second read does
+/// NOT double-print), and once more per subsequent rebuild (proving exactly one
+/// of `:1793`/`:1919` emits, not both).
+#[test]
+fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src_dir.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // No edits yet: the startup count must be exactly 1, proving the dedup-baseline
+    // second read at :2196 does not also emit.
+    let stderr_startup = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&stderr_startup, &expected),
+        1,
+        "I17: dir-watch startup must emit the vars-file warning exactly once \
+         (guards :2196); stderr:\n{stderr_startup}"
+    );
+
+    // One rebuild: the count must rise to exactly 2, proving exactly one of
+    // :1793/:1919 fires per rebuild (not both).
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I17: rebuild after edit must complete"
+    );
+    let stderr_after_edit = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&stderr_after_edit, &expected),
+        2,
+        "I17: one rebuild must add exactly one more warning (guards a double-emit \
+         between :1793 and :1919); stderr:\n{stderr_after_edit}"
+    );
+
+    drop(child);
+}
+
+/// I18 (user decision, positive control first): a vars file that starts clean
+/// produces no duplicate-key warning at startup or on the first rebuild; a
+/// duplicate introduced mid-session is reported on the NEXT rebuild, naming the
+/// key.
+#[test]
+fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let vars_dir = base.path().join("vars_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&vars_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let vars_file = vars_dir.join("vars.json");
+    std::fs::write(&vars_file, r#"{"x": 1}"#).unwrap();
+    let out = src_dir.join("t.md");
+
+    let expected = dup_vars_file_warning("x", &vars_file);
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--vars",
+                vars_file.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "I18: startup compile must complete"
+    );
+
+    // Positive control (PF-013): no duplicate at startup.
+    let startup_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&startup_stderr, &expected),
+        0,
+        "I18: a clean vars file must not warn at startup; stderr:\n{startup_stderr}"
+    );
+
+    // First rebuild, still clean: still no warning.
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I18: first rebuild must complete"
+    );
+    let clean_rebuild_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&clean_rebuild_stderr, &expected),
+        0,
+        "I18: the first rebuild must still not warn (vars file is still clean); \
+         stderr:\n{clean_rebuild_stderr}"
+    );
+
+    // Introduce a duplicate mid-session, then trigger the next rebuild.
+    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
+    std::fs::write(&src, "version 3").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 3", TIMEOUT),
+        "I18: rebuild after introducing the duplicate must complete"
+    );
+    let final_stderr = stderr_tap.text();
+    assert_eq!(
+        count_occurrences(&final_stderr, &expected),
+        1,
+        "I18: the duplicate introduced mid-session must be reported on the next \
+         rebuild, naming the key; stderr:\n{final_stderr}"
     );
 
     drop(child);
