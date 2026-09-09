@@ -30,8 +30,9 @@
 //! - Array-element nesting uses a 0-based bracket index: `x[2].a`, and an array at
 //!   the document root renders as `[0].a`.
 //! - A literal key containing `.`, `[`, or `]` is **not** escaped — it renders
-//!   ambiguously with an actual nesting separator. This is a documented,
-//!   accepted limitation (display-only; the underlying key is never altered).
+//!   ambiguously with an actual nesting separator, and an empty-string key
+//!   renders as an empty segment. This is a documented, accepted limitation
+//!   (display-only; the underlying key is never altered).
 //!
 //! # Cap
 //!

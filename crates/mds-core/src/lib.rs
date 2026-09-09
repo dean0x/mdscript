@@ -1403,8 +1403,9 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 /// enclosing object, at any nesting depth, in encounter order: dotted for
 /// object nesting (`x.a`), 0-based bracketed for array-element nesting
 /// (`x[2].a`, or `[0].a` for an array at the document root). A literal key
-/// containing `.`, `[`, or `]` renders ambiguously with a nesting separator —
-/// a documented, accepted limitation. **These paths are structured, untrusted
+/// containing `.`, `[`, or `]` renders ambiguously with a nesting separator,
+/// and an empty-string key renders as an empty segment — a documented,
+/// accepted limitation. **These paths are structured, untrusted
 /// text** taken directly from the input JSON: a caller that displays one must
 /// escape it first (e.g. with [`sanitize_control_chars_wire`]), exactly as for
 /// any other untrusted identifier.
@@ -1413,8 +1414,8 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 /// counts any further distinct duplicate paths beyond that cap.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
-/// Obtain values from the load API above; do not construct via struct literal
-/// in external crates.
+/// Obtain values from the functions named above; do not construct via struct
+/// literal in external crates.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarsLoad {

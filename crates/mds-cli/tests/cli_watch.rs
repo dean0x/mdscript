@@ -4516,10 +4516,14 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     std::fs::remove_dir_all(&root).unwrap();
     std::thread::sleep(Duration::from_millis(200));
 
-    // Recreate the root with a brand-new file. TICK-DEPENDENT: the create event
-    // above is unobservable (new inode, nothing watching it yet) — only the
+    // Recreate the root with a brand-new file. On Linux/inotify the create event
+    // above is unobservable (new inode, nothing watching it yet), so only the
     // liveness probe's re-arm + reconcile self-heal path (`liveness_probe_dir`)
-    // can find and compile it.
+    // can find and compile it; on macOS FSEvents watches by path, so the create
+    // event IS delivered and `handle_fs_event_dir` may service the self-heal
+    // first instead. Either way, the content-changed gate guarantees exactly one
+    // warning per observable rebuild, which is what the count assertion below
+    // pins.
     std::fs::create_dir(&root).unwrap();
     std::fs::write(
         root.join("new.mds"),

@@ -950,7 +950,7 @@ fn rebuild_file(
     // every startup. Instead the resolved vars are held and the warning is
     // emitted below, gated on `content_changed` — the same signal that gates
     // the "Recompiled" line — so the vars-file duplicate is re-reported exactly
-    // once per OBSERVABLE rebuild (tests I9, I16, I18).
+    // once per OBSERVABLE rebuild (tests I16, I18, I20).
     let resolved = match build_runtime_vars(RuntimeVarArgs {
         vars: ctx.vars_path_raw.clone(),
         set_vars: ctx.static_set_vars.clone(),
@@ -1985,7 +1985,7 @@ fn handle_fs_event_dir(
         // --set/--set-string are fixed for the session and warned once at startup —
         // discarded (via `resolved.vars` below). The vars file is reloaded on every
         // rebuild (ADR-016), so its duplicate keys are re-reported too — but only when
-        // this batch produces an OBSERVABLE rebuild (#326, tests I16-I18): at
+        // this batch produces an OBSERVABLE rebuild (#326, test I17): at
         // `--debounce 0` a single edit can generate more than one raw FS event, each
         // reaching this function separately, so the warning is emitted after
         // `process_dir_batch` reports whether anything actually changed rather than
@@ -2270,8 +2270,8 @@ fn dir_watch_startup(
     // dir_watch_startup calls build_runtime_vars twice: once above (emit, including
     // the #326 vars-file duplicate-key warnings) and once here (discard) — emitting
     // at both sites would double-print every warning (both the --set/--set-string
-    // ones and the vars-file ones) on directory-watch startup. Tests I9 and I17 are
-    // the mechanical guards on this.
+    // ones and the vars-file ones) on directory-watch startup. Test I17 is
+    // the mechanical guard on this.
     {
         let baseline_resolved = build_runtime_vars(RuntimeVarArgs {
             vars: vars_path_raw.clone(),

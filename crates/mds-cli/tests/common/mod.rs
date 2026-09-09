@@ -31,8 +31,9 @@ pub fn mds_bin() -> std::process::Command {
 pub const DUP_VARS_FILE_WARNING_FMT: &str =
     "warning: key '{key}' is set more than once in vars file {path}; the last value wins";
 
-/// Tail line printed when more than [`mds::VarsLoad::duplicate_keys_omitted`]
-/// (capped at 1 000) distinct duplicate paths exist (#326).
+/// Tail line printed when more distinct duplicate paths exist than the
+/// 1 000-path cap on [`mds::VarsLoad::duplicate_keys`] allows; `{n}` is
+/// [`mds::VarsLoad::duplicate_keys_omitted`] (#326).
 #[allow(dead_code)]
 pub const DUP_VARS_FILE_OMITTED_FMT: &str =
     "warning: {n} more duplicate keys in vars file {path} are not listed";

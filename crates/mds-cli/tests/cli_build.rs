@@ -1091,7 +1091,7 @@ fn vars_file_without_duplicates_emits_no_duplicate_warning() {
     );
 }
 
-/// More than [`mds::VarsLoad::duplicate_keys_omitted`]'s cap (1 000) distinct
+/// More than [`mds::VarsLoad::duplicate_keys`]'s cap (1 000) distinct
 /// duplicate paths prints exactly 1 000 warning lines plus one omitted-count tail
 /// line naming the remainder (D6).
 #[test]

@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays byte-for-byte what the existing parser produced. `load_vars_file`/`load_vars_str`
   are unchanged in every observable way (same signature, same return type, same errors)
   and now delegate to the reporting variants. Known limitations: a key containing a
-  literal `.`, `[`, or `]` renders ambiguously in its reported path; the file-load and
-  string-load error codes (`mds::invalid_vars` vs `mds::json`) remain deliberately
+  literal `.`, `[`, or `]` renders ambiguously in its reported path, and an
+  empty-string key renders as an empty segment; the file-load and string-load
+  error codes (`mds::invalid_vars` vs `mds::json`) remain deliberately
   un-unified (pre-existing split, unchanged).
 - **Fix stale `lint_str` rustdoc and lint-rule Tier tables (#329).** `mds-core`'s
   `lint_str` rustdoc said "applies the 9 lint rules" after a 10th rule
