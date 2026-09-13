@@ -4770,3 +4770,61 @@ fn stderr_tap_finish_captures_every_line_the_child_wrote() {
          of {FILE_COUNT}"
     );
 }
+
+// ── R4: readiness must not depend on someone draining stdout (#320) ─────────
+
+/// A watcher whose stdout is piped but undrained must still signal readiness.
+///
+/// `mds watch -o -` publishes the startup output to stdout BEFORE it writes the
+/// readiness marker (watch.rs: the marker is emitted after the compile, the arming and
+/// the publish). A pipe holds ~64 KiB; once it is full the child blocks in `write`, so
+/// if the harness is sitting in the marker poll loop with nothing draining stdout,
+/// neither side can move and the spawn helper times out.
+///
+/// 256 KiB of body is several pipe buffers on both Linux and macOS, so the block is a
+/// certainty, not a matter of timing.
+#[test]
+fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("big.mds");
+    // Plain text is valid MDS; short lines keep the compile trivial.
+    let body: String = std::iter::repeat_n("x".repeat(63) + "\n", 8192).collect();
+    assert!(
+        body.len() > 256 * 1024,
+        "fixture must exceed several pipe buffers; got {} bytes",
+        body.len()
+    );
+    std::fs::write(&src, &body).unwrap();
+
+    let (mut child, _stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "-o",
+                "-",
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::piped()),
+    );
+
+    // Readiness returned, so the startup publish got through. Prove the bytes really
+    // travelled rather than the marker having been written before any output.
+    use std::io::Read as _;
+    let mut stdout = Vec::new();
+    child
+        .0
+        .stdout
+        .take()
+        .expect("stdout must be piped")
+        .read_to_end(&mut stdout)
+        .expect("reading the child's stdout must succeed");
+    assert!(
+        stdout.len() >= body.len(),
+        "the whole startup output must reach stdout; got {} bytes of {}",
+        stdout.len(),
+        body.len()
+    );
+}
