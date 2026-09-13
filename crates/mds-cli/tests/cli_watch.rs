@@ -4028,6 +4028,38 @@ fn wait_for_stderr_contains_str(tap: &StderrTap, needle: &str, timeout: Duration
     }
 }
 
+/// Wait until the stderr tap holds at least `n` occurrences of `needle`.
+///
+/// Returns the tap's contents as soon as the count is reached. Unlike
+/// [`wait_for_stderr_contains_str`], which returns the text on timeout and so lets the
+/// caller's assertion report the shortfall as if it were a final answer, this one
+/// PANICS on timeout and names the count it actually saw.
+///
+/// Why a count and not "contains": a stderr line the watcher emits AFTER the output
+/// write has no ordering relationship with the output file the test waited on.
+/// Dir-mode emits the duplicate-vars-key warning after the write (watch.rs
+/// `handle_fs_event_dir`), so a snapshot taken the instant `wait_for_file_contains`
+/// returns can legitimately be one warning short — or, if the previous rebuild's
+/// warning has not been sampled yet, one long. Waiting for the expected count first
+/// turns the assertion that follows into a genuine over-count check instead of a race.
+fn wait_for_stderr_count(tap: &StderrTap, needle: &str, n: usize, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    // Bounded by `timeout`: at most timeout / 20ms iterations.
+    loop {
+        let text = tap.text();
+        let seen = count_occurrences(&text, needle);
+        if seen >= n {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least {n} occurrences of {needle:?} within {timeout:?}; \
+             saw {seen}; stderr was:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
     // I8: mds watch (file mode) with --set x=1 --set x=2 must print the
@@ -4235,9 +4267,18 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 }
 
 /// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
-/// rebuild: once at startup (proving the `:2196` dedup-baseline second read does
-/// NOT double-print), and once more per subsequent rebuild (proving exactly one
-/// of `:1793`/`:1919` emits, not both).
+/// rebuild: once at startup (proving the dedup-baseline second read in
+/// `dir_watch_startup` does NOT double-print), and once more per subsequent rebuild
+/// (proving exactly one of `liveness_probe_dir` / `handle_fs_event_dir` emits, not
+/// both).
+///
+/// Sampling hazard this test has to defend against: dir mode emits the warning AFTER
+/// the output write, so `wait_for_file_contains` returning tells you nothing about
+/// whether the warning has been written yet. Sampling `stderr_tap.text()` right there
+/// is a race in both directions, and CI has shown both — run 34404318888 attempt 1
+/// saw left 1 / right 2 here, while run 34366009518 saw left 3 / right 2. The wait
+/// for the expected count has to come first; the exact-count assertion then means
+/// "not more than expected" rather than "happened to be sampled at the right moment".
 #[test]
 fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
     let base = tempfile::tempdir().unwrap();
@@ -4268,13 +4309,14 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
     );
 
     // No edits yet: the startup count must be exactly 1, proving the dedup-baseline
-    // second read at :2196 does not also emit.
-    let stderr_startup = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    // second read in `dir_watch_startup` does not also emit.
+    let stderr_startup = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&stderr_startup, &expected),
         1,
         "I17: dir-watch startup must emit the vars-file warning exactly once \
-         (guards :2196); stderr:\n{stderr_startup}"
+         (guards the dedup-baseline second read in dir_watch_startup); \
+         stderr:\n{stderr_startup}"
     );
 
     // One rebuild: the count must rise to exactly 2, proving exactly one of
