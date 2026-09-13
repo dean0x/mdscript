@@ -220,8 +220,11 @@ enum Commands {
         /// Clear the terminal before each rebuild (only when stderr is a TTY)
         #[arg(long)]
         clear: bool,
-        /// Debounce window in milliseconds (default 100; use 0 for immediate rebuilds).
-        /// Controls how long to wait for burst coalescing after the first event.
+        /// Quiet period in milliseconds before a rebuild (default 100).
+        /// Each file change restarts the window, so a save burst longer than MS still
+        /// coalesces into one rebuild; the window is capped at max(10 x MS, 1000) ms so
+        /// continuous writes still rebuild. Use 0 to disable coalescing.
+        /// Values above 60000 are clamped.
         #[arg(long = "debounce", value_name = "MS", default_value = "100")]
         debounce: u64,
         /// Self-heal poll interval in milliseconds (default 1000).

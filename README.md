@@ -113,7 +113,12 @@ Build/Watch options:
 
 Watch-only options:
   --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
-  --debounce <MS>             Debounce window in milliseconds (default: 100)
+  --debounce <MS>             Quiet period in milliseconds before a rebuild (default: 100).
+                              Each file change restarts the window, so a save burst longer
+                              than MS still coalesces into a single rebuild. The window is
+                              capped at max(10 × MS, 1000) ms, so a file written to
+                              continuously still rebuilds. 0 disables coalescing (every
+                              event rebuilds). Values above 60000 are clamped.
   --poll-interval <MS>        Liveness-probe interval in milliseconds (default: 1000).
                               0 disables self-heal (native events only). Clamped to ≥50ms.
                               The watcher self-heals after a watched dir/root is deleted and

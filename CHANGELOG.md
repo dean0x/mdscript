@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`mds watch --debounce` is now a quiet period with a hard cap (#379).**
+  Each content event restarts the window instead of the window expiring at a fixed
+  offset from the first event, so a save burst longer than the window coalesces into
+  one rebuild; the window is bounded by `max(10 x window, 1 s)` and 10 000 events so a
+  file written to continuously still rebuilds and the idle-tick liveness probe cannot
+  be starved; raw values are clamped to 60 s (`--debounce 18446744073709551615`
+  previously watched forever without ever rebuilding); `--debounce 0` still means no
+  coalescing. No new output. Known cost: in directory mode every event opens a window,
+  including events under excluded directories that are filtered afterwards, so
+  `npm install` churn can delay a real edit and the idle tick by up to the cap.
+
 ### Fixed
 
 - **Warn on duplicate keys in `--vars` JSON files, at every depth, on every `mds watch` rebuild that writes output (#326).**
