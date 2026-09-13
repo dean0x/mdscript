@@ -13,6 +13,16 @@
 //! a self-heal idle tick, [`STARTUP_WINDOW_TIMEOUT`] for the deliberately
 //! unsynchronized startup-window tests. See each constant's docs.
 //!
+//! Writes to watched paths go through `common::write_atomic`. The rule is mechanical,
+//! so a reviewer can reproduce the set exactly: a write is converted iff it occurs
+//! AFTER the `spawn_ready`/`spawn_unsynchronized` call in the same test fn AND targets
+//! a path the watcher is watching (the `.mds` source, an imported partial, the
+//! `--vars` file, an external dependency). Pre-spawn fixture writes, `.git` markers,
+//! `mds.json`, and output files keep `std::fs::write`. Two post-spawn writes are
+//! deliberate exceptions and say so inline: `watch_single_status_line_per_rebuild`
+//! and `watch_debounce_single_rebuild_from_burst`, whose subject IS the truncate+write
+//! pair that `write_atomic` collapses.
+//!
 //! Flakiness mitigations:
 //! - Assert on output FILE content rather than stderr ordering.
 //! - Write dependency files BEFORE adding the `@import` that references them.
@@ -248,7 +258,7 @@ fn watch_edit_entry_updates_output() {
     );
 
     // Edit the source.
-    std::fs::write(&src, "---\nname: Bob\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Bob\n---\nHello {{name}}!\n");
 
     // Wait for rebuild.
     assert!(
@@ -294,11 +304,10 @@ fn watch_edit_imported_dep_updates_entry() {
     );
 
     // Edit the helper to change the greeting.
-    std::fs::write(
+    write_atomic(
         &helper,
         "@define greet(name):\nHi there {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out, "Hi there World!", TIMEOUT),
@@ -330,7 +339,7 @@ fn watch_compile_error_keeps_watcher_alive() {
     );
 
     // Introduce a compile error.
-    std::fs::write(&src, "Hello {{undefined_var_xyz}}!\n").unwrap();
+    write_atomic(&src, "Hello {{undefined_var_xyz}}!\n");
     // Give the watcher time to attempt rebuild.
     std::thread::sleep(Duration::from_millis(500));
 
@@ -343,7 +352,7 @@ fn watch_compile_error_keeps_watcher_alive() {
     );
 
     // Fix the error — watcher should recover.
-    std::fs::write(&src, "---\nname: Charlie\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Charlie\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello Charlie!", TIMEOUT),
         "fixing the error should trigger a successful rebuild"
@@ -394,11 +403,10 @@ fn watch_dir_mode_compiles_all_on_startup() {
     );
 
     // Edit a.mds → only a.md should update.
-    std::fs::write(
-        dir.path().join("a.mds"),
+    write_atomic(
+        &dir.path().join("a.mds"),
         "---\nname: A-edited\n---\nFile A: {{name}}\n",
-    )
-    .unwrap();
+    );
     assert!(
         wait_for_file_contains(&out_dir.join("a.md"), "File A: A-edited", TIMEOUT),
         "editing a.mds should update a.md"
@@ -443,11 +451,10 @@ fn watch_dir_mode_picks_up_new_files() {
     );
 
     // Create a new file AFTER the watcher is running.
-    std::fs::write(
-        dir.path().join("c.mds"),
+    write_atomic(
+        &dir.path().join("c.mds"),
         "---\nname: C\n---\nNew file {{name}}\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out_dir.join("c.md"), "New file C", TIMEOUT),
@@ -540,7 +547,7 @@ fn watch_vars_file_change_triggers_recompile() {
     );
 
     // Edit the vars file.
-    std::fs::write(&vars, r#"{"name": "Bob"}"#).unwrap();
+    write_atomic(&vars, r#"{"name": "Bob"}"#);
 
     assert!(
         wait_for_file_contains(&out, "Hello Bob!", TIMEOUT),
@@ -576,7 +583,7 @@ fn watch_clear_non_tty_no_ansi_escape() {
 
     // Edit the source to trigger a rebuild — this is the path that calls
     // clear_terminal(). On a non-TTY pipe it must be a no-op.
-    std::fs::write(&src, "---\nname: There\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: There\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello There!", TIMEOUT),
         "rebuild should occur after editing source"
@@ -677,7 +684,7 @@ fn watch_set_vars_applied_on_rebuild() {
     );
 
     // Edit to trigger rebuild — --set should still apply.
-    std::fs::write(&src, "Greetings {{name}}!\n").unwrap();
+    write_atomic(&src, "Greetings {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Greetings Alice!", TIMEOUT),
         "--set name=Alice should persist across rebuilds"
@@ -850,7 +857,7 @@ fn watch_debounce_final_value_wins_after_rapid_edits() {
 
     // Write 10 rapid edits within the debounce window.
     for i in 1..=10 {
-        std::fs::write(&src, format!("---\nname: v{i}\n---\nHello {{{{name}}}}!\n")).unwrap();
+        write_atomic(&src, format!("---\nname: v{i}\n---\nHello {{{{name}}}}!\n"));
         // Tiny sleep to ensure filesystem registers the write, but
         // well within the 200ms debounce window.
         std::thread::sleep(Duration::from_millis(5));
@@ -936,11 +943,10 @@ fn watch_import_removal_stops_tracking_dep() {
 
     // STEP 1 (add direction, already covered by T-I3 but verified here too):
     // Edit helper — entry output should update because helper is tracked.
-    std::fs::write(
+    write_atomic(
         &helper,
         "@define greet(name):\nHi {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
     assert!(
         wait_for_file_contains(&out, "Hi World!", TIMEOUT),
         "editing helper while imported should trigger a rebuild"
@@ -948,7 +954,7 @@ fn watch_import_removal_stops_tracking_dep() {
 
     // STEP 2 (removal direction): rewrite entry to remove the @import.
     // The entry now produces static output that does NOT reference helper.
-    std::fs::write(&entry, "Static content\n").unwrap();
+    write_atomic(&entry, "Static content\n");
     assert!(
         wait_for_file_contains(&out, "Static content", TIMEOUT),
         "removing @import should rebuild entry with static content"
@@ -959,11 +965,10 @@ fn watch_import_removal_stops_tracking_dep() {
 
     // STEP 3: Edit helper again — entry output must NOT change because the dep
     // was removed from the watch set after the resync in step 2.
-    std::fs::write(
+    write_atomic(
         &helper,
         "@define greet(name):\nBye {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     // Wait long enough for any spurious rebuild to materialize (500ms >> debounce 0).
     std::thread::sleep(Duration::from_millis(500));
@@ -1029,7 +1034,7 @@ fn watch_dir_mode_vars_change_recompiles_all() {
     );
 
     // Edit vars.json — BOTH outputs should update.
-    std::fs::write(&vars, r#"{"greeting": "Goodbye"}"#).unwrap();
+    write_atomic(&vars, r#"{"greeting": "Goodbye"}"#);
 
     assert!(
         wait_for_file_contains(&out_dir_path.join("a.md"), "Goodbye from A", TIMEOUT),
@@ -1066,7 +1071,7 @@ fn watch_quiet_keeps_errors_visible() {
     );
 
     // Introduce a compile error (reference an undefined variable with no frontmatter default).
-    std::fs::write(&src, "Hello {{__undefined_xyz__}}!\n").unwrap();
+    write_atomic(&src, "Hello {{__undefined_xyz__}}!\n");
 
     // Give the watcher time to attempt rebuild and emit error.
     std::thread::sleep(Duration::from_millis(500));
@@ -1094,7 +1099,7 @@ fn watch_quiet_keeps_errors_visible() {
     );
 
     // Fix the error — watcher should recover.
-    std::fs::write(&src, "---\nname: Fixed\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Fixed\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello Fixed!", TIMEOUT),
         "after fixing the compile error, watcher should rebuild successfully"
@@ -1188,6 +1193,9 @@ fn watch_debounce_single_rebuild_from_burst() {
     );
 
     // Write 10 rapid edits within the 250ms debounce window.
+    // DELIBERATE: this test's subject is the debounce window collapsing a burst of
+    // truncate+write pairs, so it keeps plain writes. Every other post-spawn write in
+    // this file goes through `write_atomic`.
     for i in 1..=10u32 {
         std::fs::write(&src, format!("---\nname: v{i}\n---\nBurst {{{{name}}}}!\n")).unwrap();
         std::thread::sleep(Duration::from_millis(5));
@@ -1552,6 +1560,9 @@ fn watch_single_status_line_per_rebuild() {
     );
 
     // Make ONE real content-changing edit.
+    // DELIBERATE: this test's subject is coalescing the truncate+write pair at
+    // --debounce 100, so it keeps the plain write. Every other post-spawn write in
+    // this file goes through `write_atomic`.
     std::fs::write(&src, "---\nname: v1\n---\nStatus {{name}}!\n").unwrap();
 
     // Wait for the rebuild to appear in the output.
@@ -1737,11 +1748,10 @@ fn watch_dir_mode_shared_partial_rebuilds_importers() {
     );
 
     // Edit the partial — both importers must rebuild.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet(name):\nHi {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out_dir.join("a.md"), "Hi A!", TIMEOUT),
@@ -1801,7 +1811,7 @@ fn watch_dir_mode_chain_rebuild() {
     );
 
     // Edit C — A must update.
-    std::fs::write(&c, "@define val():\nV2\n@end\n\n@export val\n").unwrap();
+    write_atomic(&c, "@define val():\nV2\n@end\n\n@export val\n");
     assert!(
         wait_for_file_contains(&out_dir.join("a.md"), "V2", TIMEOUT),
         "a.md should update to V2 after editing _c.mds (transitive chain)"
@@ -1840,7 +1850,7 @@ fn watch_poll_interval_zero_works() {
     );
 
     // Verify a real edit also works.
-    std::fs::write(&src, "---\nname: Poll\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Poll\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello Poll!", TIMEOUT),
         "--poll-interval 0: edit should still trigger rebuild via native event"
@@ -2095,7 +2105,7 @@ fn watch_file_mode_parent_dir_delete_recreate_recovers() {
 
     // Recreate the parent dir and the source file with new content.
     std::fs::create_dir(&src_dir).unwrap();
-    std::fs::write(&src, "---\nname: After\n---\nEntry {{name}}\n").unwrap();
+    write_atomic(&src, "---\nname: After\n---\nEntry {{name}}\n");
 
     // TICK-DEPENDENT: `remove_dir_all(&src_dir)` destroyed the inotify watch on the old
     // inode, and the recreated dir is a new inode nothing is watching — so the write
@@ -2150,11 +2160,10 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
 
     // Recreate the root with a brand-new file (init-gap case).
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(
-        root.join("new.mds"),
+    write_atomic(
+        &root.join("new.mds"),
         "---\nname: N\n---\nNew file {{name}}\n",
-    )
-    .unwrap();
+    );
 
     // TICK-DEPENDENT: the recursive watch died with the old root inode, so the create
     // above is unobservable; the liveness probe's re-arm + reconcile is the only path.
@@ -2229,7 +2238,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     );
 
     // Recreate the file with different content.
-    std::fs::write(&src, "---\nname: Recovered\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Recovered\n---\nHello {{name}}!\n");
 
     // Wait for recompile after recovery.
     assert!(
@@ -2308,7 +2317,7 @@ fn watch_vars_dir_delete_recreate_rearms() {
     std::thread::sleep(Duration::from_millis(300));
 
     // Now write new vars — the re-armed watcher should catch this event.
-    std::fs::write(&vars_file, r#"{"greeting": "Goodbye"}"#).unwrap();
+    write_atomic(&vars_file, r#"{"greeting": "Goodbye"}"#);
 
     // TICK-DEPENDENT: whether the write above is delivered as an event depends on the
     // probe having already re-armed the recreated vars dir. If it has not, the fallback
@@ -2395,11 +2404,10 @@ fn watch_dir_mode_cross_root_partial_edit_rebuilds_importer() {
     );
 
     // Edit the external partial.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet():\nExternal V2\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     // In-root importer output must update.
     assert!(
@@ -2533,7 +2541,7 @@ fn watch_dir_mode_create_missing_partial_heals_importer() {
 
     // Now create the previously-missing partial.
     let partial = dir.path().join("_missing.mds");
-    std::fs::write(&partial, "@define val():\nHealed!\n@end\n\n@export val\n").unwrap();
+    write_atomic(&partial, "@define val():\nHealed!\n@end\n\n@export val\n");
 
     // The importer should heal and produce output.
     assert!(
@@ -2594,11 +2602,10 @@ fn watch_dir_mode_dual_role_node_edit_and_delete() {
 
     // Edit dual.mds — both dual.md and consumer.md should update.
     // Use a longer content to force a size delta.
-    std::fs::write(
+    write_atomic(
         &dual,
         "@define greet():\nDual V2 (updated)\n@end\n\n@export greet\n\nStandalone updated content\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(
@@ -2885,11 +2892,10 @@ fn watch_dir_mode_partial_edit_rebuilds_exactly_n_importers() {
     let independent_before = std::fs::read_to_string(out_dir.join("independent.md")).unwrap();
 
     // Edit the partial with different-length content to force a deterministic (mtime,size) delta.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define val():\nV2 updated\n@end\n\n@export val\n",
-    )
-    .unwrap();
+    );
 
     // All three importers must update.
     assert!(
@@ -2959,11 +2965,10 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
     for i in 1_u32..=50 {
         // Pad with spaces to ensure each round has a unique byte count.
         let padding = " ".repeat(i as usize);
-        std::fs::write(
+        write_atomic(
             &partial,
             format!("@define val():\nSoak V{i}{padding}\n@end\n\n@export val\n"),
-        )
-        .unwrap();
+        );
 
         // Wait for this round's rebuild to propagate.
         let expected = format!("Soak V{i}");
@@ -3066,7 +3071,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
 
     // Recreate the parent directory and write the file with new content.
     std::fs::create_dir(&src_dir).unwrap();
-    std::fs::write(&src, "V2-recovered\n").unwrap();
+    write_atomic(&src, "V2-recovered\n");
 
     // TICK-DEPENDENT: same as AC-W1 — the parent dir was removed, so the watch on it is
     // gone and the recreated dir is unwatched. Recovery is the vanish→reappear edge in
@@ -3552,7 +3557,7 @@ fn watch_file_mode_edit_during_startup_window_is_not_lost() {
     );
 
     // Edit now — inside the window under the defective ordering.
-    std::fs::write(&src, "---\nname: After\n---\nEntry {{name}}\n").unwrap();
+    write_atomic(&src, "---\nname: After\n---\nEntry {{name}}\n");
 
     assert!(
         wait_for_file_contains(&out, "Entry After", STARTUP_WINDOW_TIMEOUT),
@@ -3596,7 +3601,7 @@ fn watch_dir_mode_edit_during_startup_window_is_not_lost() {
         "startup compile should publish 'Dir Before'"
     );
 
-    std::fs::write(&src, "---\nname: After\n---\nDir {{name}}\n").unwrap();
+    write_atomic(&src, "---\nname: After\n---\nDir {{name}}\n");
 
     assert!(
         wait_for_file_contains(&out, "Dir After", STARTUP_WINDOW_TIMEOUT),
@@ -3676,11 +3681,10 @@ fn watch_dir_mode_cross_root_edit_during_startup_window_is_not_lost() {
     );
 
     // Edit the cross-root partial now — inside the window where nothing is watching it.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet():\nWindow V2\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     // TICK-DEPENDENT: no filesystem event announces this edit, so recovery is the idle
     // tick's `(mtime, size)` diff against the baseline captured before the first read.
@@ -3752,11 +3756,10 @@ fn watch_file_mode_dep_edit_during_startup_window_is_not_lost() {
         "startup compile should publish 'Dep V1'"
     );
 
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet():\nDep V2\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out, "Dep V2", TICK_TIMEOUT),
@@ -3853,7 +3856,7 @@ fn watch_dir_mode_idle_tick_fires_under_event_flood() {
     std::fs::remove_dir_all(&root).unwrap();
     std::thread::sleep(Duration::from_millis(200));
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("new.mds"), "---\nname: N\n---\nFlood {{name}}\n").unwrap();
+    write_atomic(&root.join("new.mds"), "---\nname: N\n---\nFlood {{name}}\n");
 
     let recovered = wait_for_file_contains(&out_dir.join("new.md"), "Flood N", TICK_TIMEOUT);
 
@@ -4149,14 +4152,14 @@ fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
     );
 
     // Edit 1: trigger a rebuild.
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I8: rebuild after edit 1 must complete"
     );
 
     // Edit 2: trigger another rebuild.
-    std::fs::write(&src, "version 3").unwrap();
+    write_atomic(&src, "version 3");
     assert!(
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I8: rebuild after edit 2 must complete"
@@ -4223,7 +4226,7 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
     );
 
     // Trigger a rebuild to exercise the :1914 path (handle_dir_event).
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I9: rebuild after edit must complete"
@@ -4289,7 +4292,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 
     // Edit 1: trigger a rebuild — ADR-016 reloads the vars file, re-reporting the
     // duplicate.
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I16: rebuild after edit 1 must complete"
@@ -4302,7 +4305,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
     );
 
     // Edit 2: trigger another rebuild.
-    std::fs::write(&src, "version 3").unwrap();
+    write_atomic(&src, "version 3");
     assert!(
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I16: rebuild after edit 2 must complete"
@@ -4362,7 +4365,7 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
 
     // One rebuild: the count must rise to exactly 2, proving exactly one of
     // :1793/:1919 fires per rebuild (not both).
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I17: rebuild after edit must complete"
@@ -4425,7 +4428,7 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
     );
 
     // First rebuild, still clean: still no warning.
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I18: first rebuild must complete"
@@ -4439,8 +4442,8 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
     );
 
     // Introduce a duplicate mid-session, then trigger the next rebuild.
-    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
-    std::fs::write(&src, "version 3").unwrap();
+    write_atomic(&vars_file, r#"{"x": 1, "x": 2}"#);
+    write_atomic(&src, "version 3");
     assert!(
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I18: rebuild after introducing the duplicate must complete"
@@ -4526,11 +4529,10 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     // warning per observable rebuild, which is what the count assertion below
     // pins.
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(
-        root.join("new.mds"),
+    write_atomic(
+        &root.join("new.mds"),
         "---\nname: N\n---\nNew file {{name}}\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out_dir.join("new.md"), "New file N", TICK_TIMEOUT),
@@ -4602,7 +4604,7 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
          stderr:\n{startup_stderr}"
     );
 
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I20: rebuild after edit must complete even under --quiet"
