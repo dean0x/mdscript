@@ -4108,6 +4108,155 @@ fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
     );
 }
 
+/// Bounded wait for a child that has already been signalled.
+///
+/// A **bound, not a synchroniser**: a signalled child exits in milliseconds, and one
+/// that has not exited by the deadline is the defect the caller is asserting against.
+/// `what` names the arm so the panic is self-describing.
+#[cfg(unix)]
+fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = guard.0.try_wait().expect("try_wait failed") {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("{what}: the process did not exit within {timeout:?} of the signal");
+}
+
+/// Control for #129 surface 1: the readiness handshake — not luck — is what makes a
+/// post-SIGINT `status.success()` deterministic.
+///
+/// Two arms, the same signal, opposite verdicts:
+///
+/// - **CONTROL.** [`spawn_unsynchronized`], with SIGINT gated on the `Watching …`
+///   line. `run_watch_file` prints that line before it even creates the watcher, and
+///   therefore long before `ctrlc::set_handler`, so the signal lands in the
+///   pre-handler window where the default disposition still applies: death by SIGINT.
+///   If this arm ever exits cleanly, the window is no longer being hit and the
+///   treatment arm below proves nothing.
+/// - **TREATMENT.** [`spawn_ready`], with SIGINT sent the instant the handshake
+///   returns. `set_handler` precedes `emit_ready_marker` in `run_watch_file`, so once
+///   the marker exists the handler provably does too: exit 0 and `Stopped watching.`.
+///
+/// `N = 20` is a live discriminator, not a rate bound — a single clean control exit
+/// fails the run. The manual Linux soak workflow is the rate instrument. Every wait
+/// here is bounded and none of them is a sleep standing in for a synchroniser.
+/// `#[cfg(unix)]` because SIGINT has no Windows analogue; the test compiles out there.
+#[test]
+#[cfg(unix)]
+fn watch_readiness_handshake_makes_ctrl_c_exit_deterministic() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const N: usize = 20;
+    /// Imports in the control entry. Same fixture shape as
+    /// `watch_file_mode_ctrl_c_during_startup_compile_terminates`: enough work that
+    /// the startup compile is demonstrably still running when the signal lands.
+    const PARTIALS: usize = 400;
+
+    // Both fixtures are built ONCE. No watcher in this test ever edits a watched file,
+    // so rebuilding them per iteration would buy nothing but wall clock.
+    let slow_dir = tempfile::tempdir().unwrap();
+    let mut entry = String::new();
+    for i in 0..PARTIALS {
+        let name = format!("_p{i:04}");
+        std::fs::write(
+            slow_dir.path().join(format!("{name}.mds")),
+            format!("@define v{i}():\nP{i}\n@end\n\n@export v{i}\n"),
+        )
+        .unwrap();
+        entry.push_str(&format!("@import \"./{name}.mds\" as p{i}\n"));
+    }
+    entry.push_str("done\n");
+    let slow_src = slow_dir.path().join("entry.mds");
+    std::fs::write(&slow_src, &entry).unwrap();
+
+    let fast_dir = tempfile::tempdir().unwrap();
+    let fast_src = fast_dir.path().join("hello.mds");
+    std::fs::write(&fast_src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
+
+    for iteration in 0..N {
+        // ── CONTROL arm: signal delivered before the handler is installed ───────
+        let (mut guard, tap) = spawn_unsynchronized(
+            // No -q: the `Watching …` line is the gate.
+            mds_bin()
+                .args(["watch", slow_src.to_str().unwrap(), "--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        let pid = guard.id();
+
+        let deadline = Instant::now() + STARTUP_WINDOW_TIMEOUT;
+        let mut saw_watching = false;
+        while Instant::now() < deadline {
+            if tap.text().contains("Watching ") {
+                saw_watching = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            saw_watching,
+            "control arm, iteration {iteration}: expected the `Watching …` startup \
+             line before signalling; stderr:\n{}",
+            tap.text()
+        );
+
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGINT);
+        }
+        let status = wait_bounded(
+            &mut guard,
+            Duration::from_secs(20),
+            "control arm (SIGINT before the handler is installed)",
+        );
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGINT),
+            "control arm, iteration {iteration}: SIGINT delivered before \
+             `ctrlc::set_handler` runs must terminate the process. A clean exit here \
+             means the signal no longer lands in the pre-handler window, and the \
+             treatment arm below then proves nothing; got {status:?}"
+        );
+        assert!(
+            !status.success(),
+            "control arm, iteration {iteration}: death by signal is not a success \
+             status; got {status:?}"
+        );
+
+        // ── TREATMENT arm: signal delivered after the readiness handshake ───────
+        let (mut guard, tap) = spawn_ready(
+            mds_bin()
+                .args(["watch", fast_src.to_str().unwrap(), "--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        let pid = guard.id();
+
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGINT);
+        }
+        let status = wait_bounded(
+            &mut guard,
+            Duration::from_secs(5),
+            "treatment arm (SIGINT after the readiness handshake)",
+        );
+        assert!(
+            status.success(),
+            "treatment arm, iteration {iteration}: after the readiness handshake the \
+             ctrl-c handler provably exists (`set_handler` precedes \
+             `emit_ready_marker` in `run_watch_file`), so SIGINT must exit 0; got \
+             {status:?}; stderr:\n{}",
+            tap.text()
+        );
+        let stderr = tap.finish_text(&mut guard);
+        assert!(
+            stderr.contains("Stopped watching."),
+            "treatment arm, iteration {iteration}: a clean SIGINT exit must also print \
+             `Stopped watching.`; stderr:\n{stderr}"
+        );
+    }
+}
+
 // ── I8: file-watch mode warns exactly ONCE across two edits (#200) ──────────
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
@@ -4512,6 +4661,15 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
     );
 
     // Introduce a duplicate mid-session, then trigger the next rebuild.
+    //
+    // Two watched files are written here, yet the expected count below is exactly 1.
+    // The warning is gated in `rebuild_file` on an OBSERVABLE output-content change —
+    // the same signal that gates the "Recompiled" line — and this fixture never
+    // interpolates `x`, so the rebuild the vars-file write triggers produces
+    // byte-identical output and reports nothing. Only the `version 3` rebuild is
+    // observable. The atomic writes are what make that exact: a truncate-then-write
+    // published a 0-byte intermediate, which was itself an observable transition and
+    // could contribute a second warning.
     write_atomic(&vars_file, r#"{"x": 1, "x": 2}"#);
     write_atomic(&src, "version 3");
     assert!(
