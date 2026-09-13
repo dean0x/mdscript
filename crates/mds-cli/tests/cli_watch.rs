@@ -570,10 +570,11 @@ fn watch_clear_non_tty_no_ansi_escape() {
         "rebuild should occur after editing source"
     );
 
-    // Stop the child and collect everything it wrote to stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    let stderr_bytes = stderr_tap.bytes();
+    // Stop the child and collect everything it wrote to stderr. `finish` reaps the
+    // child and then JOINS the drain thread, so the snapshot cannot be a truncated
+    // prefix — this site is where the Linux tearing was first observed. Raw bytes,
+    // not text: the assertions below hunt for raw ESC sequences.
+    let stderr_bytes = stderr_tap.finish(&mut child);
 
     // AC-F6: the ANSI clear/home sequences emitted by clear_terminal()
     // (\x1b[2J, \x1b[3J, \x1b[H) must be ABSENT when stderr is not a TTY.
@@ -1136,11 +1137,10 @@ fn watch_ctrl_c_prints_stopped_watching() {
         "exit code should be 0 after Ctrl+C, got: {status:?}"
     );
 
-    // Give the reader thread a moment to flush remaining bytes.
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    // The child has already exited; `finish_text` reaps it again (harmless — `wait`
+    // caches the status) and then joins the drain thread, which is what actually
+    // guarantees every byte has been copied.
+    let stderr_str = stderr_tap.finish_text(&mut guard);
     assert!(
         stderr_str.contains("Stopped watching."),
         "stderr should contain 'Stopped watching.' after Ctrl+C, got: {stderr_str:?}"
@@ -1192,12 +1192,7 @@ fn watch_debounce_single_rebuild_from_burst() {
     std::thread::sleep(Duration::from_millis(400));
 
     // Kill child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // Count "Recompiled " lines (each rebuild emits exactly one such line).
     let rebuild_count = stderr_str.matches("Recompiled ").count();
@@ -1313,12 +1308,7 @@ fn watch_startup_no_spurious_recompile() {
     std::thread::sleep(Duration::from_millis(1500));
 
     // Stop the child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // There must be exactly ONE "Compiled to" message (the initial compile).
     let compiled_count = stderr_str.matches("Compiled to").count();
@@ -1467,12 +1457,7 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
     std::thread::sleep(Duration::from_millis(1500));
 
     // Stop the child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // There must be ZERO "Recompiled" lines — no rebuild without edits.
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -1556,12 +1541,7 @@ fn watch_single_status_line_per_rebuild() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Stop the child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // Exactly ONE "Recompiled" line (the real edit).
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -1939,12 +1919,7 @@ fn watch_file_mode_idle_no_recompile_across_ticks() {
     // Idle for 2.5s (≥2 ticks at 100ms poll-interval — well above the minimum).
     std::thread::sleep(Duration::from_millis(2500));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
     assert_eq!(
@@ -2013,12 +1988,7 @@ fn watch_dir_mode_idle_no_recompile_across_ticks() {
     // Idle for 2.5s (≥2 ticks at 100ms).
     std::thread::sleep(Duration::from_millis(2500));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
     assert_eq!(
@@ -2230,12 +2200,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     // Give the watcher a moment to settle after recovery before killing.
     std::thread::sleep(Duration::from_millis(200));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // Sanity: error count across the FULL test run must still be small — rules out a
     // burst of errors that somehow all arrived in window 1.
@@ -2305,11 +2270,7 @@ fn watch_vars_dir_delete_recreate_rearms() {
     // is the probe's own `(mtime, size)` comparison — another tick. Either way the
     // recovery is denominated in ticks, not in event latency.
     let got = wait_for_file_contains(&out, "Goodbye", TICK_TIMEOUT);
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
     assert!(
         got,
         "watcher must re-arm vars dir watch after delete+recreate and recompile on edit; \
@@ -2690,12 +2651,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
         "watcher must stay alive with persistent syntax error in bad.mds"
     );
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     assert_eq!(
         count_w1, count_w2,
@@ -3065,12 +3021,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     // Watcher must still be alive after recovery.
     let still_alive = child.0.try_wait().unwrap().is_none();
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     assert!(
         still_alive,
@@ -3162,12 +3113,7 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
     // (ADR-021) must emit zero "Recompiled" lines during this window.
     std::thread::sleep(Duration::from_millis(600));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
     assert_eq!(
@@ -3442,16 +3388,17 @@ fn watch_esc_in_initial_compile_error_is_sanitized() {
     // The readiness handshake already implies the initial compile ran to completion:
     // the error is printed on the startup path, and the marker is only emitted after
     // it. No sleep needed to "give it time".
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
             .stdout(Stdio::null()),
     );
 
-    // Kill the watch process (ChildGuard.drop → kill + wait) to close the pipe.
-    drop(child);
-
-    let stderr_bytes = stderr_tap.bytes();
+    // Kill the watch process to close the pipe, then join the drain: `finish` does
+    // both in that order, so the snapshot is the complete stream rather than whatever
+    // the drain thread happened to have copied by then. Raw bytes, because assertion
+    // 2 below hunts for a raw ESC byte.
+    let stderr_bytes = stderr_tap.finish(&mut child);
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     // Assertion 1: the initial-compile error was rendered (non-vacuous guard for
