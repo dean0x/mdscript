@@ -1360,10 +1360,17 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
     // Insert frontmatter import paths (they resolve before body imports).
     // Best-effort: ignore parse errors here (parse errors will surface at compile time).
     if let Some(fm) = module.frontmatter.as_ref() {
-        if let Ok(fm_imports) = resolver::parse_frontmatter_imports(&fm.raw) {
-            for imp in &fm_imports {
-                paths.insert(imp.path().to_owned());
+        // Best-effort for plain parse/validation errors, but a resource limit (frontmatter
+        // size cap / node budget / too-many-imports) must fail closed rather than silently
+        // return only body imports (#162).
+        match resolver::parse_frontmatter_imports(&fm.raw) {
+            Ok(fm_imports) => {
+                for imp in &fm_imports {
+                    paths.insert(imp.path().to_owned());
+                }
             }
+            Err(e @ MdsError::ResourceLimit { .. }) => return Err(e),
+            Err(_) => {}
         }
     }
 

@@ -4,7 +4,11 @@
 //! frontmatter mappings, building variable scopes, and parsing `imports:` declarations
 //! from YAML frontmatter.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
+
+use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 
 use crate::error::MdsError;
 use crate::limits::{
@@ -131,20 +135,247 @@ pub(super) fn deep_merge_yaml(
     Ok(result)
 }
 
-// STUB (RED commit): unbounded parse, no size cap, no node budget. The GREEN commit
-// replaces the body of `parse_frontmatter_yaml_bounded` with the budgeted choke point
-// (1 MiB size cap + node budget). Present only so the boundary tests compile and fail
-// behaviourally rather than at link time.
+/// The single choke point for parsing frontmatter YAML into an untyped `Value` (#162).
+///
+/// All four frontmatter parse sites route through here so the DoS bounds cannot be
+/// bypassed on a parallel path. It returns a `Value` (not a `Mapping`) so each caller
+/// keeps its own "not a mapping" handling.
+///
+/// Two bounds are enforced ahead of / during the parse:
+/// 1. A 1 MiB byte cap (`MAX_FRONTMATTER_SIZE`), checked before any YAML work because the
+///    `serde_yaml_ng` loader is eager (it drains the whole document into an event vector).
+///    This also bounds libyaml's flow-scanner, whose CPU cost is upstream of the budget.
+/// 2. A 200 000-node budget (`MAX_FRONTMATTER_NODES`), charged while deserialising, which
+///    is what catches an `&anchor` referenced by many `*alias`es — the amplification
+///    `serde_yaml_ng`'s own alias-jump limit does not catch.
+///
+/// Our bounds surface as [`MdsError::resource_limit`]; everything `serde_yaml_ng` itself
+/// rejects (syntax errors, its recursion/repetition limits, duplicate keys) surfaces as
+/// [`MdsError::yaml_error`] with a message byte-identical to a plain
+/// `serde_yaml_ng::from_str::<Value>`, because the same `Deserializer` drives both.
 pub(crate) fn parse_frontmatter_yaml(raw: &str) -> Result<serde_yaml_ng::Value, MdsError> {
     parse_frontmatter_yaml_bounded(raw, MAX_FRONTMATTER_SIZE, MAX_FRONTMATTER_NODES)
 }
 
+/// Bounds-parameterised core of [`parse_frontmatter_yaml`], so unit tests can pin node
+/// accounting on tiny documents without allocating a real attack.
 fn parse_frontmatter_yaml_bounded(
     raw: &str,
-    _max_bytes: usize,
-    _max_nodes: usize,
+    max_bytes: usize,
+    max_nodes: usize,
 ) -> Result<serde_yaml_ng::Value, MdsError> {
-    serde_yaml_ng::from_str(raw).map_err(|e| MdsError::yaml_error(e.to_string()))
+    // 1. Size cap FIRST — before the eager loader touches the input, and before libyaml's
+    //    flow scanner (a CPU cost upstream of deserialisation) can run on a huge document.
+    if raw.len() > max_bytes {
+        return Err(MdsError::resource_limit(format!(
+            "frontmatter too large ({} bytes, max {max_bytes} bytes)",
+            raw.len()
+        )));
+    }
+
+    // 2. Budgeted deserialisation. `from_str::<Value>` is exactly
+    //    `Value::deserialize(Deserializer::from_str(raw))`; driving the same deserializer
+    //    with the budgeted seed keeps every non-budget error byte-identical.
+    let budget = NodeBudget::new(max_nodes);
+    let seed = BoundedYaml { budget: &budget };
+    match seed.deserialize(serde_yaml_ng::Deserializer::from_str(raw)) {
+        Ok(value) => Ok(value),
+        // The budget latch is the discriminator — never the message text.
+        Err(_) if budget.tripped() => Err(MdsError::resource_limit(format!(
+            "frontmatter YAML node count exceeds maximum of {max_nodes} \
+             (anchors expanded by aliases count once per expansion)"
+        ))),
+        Err(e) => Err(MdsError::yaml_error(e.to_string())),
+    }
+}
+
+/// A saturating-free node budget with a "tripped" latch, shared by reference across the
+/// deserialise walk. `Cell` because the seed is `Copy` and threaded by value.
+struct NodeBudget {
+    remaining: Cell<usize>,
+    tripped: Cell<bool>,
+}
+
+impl NodeBudget {
+    fn new(max: usize) -> Self {
+        Self {
+            remaining: Cell::new(max),
+            tripped: Cell::new(false),
+        }
+    }
+
+    /// Charge one node. On exhaustion, latch `tripped` and return a custom error so the
+    /// classifier in [`parse_frontmatter_yaml_bounded`] can attribute it to our bound.
+    /// `checked_sub` (never saturating) so the boundary is exact.
+    fn charge<E: de::Error>(&self) -> Result<(), E> {
+        match self.remaining.get().checked_sub(1) {
+            Some(rest) => {
+                self.remaining.set(rest);
+                Ok(())
+            }
+            None => {
+                self.tripped.set(true);
+                Err(E::custom("frontmatter YAML node budget exhausted"))
+            }
+        }
+    }
+
+    fn tripped(&self) -> bool {
+        self.tripped.get()
+    }
+}
+
+/// A budgeted `DeserializeSeed`/`Visitor` that mirrors `serde_yaml_ng`'s own
+/// `impl Deserialize for Value`, charging one node per scalar, sequence, mapping, mapping
+/// key and `!tag` wrapper. It never pre-sizes from `size_hint` (an attacker controls it),
+/// and it rejects duplicate keys with a message byte-identical to `serde_yaml_ng`'s.
+#[derive(Clone, Copy)]
+struct BoundedYaml<'b> {
+    budget: &'b NodeBudget,
+}
+
+impl<'de, 'b> DeserializeSeed<'de> for BoundedYaml<'b> {
+    type Value = serde_yaml_ng::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de, 'b> Visitor<'de> for BoundedYaml<'b> {
+    type Value = serde_yaml_ng::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any YAML value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::Bool(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::Number(v.into()))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::Number(v.into()))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::Number(v.into()))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::String(v))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        self.budget.charge::<E>()?;
+        Ok(serde_yaml_ng::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        // Charge the container, then each element as the seed visits it. Do NOT pre-size
+        // from `size_hint` — an alias expansion reports a large hint the attacker controls.
+        self.budget.charge::<A::Error>()?;
+        let mut out = serde_yaml_ng::Sequence::new();
+        while let Some(elem) = seq.next_element_seed(self)? {
+            out.push(elem);
+        }
+        Ok(serde_yaml_ng::Value::Sequence(out))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        self.budget.charge::<A::Error>()?;
+        let mut out = serde_yaml_ng::Mapping::new();
+        // Keys are nodes too. Reject a duplicate BEFORE reading its value, exactly as
+        // `serde_yaml_ng`'s `Mapping` visitor does, with a byte-identical message.
+        while let Some(key) = map.next_key_seed(self)? {
+            match out.entry(key) {
+                serde_yaml_ng::mapping::Entry::Occupied(entry) => {
+                    return Err(<A::Error as de::Error>::custom(duplicate_key_message(
+                        entry.key(),
+                    )));
+                }
+                serde_yaml_ng::mapping::Entry::Vacant(entry) => {
+                    let value = map.next_value_seed(self)?;
+                    entry.insert(value);
+                }
+            }
+        }
+        Ok(serde_yaml_ng::Value::Mapping(out))
+    }
+
+    fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
+    where
+        A: EnumAccess<'de>,
+    {
+        // Charge the `!tag` wrapper, then the inner value via the seed.
+        self.budget.charge::<A::Error>()?;
+        let (tag, contents) = data.variant_seed(PhantomData::<String>)?;
+        // `Tag::new` panics on an empty tag, so mirror `TagStringVisitor`'s guard and
+        // return the same error instead (never panic — #162 / never-panic contract).
+        if tag.is_empty() {
+            return Err(<A::Error as de::Error>::custom(
+                "empty YAML tag is not allowed",
+            ));
+        }
+        let value = contents.newtype_variant_seed(self)?;
+        Ok(serde_yaml_ng::Value::Tagged(Box::new(
+            serde_yaml_ng::value::TaggedValue {
+                tag: serde_yaml_ng::value::Tag::new(tag),
+                value,
+            },
+        )))
+    }
+}
+
+/// The `serde_yaml_ng` `DuplicateKeyError` `Display`, reproduced byte-for-byte (its type
+/// is private). Mirrors `src/mapping.rs` in the vendored crate.
+fn duplicate_key_message(key: &serde_yaml_ng::Value) -> String {
+    use serde_yaml_ng::Value;
+    let mut message = String::from("duplicate entry ");
+    match key {
+        Value::Null => message.push_str("with null key"),
+        Value::Bool(boolean) => message.push_str(&format!("with key `{boolean}`")),
+        Value::Number(number) => message.push_str(&format!("with key {number}")),
+        Value::String(string) => message.push_str(&format!("with key {string:?}")),
+        Value::Sequence(_) | Value::Mapping(_) | Value::Tagged(_) => {
+            message.push_str("in YAML map");
+        }
+    }
+    message
 }
 
 /// Build a scope from a pre-merged `Mapping` and runtime variable overrides.
@@ -311,8 +542,7 @@ fn parse_selective_entry(
 /// Returns an empty `Vec` if the `imports` key is absent. Propagates any
 /// parse or validation error from [`parse_frontmatter_imports_from_yaml`].
 pub(crate) fn parse_frontmatter_imports(raw: &str) -> Result<Vec<FrontmatterImport>, MdsError> {
-    let yaml: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(raw).map_err(|e| MdsError::yaml_error(e.to_string()))?;
+    let yaml = parse_frontmatter_yaml(raw)?;
 
     let serde_yaml_ng::Value::Mapping(ref map) = yaml else {
         return Ok(vec![]);

@@ -224,7 +224,7 @@ pub(super) fn collect_facts(
 
     // ── 1. Pre-collect frontmatter vars ─────────────────────────────────────
     if let Some(fm) = &module.frontmatter {
-        collect_frontmatter_vars(fm, source, &mut ctx);
+        collect_frontmatter_vars(fm, source, &mut ctx)?;
     }
 
     // ── 2. Build walk scope for shadow detection ─────────────────────────────
@@ -255,19 +255,26 @@ pub(super) fn collect_facts(
 ///
 /// Reserved keys (imports, type, extends, prompt) are excluded.
 /// Approximate source offsets are computed via substring search in `source`.
-fn collect_frontmatter_vars(fm: &crate::ast::Frontmatter, source: &str, ctx: &mut AnalysisContext) {
+fn collect_frontmatter_vars(
+    fm: &crate::ast::Frontmatter,
+    source: &str,
+    ctx: &mut AnalysisContext,
+) -> Result<(), MdsError> {
     // Reserved keys per Appendix A (unused-variable skip-set).
     const RESERVED: &[&str] = &["imports", "type", "extends", "prompt"];
 
-    let yaml_result = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&fm.raw);
-    let yaml = match yaml_result {
+    // Route through the bounded choke point (#162). A resource limit (size cap / node
+    // budget) propagates so the lint pass fails closed on an amplification attack; a plain
+    // YAML syntax error stays swallowed (lenient) — the resolver surfaces the diagnostic.
+    let yaml = match crate::resolver::parse_frontmatter_yaml(&fm.raw) {
         Ok(v) => v,
-        Err(_) => return, // malformed YAML — skip; resolver would have caught this
+        Err(e @ MdsError::ResourceLimit { .. }) => return Err(e),
+        Err(_) => return Ok(()),
     };
 
     let mapping = match &yaml {
         serde_yaml_ng::Value::Mapping(m) => m,
-        _ => return,
+        _ => return Ok(()),
     };
 
     // Find the byte offset of the frontmatter content in the source.
@@ -291,6 +298,8 @@ fn collect_frontmatter_vars(fm: &crate::ast::Frontmatter, source: &str, ctx: &mu
             approx_offset,
         });
     }
+
+    Ok(())
 }
 
 /// Find the byte offset where frontmatter YAML content starts in `source`.

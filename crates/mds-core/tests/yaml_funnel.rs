@@ -67,7 +67,10 @@ fn yaml_parse_sites_are_funnelled() {
         "non-vacuity: expected `resolver/frontmatter.rs` to contain a YAML parse entry \
          point, found none — the funnel guard is not actually matching anything"
     );
-    assert!(scanned_needles >= 1, "non-vacuity: no needles matched at all");
+    assert!(
+        scanned_needles >= 1,
+        "non-vacuity: no needles matched at all"
+    );
 
     assert!(
         violations.is_empty(),
@@ -84,8 +87,7 @@ fn is_choke_point(path: &Path) -> bool {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    comps.len() >= CHOKE_POINT.len()
-        && comps[comps.len() - CHOKE_POINT.len()..] == CHOKE_POINT[..]
+    comps.len() >= CHOKE_POINT.len() && comps[comps.len() - CHOKE_POINT.len()..] == CHOKE_POINT[..]
 }
 
 fn rel(base: &Path, path: &Path) -> String {
@@ -230,12 +232,9 @@ fn mask_comments_and_strings(src: &str) -> String {
 /// inside `mod tests` or `*_tests.rs`, both of which are handled.
 fn strip_cfg_test_mods(code: &str) -> String {
     let mut result = code.to_string();
-    // Bounded: at most one removal per `#[cfg(test)]` occurrence, and the string only
-    // shrinks, so the loop terminates.
-    loop {
-        let Some(attr) = result.find("#[cfg(test)]") else {
-            break;
-        };
+    // Bounded: at most one removal per `#[cfg(test)]` occurrence, and each iteration
+    // either removes a block or blanks the attribute, so no occurrence is seen twice.
+    while let Some(attr) = result.find("#[cfg(test)]") {
         // Find the next `mod` keyword after the attribute.
         let after = attr + "#[cfg(test)]".len();
         let Some(mod_rel) = result[after..].find("mod ") else {
@@ -248,7 +247,7 @@ fn strip_cfg_test_mods(code: &str) -> String {
         let brace = result[mod_start..].find('{');
         let semi = result[mod_start..].find(';');
         match (brace, semi) {
-            (Some(bo), semi_opt) if semi_opt.map_or(true, |s| bo < s) => {
+            (Some(bo), semi_opt) if semi_opt.is_none_or(|s| bo < s) => {
                 let open = mod_start + bo;
                 if let Some(close) = match_brace(&result, open) {
                     result.replace_range(attr..=close, "");

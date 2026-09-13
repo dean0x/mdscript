@@ -48,7 +48,11 @@ fn fm_of_size(bytes: usize) -> String {
     // PREFIX + pad + '\n' == bytes.
     let pad = bytes - PREFIX.len() - 1;
     let out = format!("{PREFIX}{}\n", "x".repeat(pad));
-    assert_eq!(out.len(), bytes, "fm_of_size must produce EXACTLY `bytes` bytes");
+    assert_eq!(
+        out.len(),
+        bytes,
+        "fm_of_size must produce EXACTLY `bytes` bytes"
+    );
     out
 }
 
@@ -120,9 +124,15 @@ fn nested_block_map(d: usize) -> String {
     out
 }
 
-/// `d` chained YAML tags around a scalar: `!a !a ... 5`.
+/// `d` nested tagged flow sequences around a scalar: `!t [!t [ ... 5 ... ]]`. Each level
+/// is a tag on a one-element sequence (a node may carry only one tag, so tags cannot be
+/// stacked directly). Every level adds a `Tagged` + a `Sequence` to the value tree.
 fn tagged_nest(d: usize) -> String {
-    format!("k: {}5\n", "!a ".repeat(d))
+    let mut inner = String::from("5");
+    for _ in 0..d {
+        inner = format!("!t [{inner}]");
+    }
+    format!("k: {inner}\n")
 }
 
 /// Billion-laughs style multi-level alias amplification with `levels` anchor levels each
@@ -158,9 +168,15 @@ fn c2_size_cap_exact_boundary() {
 
     // One byte over: rejected as a resource limit, BEFORE any YAML work.
     let over = parse_frontmatter_yaml(&fm_of_size(MAX_FRONTMATTER_SIZE + 1));
-    assert!(is_rl(&over), "over-cap must be a resource limit, got {over:?}");
+    assert!(
+        is_rl(&over),
+        "over-cap must be a resource limit, got {over:?}"
+    );
     let m = msg(&over);
-    assert!(m.contains("frontmatter"), "message must mention frontmatter: {m}");
+    assert!(
+        m.contains("frontmatter"),
+        "message must mention frontmatter: {m}"
+    );
     assert!(
         m.contains(&MAX_FRONTMATTER_SIZE.to_string()),
         "message must state the limit: {m}"
@@ -178,7 +194,10 @@ fn c3_size_cap_precedes_yaml_parse() {
     let raw = format!("k: [{}", "x".repeat(MAX_FRONTMATTER_SIZE));
     let r = parse_frontmatter_yaml(&raw);
     assert!(is_rl(&r), "size cap must precede the parse: {r:?}");
-    assert!(!is_yaml(&r), "must NOT surface as a YAML syntax error: {r:?}");
+    assert!(
+        !is_yaml(&r),
+        "must NOT surface as a YAML syntax error: {r:?}"
+    );
 }
 
 #[test]
@@ -198,7 +217,10 @@ fn c2_size_cap_end_to_end() {
     // The cap is enforced on the string-compile path, not only in a unit call.
     let doc = wrap(&fm_of_size(MAX_FRONTMATTER_SIZE + 4096));
     let r = crate::check_str(&doc);
-    assert!(is_rl(&r), "oversized frontmatter must be rejected via check_str: {r:?}");
+    assert!(
+        is_rl(&r),
+        "oversized frontmatter must be rejected via check_str: {r:?}"
+    );
 }
 
 // ── Node budget (exact accounting on tiny documents) ────────────────────────────
@@ -248,13 +270,19 @@ fn c4_c5_node_budget_real_boundary() {
     // C-5: one node over the cap is rejected as a resource limit.
     let over = alias_bomb_at(MAX_FRONTMATTER_NODES + 1);
     let over_r = parse_frontmatter_yaml(&over);
-    assert!(is_rl(&over_r), "one node over the cap must be rejected: {over_r:?}");
+    assert!(
+        is_rl(&over_r),
+        "one node over the cap must be rejected: {over_r:?}"
+    );
     let m = msg(&over_r);
     assert!(
         m.contains(&MAX_FRONTMATTER_NODES.to_string()),
         "message must state the node limit: {m}"
     );
-    assert!(!m.contains("*a"), "message must not echo the bomb content: {m}");
+    assert!(
+        !m.contains("*a"),
+        "message must not echo the bomb content: {m}"
+    );
 }
 
 /// Exactly-`target`-node alias bomb (wrapper around `bomb_with_nodes`).
@@ -267,9 +295,16 @@ fn c6_alias_revisits_are_counted() {
     // ~150 KB source, but each of the m aliases re-expands the n-element anchor, so the
     // materialised tree far exceeds the node cap: the budget counts re-visits, not bytes.
     let raw = alias_bomb(MAX_FRONTMATTER_NODES / 4, 4, 0);
-    assert!(raw.len() < 400 * 1024, "bomb source stays small: {} bytes", raw.len());
+    assert!(
+        raw.len() < 400 * 1024,
+        "bomb source stays small: {} bytes",
+        raw.len()
+    );
     let r = parse_frontmatter_yaml(&raw);
-    assert!(is_rl(&r), "alias re-visits must be counted toward the budget: {r:?}");
+    assert!(
+        is_rl(&r),
+        "alias re-visits must be counted toward the budget: {r:?}"
+    );
 }
 
 #[test]
@@ -332,7 +367,10 @@ fn c10d_flow_depth_128_recursion_limit() {
 #[test]
 fn c10e_block_map_depth_128_value_nesting() {
     let r = crate::check_str(&wrap(&nested_block_map(128)));
-    assert!(is_yaml(&r), "128-deep block map must be a YAML error: {r:?}");
+    assert!(
+        is_yaml(&r),
+        "128-deep block map must be a YAML error: {r:?}"
+    );
     assert!(
         msg(&r).contains("value nesting exceeds maximum depth of 64"),
         "expected value-nesting message: {}",
@@ -342,14 +380,20 @@ fn c10e_block_map_depth_128_value_nesting() {
 
 #[test]
 fn c10f_tagged_nest_shallow_ok() {
-    assert!(crate::check_str(&wrap(&tagged_nest(32))).is_ok());
-    assert!(crate::check_str(&wrap(&tagged_nest(33))).is_ok());
+    // Tagged values exercise visit_enum and, while comfortably under the depth-64 cap,
+    // are accepted. Each nested `!t [...]` adds two levels (tag + sequence), so depth 20
+    // and 30 map to value depths 40 and 60 — both under 64.
+    assert!(crate::check_str(&wrap(&tagged_nest(20))).is_ok());
+    assert!(crate::check_str(&wrap(&tagged_nest(30))).is_ok());
 }
 
 #[test]
 fn c10g_flow_depth_10000_recursion_limit() {
     let r = crate::check_str(&wrap(&nested_flow_seq(10_000)));
-    assert!(is_yaml(&r), "very deep flow nest must be a YAML error: {r:?}");
+    assert!(
+        is_yaml(&r),
+        "very deep flow nest must be a YAML error: {r:?}"
+    );
     assert!(
         msg(&r).contains("recursion limit exceeded"),
         "expected serde recursion-limit message: {}",
@@ -362,7 +406,10 @@ fn c10g_flow_depth_10000_recursion_limit() {
 #[test]
 fn c11_billion_laughs_repetition_limit() {
     let r = parse_frontmatter_yaml(&laughs(5, 7));
-    assert!(is_yaml(&r), "billion-laughs must surface as a YAML error: {r:?}");
+    assert!(
+        is_yaml(&r),
+        "billion-laughs must surface as a YAML error: {r:?}"
+    );
     assert!(
         msg(&r).contains("repetition limit exceeded"),
         "expected serde repetition-limit message: {}",
@@ -421,7 +468,10 @@ fn c_par_duplicate_key_message_is_byte_identical() {
         plain_msg.contains("duplicate entry with key \"a\""),
         "sanity: raw parser reports duplicate-key text: {plain_msg}"
     );
-    assert_eq!(message, plain_msg, "duplicate-key message must be byte-identical");
+    assert_eq!(
+        message, plain_msg,
+        "duplicate-key message must be byte-identical"
+    );
 }
 
 #[test]
