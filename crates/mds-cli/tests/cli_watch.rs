@@ -1241,9 +1241,10 @@ fn watch_debounce_single_rebuild_from_burst() {
         1,
         "the startup compile is the only 'Compiled to' line; stderr was:\n{stderr}"
     );
+    // `mds` copies the frontmatter block through verbatim and interpolates the body.
     assert_eq!(
         std::fs::read_to_string(&out).unwrap(),
-        "Burst v12!\n",
+        "---\nname: v12\n---\nBurst v12!\n",
         "the single rebuild must compile the FINAL state of the burst, not an \
          intermediate one; stderr was:\n{stderr}"
     );

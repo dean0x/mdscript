@@ -29,6 +29,16 @@
 //! The tick is scheduled against an absolute deadline (`TickClock`), so a stream of
 //! filesystem events cannot postpone the backstop indefinitely (#319).
 //!
+//! # Coalescing
+//!
+//! `--debounce` is a **quiet period**: the first relevant event opens a window and
+//! every further content event restarts it, so a save burst longer than the window is
+//! still one rebuild. The window is itself bounded — by an absolute cap of
+//! `max(10 x window, 1s)` measured from the first event, and by 10 000 drained
+//! messages — because the loop does not consult the idle tick while a window is open,
+//! so an unbounded window would starve the content backstop as well as the rebuild
+//! (#379).
+//!
 //! # Key invariants
 //!
 //! - All content output → stdout ONLY when output resolves to stdout.
@@ -36,7 +46,9 @@
 //! - `--quiet` suppresses status + warnings but NOT compile errors.
 //! - Exit 0 on clean Ctrl+C; non-zero only on startup failure.
 //! - Compile errors during watching never terminate the watcher.
-//! - All loops have fixed upper bounds (ADR-021 / reliability.md).
+//! - All loops have fixed upper bounds (ADR-021 / reliability.md): the idle tick
+//!   against an absolute deadline, and the debounce window against an absolute cap
+//!   (window <= cap) and a message bound (<= 10 000 per window).
 //! - All `.mds` reads go through `compile_to_content` (PF-004).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -592,11 +604,32 @@ impl TickClock {
 
 // ── Debounce loop ─────────────────────────────────────────────────────────────
 
+/// Largest accepted `--debounce` window; larger values are clamped to it.
+///
+/// `Instant::now() + Duration::from_millis(u64::MAX)` does not overflow on the
+/// i64-second monotonic clocks of macOS and Linux: the deadline lands roughly 585
+/// million years out, so an unclamped `--debounce 18446744073709551615` watches
+/// forever and silently never rebuilds (observed). 60s is orders of magnitude past
+/// any editor save burst.
+const MAX_DEBOUNCE_MS: u64 = 60_000;
+
+/// Absolute cap on one debounce window, as a multiple of the window.
+const DEBOUNCE_CAP_FACTOR: u32 = 10;
+
+/// Floor under the absolute cap.
+///
+/// Matches the default `--poll-interval`: while a window is open the loop never
+/// reaches `TickClock::recv_next`, so this floor is also the bound on how late the
+/// idle-tick backstop can run under a continuous event stream.
+const DEBOUNCE_CAP_FLOOR: Duration = Duration::from_millis(1_000);
+
 /// Upper bound on the messages one window will drain.
 ///
-/// TEMPORARY: set so high that the bound is unreachable, which is exactly today's
-/// behaviour — one window drains however many messages arrive in it.
-const MAX_DEBOUNCE_MESSAGES: usize = 1_000_000;
+/// The cap bounds the window's DURATION; this bounds its work and its memory. A
+/// sender faster than the drain would otherwise grow `paths` without limit inside a
+/// single window. Messages left in the channel are not lost: the caller's next
+/// event opens a new window and drains them.
+const MAX_DEBOUNCE_MESSAGES: usize = 10_000;
 
 /// Why a debounce window ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,36 +665,58 @@ impl DebounceOutcome {
 /// Convert a raw `--debounce` value (milliseconds) into a quiet-period window.
 ///
 /// - `0` -> `None`: coalescing disabled, every event rebuilds immediately.
-/// - nonzero -> `Some(min(value, 60s))`.
+/// - nonzero -> `Some(min(value, MAX_DEBOUNCE_MS))`.
 ///
 /// Extracted so the clamp contract is verifiable without the watch loop, exactly as
 /// [`clamp_poll_interval`] is.
-///
-/// TEMPORARY: the clamp is not applied yet; the raw value is passed through.
 fn clamp_debounce(debounce_ms: u64) -> Option<Duration> {
     if debounce_ms == 0 {
         None
     } else {
-        Some(Duration::from_millis(debounce_ms))
+        Some(Duration::from_millis(debounce_ms.min(MAX_DEBOUNCE_MS)))
     }
 }
 
-/// Absolute bound on one debounce window.
+/// Absolute bound on one debounce window: `max(10 x window, 1s)`.
 ///
-/// TEMPORARY: returns a value so large that today's fixed window is always the binding
-/// deadline, which makes the current (uncapped, non-extending) behaviour observable
-/// through the same code shape the real cap will use.
-fn debounce_cap(_window: Duration) -> Duration {
-    Duration::from_secs(u32::MAX as u64)
+/// `window * DEBOUNCE_CAP_FACTOR` cannot overflow `Duration`: [`clamp_debounce`] caps
+/// the window at 60s, so the product is at most 600s.
+fn debounce_cap(window: Duration) -> Duration {
+    (window * DEBOUNCE_CAP_FACTOR).max(DEBOUNCE_CAP_FLOOR)
 }
 
 /// Coalesce a burst of filesystem events into one rebuild.
 ///
-/// TEMPORARY: the window is still a FIXED offset from the first event — `deadline` is
-/// computed once and never extended — so a burst longer than `debounce_ms` is split
-/// across two or more windows and rebuilt once per window. The `Cap` and
-/// `MessageLimit` exits are wired into the classification but their bounds are set
-/// beyond reach, so they cannot be taken.
+/// # Quiet period, not a fixed window
+///
+/// The first relevant event opens a window of `debounce_ms`; every further **content**
+/// event restarts it. A window that expired at a fixed offset from the FIRST event
+/// split any burst longer than `debounce_ms` across two or three windows and rebuilt
+/// once per window, each compile seeing a different intermediate state of the file:
+/// visible as three `Recompiled` lines from one ten-write burst on a loaded CI runner.
+/// The size of the burst a user can produce is not a property `debounce_ms` can
+/// predict; the size of the GAP between saves is.
+///
+/// # Why the cap is mandatory
+///
+/// An extendable window with no bound is unbounded: a file written to continuously
+/// postpones its own rebuild for as long as the writing lasts. Worse, the idle-tick
+/// liveness probe is not consulted while a window is open ([`TickClock::recv_next`] is
+/// only reached between batches), so an endless stream would starve the content
+/// backstop through a door the absolute tick deadline does not cover. The cap
+/// (`max(10 x window, 1s)`) bounds both: the rebuild, and the probe behind it.
+///
+/// # What does NOT extend
+///
+/// `Access` events (inotify reads; see [`is_content_event`]) and watch errors. The
+/// compile reads its own sources, so an extending `Access` event would let the watcher
+/// hold its own window open.
+///
+/// Relevance is deliberately NOT filtered here. An editor's atomic save writes a temp
+/// file and renames it; that temp path is in no watch set, and ending the window on it
+/// would split the very burst this exists to coalesce. Relevance decides whether to
+/// rebuild ([`event_is_relevant`] in file mode, the `.mds`/root filter in dir mode);
+/// this decides when.
 fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome {
     let mut paths = BTreeSet::new();
 
@@ -676,10 +731,21 @@ fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome
 
     let start = Instant::now();
     let hard_cap = start + debounce_cap(window);
-    let deadline = start + window;
+    let mut deadline = start + window;
     let mut messages: usize = 0;
 
     let end = loop {
+        // The bound, enforced in release too: a window may be extended by further
+        // events, never past `start + cap`. Pure arithmetic: a descheduled runner
+        // cannot trip it, only a defect can. Asserting on MEASURED elapsed time
+        // instead would panic a shipped watcher whenever `recv_timeout` overshoots.
+        assert!(
+            deadline <= hard_cap,
+            "debounce deadline escaped its cap: a file written to continuously would \
+             postpone its own rebuild (and the idle-tick backstop behind it) for as \
+             long as the writing lasts"
+        );
+
         if messages >= MAX_DEBOUNCE_MESSAGES {
             break DebounceEnd::MessageLimit;
         }
@@ -706,6 +772,7 @@ fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome
                         for p in event.paths {
                             paths.insert(p);
                         }
+                        deadline = (Instant::now() + window).min(hard_cap);
                     }
                     Msg::Fs(Err(e)) => {
                         eprint_warning(&format!(
@@ -3550,6 +3617,10 @@ mod tests {
     #[test]
     fn debounce_quiet_period_extends_on_content_events() {
         let (tx, rx) = mpsc::channel::<Msg>();
+        // The window now outlives the burst, so the test must too: in production the
+        // notify sender lives as long as the watcher, and a dropped sender means
+        // "the watcher is gone", not "the burst ended".
+        let keepalive = tx.clone();
         // 40 events, 5ms apart: a ~200ms burst under a 100ms window.
         let sender = std::thread::spawn(move || {
             for i in 0..40u32 {
@@ -3568,6 +3639,7 @@ mod tests {
             "a burst of content events must not postpone the window forever",
         );
         let elapsed = t0.elapsed();
+        drop(keepalive);
         sender.join().expect("sender thread panicked");
 
         assert_eq!(
@@ -3691,6 +3763,10 @@ mod tests {
     #[test]
     fn debounce_access_events_do_not_extend() {
         let (tx, rx) = mpsc::channel::<Msg>();
+        // Outlive the read stream, so a window that DID extend ends on its own
+        // elapsed time rather than on the sender being dropped — the failure then
+        // names the property under test instead of the channel's lifetime.
+        let keepalive = tx.clone();
         let sender = std::thread::spawn(move || {
             if tx.send(modify_event("/w/a.mds")).is_err() {
                 return;
@@ -3712,6 +3788,7 @@ mod tests {
             "a stream of reads must not hold the window open",
         );
         let elapsed = t0.elapsed();
+        drop(keepalive);
         sender.join().expect("sender thread panicked");
 
         assert_eq!(outcome.end, DebounceEnd::Quiet);
