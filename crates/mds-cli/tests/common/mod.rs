@@ -161,28 +161,132 @@ const READY_POLL: Duration = Duration::from_millis(2);
 /// every source in the tree while the suite runs at full parallelism.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Captured stderr of a watcher spawned by [`spawn_watch_ready`] or
-/// [`spawn_watch_unsynchronized`].
+/// RAII guard that kills + waits the child on drop.
 ///
-/// Holds **exactly** what the child wrote and nothing else — the readiness handshake
-/// travels over a file, not this stream. That is load-bearing: tests assert that a
-/// compile error reaches stderr through `--quiet` and that no raw ESC byte appears in
-/// a diagnostic, and both assertions become unfalsifiable if the harness itself
-/// contributes bytes here.
+/// Lives here rather than in `cli_watch.rs` so [`PipeTap::finish`] can take
+/// `&mut ChildGuard` and thereby establish "reaped before join" in the type, not in a
+/// comment: the drain thread's loop ends at EOF, and EOF arrives only once the child's
+/// write end is closed.
 #[allow(dead_code)]
-#[derive(Clone)]
-pub struct StderrTap(Arc<Mutex<Vec<u8>>>);
+pub struct ChildGuard(pub Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[allow(dead_code)]
-impl StderrTap {
-    /// Raw bytes written to stderr so far.
-    pub fn bytes(&self) -> Vec<u8> {
-        self.0.lock().expect("stderr tap poisoned").clone()
+impl ChildGuard {
+    pub fn id(&self) -> u32 {
+        self.0.id()
     }
 
-    /// Lossy-UTF8 view of [`StderrTap::bytes`].
+    /// Reap an already-exiting child. `Child::wait` caches its status, so calling this
+    /// and then letting `Drop` run is safe.
+    pub fn wait_status(&mut self) -> std::process::ExitStatus {
+        self.0.wait().expect("wait failed")
+    }
+
+    /// Kill (best-effort) and reap. Idempotent — a second call returns the cached
+    /// status.
+    pub fn kill_and_wait(&mut self) -> std::process::ExitStatus {
+        let _ = self.0.kill();
+        self.0.wait().expect("wait failed")
+    }
+}
+
+/// A background-drained capture of one of the child's output pipes.
+///
+/// Holds **exactly** what the child wrote and nothing else — the readiness handshake
+/// travels over a file, not over these streams. That is load-bearing: tests assert
+/// that a compile error reaches stderr through `--quiet` and that no raw ESC byte
+/// appears in a diagnostic, and both assertions become unfalsifiable if the harness
+/// itself contributes bytes here.
+///
+/// [`PipeTap::bytes`] stays NON-blocking so the live-poll sites keep working;
+/// [`PipeTap::finish`] is the end-of-test read that is guaranteed complete.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct PipeTap {
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// `Option` because `finish` takes the handle out; behind `Arc<Mutex<_>>` so
+    /// `PipeTap` stays `Clone` (several tests hand a clone to a helper).
+    drain: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+/// A [`PipeTap`] over the child's stderr.
+#[allow(dead_code)]
+pub type StderrTap = PipeTap;
+
+/// A [`PipeTap`] over the child's stdout.
+#[allow(dead_code)]
+pub type StdoutTap = PipeTap;
+
+#[allow(dead_code)]
+impl PipeTap {
+    /// Bytes written so far.
+    ///
+    /// Non-blocking, and therefore carries **no** happens-before edge to the child's
+    /// last write: a snapshot taken right after the child is reaped can be a truncated
+    /// prefix. Use it only while polling a live child; use [`PipeTap::finish`] for the
+    /// final read.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.buf.lock().expect("pipe tap poisoned").clone()
+    }
+
+    /// Lossy-UTF8 view of [`PipeTap::bytes`], with the same caveat.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes()).into_owned()
+    }
+
+    /// Stop the child, JOIN the drain thread, and return everything it wrote.
+    ///
+    /// Termination is proved, not bounded: the drain loop exits only at EOF, EOF
+    /// arrives when the child's write end closes, and the child is reaped here first —
+    /// so the join cannot hang on a live writer. A clone calling `finish` concurrently
+    /// blocks on the drain slot and then observes a fully drained buffer.
+    #[must_use]
+    pub fn finish(self, child: &mut ChildGuard) -> Vec<u8> {
+        child.kill_and_wait();
+        {
+            let mut slot = self.drain.lock().expect("pipe tap drain slot poisoned");
+            if let Some(handle) = slot.take() {
+                handle.join().expect("pipe drain thread panicked");
+            }
+        }
+        self.bytes()
+    }
+
+    /// Lossy-UTF8 view of [`PipeTap::finish`].
+    #[must_use]
+    pub fn finish_text(self, child: &mut ChildGuard) -> String {
+        String::from_utf8_lossy(&self.finish(child)).into_owned()
+    }
+}
+
+/// Spawn a background thread that drains `reader` into a fresh [`PipeTap`].
+fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = buf.clone();
+    let handle = std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut chunk = [0u8; 512];
+        // Bounded by EOF: the loop ends when the child's pipe closes.
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink
+                    .lock()
+                    .expect("pipe tap poisoned")
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    PipeTap {
+        buf,
+        drain: Arc::new(Mutex::new(Some(handle))),
     }
 }
 
@@ -202,24 +306,7 @@ pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap) {
         .spawn()
         .expect("failed to spawn mds watch");
 
-    let handle = child.stderr.take().expect("stderr must be piped");
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let tap = StderrTap(buf.clone());
-
-    std::thread::spawn(move || {
-        let mut handle = handle;
-        let mut chunk = [0u8; 512];
-        // Bounded by EOF: the loop ends when the child's stderr closes.
-        loop {
-            match handle.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf
-                    .lock()
-                    .expect("stderr tap poisoned")
-                    .extend_from_slice(&chunk[..n]),
-            }
-        }
-    });
+    let tap = tap_reader(child.stderr.take().expect("stderr must be piped"));
 
     (child, tap)
 }

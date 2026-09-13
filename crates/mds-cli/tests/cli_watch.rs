@@ -32,33 +32,14 @@
 mod common;
 use common::{
     dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, write_atomic,
-    StderrTap,
+    ChildGuard, StderrTap,
 };
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-
-/// RAII guard that kills + waits the child process on drop.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-impl ChildGuard {
-    fn id(&self) -> u32 {
-        self.0.id()
-    }
-    fn wait_status(&mut self) -> std::process::ExitStatus {
-        self.0.wait().expect("wait failed")
-    }
-}
 
 /// Spawn a watcher, block until it reports readiness, and wrap it in a `ChildGuard`.
 ///
@@ -4832,11 +4813,9 @@ fn stderr_tap_finish_captures_every_line_the_child_wrote() {
     );
 
     // Readiness fires only after the whole startup batch, so all FILE_COUNT lines
-    // have been written by the child by the time this returns.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-
-    let stderr = stderr_tap.text();
+    // have been written by the child by the time this returns. `finish` reaps the
+    // child and then joins the drain, so what comes back is the complete stream.
+    let stderr = stderr_tap.finish_text(&mut child);
     let announced = count_occurrences(&stderr, "Compiled to");
     assert_eq!(
         announced, FILE_COUNT,
