@@ -298,17 +298,25 @@ fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
 /// must act *inside* the startup window, so they cannot synchronise on it closing.
 ///
 /// stderr is piped and drained on a background thread so the pipe can never fill and
-/// block the child.
+/// block the child. If the caller also piped stdout, that pipe is drained the same
+/// way and the tap is returned as the third element; `Command` inherits stdout by
+/// default, so `child.stdout.is_some()` is exactly "the caller asked for a pipe".
+///
+/// Draining stdout here rather than in the caller is what keeps the readiness wait
+/// sound: `mds watch -o -` publishes its startup output before it writes the marker,
+/// so an undrained stdout pipe fills and blocks the child while the poller waits for
+/// a marker that can never be written.
 #[allow(dead_code)]
-pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap) {
+pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutTap>) {
     let mut child = cmd
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn mds watch");
 
     let tap = tap_reader(child.stderr.take().expect("stderr must be piped"));
+    let stdout_tap = child.stdout.take().map(tap_reader);
 
-    (child, tap)
+    (child, tap, stdout_tap)
 }
 
 /// Spawn a `mds watch` command and block until the watcher is **fully armed**.
@@ -331,12 +339,17 @@ pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap) {
 /// stderr is still piped and drained on a background thread so the pipe can never
 /// fill and block the child. Use the returned [`StderrTap`] to inspect it.
 ///
+/// A piped stdout is drained too, and its tap handed back as the third element. That
+/// ordering is load-bearing, not a convenience: `mds watch -o -` publishes its startup
+/// output before it writes the marker, so leaving stdout undrained would let the child
+/// block on a full pipe while this function waits for a marker that can never arrive.
+///
 /// # Panics
 /// Panics if the child cannot be spawned, or if readiness is not signalled within
 /// [`READY_TIMEOUT`] — a watcher that never reports readiness is a defect, not a
 /// slow machine.
 #[allow(dead_code)]
-pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap) {
+pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutTap>) {
     // A private directory per spawn: the suite runs at full parallelism, so a shared
     // path would let one watcher's marker satisfy another's wait. Dropped — and so
     // deleted — when this function returns, by which point the marker has been read.
@@ -347,13 +360,14 @@ pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap) {
         "MDS_TEST_READY must be absolute; mds watch ignores relative values"
     );
 
-    let (mut child, tap) = spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", &ready_path));
+    let (mut child, tap, stdout_tap) =
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", &ready_path));
 
     // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
         if std::fs::read(&ready_path).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
-            return (child, tap);
+            return (child, tap, stdout_tap);
         }
         // Check liveness before the deadline so a watcher that failed at startup is
         // reported as "exited", not as "timed out".

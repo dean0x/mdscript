@@ -32,7 +32,7 @@
 mod common;
 use common::{
     dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, write_atomic,
-    ChildGuard, StderrTap,
+    ChildGuard, StderrTap, StdoutTap,
 };
 
 use std::path::Path;
@@ -50,8 +50,24 @@ use std::time::{Duration, Instant};
 /// The returned [`StderrTap`] holds everything the child wrote to stderr, including
 /// the startup lines printed before the readiness marker.
 fn spawn_ready(cmd: &mut Command) -> (ChildGuard, StderrTap) {
-    let (child, tap) = spawn_watch_ready(cmd);
+    let (child, tap, stdout_tap) = spawn_watch_ready(cmd);
+    assert!(
+        stdout_tap.is_none(),
+        "this spawn piped stdout; use spawn_ready_piped_stdout so the drained stdout \
+         is handed back instead of discarded"
+    );
     (ChildGuard(child), tap)
+}
+
+/// [`spawn_ready`] for a command that set `.stdout(Stdio::piped())`.
+///
+/// The stdout pipe is drained by the harness — it has to be, or the child blocks on a
+/// full pipe before it can write the readiness marker — so the tap is the only way to
+/// read it. Tests must not take `child.0.stdout` themselves; it is already gone.
+fn spawn_ready_piped_stdout(cmd: &mut Command) -> (ChildGuard, StderrTap, StdoutTap) {
+    let (child, tap, stdout_tap) = spawn_watch_ready(cmd);
+    let stdout_tap = stdout_tap.expect("caller must set .stdout(Stdio::piped())");
+    (ChildGuard(child), tap, stdout_tap)
 }
 
 /// Spawn a watcher WITHOUT the readiness handshake and wrap it in a `ChildGuard`.
@@ -60,7 +76,14 @@ fn spawn_ready(cmd: &mut Command) -> (ChildGuard, StderrTap) {
 /// synchronises on "startup finished" can never observe anything that happens
 /// *during* startup. Every other test must use [`spawn_ready`].
 fn spawn_unsynchronized(cmd: &mut Command) -> (ChildGuard, StderrTap) {
-    let (child, tap) = spawn_watch_unsynchronized(cmd);
+    let (child, tap, stdout_tap) = spawn_watch_unsynchronized(cmd);
+    assert!(
+        stdout_tap.is_none(),
+        "this spawn piped stdout, and the harness has already drained it — the tap \
+         would be discarded here. Add a `spawn_unsynchronized_piped_stdout` wrapper \
+         mirroring `spawn_ready_piped_stdout` and use that instead; none exists yet \
+         because no unsynchronized test pipes stdout."
+    );
     (ChildGuard(child), tap)
 }
 
@@ -726,8 +749,8 @@ fn watch_stdout_contains_content_when_o_stdout() {
     let src = dir.path().join("hello.mds");
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
-    // -o - forces stdout output.
-    let (mut child, _stderr_tap) = spawn_ready(
+    // -o - forces stdout output. The harness drains the pipe, so poll the tap.
+    let (child, _stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
         mds_bin()
             .args([
                 "watch",
@@ -741,25 +764,13 @@ fn watch_stdout_contains_content_when_o_stdout() {
             .stdout(Stdio::piped()),
     );
 
-    // Read from stdout with a timeout.
-    use std::io::Read as _;
+    // Bounded by TIMEOUT: at most TIMEOUT / 50ms iterations.
     let deadline = Instant::now() + TIMEOUT;
-    let mut buf = String::new();
     let mut found = false;
-    // Give the child time to produce output.
     while Instant::now() < deadline {
-        let mut tmp = [0u8; 256];
-        if let Some(stdout) = child.0.stdout.as_mut() {
-            match stdout.read(&mut tmp) {
-                Ok(0) | Err(_) => {}
-                Ok(n) => {
-                    buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
-                    if buf.contains("Hello World!") {
-                        found = true;
-                        break;
-                    }
-                }
-            }
+        if stdout_tap.text().contains("Hello World!") {
+            found = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1340,7 +1351,7 @@ fn watch_stdout_no_duplicate_write_on_startup() {
     // Use a distinctive marker so we can count occurrences.
     std::fs::write(&src, "UNIQUE_MARKER_XYZ\n").unwrap();
 
-    let (mut child, _stderr_tap) = spawn_ready(
+    let (mut child, _stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
         mds_bin()
             .args([
                 "watch",
@@ -1354,37 +1365,12 @@ fn watch_stdout_no_duplicate_write_on_startup() {
             .stdout(Stdio::piped()),
     );
 
-    // Drain stdout on a background thread.
-    let stdout_handle = child.0.stdout.take().expect("piped stdout");
-    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stdout_buf_clone = stdout_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stdout_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stdout_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
-
     // Let the watcher run long enough to capture initial compile + any spurious second write.
     std::thread::sleep(Duration::from_millis(1500));
 
-    // Stop the child and collect all stdout.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stdout_bytes = stdout_buf.lock().unwrap().clone();
-    let stdout_str = String::from_utf8_lossy(&stdout_bytes);
+    // Stop the child and collect all stdout. `finish_text` reaps the child and then
+    // joins the drain, so no flush sleep is needed to make the snapshot complete.
+    let stdout_str = stdout_tap.finish_text(&mut child);
 
     // The marker should appear at least once (the initial compile wrote it).
     assert!(
@@ -4796,7 +4782,7 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
     );
     std::fs::write(&src, &body).unwrap();
 
-    let (mut child, _stderr_tap) = spawn_ready(
+    let (mut child, _stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
         mds_bin()
             .args([
                 "watch",
@@ -4812,15 +4798,7 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
 
     // Readiness returned, so the startup publish got through. Prove the bytes really
     // travelled rather than the marker having been written before any output.
-    use std::io::Read as _;
-    let mut stdout = Vec::new();
-    child
-        .0
-        .stdout
-        .take()
-        .expect("stdout must be piped")
-        .read_to_end(&mut stdout)
-        .expect("reading the child's stdout must succeed");
+    let stdout = stdout_tap.finish(&mut child);
     assert!(
         stdout.len() >= body.len(),
         "the whole startup output must reach stdout; got {} bytes of {}",
