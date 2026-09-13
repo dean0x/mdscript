@@ -13,6 +13,17 @@
 //! a self-heal idle tick, [`STARTUP_WINDOW_TIMEOUT`] for the deliberately
 //! unsynchronized startup-window tests. See each constant's docs.
 //!
+//! Writes to watched paths go through `common::write_atomic`. The rule is mechanical,
+//! so a reviewer can reproduce the set exactly: a write is converted iff it occurs
+//! AFTER the `spawn_ready`/`spawn_unsynchronized` call in the same test fn AND targets
+//! a path the watcher is watching (the `.mds` source, an imported partial, the
+//! `--vars` file, an external dependency). Pre-spawn fixture writes, `.git` markers,
+//! `mds.json`, and output files keep `std::fs::write`. Two post-spawn writes are
+//! deliberate exceptions and say so inline: `watch_single_status_line_per_rebuild`,
+//! whose subject IS the truncate+write pair that `write_atomic` collapses, and
+//! `watch_debounce_single_rebuild_from_burst`, which keeps plain writes because they
+//! double the event load its coalescing claim has to survive.
+//!
 //! Flakiness mitigations:
 //! - Assert on output FILE content rather than stderr ordering.
 //! - Write dependency files BEFORE adding the `@import` that references them.
@@ -21,33 +32,15 @@
 
 mod common;
 use common::{
-    dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, StderrTap,
+    dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, write_atomic,
+    ChildGuard, StderrTap, StdoutTap,
 };
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-
-/// RAII guard that kills + waits the child process on drop.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-impl ChildGuard {
-    fn id(&self) -> u32 {
-        self.0.id()
-    }
-    fn wait_status(&mut self) -> std::process::ExitStatus {
-        self.0.wait().expect("wait failed")
-    }
-}
 
 /// Spawn a watcher, block until it reports readiness, and wrap it in a `ChildGuard`.
 ///
@@ -58,8 +51,24 @@ impl ChildGuard {
 /// The returned [`StderrTap`] holds everything the child wrote to stderr, including
 /// the startup lines printed before the readiness marker.
 fn spawn_ready(cmd: &mut Command) -> (ChildGuard, StderrTap) {
-    let (child, tap) = spawn_watch_ready(cmd);
+    let (child, tap, stdout_tap) = spawn_watch_ready(cmd);
+    assert!(
+        stdout_tap.is_none(),
+        "this spawn piped stdout; use spawn_ready_piped_stdout so the drained stdout \
+         is handed back instead of discarded"
+    );
     (ChildGuard(child), tap)
+}
+
+/// [`spawn_ready`] for a command that set `.stdout(Stdio::piped())`.
+///
+/// The stdout pipe is drained by the harness — it has to be, or the child blocks on a
+/// full pipe before it can write the readiness marker — so the tap is the only way to
+/// read it. Tests must not take `child.0.stdout` themselves; it is already gone.
+fn spawn_ready_piped_stdout(cmd: &mut Command) -> (ChildGuard, StderrTap, StdoutTap) {
+    let (child, tap, stdout_tap) = spawn_watch_ready(cmd);
+    let stdout_tap = stdout_tap.expect("caller must set .stdout(Stdio::piped())");
+    (ChildGuard(child), tap, stdout_tap)
 }
 
 /// Spawn a watcher WITHOUT the readiness handshake and wrap it in a `ChildGuard`.
@@ -68,7 +77,14 @@ fn spawn_ready(cmd: &mut Command) -> (ChildGuard, StderrTap) {
 /// synchronises on "startup finished" can never observe anything that happens
 /// *during* startup. Every other test must use [`spawn_ready`].
 fn spawn_unsynchronized(cmd: &mut Command) -> (ChildGuard, StderrTap) {
-    let (child, tap) = spawn_watch_unsynchronized(cmd);
+    let (child, tap, stdout_tap) = spawn_watch_unsynchronized(cmd);
+    assert!(
+        stdout_tap.is_none(),
+        "this spawn piped stdout, and the harness has already drained it — the tap \
+         would be discarded here. Add a `spawn_unsynchronized_piped_stdout` wrapper \
+         mirroring `spawn_ready_piped_stdout` and use that instead; none exists yet \
+         because no unsynchronized test pipes stdout."
+    );
     (ChildGuard(child), tap)
 }
 
@@ -247,7 +263,7 @@ fn watch_edit_entry_updates_output() {
     );
 
     // Edit the source.
-    std::fs::write(&src, "---\nname: Bob\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Bob\n---\nHello {{name}}!\n");
 
     // Wait for rebuild.
     assert!(
@@ -293,11 +309,10 @@ fn watch_edit_imported_dep_updates_entry() {
     );
 
     // Edit the helper to change the greeting.
-    std::fs::write(
+    write_atomic(
         &helper,
         "@define greet(name):\nHi there {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out, "Hi there World!", TIMEOUT),
@@ -329,7 +344,7 @@ fn watch_compile_error_keeps_watcher_alive() {
     );
 
     // Introduce a compile error.
-    std::fs::write(&src, "Hello {{undefined_var_xyz}}!\n").unwrap();
+    write_atomic(&src, "Hello {{undefined_var_xyz}}!\n");
     // Give the watcher time to attempt rebuild.
     std::thread::sleep(Duration::from_millis(500));
 
@@ -342,7 +357,7 @@ fn watch_compile_error_keeps_watcher_alive() {
     );
 
     // Fix the error — watcher should recover.
-    std::fs::write(&src, "---\nname: Charlie\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Charlie\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello Charlie!", TIMEOUT),
         "fixing the error should trigger a successful rebuild"
@@ -393,11 +408,10 @@ fn watch_dir_mode_compiles_all_on_startup() {
     );
 
     // Edit a.mds → only a.md should update.
-    std::fs::write(
-        dir.path().join("a.mds"),
+    write_atomic(
+        &dir.path().join("a.mds"),
         "---\nname: A-edited\n---\nFile A: {{name}}\n",
-    )
-    .unwrap();
+    );
     assert!(
         wait_for_file_contains(&out_dir.join("a.md"), "File A: A-edited", TIMEOUT),
         "editing a.mds should update a.md"
@@ -442,11 +456,10 @@ fn watch_dir_mode_picks_up_new_files() {
     );
 
     // Create a new file AFTER the watcher is running.
-    std::fs::write(
-        dir.path().join("c.mds"),
+    write_atomic(
+        &dir.path().join("c.mds"),
         "---\nname: C\n---\nNew file {{name}}\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out_dir.join("c.md"), "New file C", TIMEOUT),
@@ -539,7 +552,7 @@ fn watch_vars_file_change_triggers_recompile() {
     );
 
     // Edit the vars file.
-    std::fs::write(&vars, r#"{"name": "Bob"}"#).unwrap();
+    write_atomic(&vars, r#"{"name": "Bob"}"#);
 
     assert!(
         wait_for_file_contains(&out, "Hello Bob!", TIMEOUT),
@@ -575,16 +588,17 @@ fn watch_clear_non_tty_no_ansi_escape() {
 
     // Edit the source to trigger a rebuild — this is the path that calls
     // clear_terminal(). On a non-TTY pipe it must be a no-op.
-    std::fs::write(&src, "---\nname: There\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: There\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello There!", TIMEOUT),
         "rebuild should occur after editing source"
     );
 
-    // Stop the child and collect everything it wrote to stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    let stderr_bytes = stderr_tap.bytes();
+    // Stop the child and collect everything it wrote to stderr. `finish` reaps the
+    // child and then JOINS the drain thread, so the snapshot cannot be a truncated
+    // prefix — this site is where the Linux tearing was first observed. Raw bytes,
+    // not text: the assertions below hunt for raw ESC sequences.
+    let stderr_bytes = stderr_tap.finish(&mut child);
 
     // AC-F6: the ANSI clear/home sequences emitted by clear_terminal()
     // (\x1b[2J, \x1b[3J, \x1b[H) must be ABSENT when stderr is not a TTY.
@@ -676,7 +690,7 @@ fn watch_set_vars_applied_on_rebuild() {
     );
 
     // Edit to trigger rebuild — --set should still apply.
-    std::fs::write(&src, "Greetings {{name}}!\n").unwrap();
+    write_atomic(&src, "Greetings {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Greetings Alice!", TIMEOUT),
         "--set name=Alice should persist across rebuilds"
@@ -736,8 +750,8 @@ fn watch_stdout_contains_content_when_o_stdout() {
     let src = dir.path().join("hello.mds");
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
-    // -o - forces stdout output.
-    let (mut child, _stderr_tap) = spawn_ready(
+    // -o - forces stdout output. The harness drains the pipe, so poll the tap.
+    let (child, _stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
         mds_bin()
             .args([
                 "watch",
@@ -751,25 +765,13 @@ fn watch_stdout_contains_content_when_o_stdout() {
             .stdout(Stdio::piped()),
     );
 
-    // Read from stdout with a timeout.
-    use std::io::Read as _;
+    // Bounded by TIMEOUT: at most TIMEOUT / 50ms iterations.
     let deadline = Instant::now() + TIMEOUT;
-    let mut buf = String::new();
     let mut found = false;
-    // Give the child time to produce output.
     while Instant::now() < deadline {
-        let mut tmp = [0u8; 256];
-        if let Some(stdout) = child.0.stdout.as_mut() {
-            match stdout.read(&mut tmp) {
-                Ok(0) | Err(_) => {}
-                Ok(n) => {
-                    buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
-                    if buf.contains("Hello World!") {
-                        found = true;
-                        break;
-                    }
-                }
-            }
+        if stdout_tap.text().contains("Hello World!") {
+            found = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -849,7 +851,7 @@ fn watch_debounce_final_value_wins_after_rapid_edits() {
 
     // Write 10 rapid edits within the debounce window.
     for i in 1..=10 {
-        std::fs::write(&src, format!("---\nname: v{i}\n---\nHello {{{{name}}}}!\n")).unwrap();
+        write_atomic(&src, format!("---\nname: v{i}\n---\nHello {{{{name}}}}!\n"));
         // Tiny sleep to ensure filesystem registers the write, but
         // well within the 200ms debounce window.
         std::thread::sleep(Duration::from_millis(5));
@@ -935,11 +937,10 @@ fn watch_import_removal_stops_tracking_dep() {
 
     // STEP 1 (add direction, already covered by T-I3 but verified here too):
     // Edit helper — entry output should update because helper is tracked.
-    std::fs::write(
+    write_atomic(
         &helper,
         "@define greet(name):\nHi {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
     assert!(
         wait_for_file_contains(&out, "Hi World!", TIMEOUT),
         "editing helper while imported should trigger a rebuild"
@@ -947,7 +948,7 @@ fn watch_import_removal_stops_tracking_dep() {
 
     // STEP 2 (removal direction): rewrite entry to remove the @import.
     // The entry now produces static output that does NOT reference helper.
-    std::fs::write(&entry, "Static content\n").unwrap();
+    write_atomic(&entry, "Static content\n");
     assert!(
         wait_for_file_contains(&out, "Static content", TIMEOUT),
         "removing @import should rebuild entry with static content"
@@ -958,11 +959,10 @@ fn watch_import_removal_stops_tracking_dep() {
 
     // STEP 3: Edit helper again — entry output must NOT change because the dep
     // was removed from the watch set after the resync in step 2.
-    std::fs::write(
+    write_atomic(
         &helper,
         "@define greet(name):\nBye {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     // Wait long enough for any spurious rebuild to materialize (500ms >> debounce 0).
     std::thread::sleep(Duration::from_millis(500));
@@ -1028,7 +1028,7 @@ fn watch_dir_mode_vars_change_recompiles_all() {
     );
 
     // Edit vars.json — BOTH outputs should update.
-    std::fs::write(&vars, r#"{"greeting": "Goodbye"}"#).unwrap();
+    write_atomic(&vars, r#"{"greeting": "Goodbye"}"#);
 
     assert!(
         wait_for_file_contains(&out_dir_path.join("a.md"), "Goodbye from A", TIMEOUT),
@@ -1065,7 +1065,7 @@ fn watch_quiet_keeps_errors_visible() {
     );
 
     // Introduce a compile error (reference an undefined variable with no frontmatter default).
-    std::fs::write(&src, "Hello {{__undefined_xyz__}}!\n").unwrap();
+    write_atomic(&src, "Hello {{__undefined_xyz__}}!\n");
 
     // Give the watcher time to attempt rebuild and emit error.
     std::thread::sleep(Duration::from_millis(500));
@@ -1093,7 +1093,7 @@ fn watch_quiet_keeps_errors_visible() {
     );
 
     // Fix the error — watcher should recover.
-    std::fs::write(&src, "---\nname: Fixed\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Fixed\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello Fixed!", TIMEOUT),
         "after fixing the compile error, watcher should rebuild successfully"
@@ -1149,11 +1149,10 @@ fn watch_ctrl_c_prints_stopped_watching() {
         "exit code should be 0 after Ctrl+C, got: {status:?}"
     );
 
-    // Give the reader thread a moment to flush remaining bytes.
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    // The child has already exited; `finish_text` reaps it again (harmless — `wait`
+    // caches the status) and then joins the drain thread, which is what actually
+    // guarantees every byte has been copied.
+    let stderr_str = stderr_tap.finish_text(&mut guard);
     assert!(
         stderr_str.contains("Stopped watching."),
         "stderr should contain 'Stopped watching.' after Ctrl+C, got: {stderr_str:?}"
@@ -1162,10 +1161,20 @@ fn watch_ctrl_c_prints_stopped_watching() {
 
 // ── AC-P1: Debounce coalesces burst — count rebuild summary lines ──────────
 
-/// Burst of ~10 writes within a 250ms debounce window must produce exactly 1
-/// "Recompiled " line in stderr.  250ms is large enough to be reliable on CI;
-/// if the filesystem splits the burst into two windows, the test permits <= 2
-/// rebuilds (documented below) but asserts == 1 as the expected case.
+/// A save burst LONGER than the debounce window is still one rebuild (#379).
+///
+/// The old shape of this test wrote a burst that fit inside the window and then
+/// tolerated a second rebuild, so the property it advertised — one rebuild per burst —
+/// was never actually pinned. It failed as `got 3` on loaded CI runners (runs
+/// 33996153739, 33976595173, 33753123463), each of the three compiles seeing a
+/// different intermediate state of the file.
+///
+/// The burst here is deliberately longer than the window: 12 writes, 30ms apart, so at
+/// least 330ms against a 250ms window. Under a window that expires at a fixed offset from
+/// the FIRST event that is two or three rebuilds; under a quiet period it is one,
+/// because no gap between writes ever reaches 250ms. `--poll-interval` is left at its
+/// default so the idle-tick liveness probe stays live — a stronger claim than
+/// disabling it.
 #[test]
 fn watch_debounce_single_rebuild_from_burst() {
     let dir = tempfile::tempdir().unwrap();
@@ -1173,7 +1182,6 @@ fn watch_debounce_single_rebuild_from_burst() {
     std::fs::write(&src, "---\nname: v0\n---\nBurst {{name}}!\n").unwrap();
     let out = dir.path().join("burst.md");
 
-    // Use a 250ms debounce — large enough to reliably swallow the ~10 × 5ms burst.
     let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "250"])
@@ -1186,45 +1194,144 @@ fn watch_debounce_single_rebuild_from_burst() {
         "initial compile should produce Burst v0!"
     );
 
-    // Write 10 rapid edits within the 250ms debounce window.
-    for i in 1..=10u32 {
+    // DELIBERATE: this test's subject is the debounce window collapsing a burst of
+    // truncate+write pairs, so it keeps plain writes — they double the event load
+    // that `write_atomic` would collapse into one rename. Every other post-spawn write
+    // in this file goes through `write_atomic`.
+    let mut stamps: Vec<Instant> = Vec::with_capacity(12);
+    for i in 1..=12u32 {
         std::fs::write(&src, format!("---\nname: v{i}\n---\nBurst {{{{name}}}}!\n")).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
+        stamps.push(Instant::now());
+        std::thread::sleep(Duration::from_millis(30));
     }
 
-    // Wait for the debounced rebuild to settle (debounce window + generous FSEvent latency).
+    // Self-diagnosing preconditions, asserted BEFORE the outcome: if the burst this
+    // process actually produced was not longer than the window, or had a gap wide
+    // enough to legitimately close it, the outcome assertion below would be measuring
+    // the scheduler rather than the watcher.
+    let span = stamps[stamps.len() - 1].duration_since(stamps[0]);
+    let max_gap = stamps
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]))
+        .max()
+        .expect("burst has at least two writes");
     assert!(
-        wait_for_file_contains(&out, "Burst v10!", TIMEOUT),
-        "after burst, output should reflect final value v10"
-    );
-
-    // Wait an extra moment to ensure no trailing rebuilds are in-flight.
-    std::thread::sleep(Duration::from_millis(400));
-
-    // Kill child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
-
-    // Count "Recompiled " lines (each rebuild emits exactly one such line).
-    let rebuild_count = stderr_str.matches("Recompiled ").count();
-
-    // Expected: exactly 1 rebuild from the burst.
-    // Allow <= 2 as a documented tolerance: on a heavily loaded CI machine the
-    // 250ms window may occasionally be split by an FSEvent scheduling gap, yielding
-    // a second rebuild for the tail of the burst.  The important property is that
-    // we do NOT get 10 individual rebuilds.
-    assert!(
-        rebuild_count >= 1,
-        "at least one rebuild must have occurred, got 0; stderr: {stderr_str}"
+        span > Duration::from_millis(250),
+        "precondition: the burst must outlast the 250ms window, else the test proves \
+         nothing about extension; span was {span:?}"
     );
     assert!(
-        rebuild_count <= 2,
-        "debounce should coalesce burst into <= 2 rebuilds, got {rebuild_count}; \
-         stderr: {stderr_str}"
+        max_gap < Duration::from_millis(250),
+        "precondition: no gap between writes may reach the 250ms window, else the \
+         window is entitled to close mid-burst; largest gap was {max_gap:?}"
+    );
+
+    // WAIT ONLY — the assertion is the count below, taken from the joined tap.
+    wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", TIMEOUT);
+    let stderr = stderr_tap.finish_text(&mut child);
+
+    assert_eq!(
+        count_occurrences(&stderr, "Recompiled "),
+        1,
+        "a {span:?} burst with a largest gap of {max_gap:?} must coalesce into exactly \
+         one rebuild under a 250ms quiet period; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, "Compiled to"),
+        1,
+        "the startup compile is the only 'Compiled to' line; stderr was:\n{stderr}"
+    );
+    // `mds` copies the frontmatter block through verbatim and interpolates the body.
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "---\nname: v12\n---\nBurst v12!\n",
+        "the single rebuild must compile the FINAL state of the burst, not an \
+         intermediate one; stderr was:\n{stderr}"
+    );
+}
+
+/// The cap rebuilds a file that is never left alone (#379).
+///
+/// A quiet period that can always be extended is unbounded: a writer that never
+/// pauses postpones its own rebuild for as long as it keeps writing. `--poll-interval 0`
+/// turns the idle-tick liveness probe off, so within this test the cap is the ONLY
+/// mechanism that can produce a rebuild while the stream is running — and it is also
+/// the reason the probe cannot be starved in the configurations that do enable it,
+/// since the loop never reaches `TickClock::recv_next` while a window is open.
+#[test]
+fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hot.mds");
+    std::fs::write(&src, "---\nname: v0\n---\nHot {{name}}!\n").unwrap();
+    let out = dir.path().join("hot.md");
+
+    // --debounce 200 => cap = max(10 x 200ms, 1s) = 2s.
+    let (mut child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--debounce",
+                "200",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "Hot v0!", TIMEOUT),
+        "initial compile should produce Hot v0!"
+    );
+
+    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let writer_flag = std::sync::Arc::clone(&writing);
+    let writer_src = src.clone();
+    let writer = std::thread::spawn(move || {
+        let stop_at = Instant::now() + Duration::from_secs(3);
+        let mut max_gap = Duration::ZERO;
+        let mut last = Instant::now();
+        // Doubly bounded: <= 3s of wall clock AND <= 2000 iterations.
+        for i in 1..=2_000u32 {
+            if Instant::now() >= stop_at {
+                break;
+            }
+            write_atomic(
+                &writer_src,
+                format!("---\nname: v{i}\n---\nHot {{{{name}}}}!\n"),
+            );
+            let now = Instant::now();
+            max_gap = max_gap.max(now.duration_since(last));
+            last = now;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        writer_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        max_gap
+    });
+
+    // The cap is 2s; allow the compile that follows it to land inside the bound.
+    wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", Duration::from_millis(3500));
+    let rebuilt_while_writing = writing.load(std::sync::atomic::Ordering::SeqCst);
+
+    let max_gap = writer.join().expect("writer thread panicked");
+    assert!(
+        max_gap < Duration::from_millis(200),
+        "precondition: no gap in the write stream may reach the 200ms window, else a \
+         quiet period could legitimately have ended it; largest gap was {max_gap:?}"
+    );
+    assert!(
+        rebuilt_while_writing,
+        "a rebuild must happen WHILE the writes are still arriving — that is what the \
+         cap is for; nothing was seen until the stream stopped"
+    );
+
+    let stderr = stderr_tap.finish_text(&mut child);
+    let rebuilds = count_occurrences(&stderr, "Recompiled ");
+    assert!(
+        (1..=4).contains(&rebuilds),
+        "3s of writes under a 200ms window with a 2s cap is one capped rebuild plus \
+         the quiet-period rebuild that follows the last write; a fixed 200ms window \
+         would give ~15. Got {rebuilds}; stderr was:\n{stderr}"
     );
 }
 
@@ -1323,12 +1430,7 @@ fn watch_startup_no_spurious_recompile() {
     std::thread::sleep(Duration::from_millis(1500));
 
     // Stop the child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // There must be exactly ONE "Compiled to" message (the initial compile).
     let compiled_count = stderr_str.matches("Compiled to").count();
@@ -1360,7 +1462,7 @@ fn watch_stdout_no_duplicate_write_on_startup() {
     // Use a distinctive marker so we can count occurrences.
     std::fs::write(&src, "UNIQUE_MARKER_XYZ\n").unwrap();
 
-    let (mut child, _stderr_tap) = spawn_ready(
+    let (mut child, _stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
         mds_bin()
             .args([
                 "watch",
@@ -1374,37 +1476,12 @@ fn watch_stdout_no_duplicate_write_on_startup() {
             .stdout(Stdio::piped()),
     );
 
-    // Drain stdout on a background thread.
-    let stdout_handle = child.0.stdout.take().expect("piped stdout");
-    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stdout_buf_clone = stdout_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stdout_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stdout_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
-
     // Let the watcher run long enough to capture initial compile + any spurious second write.
     std::thread::sleep(Duration::from_millis(1500));
 
-    // Stop the child and collect all stdout.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stdout_bytes = stdout_buf.lock().unwrap().clone();
-    let stdout_str = String::from_utf8_lossy(&stdout_bytes);
+    // Stop the child and collect all stdout. `finish_text` reaps the child and then
+    // joins the drain, so no flush sleep is needed to make the snapshot complete.
+    let stdout_str = stdout_tap.finish_text(&mut child);
 
     // The marker should appear at least once (the initial compile wrote it).
     assert!(
@@ -1477,12 +1554,7 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
     std::thread::sleep(Duration::from_millis(1500));
 
     // Stop the child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // There must be ZERO "Recompiled" lines — no rebuild without edits.
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -1551,6 +1623,9 @@ fn watch_single_status_line_per_rebuild() {
     );
 
     // Make ONE real content-changing edit.
+    // DELIBERATE: this test's subject is coalescing the truncate+write pair at
+    // --debounce 100, so it keeps the plain write. Every other post-spawn write in
+    // this file goes through `write_atomic`.
     std::fs::write(&src, "---\nname: v1\n---\nStatus {{name}}!\n").unwrap();
 
     // Wait for the rebuild to appear in the output.
@@ -1563,12 +1638,7 @@ fn watch_single_status_line_per_rebuild() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Stop the child and collect all stderr.
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(50));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // Exactly ONE "Recompiled" line (the real edit).
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -1736,11 +1806,10 @@ fn watch_dir_mode_shared_partial_rebuilds_importers() {
     );
 
     // Edit the partial — both importers must rebuild.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet(name):\nHi {{name}}!\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out_dir.join("a.md"), "Hi A!", TIMEOUT),
@@ -1800,7 +1869,7 @@ fn watch_dir_mode_chain_rebuild() {
     );
 
     // Edit C — A must update.
-    std::fs::write(&c, "@define val():\nV2\n@end\n\n@export val\n").unwrap();
+    write_atomic(&c, "@define val():\nV2\n@end\n\n@export val\n");
     assert!(
         wait_for_file_contains(&out_dir.join("a.md"), "V2", TIMEOUT),
         "a.md should update to V2 after editing _c.mds (transitive chain)"
@@ -1839,7 +1908,7 @@ fn watch_poll_interval_zero_works() {
     );
 
     // Verify a real edit also works.
-    std::fs::write(&src, "---\nname: Poll\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Poll\n---\nHello {{name}}!\n");
     assert!(
         wait_for_file_contains(&out, "Hello Poll!", TIMEOUT),
         "--poll-interval 0: edit should still trigger rebuild via native event"
@@ -1947,12 +2016,7 @@ fn watch_file_mode_idle_no_recompile_across_ticks() {
     // Idle for 2.5s (≥2 ticks at 100ms poll-interval — well above the minimum).
     std::thread::sleep(Duration::from_millis(2500));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
     assert_eq!(
@@ -2021,12 +2085,7 @@ fn watch_dir_mode_idle_no_recompile_across_ticks() {
     // Idle for 2.5s (≥2 ticks at 100ms).
     std::thread::sleep(Duration::from_millis(2500));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
     assert_eq!(
@@ -2094,7 +2153,7 @@ fn watch_file_mode_parent_dir_delete_recreate_recovers() {
 
     // Recreate the parent dir and the source file with new content.
     std::fs::create_dir(&src_dir).unwrap();
-    std::fs::write(&src, "---\nname: After\n---\nEntry {{name}}\n").unwrap();
+    write_atomic(&src, "---\nname: After\n---\nEntry {{name}}\n");
 
     // TICK-DEPENDENT: `remove_dir_all(&src_dir)` destroyed the inotify watch on the old
     // inode, and the recreated dir is a new inode nothing is watching — so the write
@@ -2149,11 +2208,10 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
 
     // Recreate the root with a brand-new file (init-gap case).
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(
-        root.join("new.mds"),
+    write_atomic(
+        &root.join("new.mds"),
         "---\nname: N\n---\nNew file {{name}}\n",
-    )
-    .unwrap();
+    );
 
     // TICK-DEPENDENT: the recursive watch died with the old root inode, so the create
     // above is unobservable; the liveness probe's re-arm + reconcile is the only path.
@@ -2228,7 +2286,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     );
 
     // Recreate the file with different content.
-    std::fs::write(&src, "---\nname: Recovered\n---\nHello {{name}}!\n").unwrap();
+    write_atomic(&src, "---\nname: Recovered\n---\nHello {{name}}!\n");
 
     // Wait for recompile after recovery.
     assert!(
@@ -2239,12 +2297,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     // Give the watcher a moment to settle after recovery before killing.
     std::thread::sleep(Duration::from_millis(200));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     // Sanity: error count across the FULL test run must still be small — rules out a
     // burst of errors that somehow all arrived in window 1.
@@ -2307,18 +2360,14 @@ fn watch_vars_dir_delete_recreate_rearms() {
     std::thread::sleep(Duration::from_millis(300));
 
     // Now write new vars — the re-armed watcher should catch this event.
-    std::fs::write(&vars_file, r#"{"greeting": "Goodbye"}"#).unwrap();
+    write_atomic(&vars_file, r#"{"greeting": "Goodbye"}"#);
 
     // TICK-DEPENDENT: whether the write above is delivered as an event depends on the
     // probe having already re-armed the recreated vars dir. If it has not, the fallback
     // is the probe's own `(mtime, size)` comparison — another tick. Either way the
     // recovery is denominated in ticks, not in event latency.
     let got = wait_for_file_contains(&out, "Goodbye", TICK_TIMEOUT);
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
     assert!(
         got,
         "watcher must re-arm vars dir watch after delete+recreate and recompile on edit; \
@@ -2394,11 +2443,10 @@ fn watch_dir_mode_cross_root_partial_edit_rebuilds_importer() {
     );
 
     // Edit the external partial.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet():\nExternal V2\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     // In-root importer output must update.
     assert!(
@@ -2532,7 +2580,7 @@ fn watch_dir_mode_create_missing_partial_heals_importer() {
 
     // Now create the previously-missing partial.
     let partial = dir.path().join("_missing.mds");
-    std::fs::write(&partial, "@define val():\nHealed!\n@end\n\n@export val\n").unwrap();
+    write_atomic(&partial, "@define val():\nHealed!\n@end\n\n@export val\n");
 
     // The importer should heal and produce output.
     assert!(
@@ -2593,11 +2641,10 @@ fn watch_dir_mode_dual_role_node_edit_and_delete() {
 
     // Edit dual.mds — both dual.md and consumer.md should update.
     // Use a longer content to force a size delta.
-    std::fs::write(
+    write_atomic(
         &dual,
         "@define greet():\nDual V2 (updated)\n@end\n\n@export greet\n\nStandalone updated content\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(
@@ -2701,12 +2748,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
         "watcher must stay alive with persistent syntax error in bad.mds"
     );
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     assert_eq!(
         count_w1, count_w2,
@@ -2884,11 +2926,10 @@ fn watch_dir_mode_partial_edit_rebuilds_exactly_n_importers() {
     let independent_before = std::fs::read_to_string(out_dir.join("independent.md")).unwrap();
 
     // Edit the partial with different-length content to force a deterministic (mtime,size) delta.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define val():\nV2 updated\n@end\n\n@export val\n",
-    )
-    .unwrap();
+    );
 
     // All three importers must update.
     assert!(
@@ -2958,11 +2999,10 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
     for i in 1_u32..=50 {
         // Pad with spaces to ensure each round has a unique byte count.
         let padding = " ".repeat(i as usize);
-        std::fs::write(
+        write_atomic(
             &partial,
             format!("@define val():\nSoak V{i}{padding}\n@end\n\n@export val\n"),
-        )
-        .unwrap();
+        );
 
         // Wait for this round's rebuild to propagate.
         let expected = format!("Soak V{i}");
@@ -3065,7 +3105,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
 
     // Recreate the parent directory and write the file with new content.
     std::fs::create_dir(&src_dir).unwrap();
-    std::fs::write(&src, "V2-recovered\n").unwrap();
+    write_atomic(&src, "V2-recovered\n");
 
     // TICK-DEPENDENT: same as AC-W1 — the parent dir was removed, so the watch on it is
     // gone and the recreated dir is unwatched. Recovery is the vanish→reappear edge in
@@ -3078,12 +3118,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     // Watcher must still be alive after recovery.
     let still_alive = child.0.try_wait().unwrap().is_none();
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     assert!(
         still_alive,
@@ -3175,12 +3210,7 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
     // (ADR-021) must emit zero "Recompiled" lines during this window.
     std::thread::sleep(Duration::from_millis(600));
 
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stderr_bytes = stderr_tap.bytes();
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
     assert_eq!(
@@ -3455,16 +3485,17 @@ fn watch_esc_in_initial_compile_error_is_sanitized() {
     // The readiness handshake already implies the initial compile ran to completion:
     // the error is printed on the startup path, and the marker is only emitted after
     // it. No sleep needed to "give it time".
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
             .stdout(Stdio::null()),
     );
 
-    // Kill the watch process (ChildGuard.drop → kill + wait) to close the pipe.
-    drop(child);
-
-    let stderr_bytes = stderr_tap.bytes();
+    // Kill the watch process to close the pipe, then join the drain: `finish` does
+    // both in that order, so the snapshot is the complete stream rather than whatever
+    // the drain thread happened to have copied by then. Raw bytes, because assertion
+    // 2 below hunts for a raw ESC byte.
+    let stderr_bytes = stderr_tap.finish(&mut child);
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     // Assertion 1: the initial-compile error was rendered (non-vacuous guard for
@@ -3551,7 +3582,7 @@ fn watch_file_mode_edit_during_startup_window_is_not_lost() {
     );
 
     // Edit now — inside the window under the defective ordering.
-    std::fs::write(&src, "---\nname: After\n---\nEntry {{name}}\n").unwrap();
+    write_atomic(&src, "---\nname: After\n---\nEntry {{name}}\n");
 
     assert!(
         wait_for_file_contains(&out, "Entry After", STARTUP_WINDOW_TIMEOUT),
@@ -3595,7 +3626,7 @@ fn watch_dir_mode_edit_during_startup_window_is_not_lost() {
         "startup compile should publish 'Dir Before'"
     );
 
-    std::fs::write(&src, "---\nname: After\n---\nDir {{name}}\n").unwrap();
+    write_atomic(&src, "---\nname: After\n---\nDir {{name}}\n");
 
     assert!(
         wait_for_file_contains(&out, "Dir After", STARTUP_WINDOW_TIMEOUT),
@@ -3675,11 +3706,10 @@ fn watch_dir_mode_cross_root_edit_during_startup_window_is_not_lost() {
     );
 
     // Edit the cross-root partial now — inside the window where nothing is watching it.
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet():\nWindow V2\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     // TICK-DEPENDENT: no filesystem event announces this edit, so recovery is the idle
     // tick's `(mtime, size)` diff against the baseline captured before the first read.
@@ -3751,11 +3781,10 @@ fn watch_file_mode_dep_edit_during_startup_window_is_not_lost() {
         "startup compile should publish 'Dep V1'"
     );
 
-    std::fs::write(
+    write_atomic(
         &partial,
         "@define greet():\nDep V2\n@end\n\n@export greet\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out, "Dep V2", TICK_TIMEOUT),
@@ -3852,7 +3881,7 @@ fn watch_dir_mode_idle_tick_fires_under_event_flood() {
     std::fs::remove_dir_all(&root).unwrap();
     std::thread::sleep(Duration::from_millis(200));
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("new.mds"), "---\nname: N\n---\nFlood {{name}}\n").unwrap();
+    write_atomic(&root.join("new.mds"), "---\nname: N\n---\nFlood {{name}}\n");
 
     let recovered = wait_for_file_contains(&out_dir.join("new.md"), "Flood N", TICK_TIMEOUT);
 
@@ -4079,6 +4108,155 @@ fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
     );
 }
 
+/// Bounded wait for a child that has already been signalled.
+///
+/// A **bound, not a synchroniser**: a signalled child exits in milliseconds, and one
+/// that has not exited by the deadline is the defect the caller is asserting against.
+/// `what` names the arm so the panic is self-describing.
+#[cfg(unix)]
+fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = guard.0.try_wait().expect("try_wait failed") {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("{what}: the process did not exit within {timeout:?} of the signal");
+}
+
+/// Control for #129 surface 1: the readiness handshake — not luck — is what makes a
+/// post-SIGINT `status.success()` deterministic.
+///
+/// Two arms, the same signal, opposite verdicts:
+///
+/// - **CONTROL.** [`spawn_unsynchronized`], with SIGINT gated on the `Watching …`
+///   line. `run_watch_file` prints that line before it even creates the watcher, and
+///   therefore long before `ctrlc::set_handler`, so the signal lands in the
+///   pre-handler window where the default disposition still applies: death by SIGINT.
+///   If this arm ever exits cleanly, the window is no longer being hit and the
+///   treatment arm below proves nothing.
+/// - **TREATMENT.** [`spawn_ready`], with SIGINT sent the instant the handshake
+///   returns. `set_handler` precedes `emit_ready_marker` in `run_watch_file`, so once
+///   the marker exists the handler provably does too: exit 0 and `Stopped watching.`.
+///
+/// `N = 20` is a live discriminator, not a rate bound — a single clean control exit
+/// fails the run. The manual Linux soak workflow is the rate instrument. Every wait
+/// here is bounded and none of them is a sleep standing in for a synchroniser.
+/// `#[cfg(unix)]` because SIGINT has no Windows analogue; the test compiles out there.
+#[test]
+#[cfg(unix)]
+fn watch_readiness_handshake_makes_ctrl_c_exit_deterministic() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const N: usize = 20;
+    /// Imports in the control entry. Same fixture shape as
+    /// `watch_file_mode_ctrl_c_during_startup_compile_terminates`: enough work that
+    /// the startup compile is demonstrably still running when the signal lands.
+    const PARTIALS: usize = 400;
+
+    // Both fixtures are built ONCE. No watcher in this test ever edits a watched file,
+    // so rebuilding them per iteration would buy nothing but wall clock.
+    let slow_dir = tempfile::tempdir().unwrap();
+    let mut entry = String::new();
+    for i in 0..PARTIALS {
+        let name = format!("_p{i:04}");
+        std::fs::write(
+            slow_dir.path().join(format!("{name}.mds")),
+            format!("@define v{i}():\nP{i}\n@end\n\n@export v{i}\n"),
+        )
+        .unwrap();
+        entry.push_str(&format!("@import \"./{name}.mds\" as p{i}\n"));
+    }
+    entry.push_str("done\n");
+    let slow_src = slow_dir.path().join("entry.mds");
+    std::fs::write(&slow_src, &entry).unwrap();
+
+    let fast_dir = tempfile::tempdir().unwrap();
+    let fast_src = fast_dir.path().join("hello.mds");
+    std::fs::write(&fast_src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
+
+    for iteration in 0..N {
+        // ── CONTROL arm: signal delivered before the handler is installed ───────
+        let (mut guard, tap) = spawn_unsynchronized(
+            // No -q: the `Watching …` line is the gate.
+            mds_bin()
+                .args(["watch", slow_src.to_str().unwrap(), "--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        let pid = guard.id();
+
+        let deadline = Instant::now() + STARTUP_WINDOW_TIMEOUT;
+        let mut saw_watching = false;
+        while Instant::now() < deadline {
+            if tap.text().contains("Watching ") {
+                saw_watching = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            saw_watching,
+            "control arm, iteration {iteration}: expected the `Watching …` startup \
+             line before signalling; stderr:\n{}",
+            tap.text()
+        );
+
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGINT);
+        }
+        let status = wait_bounded(
+            &mut guard,
+            Duration::from_secs(20),
+            "control arm (SIGINT before the handler is installed)",
+        );
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGINT),
+            "control arm, iteration {iteration}: SIGINT delivered before \
+             `ctrlc::set_handler` runs must terminate the process. A clean exit here \
+             means the signal no longer lands in the pre-handler window, and the \
+             treatment arm below then proves nothing; got {status:?}"
+        );
+        assert!(
+            !status.success(),
+            "control arm, iteration {iteration}: death by signal is not a success \
+             status; got {status:?}"
+        );
+
+        // ── TREATMENT arm: signal delivered after the readiness handshake ───────
+        let (mut guard, tap) = spawn_ready(
+            mds_bin()
+                .args(["watch", fast_src.to_str().unwrap(), "--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        let pid = guard.id();
+
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGINT);
+        }
+        let status = wait_bounded(
+            &mut guard,
+            Duration::from_secs(5),
+            "treatment arm (SIGINT after the readiness handshake)",
+        );
+        assert!(
+            status.success(),
+            "treatment arm, iteration {iteration}: after the readiness handshake the \
+             ctrl-c handler provably exists (`set_handler` precedes \
+             `emit_ready_marker` in `run_watch_file`), so SIGINT must exit 0; got \
+             {status:?}; stderr:\n{}",
+            tap.text()
+        );
+        let stderr = tap.finish_text(&mut guard);
+        assert!(
+            stderr.contains("Stopped watching."),
+            "treatment arm, iteration {iteration}: a clean SIGINT exit must also print \
+             `Stopped watching.`; stderr:\n{stderr}"
+        );
+    }
+}
+
 // ── I8: file-watch mode warns exactly ONCE across two edits (#200) ──────────
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
@@ -4106,6 +4284,38 @@ fn wait_for_stderr_contains_str(tap: &StderrTap, needle: &str, timeout: Duration
         if text.contains(needle) || Instant::now() >= deadline {
             return text;
         }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Wait until the stderr tap holds at least `n` occurrences of `needle`.
+///
+/// Returns the tap's contents as soon as the count is reached. Unlike
+/// [`wait_for_stderr_contains_str`], which returns the text on timeout and so lets the
+/// caller's assertion report the shortfall as if it were a final answer, this one
+/// PANICS on timeout and names the count it actually saw.
+///
+/// Why a count and not "contains": a stderr line the watcher emits AFTER the output
+/// write has no ordering relationship with the output file the test waited on.
+/// Dir-mode emits the duplicate-vars-key warning after the write (watch.rs
+/// `handle_fs_event_dir`), so a snapshot taken the instant `wait_for_file_contains`
+/// returns can legitimately be one warning short — or, if the previous rebuild's
+/// warning has not been sampled yet, one long. Waiting for the expected count first
+/// turns the assertion that follows into a genuine over-count check instead of a race.
+fn wait_for_stderr_count(tap: &StderrTap, needle: &str, n: usize, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    // Bounded by `timeout`: at most timeout / 20ms iterations.
+    loop {
+        let text = tap.text();
+        let seen = count_occurrences(&text, needle);
+        if seen >= n {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least {n} occurrences of {needle:?} within {timeout:?}; \
+             saw {seen}; stderr was:\n{text}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -4148,14 +4358,14 @@ fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
     );
 
     // Edit 1: trigger a rebuild.
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I8: rebuild after edit 1 must complete"
     );
 
     // Edit 2: trigger another rebuild.
-    std::fs::write(&src, "version 3").unwrap();
+    write_atomic(&src, "version 3");
     assert!(
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I8: rebuild after edit 2 must complete"
@@ -4222,7 +4432,7 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
     );
 
     // Trigger a rebuild to exercise the :1914 path (handle_dir_event).
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I9: rebuild after edit must complete"
@@ -4249,7 +4459,11 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
 // re-reported each time (D9).
 
 /// I16: mds watch (file mode) with a duplicated top-level key in the vars file
-/// warns at STARTUP and on EVERY rebuild. Guards `watch.rs:936`.
+/// warns at STARTUP and on EVERY rebuild. Guards the emit in `rebuild_file`.
+///
+/// Each count assertion is preceded by a bounded wait for that count, so it reads
+/// "never more than N", not "happened to be N when sampled". The warning is written
+/// to stderr with no ordering relationship to the output file the test waits on.
 #[test]
 fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
     let base = tempfile::tempdir().unwrap();
@@ -4266,7 +4480,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4279,7 +4493,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
             .stdout(Stdio::null()),
     );
 
-    let stderr_after_start = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    let stderr_after_start = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&stderr_after_start, &expected),
         1,
@@ -4288,12 +4502,12 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 
     // Edit 1: trigger a rebuild — ADR-016 reloads the vars file, re-reporting the
     // duplicate.
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I16: rebuild after edit 1 must complete"
     );
-    let after_edit_1 = stderr_tap.text();
+    let after_edit_1 = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
     assert_eq!(
         count_occurrences(&after_edit_1, &expected),
         2,
@@ -4301,25 +4515,33 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
     );
 
     // Edit 2: trigger another rebuild.
-    std::fs::write(&src, "version 3").unwrap();
+    write_atomic(&src, "version 3");
     assert!(
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I16: rebuild after edit 2 must complete"
     );
-    let after_edit_2 = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 3, TIMEOUT);
+    let after_edit_2 = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&after_edit_2, &expected),
         3,
         "I16: a second rebuild must report the duplicate again; stderr:\n{after_edit_2}"
     );
-
-    drop(child);
 }
 
 /// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
-/// rebuild: once at startup (proving the `:2196` dedup-baseline second read does
-/// NOT double-print), and once more per subsequent rebuild (proving exactly one
-/// of `:1793`/`:1919` emits, not both).
+/// rebuild: once at startup (proving the dedup-baseline second read in
+/// `dir_watch_startup` does NOT double-print), and once more per subsequent rebuild
+/// (proving exactly one of `liveness_probe_dir` / `handle_fs_event_dir` emits, not
+/// both).
+///
+/// Sampling hazard this test has to defend against: dir mode emits the warning AFTER
+/// the output write, so `wait_for_file_contains` returning tells you nothing about
+/// whether the warning has been written yet. Sampling `stderr_tap.text()` right there
+/// is a race in both directions, and CI has shown both — run 34404318888 attempt 1
+/// saw left 1 / right 2 here, while run 34366009518 saw left 3 / right 2. The wait
+/// for the expected count has to come first; the exact-count assertion then means
+/// "not more than expected" rather than "happened to be sampled at the right moment".
 #[test]
 fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
     let base = tempfile::tempdir().unwrap();
@@ -4336,7 +4558,7 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4350,31 +4572,32 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
     );
 
     // No edits yet: the startup count must be exactly 1, proving the dedup-baseline
-    // second read at :2196 does not also emit.
-    let stderr_startup = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    // second read in `dir_watch_startup` does not also emit.
+    let stderr_startup = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&stderr_startup, &expected),
         1,
         "I17: dir-watch startup must emit the vars-file warning exactly once \
-         (guards :2196); stderr:\n{stderr_startup}"
+         (guards the dedup-baseline second read in dir_watch_startup); \
+         stderr:\n{stderr_startup}"
     );
 
     // One rebuild: the count must rise to exactly 2, proving exactly one of
     // :1793/:1919 fires per rebuild (not both).
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I17: rebuild after edit must complete"
     );
-    let stderr_after_edit = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
+    let stderr_after_edit = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&stderr_after_edit, &expected),
         2,
         "I17: one rebuild must add exactly one more warning (guards a double-emit \
-         between :1793 and :1919); stderr:\n{stderr_after_edit}"
+         between liveness_probe_dir and handle_fs_event_dir); \
+         stderr:\n{stderr_after_edit}"
     );
-
-    drop(child);
 }
 
 /// I18 (user decision, positive control first): a vars file that starts clean
@@ -4397,7 +4620,7 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4424,7 +4647,7 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
     );
 
     // First rebuild, still clean: still no warning.
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I18: first rebuild must complete"
@@ -4438,21 +4661,29 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
     );
 
     // Introduce a duplicate mid-session, then trigger the next rebuild.
-    std::fs::write(&vars_file, r#"{"x": 1, "x": 2}"#).unwrap();
-    std::fs::write(&src, "version 3").unwrap();
+    //
+    // Two watched files are written here, yet the expected count below is exactly 1.
+    // The warning is gated in `rebuild_file` on an OBSERVABLE output-content change —
+    // the same signal that gates the "Recompiled" line — and this fixture never
+    // interpolates `x`, so the rebuild the vars-file write triggers produces
+    // byte-identical output and reports nothing. Only the `version 3` rebuild is
+    // observable. The atomic writes are what make that exact: a truncate-then-write
+    // published a 0-byte intermediate, which was itself an observable transition and
+    // could contribute a second warning.
+    write_atomic(&vars_file, r#"{"x": 1, "x": 2}"#);
+    write_atomic(&src, "version 3");
     assert!(
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I18: rebuild after introducing the duplicate must complete"
     );
-    let final_stderr = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
+    let final_stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&final_stderr, &expected),
         1,
         "I18: the duplicate introduced mid-session must be reported on the next \
          rebuild, naming the key; stderr:\n{final_stderr}"
     );
-
-    drop(child);
 }
 
 // ── I19-I20: liveness self-heal rebuild and --quiet regressions (#326) ───────
@@ -4482,7 +4713,7 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4500,7 +4731,7 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     );
 
     // Startup: exactly 1 warning (dir-mode startup, unaffected by this fix).
-    let startup_stderr = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    let startup_stderr = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&startup_stderr, &expected),
         1,
@@ -4525,11 +4756,10 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     // warning per observable rebuild, which is what the count assertion below
     // pins.
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(
-        root.join("new.mds"),
+    write_atomic(
+        &root.join("new.mds"),
         "---\nname: N\n---\nNew file {{name}}\n",
-    )
-    .unwrap();
+    );
 
     assert!(
         wait_for_file_contains(&out_dir.join("new.md"), "New file N", TICK_TIMEOUT),
@@ -4539,15 +4769,14 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     // The self-heal recompile must ALSO re-warn about the vars-file duplicate —
     // proves liveness_probe_dir no longer discards the resolved vars, matching
     // handle_fs_event_dir's gate (emit iff the rebuild was observable).
-    let final_stderr = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
+    let final_stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&final_stderr, &expected),
         2,
         "I19: the liveness self-heal rebuild must warn about the vars-file \
          duplicate too, not only at startup; stderr:\n{final_stderr}"
     );
-
-    drop(child);
 }
 
 /// I20: `mds watch --quiet` suppresses the vars-file duplicate-key warning on
@@ -4573,7 +4802,7 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4601,19 +4830,292 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
          stderr:\n{startup_stderr}"
     );
 
-    std::fs::write(&src, "version 2").unwrap();
+    write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I20: rebuild after edit must complete even under --quiet"
     );
 
-    let after_edit = stderr_tap.text();
+    // No count to wait for — the expectation is zero — so this one takes the
+    // strongest snapshot available instead: `finish_text` joins the drain, so a
+    // warning the child wrote and the drain had not yet copied would still be here.
+    let after_edit = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&after_edit, &expected),
         0,
         "I20: --quiet must suppress the vars-file duplicate warning on rebuild \
          too; stderr:\n{after_edit}"
     );
+}
+
+// ── R1-R3: rename-into-place (atomic write) is a first-class edit (#320) ─────
+//
+// Editors and `write_atomic` replace a file by writing a sibling temp file and
+// renaming it over the target. That is ONE filesystem event on the destination
+// (`Modify(Name(RenameMode::To))` under notify 8 / inotify `IN_MOVED_TO`), not the
+// truncate-then-write pair `std::fs::write` produces. These three tests pin that the
+// watcher treats it as a content edit and that the in-flight temp file is invisible
+// to both watch modes.
+
+/// R1: file mode must rebuild when the watched source is replaced by a rename.
+#[test]
+fn watch_file_mode_rename_into_place_triggers_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let out = dir.path().join("t.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "R1: startup compile must complete"
+    );
+
+    write_atomic(&src, "version 2");
+
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "R1: a rename-into-place edit must trigger a rebuild"
+    );
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, "Recompiled", TIMEOUT);
+    assert!(
+        stderr.contains("Recompiled"),
+        "R1: the rebuild must announce itself; stderr:\n{stderr}"
+    );
 
     drop(child);
+}
+
+/// R2: dir mode must rebuild when a watched source is replaced by a rename.
+#[test]
+fn watch_dir_mode_rename_into_place_triggers_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let out = out_dir.join("t.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src_dir.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "R2: startup compile must complete"
+    );
+
+    write_atomic(&src, "version 2");
+
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "R2: a rename-into-place edit must trigger a rebuild"
+    );
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, "Recompiled", TIMEOUT);
+    assert!(
+        stderr.contains("Recompiled"),
+        "R2: the rebuild must announce itself; stderr:\n{stderr}"
+    );
+
+    drop(child);
+}
+
+/// R3: the temp file an atomic write leaves in flight is never compiled.
+///
+/// The `.<name>.tmp-<pid>-<n>` shape puts the suffix AFTER the `.mds`, so
+/// `Path::extension()` is not `mds` and both the dir-mode event filter and
+/// `collect_mds_files` drop it. Asserting only that absence would be vacuous if the
+/// watcher were simply not compiling anything, so the same test writes a REAL second
+/// source through `write_atomic` and requires that one to be compiled.
+#[test]
+fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src_dir.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out_dir.join("t.md"), "version 1", TIMEOUT),
+        "R3: startup compile must complete"
+    );
+
+    // Atomic edit of the existing source, then a brand-new source — also atomic.
+    write_atomic(&src, "version 2");
+    assert!(
+        wait_for_file_contains(&out_dir.join("t.md"), "version 2", TIMEOUT),
+        "R3: the atomic edit must rebuild t.md"
+    );
+
+    // Positive control: a genuine new source written the same way IS compiled, so the
+    // "temp file produced nothing" assertions below cannot pass vacuously.
+    write_atomic(&src_dir.join("u.mds"), "brand new");
+    assert!(
+        wait_for_file_contains(&out_dir.join("u.md"), "brand new", TIMEOUT),
+        "R3 (positive control): a real source created by a rename must be compiled"
+    );
+
+    // No output derives from any temp name, in either directory.
+    for dir in [&out_dir, &src_dir] {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".tmp-"),
+                "R3: no file derived from a write_atomic temp name may survive in {}; \
+                 found {name}",
+                dir.display()
+            );
+        }
+    }
+
+    // And nothing announced compiling one.
+    let stderr = stderr_tap.text();
+    assert!(
+        !stderr.contains(".tmp-"),
+        "R3: no status line may mention a write_atomic temp file; stderr:\n{stderr}"
+    );
+
+    drop(child);
+}
+
+// ── Stderr capture completeness (#320) ──────────────────────────────────────
+
+/// The tap must hand back every byte the child wrote, not a prefix of it.
+///
+/// `StderrTap::bytes` clones the shared buffer without any happens-before edge to the
+/// drain thread's last write. Reaping the child closes its write end and ends the
+/// drain loop, but nothing makes the reader observe that the loop has finished, so a
+/// snapshot taken right after `kill` + `wait` can be a truncated prefix. The suite hid
+/// that behind a `thread::sleep` at every such site.
+///
+/// A dir watcher over 500 sources announces `Compiled to` once per file at startup, so
+/// the expected count is exact and any lost tail shows up as a shortfall rather than
+/// as a vague "looks empty". The `Compiled to` lines are also the positive control:
+/// a count of 0 would mean the watcher compiled nothing, not that the tap is sound.
+///
+/// macOS has not been observed to lose the tail; the field signature is Linux
+/// (`cli_watch.rs:520` in CI runs 32954883014 and 32954876042). The Linux soak is the
+/// instrument for this one.
+#[test]
+fn stderr_tap_finish_captures_every_line_the_child_wrote() {
+    const FILE_COUNT: usize = 500;
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    for i in 1..=FILE_COUNT {
+        std::fs::write(
+            dir.path().join(format!("file_{i:04}.mds")),
+            format!("drain-{i}\n"),
+        )
+        .unwrap();
+    }
+
+    // No -q: the startup compile announces `Compiled to` once per file.
+    let (mut child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                dir.path().to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Readiness fires only after the whole startup batch, so all FILE_COUNT lines
+    // have been written by the child by the time this returns. `finish` reaps the
+    // child and then joins the drain, so what comes back is the complete stream.
+    let stderr = stderr_tap.finish_text(&mut child);
+    let announced = count_occurrences(&stderr, "Compiled to");
+    assert_eq!(
+        announced, FILE_COUNT,
+        "the tap must return every `Compiled to` line the child wrote; got {announced} \
+         of {FILE_COUNT}"
+    );
+}
+
+// ── R4: readiness must not depend on someone draining stdout (#320) ─────────
+
+/// A watcher whose stdout is piped but undrained must still signal readiness.
+///
+/// `mds watch -o -` publishes the startup output to stdout BEFORE it writes the
+/// readiness marker (watch.rs: the marker is emitted after the compile, the arming and
+/// the publish). A pipe holds ~64 KiB; once it is full the child blocks in `write`, so
+/// if the harness is sitting in the marker poll loop with nothing draining stdout,
+/// neither side can move and the spawn helper times out.
+///
+/// 256 KiB of body is several pipe buffers on both Linux and macOS, so the block is a
+/// certainty, not a matter of timing.
+#[test]
+fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("big.mds");
+    // Plain text is valid MDS; short lines keep the compile trivial.
+    let body: String = std::iter::repeat_n("x".repeat(63) + "\n", 8192).collect();
+    assert!(
+        body.len() > 256 * 1024,
+        "fixture must exceed several pipe buffers; got {} bytes",
+        body.len()
+    );
+    std::fs::write(&src, &body).unwrap();
+
+    let (mut child, _stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "-o",
+                "-",
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::piped()),
+    );
+
+    // Readiness returned, so the startup publish got through. Prove the bytes really
+    // travelled rather than the marker having been written before any output.
+    let stdout = stdout_tap.finish(&mut child);
+    assert!(
+        stdout.len() >= body.len(),
+        "the whole startup output must reach stdout; got {} bytes of {}",
+        stdout.len(),
+        body.len()
+    );
 }

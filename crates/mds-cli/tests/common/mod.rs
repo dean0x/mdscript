@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,6 +71,74 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     count
 }
 
+// ── Atomic file replacement ──────────────────────────────────────────────────
+
+/// Monotonic counter making every [`write_atomic`] temp name unique within a
+/// process; the pid disambiguates across processes.
+static WRITE_ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Replace `path`'s contents in ONE filesystem event, the way an editor does: write a
+/// fresh temp file in the same directory, then `rename` it over `path`.
+///
+/// Why: `std::fs::write` truncates before it writes, so a zero-debounce watcher can
+/// compile the 0-byte intermediate — CI run 34366009518 on 2b91850 printed two
+/// `Recompiled` lines for one write. notify 8 surfaces the rename as
+/// `Modify(Name(RenameMode::To))` on the destination path, which the watcher treats
+/// as a content event.
+///
+/// The temp name is `.<name>.tmp-<pid>-<n>` — the suffix goes AFTER the name so
+/// `Path::extension()` is never `mds`: `collect_mds_files_inner` (output.rs) and the
+/// dir-mode event filter (watch.rs) gate on exactly that, so an in-flight temp file
+/// is invisible to both.
+///
+/// No fsync: `rename` orders the replacement for every live process, which is all a
+/// watcher needs. The product's own readiness marker is written the same way.
+///
+/// Deliberate non-user: `watch_single_status_line_per_rebuild`, whose subject IS the
+/// coalescing of the truncate+write pair.
+///
+/// The Windows sharing-violation caveat (a rename over a file another process holds
+/// open can fail) is developer-machine only; CI runs this suite on ubuntu.
+///
+/// # Panics
+/// Panics if `path` has no parent or no file name, or if either filesystem step
+/// fails — a test whose edit did not land is a defect, not a slow machine.
+#[allow(dead_code)]
+pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) {
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| panic!("write_atomic: path has no parent: {}", path.display()));
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| panic!("write_atomic: path has no file name: {}", path.display()));
+    let seq = WRITE_ATOMIC_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        seq
+    ));
+    debug_assert_ne!(
+        tmp.extension().and_then(|e| e.to_str()),
+        Some("mds"),
+        "write_atomic temp name must never end in .mds; it would be collected as a source"
+    );
+    if let Err(e) = std::fs::write(&tmp, contents.as_ref()) {
+        panic!(
+            "write_atomic: cannot write temp file {}: {e}",
+            tmp.display()
+        );
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        panic!(
+            "write_atomic: cannot rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        );
+    }
+}
+
 // ── Watch readiness handshake ────────────────────────────────────────────────
 
 /// Contents `mds watch` writes to the file named by `MDS_TEST_READY`.
@@ -92,28 +161,135 @@ const READY_POLL: Duration = Duration::from_millis(2);
 /// every source in the tree while the suite runs at full parallelism.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Captured stderr of a watcher spawned by [`spawn_watch_ready`] or
-/// [`spawn_watch_unsynchronized`].
+/// RAII guard that kills + waits the child on drop.
 ///
-/// Holds **exactly** what the child wrote and nothing else — the readiness handshake
-/// travels over a file, not this stream. That is load-bearing: tests assert that a
-/// compile error reaches stderr through `--quiet` and that no raw ESC byte appears in
-/// a diagnostic, and both assertions become unfalsifiable if the harness itself
-/// contributes bytes here.
+/// Lives here rather than in `cli_watch.rs` so [`PipeTap::finish`] can take
+/// `&mut ChildGuard` and thereby establish "reaped before join" in the type, not in a
+/// comment: the drain thread's loop ends at EOF, and EOF arrives only once the child's
+/// write end is closed.
 #[allow(dead_code)]
-#[derive(Clone)]
-pub struct StderrTap(Arc<Mutex<Vec<u8>>>);
+pub struct ChildGuard(pub Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[allow(dead_code)]
-impl StderrTap {
-    /// Raw bytes written to stderr so far.
-    pub fn bytes(&self) -> Vec<u8> {
-        self.0.lock().expect("stderr tap poisoned").clone()
+impl ChildGuard {
+    pub fn id(&self) -> u32 {
+        self.0.id()
     }
 
-    /// Lossy-UTF8 view of [`StderrTap::bytes`].
+    /// Reap an already-exiting child. `Child::wait` caches its status, so calling this
+    /// and then letting `Drop` run is safe.
+    pub fn wait_status(&mut self) -> std::process::ExitStatus {
+        self.0.wait().expect("wait failed")
+    }
+
+    /// Kill (best-effort) and reap. Idempotent — a second call returns the cached
+    /// status.
+    pub fn kill_and_wait(&mut self) -> std::process::ExitStatus {
+        let _ = self.0.kill();
+        self.0.wait().expect("wait failed")
+    }
+}
+
+/// A background-drained capture of one of the child's output pipes.
+///
+/// Holds **exactly** what the child wrote and nothing else — the readiness handshake
+/// travels over a file, not over these streams. That is load-bearing: tests assert
+/// that a compile error reaches stderr through `--quiet` and that no raw ESC byte
+/// appears in a diagnostic, and both assertions become unfalsifiable if the harness
+/// itself contributes bytes here.
+///
+/// [`PipeTap::bytes`] stays NON-blocking so the live-poll sites keep working;
+/// [`PipeTap::finish`] is the end-of-test read that is guaranteed complete.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct PipeTap {
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// `Option` because `finish` takes the handle out; behind `Arc<Mutex<_>>` so
+    /// `PipeTap` stays `Clone`. `Clone` is harness API — it lets a tap be shared with
+    /// a helper thread — and the mutex is what makes that safe: a clone calling
+    /// `finish` concurrently blocks on this slot until the drain has been joined, and
+    /// then observes the fully drained buffer. No call site clones a tap today.
+    drain: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+/// A [`PipeTap`] over the child's stderr.
+#[allow(dead_code)]
+pub type StderrTap = PipeTap;
+
+/// A [`PipeTap`] over the child's stdout.
+#[allow(dead_code)]
+pub type StdoutTap = PipeTap;
+
+#[allow(dead_code)]
+impl PipeTap {
+    /// Bytes written so far.
+    ///
+    /// Non-blocking, and therefore carries **no** happens-before edge to the child's
+    /// last write: a snapshot taken right after the child is reaped can be a truncated
+    /// prefix. Use it only while polling a live child; use [`PipeTap::finish`] for the
+    /// final read.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.buf.lock().expect("pipe tap poisoned").clone()
+    }
+
+    /// Lossy-UTF8 view of [`PipeTap::bytes`], with the same caveat.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes()).into_owned()
+    }
+
+    /// Stop the child, JOIN the drain thread, and return everything it wrote.
+    ///
+    /// Termination is proved, not bounded: the drain loop exits only at EOF, EOF
+    /// arrives when the child's write end closes, and the child is reaped here first —
+    /// so the join cannot hang on a live writer. A clone calling `finish` concurrently
+    /// blocks on the drain slot and then observes a fully drained buffer.
+    #[must_use]
+    pub fn finish(self, child: &mut ChildGuard) -> Vec<u8> {
+        child.kill_and_wait();
+        {
+            let mut slot = self.drain.lock().expect("pipe tap drain slot poisoned");
+            if let Some(handle) = slot.take() {
+                handle.join().expect("pipe drain thread panicked");
+            }
+        }
+        self.bytes()
+    }
+
+    /// Lossy-UTF8 view of [`PipeTap::finish`].
+    #[must_use]
+    pub fn finish_text(self, child: &mut ChildGuard) -> String {
+        String::from_utf8_lossy(&self.finish(child)).into_owned()
+    }
+}
+
+/// Spawn a background thread that drains `reader` into a fresh [`PipeTap`].
+fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = buf.clone();
+    let handle = std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut chunk = [0u8; 512];
+        // Bounded by EOF: the loop ends when the child's pipe closes.
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink
+                    .lock()
+                    .expect("pipe tap poisoned")
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    PipeTap {
+        buf,
+        drain: Arc::new(Mutex::new(Some(handle))),
     }
 }
 
@@ -125,34 +301,25 @@ impl StderrTap {
 /// must act *inside* the startup window, so they cannot synchronise on it closing.
 ///
 /// stderr is piped and drained on a background thread so the pipe can never fill and
-/// block the child.
+/// block the child. If the caller also piped stdout, that pipe is drained the same
+/// way and the tap is returned as the third element; `Command` inherits stdout by
+/// default, so `child.stdout.is_some()` is exactly "the caller asked for a pipe".
+///
+/// Draining stdout here rather than in the caller is what keeps the readiness wait
+/// sound: `mds watch -o -` publishes its startup output before it writes the marker,
+/// so an undrained stdout pipe fills and blocks the child while the poller waits for
+/// a marker that can never be written.
 #[allow(dead_code)]
-pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap) {
+pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutTap>) {
     let mut child = cmd
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn mds watch");
 
-    let handle = child.stderr.take().expect("stderr must be piped");
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let tap = StderrTap(buf.clone());
+    let tap = tap_reader(child.stderr.take().expect("stderr must be piped"));
+    let stdout_tap = child.stdout.take().map(tap_reader);
 
-    std::thread::spawn(move || {
-        let mut handle = handle;
-        let mut chunk = [0u8; 512];
-        // Bounded by EOF: the loop ends when the child's stderr closes.
-        loop {
-            match handle.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf
-                    .lock()
-                    .expect("stderr tap poisoned")
-                    .extend_from_slice(&chunk[..n]),
-            }
-        }
-    });
-
-    (child, tap)
+    (child, tap, stdout_tap)
 }
 
 /// Spawn a `mds watch` command and block until the watcher is **fully armed**.
@@ -175,12 +342,17 @@ pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap) {
 /// stderr is still piped and drained on a background thread so the pipe can never
 /// fill and block the child. Use the returned [`StderrTap`] to inspect it.
 ///
+/// A piped stdout is drained too, and its tap handed back as the third element. That
+/// ordering is load-bearing, not a convenience: `mds watch -o -` publishes its startup
+/// output before it writes the marker, so leaving stdout undrained would let the child
+/// block on a full pipe while this function waits for a marker that can never arrive.
+///
 /// # Panics
 /// Panics if the child cannot be spawned, or if readiness is not signalled within
 /// [`READY_TIMEOUT`] — a watcher that never reports readiness is a defect, not a
 /// slow machine.
 #[allow(dead_code)]
-pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap) {
+pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutTap>) {
     // A private directory per spawn: the suite runs at full parallelism, so a shared
     // path would let one watcher's marker satisfy another's wait. Dropped — and so
     // deleted — when this function returns, by which point the marker has been read.
@@ -191,13 +363,14 @@ pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap) {
         "MDS_TEST_READY must be absolute; mds watch ignores relative values"
     );
 
-    let (mut child, tap) = spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", &ready_path));
+    let (mut child, tap, stdout_tap) =
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", &ready_path));
 
     // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
         if std::fs::read(&ready_path).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
-            return (child, tap);
+            return (child, tap, stdout_tap);
         }
         // Check liveness before the deadline so a watcher that failed at startup is
         // reported as "exited", not as "timed out".

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`mds watch --debounce` is now a quiet period with a hard cap (#379).**
+  Each content event restarts the window instead of the window expiring at a fixed
+  offset from the first event, so a save burst longer than the window coalesces into
+  one rebuild; the window is bounded by `max(10 x window, 1 s)` and 10 000 events so a
+  file written to continuously still rebuilds and the idle-tick liveness probe cannot
+  be starved; raw values are clamped to 60 s (`--debounce 18446744073709551615`
+  previously watched forever without ever rebuilding); `--debounce 0` still means no
+  coalescing. No new output. Known cost, in both modes: an event that is not the edit
+  you care about can still extend an open window, because relevance is not re-derived
+  per message inside it — in directory mode every event also *opens* one (events under
+  excluded directories are filtered only afterwards), while in file mode the entry's
+  parent directory is watched non-recursively, so a sibling scratch write by an editor
+  extends a window a real edit has already opened. Either way `npm install` churn or a
+  noisy editor can delay a real edit and the idle tick by up to the cap.
+
 ### Fixed
 
 - **Warn on duplicate keys in `--vars` JSON files, at every depth, on every `mds watch` rebuild that writes output (#326).**
@@ -60,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `build-napi` per-leg rust-cache key: adds `key: ${{ matrix.settings.target }}` to the `Swatinem/rust-cache` step so each cross-compile leg's target artifacts stay isolated (PF-041; without the key all four ubuntu legs and both macOS legs restored one shared blob, confirmed live in run 34065573775); `build-python`'s existing `key: matrix.target-matrix.manylinux` (#347) unchanged; spec S20 in `release-auth-probe.spec.mjs` pins both and fails `Version gate` if a key is dropped; spec S3 extended to pin the `-z` CARGO_REG_TOKEN guard in executable code; #345 verified that crates.io `GET /api/v1/me` is `AuthCheck::only_cookie()` (HTTP 403 for any API token) and the only token-accepting read route rejects scoped tokens — non-empty guard is the strongest check available, durable fix tracked in #368; #345 closed won't-fix-as-filed (#345 #352).
 - Alpine `node:22-alpine` load tests for both musl napi addons gate `publish-crates`: x64 (`linux-x64-musl`) as the last step of `stage-and-verify-napi` (after the staged artifact upload, so the artifact is never suppressed by an x64 failure), arm64 (`linux-arm64-musl`) in a new unguarded `load-test-musl-arm64` job on a native `ubuntu-24.04-arm` runner using the `napi-staged` artifact; both use `scripts/musl-load-probe.cjs` in a `docker run --network none` step with a positive control; `publish-crates` blocks on both via `needs:` AND its `if:` conjunct (PF-047); spec S21 in `release-auth-probe.spec.mjs` pins job existence, runner, guard shape, wiring, step order, and run-block byte-equality (#340); the first CI run surfaced #371 (string compile fails when the base directory is a filesystem root — `node:22-alpine` has no `WORKDIR` so the default container cwd is `/`); the gate now runs the container from `/w` (`docker run -w /w`) and the probe asserts its cwd so a dropped flag fails loudly.
 - Both musl napi legs (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) now cross-compile with `napi build … -x` / cargo-zigbuild 0.23.0: the SHA-pinned `taiki-e/install-action` (v2.85.10, `fallback: none`) installs cargo-zigbuild before `Swatinem/rust-cache` (rust-cache deletes `~/.cargo/bin` on save; napi's detector is presence-only and would `cargo install` an unpinned copy mid-build otherwise); the hand-written zig cc wrappers, fake-zig self-check, and both `CARGO_TARGET_*_MUSL_LINKER` exports are deleted; three new steps assert the pinned version (before and after the build) and the no-op detector reads both musl linker vars inside `[ -z ]` guards to confirm none is set; the readelf gate adds `ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'` with a planted `libunwind.so.1` control; `mlugg/setup-zig` SHA-pinned (v2.2.1) in the same step; spec S22 in `release-auth-probe.spec.mjs` pins all of the above (#339).
+- manual `watch-soak.yml` Linux soak instrument for the cli_watch flake family (#129 #318 #320); `workflow_dispatch` only, not a gate, not a required context, not release-surface
+- `cli_watch` harness: every post-spawn write to a watched path goes through `common::write_atomic` (temp + rename, one FS event instead of the truncate-then-write pair whose 0-byte intermediate was compiled at `--debounce 0`); 45 sites converted by a mechanical rule stated in the file's doc comment, with two `// DELIBERATE:` plain-write exceptions whose subject IS the truncate+write pair (#318).
+- `cli_watch` harness: the pipe drain thread is now joinable — `PipeTap::finish`/`finish_text` reap the child and then JOIN the drain, so the final stderr read carries a happens-before edge to the child's last write; 13 of 13 post-kill flush sleeps deleted and `ChildGuard` moved to `tests/common` so `finish` can name it (#320).
+- `cli_watch` harness: a piped stdout is drained *before* the readiness wait, not after (`spawn_watch_ready` returns the tap as a third element; `spawn_ready_piped_stdout` hands it to the caller). `mds watch -o -` publishes its startup output before it writes the readiness marker, so an undrained pipe filled and blocked the child while the poller waited for a marker that could never arrive — reproduced locally as a deterministic 10s `READY_TIMEOUT` failure on 512 KiB of stdout (#320).
+- `cli_watch` harness: the i16–i20 duplicate-vars-warning family waits for the expected warning count with a bounded `wait_for_stderr_count` before asserting it. In directory mode the warning is emitted after the output write, so sampling stderr the instant the artifact appeared could read one warning short (CI runs 34366009518, 34404318888) (#326 #320).
+- `cli_watch`: `watch_readiness_handshake_makes_ctrl_c_exit_deterministic` is a two-arm control (20 iterations) proving the `MDS_TEST_READY` handshake, not luck, is what makes a post-SIGINT `status.success()` deterministic — unsynchronized spawn signalled on the `Watching …` line dies by SIGINT; a spawn signalled after the handshake exits 0 and prints `Stopped watching.` (#129).
+- `cli_build`: `watch_bare_filename_from_cwd_succeeds` is synchronised on the readiness handshake and reads `hello.md` once, instead of polling the output artifact for up to 10s; the private `ChildGuard` copy is replaced by `common::ChildGuard` and stderr is drained rather than discarded (#318).
 
 ## [0.4.2] — 2026-09-03
 
