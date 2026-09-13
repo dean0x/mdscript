@@ -725,6 +725,60 @@ mod tests {
         assert!(ctx.is_partial_or_extends);
     }
 
+    // ── Frontmatter YAML bounds propagation (#162) ──────────────────────────
+
+    fn fm_doc(body: &str) -> String {
+        format!("---\n{body}---\nHi\n")
+    }
+
+    /// An alias-fan-out bomb whose materialised tree (400 * 1001 nodes) far exceeds the
+    /// frontmatter node budget.
+    fn alias_bomb_fm() -> String {
+        let xs = vec!["x"; 1000].join(", ");
+        let refs = vec!["*a"; 400].join(", ");
+        format!("a: &a [{xs}]\nb: [{refs}]\n")
+    }
+
+    /// Non-vacuity (checked FIRST): the collector really extracts frontmatter var names,
+    /// so the swallow tests below are not passing on an empty scan.
+    #[test]
+    fn collect_facts_frontmatter_vars_non_vacuous() {
+        let src = fm_doc("name: x\n");
+        let module = parse(&src);
+        let ctx = collect_facts(&module, false, &src).unwrap();
+        assert!(
+            ctx.frontmatter_vars.iter().any(|f| f.name == "name"),
+            "expected `name` frontmatter var, got {:?}",
+            ctx.frontmatter_vars
+        );
+    }
+
+    /// A plain YAML syntax error stays swallowed (lenient): no vars, no error — the
+    /// resolver surfaces the real diagnostic.
+    #[test]
+    fn collect_facts_swallows_syntax_error() {
+        let src = fm_doc("a: [\n");
+        let module = parse(&src);
+        let ctx = collect_facts(&module, false, &src).unwrap();
+        assert!(
+            ctx.frontmatter_vars.is_empty(),
+            "malformed frontmatter must yield no vars and no error"
+        );
+    }
+
+    /// A resource-limit error (node budget) is NOT swallowed — it propagates so the lint
+    /// pass fails closed on an amplification attack.
+    #[test]
+    fn collect_facts_propagates_resource_limit() {
+        let src = fm_doc(&alias_bomb_fm());
+        let module = parse(&src);
+        let r = collect_facts(&module, false, &src);
+        assert!(
+            matches!(r, Err(MdsError::ResourceLimit { .. })),
+            "alias bomb must propagate a resource limit, got {r:?}"
+        );
+    }
+
     /// AC-PERF-04: Nesting deeper than MAX_NESTING_DEPTH (64) returns ResourceLimit.
     #[test]
     fn collect_facts_depth_limit_enforced() {

@@ -59,6 +59,31 @@ pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;
 /// 256 entries is generous for any real template.
 pub(crate) const MAX_FRONTMATTER_IMPORTS: usize = 256;
 
+/// Maximum byte length of one frontmatter YAML block (1 MiB).
+///
+/// Checked by `resolver::frontmatter::parse_frontmatter_yaml` before any YAML work: the
+/// `serde_yaml_ng` loader is eager (it drains the whole document into an event vector
+/// before deserialising), so the cap must sit in front of it. Frontmatter is variable
+/// data, not prose: 1 MiB is on the order of 50 000 `key: value` lines, while the body
+/// keeps the 10 MiB `MAX_FILE_SIZE` bound. Exceeding this surfaces as
+/// `mds::resource_limit` (CLI exit 3). See #162.
+pub(crate) const MAX_FRONTMATTER_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of YAML nodes one frontmatter block may materialise (200 000).
+///
+/// Counted while `serde_yaml_ng` deserialises (every scalar, null, sequence, mapping,
+/// mapping key and `!tag` wrapper is one node), so the parse fails before the tree is
+/// built. This is the alias bound: an `&anchor` referenced by many `*alias`es expands at
+/// deserialise time, so a block under `MAX_FRONTMATTER_SIZE` could otherwise demand on
+/// the order of size^2/24 nodes (about 4 x 10^10 for 1 MiB). `serde_yaml_ng`'s own
+/// repetition limit counts alias jumps, not nodes, and does not catch one large anchor
+/// referenced a few thousand times. An alias-free block needs at least 2 bytes per node
+/// (`[x,x,...]`), so under the size cap it stays around 525 000 nodes at most and a
+/// realistic `key: value` block near 100 000; 200 000 rejects only amplification and
+/// bounds the materialised tree at a few tens of MB per parse. Exceeding this surfaces
+/// as `mds::resource_limit`. See #162.
+pub(crate) const MAX_FRONTMATTER_NODES: usize = 200_000;
+
 /// Maximum number of messages a `@message`-bearing template may produce.
 ///
 /// Prevents runaway memory use from adversarial inputs that generate thousands

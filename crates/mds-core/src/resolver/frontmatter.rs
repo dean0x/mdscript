@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 
 use crate::error::MdsError;
-use crate::limits::{MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH};
+use crate::limits::{
+    MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH, MAX_FRONTMATTER_NODES,
+    MAX_FRONTMATTER_SIZE,
+};
 use crate::parser::is_valid_identifier;
 use crate::scope::Scope;
 use crate::value::Value;
@@ -126,6 +129,22 @@ pub(super) fn deep_merge_yaml(
     }
 
     Ok(result)
+}
+
+// STUB (RED commit): unbounded parse, no size cap, no node budget. The GREEN commit
+// replaces the body of `parse_frontmatter_yaml_bounded` with the budgeted choke point
+// (1 MiB size cap + node budget). Present only so the boundary tests compile and fail
+// behaviourally rather than at link time.
+pub(crate) fn parse_frontmatter_yaml(raw: &str) -> Result<serde_yaml_ng::Value, MdsError> {
+    parse_frontmatter_yaml_bounded(raw, MAX_FRONTMATTER_SIZE, MAX_FRONTMATTER_NODES)
+}
+
+fn parse_frontmatter_yaml_bounded(
+    raw: &str,
+    _max_bytes: usize,
+    _max_nodes: usize,
+) -> Result<serde_yaml_ng::Value, MdsError> {
+    serde_yaml_ng::from_str(raw).map_err(|e| MdsError::yaml_error(e.to_string()))
 }
 
 /// Build a scope from a pre-merged `Mapping` and runtime variable overrides.
@@ -305,6 +324,10 @@ pub(crate) fn parse_frontmatter_imports(raw: &str) -> Result<Vec<FrontmatterImpo
 
     parse_frontmatter_imports_from_yaml(imports_val)
 }
+
+#[cfg(test)]
+#[path = "frontmatter_tests.rs"]
+mod frontmatter_tests;
 
 #[cfg(test)]
 mod tests {

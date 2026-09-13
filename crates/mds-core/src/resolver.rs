@@ -24,7 +24,8 @@ use crate::value::Value;
 
 use frontmatter::{build_scope_from_merged_mapping, deep_merge_yaml};
 pub(crate) use frontmatter::{
-    parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, FrontmatterImport,
+    parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
+    FrontmatterImport,
 };
 use inheritance::{
     apply_block_overrides, check_child_only_blocks, seed_effective_blocks, splice_skeleton,

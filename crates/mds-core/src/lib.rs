@@ -1782,6 +1782,35 @@ mod tests {
 
     // ── scan_imports: frontmatter imports paths ───────────────────────────────
 
+    /// #162: a frontmatter alias-fan-out bomb must make `scan_imports` fail closed with a
+    /// resource limit rather than silently return only body imports.
+    #[test]
+    fn scan_imports_frontmatter_bomb_propagates_resource_limit() {
+        let xs = vec!["x"; 1000].join(", ");
+        let refs = vec!["*a"; 400].join(", ");
+        let source = format!("---\na: &a [{xs}]\nb: [{refs}]\n---\nHi\n");
+        let r = scan_imports(&source);
+        assert!(
+            matches!(r, Err(crate::MdsError::ResourceLimit { .. })),
+            "frontmatter bomb must propagate a resource limit, got {r:?}"
+        );
+    }
+
+    /// A plain frontmatter YAML syntax error stays best-effort: `scan_imports` swallows it
+    /// and still returns the body imports.
+    #[test]
+    fn scan_imports_frontmatter_syntax_error_is_lenient() {
+        let source = concat!(
+            "---\n",
+            "imports: [\n", // malformed YAML — never closes
+            "---\n",
+            "@import \"./x.mds\"\n",
+            "Hi\n",
+        );
+        let paths = scan_imports(source).expect("syntax error in FM must be swallowed");
+        assert_eq!(paths, vec!["./x.mds".to_string()]);
+    }
+
     #[test]
     fn scan_imports_fm_alias() {
         let source = concat!(
