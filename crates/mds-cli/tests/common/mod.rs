@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,6 +69,74 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
         start += pos + needle.len();
     }
     count
+}
+
+// ── Atomic file replacement ──────────────────────────────────────────────────
+
+/// Monotonic counter making every [`write_atomic`] temp name unique within a
+/// process; the pid disambiguates across processes.
+static WRITE_ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Replace `path`'s contents in ONE filesystem event, the way an editor does: write a
+/// fresh temp file in the same directory, then `rename` it over `path`.
+///
+/// Why: `std::fs::write` truncates before it writes, so a zero-debounce watcher can
+/// compile the 0-byte intermediate — CI run 34366009518 on 2b91850 printed two
+/// `Recompiled` lines for one write. notify 8 surfaces the rename as
+/// `Modify(Name(RenameMode::To))` on the destination path, which the watcher treats
+/// as a content event.
+///
+/// The temp name is `.<name>.tmp-<pid>-<n>` — the suffix goes AFTER the name so
+/// `Path::extension()` is never `mds`: `collect_mds_files_inner` (output.rs) and the
+/// dir-mode event filter (watch.rs) gate on exactly that, so an in-flight temp file
+/// is invisible to both.
+///
+/// No fsync: `rename` orders the replacement for every live process, which is all a
+/// watcher needs. The product's own readiness marker is written the same way.
+///
+/// Deliberate non-user: `watch_single_status_line_per_rebuild`, whose subject IS the
+/// coalescing of the truncate+write pair.
+///
+/// The Windows sharing-violation caveat (a rename over a file another process holds
+/// open can fail) is developer-machine only; CI runs this suite on ubuntu.
+///
+/// # Panics
+/// Panics if `path` has no parent or no file name, or if either filesystem step
+/// fails — a test whose edit did not land is a defect, not a slow machine.
+#[allow(dead_code)]
+pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) {
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| panic!("write_atomic: path has no parent: {}", path.display()));
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| panic!("write_atomic: path has no file name: {}", path.display()));
+    let seq = WRITE_ATOMIC_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        seq
+    ));
+    debug_assert_ne!(
+        tmp.extension().and_then(|e| e.to_str()),
+        Some("mds"),
+        "write_atomic temp name must never end in .mds; it would be collected as a source"
+    );
+    if let Err(e) = std::fs::write(&tmp, contents.as_ref()) {
+        panic!(
+            "write_atomic: cannot write temp file {}: {e}",
+            tmp.display()
+        );
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        panic!(
+            "write_atomic: cannot rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        );
+    }
 }
 
 // ── Watch readiness handshake ────────────────────────────────────────────────
