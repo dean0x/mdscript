@@ -212,7 +212,10 @@ impl ChildGuard {
 pub struct PipeTap {
     buf: Arc<Mutex<Vec<u8>>>,
     /// `Option` because `finish` takes the handle out; behind `Arc<Mutex<_>>` so
-    /// `PipeTap` stays `Clone` (several tests hand a clone to a helper).
+    /// `PipeTap` stays `Clone`. `Clone` is harness API — it lets a tap be shared with
+    /// a helper thread — and the mutex is what makes that safe: a clone calling
+    /// `finish` concurrently blocks on this slot until the drain has been joined, and
+    /// then observes the fully drained buffer. No call site clones a tap today.
     drain: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 

@@ -16,9 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file written to continuously still rebuilds and the idle-tick liveness probe cannot
   be starved; raw values are clamped to 60 s (`--debounce 18446744073709551615`
   previously watched forever without ever rebuilding); `--debounce 0` still means no
-  coalescing. No new output. Known cost: in directory mode every event opens a window,
-  including events under excluded directories that are filtered afterwards, so
-  `npm install` churn can delay a real edit and the idle tick by up to the cap.
+  coalescing. No new output. Known cost, in both modes: an event that is not the edit
+  you care about can still extend an open window, because relevance is not re-derived
+  per message inside it — in directory mode every event also *opens* one (events under
+  excluded directories are filtered only afterwards), while in file mode the entry's
+  parent directory is watched non-recursively, so a sibling scratch write by an editor
+  extends a window a real edit has already opened. Either way `npm install` churn or a
+  noisy editor can delay a real edit and the idle tick by up to the cap.
 
 ### Fixed
 
