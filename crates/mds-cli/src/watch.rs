@@ -3844,6 +3844,36 @@ mod tests {
         );
     }
 
+    /// A dropped sender ends the window at once rather than waiting it out.
+    ///
+    /// The sender lives as long as the watcher, so a disconnect means the watcher is
+    /// gone. Sitting out the remaining window there would delay shutdown by up to the
+    /// cap for no possible gain: no further event can ever arrive.
+    #[test]
+    fn debounce_disconnected_ends_the_window_immediately() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        // One event already queued, so the drain has something to collect before it
+        // reaches the disconnect — the exit must not discard it.
+        tx.send(modify_event("/w/a.mds")).expect("send failed");
+        drop(tx);
+
+        let t0 = Instant::now();
+        let outcome = drain_debounce(&rx, 5_000);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(outcome.end, DebounceEnd::Disconnected);
+        assert_eq!(
+            outcome.paths.len(),
+            1,
+            "messages queued before the disconnect must still be collected; got {:?}",
+            outcome.paths
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a disconnect must end a 5s window immediately; got {elapsed:?}"
+        );
+    }
+
     /// The clamp contract, verifiable without the watch loop.
     #[test]
     fn clamp_debounce_contract() {
