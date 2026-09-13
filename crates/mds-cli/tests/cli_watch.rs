@@ -19,9 +19,10 @@
 //! a path the watcher is watching (the `.mds` source, an imported partial, the
 //! `--vars` file, an external dependency). Pre-spawn fixture writes, `.git` markers,
 //! `mds.json`, and output files keep `std::fs::write`. Two post-spawn writes are
-//! deliberate exceptions and say so inline: `watch_single_status_line_per_rebuild`
-//! and `watch_debounce_single_rebuild_from_burst`, whose subject IS the truncate+write
-//! pair that `write_atomic` collapses.
+//! deliberate exceptions and say so inline: `watch_single_status_line_per_rebuild`,
+//! whose subject IS the truncate+write pair that `write_atomic` collapses, and
+//! `watch_debounce_single_rebuild_from_burst`, which keeps plain writes because they
+//! double the event load its coalescing claim has to survive.
 //!
 //! Flakiness mitigations:
 //! - Assert on output FILE content rather than stderr ordering.
@@ -1160,10 +1161,20 @@ fn watch_ctrl_c_prints_stopped_watching() {
 
 // ── AC-P1: Debounce coalesces burst — count rebuild summary lines ──────────
 
-/// Burst of ~10 writes within a 250ms debounce window must produce exactly 1
-/// "Recompiled " line in stderr.  250ms is large enough to be reliable on CI;
-/// if the filesystem splits the burst into two windows, the test permits <= 2
-/// rebuilds (documented below) but asserts == 1 as the expected case.
+/// A save burst LONGER than the debounce window is still one rebuild (#379).
+///
+/// The old shape of this test wrote a burst that fit inside the window and then
+/// tolerated a second rebuild, so the property it advertised — one rebuild per burst —
+/// was never actually pinned. It failed as `got 3` on loaded CI runners (runs
+/// 33996153739, 33976595173, 33753123463), each of the three compiles seeing a
+/// different intermediate state of the file.
+///
+/// The burst here is deliberately longer than the window: 12 writes, 30ms apart, so at
+/// least 330ms against a 250ms window. Under a window that expires at a fixed offset from
+/// the FIRST event that is two or three rebuilds; under a quiet period it is one,
+/// because no gap between writes ever reaches 250ms. `--poll-interval` is left at its
+/// default so the idle-tick liveness probe stays live — a stronger claim than
+/// disabling it.
 #[test]
 fn watch_debounce_single_rebuild_from_burst() {
     let dir = tempfile::tempdir().unwrap();
@@ -1171,7 +1182,6 @@ fn watch_debounce_single_rebuild_from_burst() {
     std::fs::write(&src, "---\nname: v0\n---\nBurst {{name}}!\n").unwrap();
     let out = dir.path().join("burst.md");
 
-    // Use a 250ms debounce — large enough to reliably swallow the ~10 × 5ms burst.
     let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "250"])
@@ -1184,43 +1194,143 @@ fn watch_debounce_single_rebuild_from_burst() {
         "initial compile should produce Burst v0!"
     );
 
-    // Write 10 rapid edits within the 250ms debounce window.
     // DELIBERATE: this test's subject is the debounce window collapsing a burst of
-    // truncate+write pairs, so it keeps plain writes. Every other post-spawn write in
-    // this file goes through `write_atomic`.
-    for i in 1..=10u32 {
+    // truncate+write pairs, so it keeps plain writes — they double the event load
+    // that `write_atomic` would collapse into one rename. Every other post-spawn write
+    // in this file goes through `write_atomic`.
+    let mut stamps: Vec<Instant> = Vec::with_capacity(12);
+    for i in 1..=12u32 {
         std::fs::write(&src, format!("---\nname: v{i}\n---\nBurst {{{{name}}}}!\n")).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
+        stamps.push(Instant::now());
+        std::thread::sleep(Duration::from_millis(30));
     }
 
-    // Wait for the debounced rebuild to settle (debounce window + generous FSEvent latency).
+    // Self-diagnosing preconditions, asserted BEFORE the outcome: if the burst this
+    // process actually produced was not longer than the window, or had a gap wide
+    // enough to legitimately close it, the outcome assertion below would be measuring
+    // the scheduler rather than the watcher.
+    let span = stamps[stamps.len() - 1].duration_since(stamps[0]);
+    let max_gap = stamps
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]))
+        .max()
+        .expect("burst has at least two writes");
     assert!(
-        wait_for_file_contains(&out, "Burst v10!", TIMEOUT),
-        "after burst, output should reflect final value v10"
-    );
-
-    // Wait an extra moment to ensure no trailing rebuilds are in-flight.
-    std::thread::sleep(Duration::from_millis(400));
-
-    // Kill child and collect all stderr.
-    let stderr_str = stderr_tap.finish_text(&mut child);
-
-    // Count "Recompiled " lines (each rebuild emits exactly one such line).
-    let rebuild_count = stderr_str.matches("Recompiled ").count();
-
-    // Expected: exactly 1 rebuild from the burst.
-    // Allow <= 2 as a documented tolerance: on a heavily loaded CI machine the
-    // 250ms window may occasionally be split by an FSEvent scheduling gap, yielding
-    // a second rebuild for the tail of the burst.  The important property is that
-    // we do NOT get 10 individual rebuilds.
-    assert!(
-        rebuild_count >= 1,
-        "at least one rebuild must have occurred, got 0; stderr: {stderr_str}"
+        span > Duration::from_millis(250),
+        "precondition: the burst must outlast the 250ms window, else the test proves \
+         nothing about extension; span was {span:?}"
     );
     assert!(
-        rebuild_count <= 2,
-        "debounce should coalesce burst into <= 2 rebuilds, got {rebuild_count}; \
-         stderr: {stderr_str}"
+        max_gap < Duration::from_millis(250),
+        "precondition: no gap between writes may reach the 250ms window, else the \
+         window is entitled to close mid-burst; largest gap was {max_gap:?}"
+    );
+
+    // WAIT ONLY — the assertion is the count below, taken from the joined tap.
+    wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", TIMEOUT);
+    let stderr = stderr_tap.finish_text(&mut child);
+
+    assert_eq!(
+        count_occurrences(&stderr, "Recompiled "),
+        1,
+        "a {span:?} burst with a largest gap of {max_gap:?} must coalesce into exactly \
+         one rebuild under a 250ms quiet period; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, "Compiled to"),
+        1,
+        "the startup compile is the only 'Compiled to' line; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "Burst v12!\n",
+        "the single rebuild must compile the FINAL state of the burst, not an \
+         intermediate one; stderr was:\n{stderr}"
+    );
+}
+
+/// The cap rebuilds a file that is never left alone (#379).
+///
+/// A quiet period that can always be extended is unbounded: a writer that never
+/// pauses postpones its own rebuild for as long as it keeps writing. `--poll-interval 0`
+/// turns the idle-tick liveness probe off, so within this test the cap is the ONLY
+/// mechanism that can produce a rebuild while the stream is running — and it is also
+/// the reason the probe cannot be starved in the configurations that do enable it,
+/// since the loop never reaches `TickClock::recv_next` while a window is open.
+#[test]
+fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hot.mds");
+    std::fs::write(&src, "---\nname: v0\n---\nHot {{name}}!\n").unwrap();
+    let out = dir.path().join("hot.md");
+
+    // --debounce 200 => cap = max(10 x 200ms, 1s) = 2s.
+    let (mut child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--debounce",
+                "200",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "Hot v0!", TIMEOUT),
+        "initial compile should produce Hot v0!"
+    );
+
+    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let writer_flag = std::sync::Arc::clone(&writing);
+    let writer_src = src.clone();
+    let writer = std::thread::spawn(move || {
+        let stop_at = Instant::now() + Duration::from_secs(3);
+        let mut max_gap = Duration::ZERO;
+        let mut last = Instant::now();
+        // Doubly bounded: <= 3s of wall clock AND <= 2000 iterations.
+        for i in 1..=2_000u32 {
+            if Instant::now() >= stop_at {
+                break;
+            }
+            write_atomic(
+                &writer_src,
+                format!("---\nname: v{i}\n---\nHot {{{{name}}}}!\n"),
+            );
+            let now = Instant::now();
+            max_gap = max_gap.max(now.duration_since(last));
+            last = now;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        writer_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        max_gap
+    });
+
+    // The cap is 2s; allow the compile that follows it to land inside the bound.
+    wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", Duration::from_millis(3500));
+    let rebuilt_while_writing = writing.load(std::sync::atomic::Ordering::SeqCst);
+
+    let max_gap = writer.join().expect("writer thread panicked");
+    assert!(
+        max_gap < Duration::from_millis(200),
+        "precondition: no gap in the write stream may reach the 200ms window, else a \
+         quiet period could legitimately have ended it; largest gap was {max_gap:?}"
+    );
+    assert!(
+        rebuilt_while_writing,
+        "a rebuild must happen WHILE the writes are still arriving — that is what the \
+         cap is for; nothing was seen until the stream stopped"
+    );
+
+    let stderr = stderr_tap.finish_text(&mut child);
+    let rebuilds = count_occurrences(&stderr, "Recompiled ");
+    assert!(
+        (1..=4).contains(&rebuilds),
+        "3s of writes under a 200ms window with a 2s cap is one capped rebuild plus \
+         the quiet-period rebuild that follows the last write; a fixed 200ms window \
+         would give ~15. Got {rebuilds}; stderr was:\n{stderr}"
     );
 }
 

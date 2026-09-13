@@ -592,48 +592,138 @@ impl TickClock {
 
 // ── Debounce loop ─────────────────────────────────────────────────────────────
 
-/// Drain the channel for `debounce_ms` milliseconds, collecting all changed paths.
+/// Upper bound on the messages one window will drain.
 ///
-/// Returns `(paths, interrupted)`.
-/// - `paths`: all file paths seen in notify events during the window.
-/// - `interrupted`: true if an Interrupt message was received.
-///
-/// The loop is bounded: it ends when `Instant::now() >= deadline` or when
-/// `interrupted` is true.
-fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> (BTreeSet<PathBuf>, bool) {
-    let mut paths = BTreeSet::new();
-    if debounce_ms == 0 {
-        return (paths, false);
+/// TEMPORARY: set so high that the bound is unreachable, which is exactly today's
+/// behaviour — one window drains however many messages arrive in it.
+const MAX_DEBOUNCE_MESSAGES: usize = 1_000_000;
+
+/// Why a debounce window ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebounceEnd {
+    /// `--debounce 0`: coalescing is off; no window was ever opened.
+    Disabled,
+    /// A full window passed with no further content event: the intended exit.
+    Quiet,
+    /// The absolute cap elapsed while events were still arriving.
+    Cap,
+    /// `MAX_DEBOUNCE_MESSAGES` messages were drained in this window.
+    MessageLimit,
+    /// Ctrl+C. The caller must stop, not rebuild.
+    Interrupted,
+    /// The watcher's sender was dropped.
+    Disconnected,
+}
+
+/// Result of one debounce window.
+struct DebounceOutcome {
+    /// Every path seen in a content event during the window.
+    paths: BTreeSet<PathBuf>,
+    /// Why the window ended.
+    end: DebounceEnd,
+}
+
+impl DebounceOutcome {
+    fn interrupted(&self) -> bool {
+        self.end == DebounceEnd::Interrupted
     }
-    let deadline = Instant::now() + Duration::from_millis(debounce_ms);
-    loop {
+}
+
+/// Convert a raw `--debounce` value (milliseconds) into a quiet-period window.
+///
+/// - `0` -> `None`: coalescing disabled, every event rebuilds immediately.
+/// - nonzero -> `Some(min(value, 60s))`.
+///
+/// Extracted so the clamp contract is verifiable without the watch loop, exactly as
+/// [`clamp_poll_interval`] is.
+///
+/// TEMPORARY: the clamp is not applied yet; the raw value is passed through.
+fn clamp_debounce(debounce_ms: u64) -> Option<Duration> {
+    if debounce_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(debounce_ms))
+    }
+}
+
+/// Absolute bound on one debounce window.
+///
+/// TEMPORARY: returns a value so large that today's fixed window is always the binding
+/// deadline, which makes the current (uncapped, non-extending) behaviour observable
+/// through the same code shape the real cap will use.
+fn debounce_cap(_window: Duration) -> Duration {
+    Duration::from_secs(u32::MAX as u64)
+}
+
+/// Coalesce a burst of filesystem events into one rebuild.
+///
+/// TEMPORARY: the window is still a FIXED offset from the first event — `deadline` is
+/// computed once and never extended — so a burst longer than `debounce_ms` is split
+/// across two or more windows and rebuilt once per window. The `Cap` and
+/// `MessageLimit` exits are wired into the classification but their bounds are set
+/// beyond reach, so they cannot be taken.
+fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome {
+    let mut paths = BTreeSet::new();
+
+    let Some(window) = clamp_debounce(debounce_ms) else {
+        // `--debounce 0`: no coalescing. The channel is left untouched, so the next
+        // event is delivered to the loop as its own batch.
+        return DebounceOutcome {
+            paths,
+            end: DebounceEnd::Disabled,
+        };
+    };
+
+    let start = Instant::now();
+    let hard_cap = start + debounce_cap(window);
+    let deadline = start + window;
+    let mut messages: usize = 0;
+
+    let end = loop {
+        if messages >= MAX_DEBOUNCE_MESSAGES {
+            break DebounceEnd::MessageLimit;
+        }
+
         let now = Instant::now();
         if now >= deadline {
-            break;
+            break if deadline == hard_cap {
+                DebounceEnd::Cap
+            } else {
+                DebounceEnd::Quiet
+            };
         }
-        let remaining = deadline - now;
-        match rx.recv_timeout(remaining) {
-            Ok(Msg::Fs(Ok(event))) => {
-                // Drop Access events (inotify IN_ACCESS/IN_OPEN/IN_CLOSE_NOWRITE)
-                // — reads must not trigger recompiles; see is_content_event.
-                if is_content_event(&event.kind) {
-                    for p in event.paths {
-                        paths.insert(p);
+
+        match rx.recv_timeout(deadline - now) {
+            Ok(msg) => {
+                messages += 1;
+                match msg {
+                    Msg::Fs(Ok(event)) => {
+                        // Drop Access events (inotify IN_ACCESS/IN_OPEN/IN_CLOSE_NOWRITE)
+                        // — reads must not trigger recompiles; see is_content_event.
+                        if !is_content_event(&event.kind) {
+                            continue;
+                        }
+                        for p in event.paths {
+                            paths.insert(p);
+                        }
                     }
+                    Msg::Fs(Err(e)) => {
+                        eprint_warning(&format!(
+                            "warning: watch error during debounce: {}",
+                            safe_inline(&e)
+                        ));
+                    }
+                    Msg::Interrupt => break DebounceEnd::Interrupted,
                 }
             }
-            Ok(Msg::Fs(Err(e))) => {
-                eprint_warning(&format!(
-                    "warning: watch error during debounce: {}",
-                    safe_inline(&e)
-                ));
-            }
-            Ok(Msg::Interrupt) => return (paths, true),
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            // The deadline is the single decision point: re-loop and let the checks
+            // above classify the exit.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break DebounceEnd::Disconnected,
         }
-    }
-    (paths, false)
+    };
+
+    DebounceOutcome { paths, end }
 }
 
 // ── Poll-interval clamp (ADR-021) ─────────────────────────────────────────────
@@ -908,8 +998,9 @@ fn handle_fs_event_file(
     }
 
     // Drain the debounce window.
-    let (_extra_paths, interrupted2) = drain_debounce(rx, debounce_ms);
-    if interrupted2 {
+    // The drained paths are discarded: file mode has already decided relevance above
+    // and rebuilds its single entry regardless of which path moved.
+    if drain_debounce(rx, debounce_ms).interrupted() {
         return FileEventAction::Stop;
     }
 
@@ -1932,11 +2023,11 @@ fn handle_fs_event_dir(
     }
 
     // Drain debounce window.
-    let (extra, interrupted2) = drain_debounce(rx, ctx.debounce_ms);
-    changed.extend(extra);
-    if interrupted2 {
+    let drained = drain_debounce(rx, ctx.debounce_ms);
+    if drained.interrupted() {
         return DirEventOutcome::Stop;
     }
+    changed.extend(drained.paths);
 
     // Defense-in-depth: ignore events from inside the out-dir subtree.
     if let OutputBase::Dir(ref od) = ctx.output_base {
@@ -3399,6 +3490,315 @@ mod tests {
                 Err(mpsc::RecvTimeoutError::Disconnected)
             ),
             "a closed channel must report Disconnected rather than tick forever"
+        );
+    }
+
+    // ── Debounce window domain (#379) ────────────────────────────────────────
+
+    /// A minimal content event on `path`, shaped like the ones notify delivers.
+    fn modify_event(path: &str) -> Msg {
+        Msg::Fs(Ok(notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![PathBuf::from(path)],
+            attrs: Default::default(),
+        }))
+    }
+
+    /// A read event — the kind `is_content_event` drops.
+    fn access_event(path: &str) -> Msg {
+        Msg::Fs(Ok(notify::Event {
+            kind: notify::EventKind::Access(notify::event::AccessKind::Read),
+            paths: vec![PathBuf::from(path)],
+            attrs: Default::default(),
+        }))
+    }
+
+    /// Run `drain_debounce` on a worker thread and refuse to wait past `bound`.
+    ///
+    /// The function under test is meant to be bounded. A mutation that removes the
+    /// bound would otherwise hang the test binary until the harness's own timeout,
+    /// which reports as an infrastructure problem rather than as a failed contract.
+    /// Collecting the result through a `recv_timeout` turns that mutation into a
+    /// clean, named failure at `bound`.
+    ///
+    /// The worker thread is deliberately not joined on the timeout path: it is
+    /// blocked precisely because the bound it should have honoured is gone, so
+    /// joining it would reintroduce the hang this exists to prevent.
+    fn drain_bounded(
+        rx: mpsc::Receiver<Msg>,
+        debounce_ms: u64,
+        bound: Duration,
+        why: &str,
+    ) -> DebounceOutcome {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = drain_debounce(&rx, debounce_ms);
+            // The receiver may already have given up; the send failing is fine.
+            let _ = done_tx.send(outcome);
+        });
+        done_rx.recv_timeout(bound).unwrap_or_else(|e| {
+            panic!("drain_debounce did not return within {bound:?} ({e:?}): {why}")
+        })
+    }
+
+    /// Every content event restarts the window: a burst longer than the window
+    /// coalesces into ONE result, not one per window's worth of burst.
+    ///
+    /// A window that expired at a fixed offset from the FIRST event splits any burst
+    /// longer than `debounce_ms`; each piece rebuilds separately, against a different
+    /// intermediate state of the file.
+    #[test]
+    fn debounce_quiet_period_extends_on_content_events() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        // 40 events, 5ms apart: a ~200ms burst under a 100ms window.
+        let sender = std::thread::spawn(move || {
+            for i in 0..40u32 {
+                if tx.send(modify_event(&format!("/w/f{i}.mds"))).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let t0 = Instant::now();
+        let outcome = drain_bounded(
+            rx,
+            100,
+            Duration::from_secs(3),
+            "a burst of content events must not postpone the window forever",
+        );
+        let elapsed = t0.elapsed();
+        sender.join().expect("sender thread panicked");
+
+        assert_eq!(
+            outcome.end,
+            DebounceEnd::Quiet,
+            "a 200ms burst under a 100ms window must end quiet, not capped"
+        );
+        assert_eq!(
+            outcome.paths.len(),
+            40,
+            "every path in the burst must be collected into the one window; got {:?}",
+            outcome.paths
+        );
+        assert!(
+            elapsed >= Duration::from_millis(240) && elapsed <= Duration::from_millis(900),
+            "the window must outlast the burst (>=200ms) and then close one window \
+             later (~100ms), so ~300ms; got {elapsed:?}"
+        );
+    }
+
+    /// The cap ends a stream that never goes quiet.
+    ///
+    /// Without it an extendable window is unbounded: a file written to continuously
+    /// postpones its own rebuild — and the idle-tick backstop behind it — for as long
+    /// as the writing lasts.
+    #[test]
+    fn debounce_cap_ends_a_continuous_stream() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        // Events every 2ms for ~2s: never a 50ms gap, so the window never goes quiet.
+        let sender = std::thread::spawn(move || {
+            // Bounded: at most 1000 iterations regardless of timing.
+            for _ in 0..1000u32 {
+                if tx.send(modify_event("/w/hot.mds")).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let t0 = Instant::now();
+        let outcome = drain_bounded(
+            rx,
+            50,
+            Duration::from_secs(3),
+            "an unbounded window never returns while writes continue",
+        );
+        let elapsed = t0.elapsed();
+        sender.join().expect("sender thread panicked");
+
+        assert_eq!(
+            outcome.end,
+            DebounceEnd::Cap,
+            "a continuous stream must end the window at the cap, not quiet"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(1600),
+            "cap for a 50ms window is max(500ms, 1s) = 1s; got {elapsed:?}"
+        );
+    }
+
+    /// `--debounce 0` opens no window and consumes nothing.
+    #[test]
+    fn debounce_zero_is_disabled_and_leaves_the_channel_untouched() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        tx.send(modify_event("/w/a.mds")).expect("send failed");
+
+        let t0 = Instant::now();
+        let outcome = drain_debounce(&rx, 0);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(outcome.end, DebounceEnd::Disabled);
+        assert!(
+            outcome.paths.is_empty(),
+            "a disabled window must collect nothing"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "a disabled window must return immediately; got {elapsed:?}"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(Msg::Fs(Ok(_)))),
+            "the queued event must still be in the channel: with coalescing off the \
+             loop delivers it as its own batch"
+        );
+    }
+
+    /// Ctrl+C ends the window at once, however long the window had left.
+    #[test]
+    fn debounce_interrupt_returns_immediately() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = tx.send(Msg::Interrupt);
+        });
+
+        let t0 = Instant::now();
+        let outcome = drain_bounded(
+            rx,
+            5_000,
+            Duration::from_secs(2),
+            "Ctrl+C must not wait out the window",
+        );
+        let elapsed = t0.elapsed();
+        sender.join().expect("sender thread panicked");
+
+        assert_eq!(outcome.end, DebounceEnd::Interrupted);
+        assert!(
+            outcome.interrupted(),
+            "interrupted() must agree with the end reason"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "an interrupt must end a 5s window immediately; got {elapsed:?}"
+        );
+    }
+
+    /// Reads do not extend the window.
+    ///
+    /// The compile reads its own sources, so an extending `Access` event would let the
+    /// watcher hold its own window open.
+    #[test]
+    fn debounce_access_events_do_not_extend() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let sender = std::thread::spawn(move || {
+            if tx.send(modify_event("/w/a.mds")).is_err() {
+                return;
+            }
+            // Bounded: at most 60 iterations (~300ms) regardless of timing.
+            for _ in 0..60u32 {
+                if tx.send(access_event("/w/a.mds")).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let t0 = Instant::now();
+        let outcome = drain_bounded(
+            rx,
+            100,
+            Duration::from_secs(3),
+            "a stream of reads must not hold the window open",
+        );
+        let elapsed = t0.elapsed();
+        sender.join().expect("sender thread panicked");
+
+        assert_eq!(outcome.end, DebounceEnd::Quiet);
+        assert_eq!(
+            outcome.paths.len(),
+            1,
+            "only the one content event contributes a path; got {:?}",
+            outcome.paths
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "300ms of reads must not extend a 100ms window past ~100ms; got {elapsed:?}"
+        );
+    }
+
+    /// One window drains a bounded number of messages.
+    ///
+    /// The cap bounds the window's duration; this bounds its work and its memory. A
+    /// sender faster than the drain would otherwise grow `paths` without limit inside
+    /// a single window.
+    #[test]
+    fn debounce_message_limit_bounds_one_window() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        // Pre-queued so the drain is never waiting on the sender.
+        for _ in 0..12_000u32 {
+            tx.send(modify_event("/w/same.mds")).expect("send failed");
+        }
+
+        let t0 = Instant::now();
+        let outcome = drain_bounded(
+            rx,
+            100,
+            Duration::from_secs(5),
+            "an unbounded message count lets a fast sender own the window",
+        );
+        let elapsed = t0.elapsed();
+        drop(tx);
+
+        assert_eq!(
+            outcome.end,
+            DebounceEnd::MessageLimit,
+            "12 000 queued events must hit the message bound, not the quiet period"
+        );
+        assert_eq!(
+            outcome.paths.len(),
+            1,
+            "all 12 000 events name the same path; got {:?}",
+            outcome.paths
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the bound must be reached promptly; got {elapsed:?}"
+        );
+    }
+
+    /// The clamp contract, verifiable without the watch loop.
+    #[test]
+    fn clamp_debounce_contract() {
+        assert_eq!(
+            clamp_debounce(0),
+            None,
+            "0 disables coalescing; it does not mean a 0ms window"
+        );
+        assert_eq!(clamp_debounce(100), Some(Duration::from_millis(100)));
+        assert_eq!(
+            clamp_debounce(u64::MAX),
+            Some(Duration::from_secs(60)),
+            "an unclamped u64::MAX window does not overflow on a monotonic clock — it \
+             lands ~585 million years out, so the watcher silently never rebuilds"
+        );
+    }
+
+    /// The cap contract: `max(10 x window, 1s)`.
+    #[test]
+    fn debounce_cap_contract() {
+        assert_eq!(
+            debounce_cap(Duration::from_millis(10)),
+            Duration::from_secs(1),
+            "the floor binds for small windows"
+        );
+        assert_eq!(
+            debounce_cap(Duration::from_millis(250)),
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(
+            debounce_cap(Duration::from_millis(1_000)),
+            Duration::from_secs(10)
         );
     }
 
