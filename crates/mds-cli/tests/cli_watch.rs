@@ -4783,3 +4783,64 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
 
     drop(child);
 }
+
+// ── Stderr capture completeness (#320) ──────────────────────────────────────
+
+/// The tap must hand back every byte the child wrote, not a prefix of it.
+///
+/// `StderrTap::bytes` clones the shared buffer without any happens-before edge to the
+/// drain thread's last write. Reaping the child closes its write end and ends the
+/// drain loop, but nothing makes the reader observe that the loop has finished, so a
+/// snapshot taken right after `kill` + `wait` can be a truncated prefix. The suite hid
+/// that behind a `thread::sleep` at every such site.
+///
+/// A dir watcher over 500 sources announces `Compiled to` once per file at startup, so
+/// the expected count is exact and any lost tail shows up as a shortfall rather than
+/// as a vague "looks empty". The `Compiled to` lines are also the positive control:
+/// a count of 0 would mean the watcher compiled nothing, not that the tap is sound.
+///
+/// macOS has not been observed to lose the tail; the field signature is Linux
+/// (`cli_watch.rs:520` in CI runs 32954883014 and 32954876042). The Linux soak is the
+/// instrument for this one.
+#[test]
+fn stderr_tap_finish_captures_every_line_the_child_wrote() {
+    const FILE_COUNT: usize = 500;
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    for i in 1..=FILE_COUNT {
+        std::fs::write(
+            dir.path().join(format!("file_{i:04}.mds")),
+            format!("drain-{i}\n"),
+        )
+        .unwrap();
+    }
+
+    // No -q: the startup compile announces `Compiled to` once per file.
+    let (mut child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                dir.path().to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Readiness fires only after the whole startup batch, so all FILE_COUNT lines
+    // have been written by the child by the time this returns.
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+
+    let stderr = stderr_tap.text();
+    let announced = count_occurrences(&stderr, "Compiled to");
+    assert_eq!(
+        announced, FILE_COUNT,
+        "the tap must return every `Compiled to` line the child wrote; got {announced} \
+         of {FILE_COUNT}"
+    );
+}
