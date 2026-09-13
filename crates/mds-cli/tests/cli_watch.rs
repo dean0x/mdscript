@@ -4199,7 +4199,11 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
 // re-reported each time (D9).
 
 /// I16: mds watch (file mode) with a duplicated top-level key in the vars file
-/// warns at STARTUP and on EVERY rebuild. Guards `watch.rs:936`.
+/// warns at STARTUP and on EVERY rebuild. Guards the emit in `rebuild_file`.
+///
+/// Each count assertion is preceded by a bounded wait for that count, so it reads
+/// "never more than N", not "happened to be N when sampled". The warning is written
+/// to stderr with no ordering relationship to the output file the test waits on.
 #[test]
 fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
     let base = tempfile::tempdir().unwrap();
@@ -4216,7 +4220,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4229,7 +4233,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
             .stdout(Stdio::null()),
     );
 
-    let stderr_after_start = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    let stderr_after_start = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&stderr_after_start, &expected),
         1,
@@ -4243,7 +4247,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I16: rebuild after edit 1 must complete"
     );
-    let after_edit_1 = stderr_tap.text();
+    let after_edit_1 = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
     assert_eq!(
         count_occurrences(&after_edit_1, &expected),
         2,
@@ -4256,14 +4260,13 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I16: rebuild after edit 2 must complete"
     );
-    let after_edit_2 = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 3, TIMEOUT);
+    let after_edit_2 = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&after_edit_2, &expected),
         3,
         "I16: a second rebuild must report the duplicate again; stderr:\n{after_edit_2}"
     );
-
-    drop(child);
 }
 
 /// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
@@ -4295,7 +4298,7 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4326,15 +4329,15 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I17: rebuild after edit must complete"
     );
-    let stderr_after_edit = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
+    let stderr_after_edit = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&stderr_after_edit, &expected),
         2,
         "I17: one rebuild must add exactly one more warning (guards a double-emit \
-         between :1793 and :1919); stderr:\n{stderr_after_edit}"
+         between liveness_probe_dir and handle_fs_event_dir); \
+         stderr:\n{stderr_after_edit}"
     );
-
-    drop(child);
 }
 
 /// I18 (user decision, positive control first): a vars file that starts clean
@@ -4357,7 +4360,7 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4404,15 +4407,14 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I18: rebuild after introducing the duplicate must complete"
     );
-    let final_stderr = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
+    let final_stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&final_stderr, &expected),
         1,
         "I18: the duplicate introduced mid-session must be reported on the next \
          rebuild, naming the key; stderr:\n{final_stderr}"
     );
-
-    drop(child);
 }
 
 // ── I19-I20: liveness self-heal rebuild and --quiet regressions (#326) ───────
@@ -4442,7 +4444,7 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4460,7 +4462,7 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     );
 
     // Startup: exactly 1 warning (dir-mode startup, unaffected by this fix).
-    let startup_stderr = wait_for_stderr_contains_str(&stderr_tap, &expected, TIMEOUT);
+    let startup_stderr = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&startup_stderr, &expected),
         1,
@@ -4498,15 +4500,14 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     // The self-heal recompile must ALSO re-warn about the vars-file duplicate —
     // proves liveness_probe_dir no longer discards the resolved vars, matching
     // handle_fs_event_dir's gate (emit iff the rebuild was observable).
-    let final_stderr = stderr_tap.text();
+    let _ = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
+    let final_stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&final_stderr, &expected),
         2,
         "I19: the liveness self-heal rebuild must warn about the vars-file \
          duplicate too, not only at startup; stderr:\n{final_stderr}"
     );
-
-    drop(child);
 }
 
 /// I20: `mds watch --quiet` suppresses the vars-file duplicate-key warning on
@@ -4532,7 +4533,7 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
 
     let expected = dup_vars_file_warning("x", &vars_file);
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4566,15 +4567,16 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
         "I20: rebuild after edit must complete even under --quiet"
     );
 
-    let after_edit = stderr_tap.text();
+    // No count to wait for — the expectation is zero — so this one takes the
+    // strongest snapshot available instead: `finish_text` joins the drain, so a
+    // warning the child wrote and the drain had not yet copied would still be here.
+    let after_edit = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&after_edit, &expected),
         0,
         "I20: --quiet must suppress the vars-file duplicate warning on rebuild \
          too; stderr:\n{after_edit}"
     );
-
-    drop(child);
 }
 
 // ── R1-R3: rename-into-place (atomic write) is a first-class edit (#320) ─────
