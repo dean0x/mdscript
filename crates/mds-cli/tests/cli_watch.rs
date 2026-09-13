@@ -21,7 +21,8 @@
 
 mod common;
 use common::{
-    dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, StderrTap,
+    dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, write_atomic,
+    StderrTap,
 };
 
 use std::path::Path;
@@ -4613,6 +4614,169 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
         0,
         "I20: --quiet must suppress the vars-file duplicate warning on rebuild \
          too; stderr:\n{after_edit}"
+    );
+
+    drop(child);
+}
+
+// ── R1-R3: rename-into-place (atomic write) is a first-class edit (#320) ─────
+//
+// Editors and `write_atomic` replace a file by writing a sibling temp file and
+// renaming it over the target. That is ONE filesystem event on the destination
+// (`Modify(Name(RenameMode::To))` under notify 8 / inotify `IN_MOVED_TO`), not the
+// truncate-then-write pair `std::fs::write` produces. These three tests pin that the
+// watcher treats it as a content edit and that the in-flight temp file is invisible
+// to both watch modes.
+
+/// R1: file mode must rebuild when the watched source is replaced by a rename.
+#[test]
+fn watch_file_mode_rename_into_place_triggers_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let out = dir.path().join("t.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "R1: startup compile must complete"
+    );
+
+    write_atomic(&src, "version 2");
+
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "R1: a rename-into-place edit must trigger a rebuild"
+    );
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, "Recompiled", TIMEOUT);
+    assert!(
+        stderr.contains("Recompiled"),
+        "R1: the rebuild must announce itself; stderr:\n{stderr}"
+    );
+
+    drop(child);
+}
+
+/// R2: dir mode must rebuild when a watched source is replaced by a rename.
+#[test]
+fn watch_dir_mode_rename_into_place_triggers_rebuild() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let out = out_dir.join("t.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src_dir.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "R2: startup compile must complete"
+    );
+
+    write_atomic(&src, "version 2");
+
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "R2: a rename-into-place edit must trigger a rebuild"
+    );
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, "Recompiled", TIMEOUT);
+    assert!(
+        stderr.contains("Recompiled"),
+        "R2: the rebuild must announce itself; stderr:\n{stderr}"
+    );
+
+    drop(child);
+}
+
+/// R3: the temp file an atomic write leaves in flight is never compiled.
+///
+/// The `.<name>.tmp-<pid>-<n>` shape puts the suffix AFTER the `.mds`, so
+/// `Path::extension()` is not `mds` and both the dir-mode event filter and
+/// `collect_mds_files` drop it. Asserting only that absence would be vacuous if the
+/// watcher were simply not compiling anything, so the same test writes a REAL second
+/// source through `write_atomic` and requires that one to be compiled.
+#[test]
+fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let src = src_dir.join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src_dir.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out_dir.join("t.md"), "version 1", TIMEOUT),
+        "R3: startup compile must complete"
+    );
+
+    // Atomic edit of the existing source, then a brand-new source — also atomic.
+    write_atomic(&src, "version 2");
+    assert!(
+        wait_for_file_contains(&out_dir.join("t.md"), "version 2", TIMEOUT),
+        "R3: the atomic edit must rebuild t.md"
+    );
+
+    // Positive control: a genuine new source written the same way IS compiled, so the
+    // "temp file produced nothing" assertions below cannot pass vacuously.
+    write_atomic(&src_dir.join("u.mds"), "brand new");
+    assert!(
+        wait_for_file_contains(&out_dir.join("u.md"), "brand new", TIMEOUT),
+        "R3 (positive control): a real source created by a rename must be compiled"
+    );
+
+    // No output derives from any temp name, in either directory.
+    for dir in [&out_dir, &src_dir] {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".tmp-"),
+                "R3: no file derived from a write_atomic temp name may survive in {}; \
+                 found {name}",
+                dir.display()
+            );
+        }
+    }
+
+    // And nothing announced compiling one.
+    let stderr = stderr_tap.text();
+    assert!(
+        !stderr.contains(".tmp-"),
+        "R3: no status line may mention a write_atomic temp file; stderr:\n{stderr}"
     );
 
     drop(child);

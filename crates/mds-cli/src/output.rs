@@ -1371,6 +1371,25 @@ mod tests {
         assert_eq!(result, PathBuf::from("/out/page.md"));
     }
 
+    /// The `.<name>.tmp-<pid>-<n>` temp files an atomic write leaves in flight must
+    /// never be collected as sources. The suffix sits AFTER the `.mds`, so
+    /// `Path::extension()` is the `tmp-…` component and the walker's extension gate
+    /// rejects it — the same gate the dir-mode watch filter uses.
+    ///
+    /// The second half is the non-vacuity control: a name whose `.mds` is genuinely
+    /// last IS collected, so the first assertion is not passing on an empty walk.
+    #[test]
+    fn collect_mds_files_ignores_write_atomic_temp_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.mds"), "real").unwrap();
+        std::fs::write(dir.path().join(".t.mds.tmp-4242-7"), "in flight").unwrap();
+        let files = collect_mds_files(dir.path(), 64, None);
+        assert_eq!(files.len(), 1, "temp file must not be collected: {files:?}");
+        // Non-vacuity: the inverted name IS collected.
+        std::fs::write(dir.path().join(".tmp-4242-8.t.mds"), "wrong shape").unwrap();
+        assert_eq!(collect_mds_files(dir.path(), 64, None).len(), 2);
+    }
+
     #[test]
     fn is_partial_detects_underscore_prefix() {
         assert!(is_partial(Path::new("/dir/_partial.mds")));
