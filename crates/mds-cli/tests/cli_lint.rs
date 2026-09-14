@@ -5659,39 +5659,123 @@ fn bare_lint_never_enters_directory_mode() {
 
 // ── AC-Q21: empty and all-excluded directory print no summary ─────────────────
 
+/// #204 reversal: until v0.4.3 this test was `lint_directory_empty_prints_no_summary`
+/// and pinned exit 0 with a silent `--quiet` half. An empty tree is now "nothing was
+/// linted" — exit 2 (lint's usage-error code), diagnostic bypassing `--quiet`, same
+/// as lint's all-excluded arm. The no-summary half of AC-Q21 is unchanged and still
+/// asserted, with the same positive control proving `clean,` is the real needle.
 #[test]
-fn lint_directory_empty_prints_no_summary() {
+fn lint_directory_empty_exits_two_prints_no_summary() {
     // Empty directory.
     let dir = tempfile::tempdir().unwrap();
 
     let non_quiet = lint_path(dir.path(), &[]);
     let stderr_nq = String::from_utf8_lossy(&non_quiet.stderr);
+    let stdout_nq = String::from_utf8_lossy(&non_quiet.stdout);
 
     assert_eq!(
         non_quiet.status.code(),
-        Some(0),
-        "empty directory lint must exit 0; stderr: {stderr_nq}"
+        Some(2),
+        "empty directory lint must exit 2; stderr: {stderr_nq}"
     );
     assert!(
-        stderr_nq.contains("No .mds files found"),
-        "empty directory must print 'No .mds files found'; got: {stderr_nq:?}"
+        stderr_nq.contains("no .mds files found in"),
+        "empty directory must print the empty-tree diagnostic; got: {stderr_nq:?}"
+    );
+    assert!(
+        stderr_nq.contains("nothing was linted"),
+        "empty directory must say nothing was linted; got: {stderr_nq:?}"
     );
     assert!(
         !stderr_nq.contains("clean,"),
         "AC-Q21: empty directory must NOT print a summary; got: {stderr_nq:?}"
     );
+    assert!(
+        !stdout_nq.contains("clean,"),
+        "AC-Q21: empty directory must NOT print a summary on stdout; got: {stdout_nq:?}"
+    );
 
     let quiet = lint_path(dir.path(), &["--quiet"]);
     let stderr_q = String::from_utf8_lossy(&quiet.stderr);
+    let stdout_q = String::from_utf8_lossy(&quiet.stdout);
 
     assert_eq!(
         quiet.status.code(),
-        Some(0),
-        "empty directory lint --quiet must exit 0; stderr: {stderr_q}"
+        Some(2),
+        "empty directory lint --quiet must exit 2; stderr: {stderr_q}"
     );
     assert!(
-        stderr_q.is_empty(),
-        "AC-Q21: empty directory under --quiet must produce no stderr; got: {stderr_q:?}"
+        stderr_q.contains("no .mds files found in"),
+        "#204: the empty-tree diagnostic must appear under --quiet; got: {stderr_q:?}"
+    );
+    assert!(
+        stderr_q.contains("nothing was linted"),
+        "#204: --quiet must still say nothing was linted; got: {stderr_q:?}"
+    );
+    assert!(
+        !stderr_q.contains("clean,"),
+        "AC-Q21: empty directory under --quiet must NOT print a summary; got: {stderr_q:?}"
+    );
+    assert!(
+        !stdout_q.contains("clean,"),
+        "AC-Q21: empty directory under --quiet must NOT print a summary on stdout; \
+         got: {stdout_q:?}"
+    );
+
+    // PF-013 / ADR-009: prove "clean," is the exact substring a real directory summary
+    // contains, so the absence assertions above cannot pass vacuously.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
+    let control = lint_path(control_dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: a clean file in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+}
+
+/// #204: `--format json` on an empty tree exits 2 with the stderr diagnostic and
+/// emits NO JSON envelope on stdout — the empty-tree arm returns before any emitter
+/// runs, exactly as lint's all-excluded arm does (it emits no envelope either).
+/// Relax the stdout-empty half if a JSON envelope for "nothing to lint" is ever added.
+#[test]
+fn lint_directory_empty_format_json_exits_two_no_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "empty directory lint --format json must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "the empty-tree diagnostic must appear on stderr in JSON mode; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was linted"),
+        "JSON mode must still say nothing was linted; got: {stderr:?}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "empty directory lint --format json must emit no envelope on stdout; \
+         got: {stdout:?}"
+    );
+
+    // PF-013 / ADR-009: positive control — a directory with one .mds file DOES emit a
+    // JSON envelope on stdout, so the emptiness assertion above is not vacuous.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
+    let control = lint_path(control_dir.path(), &["--format", "json"]);
+    assert!(
+        String::from_utf8_lossy(&control.stdout).contains('{'),
+        "positive control: a non-empty directory must emit a JSON envelope on stdout; \
+         got: {:?}",
+        String::from_utf8_lossy(&control.stdout)
     );
 }
 

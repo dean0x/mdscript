@@ -469,6 +469,48 @@ fn watch_dir_mode_picks_up_new_files() {
     drop(child);
 }
 
+// ── #204 pin: watch is UNCHANGED on an empty root ──────────────────────────
+//
+// GREEN before and after #204. `mds build|check|fmt|lint <empty dir>` now exits
+// non-zero, but `mds watch <empty dir>` deliberately does NOT error: a file
+// created later is a valid flow there, and this test is what pins that.
+
+#[test]
+fn watch_dir_mode_empty_root_starts_and_picks_up_new_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    // `spawn_ready` returning IS the armed proof: it panics with "exited before
+    // signalling readiness" if the watcher bailed out on the empty root.
+    let (child, _stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                dir.path().to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Create the first .mds file AFTER the watcher armed on the empty root.
+    write_atomic(
+        &dir.path().join("c.mds"),
+        "---\nname: C\n---\nNew file {{name}}\n",
+    );
+
+    assert!(
+        wait_for_file_contains(&out_dir.join("c.md"), "New file C", TIMEOUT),
+        "a file created under an initially empty watch root should be compiled"
+    );
+
+    drop(child);
+}
+
 // ── T-I8: Directory mode deletes output when source is deleted ─────────────
 
 #[test]

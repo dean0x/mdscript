@@ -569,10 +569,12 @@ fn exit_code_fmt_oversized() {
     );
 }
 
-// Directory input: an empty directory exits 0 (prints "No .mds files found").
-// Directory build is now supported — the old "must fail" test is updated to match new behavior.
+// Directory input: an empty directory exits 1 (#204) — "nothing to build" is an
+// error, as it already was for bare auto-detect
+// (cli_build.rs::build_errors_when_no_mds_files_in_directory). A missing path is NOT
+// a directory and takes the single-file path → exit 2.
 #[test]
-fn cli_build_directory_empty_exits_zero() {
+fn cli_build_directory_empty_exits_one_missing_root_exits_two() {
     let dir = tempfile::tempdir().unwrap();
 
     let output = mds_bin()
@@ -583,15 +585,37 @@ fn cli_build_directory_empty_exits_zero() {
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "build on an empty directory should succeed (no .mds files); stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "build on an empty directory must exit 1; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("No .mds files") || stderr.contains("no .mds"),
-        "stderr should mention no .mds files found; got: {stderr}"
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic; got: {stderr:?}"
+    );
+
+    // A path that does not exist is not a directory: it takes the single-file path
+    // and reports mds::file_not_found (exit 2), never the empty-tree diagnostic.
+    let missing = dir.path().join("does-not-exist");
+    let output_missing = mds_bin()
+        .arg("build")
+        .arg(&missing)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr_missing = String::from_utf8_lossy(&output_missing.stderr);
+    assert_eq!(
+        output_missing.status.code(),
+        Some(2),
+        "build on a missing path must exit 2; stderr: {stderr_missing}"
+    );
+    assert!(
+        !stderr_missing.contains("no .mds files found in"),
+        "a missing path must NOT produce the empty-tree diagnostic; got: {stderr_missing:?}"
     );
 }
 

@@ -400,21 +400,78 @@ fn dir_check_continues_on_error_nonzero_exit() {
     );
 }
 
+/// #204 reversal: until v0.4.3 this test was `dir_check_empty_dir_exits_zero` and
+/// pinned exit 0. `mds check` now mirrors `mds build`: an empty tree is "nothing
+/// was checked", exit 1.
 #[test]
-fn dir_check_empty_dir_exits_zero() {
+fn dir_check_empty_dir_exits_one() {
     let src = tempfile::tempdir().unwrap();
 
     let output = check_dir(src.path(), &[]);
 
-    assert!(
-        output.status.success(),
-        "check on empty dir should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "check on an empty dir must exit 1; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("No .mds files") || stderr.contains("no .mds"),
-        "stderr should mention no files found; got: {stderr}"
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was checked"),
+        "stderr must say nothing was checked; got: {stderr:?}"
+    );
+}
+
+/// #204: `--quiet` must not suppress `mds check`'s empty-tree diagnostic.
+#[test]
+fn dir_check_empty_dir_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = check_dir(src.path(), &["--quiet"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "check --quiet on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet on an empty tree"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "empty-tree diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was checked"),
+        "stderr must say nothing was checked under --quiet; got: {stderr:?}"
+    );
+}
+
+/// #204 boundary pin: a path that does NOT exist is not a directory, so it takes
+/// the single-file path and exits 2 (`mds::file_not_found`) — unchanged by #204.
+/// GREEN both before and after the fix; it exists to prove the new exit-1 arm
+/// did not swallow the missing-path case.
+#[test]
+fn dir_check_missing_root_exits_two() {
+    let src = tempfile::tempdir().unwrap();
+    let missing = src.path().join("nope");
+
+    let output = check_dir(&missing, &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "check on a missing path must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no .mds files found in"),
+        "a missing path must NOT produce the empty-tree diagnostic; got: {stderr:?}"
     );
 }
 
@@ -484,23 +541,60 @@ fn dir_build_stale_output_cleaned_on_format_flip() {
     );
 }
 
-// ── T-CLI: empty dir build exits zero ────────────────────────────────────────
+// ── T-CLI: empty dir build exits one (#204) ──────────────────────────────────
 
+/// #204 reversal: until v0.4.3 this test was `dir_build_empty_dir_exits_zero` and
+/// pinned exit 0 on an empty tree. "Nothing to build" is an error, exactly as the
+/// all-excluded case already was — a silent green pass on a mistyped or
+/// not-yet-populated directory is the CI failure mode #204 closes.
 #[test]
-fn dir_build_empty_dir_exits_zero() {
+fn dir_build_empty_dir_exits_one() {
     let src = tempfile::tempdir().unwrap();
 
     let output = build_dir(src.path(), &[]);
 
-    assert!(
-        output.status.success(),
-        "build on empty dir should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "build on an empty dir must exit 1; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("No .mds files") || stderr.contains("no .mds"),
-        "stderr should mention no .mds files; got: {stderr}"
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was built"),
+        "stderr must say nothing was built; got: {stderr:?}"
+    );
+}
+
+/// #204: `--quiet` must not suppress the empty-tree diagnostic — this is the exact
+/// CI invocation where a silent green pass is the danger. Mirrors
+/// `dir_build_all_excluded_quiet_still_emits_diagnostic`.
+#[test]
+fn dir_build_empty_dir_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = build_dir(src.path(), &["--quiet"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "build --quiet on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet on an empty tree"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "empty-tree diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was built"),
+        "stderr must say nothing was built under --quiet; got: {stderr:?}"
     );
 }
 
@@ -598,28 +692,56 @@ fn dir_build_all_excluded_quiet_still_emits_diagnostic() {
     );
 }
 
+// #204 reversal: until v0.4.3 this test pinned "genuinely empty dir exits 0 — only
+// the all-excluded case exits non-zero". Both now exit 1; what this test still
+// guards is that the two cases stay DISTINGUISHABLE by message: an empty tree says
+// "no .mds files found in …", never the excluded-directories diagnostic (and vice
+// versa — inline positive control below).
 #[test]
-fn dir_build_genuinely_empty_still_exits_zero() {
-    // Regression guard: a genuinely empty directory (no .mds files anywhere)
-    // must still exit 0 — only the all-excluded case exits non-zero.
+fn dir_build_genuinely_empty_exits_one_without_excluded_diagnostic() {
     let src = tempfile::tempdir().unwrap();
 
     let output = build_dir(src.path(), &[]);
 
-    assert!(
-        output.status.success(),
-        "genuinely empty dir must still exit 0; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Message must be the original "no files" message, not the excluded diagnostic.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "genuinely empty dir must exit 1; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("No .mds files") || stderr.contains("no .mds"),
-        "empty-dir message should mention no .mds files; got: {stderr}"
+        stderr.contains("no .mds files found in"),
+        "empty-dir message must be the empty-tree diagnostic; got: {stderr:?}"
     );
     assert!(
         !stderr.contains("excluded"),
-        "empty-dir must NOT show the excluded diagnostic; got: {stderr}"
+        "empty-dir must NOT show the excluded diagnostic; got: {stderr:?}"
+    );
+
+    // Positive control (PF-013 shape): the sibling all-excluded scenario exits 1 too,
+    // so the exit code alone cannot tell them apart — the message must, and the
+    // control proves "excluded" is really the substring that appears there.
+    let control = tempfile::tempdir().unwrap();
+    let hidden = control.path().join(".github");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("x.mds"), "Hello!\n").unwrap();
+
+    let control_out = build_dir(control.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control_out.stderr);
+    assert_eq!(
+        control_out.status.code(),
+        Some(1),
+        "positive control: the all-excluded case also exits 1; stderr: {control_stderr}"
+    );
+    assert!(
+        control_stderr.contains("excluded"),
+        "positive control: the all-excluded case must carry the excluded diagnostic; \
+         got: {control_stderr:?}"
+    );
+    assert!(
+        !control_stderr.contains("no .mds files found in"),
+        "positive control: the all-excluded case must NOT carry the empty-tree \
+         diagnostic; got: {control_stderr:?}"
     );
 }
 
@@ -789,6 +911,83 @@ fn dir_fmt_all_excluded_quiet_still_emits_diagnostic() {
     assert!(
         !stderr.is_empty() && (stderr.contains("excluded") || stderr.contains("default-excluded")),
         "all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+}
+
+// ── #204: empty directory errors on fmt too ──────────────────────────────────
+
+/// #204: `mds fmt <empty dir>` exits 1 — "nothing was formatted" is an error, the
+/// same shape as `mds build` / `mds check` and as fmt's own all-excluded arm.
+#[test]
+fn dir_fmt_empty_dir_exits_one() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = fmt_dir(src.path(), &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "fmt on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was formatted"),
+        "stderr must say nothing was formatted; got: {stderr:?}"
+    );
+}
+
+/// #204: `--quiet` must not suppress `mds fmt`'s empty-tree diagnostic.
+#[test]
+fn dir_fmt_empty_dir_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = fmt_dir(src.path(), &["--quiet"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "fmt --quiet on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet on an empty tree"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "empty-tree diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was formatted"),
+        "stderr must say nothing was formatted under --quiet; got: {stderr:?}"
+    );
+}
+
+/// #204: the empty-tree arm sits BEFORE fmt's read-only split (`check || diff`),
+/// so `--check` behaves identically to a plain `fmt` on an empty tree.
+#[test]
+fn dir_fmt_empty_dir_check_flag_exits_one() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = fmt_dir(src.path(), &["--check"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "fmt --check on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic under --check; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was formatted"),
+        "stderr must say nothing was formatted under --check; got: {stderr:?}"
     );
 }
 
