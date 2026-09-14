@@ -11,7 +11,7 @@
 
 use super::{parse_frontmatter_yaml, parse_frontmatter_yaml_bounded};
 use crate::error::MdsError;
-use crate::limits::{MAX_FRONTMATTER_NODES, MAX_FRONTMATTER_SIZE};
+use crate::limits::{MAX_FRONTMATTER_FLOW_DEPTH, MAX_FRONTMATTER_NODES, MAX_FRONTMATTER_SIZE};
 
 // ── Predicates ────────────────────────────────────────────────────────────────
 
@@ -388,17 +388,87 @@ fn c10f_tagged_nest_shallow_ok() {
 }
 
 #[test]
-fn c10g_flow_depth_10000_recursion_limit() {
+fn c10g_flow_depth_10000_hits_flow_guard() {
+    // Reconciled for the pre-parse flow-depth guard (#162): a 10 000-deep flow nest now
+    // trips the guard (threshold 1024 < 10 000) BEFORE serde_yaml_ng's 128-frame recursion
+    // limit, so it surfaces as a resource limit rather than a YAML recursion error. The
+    // shallow depth pins above (<= 128) never reach the guard and stay YAML errors.
     let r = crate::check_str(&wrap(&nested_flow_seq(10_000)));
     assert!(
+        is_rl(&r),
+        "very deep flow nest must trip the flow-depth guard (resource limit): {r:?}"
+    );
+}
+
+// ── C-12: pre-parse flow-nesting depth guard (#162) ─────────────────────────────
+
+/// T0-style pin: the guard threshold is 1024.
+#[test]
+fn c12_flow_depth_guard_constant_pin() {
+    assert_eq!(MAX_FRONTMATTER_FLOW_DEPTH, 1024);
+}
+
+/// One over the guard: rejected as a resource limit, the message names the flow-depth
+/// limit (never echoes the raw bracket run), and it returns FAST — proving the guard runs
+/// pre-parse, before libyaml's O(depth^2) flow scanner.
+#[test]
+fn c12a_flow_depth_over_guard_is_resource_limit_and_fast() {
+    let raw = nested_flow_seq(MAX_FRONTMATTER_FLOW_DEPTH + 1);
+    let start = std::time::Instant::now();
+    let r = parse_frontmatter_yaml(&raw);
+    let elapsed = start.elapsed();
+    assert!(
+        is_rl(&r),
+        "flow nest over the guard must be a resource limit: {r:?}"
+    );
+    let m = msg(&r);
+    assert!(
+        m.contains("flow nesting exceeds maximum depth"),
+        "message must name the flow-depth limit: {m}"
+    );
+    // The message must never echo the (adversarial) raw input — no bracket-run leakage.
+    assert!(
+        !m.contains('[') && !m.contains(']') && !m.contains('{') && !m.contains('}'),
+        "resource-limit message must not echo raw frontmatter bytes: {m}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "guard must reject pre-parse (fast), took {elapsed:?}"
+    );
+}
+
+/// Positive control (PF-013): one BELOW the guard (1023 deep) is NOT rejected by the
+/// guard. It passes to serde_yaml_ng, which rejects it at its 128-frame recursion limit —
+/// proving the guard threshold does not mask the parser's own errors, and that the
+/// largest scan the guard admits is still cheap (returns FAST).
+#[test]
+fn c12b_flow_depth_under_guard_reaches_serde_recursion_limit_and_fast() {
+    let raw = nested_flow_seq(MAX_FRONTMATTER_FLOW_DEPTH - 1);
+    let start = std::time::Instant::now();
+    let r = parse_frontmatter_yaml(&raw);
+    let elapsed = start.elapsed();
+    assert!(
         is_yaml(&r),
-        "very deep flow nest must be a YAML error: {r:?}"
+        "just under the guard must reach serde (a YAML error), not the guard: {r:?}"
     );
     assert!(
         msg(&r).contains("recursion limit exceeded"),
-        "expected serde recursion-limit message: {}",
+        "expected serde recursion-limit message just under the guard: {}",
         msg(&r)
     );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the largest scan the guard admits must be cheap, took {elapsed:?}"
+    );
+}
+
+/// The guard bounds DEPTH, not width: a wide-but-shallow flow list (depth 1, 20 000
+/// elements) must be accepted.
+#[test]
+fn c12c_wide_flow_list_is_accepted_guard_is_depth_not_width() {
+    let raw = format!("k: [{}]\n", vec!["1"; 20_000].join(", "));
+    let r = parse_frontmatter_yaml(&raw);
+    assert!(r.is_ok(), "wide shallow flow list must be Ok: {r:?}");
 }
 
 // ── Billion-laughs: serde's repetition limit, not our budget ────────────────────

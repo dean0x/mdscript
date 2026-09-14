@@ -84,6 +84,28 @@ pub(crate) const MAX_FRONTMATTER_SIZE: usize = 1024 * 1024;
 /// as `mds::resource_limit`. See #162.
 pub(crate) const MAX_FRONTMATTER_NODES: usize = 200_000;
 
+/// Maximum running depth of flow-collection nesting (`[`/`{`) in one frontmatter
+/// YAML block (1024).
+///
+/// Checked by `resolver::frontmatter::parse_frontmatter_yaml` in a single O(n) pass over
+/// the raw bytes, AFTER the size cap and BEFORE the budgeted parse. libyaml's flow scanner
+/// is O(depth^2) in flow-collection nesting, and that cost is paid inside the scanner
+/// UPSTREAM of deserialisation. The three existing depth limits are all post-hoc: serde's
+/// recursion limit (128 parse frames, "recursion limit exceeded"), and `Value::from_yaml`'s
+/// `MAX_VALUE_DEPTH` (64, "value nesting exceeds maximum depth of 64"). Every one of them
+/// fires only AFTER the quadratic scan has already been paid, so a ~1 MiB pure deep
+/// flow-nest (no anchors) burns 10+ s of CPU at ~32 MB RSS before any of them rejects it —
+/// and the node budget cannot catch it (few nodes, trivial memory). A cheap pre-parse bound
+/// on flow-nesting depth is the only thing that stops it before the scanner runs.
+///
+/// 1024 is far above any legitimate frontmatter — flow collections are never nested even
+/// 100 deep — yet it caps the worst admitted scan at ~1024^2 work (trivially fast). It sits
+/// deliberately ABOVE serde's 128-frame recursion limit so the parser's own
+/// recursion/value-depth errors stay reachable and unchanged for shallower inputs.
+/// Block-style (indent) nesting has no quadratic cost and is not counted. Exceeding this
+/// surfaces as `mds::resource_limit`. See #162.
+pub(crate) const MAX_FRONTMATTER_FLOW_DEPTH: usize = 1024;
+
 /// Maximum number of messages a `@message`-bearing template may produce.
 ///
 /// Prevents runaway memory use from adversarial inputs that generate thousands
