@@ -80,7 +80,7 @@ use crate::build::{
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
     relabel_stdin_error, render_unified_diff, safe_file_display, safe_inline, safe_path,
-    STDIN_DISPLAY_LABEL,
+    Durability, STDIN_DISPLAY_LABEL,
 };
 
 // AC-224-15: No local rule-name list. The single source of truth is
@@ -1071,7 +1071,7 @@ fn run_lint_file(
                 residual,
             } => {
                 emit_result(format, &residual, quiet, named_source);
-                atomic_write_file(path, &new_source)?;
+                atomic_write_file(path, &new_source, Durability::Fsync)?;
                 if !quiet {
                     eprintln!("Fixed: {}", safe_path(path));
                 }
@@ -1084,7 +1084,7 @@ fn run_lint_file(
                 total_count,
             } => {
                 emit_result(format, &residual, quiet, named_source);
-                atomic_write_file(path, &new_source)?;
+                atomic_write_file(path, &new_source, Durability::Fsync)?;
                 // Print status AFTER write succeeds so "Partially fixed:" never
                 // precedes "error writing" for a file that was never modified.
                 if !quiet {
@@ -1657,7 +1657,7 @@ fn lint_one_file_accumulating(
                 // Write first (AC-F-14): on failure push a structured error entry so
                 // the JSON envelope truthfully reflects what happened rather than
                 // accumulating the clean post-fix result before the write is attempted.
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     json_files.push(serde_json::json!({
                         "file": file_key,
                         "error": MdsError::Io { message: format!("{e}") }.serialize()
@@ -1679,7 +1679,7 @@ fn lint_one_file_accumulating(
             } => {
                 // Write first (AC-F-14 + print-after-write): on failure push a
                 // structured error entry; only accumulate and print on success.
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     json_files.push(serde_json::json!({
                         "file": file_key,
                         "error": MdsError::Io { message: format!("{e}") }.serialize()
@@ -1861,7 +1861,7 @@ fn lint_one_file_human(
                 residual,
             } => {
                 render_result_human(&residual, quiet, named_source);
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
@@ -1877,7 +1877,7 @@ fn lint_one_file_human(
                 total_count,
             } => {
                 render_result_human(&residual, quiet, named_source);
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }

@@ -29,7 +29,9 @@ use mds::{effective_parent, FileSystem};
 use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
-use crate::output::{atomic_write_file, collect_mds_files_detailed, render_unified_diff};
+use crate::output::{
+    atomic_write_file, collect_mds_files_detailed, render_unified_diff, Durability,
+};
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -185,7 +187,7 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
             // Atomic write preserves file permissions and avoids truncate-then-write
             // data loss on crash or full disk (avoids the issue fixed for lint by
             // commit c5aa086 — both write paths now share the same helper).
-            atomic_write_file(path, &result.formatted)?;
+            atomic_write_file(path, &result.formatted, Durability::Fsync)?;
             if !quiet {
                 eprintln!("Formatted: {}", crate::output::safe_path(path));
             }
@@ -278,7 +280,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         // Atomic write preserves file permissions and avoids truncate-then-write
         // data loss on crash or full disk — same guarantee as lint --fix (avoids
         // the divergence introduced after commit c5aa086 hardened the lint path).
-        match atomic_write_file(file, &result.formatted) {
+        match atomic_write_file(file, &result.formatted, Durability::Fsync) {
             Ok(()) => {
                 if !quiet {
                     eprintln!("Formatted: {}", crate::output::safe_path(file));

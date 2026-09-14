@@ -9,7 +9,9 @@
 //! - [`eprint_error`]: the single CLI stderr choke-point — escapes every report's
 //!   message, help, and label text before miette renders it (CWE-150 / PF-014).
 //! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`,
-//!   and — since #227 — by every `build` / `watch` output and `.map` sidecar.
+//!   and — since #227 — by every `build` / `watch` output and `.map` sidecar. The
+//!   [`Durability`] argument says whether the bytes are fsynced before the rename;
+//!   atomicity does not depend on it.
 //! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
 //!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
@@ -581,6 +583,29 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
 
 // ── Atomic file write ─────────────────────────────────────────────────────────
 
+/// How hard [`atomic_write_file`] works to make the new bytes survive a crash.
+///
+/// Atomicity — a reader sees either the whole old file or the whole new one, never a
+/// truncated mix — is unconditional: it comes from the rename, not from the fsync. This
+/// knob only chooses whether the data is forced to stable storage *before* that rename.
+///
+/// The split exists because the two families of file MDS writes have different recovery
+/// costs, and on macOS `sync_all()` is `F_FULLFSYNC` — a full drive cache flush, ~7 ms
+/// per file. Measured on a 500-template `mds watch` startup (#227): 1.44 s → 4.69 s, and
+/// the `cli_watch` suite 4.2 s → 8.3 s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Durability {
+    /// `sync_all()` before the rename. For files whose content exists nowhere else:
+    /// `mds fmt` and `mds lint --fix` rewrite the user's hand-authored `.mds` source in
+    /// place, so bytes lost to a power failure are lost for good.
+    Fsync,
+    /// Rename only. For **derived** artifacts — compiled outputs and `.map` sidecars —
+    /// which are reproducible by re-running `mds build`. A crash can leave the previous
+    /// artifact or an unflushed new one; either way the fix is one rebuild, and paying
+    /// `F_FULLFSYNC` per file to avoid it costs more than it saves.
+    RenameOnly,
+}
+
 /// Write `content` to `path` atomically via a temp-file-then-rename cycle.
 ///
 /// Centralising this helper in `output.rs` ensures both `fmt` and `lint --fix`
@@ -604,7 +629,10 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
 /// - Temp file lives in the SAME directory as the target so the rename is
 ///   always intra-filesystem (atomic on POSIX, near-atomic on Windows).
 /// - Calls `sync_all()` (not `flush()` — `flush()` is a no-op on unbuffered
-///   `File`) for crash durability before the rename.
+///   `File`) for crash durability before the rename, when `durability` is
+///   [`Durability::Fsync`]. Under [`Durability::RenameOnly`] the fsync is skipped;
+///   the rename — and therefore the atomicity — is unchanged. See [`Durability`]
+///   for which callers pick which and why.
 /// - Directory-level symlinks in the path are resolved, not rejected (the same
 ///   rule `NativeFs::check_symlink` applies).
 ///
@@ -620,7 +648,7 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
 /// would require truncate-in-place and forfeit crash safety); ACL/xattr/
 /// owner-group preservation is not planned — MDS only rewrites its own outputs
 /// and `.mds` sources.
-pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durability) -> Result<()> {
     use mds::{effective_parent, NativeFs};
 
     // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
@@ -693,10 +721,13 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
         .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
 
     // sync_all() flushes data + metadata to storage (flush() is a no-op on
-    // unbuffered File and provides no crash durability guarantee).
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| miette::miette!("cannot fsync {}: {e}", path.display()))?;
+    // unbuffered File and provides no crash durability guarantee). Skipped for
+    // derived artifacts, which a rebuild reproduces — see `Durability`.
+    if durability == Durability::Fsync {
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| miette::miette!("cannot fsync {}: {e}", path.display()))?;
+    }
 
     // persist() atomically renames the temp file to the target path.
     tmp.persist(path)
@@ -2389,13 +2420,66 @@ mod tests {
         let target = dir.path().join("fresh.md");
         assert!(!target.exists(), "precondition: target must be absent");
 
-        atomic_write_file(&target, "CREATED").expect("writing an absent target must succeed");
+        atomic_write_file(&target, "CREATED", Durability::Fsync)
+            .expect("writing an absent target must succeed");
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "CREATED");
         let residue = temp_residue(dir.path());
         assert!(
             residue.is_empty(),
             "no .mds-tmp- residue may survive a successful write; got {residue:?}"
+        );
+    }
+
+    /// T-U9: `Durability::RenameOnly` changes ONLY whether the temp file is fsynced.
+    /// Everything the callers rely on — the content, the mode of a freshly created
+    /// artifact, the symlink refusal, and leaving no temp residue — must be identical
+    /// to `Fsync` (#227). The fsync itself is not observable from a passing process;
+    /// what this pins is that skipping it did not quietly relax anything else.
+    #[test]
+    fn atomic_write_file_rename_only_matches_fsync_contract() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Fresh target: created, with the same content and mode as the Fsync sibling.
+        let quick = dir.path().join("quick.md");
+        let synced = dir.path().join("synced.md");
+        atomic_write_file(&quick, "DERIVED", Durability::RenameOnly).unwrap();
+        atomic_write_file(&synced, "DERIVED", Durability::Fsync).unwrap();
+        assert_eq!(std::fs::read_to_string(&quick).unwrap(), "DERIVED");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&quick).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&synced).unwrap().permissions().mode() & 0o777,
+                "RenameOnly must not change the mode a fresh artifact is created with"
+            );
+        }
+
+        // Existing target: replaced, previous content gone.
+        atomic_write_file(&quick, "REBUILT", Durability::RenameOnly).unwrap();
+        assert_eq!(std::fs::read_to_string(&quick).unwrap(), "REBUILT");
+
+        // Symlink target: still refused (the fsync is not what enforces this).
+        #[cfg(unix)]
+        {
+            let real = dir.path().join("real.md");
+            std::fs::write(&real, "REAL").unwrap();
+            let link = dir.path().join("link.md");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let err = atomic_write_file(&link, "NEW", Durability::RenameOnly)
+                .expect_err("RenameOnly must still refuse a symlink target");
+            assert!(
+                err.to_string().contains("symlink"),
+                "the refusal must say why; got: {err}"
+            );
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), "REAL");
+        }
+
+        let residue = temp_residue(dir.path());
+        assert!(
+            residue.is_empty(),
+            "RenameOnly must leave no .mds-tmp- residue; got {residue:?}"
         );
     }
 
@@ -2411,7 +2495,7 @@ mod tests {
         let out = dir.path().join("out.md");
         let ctl = dir.path().join("ctl.md");
 
-        atomic_write_file(&out, "X").unwrap();
+        atomic_write_file(&out, "X", Durability::Fsync).unwrap();
         std::fs::write(&ctl, "X").unwrap();
 
         let mode_out = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
@@ -2433,7 +2517,7 @@ mod tests {
         std::fs::write(&target, "OLD").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
 
-        atomic_write_file(&target, "NEW").unwrap();
+        atomic_write_file(&target, "NEW", Durability::Fsync).unwrap();
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
         assert_eq!(
@@ -2455,7 +2539,7 @@ mod tests {
         std::fs::write(&real, "REAL").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let err = atomic_write_file(&link, "NEW")
+        let err = atomic_write_file(&link, "NEW", Durability::Fsync)
             .expect_err("writing through a symlink must be refused")
             .to_string();
         assert!(
@@ -2476,7 +2560,8 @@ mod tests {
         );
 
         // CONTROL: the same directory and content, addressed at the real file.
-        atomic_write_file(&real, "NEW").expect("writing the real file must succeed");
+        atomic_write_file(&real, "NEW", Durability::Fsync)
+            .expect("writing the real file must succeed");
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW");
     }
 
@@ -2490,7 +2575,7 @@ mod tests {
         let link = dir.path().join("link.md");
         std::os::unix::fs::symlink(&missing, &link).unwrap();
 
-        let err = atomic_write_file(&link, "NEW")
+        let err = atomic_write_file(&link, "NEW", Durability::Fsync)
             .expect_err("writing through a dangling symlink must be refused")
             .to_string();
         assert!(
@@ -2529,7 +2614,7 @@ mod tests {
         let (ino, mtime) = (before.ino(), before.modified().unwrap());
 
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let result = atomic_write_file(&target, "NEW");
+        let result = atomic_write_file(&target, "NEW", Durability::Fsync);
         // Restore before asserting so a failed assertion cannot leave an
         // undeletable tempdir behind.
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2560,7 +2645,8 @@ mod tests {
         );
 
         // CONTROL: writable again — the same call succeeds and swaps the inode.
-        atomic_write_file(&target, "NEW").expect("write must succeed once the dir is writable");
+        atomic_write_file(&target, "NEW", Durability::Fsync)
+            .expect("write must succeed once the dir is writable");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
         assert_ne!(
             std::fs::metadata(&target).unwrap().ino(),
@@ -2577,7 +2663,7 @@ mod tests {
         let target = dir.path().join("adir");
         std::fs::create_dir(&target).unwrap();
 
-        let err = atomic_write_file(&target, "X")
+        let err = atomic_write_file(&target, "X", Durability::Fsync)
             .expect_err("a directory target must not be written")
             .to_string();
         assert!(
@@ -2614,7 +2700,7 @@ mod tests {
             return;
         }
 
-        let result = atomic_write_file(&p.join("x.md"), "X");
+        let result = atomic_write_file(&p.join("x.md"), "X", Durability::Fsync);
         // Restore before asserting so tempdir cleanup always succeeds.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 

@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::output::Durability;
 use mds::{
     effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
     STRING_SOURCE_MAP_LABEL,
@@ -719,6 +720,15 @@ pub(crate) fn read_stdin() -> Result<(String, PathBuf)> {
 /// Set `announce = false` in watch-loop rebuilds so only the `"Recompiled …"`
 /// summary line is emitted (not a redundant `"Compiled to …"` line).
 /// Set `announce = true` for the initial/startup compile and for `mds build`.
+///
+/// The file write goes through [`crate::output::atomic_write_file`] (#227): a crash or
+/// write error mid-way never leaves a truncated artifact — the previous output, if any,
+/// survives until the rename — and a symlink at the output path is refused. The parent
+/// directory is created first. The stdout arm is unchanged (streaming).
+///
+/// Compiled artifacts are written with [`crate::output::Durability::RenameOnly`]: they
+/// are derived files a rebuild reproduces, and `F_FULLFSYNC` per artifact tripled a
+/// 500-template watch startup. Source rewrites (`fmt`, `lint --fix`) keep the fsync.
 pub(crate) fn write_output(
     output_path: Option<PathBuf>,
     compiled: &str,
@@ -734,8 +744,11 @@ pub(crate) fn write_output(
                     })?;
                 }
             }
-            std::fs::write(&path, compiled)
-                .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
+            // #227: temp-file + fsync + rename, so a failed or interrupted build leaves
+            // the previous artifact intact instead of a truncated one. The primitive
+            // owns the symlink refusal; the create_dir_all above stays here because the
+            // primitive deliberately does not create directories.
+            crate::output::atomic_write_file(&path, compiled, Durability::RenameOnly)?;
             if !quiet && announce {
                 eprintln!("Compiled to {}", crate::output::safe_path(&path));
             }
@@ -1383,9 +1396,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             // untrusted; see the `mds::SourceMap` rustdoc. The status
                             // line below is a diagnostic surface and IS escaped.
                             let map_json = sm.to_json();
-                            std::fs::write(&map_path, &map_json).map_err(|e| {
-                                miette::miette!("cannot write {}: {e}", map_path.display())
-                            })?;
+                            crate::output::atomic_write_file(
+                                &map_path,
+                                &map_json,
+                                Durability::RenameOnly,
+                            )?;
                             if !quiet {
                                 eprintln!(
                                     "Source map written to {}",
@@ -1515,9 +1530,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     if let Some(ref sm) = source_map {
                         let map_path = map_path_for(out);
                         let map_json = sm.to_json();
-                        std::fs::write(&map_path, &map_json).map_err(|e| {
-                            miette::miette!("cannot write {}: {e}", map_path.display())
-                        })?;
+                        crate::output::atomic_write_file(
+                            &map_path,
+                            &map_json,
+                            Durability::RenameOnly,
+                        )?;
                         if !quiet {
                             eprintln!(
                                 "Source map written to {}",
@@ -1712,7 +1729,14 @@ fn run_build_directory(
                 // not an empty success.
                 let wrote_empty = final_content.is_empty();
 
-                match std::fs::write(&out_path, &final_content) {
+                // #227: the dir-mode twin of `write_output` — same atomic contract, but
+                // it accumulates per-file counters instead of returning early, so it is
+                // its own call site. Both are enforced by `tests/write_funnel.rs`.
+                match crate::output::atomic_write_file(
+                    &out_path,
+                    &final_content,
+                    Durability::RenameOnly,
+                ) {
                     Ok(()) => {
                         if wrote_empty {
                             empty_count += 1;
@@ -1727,12 +1751,14 @@ fn run_build_directory(
                             if let Some(ref sm) = compiled.source_map {
                                 let map_path = map_path_for(&out_path);
                                 let map_json = sm.to_json();
-                                if let Err(e) = std::fs::write(&map_path, &map_json) {
-                                    eprintln!(
-                                        "error: cannot write {}: {}",
-                                        crate::output::safe_path(&map_path),
-                                        crate::output::safe_inline(&e)
-                                    );
+                                if let Err(e) = crate::output::atomic_write_file(
+                                    &map_path,
+                                    &map_json,
+                                    Durability::RenameOnly,
+                                ) {
+                                    // The primitive's message already names the path —
+                                    // re-prefixing it would print the path twice (#227).
+                                    eprintln!("error: {}", crate::output::safe_inline(&e));
                                     fail_count += 1;
                                     continue;
                                 }
@@ -1768,11 +1794,8 @@ fn run_build_directory(
                         ok_count += 1;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "error: cannot write {}: {}",
-                            crate::output::safe_path(&out_path),
-                            crate::output::safe_inline(&e)
-                        );
+                        // The primitive's message already names the path (#227).
+                        eprintln!("error: {}", crate::output::safe_inline(&e));
                         fail_count += 1;
                     }
                 }

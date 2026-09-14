@@ -1720,3 +1720,343 @@ fn fmt_unknown_lint_rule_in_mds_json_emits_no_warning() {
         String::from_utf8_lossy(&out_bad.stderr)
     );
 }
+
+// ── Atomic build outputs (#227) ──────────────────────────────────────────────
+//
+// `mds build -o <file>` routes its write through `crate::output::atomic_write_file`
+// (temp file in the target directory → fsync → rename). These tests pin the four
+// user-visible consequences: a first build stays silent apart from `Compiled to`, the
+// created file keeps the mode `std::fs::write` produced, an existing file keeps its own
+// mode, a symlinked target is refused, and no failure path leaves a temp file behind.
+
+/// Any `.mds-tmp-` prefixed entry directly inside `dir` (the temp-file prefix used by
+/// `atomic_write_file`). Empty means the write left no residue.
+fn temp_residue(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("directory must be readable")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".mds-tmp-"))
+        .collect()
+}
+
+/// T-B1: the first build into a nonexistent nested directory announces exactly one line.
+///
+/// Sentinel against a naive reroute: before #227 the primitive stat'd the target and
+/// warned when it was absent, so a reroute that kept that warning would add a second
+/// stderr line on every first build (#225). This test is GREEN on the pre-reroute tree
+/// and must stay green.
+#[test]
+fn build_o_first_build_emits_only_compiled_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    let out = dir.path().join("new").join("dir").join("out.md");
+
+    let output = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "first build into a nested new directory must succeed; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        written.contains("Hello!"),
+        "the compiled artifact must be written; got: {written:?}"
+    );
+
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "a first build must emit exactly one stderr line; got: {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with("Compiled to"),
+        "the one line must be the `Compiled to` announce; got: {:?}",
+        lines[0]
+    );
+    for forbidden in ["cannot get metadata", "cannot stat", "warning"] {
+        assert!(
+            !stderr.contains(forbidden),
+            "a first build must not emit {forbidden:?}; got: {stderr:?}"
+        );
+    }
+}
+
+/// T-B2: a newly created output has the same mode `std::fs::write` would have produced
+/// (umask-dependent, so it is compared against a live control in the same directory).
+#[cfg(unix)]
+#[test]
+fn build_o_new_output_mode_matches_std_fs_write() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    let out = dir.path().join("out.md");
+    let ctl = dir.path().join("ctl.md");
+    std::fs::write(&ctl, "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let got = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+    let want = std::fs::metadata(&ctl).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        got, want,
+        "a fresh build artifact must have the same mode std::fs::write produces \
+         (got {got:o}, control {want:o})"
+    );
+}
+
+/// T-B3: building over an existing output preserves that file's mode.
+///
+/// This is a pin: `std::fs::write` over an existing file also preserves the mode, so it
+/// was already true before the reroute. It exists so a future change to the primitive
+/// cannot quietly widen or narrow permissions on rebuild.
+#[cfg(unix)]
+#[test]
+fn build_o_existing_output_mode_0640_preserved() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    let out = dir.path().join("out.md");
+    std::fs::write(&out, "STALE").unwrap();
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    let output = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rebuild must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "rebuild must preserve mode 0640, got {mode:o}");
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        written.contains("Hello!") && !written.contains("STALE"),
+        "rebuild must replace the stale content; got: {written:?}"
+    );
+}
+
+/// T-B4: `-o` at a symlink is refused; the link and its target are left untouched.
+/// Positive control in the same test: the same build against the real file succeeds.
+#[cfg(unix)]
+#[test]
+fn build_o_symlinked_output_target_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    let real = dir.path().join("real.md");
+    std::fs::write(&real, "REAL").unwrap();
+    let link = dir.path().join("link.md");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let refused = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&link)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(refused.stderr).unwrap();
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "building onto a symlink must fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say why; got: {stderr:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "REAL",
+        "the symlink target must not be written through"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink itself must survive the refusal"
+    );
+
+    // Positive control: the same build against the real path is accepted.
+    let ok = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&real)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "control: building onto the real file must succeed; stderr: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let updated = std::fs::read_to_string(&real).unwrap();
+    assert!(
+        updated.contains("Hello!") && !updated.contains("REAL"),
+        "control: the real file must be updated; got: {updated:?}"
+    );
+}
+
+/// T-B5: a failed write leaves the previous artifact intact and no temp file behind.
+#[cfg(unix)]
+#[test]
+fn build_o_write_failure_preserves_existing_output_no_temp_residue() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    let out_dir = dir.path().join("d");
+    std::fs::create_dir(&out_dir).unwrap();
+    let out = out_dir.join("out.md");
+    std::fs::write(&out, "OLD").unwrap();
+
+    // Read-only parent: the temp file cannot be created, so the write fails before the
+    // rename — exactly the crash window `atomic_write_file` exists to close.
+    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // Restore writability BEFORE asserting so a failing assertion cannot leave an
+    // undeletable tempdir behind.
+    let _ = std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a build into a read-only directory must fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("out.md"),
+        "the error must name the target file; got: {stderr:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "OLD",
+        "the previous artifact must survive a failed write"
+    );
+    assert!(
+        temp_residue(&out_dir).is_empty(),
+        "a failed write must leave no temp file; found: {:?}",
+        temp_residue(&out_dir)
+    );
+}
+
+/// T-B6: a successful build leaves no temp file behind either.
+#[test]
+fn build_o_success_leaves_no_temp_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    let out = dir.path().join("out.md");
+
+    let output = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&out).unwrap().contains("Hello!"),
+        "non-vacuity: the artifact must actually have been written"
+    );
+    assert!(
+        temp_residue(dir.path()).is_empty(),
+        "a successful write must leave no temp file; found: {:?}",
+        temp_residue(dir.path())
+    );
+}
+
+/// T-B7: a bare `-o out.md` resolves against the process cwd (the temp-file directory is
+/// `effective_parent`, which maps "" to ".").
+#[test]
+fn build_o_bare_filename_writes_in_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["build", "in.mds", "-o", "out.md"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bare-filename -o must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("out.md"))
+            .unwrap()
+            .contains("Hello!"),
+        "out.md must be written in the process cwd"
+    );
+    assert!(
+        temp_residue(dir.path()).is_empty(),
+        "no temp residue; found: {:?}",
+        temp_residue(dir.path())
+    );
+}

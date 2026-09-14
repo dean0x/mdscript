@@ -1542,3 +1542,103 @@ fn sm20b_embed_sources_with_source_map_no_warning() {
         "embed_sources+source_map must NOT warn about no effect; got: {stderr:?}"
     );
 }
+
+// ── Atomic `.map` sidecars (#227) ────────────────────────────────────────────
+//
+// Both sidecar writers — the single-file `-o` path and the stdin `-o` path — go through
+// `crate::output::atomic_write_file`, so a symlink at `<out>.map` is refused instead of
+// being written through. These two tests are the only way to tell the sites apart from
+// the CLI: they differ only in how the source reaches the compiler.
+
+/// T-S1: single-file `--source-map` refuses a symlinked sidecar path.
+#[cfg(unix)]
+#[test]
+fn build_source_map_sidecar_symlink_target_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mds");
+    std::fs::write(&src, "Hello sidecar!\n").unwrap();
+    let out = dir.path().join("out.md");
+    let real = dir.path().join("real.map");
+    std::fs::write(&real, "OLD").unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("out.md.map")).unwrap();
+
+    let result = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("--source-map")
+        .arg("-o")
+        .arg(&out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert_ne!(
+        result.status.code(),
+        Some(0),
+        "a symlinked sidecar path must fail the build; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say why; got: {stderr:?}"
+    );
+    assert!(
+        out.exists(),
+        "the compiled artifact itself is written before the sidecar and must survive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "OLD",
+        "the symlink target must not be written through"
+    );
+}
+
+/// T-S2: the stdin `--source-map` sidecar writer is a second, distinct site — it must
+/// refuse a symlinked sidecar path too.
+#[cfg(unix)]
+#[test]
+fn build_stdin_source_map_sidecar_symlink_target_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.md");
+    let real = dir.path().join("real.map");
+    std::fs::write(&real, "OLD").unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("out.md.map")).unwrap();
+
+    let mut child = mds_bin()
+        .args(["build", "-", "--source-map", "-o", out.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mds binary should spawn");
+
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
+        .unwrap();
+
+    let result = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert_ne!(
+        result.status.code(),
+        Some(0),
+        "a symlinked sidecar path must fail the stdin build; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say why; got: {stderr:?}"
+    );
+    assert!(
+        out.exists(),
+        "the compiled artifact itself is written before the sidecar and must survive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "OLD",
+        "the symlink target must not be written through"
+    );
+}

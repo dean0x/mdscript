@@ -1010,3 +1010,173 @@ fn d5_dir_build_quiet_gate_unchanged_with_empty_outputs() {
          when empty outputs exist (gate unchanged); got: {stderr}"
     );
 }
+
+// ── Atomic directory-mode outputs (#227) ─────────────────────────────────────
+//
+// Directory mode has its own writer (it accumulates per-file counters instead of
+// returning early), so it is a second site with the same obligation as `write_output`:
+// every compiled artifact and every `.map` sidecar goes through
+// `crate::output::atomic_write_file`.
+
+/// Every `.mds-tmp-` prefixed entry anywhere under `dir` (the temp-file prefix used by
+/// `atomic_write_file`). Empty means no write left residue.
+fn temp_residue_recursive(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    // Bounded: the output tree is finite and acyclic (read_dir does not follow symlinks).
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".mds-tmp-") {
+                found.push(p.display().to_string());
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// T-D1: a clean `--out-dir --source-map` run writes every artifact and every sidecar
+/// and leaves no temp file anywhere in the output tree.
+#[test]
+fn dir_build_out_dir_source_map_no_temp_residue() {
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for name in ["one.mds", "two.mds", "three.mds"] {
+        create_plain_mds(src.path(), name);
+    }
+
+    let output = build_dir(
+        src.path(),
+        &["--out-dir", out.path().to_str().unwrap(), "--source-map"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "dir build with --source-map must succeed; stderr: {stderr}"
+    );
+
+    for stem in ["one", "two", "three"] {
+        let md = out.path().join(format!("{stem}.md"));
+        let map = out.path().join(format!("{stem}.md.map"));
+        assert!(md.is_file(), "{stem}.md must be written");
+        assert!(map.is_file(), "{stem}.md.map sidecar must be written");
+    }
+    let residue = temp_residue_recursive(out.path());
+    assert!(
+        residue.is_empty(),
+        "a successful dir build must leave no temp file; found: {residue:?}"
+    );
+}
+
+/// T-D2: when the output directory is not writable, every pre-existing artifact survives
+/// intact, the run reports the failures, and nothing is left behind.
+#[cfg(unix)]
+#[test]
+fn dir_build_write_failure_preserves_existing_outputs() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let src = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    fs::create_dir(&out).unwrap();
+
+    create_plain_mds(src.path(), "a.mds");
+    create_plain_mds(src.path(), "b.mds");
+    fs::write(out.join("a.md"), "OLD").unwrap();
+    fs::write(out.join("b.md"), "OLD").unwrap();
+
+    fs::set_permissions(&out, fs::Permissions::from_mode(0o555)).unwrap();
+    let output = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    // Restore writability BEFORE asserting so a failing assertion cannot leave an
+    // undeletable tempdir behind.
+    let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a dir build into a read-only output dir must fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("0 built"),
+        "the summary must report nothing built; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed"),
+        "the summary must report the failures; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("error:"),
+        "each failure must be reported on stderr; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("a.md"),
+        "the per-file error must name the artifact; got: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("a.md")).unwrap(),
+        "OLD",
+        "a.md must survive the failed write"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("b.md")).unwrap(),
+        "OLD",
+        "b.md must survive the failed write"
+    );
+    let residue = temp_residue_recursive(&out);
+    assert!(
+        residue.is_empty(),
+        "a failed dir build must leave no temp file; found: {residue:?}"
+    );
+}
+
+/// T-D3: the directory-mode `.map` sidecar writer is its own site — a symlinked sidecar
+/// path is refused, the artifact beside it is still written, and the run reports one
+/// failure.
+#[cfg(unix)]
+#[test]
+fn dir_build_source_map_sidecar_symlink_target_rejected() {
+    let src = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    fs::create_dir(&out).unwrap();
+
+    create_plain_mds(src.path(), "page.mds");
+    let real = root.path().join("real.map");
+    fs::write(&real, "OLD").unwrap();
+    std::os::unix::fs::symlink(&real, out.join("page.md.map")).unwrap();
+
+    let output = build_dir(
+        src.path(),
+        &["--out-dir", out.to_str().unwrap(), "--source-map"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a symlinked sidecar must fail the dir build; stderr: {stderr}"
+    );
+    assert!(
+        out.join("page.md").is_file(),
+        "the compiled artifact is written before the sidecar and must survive"
+    );
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say why; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 failed"),
+        "the summary must report exactly one failure; got: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&real).unwrap(),
+        "OLD",
+        "the symlink target must not be written through"
+    );
+}

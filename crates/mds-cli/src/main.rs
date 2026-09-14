@@ -414,6 +414,9 @@ Your items:
 - {{item}}
 @end
 ";
+    // Raw std::fs::write is deliberate (#227): `mds init` only ever CREATES a file — the
+    // overwrite refusal above guarantees there is no existing content a truncated write
+    // could destroy. Allow-listed in tests/write_funnel.rs.
     std::fs::write(&filename, starter)
         .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
     if !quiet {

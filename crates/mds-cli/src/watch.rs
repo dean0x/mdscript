@@ -524,6 +524,8 @@ fn emit_ready_marker() {
     let mut tmp = path.clone().into_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
+    // Raw write is deliberate (#227): this is already temp+rename. Allow-listed in
+    // tests/write_funnel.rs.
     if std::fs::write(&tmp, READY_MARKER).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
