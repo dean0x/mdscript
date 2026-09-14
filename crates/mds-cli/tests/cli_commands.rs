@@ -569,6 +569,8 @@ fn exit_code_fmt_oversized() {
     );
 }
 
+// #204 reversal: until v0.4.3 this test was `cli_build_directory_empty_exits_zero`
+// and pinned exit 0 for an empty directory.
 // Directory input: an empty directory exits 1 (#204) — "nothing to build" is an
 // error, as it already was for bare auto-detect
 // (cli_build.rs::build_errors_when_no_mds_files_in_directory). A missing path is NOT

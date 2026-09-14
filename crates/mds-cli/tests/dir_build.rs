@@ -718,7 +718,7 @@ fn dir_build_genuinely_empty_exits_one_without_excluded_diagnostic() {
         "empty-dir must NOT show the excluded diagnostic; got: {stderr:?}"
     );
 
-    // Positive control (PF-013 shape): the sibling all-excluded scenario exits 1 too,
+    // Positive control: the sibling all-excluded scenario exits 1 too,
     // so the exit code alone cannot tell them apart — the message must, and the
     // control proves "excluded" is really the substring that appears there.
     let control = tempfile::tempdir().unwrap();

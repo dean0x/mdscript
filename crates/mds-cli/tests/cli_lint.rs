@@ -5722,7 +5722,7 @@ fn lint_directory_empty_exits_two_prints_no_summary() {
          got: {stdout_q:?}"
     );
 
-    // PF-013 / ADR-009: prove "clean," is the exact substring a real directory summary
+    // Positive control: prove "clean," is the exact substring a real directory summary
     // contains, so the absence assertions above cannot pass vacuously.
     let control_dir = tempfile::tempdir().unwrap();
     fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
@@ -5766,7 +5766,7 @@ fn lint_directory_empty_format_json_exits_two_no_envelope() {
          got: {stdout:?}"
     );
 
-    // PF-013 / ADR-009: positive control — a directory with one .mds file DOES emit a
+    // Positive control: a directory with one .mds file DOES emit a
     // JSON envelope on stdout, so the emptiness assertion above is not vacuous.
     let control_dir = tempfile::tempdir().unwrap();
     fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
