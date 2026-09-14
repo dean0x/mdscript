@@ -12,8 +12,8 @@ use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, Variant
 
 use crate::error::MdsError;
 use crate::limits::{
-    MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH, MAX_FRONTMATTER_NODES,
-    MAX_FRONTMATTER_SIZE,
+    MAX_FRONTMATTER_FLOW_DEPTH, MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH,
+    MAX_FRONTMATTER_NODES, MAX_FRONTMATTER_SIZE,
 };
 use crate::parser::is_valid_identifier;
 use crate::scope::Scope;
@@ -141,11 +141,14 @@ pub(super) fn deep_merge_yaml(
 /// bypassed on a parallel path. It returns a `Value` (not a `Mapping`) so each caller
 /// keeps its own "not a mapping" handling.
 ///
-/// Two bounds are enforced ahead of / during the parse:
+/// Three bounds are enforced ahead of / during the parse:
 /// 1. A 1 MiB byte cap (`MAX_FRONTMATTER_SIZE`), checked before any YAML work because the
 ///    `serde_yaml_ng` loader is eager (it drains the whole document into an event vector).
-///    This also bounds libyaml's flow-scanner, whose CPU cost is upstream of the budget.
-/// 2. A 200 000-node budget (`MAX_FRONTMATTER_NODES`), charged while deserialising, which
+/// 2. A flow-nesting depth guard (`MAX_FRONTMATTER_FLOW_DEPTH`), a single O(n) byte pass
+///    before the parser. libyaml's flow scanner is O(depth^2) and runs UPSTREAM of the
+///    node budget, so a deep flow-nest under the 1 MiB cap still burns seconds of CPU at
+///    trivial RSS; the byte cap alone does not bound it. See [`check_flow_nesting_depth`].
+/// 3. A 200 000-node budget (`MAX_FRONTMATTER_NODES`), charged while deserialising, which
 ///    is what catches an `&anchor` referenced by many `*alias`es — the amplification
 ///    `serde_yaml_ng`'s own alias-jump limit does not catch.
 ///
@@ -164,14 +167,22 @@ fn parse_frontmatter_yaml_bounded(
     max_bytes: usize,
     max_nodes: usize,
 ) -> Result<serde_yaml_ng::Value, MdsError> {
-    // 1. Size cap FIRST — before the eager loader touches the input, and before libyaml's
-    //    flow scanner (a CPU cost upstream of deserialisation) can run on a huge document.
+    // 1. Size cap FIRST — before the eager loader touches the input. Bounds total work
+    //    (the flow-nesting depth guard below bounds libyaml's O(depth^2) flow scanner,
+    //    which the byte cap alone does not: a deep nest under 1 MiB still hangs).
     if raw.len() > max_bytes {
         return Err(MdsError::resource_limit(format!(
             "frontmatter too large ({} bytes, max {max_bytes} bytes)",
             raw.len()
         )));
     }
+
+    // 1b. Flow-nesting depth guard — a single O(n) byte pass BEFORE the parser, so
+    //     libyaml's O(depth^2) flow scanner never runs on a pathological deep nest. This
+    //     is a CPU bound the node budget cannot provide: the scanner runs UPSTREAM of
+    //     deserialisation (at trivial RSS, few nodes), so a ~1 MiB pure deep flow-nest
+    //     hangs for seconds before the budget or any downstream depth limit fires. #162.
+    check_flow_nesting_depth(raw, MAX_FRONTMATTER_FLOW_DEPTH)?;
 
     // 2. Budgeted deserialisation. `from_str::<Value>` is exactly
     //    `Value::deserialize(Deserializer::from_str(raw))`; driving the same deserializer
@@ -187,6 +198,44 @@ fn parse_frontmatter_yaml_bounded(
         ))),
         Err(e) => Err(MdsError::yaml_error(e.to_string())),
     }
+}
+
+/// Reject frontmatter whose running flow-collection nesting depth ever exceeds
+/// `max_depth`, in one O(n) pass over the raw bytes (#162).
+///
+/// This is the pre-parse CPU bound: libyaml's flow scanner is O(depth^2) in flow nesting
+/// and runs UPSTREAM of the node budget, so a ~1 MiB pure deep flow-nest hangs for seconds
+/// before any downstream depth limit fires. The scan counts NET depth — flow openers
+/// (`[`, `{`) increment, closers (`]`, `}`) decrement (saturating at 0) — not a total
+/// bracket count, so a wide-but-shallow flow list (`[a, b, c, ...]`, depth 1) stays legal;
+/// only nesting DEPTH is bounded. `[`/`]`/`{`/`}` are ASCII (< 0x80) and never occur inside
+/// a UTF-8 multibyte sequence, so a byte scan is exact for them.
+///
+/// The scan is deliberately naive: it does NOT skip brackets inside quoted scalars or
+/// comments (that would require a YAML lexer). At a threshold of 1024 — 8x serde_yaml_ng's
+/// own 128-frame recursion limit — a false rejection would need 1024+ net-unbalanced flow
+/// openers inside scalar/comment content, which no legitimate frontmatter contains: a
+/// document serde accepts has structural flow depth <= 64 (`MAX_VALUE_DEPTH`). The high
+/// threshold, not a lexer, is the guard against false positives.
+fn check_flow_nesting_depth(raw: &str, max_depth: usize) -> Result<(), MdsError> {
+    // Bounded by `raw.len()`, which the size cap has already bounded by MAX_FRONTMATTER_SIZE.
+    let mut depth: usize = 0;
+    for &byte in raw.as_bytes() {
+        match byte {
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > max_depth {
+                    // Never echo the (adversarial) raw input in the message.
+                    return Err(MdsError::resource_limit(format!(
+                        "frontmatter YAML flow nesting exceeds maximum depth of {max_depth}"
+                    )));
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// A saturating-free node budget with a "tripped" latch, shared by reference across the
