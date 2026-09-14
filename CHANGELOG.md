@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Frontmatter YAML parsing is bounded (#162).** Adversarial frontmatter can no
+  longer exhaust the host through the YAML parser (an abort the JS/Python FFI
+  boundary cannot catch). A block over 1 MiB, or one that would expand to more
+  than 200,000 YAML nodes (an `&anchor` referenced by many `*alias`es), or one
+  nesting flow collections deeper than 1024 levels, is rejected with
+  `mds::resource_limit` before the parser materialises or deep-scans it — on the
+  CLI, the Rust API, napi, wasm and Python. The deep-nesting guard is checked
+  before the parser runs because the parser's own depth limits are reported only
+  after an O(depth²) scan is already paid. `mds::compile_str`/`check_str`/`lint_str_with`
+  now also reject sources over `MAX_FILE_SIZE` (10 MiB) with `mds::resource_limit`;
+  the bindings and the CLI already did. `mds lint` and `scan_imports` no longer
+  swallow these errors (and `scan_imports` now reports more than 256 frontmatter
+  `imports` entries as `mds::resource_limit` instead of silently omitting them);
+  plain YAML syntax errors in those two paths stay best-effort as before.
+  Duplicate-key and syntax-error messages are unchanged.
+
 ### Changed
 
 - **`mds watch --debounce` is now a quiet period with a hard cap (#379).**

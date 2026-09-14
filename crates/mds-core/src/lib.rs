@@ -347,6 +347,13 @@ pub fn compile(
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr.
 ///
+/// # Limits
+///
+/// The source must not exceed `MAX_FILE_SIZE` (10 MiB), and its YAML frontmatter
+/// is bounded to 1 MiB, 200,000 nodes, and 1024 levels of flow-collection
+/// nesting. Exceeding any of these fails with an `mds::resource_limit` error
+/// before the frontmatter parser materialises or deep-scans the input.
+///
 /// # Examples
 ///
 /// ```rust
@@ -363,6 +370,13 @@ pub fn compile_str(source: &str) -> Result<CompileResult, MdsError> {
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr. `base_dir` sets the
 /// root for resolving `@import` paths; defaults to the current directory.
+///
+/// # Limits
+///
+/// The source must not exceed `MAX_FILE_SIZE` (10 MiB), and its YAML frontmatter
+/// is bounded to 1 MiB, 200,000 nodes, and 1024 levels of flow-collection
+/// nesting. Exceeding any of these fails with an `mds::resource_limit` error
+/// before the frontmatter parser materialises or deep-scans the input.
 ///
 /// # Examples
 ///
@@ -419,6 +433,13 @@ pub fn check(
 /// Check (validate) MDS source from a string without rendering output.
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr.
+///
+/// # Limits
+///
+/// The source must not exceed `MAX_FILE_SIZE` (10 MiB), and its YAML frontmatter
+/// is bounded to 1 MiB, 200,000 nodes, and 1024 levels of flow-collection
+/// nesting. Exceeding any of these fails with an `mds::resource_limit` error
+/// before the frontmatter parser materialises or deep-scans the input.
 ///
 /// # Examples
 ///
