@@ -567,6 +567,126 @@ fn scan_imports_handles_all_directive_forms() {
     assert_eq!(js_array_str(&result, 4), "./e.mds");
 }
 
+// ── Frontmatter YAML DoS bounds (#162) ─────────────────────────────────────────
+//
+// The alias bomb is the sub-1 MiB memory-amplification repro (n = m = 100 000,
+// ~700 KB source): under the 1 MiB size cap, so the node budget is what rejects it —
+// fast, without materialising the tree. Deep flow-nesting is the second axis, rejected
+// by the pre-parse flow-depth guard. Every rejection surfaces `code ==
+// "mds::resource_limit"` and never echoes the raw hostile bytes (`*a`, the sentinel).
+
+const MAX_FRONTMATTER_SIZE: usize = 1 << 20; // 1 MiB
+
+fn wrap_fm(y: &str) -> String {
+    format!("---\n{y}---\nHi\n")
+}
+
+/// An alias-fan-out bomb: `a: &a [x, ...(n)]`, `b: [*a, ...(m)]`. Built by repetition so
+/// there is no MiB-scale literal in the test source.
+fn alias_bomb(n: usize, m: usize) -> String {
+    let xs = vec!["x"; n].join(", ");
+    let refs = vec!["*a"; m].join(", ");
+    format!("a: &a [{xs}]\nb: [{refs}]\n")
+}
+
+fn fm_of_size(bytes: usize) -> String {
+    const PREFIX: &str = "k: ZZSENTINELZZ";
+    format!("{PREFIX}{}\n", "x".repeat(bytes - PREFIX.len() - 1))
+}
+
+fn nested_flow_seq(d: usize) -> String {
+    format!("k: {}x{}\n", "[".repeat(d), "]".repeat(d))
+}
+
+/// The rejection message must never echo the adversarial content.
+fn assert_no_echo(err: &JsValue, label: &str) {
+    let m = get_str(err, "message");
+    assert!(!m.contains("*a"), "{label}: message echoes bomb: {m}");
+    assert!(
+        !m.contains("ZZSENTINELZZ"),
+        "{label}: message echoes sentinel: {m}"
+    );
+}
+
+fn bomb_doc() -> String {
+    wrap_fm(&alias_bomb(100_000, 100_000))
+}
+
+#[wasm_bindgen_test]
+fn w1_compile_alias_bomb_is_resource_limit() {
+    let err = mds_wasm::compile(&bomb_doc(), JsValue::NULL).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_no_echo(&err, "W-1 compile bomb");
+}
+
+#[wasm_bindgen_test]
+fn w2_check_alias_bomb_is_resource_limit() {
+    let err = mds_wasm::check(&bomb_doc(), JsValue::NULL).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_no_echo(&err, "W-2 check bomb");
+}
+
+#[wasm_bindgen_test]
+fn w3_lint_alias_bomb_is_resource_limit() {
+    let err = mds_wasm::lint(&bomb_doc(), JsValue::NULL).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_no_echo(&err, "W-3 lint bomb");
+}
+
+#[wasm_bindgen_test]
+fn w4_scan_imports_alias_bomb_propagates_resource_limit() {
+    let err = mds_wasm::scan_imports(&bomb_doc()).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_no_echo(&err, "W-4 scan_imports bomb");
+}
+
+#[wasm_bindgen_test]
+fn w5_frontmatter_over_cap_rejected_at_cap_accepted() {
+    // Over the 1 MiB cap → resource limit, message never echoes the frontmatter content.
+    let over = mds_wasm::compile(
+        &wrap_fm(&fm_of_size(MAX_FRONTMATTER_SIZE + 1)),
+        JsValue::NULL,
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&over, "code"), "mds::resource_limit");
+    assert_no_echo(&over, "W-5 over-cap");
+
+    // At-cap control (PF-013): exactly 1 MiB of frontmatter compiles.
+    let at = mds_wasm::compile(&wrap_fm(&fm_of_size(MAX_FRONTMATTER_SIZE)), JsValue::NULL);
+    assert!(at.is_ok(), "at-cap frontmatter must compile: {at:?}");
+}
+
+#[wasm_bindgen_test]
+fn w6_scan_imports_stays_lenient_for_frontmatter_syntax_errors() {
+    // Positive control: a plain frontmatter YAML SYNTAX error (never-closed flow) is
+    // swallowed by scan_imports, which still returns the body imports — proving the
+    // resource-limit propagation in W-4 is specific to the bound, not blanket strictness.
+    let source = "---\nimports: [\n---\n@import \"./x.mds\"\nHi\n";
+    let result = mds_wasm::scan_imports(source).expect("syntax error in FM must be lenient");
+    assert_eq!(js_array_len(&result), 1);
+    assert_eq!(js_array_str(&result, 0), "./x.mds");
+}
+
+#[wasm_bindgen_test]
+fn w_legit_anchor_alias_still_compiles() {
+    // Positive control (PF-013): valid YAML aliasing must not be over-rejected.
+    let result =
+        mds_wasm::compile("---\na: &a [1, 2]\nb: *a\n---\n{{b}}\n", JsValue::NULL).unwrap();
+    let output = get_str(&result, "output");
+    assert!(
+        output.ends_with("1, 2\n"),
+        "legit alias must render the anchored sequence; got: {output}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn w_deep_flow_nest_is_resource_limit() {
+    // The second DoS axis: a deep flow nest (depth 2000 > 1024) trips the pre-parse
+    // flow-depth guard.
+    let err = mds_wasm::compile(&wrap_fm(&nested_flow_seq(2000)), JsValue::NULL).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+}
+
 // ── Template inheritance tests (@extends / @block) ───────────────────────────
 
 /// Build a modules option for inheritance tests.

@@ -24,6 +24,53 @@ pub fn mds_bin() -> std::process::Command {
     cmd
 }
 
+// ── Frontmatter YAML bounds builders (#162) ──────────────────────────────────
+
+/// Frontmatter size cap (1 MiB) — mirrors `mds-core`'s `MAX_FRONTMATTER_SIZE`.
+#[allow(dead_code)]
+pub const MAX_FRONTMATTER_SIZE: usize = 1 << 20;
+
+/// Wrap a YAML frontmatter body in `---` fences with a one-line body.
+#[allow(dead_code)]
+pub fn wrap(yaml: &str) -> String {
+    format!("---\n{yaml}---\nHi\n")
+}
+
+/// A single `k: <sentinel><padding>\n` line whose total byte length is EXACTLY `bytes`.
+///
+/// The `ZZSENTINELZZ` marker lets the size-cap tests assert the rejection message never
+/// echoes the (arbitrarily large) frontmatter content back to the user.
+#[allow(dead_code)]
+pub fn fm_of_size(bytes: usize) -> String {
+    const PREFIX: &str = "k: ZZSENTINELZZ";
+    assert!(bytes > PREFIX.len() + 1, "requested size too small");
+    let pad = bytes - PREFIX.len() - 1;
+    let out = format!("{PREFIX}{}\n", "x".repeat(pad));
+    assert_eq!(
+        out.len(),
+        bytes,
+        "fm_of_size must produce EXACTLY `bytes` bytes"
+    );
+    out
+}
+
+/// An alias-fan-out bomb: `a: &a [x, x, ...(n)]`, `b: [*a, *a, ...(m)]`. Each `*a`
+/// re-expands the `n`-element anchor at deserialise time, so the materialised tree far
+/// exceeds the node budget while the SOURCE stays small (~700 KB for n = m = 100 000).
+#[allow(dead_code)]
+pub fn alias_bomb(n: usize, m: usize) -> String {
+    let xs = vec!["x"; n].join(", ");
+    let refs = vec!["*a"; m].join(", ");
+    format!("a: &a [{xs}]\nb: [{refs}]\n")
+}
+
+/// `k: [[[...x...]]]` with `d` nested flow sequences around a scalar (a deep-nest DoS
+/// repro; the pre-parse flow-depth guard rejects any `d > 1024`).
+#[allow(dead_code)]
+pub fn nested_flow_seq(d: usize) -> String {
+    format!("k: {}x{}\n", "[".repeat(d), "]".repeat(d))
+}
+
 // ── Duplicate --vars file key warnings (#326) ────────────────────────────────
 
 /// USER-FACING CONTRACT (#326). `{key}` = dotted/bracketed path, `{path}` = the

@@ -319,6 +319,85 @@ fn c8_merge_key_is_a_plain_key_and_bomb_is_budgeted() {
     assert!(is_rl(&r), "`<<` alias bomb must be budgeted: {r:?}");
 }
 
+// ── Realistic sub-1 MiB alias bombs (the DoS repros) ────────────────────────────
+
+#[test]
+fn c7_realistic_sub_mib_alias_bomb_rejected_by_node_budget() {
+    // The real-world memory-amplification repro: n = m = 100 000 aliases. The SOURCE is
+    // ~700 KB — comfortably UNDER the 1 MiB size cap, so the size cap does NOT catch it
+    // (asserted first, per PF-013). The node budget is what rejects it, and it does so
+    // fast: each `*a` re-expands the anchored 100 000-element sequence, so the budget
+    // trips long before the full ~10^10-node tree could be materialised.
+    let raw = alias_bomb(100_000, 100_000, 0);
+    assert!(
+        raw.len() < MAX_FRONTMATTER_SIZE,
+        "the bomb must be under the size cap so the NODE BUDGET (not the size cap) is \
+         what rejects it: {} bytes",
+        raw.len()
+    );
+    let start = std::time::Instant::now();
+    let r = parse_frontmatter_yaml(&raw);
+    let elapsed = start.elapsed();
+    assert!(
+        is_rl(&r),
+        "sub-1 MiB alias bomb must be a resource limit: {r:?}"
+    );
+    let m = msg(&r);
+    assert!(
+        m.contains(&MAX_FRONTMATTER_NODES.to_string()),
+        "message must name the node limit: {m}"
+    );
+    assert!(
+        !m.contains("*a"),
+        "message must not echo the bomb content: {m}"
+    );
+    // Non-materialisation proof: rejecting the bomb must not take the wall-clock cost of
+    // building the full expansion (pre-fix this OOM'd / hung).
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "node budget must reject without materialising the tree, took {elapsed:?}"
+    );
+}
+
+// ── C-9: alias bomb reached through an @extends base module ──────────────────────
+
+#[test]
+fn c9_alias_bomb_in_extends_base_is_rejected() {
+    // The bomb lives in a BASE module's frontmatter, reached through the resolver when a
+    // child `@extends` it. The base's frontmatter is parsed via the same choke point, so
+    // the resource limit fires before any inheritance work.
+    use std::collections::HashMap;
+    let bomb = alias_bomb(100_000, 100_000, 0);
+    let modules = HashMap::from([
+        (
+            "main.mds".to_string(),
+            "@extends \"./base.mds\"\n@block persona:\nhi\n@end\n".to_string(),
+        ),
+        ("base.mds".to_string(), format!("---\n{bomb}---\nBASE\n")),
+    ]);
+    let r = crate::compile_virtual(modules, "main.mds", None);
+    assert!(
+        is_rl(&r),
+        "a bomb in an @extends base's frontmatter must be rejected: {r:?}"
+    );
+}
+
+#[test]
+fn c9c_legit_anchor_alias_still_compiles() {
+    // Positive control (PF-013): a legitimate anchor/alias used in the body must still
+    // work — the bounds must not over-reject valid YAML aliasing. `b: *a` resolves to the
+    // `[1, 2]` sequence and renders in the body.
+    let doc = "---\na: &a [1, 2]\nb: *a\n---\n{{b}}\n";
+    let out = crate::compile_str(doc)
+        .expect("legit anchor/alias must compile")
+        .into_markdown()
+        .expect("markdown output");
+    assert!(
+        out.contains("1, 2"),
+        "legit alias must render the anchored sequence: {out:?}"
+    );
+}
+
 // ── Depth pins (existing serde / Value::from_yaml behaviour, via check_str) ──────
 
 #[test]

@@ -1,5 +1,8 @@
 mod common;
-use common::{assert_no_control_chars, fixture, mds_bin};
+use common::{
+    alias_bomb, assert_no_control_chars, fixture, fm_of_size, mds_bin, nested_flow_seq, wrap,
+    MAX_FRONTMATTER_SIZE,
+};
 use std::collections::HashMap;
 
 #[test]
@@ -391,6 +394,268 @@ fn exit_code_resource_limit() {
         Some(3),
         "expected exit code 3 for resource-limit error"
     );
+}
+
+// ── Frontmatter YAML DoS bounds across the CLI (#162) ────────────────────────
+//
+// The alias bomb is the sub-1 MiB memory-amplification repro (n = m = 100 000,
+// ~700 KB source): the source is under the 1 MiB size cap, so the node budget is what
+// rejects it — fast, without materialising the tree. Every rejection is exit code 3
+// (`mds::resource_limit`), never echoes the raw hostile bytes (`*a`, the sentinel, or a
+// bracket run), and stays free of control characters.
+
+/// The realistic memory-amplification repro, wrapped as a full `.mds` document.
+fn bomb_doc() -> String {
+    wrap(&alias_bomb(100_000, 100_000))
+}
+
+#[test]
+fn cli_1_check_stdin_alias_bomb_is_resource_limit() {
+    use std::io::Write;
+    let mut child = mds_bin()
+        .args(["check", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(bomb_doc().as_bytes());
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "alias bomb via `check -` must exit 3"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::resource_limit"),
+        "stderr must name the resource limit: {stderr}"
+    );
+    assert!(
+        !stderr.contains("*a"),
+        "stderr must not echo bomb content: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "cli_1 check stdin bomb stderr");
+}
+
+#[test]
+fn cli_2_check_file_alias_bomb_is_resource_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("bomb.mds");
+    std::fs::write(&src, bomb_doc()).unwrap();
+    let output = mds_bin().arg("check").arg(&src).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "alias bomb via `check <file>` must exit 3"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::resource_limit"),
+        "stderr must name the resource limit: {stderr}"
+    );
+    assert!(
+        !stderr.contains("*a"),
+        "stderr must not echo bomb content: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "cli_2 check file bomb stderr");
+}
+
+#[test]
+fn cli_3_check_over_size_cap_is_resource_limit_no_echo() {
+    // Frontmatter one byte over the 1 MiB cap → rejected before any YAML work, and the
+    // message must never echo the (arbitrarily large) frontmatter content.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("over.mds");
+    std::fs::write(&src, wrap(&fm_of_size(MAX_FRONTMATTER_SIZE + 1))).unwrap();
+    let output = mds_bin().arg("check").arg(&src).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "over-cap frontmatter must exit 3"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::resource_limit"),
+        "stderr must name the resource limit: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ZZSENTINELZZ"),
+        "stderr must not echo the frontmatter content: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "cli_3 over-cap stderr");
+}
+
+#[test]
+fn cli_3c_check_at_size_cap_is_accepted() {
+    // At-cap control (PF-013): exactly 1 MiB of frontmatter is admitted.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("atcap.mds");
+    std::fs::write(&src, wrap(&fm_of_size(MAX_FRONTMATTER_SIZE))).unwrap();
+    let status = mds_bin()
+        .arg("check")
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "at-cap frontmatter must be accepted"
+    );
+}
+
+#[test]
+fn cli_4_lint_alias_bomb_is_resource_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("bomb.mds");
+    std::fs::write(&src, bomb_doc()).unwrap();
+    let output = mds_bin().arg("lint").arg(&src).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "lint on the bomb must exit 3"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::resource_limit"),
+        "stderr must name the resource limit: {stderr}"
+    );
+    assert!(
+        !stderr.contains("*a"),
+        "stderr must not echo bomb content: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "cli_4 lint bomb stderr");
+}
+
+#[test]
+fn cli_4c_lint_legit_aliases_is_clean() {
+    // Positive control (PF-013): a legitimate anchor/alias with every frontmatter key
+    // referenced in the body lints clean (exit 0) — the bounds do not over-reject.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("legit.mds");
+    std::fs::write(&src, "---\na: &a [1, 2]\nb: *a\n---\n{{a}} {{b}}\n").unwrap();
+    let status = mds_bin()
+        .arg("lint")
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "legit aliases must lint clean");
+}
+
+#[test]
+fn cli_5_fmt_check_alias_bomb_leaves_file_byte_identical() {
+    // `mds fmt --check` compiles the source to prove formatting equivalence. Post-fix the
+    // compile rejects the bomb cleanly, the formatter falls back and reattaches the
+    // frontmatter verbatim, so `--check` reports the file unchanged (exit 0) and the
+    // on-disk bytes are untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("bomb.mds");
+    let original = bomb_doc();
+    std::fs::write(&src, &original).unwrap();
+    let status = mds_bin()
+        .args(["fmt", "--check"])
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "fmt --check on the bomb must exit 0"
+    );
+    let after = std::fs::read(&src).unwrap();
+    assert_eq!(
+        after,
+        original.as_bytes(),
+        "fmt --check must leave the bomb file byte-identical"
+    );
+}
+
+#[test]
+fn cli_deep_check_deep_flow_nest_is_resource_limit() {
+    // The second DoS axis: pure deep flow-nesting (no anchors), a CPU hang in libyaml's
+    // flow scanner pre-fix. The pre-parse depth guard rejects depth > 1024 fast, before
+    // any scanner work, and the message names the flow-depth limit without echoing the
+    // bracket run.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("deep.mds");
+    std::fs::write(&src, wrap(&nested_flow_seq(2000))).unwrap();
+    let start = std::time::Instant::now();
+    let output = mds_bin().arg("check").arg(&src).output().unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(output.status.code(), Some(3), "deep flow nest must exit 3");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::resource_limit"),
+        "stderr must name the resource limit: {stderr}"
+    );
+    // miette word-wraps the diagnostic and prefixes continuation lines with `│`; flatten
+    // that back to a single line before matching the full message.
+    let flat: String = stderr
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("flow nesting exceeds maximum depth of 1024"),
+        "stderr must name the flow-depth limit: {stderr}"
+    );
+    assert!(
+        !stderr.contains("[[[") && !stderr.contains("]]]"),
+        "stderr must not echo the bracket run: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "cli_deep stderr");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the guard must reject the deep nest pre-parse (fast), took {elapsed:?}"
+    );
+}
+
+#[test]
+fn cli_6_max_frontmatter_in_max_source_build_is_accepted() {
+    // Both caps at their boundaries compose: a 1 MiB (at-cap) frontmatter inside a
+    // source that is exactly 10 MiB (at MAX_FILE_SIZE) is accepted by `build -`.
+    use std::io::Write;
+    const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+    let head = wrap_open(&fm_of_size(MAX_FRONTMATTER_SIZE));
+    let body_len = MAX_FILE_SIZE - head.len();
+    let mut doc = head;
+    doc.push_str(&"H".repeat(body_len - 1));
+    doc.push('\n');
+    assert_eq!(
+        doc.len(),
+        MAX_FILE_SIZE,
+        "source must be exactly at MAX_FILE_SIZE"
+    );
+
+    let mut child = mds_bin()
+        .args(["build", "-o", "-", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(doc.as_bytes());
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "1 MiB frontmatter inside a 10 MiB source must be accepted at both boundaries"
+    );
+}
+
+/// `---\n{yaml}---\n` — the fenced header without a body, for size-composition tests.
+fn wrap_open(yaml: &str) -> String {
+    format!("---\n{yaml}---\n")
 }
 
 // ── AC-2: load_vars_file rejects symlinked vars paths (PF-004 fix) ───────────

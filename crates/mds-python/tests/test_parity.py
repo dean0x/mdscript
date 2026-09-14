@@ -115,6 +115,16 @@ def test_par2_live_cli_messages_byte_parity(
 # Same inputs the napi __test__ suite asserts on must yield the same core error
 # code through the Python binding (messages/spans come from the shared core).
 
+# Frontmatter YAML bomb builders (#162), mirroring the napi R-4 assertion. Built by
+# string repetition so there is no MiB-scale literal here.
+def wrap(yaml: str) -> str:
+    return f"---\n{yaml}---\nHi\n"
+
+
+def alias_bomb(n: int, mm: int) -> str:
+    return "a: &a [" + "x, " * n + "]\nb: [" + "*a, " * mm + "]\n"
+
+
 NAPI_ERROR_PARITY = [
     ("mds::undefined_var", lambda: m.compile("Hello {{undefined_var}}!\n")),
     ("mds::syntax", lambda: m.compile("@import\n")),
@@ -125,6 +135,9 @@ NAPI_ERROR_PARITY = [
     # Frontmatter sets count to Number(3); comparing against string literal "3" is a
     # cross-type comparison → mds::type_mismatch (#152).
     ("mds::type_mismatch", lambda: m.compile('---\ncount: 3\n---\n@if count == "3":\nx\n@end\n')),
+    # The sub-1 MiB alias bomb (napi R-4): the node budget rejects it with a resource
+    # limit through the Python binding too — same shared-core code.
+    ("mds::resource_limit", lambda: m.compile(wrap(alias_bomb(100000, 100000)))),
 ]
 
 

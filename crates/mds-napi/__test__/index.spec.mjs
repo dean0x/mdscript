@@ -1725,3 +1725,83 @@ describe('unknown rule name warning (AC-224 D8)', () => {
     );
   });
 });
+
+// ── Frontmatter YAML DoS bounds (#162) ─────────────────────────────────────────
+//
+// The alias bomb is the sub-1 MiB memory-amplification repro (n = m = 100 000,
+// ~700 KB source): under the 1 MiB size cap, so the node budget is what rejects it —
+// fast, without materialising the tree. Deep flow-nesting is the second axis, rejected
+// by the pre-parse flow-depth guard. Every rejection throws with `err.code ===
+// 'mds::resource_limit'` and never echoes the raw hostile bytes (`*a`, the sentinel).
+describe('resource limits', () => {
+  const MAX_FRONTMATTER_SIZE = 1 << 20; // 1 MiB
+  const wrapFm = (y) => `---\n${y}---\nHi\n`;
+  // Builders mirror the core/CLI ones via string repetition (no MiB-scale literals).
+  const aliasBomb = (n, m) =>
+    'a: &a [' + 'x, '.repeat(n) + ']\nb: [' + '*a, '.repeat(m) + ']\n';
+  const fmOfSize = (bytes) => {
+    const PREFIX = 'k: ZZSENTINELZZ';
+    return PREFIX + 'x'.repeat(bytes - PREFIX.length - 1) + '\n';
+  };
+  const nestedFlowSeq = (d) => 'k: ' + '['.repeat(d) + 'x' + ']'.repeat(d) + '\n';
+
+  const bombDoc = wrapFm(aliasBomb(100000, 100000));
+
+  /// Assert `fn()` throws a resource-limit error whose message does not echo hostile bytes.
+  const assertResourceLimit = (fn, label) => {
+    assert.throws(
+      fn,
+      (err) => {
+        assert.ok(err instanceof Error, `${label}: should be an Error`);
+        assert.equal(err.code, 'mds::resource_limit', `${label}: got code ${err.code}`);
+        assert.ok(!err.message.includes('*a'), `${label}: message echoes bomb: ${err.message}`);
+        assert.ok(
+          !err.message.includes('ZZSENTINELZZ'),
+          `${label}: message echoes sentinel: ${err.message}`,
+        );
+        return true;
+      },
+      label,
+    );
+  };
+
+  test('R-4: compile rejects the sub-1 MiB alias bomb as a resource limit', () => {
+    assert.ok(bombDoc.length < MAX_FRONTMATTER_SIZE + 64, 'bomb source stays near ~700 KB');
+    assertResourceLimit(() => compile(bombDoc), 'R-4 compile bomb');
+  });
+
+  test('R-5: check rejects the alias bomb as a resource limit', () => {
+    assertResourceLimit(() => check(bombDoc), 'R-5 check bomb');
+  });
+
+  test('R-6: lint rejects the alias bomb as a resource limit', () => {
+    assertResourceLimit(() => lint(bombDoc), 'R-6 lint bomb');
+  });
+
+  test('R-7: frontmatter one byte over the size cap is a resource limit', () => {
+    assertResourceLimit(
+      () => compile(wrapFm(fmOfSize(MAX_FRONTMATTER_SIZE + 1))),
+      'R-7 over-cap',
+    );
+  });
+
+  test('R-8: frontmatter exactly at the size cap is accepted', () => {
+    // At-cap control (PF-013): exactly 1 MiB of frontmatter compiles.
+    const result = compile(wrapFm(fmOfSize(MAX_FRONTMATTER_SIZE)));
+    assert.equal(result.kind, 'markdown', 'at-cap frontmatter must compile');
+  });
+
+  test('R-9: a legitimate anchor/alias still compiles', () => {
+    // Positive control (PF-013): the bounds must not over-reject valid YAML aliasing.
+    const result = compile('---\na: &a [1, 2]\nb: *a\n---\n{{b}}\n');
+    assert.equal(result.kind, 'markdown');
+    assert.ok(
+      result.output.endsWith('1, 2\n'),
+      `legit alias must render the anchored sequence; got: ${result.output}`,
+    );
+  });
+
+  test('napi-DEEP: a deep flow nest trips the flow-depth guard', () => {
+    assertResourceLimit(() => compile(wrapFm(nestedFlowSeq(2000))), 'napi-DEEP');
+  });
+});
