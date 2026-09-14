@@ -45,7 +45,9 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
         "main.rs",
         "fs::write(",
         1,
-        "mds init creates a NEW file after an explicit exists-check; nothing to truncate (#227)",
+        "mds init scaffolds a fixed public template at a user-typed path, reproducible by \
+         a re-run — NOT because it only ever creates: --force truncates in place and the \
+         write follows a symlink at the target (#227)",
     ),
     (
         "watch.rs",

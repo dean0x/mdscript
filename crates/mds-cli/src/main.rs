@@ -418,9 +418,13 @@ Your items:
 - {{item}}
 @end
 ";
-    // Raw std::fs::write is deliberate (#227): `mds init` only ever CREATES a file — the
-    // overwrite refusal above guarantees there is no existing content a truncated write
-    // could destroy. Allow-listed in tests/write_funnel.rs.
+    // Raw std::fs::write is deliberate (#227). What it is NOT justified by: "init only
+    // ever creates a file". `--force` skips the exists-check above and truncates in
+    // place, and both `exists()` and `write` follow a symlink, so a link at `filename`
+    // — dangling, or live under `--force` — is written through to its target. The raw
+    // write stays because the blast radius is small and entirely user-directed:
+    // `filename` is typed on the command line and `starter` is a fixed public template
+    // that a re-run reproduces. Allow-listed in tests/write_funnel.rs.
     std::fs::write(&filename, starter)
         .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
     if !quiet {
