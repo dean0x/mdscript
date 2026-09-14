@@ -53,6 +53,22 @@ config:
 - Object values support dot-notation field access: `{{config.key}}`, `{{a.b.c}}`
 - Objects cannot be interpolated directly; access a specific field instead
 
+**Resource limits:**
+
+| Limit | Value |
+|-------|-------|
+| `MAX_FRONTMATTER_SIZE` | 1 MiB per frontmatter block |
+| `MAX_FRONTMATTER_NODES` | 200,000 YAML nodes per block, counted during parsing so alias expansion stops before the tree is built |
+| `MAX_FRONTMATTER_FLOW_DEPTH` | 1024 levels of flow-collection (`[`/`{`) nesting, checked before the parser scans (bounds libyaml's O(depth²) flow scan) |
+| `MAX_FILE_SIZE` | 10 MiB per source, including strings passed to the string APIs |
+
+Exceeding one of these returns `mds::resource_limit` (exit 3). YAML the parser
+itself refuses — syntax errors, duplicate keys, nesting deeper than 128 levels,
+its alias-repetition limit — returns `mds::yaml`, as does value nesting deeper
+than 64 levels. These bounds are pinned by the `parse_frontmatter_yaml` tests in
+`crates/mds-core/src/resolver/frontmatter.rs` and by the
+`yaml_parse_sites_are_funnelled` test.
+
 ---
 
 ### 4.2 Interpolation
@@ -1296,7 +1312,7 @@ Maximum config file size: 1 MB.
 | `0` | Success |
 | `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.) |
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure) |
-| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), or cumulative message content exceeds 50 MB) |
+| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, or frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels) |
 
 **`mds lint`** (see §7.5 for per-code meaning):
 

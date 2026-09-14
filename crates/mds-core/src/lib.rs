@@ -347,6 +347,13 @@ pub fn compile(
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr.
 ///
+/// # Limits
+///
+/// The source must not exceed `MAX_FILE_SIZE` (10 MiB), and its YAML frontmatter
+/// is bounded to 1 MiB, 200,000 nodes, and 1024 levels of flow-collection
+/// nesting. Exceeding any of these fails with an `mds::resource_limit` error
+/// before the frontmatter parser materialises or deep-scans the input.
+///
 /// # Examples
 ///
 /// ```rust
@@ -363,6 +370,13 @@ pub fn compile_str(source: &str) -> Result<CompileResult, MdsError> {
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr. `base_dir` sets the
 /// root for resolving `@import` paths; defaults to the current directory.
+///
+/// # Limits
+///
+/// The source must not exceed `MAX_FILE_SIZE` (10 MiB), and its YAML frontmatter
+/// is bounded to 1 MiB, 200,000 nodes, and 1024 levels of flow-collection
+/// nesting. Exceeding any of these fails with an `mds::resource_limit` error
+/// before the frontmatter parser materialises or deep-scans the input.
 ///
 /// # Examples
 ///
@@ -419,6 +433,13 @@ pub fn check(
 /// Check (validate) MDS source from a string without rendering output.
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr.
+///
+/// # Limits
+///
+/// The source must not exceed `MAX_FILE_SIZE` (10 MiB), and its YAML frontmatter
+/// is bounded to 1 MiB, 200,000 nodes, and 1024 levels of flow-collection
+/// nesting. Exceeding any of these fails with an `mds::resource_limit` error
+/// before the frontmatter parser materialises or deep-scans the input.
 ///
 /// # Examples
 ///
@@ -1360,10 +1381,17 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
     // Insert frontmatter import paths (they resolve before body imports).
     // Best-effort: ignore parse errors here (parse errors will surface at compile time).
     if let Some(fm) = module.frontmatter.as_ref() {
-        if let Ok(fm_imports) = resolver::parse_frontmatter_imports(&fm.raw) {
-            for imp in &fm_imports {
-                paths.insert(imp.path().to_owned());
+        // Best-effort for plain parse/validation errors, but a resource limit (frontmatter
+        // size cap / node budget / too-many-imports) must fail closed rather than silently
+        // return only body imports (#162).
+        match resolver::parse_frontmatter_imports(&fm.raw) {
+            Ok(fm_imports) => {
+                for imp in &fm_imports {
+                    paths.insert(imp.path().to_owned());
+                }
             }
+            Err(e @ MdsError::ResourceLimit { .. }) => return Err(e),
+            Err(_) => {}
         }
     }
 
@@ -1781,6 +1809,35 @@ mod tests {
     }
 
     // ── scan_imports: frontmatter imports paths ───────────────────────────────
+
+    /// #162: a frontmatter alias-fan-out bomb must make `scan_imports` fail closed with a
+    /// resource limit rather than silently return only body imports.
+    #[test]
+    fn scan_imports_frontmatter_bomb_propagates_resource_limit() {
+        let xs = vec!["x"; 1000].join(", ");
+        let refs = vec!["*a"; 400].join(", ");
+        let source = format!("---\na: &a [{xs}]\nb: [{refs}]\n---\nHi\n");
+        let r = scan_imports(&source);
+        assert!(
+            matches!(r, Err(crate::MdsError::ResourceLimit { .. })),
+            "frontmatter bomb must propagate a resource limit, got {r:?}"
+        );
+    }
+
+    /// A plain frontmatter YAML syntax error stays best-effort: `scan_imports` swallows it
+    /// and still returns the body imports.
+    #[test]
+    fn scan_imports_frontmatter_syntax_error_is_lenient() {
+        let source = concat!(
+            "---\n",
+            "imports: [\n", // malformed YAML — never closes
+            "---\n",
+            "@import \"./x.mds\"\n",
+            "Hi\n",
+        );
+        let paths = scan_imports(source).expect("syntax error in FM must be swallowed");
+        assert_eq!(paths, vec!["./x.mds".to_string()]);
+    }
 
     #[test]
     fn scan_imports_fm_alias() {

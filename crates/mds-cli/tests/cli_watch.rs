@@ -1260,79 +1260,107 @@ fn watch_debounce_single_rebuild_from_burst() {
 /// since the loop never reaches `TickClock::recv_next` while a window is open.
 #[test]
 fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("hot.mds");
-    std::fs::write(&src, "---\nname: v0\n---\nHot {{name}}!\n").unwrap();
-    let out = dir.path().join("hot.md");
+    // The writer thread must keep the stream denser than the 200ms quiet-period window,
+    // so a rebuild seen WHILE writing provably comes from the cap and not from a quiet
+    // period that ended on its own. That is a HARNESS precondition, not a property of
+    // the code under test: on a loaded runner the writer thread can itself be
+    // descheduled past the window (a 747ms inter-write gap was observed on CI), which
+    // makes the sample inconclusive rather than failing. Retry the whole measurement a
+    // bounded number of times, gated ONLY on that precondition — every behaviour
+    // assertion below still fails hard on the first attempt, so a real regression is
+    // never retried away.
+    const MAX_ATTEMPTS: u32 = 4;
+    const WINDOW: Duration = Duration::from_millis(200);
 
-    // --debounce 200 => cap = max(10 x 200ms, 1s) = 2s.
-    let (mut child, stderr_tap) = spawn_ready(
-        mds_bin()
-            .args([
-                "watch",
-                src.to_str().unwrap(),
-                "--debounce",
-                "200",
-                "--poll-interval",
-                "0",
-            ])
-            .stdout(Stdio::null()),
-    );
+    for attempt in 1..=MAX_ATTEMPTS {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("hot.mds");
+        std::fs::write(&src, "---\nname: v0\n---\nHot {{name}}!\n").unwrap();
+        let out = dir.path().join("hot.md");
 
-    assert!(
-        wait_for_file_contains(&out, "Hot v0!", TIMEOUT),
-        "initial compile should produce Hot v0!"
-    );
+        // --debounce 200 => cap = max(10 x 200ms, 1s) = 2s.
+        let (mut child, stderr_tap) = spawn_ready(
+            mds_bin()
+                .args([
+                    "watch",
+                    src.to_str().unwrap(),
+                    "--debounce",
+                    "200",
+                    "--poll-interval",
+                    "0",
+                ])
+                .stdout(Stdio::null()),
+        );
 
-    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let writer_flag = std::sync::Arc::clone(&writing);
-    let writer_src = src.clone();
-    let writer = std::thread::spawn(move || {
-        let stop_at = Instant::now() + Duration::from_secs(3);
-        let mut max_gap = Duration::ZERO;
-        let mut last = Instant::now();
-        // Doubly bounded: <= 3s of wall clock AND <= 2000 iterations.
-        for i in 1..=2_000u32 {
-            if Instant::now() >= stop_at {
-                break;
+        assert!(
+            wait_for_file_contains(&out, "Hot v0!", TIMEOUT),
+            "initial compile should produce Hot v0!"
+        );
+
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_flag = std::sync::Arc::clone(&writing);
+        let writer_src = src.clone();
+        let writer = std::thread::spawn(move || {
+            let stop_at = Instant::now() + Duration::from_secs(3);
+            let mut max_gap = Duration::ZERO;
+            let mut last = Instant::now();
+            // Doubly bounded: <= 3s of wall clock AND <= 2000 iterations.
+            for i in 1..=2_000u32 {
+                if Instant::now() >= stop_at {
+                    break;
+                }
+                write_atomic(
+                    &writer_src,
+                    format!("---\nname: v{i}\n---\nHot {{{{name}}}}!\n"),
+                );
+                let now = Instant::now();
+                max_gap = max_gap.max(now.duration_since(last));
+                last = now;
+                std::thread::sleep(Duration::from_millis(5));
             }
-            write_atomic(
-                &writer_src,
-                format!("---\nname: v{i}\n---\nHot {{{{name}}}}!\n"),
+            writer_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            max_gap
+        });
+
+        // The cap is 2s; allow the compile that follows it to land inside the bound.
+        wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", Duration::from_millis(3500));
+        let rebuilt_while_writing = writing.load(std::sync::atomic::Ordering::SeqCst);
+
+        let max_gap = writer.join().expect("writer thread panicked");
+
+        // Harness precondition, checked before any behaviour assertion: if the writer
+        // thread could not sustain a sub-window cadence, this run cannot tell a cap
+        // rebuild from a quiet-period one. Discard it and retry rather than reporting a
+        // scheduling hiccup as a product failure.
+        if max_gap >= WINDOW {
+            drop(child);
+            assert!(
+                attempt < MAX_ATTEMPTS,
+                "the writer thread could not sustain a sub-{WINDOW:?} write cadence in \
+                 {MAX_ATTEMPTS} attempts (largest gap {max_gap:?}); the runner is too \
+                 loaded to exercise the cap deterministically"
             );
-            let now = Instant::now();
-            max_gap = max_gap.max(now.duration_since(last));
-            last = now;
-            std::thread::sleep(Duration::from_millis(5));
+            continue;
         }
-        writer_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-        max_gap
-    });
 
-    // The cap is 2s; allow the compile that follows it to land inside the bound.
-    wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", Duration::from_millis(3500));
-    let rebuilt_while_writing = writing.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            rebuilt_while_writing,
+            "a rebuild must happen WHILE the writes are still arriving — that is what the \
+             cap is for; nothing was seen until the stream stopped"
+        );
 
-    let max_gap = writer.join().expect("writer thread panicked");
-    assert!(
-        max_gap < Duration::from_millis(200),
-        "precondition: no gap in the write stream may reach the 200ms window, else a \
-         quiet period could legitimately have ended it; largest gap was {max_gap:?}"
-    );
-    assert!(
-        rebuilt_while_writing,
-        "a rebuild must happen WHILE the writes are still arriving — that is what the \
-         cap is for; nothing was seen until the stream stopped"
-    );
+        let stderr = stderr_tap.finish_text(&mut child);
+        let rebuilds = count_occurrences(&stderr, "Recompiled ");
+        assert!(
+            (1..=4).contains(&rebuilds),
+            "3s of writes under a 200ms window with a 2s cap is one capped rebuild plus \
+             the quiet-period rebuild that follows the last write; a fixed 200ms window \
+             would give ~15. Got {rebuilds}; stderr was:\n{stderr}"
+        );
+        return;
+    }
 
-    let stderr = stderr_tap.finish_text(&mut child);
-    let rebuilds = count_occurrences(&stderr, "Recompiled ");
-    assert!(
-        (1..=4).contains(&rebuilds),
-        "3s of writes under a 200ms window with a 2s cap is one capped rebuild plus \
-         the quiet-period rebuild that follows the last write; a fixed 200ms window \
-         would give ~15. Got {rebuilds}; stderr was:\n{stderr}"
-    );
+    unreachable!("the loop returns on a conclusive attempt or asserts on the last one");
 }
 
 // ── AC-F10: Watch no-arg auto-detect ─────────────────────────────────────

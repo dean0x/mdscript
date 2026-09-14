@@ -59,6 +59,53 @@ pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;
 /// 256 entries is generous for any real template.
 pub(crate) const MAX_FRONTMATTER_IMPORTS: usize = 256;
 
+/// Maximum byte length of one frontmatter YAML block (1 MiB).
+///
+/// Checked by `resolver::frontmatter::parse_frontmatter_yaml` before any YAML work: the
+/// `serde_yaml_ng` loader is eager (it drains the whole document into an event vector
+/// before deserialising), so the cap must sit in front of it. Frontmatter is variable
+/// data, not prose: 1 MiB is on the order of 50 000 `key: value` lines, while the body
+/// keeps the 10 MiB `MAX_FILE_SIZE` bound. Exceeding this surfaces as
+/// `mds::resource_limit` (CLI exit 3). See #162.
+pub(crate) const MAX_FRONTMATTER_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of YAML nodes one frontmatter block may materialise (200 000).
+///
+/// Counted while `serde_yaml_ng` deserialises (every scalar, null, sequence, mapping,
+/// mapping key and `!tag` wrapper is one node), so the parse fails before the tree is
+/// built. This is the alias bound: an `&anchor` referenced by many `*alias`es expands at
+/// deserialise time, so a block under `MAX_FRONTMATTER_SIZE` could otherwise demand on
+/// the order of size^2/24 nodes (about 4 x 10^10 for 1 MiB). `serde_yaml_ng`'s own
+/// repetition limit counts alias jumps, not nodes, and does not catch one large anchor
+/// referenced a few thousand times. An alias-free block needs at least 2 bytes per node
+/// (`[x,x,...]`), so under the size cap it stays around 525 000 nodes at most and a
+/// realistic `key: value` block near 100 000; 200 000 rejects only amplification and
+/// bounds the materialised tree at a few tens of MB per parse. Exceeding this surfaces
+/// as `mds::resource_limit`. See #162.
+pub(crate) const MAX_FRONTMATTER_NODES: usize = 200_000;
+
+/// Maximum running depth of flow-collection nesting (`[`/`{`) in one frontmatter
+/// YAML block (1024).
+///
+/// Checked by `resolver::frontmatter::parse_frontmatter_yaml` in a single O(n) pass over
+/// the raw bytes, AFTER the size cap and BEFORE the budgeted parse. libyaml's flow scanner
+/// is O(depth^2) in flow-collection nesting, and that cost is paid inside the scanner
+/// UPSTREAM of deserialisation. The three existing depth limits are all post-hoc: serde's
+/// recursion limit (128 parse frames, "recursion limit exceeded"), and `Value::from_yaml`'s
+/// `MAX_VALUE_DEPTH` (64, "value nesting exceeds maximum depth of 64"). Every one of them
+/// fires only AFTER the quadratic scan has already been paid, so a ~1 MiB pure deep
+/// flow-nest (no anchors) burns 10+ s of CPU at ~32 MB RSS before any of them rejects it —
+/// and the node budget cannot catch it (few nodes, trivial memory). A cheap pre-parse bound
+/// on flow-nesting depth is the only thing that stops it before the scanner runs.
+///
+/// 1024 is far above any legitimate frontmatter — flow collections are never nested even
+/// 100 deep — yet it caps the worst admitted scan at ~1024^2 work (trivially fast). It sits
+/// deliberately ABOVE serde's 128-frame recursion limit so the parser's own
+/// recursion/value-depth errors stay reachable and unchanged for shallower inputs.
+/// Block-style (indent) nesting has no quadratic cost and is not counted. Exceeding this
+/// surfaces as `mds::resource_limit`. See #162.
+pub(crate) const MAX_FRONTMATTER_FLOW_DEPTH: usize = 1024;
+
 /// Maximum number of messages a `@message`-bearing template may produce.
 ///
 /// Prevents runaway memory use from adversarial inputs that generate thousands

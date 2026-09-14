@@ -14,7 +14,7 @@ use crate::evaluator::evaluate_with_map;
 use crate::evaluator::evaluate_with_map_seeded;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
-use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_MODULE_COUNT};
+use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT};
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
@@ -24,7 +24,8 @@ use crate::value::Value;
 
 use frontmatter::{build_scope_from_merged_mapping, deep_merge_yaml};
 pub(crate) use frontmatter::{
-    parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, FrontmatterImport,
+    parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
+    FrontmatterImport,
 };
 use inheritance::{
     apply_block_overrides, check_child_only_blocks, seed_effective_blocks, splice_skeleton,
@@ -300,6 +301,24 @@ impl ModuleCache {
         self.modules.keys().cloned().collect()
     }
 
+    /// Enforce `MAX_FILE_SIZE` on a string entry source at the core string funnels.
+    ///
+    /// The binding layers (WASM/napi) and `NativeFs::read` carry their own size guards
+    /// with their own messages, but `compile_str`/`check_str`/`lint_str_with` and the
+    /// opts variants reach the resolver as an in-memory `&str` that never passes those
+    /// guards (PF-004). The message shape mirrors `fs.rs` so callers matching on
+    /// "too large" behave identically across paths.
+    fn check_source_size(source: &str) -> Result<(), MdsError> {
+        if source.len() as u64 > MAX_FILE_SIZE {
+            return Err(MdsError::resource_limit(format!(
+                "file too large ({} bytes, max {} bytes): {SOURCE_LABEL}",
+                source.len(),
+                MAX_FILE_SIZE,
+            )));
+        }
+        Ok(())
+    }
+
     /// Guard against excessively deep import chains.
     fn check_import_depth(&self) -> Result<(), MdsError> {
         if self.resolving.len() >= MAX_IMPORT_DEPTH {
@@ -503,6 +522,8 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
+        // Entry-size backstop for the string funnel (PF-004) — before any IO or parse.
+        Self::check_source_size(source)?;
         // Canonicalize base_dir via the FileSystem abstraction so that custom
         // or virtual backends can override this behaviour (fixes issue #21).
         let canonical_str = self.fs.canonicalize(base_dir)?;
@@ -623,6 +644,7 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
+        Self::check_source_size(source)?;
         let canonical_str = self.fs.canonicalize(base_dir)?;
         self.fs.set_root(&canonical_str)?;
         self.check_import_depth()?;
@@ -649,6 +671,7 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        Self::check_source_size(source)?;
         let canonical_str = self.fs.canonicalize(base_dir)?;
         self.fs.set_root(&canonical_str)?;
         self.check_import_depth()?;
@@ -2301,9 +2324,8 @@ fn build_scope_from_frontmatter(
     let is_mds = !is_md || frontmatter.is_some_and(|fm| has_type_mds_frontmatter_raw(&fm.raw));
 
     if let Some(fm) = frontmatter {
-        // Parse YAML once to avoid double-parsing
-        let yaml: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str(&fm.raw).map_err(|e| MdsError::yaml_error(e.to_string()))?;
+        // Parse YAML once to avoid double-parsing (bounded — #162).
+        let yaml = parse_frontmatter_yaml(&fm.raw)?;
 
         if let serde_yaml_ng::Value::Mapping(map) = yaml {
             for (key, val) in map {
@@ -2586,8 +2608,7 @@ fn parse_frontmatter_mapping(
     let Some(fm) = frontmatter else {
         return Ok(None);
     };
-    let yaml: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&fm.raw).map_err(|e| MdsError::yaml_error(e.to_string()))?;
+    let yaml = parse_frontmatter_yaml(&fm.raw)?;
     if let serde_yaml_ng::Value::Mapping(map) = yaml {
         Ok(Some(map))
     } else {

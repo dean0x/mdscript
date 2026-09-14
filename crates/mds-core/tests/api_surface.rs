@@ -1161,6 +1161,69 @@ fn compile_max_file_size_still_enforced() {
     );
 }
 
+// ── #162: MAX_FILE_SIZE backstop at the string funnels ────────────────────────
+
+fn cwd_str() -> String {
+    std::env::current_dir()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// Every string-source funnel that runs a resolve pass rejects a source over
+/// MAX_FILE_SIZE with a resource limit — the binding-layer size guards are bypassed by
+/// these core entry points (PF-004), so the check must live in core.
+#[track_caller]
+fn assert_oversize_rejected(name: &str, r: Result<(), MdsError>) {
+    assert!(
+        matches!(r, Err(MdsError::ResourceLimit { .. })),
+        "{name} must reject an oversize source with a resource limit, got {r:?}"
+    );
+    let msg = r.unwrap_err().to_string();
+    assert!(
+        msg.contains("too large"),
+        "{name} rejection must mention the size limit, got: {msg}"
+    );
+}
+
+#[test]
+fn string_funnels_reject_oversize_source() {
+    let over = " ".repeat((MAX_FILE_SIZE + 1) as usize);
+
+    assert_oversize_rejected("compile_str", mds::compile_str(&over).map(|_| ()));
+    assert_oversize_rejected("check_str", mds::check_str(&over));
+    assert_oversize_rejected(
+        "lint_str_with",
+        mds::lint_str_with(&over, None, None, &LintConfig::default()).map(|_| ()),
+    );
+    assert_oversize_rejected(
+        "compile_str_with_deps_opts",
+        mds::compile_str_with_deps_opts(&over, None, None, mds::CompileOptions::default())
+            .map(|_| ()),
+    );
+
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    assert_oversize_rejected(
+        "ModuleCache::resolve_source",
+        cache
+            .resolve_source(&over, &cwd_str(), &HashMap::new(), &mut warnings)
+            .map(|_| ()),
+    );
+}
+
+/// PF-013 at-cap Ok twin: a source of EXACTLY MAX_FILE_SIZE bytes is accepted.
+#[test]
+fn string_funnel_accepts_source_at_cap() {
+    let at = " ".repeat(MAX_FILE_SIZE as usize);
+    let r = mds::check_str(&at);
+    assert!(
+        r.is_ok(),
+        "a source at exactly MAX_FILE_SIZE must be accepted: {r:?}"
+    );
+}
+
 // ── Lint API surface pins (L-API-1/2/3/4/5) ──────────────────────────────────
 
 /// L-API-1: lint_* function signatures mirror check_* conventions.

@@ -144,6 +144,11 @@ def test_concurrent_compiles_match_single_threaded_reference() -> None:
 # ── PERF4: the off-GIL panic path is reserved for true panics ────────────────────
 
 
+# The sub-1 MiB frontmatter alias bomb (#162): our bounds must reject it as an MdsError
+# (mds::resource_limit), never as mds::internal — proving the node budget returns a clean
+# error rather than panicking under the off-GIL catch_unwind path.
+_ALIAS_BOMB = "---\na: &a [" + "x, " * 100000 + "]\nb: [" + "*a, " * 100000 + "]\n---\nHi\n"
+
 MALFORMED = [
     "{",
     "}",
@@ -160,6 +165,7 @@ MALFORMED = [
     "———\nnot: yaml: [\n———\n",
     "@extends\n",
     "{fn(((((}\n",
+    _ALIAS_BOMB,
 ]
 
 

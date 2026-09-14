@@ -9,6 +9,34 @@ import pytest
 import markdown_script as m
 
 MAX = 10 * 1024 * 1024  # MAX_SOURCE_SIZE (10 MiB)
+FM_MAX = 1 << 20  # MAX_FRONTMATTER_SIZE (1 MiB)
+
+
+# ── Frontmatter YAML DoS bomb builders (#162) ────────────────────────────────────
+# Built by string repetition so there is no MiB-scale literal in the test source.
+
+
+def wrap_fm(yaml: str) -> str:
+    return f"---\n{yaml}---\nHi\n"
+
+
+def alias_bomb(n: int, mm: int) -> str:
+    # a: &a [x, x, ...(n)]  /  b: [*a, *a, ...(mm)] — each *a re-expands the anchor.
+    return "a: &a [" + "x, " * n + "]\nb: [" + "*a, " * mm + "]\n"
+
+
+def fm_of_size(nbytes: int) -> str:
+    prefix = "k: ZZSENTINELZZ"  # sentinel proves the message never echoes content
+    return prefix + "x" * (nbytes - len(prefix) - 1) + "\n"
+
+
+def nested_flow_seq(d: int) -> str:
+    return "k: " + "[" * d + "x" + "]" * d + "\n"
+
+
+# The sub-1 MiB memory-amplification repro: ~700 KB source (under the size cap), so the
+# node budget is what rejects it.
+BOMB_DOC = wrap_fm(alias_bomb(100_000, 100_000))
 
 
 # ── L1: >10 MiB source → resource_limit (all string inputs) ─────────────────────
@@ -174,3 +202,57 @@ def test_v3_nested_json_values_accepted() -> None:
         vars={"cfg": {"flag": True, "items": [1, 2], "n": None}},
     )
     assert r.output == "true 1, 2\n"
+
+
+# ── L4: frontmatter YAML DoS bounds across every entry point (#162) ──────────────
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [m.compile, m.check, m.lint, m.scan_imports],
+    ids=["compile", "check", "lint", "scan_imports"],
+)
+def test_l4_alias_bomb_is_resource_limit(fn) -> None:  # type: ignore[no-untyped-def]
+    # The bomb rejects with a resource limit on every surface, and the message never
+    # echoes the raw hostile bytes (`*a` or the sentinel).
+    with pytest.raises(m.MdsError) as ei:
+        fn(BOMB_DOC)
+    assert ei.value.code == "mds::resource_limit"
+    assert "*a" not in ei.value.message
+    assert "ZZSENTINELZZ" not in ei.value.message
+
+
+def test_l4_frontmatter_over_size_cap_is_resource_limit() -> None:
+    with pytest.raises(m.MdsError) as ei:
+        m.compile(wrap_fm(fm_of_size(FM_MAX + 1)))
+    assert ei.value.code == "mds::resource_limit"
+    assert "ZZSENTINELZZ" not in ei.value.message
+
+
+def test_l4_frontmatter_at_size_cap_is_accepted() -> None:
+    # At-cap control (PF-013): exactly 1 MiB of frontmatter compiles.
+    r = m.compile(wrap_fm(fm_of_size(FM_MAX)))
+    assert isinstance(r.output, str)
+
+
+def test_l4_legit_anchor_alias_still_compiles() -> None:
+    # Positive control (PF-013): valid YAML aliasing must not be over-rejected.
+    r = m.compile("---\na: &a [1, 2]\nb: *a\n---\n{{b}}\n")
+    assert r.output.endswith("1, 2\n")
+
+
+def test_l4_scan_imports_stays_lenient_for_frontmatter_syntax_errors() -> None:
+    # scan_imports swallows a plain frontmatter YAML SYNTAX error and still returns the
+    # body imports — proving the resource-limit propagation above is specific to the
+    # bound, not blanket strictness. (Bomb propagation is covered by the parametrised
+    # scan_imports case.)
+    src = '---\nimports: [\n---\n@import "./x.mds"\nHi\n'
+    assert m.scan_imports(src) == ["./x.mds"]
+
+
+def test_l4_deep_flow_nest_is_resource_limit() -> None:
+    # The second DoS axis: a deep flow nest (depth 2000 > 1024) trips the pre-parse
+    # flow-depth guard.
+    with pytest.raises(m.MdsError) as ei:
+        m.compile(wrap_fm(nested_flow_seq(2000)))
+    assert ei.value.code == "mds::resource_limit"
