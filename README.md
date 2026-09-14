@@ -138,7 +138,7 @@ Exit codes:
   3   Resource limit exceeded
 ```
 
-**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary (`N built, N failed`; `N passed, N failed` for `check`) is printed on a successful run or when any file fails; the exit code is non-zero if any file fails. Under `--quiet`, the summary is suppressed on a fully-successful run but is always emitted when any file fails, so the non-zero exit is never unexplained. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) still exits 0 with a "No .mds files found" message. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
+**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary (`N built, N failed`; `N passed, N failed` for `check`) is printed on a successful run or when any file fails; the exit code is non-zero if any file fails. Under `--quiet`, the summary is suppressed on a fully-successful run but is always emitted when any file fails, so the non-zero exit is never unexplained. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) also exits non-zero (`1`) with `no .mds files found in <dir>; nothing was built` (`…checked` for `check`), likewise even under `--quiet` — an empty tree is treated as a misconfiguration, not a success. (Changed in v0.4.3; previously exited 0.) `mds watch <dir>` is the exception: it starts on an empty tree and compiles files created later. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
 
 `mds fmt <dir>` follows the same directory-mode conventions (recursive, symlinks rejected, continue-on-error, non-zero exit summary) with one deliberate difference: it formats `_`-prefixed **partials too** — formatting rewrites source, not compiled output, and a partial's source is just as much a candidate for reformatting as any other file.
 
@@ -160,6 +160,10 @@ mds watch src/                  # compile each .mds next to its source
 mds watch src/ --out-dir dist   # mirror source subtree under dist/
                                 # src/a/b/foo.mds → dist/a/b/foo.md  (not dist/foo.md)
 ```
+
+`mds watch src/` starts even when `src/` has no `.mds` files yet; files created later are
+compiled as they appear (unlike `build`/`check`/`fmt`/`lint`, which exit non-zero on an empty
+tree).
 
 > **Changed in v0.4.0:** Directory mode with `--out-dir` or `mds.json output_dir`
 > now mirrors the source subtree instead of writing flat stems. Old flat outputs are
@@ -216,7 +220,9 @@ continuing past per-file errors and printing a summary
 (`N formatted, M unchanged, K failed`, or `N would reformat, M unchanged, K failed` under `--check`). A file
 is only written (and its mtime touched) when its content actually changes. Status lines and
 summaries go to stderr; `--diff` output and stdin filter-mode content go to stdout; `--quiet`
-suppresses status but never errors. Reads a `fmt` section from `mds.json`
+suppresses status but never errors. A directory with no `.mds` files exits 1 with
+`no .mds files found in <dir>; nothing was formatted`, even under `--quiet`.
+Reads a `fmt` section from `mds.json`
 (`{"fmt": {"sort_frontmatter_keys": true}}`) for forward compatibility — the field doesn't drive
 any formatting behavior yet; frontmatter key sorting is deferred to a future version.
 
@@ -236,6 +242,9 @@ mds lint --quiet .              # directory lint: silent on clean/warn-only; sum
 Directory mode (`mds lint <dir>`) lints every `.mds` file recursively (partials included) and
 prints one summary line to stderr after processing all files:
 `N clean, N with warnings, N with errors, N resource-limited`.
+A directory with no `.mds` files exits 2 (lint's usage-error code) with
+`no .mds files found in <dir>; nothing was linted` on stderr, even under `--quiet`, and prints
+no summary.
 Under `--quiet`, the summary is suppressed when the worst outcome is warnings or clean; it is
 always printed when any file has errors or hits a resource limit, so the non-zero exit is never
 unexplained in those cases. Two exits are deliberately left unexplained under `--quiet`, because

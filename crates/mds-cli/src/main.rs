@@ -65,7 +65,7 @@ enum Commands {
         /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3"; repeating a key warns, last value wins)
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
-        /// Generate a source map alongside the compiled output (sidecar: <output-file>.map, e.g. -o out.md → out.md.map).
+        /// Generate a source map alongside the compiled output (sidecar: `<output-file>`.map, e.g. -o out.md → out.md.map).
         /// Conflicts with --no-source-map.
         #[arg(long = "source-map", conflicts_with = "no_source_map")]
         source_map: bool,
@@ -342,10 +342,14 @@ fn run_check_directory(
             );
             std::process::exit(1);
         }
-        if !quiet {
-            eprintln!("No .mds files found in {}", output::safe_path(dir));
-        }
-        return Ok(());
+        // #204: an empty tree is "nothing to check", not success (mirrors build.rs).
+        // Emitted even under --quiet and exit 1, the same "nothing was done" code
+        // build and fmt use.
+        eprintln!(
+            "no .mds files found in {}; nothing was checked",
+            output::safe_path(dir)
+        );
+        std::process::exit(1);
     }
 
     let mut ok_count: usize = 0;
@@ -414,6 +418,13 @@ Your items:
 - {{item}}
 @end
 ";
+    // Raw std::fs::write is deliberate (#227). What it is NOT justified by: "init only
+    // ever creates a file". `--force` skips the exists-check above and truncates in
+    // place, and both `exists()` and `write` follow a symlink, so a link at `filename`
+    // — dangling, or live under `--force` — is written through to its target. The raw
+    // write stays because the blast radius is small and entirely user-directed:
+    // `filename` is typed on the command line and `starter` is a fixed public template
+    // that a re-run reproduces. Allow-listed in tests/write_funnel.rs.
     std::fs::write(&filename, starter)
         .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
     if !quiet {

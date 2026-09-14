@@ -46,6 +46,13 @@ input. The compiler enforces several defense-in-depth controls:
   boundary rather than being passed to the OS.
 - **Non-UTF-8 paths** are rejected at the public API boundary with an explicit
   error instead of producing corrupted output.
+- **Replace-by-rename writes**: `mds fmt`, `mds lint --fix`, and `mds build`/`mds
+  watch` outputs and `.map` sidecars are written to a same-directory temp file and
+  renamed over the target after a final symlink re-check (`mds-cli/src/output.rs`,
+  `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so a
+  crash never leaves a truncated target and a symlinked output path is refused.
+  Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
+  are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 
 ### Resource limits
 

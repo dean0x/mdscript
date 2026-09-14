@@ -80,7 +80,7 @@ use crate::build::{
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
     relabel_stdin_error, render_unified_diff, safe_file_display, safe_inline, safe_path,
-    STDIN_DISPLAY_LABEL,
+    Durability, STDIN_DISPLAY_LABEL,
 };
 
 // AC-224-15: No local rule-name list. The single source of truth is
@@ -1071,7 +1071,7 @@ fn run_lint_file(
                 residual,
             } => {
                 emit_result(format, &residual, quiet, named_source);
-                atomic_write_file(path, &new_source)?;
+                atomic_write_file(path, &new_source, Durability::Fsync)?;
                 if !quiet {
                     eprintln!("Fixed: {}", safe_path(path));
                 }
@@ -1084,7 +1084,7 @@ fn run_lint_file(
                 total_count,
             } => {
                 emit_result(format, &residual, quiet, named_source);
-                atomic_write_file(path, &new_source)?;
+                atomic_write_file(path, &new_source, Durability::Fsync)?;
                 // Print status AFTER write succeeds so "Partially fixed:" never
                 // precedes "error writing" for a file that was never modified.
                 if !quiet {
@@ -1371,11 +1371,12 @@ fn run_lint_directory(
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
     let mut files = walk.files;
 
-    // AD-216-9: empty-dir early return emits no summary — the per-file loop never
+    // AD-216-9: neither early exit below emits a summary — the per-file loop never
     // runs, so all four counters stay at zero and there is nothing meaningful to
-    // print.  The all-excluded diagnostic (below) bypasses --quiet and exits 2:
-    // parity with `build`/`check`/`fmt` (a silent non-zero exit here would be a
-    // bug, not a feature).
+    // print.  Both diagnostics bypass --quiet and exit 2 (lint's usage-error code;
+    // build/check/fmt use 1): the all-excluded arm, and since #204 the empty-tree
+    // arm — a silent non-zero exit here would be a bug, and a silent ZERO exit on an
+    // empty tree was the CI green-pass hole #204 closes.
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
@@ -1387,10 +1388,14 @@ fn run_lint_directory(
             );
             std::process::exit(2);
         }
-        if !quiet {
-            eprintln!("No .mds files found in {}", safe_path(dir));
-        }
-        return Ok(());
+        // #204: an empty tree is "nothing to lint", not success (mirrors build.rs).
+        // Emitted even under --quiet.  Exit 2 is lint's usage-error code (module doc),
+        // matching the all-excluded arm above; build/check/fmt use 1.
+        eprintln!(
+            "no .mds files found in {}; nothing was linted",
+            safe_path(dir)
+        );
+        std::process::exit(2);
     }
 
     // F1: sort by (sanitized_display_key, raw_os_path) so that:
@@ -1657,7 +1662,7 @@ fn lint_one_file_accumulating(
                 // Write first (AC-F-14): on failure push a structured error entry so
                 // the JSON envelope truthfully reflects what happened rather than
                 // accumulating the clean post-fix result before the write is attempted.
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     json_files.push(serde_json::json!({
                         "file": file_key,
                         "error": MdsError::Io { message: format!("{e}") }.serialize()
@@ -1679,7 +1684,7 @@ fn lint_one_file_accumulating(
             } => {
                 // Write first (AC-F-14 + print-after-write): on failure push a
                 // structured error entry; only accumulate and print on success.
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     json_files.push(serde_json::json!({
                         "file": file_key,
                         "error": MdsError::Io { message: format!("{e}") }.serialize()
@@ -1861,7 +1866,7 @@ fn lint_one_file_human(
                 residual,
             } => {
                 render_result_human(&residual, quiet, named_source);
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
@@ -1877,7 +1882,7 @@ fn lint_one_file_human(
                 total_count,
             } => {
                 render_result_human(&residual, quiet, named_source);
-                if let Err(e) = atomic_write_file(file, &new_source) {
+                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }

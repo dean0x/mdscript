@@ -896,7 +896,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source.
 - `-o` is rejected for a directory input.
 - Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
-- When the directory contains no `.mds` files, exits 0 with a "no files found" message.
+- When the directory contains no `.mds` files at all, exits 1 with `no .mds files found in <dir>; nothing was built` on stderr — emitted even under `--quiet`, like the all-excluded diagnostic — so an empty tree cannot pass a CI gate silently. (Changed in v0.4.3; previously exited 0.) `mds watch <dir>` is unaffected: it starts on an empty tree and compiles files created later.
 - **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
 - stdin (`mds build -`) with `--out-dir`: the fallback output name is `output.md` (markdown) or `output.json` (messages).
 
@@ -926,6 +926,8 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 
 In all paths, `<ext>` is `md` for Markdown templates and `json` for messages templates.
 
+**Output writing.** Compiled outputs and `.map` sidecars written by `mds build` and `mds watch`, and `.mds` sources rewritten by `mds fmt` and `mds lint --fix`, are written to a temporary file in the target's directory and then renamed over the target, after a final symlink re-check of the target: a crash, kill or full disk never leaves a truncated file behind, and a destination path that is a symlink is refused. Because the output is created as a sibling temporary file and renamed into place, the destination must be a regular-file path inside a writable directory: device files such as `/dev/null` and FIFOs are not supported as `-o` targets (write to stdout instead). Source rewrites (`fmt`, `lint --fix`) are additionally fsynced before the rename; compiled outputs and sidecars rely on the rename alone — they are regenerable, and an unconditional fsync made directory-mode startup several times slower on macOS. Because the rename gives the target a new inode, a pre-existing target's hard links (other links keep the old content), ACLs, extended attributes, and owner/group are not preserved; permission bits are preserved on Unix. This is enforced for the CLI's write sites by `crates/mds-cli/tests/write_funnel.rs`.
+
 ### 7.3 `mds check`
 
 ```bash
@@ -936,7 +938,7 @@ echo "@if flag:" | mds check -             # Validate from stdin
 mds check src/                             # Validate every non-partial .mds in the tree
 ```
 
-Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
+Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error, and the two nothing-to-process exits — empty tree and all-excluded — which exit 1 with `…; nothing was checked`) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
 
 ### 7.4 `mds fmt`
 
@@ -956,7 +958,7 @@ Every rewrite is **safety-gated**: the formatter re-compiles both the original a
 |--------|-------------|
 | `--check` | Exit non-zero without writing if any file would change. |
 | `--diff` | Print a unified diff of proposed changes without writing. |
-| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format. Exception: under `--check`, a run where files would reformat but none failed exits 1 with no summary — the would-reformat count is treated as status output and is suppressed by `--quiet` (mirrors the same rule for `mds lint --fix --check`). (Two notices bypass `--quiet`: the directory-depth warning and the all-files-excluded diagnostic.) |
+| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format. Exception: under `--check`, a run where files would reformat but none failed exits 1 with no summary — the would-reformat count is treated as status output and is suppressed by `--quiet` (mirrors the same rule for `mds lint --fix --check`). (Three notices bypass `--quiet`: the directory-depth warning, the all-files-excluded diagnostic, and the empty-tree diagnostic `no .mds files found in <dir>; nothing was formatted` — both diagnostics exit 1.) |
 
 ### 7.5 `mds lint`
 
@@ -1015,6 +1017,11 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
   stderr bytes when pending fixes exist but no file is in the error or
   resource-limited bucket — the `--fix --check` pending-fix signal is treated as
   status output and is suppressed by `--quiet` alongside the summary line.
+- A directory with no `.mds` files at all exits 2 (the usage-error code) with
+  `no .mds files found in <dir>; nothing was linted` on stderr; a directory whose
+  every `.mds` file lies under a default-excluded directory exits 2 with a
+  diagnostic carrying the skip count. Both bypass `--quiet`, print no summary
+  line, and write nothing to stdout even under `--format json`.
 - The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
   regardless of `--quiet` or directory mode — no `"summary"` key is added.
 
@@ -1310,7 +1317,7 @@ Maximum config file size: 1 MB.
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.) |
+| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, or all under default-excluded directories) |
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure) |
 | `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, or frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels) |
 
@@ -1320,7 +1327,7 @@ Maximum config file size: 1 MB.
 |------|---------|
 | `0` | Clean — no warning- or error-severity findings |
 | `1` | Warning-severity findings only (no errors) |
-| `2` | Error-severity finding, analysis failure, or usage error |
+| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint) |
 | `3` | Resource limit exceeded |
 
 ---

@@ -400,21 +400,78 @@ fn dir_check_continues_on_error_nonzero_exit() {
     );
 }
 
+/// #204 reversal: until v0.4.3 this test was `dir_check_empty_dir_exits_zero` and
+/// pinned exit 0. `mds check` now mirrors `mds build`: an empty tree is "nothing
+/// was checked", exit 1.
 #[test]
-fn dir_check_empty_dir_exits_zero() {
+fn dir_check_empty_dir_exits_one() {
     let src = tempfile::tempdir().unwrap();
 
     let output = check_dir(src.path(), &[]);
 
-    assert!(
-        output.status.success(),
-        "check on empty dir should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "check on an empty dir must exit 1; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("No .mds files") || stderr.contains("no .mds"),
-        "stderr should mention no files found; got: {stderr}"
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was checked"),
+        "stderr must say nothing was checked; got: {stderr:?}"
+    );
+}
+
+/// #204: `--quiet` must not suppress `mds check`'s empty-tree diagnostic.
+#[test]
+fn dir_check_empty_dir_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = check_dir(src.path(), &["--quiet"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "check --quiet on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet on an empty tree"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "empty-tree diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was checked"),
+        "stderr must say nothing was checked under --quiet; got: {stderr:?}"
+    );
+}
+
+/// #204 boundary pin: a path that does NOT exist is not a directory, so it takes
+/// the single-file path and exits 2 (`mds::file_not_found`) — unchanged by #204.
+/// GREEN both before and after the fix; it exists to prove the new exit-1 arm
+/// did not swallow the missing-path case.
+#[test]
+fn dir_check_missing_root_exits_two() {
+    let src = tempfile::tempdir().unwrap();
+    let missing = src.path().join("nope");
+
+    let output = check_dir(&missing, &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "check on a missing path must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no .mds files found in"),
+        "a missing path must NOT produce the empty-tree diagnostic; got: {stderr:?}"
     );
 }
 
@@ -484,23 +541,60 @@ fn dir_build_stale_output_cleaned_on_format_flip() {
     );
 }
 
-// ── T-CLI: empty dir build exits zero ────────────────────────────────────────
+// ── T-CLI: empty dir build exits one (#204) ──────────────────────────────────
 
+/// #204 reversal: until v0.4.3 this test was `dir_build_empty_dir_exits_zero` and
+/// pinned exit 0 on an empty tree. "Nothing to build" is an error, exactly as the
+/// all-excluded case already was — a silent green pass on a mistyped or
+/// not-yet-populated directory is the CI failure mode #204 closes.
 #[test]
-fn dir_build_empty_dir_exits_zero() {
+fn dir_build_empty_dir_exits_one() {
     let src = tempfile::tempdir().unwrap();
 
     let output = build_dir(src.path(), &[]);
 
-    assert!(
-        output.status.success(),
-        "build on empty dir should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "build on an empty dir must exit 1; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("No .mds files") || stderr.contains("no .mds"),
-        "stderr should mention no .mds files; got: {stderr}"
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was built"),
+        "stderr must say nothing was built; got: {stderr:?}"
+    );
+}
+
+/// #204: `--quiet` must not suppress the empty-tree diagnostic — this is the exact
+/// CI invocation where a silent green pass is the danger. Mirrors
+/// `dir_build_all_excluded_quiet_still_emits_diagnostic`.
+#[test]
+fn dir_build_empty_dir_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = build_dir(src.path(), &["--quiet"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "build --quiet on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet on an empty tree"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "empty-tree diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was built"),
+        "stderr must say nothing was built under --quiet; got: {stderr:?}"
     );
 }
 
@@ -598,28 +692,56 @@ fn dir_build_all_excluded_quiet_still_emits_diagnostic() {
     );
 }
 
+// #204 reversal: until v0.4.3 this test pinned "genuinely empty dir exits 0 — only
+// the all-excluded case exits non-zero". Both now exit 1; what this test still
+// guards is that the two cases stay DISTINGUISHABLE by message: an empty tree says
+// "no .mds files found in …", never the excluded-directories diagnostic (and vice
+// versa — inline positive control below).
 #[test]
-fn dir_build_genuinely_empty_still_exits_zero() {
-    // Regression guard: a genuinely empty directory (no .mds files anywhere)
-    // must still exit 0 — only the all-excluded case exits non-zero.
+fn dir_build_genuinely_empty_exits_one_without_excluded_diagnostic() {
     let src = tempfile::tempdir().unwrap();
 
     let output = build_dir(src.path(), &[]);
 
-    assert!(
-        output.status.success(),
-        "genuinely empty dir must still exit 0; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Message must be the original "no files" message, not the excluded diagnostic.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "genuinely empty dir must exit 1; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("No .mds files") || stderr.contains("no .mds"),
-        "empty-dir message should mention no .mds files; got: {stderr}"
+        stderr.contains("no .mds files found in"),
+        "empty-dir message must be the empty-tree diagnostic; got: {stderr:?}"
     );
     assert!(
         !stderr.contains("excluded"),
-        "empty-dir must NOT show the excluded diagnostic; got: {stderr}"
+        "empty-dir must NOT show the excluded diagnostic; got: {stderr:?}"
+    );
+
+    // Positive control: the sibling all-excluded scenario exits 1 too,
+    // so the exit code alone cannot tell them apart — the message must, and the
+    // control proves "excluded" is really the substring that appears there.
+    let control = tempfile::tempdir().unwrap();
+    let hidden = control.path().join(".github");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("x.mds"), "Hello!\n").unwrap();
+
+    let control_out = build_dir(control.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control_out.stderr);
+    assert_eq!(
+        control_out.status.code(),
+        Some(1),
+        "positive control: the all-excluded case also exits 1; stderr: {control_stderr}"
+    );
+    assert!(
+        control_stderr.contains("excluded"),
+        "positive control: the all-excluded case must carry the excluded diagnostic; \
+         got: {control_stderr:?}"
+    );
+    assert!(
+        !control_stderr.contains("no .mds files found in"),
+        "positive control: the all-excluded case must NOT carry the empty-tree \
+         diagnostic; got: {control_stderr:?}"
     );
 }
 
@@ -789,6 +911,83 @@ fn dir_fmt_all_excluded_quiet_still_emits_diagnostic() {
     assert!(
         !stderr.is_empty() && (stderr.contains("excluded") || stderr.contains("default-excluded")),
         "all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+}
+
+// ── #204: empty directory errors on fmt too ──────────────────────────────────
+
+/// #204: `mds fmt <empty dir>` exits 1 — "nothing was formatted" is an error, the
+/// same shape as `mds build` / `mds check` and as fmt's own all-excluded arm.
+#[test]
+fn dir_fmt_empty_dir_exits_one() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = fmt_dir(src.path(), &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "fmt on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was formatted"),
+        "stderr must say nothing was formatted; got: {stderr:?}"
+    );
+}
+
+/// #204: `--quiet` must not suppress `mds fmt`'s empty-tree diagnostic.
+#[test]
+fn dir_fmt_empty_dir_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = fmt_dir(src.path(), &["--quiet"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "fmt --quiet on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet on an empty tree"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "empty-tree diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was formatted"),
+        "stderr must say nothing was formatted under --quiet; got: {stderr:?}"
+    );
+}
+
+/// #204: the empty-tree arm sits BEFORE fmt's read-only split (`check || diff`),
+/// so `--check` behaves identically to a plain `fmt` on an empty tree.
+#[test]
+fn dir_fmt_empty_dir_check_flag_exits_one() {
+    let src = tempfile::tempdir().unwrap();
+
+    let output = fmt_dir(src.path(), &["--check"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "fmt --check on an empty dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no .mds files found in"),
+        "stderr must carry the empty-tree diagnostic under --check; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was formatted"),
+        "stderr must say nothing was formatted under --check; got: {stderr:?}"
     );
 }
 
@@ -1008,5 +1207,175 @@ fn d5_dir_build_quiet_gate_unchanged_with_empty_outputs() {
         !stderr.contains("built"),
         "R5: --quiet must still suppress the summary on an all-success run even \
          when empty outputs exist (gate unchanged); got: {stderr}"
+    );
+}
+
+// ── Atomic directory-mode outputs (#227) ─────────────────────────────────────
+//
+// Directory mode has its own writer (it accumulates per-file counters instead of
+// returning early), so it is a second site with the same obligation as `write_output`:
+// every compiled artifact and every `.map` sidecar goes through
+// `crate::output::atomic_write_file`.
+
+/// Every `.mds-tmp-` prefixed entry anywhere under `dir` (the temp-file prefix used by
+/// `atomic_write_file`). Empty means no write left residue.
+fn temp_residue_recursive(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    // Bounded: the output tree is finite and acyclic (read_dir does not follow symlinks).
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".mds-tmp-") {
+                found.push(p.display().to_string());
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// T-D1: a clean `--out-dir --source-map` run writes every artifact and every sidecar
+/// and leaves no temp file anywhere in the output tree.
+#[test]
+fn dir_build_out_dir_source_map_no_temp_residue() {
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for name in ["one.mds", "two.mds", "three.mds"] {
+        create_plain_mds(src.path(), name);
+    }
+
+    let output = build_dir(
+        src.path(),
+        &["--out-dir", out.path().to_str().unwrap(), "--source-map"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "dir build with --source-map must succeed; stderr: {stderr}"
+    );
+
+    for stem in ["one", "two", "three"] {
+        let md = out.path().join(format!("{stem}.md"));
+        let map = out.path().join(format!("{stem}.md.map"));
+        assert!(md.is_file(), "{stem}.md must be written");
+        assert!(map.is_file(), "{stem}.md.map sidecar must be written");
+    }
+    let residue = temp_residue_recursive(out.path());
+    assert!(
+        residue.is_empty(),
+        "a successful dir build must leave no temp file; found: {residue:?}"
+    );
+}
+
+/// T-D2: when the output directory is not writable, every pre-existing artifact survives
+/// intact, the run reports the failures, and nothing is left behind.
+#[cfg(unix)]
+#[test]
+fn dir_build_write_failure_preserves_existing_outputs() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let src = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    fs::create_dir(&out).unwrap();
+
+    create_plain_mds(src.path(), "a.mds");
+    create_plain_mds(src.path(), "b.mds");
+    fs::write(out.join("a.md"), "OLD").unwrap();
+    fs::write(out.join("b.md"), "OLD").unwrap();
+
+    fs::set_permissions(&out, fs::Permissions::from_mode(0o555)).unwrap();
+    let output = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    // Restore writability BEFORE asserting so a failing assertion cannot leave an
+    // undeletable tempdir behind.
+    let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a dir build into a read-only output dir must fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("0 built"),
+        "the summary must report nothing built; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed"),
+        "the summary must report the failures; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("error:"),
+        "each failure must be reported on stderr; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("a.md"),
+        "the per-file error must name the artifact; got: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("a.md")).unwrap(),
+        "OLD",
+        "a.md must survive the failed write"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("b.md")).unwrap(),
+        "OLD",
+        "b.md must survive the failed write"
+    );
+    let residue = temp_residue_recursive(&out);
+    assert!(
+        residue.is_empty(),
+        "a failed dir build must leave no temp file; found: {residue:?}"
+    );
+}
+
+/// T-D3: the directory-mode `.map` sidecar writer is its own site — a symlinked sidecar
+/// path is refused, the artifact beside it is still written, and the run reports one
+/// failure.
+#[cfg(unix)]
+#[test]
+fn dir_build_source_map_sidecar_symlink_target_rejected() {
+    let src = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    fs::create_dir(&out).unwrap();
+
+    create_plain_mds(src.path(), "page.mds");
+    let real = root.path().join("real.map");
+    fs::write(&real, "OLD").unwrap();
+    std::os::unix::fs::symlink(&real, out.join("page.md.map")).unwrap();
+
+    let output = build_dir(
+        src.path(),
+        &["--out-dir", out.to_str().unwrap(), "--source-map"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a symlinked sidecar must fail the dir build; stderr: {stderr}"
+    );
+    assert!(
+        out.join("page.md").is_file(),
+        "the compiled artifact is written before the sidecar and must survive"
+    );
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say why; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 failed"),
+        "the summary must report exactly one failure; got: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&real).unwrap(),
+        "OLD",
+        "the symlink target must not be written through"
     );
 }
