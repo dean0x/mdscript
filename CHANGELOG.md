@@ -96,11 +96,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing output keeps its mode. Consequences: an output path that is a symlink (live or
   dangling) is refused instead of written through; a destination directory that is not
   writable fails the build even when the file itself is writable; a read-only (0444)
-  existing output is replaced, mode preserved. The spurious `cannot get metadata` message
-  that #240 emitted on every first write of a not-yet-existing file is gone; a stat
-  failure other than "not found" is now a hard error rather than a warning (#225). A new
-  test, `write_funnel.rs`, fails CI on any raw `fs::write`/`File::create` in the CLI
-  outside the two justified sites.
+  existing output is replaced, mode preserved; an output path that is not a regular file
+  in a writable directory — for example `-o /dev/null` or `/dev/stdout` — is no longer
+  accepted (use stdout, i.e. omit `-o`, or `mds check` instead); a FIFO or other special
+  file at the output path is replaced by a regular file rather than opened. The spurious
+  `cannot get metadata` message that #240 emitted on every first write of a
+  not-yet-existing file is gone; a stat failure other than "not found" is now a hard
+  error rather than a warning (#225). A new test, `write_funnel.rs`, fails CI on any raw
+  `fs::write`/`File::create` in the CLI outside the two justified sites.
 - **Fix stale `lint_str` rustdoc and lint-rule Tier tables (#329).** `mds-core`'s
   `lint_str` rustdoc said "applies the 9 lint rules" after a 10th rule
   (`legacy-interpolation`) had shipped; the Tier tables in `lint/tier.rs` and
