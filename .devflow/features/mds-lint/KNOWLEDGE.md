@@ -204,7 +204,7 @@ The output-equality sub-check (3) is **skipped** when the plan contains any edit
 
 **Emit-before-exit ordering rule** (`lint.rs` output-contract, PF-004 recurring defect class — 7 realized defects across ~33 emitter sites): The invariant is **emit the envelope before any early exit; write first, then print/accumulate**. Two defects fixed in PR #308: (1) `lint <file> --fix --check --format json` called `process::exit(1)` before `emit_result`, emitting zero stdout bytes (AC-F-14 held for `<dir>` but not `<file>`); (2) JSON write-failure arms pushed the post-fix result before the write, so a failed write emitted `{"files":[],…}` (reads as a clean tree) with exit 2. The `Fixed:` arms were already correct; `PartiallyFixed` arms were not. The `ResultSink` redesign that makes `--quiet` structurally unbypassable is deferred to issue **#309**.
 
-**Atomic write** (`atomic_write_file` in `output.rs`, imported by both `lint.rs` and `fmt.rs`): TOCTOU guard + permissions restore + `sync_all()` + `persist()` (intra-filesystem rename). Temp prefix `.mds-tmp-`. `Fixed:` is printed only AFTER a successful write.
+**Atomic write** (`atomic_write_file` in `output.rs`, imported by both `lint.rs` and `fmt.rs`): TOCTOU guard + permissions restore + `sync_all()` + `persist()` (intra-filesystem rename). Temp prefix `.mds-tmp-`. `Fixed:` is printed only AFTER a successful write. Shared with `build`/`watch` since #227; third parameter `Durability` (`Fsync` for lint/fmt, `RenameOnly` for build/watch).
 
 ### CLI Preview Pipeline (`preview_fixes`)
 
@@ -547,7 +547,9 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **`assertKnownKeys` must be called before backend dispatch**: The validation runs synchronously in the wrapper, before `init()` is awaited or any backend is invoked.
 
-**atomic_write_file temp prefix**: The temp file prefix is `.mds-tmp-`. Both lint and fmt share the same `atomic_write_file` from `output.rs`.
+**atomic_write_file temp prefix**: The temp file prefix is `.mds-tmp-`. Both lint and fmt share the same `atomic_write_file` from `output.rs`. Shared with `build`/`watch` since #227; third parameter `Durability` (`Fsync` for lint/fmt, `RenameOnly` for build/watch).
+
+**`crates/mds-cli/tests/write_funnel.rs` fails CI on any raw `fs::write(` / `File::create(` in `crates/mds-cli/src`** outside the two allow-listed sites (`mds init` in main.rs; the test-only readiness marker in watch.rs).
 
 **Python `LintDiagnostic.fix_edits` getter vs `#[pyo3(get)]`**: `Vec<serde_json::Value>` does not implement `IntoPy`. Use the custom `#[getter]` which calls `value_to_py`. Stored internally as `Option<Vec<serde_json::Value>>`.
 

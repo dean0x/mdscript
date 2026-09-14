@@ -816,12 +816,12 @@ const MAX_AUX_DEPTH: usize = 16;
 ///
 /// Every prose surface (`message`, `help`, `code`, `url`, label text) is escaped with
 /// HUMAN-mode [`mds::sanitize_control_chars`] when the node is built.  Label byte spans
-/// are copied verbatim, exactly as [`SanitizedReport::labels`] does, so caret geometry
+/// are copied verbatim, exactly as `SanitizedReport::labels` does, so caret geometry
 /// against the parent's already-neutralized source stays exact.
 ///
 /// `source_code()` returns `None` by design: a `&dyn miette::SourceCode` cannot be
 /// cloned out of the inner diagnostic, and miette falls back to the *parent* report's
-/// source — which [`SanitizedReport::source_code`] forwards — when a nested diagnostic
+/// source — which `SanitizedReport::source_code` forwards — when a nested diagnostic
 /// supplies none.  So a nested diagnostic still renders against neutralized source.
 struct SanitizedNode {
     message: String,

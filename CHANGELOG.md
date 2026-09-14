@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (CLI): `mds build`, `mds check`, `mds fmt` and `mds lint` now exit
+  non-zero on a directory that contains no `.mds` files (#204).** `build`/`check`/`fmt`
+  exit 1 and `lint` exits 2 (its usage-error code), printing `no .mds files found in
+  <dir>; nothing was built` (`…checked` / `…formatted` / `…linted`) on stderr — even
+  under `--quiet`, exactly like the existing all-under-excluded-directories diagnostic.
+  Previously an empty tree exited 0 with `No .mds files found in <dir>` (silent under
+  `--quiet`), so a mistyped or not-yet-populated directory passed CI green. Scripts that
+  relied on exit 0 for an empty directory must create at least one `.mds` file or skip
+  the call. `mds watch <dir>` is unchanged: it starts on an empty tree and compiles files
+  created later. The bare auto-detect form (`mds build` with no argument in a directory
+  holding no `.mds` file) already exited non-zero; this aligns the explicit directory form.
 - **`mds watch --debounce` is now a quiet period with a hard cap (#379).**
   Each content event restarts the window instead of the window expiring at a fixed
   offset from the first event, so a save burst longer than the window coalesces into
@@ -74,6 +85,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty-string key renders as an empty segment; the file-load and string-load
   error codes (`mds::invalid_vars` vs `mds::json`) remain deliberately
   un-unified (pre-existing split, unchanged).
+- **`mds build` and `mds watch` outputs are written atomically (#227).** Compiled
+  artifacts, directory-mode outputs and `.map` sidecars are now written to a temporary
+  file in the destination directory and renamed into place — the same primitive
+  `mds fmt` and `mds lint --fix` already use — so a crash, kill or write error can never
+  leave a truncated file; the previous output survives until the rename. Source rewrites
+  keep their fsync-before-rename; compiled outputs and sidecars use rename only
+  (regenerable; an unconditional fsync made directory-mode watch startup ~3× slower on
+  macOS). A first build into a new file keeps the umask default mode (typically 0644); an
+  existing output keeps its mode. Consequences: an output path that is a symlink (live or
+  dangling) is refused instead of written through; a destination directory that is not
+  writable fails the build even when the file itself is writable; a read-only (0444)
+  existing output is replaced, mode preserved. The spurious `cannot get metadata` message
+  that #240 emitted on every first write of a not-yet-existing file is gone; a stat
+  failure other than "not found" is now a hard error rather than a warning (#225). A new
+  test, `write_funnel.rs`, fails CI on any raw `fs::write`/`File::create` in the CLI
+  outside the two justified sites.
 - **Fix stale `lint_str` rustdoc and lint-rule Tier tables (#329).** `mds-core`'s
   `lint_str` rustdoc said "applies the 9 lint rules" after a 10th rule
   (`legacy-interpolation`) had shipped; the Tier tables in `lint/tier.rs` and
@@ -87,6 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **`atomic_write_file` replace-by-rename contract documented (#226).** The temp-file-then-rename write used by `mds fmt`, `mds lint --fix` and (with #227) `mds build`/`mds watch` outputs and `.map` sidecars gives the target a new inode, so hard links, ACLs, xattrs and owner/group of a pre-existing target are not preserved (permission bits are, on Unix). Stated in spec §7.2 "Output writing", `SECURITY.md`, the helper's rustdoc and `RELEASING.md`.
 - Cargo dependency sweep: napi 3.9.0 → 3.12.2, napi-derive 3.5.6 → 3.6.3, napi-build 2.3.2 → 2.4.1 (napi-sys 3.3.0, napi-derive-backend 6.1.2), pyo3 0.29.0 → 0.29.2, clap 4.6.1 → 4.6.6, similar 3.1.1 → 3.2.0, wasm-bindgen 0.2.121 → 0.2.126 (js-sys 0.3.103, wasm-bindgen-futures 0.4.76, wasm-bindgen-test 0.3.76), serde 1.0.228 → 1.0.229, serde_json 1.0.150 → 1.0.151, thiserror 2.0.18 → 2.0.20, libc 0.2.186 → 0.2.189. Supersedes Dependabot #354 #360 #359 #358 #280 #251 #249 #246 #243.
 - npm dependency sweep: relaxed the three phantom floor pins to caret ranges — fast-uri 3.1.5 → ^3.1.6 (oldest release patching GHSA-5jgf-p345-68v8, GHSA-fph4-wmhf-6fwf, GHSA-f65p-4m7j-42xc, GHSA-jqff-g426-hqxp), nanoid 3.3.18 → ^3.3.18, js-yaml 4.3.1 → ^4.3.1 (#336); @napi-rs/cli ^3.0.0 → ^3.8.6 (lock 3.7.0 → 3.8.6); vite lock 8.1.5 → 8.2.2; Dependabot `ignore` rules for semver-major bumps of the three phantom pins. Supersedes Dependabot #315 #332 #346 #362 #355 #357 #279.
 - GitHub Actions sweep: actions/checkout v6 → v7 (16 call sites: 9 ci.yml + 7 release.yml), actions/setup-node v6 → v7 (6 sites), actions/setup-python v5 → v7 (5 sites, ci.yml only; action runtime node20 → node24), PyO3/maturin-action pin normalized from the v1.51.0 annotated-tag object (`3e2bdf6`) to the commit it points to (`e83996d1`), same version (PF-040); Dependabot `ignore` for typescript semver-major version updates pending the TS 7 migration (#364). Supersedes Dependabot #111, #189, #241, #356; replaces #169.

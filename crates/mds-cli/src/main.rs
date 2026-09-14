@@ -65,7 +65,7 @@ enum Commands {
         /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3"; repeating a key warns, last value wins)
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
-        /// Generate a source map alongside the compiled output (sidecar: <output-file>.map, e.g. -o out.md → out.md.map).
+        /// Generate a source map alongside the compiled output (sidecar: `<output-file>`.map, e.g. -o out.md → out.md.map).
         /// Conflicts with --no-source-map.
         #[arg(long = "source-map", conflicts_with = "no_source_map")]
         source_map: bool,

@@ -210,7 +210,8 @@ Notable divergences worth knowing before touching this file:
 - **Adding a field to `MdsConfig` ripples into unrelated existing tests.** The `fmt: FmtConfig` field addition required `..Default::default()` in pre-existing struct-literal test sites in `build.rs` and `watch.rs`.
 - **Partials are reformatted but `is_partial` still gates output emission elsewhere.** Don't conflate the two meanings of "partial" across `fmt` vs. `build`/`check`.
 - **Hidden FILES are still collected by the walker.** `is_default_excluded_dir` excludes hidden *directories* from recursion, not hidden `.mds` files at the traversed level. A `.dotfile.mds` at the root of a traversed directory is collected and formatted.
-- **`atomic_write_file` is the write primitive — not `std::fs::write`.** `fmt.rs` calls `atomic_write_file` from `output.rs` (shared with `lint.rs`). It provides a TOCTOU guard, Unix permission preservation (`mode & 0o7777`), and `sync_all()` + atomic rename. This means a failed write leaves the original file intact — it does NOT leave a partially-written file.
+- **`atomic_write_file` is the write primitive — not `std::fs::write`.** `fmt.rs` calls `atomic_write_file` from `output.rs` (shared with `lint.rs`). It provides a TOCTOU guard, Unix permission preservation (`mode & 0o7777`), and `sync_all()` + atomic rename. This means a failed write leaves the original file intact — it does NOT leave a partially-written file. And, since #227, `write_output`/dir-mode build/`.map` sidecars route through it too, with `Durability::RenameOnly` (fmt/lint pass `Fsync`).
+- **`crates/mds-cli/tests/write_funnel.rs` fails CI on any raw `fs::write(` / `File::create(` in `crates/mds-cli/src` outside the two allow-listed sites** (`mds init` in main.rs; the test-only readiness marker in watch.rs).
 
 ## Deferred follow-ups (recorded to avoid re-flagging as new debt)
 
@@ -228,7 +229,7 @@ These items were consciously deferred and have back-ref comments in source:
 - `crates/mds-core/src/formatter.rs` — the entire engine: `format_str_named` (~line 135), region computation, the rewrite pass, `strip_trailing_insignificant_text` (~line 522), `in_raw_content` binary-search helper, `assert_equivalent` (~line 446), and `structural_equivalent` (~line 565)
 - `crates/mds-core/src/lib.rs:60` — `pub use formatter::{format_str, format_str_named, format_str_with}` (the public re-export); `:665-681` — `clean_output`
 - `crates/mds-core/src/fs.rs:287` — `effective_parent` (bare-filename fix, maps `Some("")`/`None` → `"."`)
-- `crates/mds-cli/src/output.rs:164,177` — `is_default_excluded_dir` / `is_within_default_excluded_dir` (shared walker exclusions; applies to all subcommands and both watch paths); `:432` — `atomic_write_file` (shared write primitive: TOCTOU guard + permissions restore + sync_all + atomic rename; used by both `fmt.rs` and `lint.rs`)
+- `crates/mds-cli/src/output.rs:164,177` — `is_default_excluded_dir` / `is_within_default_excluded_dir` (shared walker exclusions; applies to all subcommands and both watch paths); `:651` — `atomic_write_file` (shared write primitive: TOCTOU guard + permissions restore + atomic rename, with `sync_all` under `Durability::Fsync`; used by `fmt.rs`, `lint.rs`, and — since #227 — `build.rs`/`watch.rs` outputs and `.map` sidecars)
 - `crates/mds-core/src/evaluator.rs:845` — the `evaluate_nodes(...).trim()` call (spec §4.11 edge-trim) that makes `@message` bodies bypass `clean_output`
 - `crates/mds-core/src/resolver/frontmatter.rs:53-129` — `deep_merge_yaml` (`@extends` frontmatter merge)
 - `crates/mds-core/src/parser.rs:545-594` — `parse_block`; the `@block`-cannot-nest-in-`@message` guard
