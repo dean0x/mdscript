@@ -328,10 +328,14 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
             );
             std::process::exit(1);
         }
-        if !flags.quiet {
-            eprintln!("No .mds files found in {}", crate::output::safe_path(dir));
-        }
-        return Ok(());
+        // #204: an empty tree is "nothing to format", not success (mirrors build.rs).
+        // Emitted even under --quiet and exit 1.  This arm sits BEFORE the `read_only`
+        // split below, so `--check` and `--diff` behave identically on an empty tree.
+        eprintln!(
+            "no .mds files found in {}; nothing was formatted",
+            crate::output::safe_path(dir)
+        );
+        std::process::exit(1);
     }
 
     let read_only = flags.check || flags.diff;

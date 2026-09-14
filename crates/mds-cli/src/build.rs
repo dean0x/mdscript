@@ -1577,6 +1577,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// the summary is always emitted so the non-zero exit is never unexplained.
 /// This mirrors the gate used by `mds check` (`main.rs`) and `mds fmt` (`fmt.rs`).
 ///
+/// **Nothing to build is an error (#204):** when the walk yields no files the run
+/// exits 1 with a one-line stderr diagnostic that bypasses `--quiet` — either the
+/// all-excluded count diagnostic or `no .mds files found in <dir>; nothing was built`.
+/// Both call `process::exit` directly: no `MdsError` variant exists for "nothing to
+/// do" and `exit_code` must not grow one for a non-error class.
+/// `mds check` and `mds fmt` mirror this with exit 1, `mds lint` with exit 2;
+/// `mds watch <dir>` deliberately does NOT error on an empty tree.
+///
 /// **Documented limitation (AC-Q05):** two warning writers reachable from this
 /// function do not accept a `quiet` parameter — `output.rs::collect_mds_files_inner`
 /// (depth-limit warning, fires on trees deeper than MAX_DEPTH=64) and
@@ -1644,10 +1652,17 @@ fn run_build_directory(
             );
             std::process::exit(1);
         }
-        if !quiet {
-            eprintln!("No .mds files found in {}", crate::output::safe_path(dir));
-        }
-        return Ok(());
+        // #204: an empty tree is "nothing to build", not success.  Same shape as the
+        // all-excluded arm above — emitted even under --quiet (a silent green pass on
+        // a mistyped or not-yet-populated directory is the CI failure mode this
+        // closes) and exit 1, the build/check/fmt "nothing was done" code (spec §7.9).
+        // `mds watch <dir>` deliberately still starts on an empty tree: a file created
+        // later is a valid flow there.
+        eprintln!(
+            "no .mds files found in {}; nothing was built",
+            crate::output::safe_path(dir)
+        );
+        std::process::exit(1);
     }
 
     let mut ok_count: usize = 0;

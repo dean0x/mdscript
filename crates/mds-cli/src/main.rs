@@ -342,10 +342,14 @@ fn run_check_directory(
             );
             std::process::exit(1);
         }
-        if !quiet {
-            eprintln!("No .mds files found in {}", output::safe_path(dir));
-        }
-        return Ok(());
+        // #204: an empty tree is "nothing to check", not success (mirrors build.rs).
+        // Emitted even under --quiet and exit 1, the same "nothing was done" code
+        // build and fmt use.
+        eprintln!(
+            "no .mds files found in {}; nothing was checked",
+            output::safe_path(dir)
+        );
+        std::process::exit(1);
     }
 
     let mut ok_count: usize = 0;

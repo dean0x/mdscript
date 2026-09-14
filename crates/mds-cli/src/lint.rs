@@ -1371,11 +1371,12 @@ fn run_lint_directory(
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
     let mut files = walk.files;
 
-    // AD-216-9: empty-dir early return emits no summary — the per-file loop never
+    // AD-216-9: neither early exit below emits a summary — the per-file loop never
     // runs, so all four counters stay at zero and there is nothing meaningful to
-    // print.  The all-excluded diagnostic (below) bypasses --quiet and exits 2:
-    // parity with `build`/`check`/`fmt` (a silent non-zero exit here would be a
-    // bug, not a feature).
+    // print.  Both diagnostics bypass --quiet and exit 2 (lint's usage-error code;
+    // build/check/fmt use 1): the all-excluded arm, and since #204 the empty-tree
+    // arm — a silent non-zero exit here would be a bug, and a silent ZERO exit on an
+    // empty tree was the CI green-pass hole #204 closes.
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
@@ -1387,10 +1388,14 @@ fn run_lint_directory(
             );
             std::process::exit(2);
         }
-        if !quiet {
-            eprintln!("No .mds files found in {}", safe_path(dir));
-        }
-        return Ok(());
+        // #204: an empty tree is "nothing to lint", not success (mirrors build.rs).
+        // Emitted even under --quiet.  Exit 2 is lint's usage-error code (module doc),
+        // matching the all-excluded arm above; build/check/fmt use 1.
+        eprintln!(
+            "no .mds files found in {}; nothing was linted",
+            safe_path(dir)
+        );
+        std::process::exit(2);
     }
 
     // F1: sort by (sanitized_display_key, raw_os_path) so that:
