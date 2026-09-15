@@ -189,7 +189,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
   test('T-HMR-b (AC-F2): edit transitive @import dep → fresh transform', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
       {
-        // ADR-014: dep BEFORE entry
+        // deps-before-entry: dep BEFORE entry
         'dep.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
         'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
       },

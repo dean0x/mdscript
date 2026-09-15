@@ -85,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mds::load_vars_file`/`load_vars_str` never sees it). At most 1 000 distinct
   duplicate key paths are listed; beyond that a single tail line reports how many
   more were omitted: `warning: {n} more duplicate keys in vars file <file> are not
-  listed`. `mds watch` reloads the vars file from disk on every rebuild (ADR-016),
+  listed`. `mds watch` reloads the vars file from disk on every rebuild,
   so its duplicate keys are re-reported on every rebuild that writes output too —
   including a duplicate introduced mid-session by editing the vars file — while
   `--set`/`--set-string` duplicate warnings keep their existing once-at-startup

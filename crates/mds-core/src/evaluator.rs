@@ -1262,7 +1262,8 @@ pub struct EvalMessage {
 /// `file`/`source` provide the diagnostic context for the [`MdsError::MixedContent`]
 /// span: when orphan content is found, the offending node's byte offset (already
 /// captured by the parser on every `TextNode`/`Interpolation`) is paired with
-/// `source` so the error underlines the prose (ADR-022). For the `@extends` path the
+/// `source` so the error underlines the prose (origin rides along the data, not a
+/// path→source lookup). For the `@extends` path the
 /// offsets may originate in a base template rather than `source`; the shared `at()`
 /// guard drops the source in that out-of-bounds case so no miette `OutOfBounds`
 /// render can occur (the raw offset/length are still preserved in `serialize()`).

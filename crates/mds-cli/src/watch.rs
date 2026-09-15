@@ -6,7 +6,7 @@
 //!
 //! - **Single-file mode**: watches the entry file and all its transitive imports.
 //!   On each rebuild the dependency set is recomputed from fresh compilation output
-//!   (ADR-016: never trust a stale dep set).
+//!   (the freshness rule under "Key invariants": never trust a stale dep set).
 //!
 //! - **Directory mode**: recursive watch on the root dir; tracks a reverse-dependency
 //!   graph so editing a shared partial recompiles all transitive importers.
@@ -46,10 +46,17 @@
 //! - `--quiet` suppresses status + warnings but NOT compile errors.
 //! - Exit 0 on clean Ctrl+C; non-zero only on startup failure.
 //! - Compile errors during watching never terminate the watcher.
-//! - All loops have fixed upper bounds (ADR-021 / reliability.md): the idle tick
+//! - All loops have fixed upper bounds (reconcile rule / reliability.md): the idle tick
 //!   against an absolute deadline, and the debounce window against an absolute cap
 //!   (window <= cap) and a message bound (<= 10 000 per window).
 //! - All `.mds` reads go through `compile_to_content` (PF-004).
+//! - **Freshness rule** (design decision of 2026-06; kept in git history as legacy
+//!   decision 016 in `88ddbcc~1:.devflow/decisions/decisions.md`): the dependency set
+//!   and the `--vars` file are re-derived from fresh compile output / from disk on
+//!   every rebuild — never served from a cached snapshot.
+//! - **Reconcile rule** (legacy decision 021, same file): the idle tick only re-arms
+//!   watches cheaply; a full directory rescan happens only on watch loss/recovery, so
+//!   idle cost is O(1) in tree size.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -352,7 +359,7 @@ pub(crate) fn state_differs(paths: &HashSet<PathBuf>, prev: &StampMap) -> bool {
 /// Decide whether a missing/recovered external dep dir should trigger a full
 /// reconcile, and compute the new "missing" set for the next tick.
 ///
-/// Edge-triggered (ADR-021 / AC-P1): a missing external dir forces a reconcile
+/// Edge-triggered (reconcile rule / AC-P1): a missing external dir forces a reconcile
 /// only when it *reappears* (was in `prev_missing`, now exists). A dir that stays
 /// missing across ticks does NOT trigger a walk — otherwise a permanently-deleted
 /// cross-root dep dir would cause an O(tree) rescan on every idle tick.
@@ -389,7 +396,7 @@ pub(crate) fn external_recovery_decision(
 ///
 /// Rejects a symlinked vars file at startup (build parity — PF-004).
 /// Falls back to the raw path when the file does not yet exist (the user may create
-/// it later; the vars file is reloaded on every rebuild — ADR-016 — so a duplicate
+/// it later; the vars file is reloaded on every rebuild — freshness rule — so a duplicate
 /// key introduced after startup is caught on the next rebuild, #326).
 pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<PathBuf>, MdsError> {
     match vars {
@@ -795,7 +802,7 @@ fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome
     DebounceOutcome { paths, end }
 }
 
-// ── Poll-interval clamp (ADR-021) ─────────────────────────────────────────────
+// ── Poll-interval clamp (reconcile rule) ─────────────────────────────────────────────
 
 /// Convert a raw `--poll-interval` value (milliseconds) into a tick duration.
 ///
@@ -859,7 +866,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
     let canonical_input =
         mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
 
-    // Clamp poll_interval: 0 = disable; nonzero ≥ 50ms floor (ADR-021).
+    // Clamp poll_interval: 0 = disable; nonzero ≥ 50ms floor (reconcile rule).
     let tick_opt: Option<Duration> = clamp_poll_interval(poll_interval);
 
     if is_dir {
@@ -935,11 +942,11 @@ struct FileWatchState {
     /// Subset of `watched_dirs` that have been successfully armed (registered with the
     /// OS watcher).  Used by `liveness_probe_file` to skip the `watcher.watch()` syscall
     /// for dirs that are already known-good — steady-state idle cost becomes O(missing_dirs)
-    /// ≈ O(0) rather than O(watched_dirs) (ADR-021 / issue #1).
+    /// ≈ O(0) rather than O(watched_dirs) (reconcile rule / issue #1).
     armed_dirs: BTreeSet<PathBuf>,
     /// Set of paths relevant to the current build (entry + deps + vars).
     foi: HashSet<PathBuf>,
-    /// Snapshot of `(mtime, size)` used by the liveness probe (ADR-021).
+    /// Snapshot of `(mtime, size)` used by the liveness probe (reconcile rule).
     last_mtimes: StampMap,
     /// Content-dedup map keyed by output-path string (or `"<stdout>"`).
     last_written: HashMap<String, String>,
@@ -961,7 +968,7 @@ enum FileEventAction {
     Rebuild,
 }
 
-/// Run the idle-tick liveness probe for single-file mode (ADR-021).
+/// Run the idle-tick liveness probe for single-file mode (reconcile rule).
 ///
 /// Re-arms watches for dirs that were missing or not yet armed; skips the
 /// `watcher.watch()` syscall for dirs already known-good (`armed_dirs`).
@@ -974,7 +981,7 @@ fn liveness_probe_file(
     watcher: &mut RecommendedWatcher,
     state: &mut FileWatchState,
 ) -> bool {
-    // 1. Re-arm watches for dirs that need attention (ADR-021 idle-O(1) fix).
+    // 1. Re-arm watches for dirs that need attention (reconcile rule idle-O(1) fix).
     //    A dir "needs attention" if it was previously missing OR not yet armed.
     //    Already-armed, currently-present dirs are not touched — steady-state idle
     //    cost becomes O(missing_dirs) ≈ O(0), not O(watched_dirs).
@@ -1011,7 +1018,7 @@ fn liveness_probe_file(
             state.armed_dirs.remove(d);
         }
     }
-    // Edge-triggered recovery (ADR-021): mirrors external_recovery_decision used in
+    // Edge-triggered recovery (reconcile rule): mirrors external_recovery_decision used in
     // dir mode — a dir that STAYS missing must not trigger recovery every tick.
     let (dirs_recovery, now_missing_dirs) =
         external_recovery_decision(&state.missing_watched_dirs, &dir_statuses);
@@ -1090,7 +1097,7 @@ fn handle_fs_event_file(
 /// `watcher` is passed separately (non-Clone, distinct lifecycle role).
 ///
 /// # Invariants preserved
-/// - ADR-016: `foi` and `watched_dirs` always recomputed from fresh dep output.
+/// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output.
 /// - PF-004: all reads go through `compile_to_content`.
 /// - Error-settle: `last_mtimes` updated on vars error, compile error, and write error.
 fn rebuild_file(
@@ -1179,7 +1186,7 @@ fn rebuild_file(
                 crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
             }
 
-            // ADR-016: always recompute dep set from fresh output.
+            // Freshness rule: always recompute dep set from fresh output.
             let new_dirs =
                 dirs_to_watch(&ctx.entry, &compiled.dependencies, ctx.vars_path.as_deref());
             state.watched_dirs = resync_watches(watcher, &state.watched_dirs, &new_dirs);
@@ -1483,7 +1490,7 @@ fn run_watch_file(
 
     let mut state = FileWatchState {
         // armed_dirs mirrors watched_dirs at startup: all dirs that were successfully
-        // registered in the loop above are considered armed (ADR-021 idle-O(1) fix).
+        // registered in the loop above are considered armed (reconcile rule idle-O(1) fix).
         armed_dirs: watched_dirs.clone(),
         watched_dirs,
         foi,
@@ -1535,7 +1542,7 @@ fn run_watch_file(
         match clock.recv_next(&rx) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(None) => {
-                // Idle tick — run liveness probe (ADR-021).
+                // Idle tick — run liveness probe (reconcile rule).
                 if liveness_probe_file(&ctx, &mut watcher, &mut state) {
                     rebuild_file(&ctx, &mut watcher, &mut state);
                 }
@@ -1630,7 +1637,7 @@ impl DirWatchState {
     /// The retained set is used only to decide what to *watch* and what to re-seed —
     /// never as a substitute for recompiling. It therefore only ever widens what may
     /// trigger a rebuild, and the cost of a stale edge is one recompile whose output
-    /// the `last_written` dedup then suppresses. ADR-016's freshness rule is about the
+    /// the `last_written` dedup then suppresses. The freshness rule is about the
     /// dep set a *rebuild* records, and that still comes from fresh `compile_to_content`
     /// output on every success; a failed compile produces no fresh set to record.
     fn record_error(&mut self, src: &Path) {
@@ -1676,7 +1683,7 @@ impl DirWatchState {
     }
 }
 
-/// State for the dir-mode liveness probe (ADR-021).
+/// State for the dir-mode liveness probe (reconcile rule).
 struct LivenessState {
     /// Set to true on the very first tick so we do a reconcile after startup.
     first_tick: bool,
@@ -1686,14 +1693,14 @@ struct LivenessState {
     ///
     /// Mirrors the `armed_dirs` discipline from file mode: skip `watcher.watch(root, …)`
     /// on healthy ticks so the OS-level re-WalkDir / FSEvents stream teardown does not
-    /// happen every idle tick — O(1) idle cost regardless of subtree size (ADR-021).
+    /// happen every idle tick — O(1) idle cost regardless of subtree size (reconcile rule).
     root_armed: bool,
     /// External dep dirs that were missing on the previous tick.
     ///
     /// Recovery is **edge-triggered**: a missing external dir triggers a full
     /// reconcile only when it *reappears* (vanish→reappear), never while it stays
     /// missing. A permanently-missing external dir must NOT force an O(tree) walk
-    /// on every idle tick (ADR-021 / AC-P1).
+    /// on every idle tick (reconcile rule / AC-P1).
     missing_external_dirs: BTreeSet<PathBuf>,
     /// External dep dirs that are currently armed with the OS watcher.
     ///
@@ -1716,7 +1723,7 @@ struct LivenessState {
 /// and external-only deps where the caller decides skip/continue).
 ///
 /// # Invariants preserved
-/// - ADR-016: dep set recomputed from fresh `compile_to_content` output.
+/// - Freshness rule: dep set recomputed from fresh `compile_to_content` output.
 /// - PF-004: all reads go through `compile_to_content`.
 ///
 /// Does **not** touch `state.last_mtimes`: the content backstop's baseline is settled
@@ -1872,7 +1879,7 @@ struct DirWatchCtx {
     quiet: bool,
 }
 
-/// Run the idle-tick liveness probe for directory mode (ADR-021, DD1).
+/// Run the idle-tick liveness probe for directory mode (reconcile rule, DD1).
 ///
 /// Re-arms root + external dirs + vars dir. Applies edge-triggered recovery
 /// to decide whether a full reconcile (collect_mds_files diff) is needed.
@@ -1883,7 +1890,7 @@ fn liveness_probe_dir(
     liveness: &mut LivenessState,
     state: &mut DirWatchState,
 ) {
-    // 1. Re-arm root as Recursive (gated — ADR-021 / issue #1 idle O(1) fix).
+    // 1. Re-arm root as Recursive (gated — reconcile rule / issue #1 idle O(1) fix).
     //
     // Skip the `watcher.watch()` syscall on healthy ticks when root is already armed:
     // on Linux `notify` re-WalkDirs the entire subtree + calls `inotify_add_watch` per
@@ -1966,7 +1973,7 @@ fn liveness_probe_dir(
         }
     }
 
-    // 2. Recovery trigger (ADR-021):
+    // 2. Recovery trigger (reconcile rule):
     //    `root_now_exists && !root_ok` = existing root whose re-arm failed (genuine watch loss).
     //    A *missing* root is handled by the `root_was_missing && root_now_exists` vanish→reappear
     //    edge and must NOT trigger recovery on every tick while absent (per-tick error spam).
@@ -2029,7 +2036,7 @@ fn liveness_probe_dir(
         }) {
             // --set/--set-string are fixed for the session and warned once at
             // startup — discarded (via `resolved.vars` below). The vars file is
-            // reloaded on every rebuild (ADR-016); this self-heal path emits under
+            // reloaded on every rebuild (freshness rule); this self-heal path emits under
             // the same content-changed gate as `handle_fs_event_dir`, so one
             // logical edit observed by both paths still warns once — tests I17 and
             // I19. Without this, a self-heal recompile driven purely by this
@@ -2157,7 +2164,7 @@ fn handle_fs_event_dir(
         clear_terminal();
     }
 
-    // ADR-016: reload vars from disk on every rebuild.
+    // Freshness rule: reload vars from disk on every rebuild.
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
     let resolved = match build_runtime_vars(RuntimeVarArgs {
         vars: ctx.vars_path_raw.clone(),
@@ -2166,7 +2173,7 @@ fn handle_fs_event_dir(
     }) {
         // --set/--set-string are fixed for the session and warned once at startup —
         // discarded (via `resolved.vars` below). The vars file is reloaded on every
-        // rebuild (ADR-016), so its duplicate keys are re-reported too — but only when
+        // rebuild (freshness rule), so its duplicate keys are re-reported too — but only when
         // this batch produces an OBSERVABLE rebuild (#326, test I17): at
         // `--debounce 0` a single edit can generate more than one raw FS event, each
         // reaching this function separately, so the warning is emitted after
@@ -2314,7 +2321,7 @@ fn dir_watch_startup(
 
     // Watch the vars dir if it is outside root — soft warning on failure (mirrors the
     // external-dep-dir convention and the liveness probe's best-effort re-arm semantics;
-    // a transient failure must not abort the session, applies ADR-021 / consistency fix).
+    // a transient failure must not abort the session, applies the reconcile rule / consistency fix).
     if let Some(ref vd) = vars_dir_extra {
         if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
             eprint_warning(&format!(
@@ -2638,7 +2645,7 @@ fn run_watch_dir(
         match clock.recv_next(&rx) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(None) => {
-                // Idle tick — run liveness probe (ADR-021, DD1).
+                // Idle tick — run liveness probe (reconcile rule, DD1).
                 liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
                 continue;
             }
@@ -2779,7 +2786,7 @@ fn process_dir_batch_vars_changed(
 /// Steps:
 /// 1. Partition changed paths into `existing` / `deleted`.
 /// 2. Compute seeds = existing ∪ deleted ∪ (errored ∩ real-change batch).
-/// 3. Compute affected = transitive importers of seeds (ADR-016 snapshot).
+/// 3. Compute affected = transitive importers of seeds (freshness-rule snapshot).
 /// 4. Compile each affected source that exists and is not an external-only dep.
 /// 5. Delete outputs for removed sources.
 ///
@@ -2927,7 +2934,7 @@ fn process_dir_batch_incremental(
     // (issue #2 / reliability.md): when a cross-root @import is edited away, the now-
     // unused dir stays in the set, causing the liveness probe to re-arm it on every tick
     // forever. Recompute from the current `forward_deps` after each batch so abandoned
-    // external dirs are unwatched and removed (applies ADR-021 / mirrors the prune
+    // external dirs are unwatched and removed (applies the reconcile rule / mirrors the prune
     // already done in `process_dir_batch_vars_changed`).
     let live_ext_dirs: BTreeSet<PathBuf> = state
         .forward_deps
@@ -3341,7 +3348,7 @@ mod tests {
     }
 
     // external_recovery_decision: a dir that STAYS missing across ticks does NOT
-    // trigger recovery (ADR-021 / AC-P1 — no per-tick full-tree walk).
+    // trigger recovery (reconcile rule / AC-P1 — no per-tick full-tree walk).
     #[test]
     fn external_recovery_missing_stays_missing_no_recovery() {
         let gone = PathBuf::from("/elsewhere/shared");

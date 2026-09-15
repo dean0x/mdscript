@@ -111,7 +111,7 @@ export function createMdsLoader(): MdsLoaderApi {
         // Runtime validation: esmImport() must return a thenable (Promise-like).
         // new Function() bypasses TypeScript's type checker, so the return type
         // annotation is not enforced at runtime. A non-thenable here would cause
-        // a silent hang rather than a clear error. (applies ADR-016)
+        // a silent hang rather than a clear error. (runtime re-validation of a value the type checker cannot see)
         if (
           importResult === null ||
           typeof importResult !== 'object' ||

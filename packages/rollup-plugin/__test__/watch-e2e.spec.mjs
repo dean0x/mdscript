@@ -118,7 +118,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
 
   test('T-HMR-b (AC-F2): edit transitive @import dep → fresh bundle', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      // ADR-014: dep BEFORE entry
+      // deps-before-entry: dep BEFORE entry
       'dep.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
       'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
     });
@@ -245,7 +245,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
   });
 
   test('T-HMR-e (AC-F5): add a second @import dep, edit it → recompile', async () => {
-    // ADR-014: dep files BEFORE entry
+    // deps-before-entry: dep files BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
       'dep1.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
       'entry.mds': '@import { greet } from "./dep1.mds"\n\n{{greet("World")}}',

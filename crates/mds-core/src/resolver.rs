@@ -1069,7 +1069,9 @@ impl ModuleCache {
         let (mut scope, fm_imports) =
             build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
 
-        // Resolve frontmatter imports BEFORE body imports (per spec, ADR-014).
+        // Resolve frontmatter imports BEFORE body imports (per spec: frontmatter imports
+        // resolve before body imports; a duplicate alias is a compile error — legacy
+        // decision 014 in 88ddbcc~1:.devflow/decisions/decisions.md).
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
         // Walk the AST: collect @define functions (with closure capture), process imports/exports
@@ -1180,7 +1182,7 @@ impl ModuleCache {
     /// - Parse FM imports from base and child frontmatter (3d-i).
     /// - Deep-merge base and child FM mappings (3d-ii).
     /// - Build scope from the merged mapping with runtime vars (3d-iii).
-    /// - Resolve base FM imports against the base file (3d-iv, ADR-014 ordering).
+    /// - Resolve base FM imports against the base file (3d-iv, frontmatter-first ordering).
     /// - Resolve child FM imports against the child file (3d-v).
     /// - Merge base functions into scope (3d-vi).
     ///
@@ -1190,7 +1192,7 @@ impl ModuleCache {
     /// independent of `&mut self`. The caller passes `&*arc` to deref from `Arc`.
     ///
     /// # Invariants preserved
-    /// - Base FM imports resolved BEFORE child FM imports (ADR-014).
+    /// - Base FM imports resolved BEFORE child FM imports (frontmatter-first ordering).
     /// - `deep_merge_yaml` applies `MAX_FRONTMATTER_MERGE_DEPTH` cap.
     /// - `resolve_frontmatter_imports` → `resolve_import_from` → `resolve_by_key_skeleton`
     ///   preserves PF-004 safety (cycle detection, `check_import_depth`, file-size cap).
@@ -1207,7 +1209,8 @@ impl ModuleCache {
         // Base imports resolve relative to the BASE file's directory (base_base_dir, derived
         // from base_key via FileSystem::parent_dir). Child imports resolve relative to the
         // CHILD file's directory (ctx.base_dir). Both sets are resolved; a duplicate alias
-        // across base+child → mds::name_collision (ADR-014).
+        // across base+child → mds::name_collision (a duplicate alias across frontmatter
+        // and body is a compile error).
         let base_fm_imports: Vec<FrontmatterImport> = base
             .frontmatter_values
             .as_ref()
@@ -1236,7 +1239,7 @@ impl ModuleCache {
         // (base < child < runtime, F7, decision #3).
         let mut scope = build_scope_from_merged_mapping(&merged_mapping, ctx.runtime_vars)?;
 
-        // 3d-iv: Resolve base frontmatter imports against base_key (ADR-014 ordering,
+        // 3d-iv: Resolve base frontmatter imports against base_key (frontmatter-first ordering,
         // PF-004 safe via resolve_frontmatter_imports → resolve_import_from).
         // Use a ctx pointing to the base file with its REAL source bytes so that any
         // span-carrying error here attributes correctly AND the at() debug_assert can't
@@ -1284,7 +1287,8 @@ impl ModuleCache {
     ///
     /// Factoring here enforces that BOTH modes go through the same PF-004-safe
     /// `resolve_by_key_skeleton` path for the base, and share one copy of the
-    /// scope-construction pipeline (ADR-016: re-validate at the leaf; decision #3/7).
+    /// scope-construction pipeline (re-validated at the leaf even though every part
+    /// passed its parse-time check; decision #3/7).
     fn resolve_extends_components(
         &mut self,
         module: &crate::ast::Module,
@@ -1381,7 +1385,7 @@ impl ModuleCache {
     /// and `process_module_intrinsic` (@extends branch) — enforcing PF-004 parity: the two
     /// parallel paths can never drift because they share one implementation.
     ///
-    /// ADR-016: re-validate at the leaf (on `final_body` regions), not at intermediate bases.
+    /// Re-validate at the leaf (on `final_body` regions), not at intermediate bases.
     fn validate_extends_components(
         components: &ExtendsComponents,
         scope: &mut Scope,
@@ -1418,7 +1422,8 @@ impl ModuleCache {
         // Validate per-region so each region's offsets are checked against the correct
         // source (fixes the cross-source OutOfBounds diagnostic bug). This is what makes
         // E12 work: a base default block referencing an undefined var is caught HERE
-        // against the merged leaf scope. (ADR-016: re-validate dynamically-assembled content.)
+        // against the merged leaf scope. (dynamically-assembled content is re-validated
+        // even though each part was checked at parse time.)
         {
             let mut scope = components.scope.clone();
             Self::validate_extends_components(&components, &mut scope)?;
@@ -1534,7 +1539,9 @@ impl ModuleCache {
     /// - `check_import_depth` + cycle detection (`self.resolving`) apply via
     ///   `resolve_by_key_skeleton`.
     /// - `deep_merge_yaml` depth cap (`MAX_FRONTMATTER_MERGE_DEPTH`) applies transitively.
-    /// - `skeleton_origin` Arc is cloned from the grandparent (ADR-022 ride-along).
+    /// - `skeleton_origin` Arc is cloned from the grandparent (origin rides along the
+    ///   data — never a path→source lookup; legacy decision 022 in the same
+    ///   git-history file).
     #[allow(clippy::type_complexity)]
     fn resolve_intermediate_base(
         &mut self,
@@ -1569,7 +1576,8 @@ impl ModuleCache {
 
         // skeleton_origin Arc::clone'd from grandparent — the root base's source bytes
         // ride down the chain so the leaf's validate_extends_components can attribute
-        // non-block skeleton node diagnostics to the root file (Risk #2, ADR-022).
+        // non-block skeleton node diagnostics to the root file (Risk #2; origin rides
+        // along via Arc, never reconstructed from a path cache).
         let skel_origin = grandparent.skeleton_origin.clone();
 
         // Phase 3: transitive FM merge: grandparent.frontmatter_values < own_fm_values.
