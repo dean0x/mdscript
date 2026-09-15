@@ -6838,3 +6838,70 @@ fn d1_dir_fix_check_json_body_pre_fix_and_exit_2() {
          (residual error); stdout: {stdout}"
     );
 }
+
+/// #217: the SINGLE-FILE arm of `mds lint` also exits 2 for a path that cannot be
+/// named in UTF-8.
+///
+/// Sibling of `lint_directory_non_utf8_entry_is_an_io_error_exit_2` above, which covers
+/// the directory arm. This one is a PIN: `read_source_file` has always raised
+/// `MdsError::Io` here, and `exit_code` has always mapped that to 2. It is recorded
+/// because `mds fmt` is being brought to the same behaviour and needs a pinned
+/// reference to match — the two now emit the identical message text
+/// (`path is not valid UTF-8: …`).
+///
+/// Positive control: the same invocation on a clean, normally named file exits 0, so
+/// the exit-2 assertion cannot be satisfied by a `lint` that is simply broken.
+///
+/// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or
+/// raw byte appears in this source file (source hygiene gate).
+#[cfg(unix)]
+#[test]
+fn lint_single_file_non_utf8_path_exits_2() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let clean = fs::read_to_string(fixture("lint_clean.mds")).unwrap();
+
+    // CONTROL ARM — a normally named file with the same content.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::write(control_dir.path().join("ok.mds"), &clean).unwrap();
+    let control = lint_path(&control_dir.path().join("ok.mds"), &[]);
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "control: a clean file named in UTF-8 must exit 0; stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // HOSTILE ARM — the same content under a name that is not valid UTF-8.
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Vec<u8> = vec![0xff, 0xfe, b'.', b'm', b'd', b's'];
+    let hostile = dir.path().join(OsString::from_vec(raw));
+
+    if fs::write(&hostile, &clean).is_err() {
+        // macOS (APFS / HFS+) enforces valid UTF-8 in filenames and rejects this create
+        // with EILSEQ, so the ON-DISK half is a Linux-CI gate. The control arm above has
+        // already run here. Any OTHER unix filesystem must accept the name and reach the
+        // assertions below — panic rather than skip silently, so a genuine regression
+        // can never masquerade as a skip.
+        #[cfg(not(target_os = "macos"))]
+        panic!(
+            "lint_single_file_non_utf8_path_exits_2: a non-UTF-8 filename was rejected \
+             by the filesystem — unexpected on this platform"
+        );
+        #[cfg(target_os = "macos")]
+        return;
+    }
+
+    let out = lint_path(&hostile, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "#217: a single-file path that cannot be named must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "the diagnostic must say why; got: {stderr}"
+    );
+}

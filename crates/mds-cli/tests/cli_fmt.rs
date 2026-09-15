@@ -1369,3 +1369,68 @@ fn r3_fmt_read_error_names_root_relative_path() {
         "fmt read error must not leak the absolute path prefix; got: {stderr}"
     );
 }
+
+/// #217: `mds fmt <path that is not valid UTF-8>` exits 2, like `lint` and `build`.
+///
+/// The module doc has promised "2: file not found / not `.mds` / I/O / bad UTF-8" since
+/// the subcommand shipped, and `check_symlink` — two statements earlier in the very same
+/// function — already exits 2 (`symlinked_input_rejected_exits_two`). The undecodable-path
+/// arm raised a bare `miette::miette!`, which does not downcast to `MdsError` and so fell
+/// through `exit_code` to 1: one input class produced two different exit codes depending
+/// on which of two adjacent checks caught it first.
+///
+/// Positive control: the same content under a normally named path exits 0, so the exit-2
+/// assertion cannot be satisfied by a `fmt` that is simply broken.
+///
+/// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or raw
+/// byte appears in this source file (source hygiene gate).
+#[cfg(unix)]
+#[test]
+fn fmt_non_utf8_path_exits_two() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // CONTROL ARM — a normally named, already-formatted source.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::write(control_dir.path().join("ok.mds"), "Hello\n").unwrap();
+    let control = fmt_path(&control_dir.path().join("ok.mds"), &[]);
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "control: a source named in UTF-8 must format cleanly; stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // HOSTILE ARM — the same content under a name that is not valid UTF-8.
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Vec<u8> = vec![0xff, 0xfe, b'.', b'm', b'd', b's'];
+    let hostile = dir.path().join(OsString::from_vec(raw));
+
+    if fs::write(&hostile, "Hello\n").is_err() {
+        // macOS (APFS / HFS+) enforces valid UTF-8 in filenames and rejects this create
+        // with EILSEQ, so the ON-DISK half is a Linux-CI gate. The control arm above has
+        // already run here. Any OTHER unix filesystem must accept the name and reach the
+        // assertions below — panic rather than skip silently, so a genuine regression
+        // can never masquerade as a skip.
+        #[cfg(not(target_os = "macos"))]
+        panic!(
+            "fmt_non_utf8_path_exits_two: a non-UTF-8 filename was rejected by the \
+             filesystem — unexpected on this platform"
+        );
+        #[cfg(target_os = "macos")]
+        return;
+    }
+
+    let output = fmt_path(&hostile, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "#217: an undecodable path is an I/O failure, not a format failure; \
+         stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "the diagnostic must say why; got: {stderr}"
+    );
+}
