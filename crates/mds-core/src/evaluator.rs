@@ -2532,4 +2532,101 @@ mod tests {
             "messages: wrong error for object-in-array syntax: {err}"
         );
     }
+
+    // ── #220: the source-map cursor invariant, checked from outside ───────────
+
+    /// The cursor invariant the record points assert internally is also an observable
+    /// output property: when `evaluate_with_map` returns, `cursor` is the compiled
+    /// output length, and every recorded segment points inside that output.
+    ///
+    /// Exercised across all three recording node kinds (Text, EscapedBrace,
+    /// Interpolation) and through the recursive arms (`@if`, `@for`, `@message`,
+    /// `@block`) that each run their own `evaluate_nodes` invocation with its own
+    /// local output buffer.
+    #[test]
+    fn evaluate_with_map_cursor_tracks_output_length_across_node_kinds() {
+        let source = concat!(
+            "Hello {{name}}!\n",
+            "Escaped: \\{{ raw\n",
+            "@if flag:\n",
+            "yes {{name}}\n",
+            "@end\n",
+            "@for i in items:\n",
+            "- {{i}}\n",
+            "@end\n",
+            "@message user:\n",
+            "ask {{name}}\n",
+            "@end\n",
+            "@block extra:\n",
+            "inside {{name}}\n",
+            "@end\n",
+        );
+        let tokens = crate::lexer::tokenize(source, "t.mds").expect("fixture must tokenize");
+        let module =
+            crate::parser::parse_with_ctx(&tokens, "t.mds", source).expect("fixture must parse");
+
+        let mut scope = Scope::new();
+        scope.set_var("name", Value::String("World".to_string()));
+        scope.set_var("flag", Value::Boolean(true));
+        scope.set_var(
+            "items",
+            Value::Array(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ]),
+        );
+
+        let builder = crate::sourcemap::MapBuilder::new(
+            "t.mds".to_string(),
+            "t.mds".to_string(),
+            source.to_string(),
+        );
+        let mut warnings = vec![];
+        let (output, map) = evaluate_with_map(&module.body, &mut scope, &mut warnings, builder)
+            .expect("fixture must evaluate");
+
+        assert_eq!(
+            map.cursor,
+            output.len() as u32,
+            "the cursor must equal the compiled output length when evaluation returns"
+        );
+        assert!(
+            map.segments.len() >= 12,
+            "non-vacuity: the fixture must reach many record points; got {} segments",
+            map.segments.len()
+        );
+
+        let mut prev_out = 0u32;
+        for (i, seg) in map.segments.iter().enumerate() {
+            assert!(
+                seg.out >= prev_out,
+                "segment {i} output offset went backwards: {} < {prev_out}",
+                seg.out
+            );
+            assert!(
+                seg.out as usize <= output.len(),
+                "segment {i} output offset {} is past the end of the compiled output ({})",
+                seg.out,
+                output.len()
+            );
+            prev_out = seg.out;
+        }
+
+        // The escaped brace is the record point with a fixed source width: three source
+        // bytes (backslash + two braces) collapsing to a two-byte output.
+        let escape_off = u32::try_from(
+            source
+                .find("\\{{")
+                .expect("fixture must contain an escaped brace"),
+        )
+        .expect("fixture offset fits in u32");
+        assert!(
+            map.segments
+                .iter()
+                .any(|s| s.src_off == escape_off && s.len == 3),
+            "expected an EscapedBrace segment at source offset {escape_off} with len 3; \
+             got: {:?}",
+            map.segments
+        );
+    }
 }

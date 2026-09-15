@@ -2554,4 +2554,92 @@ mod tests {
         assert_eq!(diags[0]["span"]["offset"], 50_u64);
         assert_eq!(diags[1]["span"]["offset"], 10_u64);
     }
+
+    // ── #220: width parity and public range checks hold in release too ────────
+
+    /// The byte-width parity of `neutralize_source_for_render`, checked over the WHOLE
+    /// class `is_control_char` claims rather than just the twelve bidi controls.
+    ///
+    /// The existing bidi test covers the subset most likely to regress; this one closes
+    /// the class, so a member added to the wrong width helper is caught even when it is
+    /// a C0 byte or a C1 codepoint rather than a bidi control.
+    #[test]
+    fn neutralize_replacement_width_matches_for_every_hazard_codepoint() {
+        let mut hits = 0usize;
+        // Bounded: `char` is a finite scalar range and the iterator skips surrogates.
+        for ch in '\0'..=char::MAX {
+            if !is_control_char(ch) {
+                continue;
+            }
+            hits += 1;
+            let raw = ch.to_string();
+            let out = neutralize_source_for_render(&raw);
+            assert_eq!(
+                out.len(),
+                ch.len_utf8(),
+                "U+{:04X} must be replaced by a substitute of identical byte width \
+                 ({} bytes); got {} bytes",
+                ch as u32,
+                ch.len_utf8(),
+                out.len()
+            );
+            assert_ne!(
+                &*out,
+                raw.as_str(),
+                "U+{:04X} is claimed hostile by is_control_char but was passed through \
+                 unchanged",
+                ch as u32
+            );
+        }
+        // Non-vacuity: the walk really matched the whole hazard class (30 C0 + DEL +
+        // 32 C1 + U+061C + 14 three-byte format hazards).
+        assert_eq!(
+            hits, 78,
+            "non-vacuity: expected is_control_char to claim exactly 78 codepoints; a \
+             different count means the class changed and this pin must be updated \
+             together with the width helpers"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "TextEdit::new: start is greater than end")]
+    fn text_edit_new_reversed_range_panics() {
+        let _ = TextEdit::new(5, 4, "");
+    }
+
+    #[test]
+    #[should_panic(expected = "FixLineSpan::range_inclusive: from is greater than to")]
+    fn fix_line_span_range_inclusive_reversed_panics() {
+        let _ = FixLineSpan::range_inclusive(5, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "FixLineSpan::range_exclusive: from is greater than to")]
+    fn fix_line_span_range_exclusive_reversed_panics() {
+        let _ = FixLineSpan::range_exclusive(5, 4);
+    }
+
+    /// Positive control for the three checks above: equal and correctly-ordered bounds
+    /// are legitimate constructions and must never panic.
+    #[test]
+    fn range_constructors_accept_equal_and_ordered_bounds() {
+        let empty = TextEdit::new(4, 4, "");
+        assert_eq!(empty.start, 4);
+        assert_eq!(empty.end, 4);
+        assert_eq!(empty.new_text, "");
+
+        let ordered = TextEdit::new(4, 5, "");
+        assert_eq!(ordered.start, 4);
+        assert_eq!(ordered.end, 5);
+
+        let inclusive = FixLineSpan::range_inclusive(4, 4);
+        assert_eq!(inclusive.from, 4);
+        assert_eq!(inclusive.to, 4);
+        assert!(inclusive.to_inclusive);
+
+        let exclusive = FixLineSpan::range_exclusive(4, 5);
+        assert_eq!(exclusive.from, 4);
+        assert_eq!(exclusive.to, 5);
+        assert!(!exclusive.to_inclusive);
+    }
 }
