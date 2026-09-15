@@ -897,6 +897,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - `-o` is rejected for a directory input.
 - Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
 - When the directory contains no `.mds` files at all, exits 1 with `no .mds files found in <dir>; nothing was built` on stderr — emitted even under `--quiet`, like the all-excluded diagnostic — so an empty tree cannot pass a CI gate silently. (Changed in v0.4.3; previously exited 0.) `mds watch <dir>` is unaffected: it starts on an empty tree and compiles files created later.
+- When the directory contains `.mds` files but every one of them is a `_`-prefixed partial, exits 1 with `<n> .mds file(s) found in <dir> but all are _-prefixed partials; nothing was built` on stderr — emitted even under `--quiet`, the same bypass as the two diagnostics above. (Changed in v0.4.3; previously `0 built, 0 failed`, exit 0.) `mds fmt <dir>` and `mds lint <dir>` are unaffected: they format and lint partials, so a partials-only tree is real work for them. `mds watch <dir>` is unaffected: it still starts.
 - **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
 - stdin (`mds build -`) with `--out-dir`: the fallback output name is `output.md` (markdown) or `output.json` (messages).
 
@@ -938,7 +939,7 @@ echo "@if flag:" | mds check -             # Validate from stdin
 mds check src/                             # Validate every non-partial .mds in the tree
 ```
 
-Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error, and the two nothing-to-process exits — empty tree and all-excluded — which exit 1 with `…; nothing was checked`) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
+Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error, and the three nothing-to-process exits — empty tree, all-excluded, and partials-only — which exit 1 with `…; nothing was checked`) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
 
 ### 7.4 `mds fmt`
 
@@ -1318,7 +1319,7 @@ Maximum config file size: 1 MB.
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, or all under default-excluded directories) |
+| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials) |
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8) |
 | `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, or frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels) |
 
