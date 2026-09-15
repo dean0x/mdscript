@@ -110,7 +110,7 @@ describe('T-D1-11: ceiling control', () => {
       writeAndAdd(dir, git, 'src/note.rs', `// ${token}: plan-local, not yet minted\n`);
       const r = runScanner([], { cwd: dir });
       assert.equal(r.status, 1, `expected exit 1; stdout: ${r.stdout}\nstderr: ${r.stderr}`);
-      assert.ok(r.stdout.includes('not minted'), `expected "not minted" in output; got: ${r.stdout}`);
+      assert.ok(r.stderr.includes('not minted'), `expected "not minted" in output; got: ${r.stderr}`);
     } finally { cleanup(dir); }
   });
 });
@@ -127,7 +127,7 @@ describe('T-D1-12: denylist control', () => {
       writeAndAdd(dir, git, 'src/note.rs', `// applies ${token}\n`);
       const r = runScanner([], { cwd: dir });
       assert.equal(r.status, 1, `expected exit 1; stdout: ${r.stdout}\nstderr: ${r.stderr}`);
-      assert.ok(r.stdout.includes('source-local meaning'), `expected "source-local meaning" in output; got: ${r.stdout}`);
+      assert.ok(r.stderr.includes('source-local meaning'), `expected "source-local meaning" in output; got: ${r.stderr}`);
     } finally { cleanup(dir); }
   });
 });
@@ -185,16 +185,14 @@ describe('T-D1-15: empty repo', () => {
 // T-D1-16: self-clean — the guard cannot flag its own source or this spec
 // ---------------------------------------------------------------------------
 describe('T-D1-16: self-clean', () => {
-  test('the guard script source has zero citation-token regex matches', () => {
-    const text = readFileSync(SCANNER, 'utf8');
-    assert.equal(countCitationTokens(text), 0, 'script must be self-clean (no literal citation tokens)');
-    assert.equal(scanText(SCANNER, text).length, 0, 'script must produce zero findings against itself');
-  });
+  test('the guard script and this spec have zero citation-token regex matches against themselves', () => {
+    const scriptText = readFileSync(SCANNER, 'utf8');
+    assert.equal(countCitationTokens(scriptText), 0, 'script must be self-clean (no literal citation tokens)');
+    assert.equal(scanText(SCANNER, scriptText).length, 0, 'script must produce zero findings against itself');
 
-  test('this spec source has zero citation-token regex matches', () => {
-    const text = readFileSync(SPEC_SELF, 'utf8');
-    assert.equal(countCitationTokens(text), 0, 'spec must be self-clean (no literal citation tokens)');
-    assert.equal(scanText(SPEC_SELF, text).length, 0, 'spec must produce zero findings against itself');
+    const specText = readFileSync(SPEC_SELF, 'utf8');
+    assert.equal(countCitationTokens(specText), 0, 'spec must be self-clean (no literal citation tokens)');
+    assert.equal(scanText(SPEC_SELF, specText).length, 0, 'spec must produce zero findings against itself');
   });
 });
 
@@ -202,19 +200,15 @@ describe('T-D1-16: self-clean', () => {
 // T-D1-17: golden — the frozen ceiling and denylist cannot silently drift
 // ---------------------------------------------------------------------------
 describe('T-D1-17: golden', () => {
-  test('CEILING matches the frozen snapshot', () => {
+  test('CEILING and DENYLIST match the frozen snapshot, and classify()/scanText() agree with it', () => {
     assert.deepEqual(CEILING, { ADR: 17, PF: 53 });
-  });
 
-  test('DENYLIST matches the frozen set of retired ADR numbers, every entry reasoned', () => {
     assert.deepEqual(DENYLIST.map(d => d.num), [14, 16, 19, 21, 22, 23]);
     for (const entry of DENYLIST) {
       assert.equal(entry.prefix, 'ADR', `entry for ${entry.num} must have prefix "ADR"`);
       assert.ok(entry.reason.length > 0, `entry for ${entry.num} must have a non-empty reason`);
     }
-  });
 
-  test('classify() direct unit checks agree with the golden data', () => {
     const minted = classify('PF', 4);
     assert.equal(minted.ok, true, 'this PF id is minted, under ceiling, and not denylisted');
 
@@ -225,9 +219,7 @@ describe('T-D1-17: golden', () => {
     const unminted = classify('ADR', 99);
     assert.equal(unminted.ok, false);
     assert.ok(unminted.reason.includes('not minted'));
-  });
 
-  test('scanText() direct unit check: no tokens means no findings', () => {
     assert.deepEqual(scanText('x.rs', 'no citation tokens in this text at all'), []);
   });
 });
