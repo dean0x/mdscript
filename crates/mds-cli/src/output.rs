@@ -553,27 +553,61 @@ pub(crate) fn probe_and_remove_stale(base_no_ext: &Path, kind: OutputKind) {
     }
 }
 
+/// Where a `Dir(_)`-mode source landed.
+///
+/// `Flattened` is the `strip_prefix` failure arm: contained by construction (the join
+/// argument is always a relative `OsStr`) but it abandons the subtree mirror, so two
+/// out-of-root sources with the same file name map to the same path. Unreachable from
+/// every live caller — see [`output_path_for`] — and the variant exists so the write
+/// oracle can *say* so instead of silently degrading (#217).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MirroredStem {
+    /// `source` was below `root`: its relative subtree is preserved under the out-dir.
+    Mirrored(PathBuf),
+    /// `source` was not below `root`: only its stem survives, joined to the out-dir.
+    Flattened(PathBuf),
+}
+
+impl MirroredStem {
+    /// The extension-less output path, whichever arm produced it.
+    pub(crate) fn into_path(self) -> PathBuf {
+        match self {
+            Self::Mirrored(p) | Self::Flattened(p) => p,
+        }
+    }
+}
+
+/// Compute the `Dir(_)`-mode extension-less output stem for `source`, classified by
+/// whether the subtree mirror survived.
+///
+/// Single source of truth for both [`output_base_no_ext`] (the silent probe oracle) and
+/// [`output_path_for`] (the write oracle that reports the flatten).
+fn mirror_stem(source: &Path, root: &Path, d: &Path) -> MirroredStem {
+    match source.strip_prefix(root) {
+        Ok(rel) => {
+            let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
+            MirroredStem::Mirrored(d.join(rel.parent().unwrap_or(Path::new(""))).join(stem))
+        }
+        Err(_) => {
+            // RED scaffold (#217): reproduces the current fail-open fallback verbatim so
+            // the classification interface can be pinned before the behaviour changes.
+            // `source.as_os_str()` is absolute for an absolute `source`, and
+            // `d.join(<absolute>)` re-roots — replaced in the follow-up commit.
+            let stem = source.file_stem().unwrap_or(source.as_os_str());
+            MirroredStem::Flattened(d.join(stem))
+        }
+    }
+}
+
 /// Return the path stem (path without extension) for a compiled source.
 ///
 /// Used to construct the `base_no_ext` argument to [`probe_and_remove_stale`].
 ///
-/// For `Dir(base)` mode this mirrors the same strip_prefix logic as [`output_path_for`]
-/// so the stem is always computed consistently.
+/// For `Dir(base)` mode this defers to [`mirror_stem`] so the stem is always computed
+/// consistently with [`output_path_for`].
 pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) -> PathBuf {
     match base {
-        OutputBase::Dir(d) => {
-            let rel = match source.strip_prefix(root) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => {
-                    // Path-escape guard: use filename only (mirrors output_path_for).
-                    let stem = source.file_stem().unwrap_or(source.as_os_str());
-                    return d.join(stem);
-                }
-            };
-            // Build the path with no extension.
-            let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
-            d.join(rel.parent().unwrap_or(Path::new(""))).join(stem)
-        }
+        OutputBase::Dir(d) => mirror_stem(source, root, d).into_path(),
         OutputBase::NextToSource => {
             // source.with_extension("") removes the existing extension.
             source.with_extension("")
@@ -1442,6 +1476,123 @@ mod tests {
             "output must be inside /out; got {result:?}"
         );
         assert_eq!(result, PathBuf::from("/out/page.md"));
+    }
+
+    /// Body of the first `fn` whose header starts with `header`, brace-matched from the
+    /// first `{` after it. Used by the lexical guard below; `None` when the header is
+    /// absent, which the caller turns into a non-vacuity failure.
+    fn fn_body(src: &str, header: &str) -> Option<String> {
+        let start = src.find(header)?;
+        let open = start + src[start..].find('{')?;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(src[open..open + i + 1].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// #217: the `Dir(_)` oracles must be able to say WHICH arm produced a stem — the
+    /// subtree mirror, or the out-of-root flatten that drops the subtree and lets two
+    /// sources with the same file name collide.
+    ///
+    /// Both arms are asserted: an assertion that only ever observes `Flattened` would be
+    /// satisfied by a classifier that returns it unconditionally.
+    #[test]
+    fn mirror_stem_classifies_out_of_root_as_flattened() {
+        assert_eq!(
+            mirror_stem(
+                Path::new("/other/page.mds"),
+                Path::new("/root"),
+                Path::new("/out"),
+            ),
+            MirroredStem::Flattened(PathBuf::from("/out/page")),
+            "a source outside the root loses its subtree and must say so"
+        );
+        assert_eq!(
+            mirror_stem(
+                Path::new("/root/a/page.mds"),
+                Path::new("/root"),
+                Path::new("/out"),
+            ),
+            MirroredStem::Mirrored(PathBuf::from("/out/a/page")),
+            "a source below the root keeps its subtree and must NOT be reported"
+        );
+    }
+
+    /// #217: a stem-less source must never hand `d.join` an absolute argument.
+    ///
+    /// `Path::new("/").file_stem()` is `None`, and the fallback used to be
+    /// `source.as_os_str()` — `"/"`. `Path::new("/out").join("/")` re-roots to `"/"`,
+    /// and the write oracle then built `"/.md"`. Neither is inside the out-dir, and
+    /// neither is a path any source would legitimately compile to.
+    ///
+    /// `output_path_for_outside_root_falls_back_to_flat` above is the control: a source
+    /// that HAS a stem still flattens to `<out-dir>/<stem>.<ext>`.
+    #[test]
+    fn stemless_source_never_escapes_out_dir() {
+        let source = Path::new("/");
+        let root = Path::new("/root");
+        let base = OutputBase::Dir(PathBuf::from("/out"));
+
+        assert_eq!(
+            output_base_no_ext(source, root, &base),
+            PathBuf::from("/out/output"),
+            "the probe oracle must keep a stem-less source inside the out-dir"
+        );
+        assert_eq!(
+            output_path_for(source, root, &base, "md"),
+            PathBuf::from("/out/output.md"),
+            "the write oracle must not join an absolute stem"
+        );
+    }
+
+    /// #217: the out-of-root flatten is reported from the WRITE oracle only.
+    ///
+    /// `output_base_no_ext` is a probe: watch calls it to guess the output siblings of a
+    /// source it is about to forget, repeatedly per batch and for sources that are never
+    /// written. A warning there would fire on bookkeeping rather than on a write.
+    /// `output_path_for` is called once per output path actually computed for a write,
+    /// so that is where the report belongs.
+    ///
+    /// Lexical, because the property being pinned is exactly "which function contains
+    /// the call". Both headers must be found, or the two negative assertions would pass
+    /// on an empty string.
+    #[test]
+    fn flatten_warning_lives_in_the_write_oracle_only() {
+        const SRC: &str = include_str!("output.rs");
+        const NEEDLE: &str = "is outside the build root";
+
+        let oracle = fn_body(SRC, "fn output_path_for(")
+            .expect("non-vacuity: fn output_path_for must be present in this file");
+        let probe = fn_body(SRC, "fn output_base_no_ext(")
+            .expect("non-vacuity: fn output_base_no_ext must be present in this file");
+
+        assert!(
+            oracle.contains("eprint_warning("),
+            "the write oracle must report the flattened arm; body: {oracle}"
+        );
+        assert!(
+            oracle.contains(NEEDLE),
+            "the write oracle's report must name the out-of-root condition; body: {oracle}"
+        );
+        assert!(
+            !probe.contains("eprint_warning("),
+            "the probe oracle must stay silent — it runs on bookkeeping, not on writes; \
+             body: {probe}"
+        );
+        assert!(
+            !probe.contains(NEEDLE),
+            "the probe oracle must not carry the report text either; body: {probe}"
+        );
     }
 
     /// The `.<name>.tmp-<pid>-<n>` temp files an atomic write leaves in flight must

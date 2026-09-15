@@ -3987,6 +3987,78 @@ mod tests {
         );
     }
 
+    /// #217: pruning a ghost EXTERNAL dep must not forget an in-root source's output.
+    ///
+    /// A dependency outside the watched root never had an output of its own, so there is
+    /// no sibling to forget. Probing for one through `output_base_no_ext` takes the
+    /// out-of-root flatten arm and yields `<out-dir>/<file name>`, which is exactly the
+    /// path an IN-ROOT source with the same file name owns. The prune then dropped that
+    /// source's `last_written` entry and its next rebuild rewrote identical bytes.
+    ///
+    /// Reachable: an importer whose cross-root `@import` target is deleted leaves the
+    /// vanished dep in `errored`, and every later real-change batch re-seeds `errored`.
+    #[test]
+    fn ghost_external_dep_prune_keeps_in_root_last_written() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let shared_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let out = out_dir.path().to_path_buf();
+
+        // The in-root source that carries the batch's real change.
+        let other = root.join("other.mds");
+        std::fs::write(&other, "Hello.\n").unwrap();
+
+        // The in-root source whose bookkeeping is at risk. It is not in this batch, so
+        // nothing recompiles it — only its `last_written` entry can change.
+        let victim = root.join("x.mds");
+        std::fs::write(&victim, "Victim.\n").unwrap();
+        let victim_out = out.join("x.md");
+
+        // A cross-root dependency with the same file name that no longer exists.
+        let ghost = shared_dir.path().join("x.mds");
+        assert!(!ghost.exists(), "the ghost dep must not exist on disk");
+
+        let mut state = DirWatchState {
+            forward_deps: HashMap::new(),
+            errored: HashSet::new(),
+            known_files: BTreeSet::new(),
+            last_written: HashMap::new(),
+            external_dep_dirs: BTreeSet::new(),
+            last_mtimes: HashMap::new(),
+        };
+        state.known_files.insert(victim.clone());
+        state
+            .last_written
+            .insert(victim_out.clone(), "Victim.\n".to_string());
+        state.errored.insert(ghost.clone());
+        state
+            .external_dep_dirs
+            .insert(shared_dir.path().to_path_buf());
+
+        let changed: BTreeSet<PathBuf> = std::iter::once(other).collect();
+        process_dir_batch_incremental(
+            &changed,
+            &root,
+            &OutputBase::Dir(out.clone()),
+            &None,
+            true,
+            &mut state,
+        );
+
+        assert!(
+            !state.errored.contains(&ghost),
+            "control: the ghost prune must actually have run — without it the assertion \
+             below would pass on a batch that never reached the branch"
+        );
+        assert!(
+            state.last_written.contains_key(&victim_out),
+            "#217: forgetting a ghost external dep must not drop an in-root source's \
+             last_written entry; keys: {:?}",
+            state.last_written.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// A source that has never compiled successfully gets an empty dep set, not a panic.
     #[test]
     fn record_error_on_unknown_source_inserts_empty_deps() {
