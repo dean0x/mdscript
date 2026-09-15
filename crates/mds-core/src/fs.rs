@@ -127,6 +127,12 @@ pub trait FileSystem: Send + Sync {
     /// root found by walking up from the entry-point directory).  Returns
     /// `None` if the root has not been established yet (before any
     /// `normalize` or `set_root` call).
+    ///
+    /// # Contract
+    ///
+    /// Implementations must return `None` rather than a lossy string for a root
+    /// that is not valid UTF-8 — a lossy anchor is not byte-faithful and must not
+    /// participate in containment (#217).
     fn source_root(&self) -> Option<String> {
         None
     }
@@ -556,7 +562,14 @@ impl FileSystem for NativeFs {
     }
 
     fn source_root(&self) -> Option<String> {
-        self.root_dir.get().map(|p| p.display().to_string())
+        // `to_str`, not `display()`: a root that is not valid UTF-8 has no
+        // byte-faithful string form, and `None` is the documented "no containment
+        // concept" value every consumer already guards (#217).  Containment itself
+        // is unaffected — `check_path_traversal` compares `Path`s from `root_dir`
+        // directly and never goes through this string.
+        self.root_dir
+            .get()
+            .and_then(|p| p.to_str().map(str::to_owned))
     }
 }
 

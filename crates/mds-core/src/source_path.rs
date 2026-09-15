@@ -11,6 +11,11 @@
 //! information can survive into `sources[]`.  The invariant holds in release
 //! builds (never `debug_assert!`).
 //!
+//! An anchor that cannot be used is never treated as one: an empty or non-UTF-8
+//! root degrades to the basename and an empty or non-UTF-8 base anchors on the
+//! root, because an empty component list is a prefix of every path and would
+//! otherwise authorise emitting the whole host path (#217).
+//!
 //! # Single choke-point (PF-004)
 //!
 //! **All** `sources[]` relativization MUST flow through this function.  There
@@ -66,6 +71,9 @@ use std::path::Path;
 ///    `./../../` and interior-`..` bypasses.
 /// 6. If `root = None`: absolute / drive-qualified / lexical-escape checks all
 ///    degrade to basename; otherwise return the unified path.
+///    6b. Anchor validity: an empty or non-UTF-8 root is not an anchor →
+///    basename; an empty or non-UTF-8 base → anchor on the root.  Root `/`
+///    unifies to `"/"`, which is not empty, so it stays a real root.
 /// 7. If not absolute: resolve against `base` (or `root`) before containment.
 /// 8. Containment: component-wise descendant of `root`?  If not → basename.
 /// 9. Emit relative to `b` (where `b = base` if `base` is inside `root`, else
@@ -135,18 +143,25 @@ pub fn relativize_source(source: &str, base: Option<&Path>, root: Option<&Path>)
         };
     };
 
+    // Step 6b: anchor validity.  A root that is empty or not valid UTF-8 is not an
+    // anchor — `starts_with_comps(x, [])` is vacuously true, so treating it as one
+    // would pass containment for every source and emit the host path minus its
+    // leading `/`.  Degrade to the basename instead.  (Root `/` unifies to `"/"`,
+    // which is not empty — it stays a real root; see `path_to_unified`.)
+    let Some(root_unified) = path_to_unified(root) else {
+        return basename_fallback(&norm_comps);
+    };
     // Normalize root components (absolute component list).
-    let root_unified = path_to_unified(root);
     let root_comps = normalize_abs(&root_unified);
+    // A base that is empty or not valid UTF-8 is likewise not an anchor; both
+    // uses below fall back to the root, which IS one.
+    let base_comps: Option<Vec<String>> = base.and_then(path_to_unified).map(|b| normalize_abs(&b));
 
     // Step 7: if not absolute, resolve against base (or root) before containment.
     let abs_comps: Vec<String> = if is_abs {
         norm_comps.clone()
     } else {
-        let anchor = match base {
-            Some(b) => normalize_abs(&path_to_unified(b)),
-            None => root_comps.clone(),
-        };
+        let anchor = base_comps.clone().unwrap_or_else(|| root_comps.clone());
         match apply_relative(anchor, &norm_comps) {
             Some(comps) => comps,
             // Path escapes above anchor root → basename fallback.
@@ -167,16 +182,9 @@ pub fn relativize_source(source: &str, base: Option<&Path>, root: Option<&Path>)
     // root-relative rather than degrading to a basename.  It also makes CLI
     // and binding surfaces run the **same algorithm** — bindings are permanently
     // in the base-absent case and always receive root-relative paths.
-    let b_comps = match base {
-        Some(b) => {
-            let bc = normalize_abs(&path_to_unified(b));
-            if starts_with_comps(&bc, &root_comps) {
-                bc
-            } else {
-                root_comps.clone()
-            }
-        }
-        None => root_comps.clone(),
+    let b_comps = match base_comps {
+        Some(bc) if starts_with_comps(&bc, &root_comps) => bc,
+        _ => root_comps.clone(),
     };
 
     let result = component_diff(&b_comps, &abs_comps);
@@ -220,8 +228,20 @@ fn is_drive_qualified(s: &str) -> bool {
 }
 
 /// Convert a `Path` to a `/`-unified string.
-fn path_to_unified(p: &Path) -> String {
-    let s = p.to_str().unwrap_or("").replace('\\', "/");
+///
+/// Returns `None` when `p` is not valid UTF-8 or unifies to the empty string.
+///
+/// Security invariant: a `None` anchor is never treated as a root or base. An
+/// empty component list is a prefix of every path (`starts_with_comps(x, [])` is
+/// vacuously true), so an empty root would pass containment for every source and
+/// `component_diff` would emit the full host path minus its leading `/`. Callers
+/// route `None` root → basename fallback, `None` base → root anchor.
+///
+/// A root of `/` unifies to `"/"`, which is NOT empty — it is a real root (a
+/// container with no WORKDIR resolves there) and keeps root-relative emission
+/// even though `normalize_abs("/")` is also the empty component list.
+fn path_to_unified(p: &Path) -> Option<String> {
+    let s = p.to_str()?.replace('\\', "/");
     // Strip Windows verbatim-prefix variants (same normalization that
     // `relativize_source` applies to source strings in step 3), so that the
     // root component list is comparable to the stripped source component list.
@@ -233,7 +253,7 @@ fn path_to_unified(p: &Path) -> String {
         .strip_prefix("//?/UNC/")
         .or_else(|| s.strip_prefix("//?/"))
         .unwrap_or(&s);
-    stripped.to_string()
+    (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
 /// Normalize an **absolute** path string into a component list.
