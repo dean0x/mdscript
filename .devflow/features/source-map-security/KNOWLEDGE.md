@@ -8,7 +8,7 @@ directories:
   - crates/mds-cli/src
   - packages/mds/src
 created: 2026-07-19
-updated: 2026-08-31
+updated: 2026-09-15
 ---
 
 # Source Map Security and Path Containment
@@ -166,7 +166,7 @@ The `Origin.display` field is populated eagerly at module-load time so no absolu
 - `sources: Vec<String>` — canonical keys; emitted verbatim into SMv3 `sources[]` (byte-identical to ADR-005 contract)
 - `display_names: Vec<String>` — root-relative display paths; used only for diagnostics, never emitted into `sources[]`
 
-Both `MapBuilder::new(source_name, display_name, source_content)` and `MapBuilder::source_index(file, display, content)` are 3-argument; callers must supply both the canonical key and the display path. A `debug_assert_eq!` enforces strict length parity between the two vecs after every insertion.
+Both `MapBuilder::new(source_name, display_name, source_content)` and `MapBuilder::source_index(file, display, content)` are 3-argument; callers must supply both the canonical key and the display path. A `debug_assert_eq!` enforces strict length parity between the two vecs after every insertion; the evaluator's cursor invariant is an unconditional `assert_eq!` since #220.
 
 The `sources[]` bytes emitted into produced source maps are **byte-identical** to what they were before R3 — only the diagnostic display path changes. ADR-005 is preserved.
 
@@ -208,7 +208,9 @@ The Windows verbatim lesson is the same on both sides: native backend emits `\\?
 
 **Windows verbatim UNC root** (`path_to_unified` fix): `std::fs::canonicalize` on Windows returns verbatim UNC paths (`\\?\C:\proj`). After `replace('\\', "/")` this becomes `//?/C:/proj`, and `normalize_abs` yields components `["?", "C:", "proj", ...]`. But the source path after the same treatment yields `["C:", "proj", ...]`. The prefix `"?"` causes the first-component comparison to fail → containment always fails → EVERY source map entry degrades to its basename. `path_to_unified` now strips `//?/UNC/` then `//?/` before normalizing, so root components match source components. This bug is invisible on Unix CI.
 
-**`source_root()` returns `None` before any `normalize()` call**: `NativeFs::source_root()` returns `None` until at least one `normalize()` or explicit `set_root()` call establishes the project root. The defense-in-depth guard in `resolver.rs` catches this, but external callers that skip `normalize()` and jump straight to `compile_with_deps_opts` will land on the `root = None` branch.
+**Empty/non-UTF-8 anchor hazard**: `path_to_unified` is `Option`; `None` root → basename, `None` base → root anchor; `starts_with_comps(x, [])` is vacuously true; root `/` is deliberately still a real root. The `Option` return exists so an unusable anchor can never reach `starts_with_comps` as an empty component list that every path matches — the degradation is chosen at the choke-point (step 6b), not inferred later.
+
+**`source_root()` returns `None` before any `normalize()` call**: `NativeFs::source_root()` returns `None` until at least one `normalize()` or explicit `set_root()` call establishes the project root. The defense-in-depth guard in `resolver.rs` catches this, but external callers that skip `normalize()` and jump straight to `compile_with_deps_opts` will land on the `root = None` branch — and returns `None` for a non-UTF-8 root (lossy strings are not anchors).
 
 **Directory-mode `opts` must be per-file**: In directory mode (`run_build_directory`), each file has a different output directory, so `source_map_base` differs per file. Constructing `opts` as loop-invariant (outside the per-file loop) would give every file the same anchor, producing incorrect relative paths for all but one file.
 

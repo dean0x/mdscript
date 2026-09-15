@@ -3190,6 +3190,12 @@ fn parent_dir_drives_nested_file_import_resolution() {
 // These tests verify `line_len_at` degrades to 0 rather than panicking on
 // non-boundary or out-of-bounds offsets, matching the guard in
 // `build_type_mismatch` (evaluator.rs) per ADR-005.
+//
+// Since #220 `line_len_at` is also the helper behind `attach_import_span`
+// (resolver.rs) and `check_child_only_blocks` (resolver/inheritance.rs). Both
+// used to slice `source` directly below a `debug_assert!`, so a non-boundary
+// offset panicked in release; they now route the underline length through this
+// helper and degrade to a zero-length span.
 
 #[test]
 fn line_len_at_out_of_bounds_returns_zero() {

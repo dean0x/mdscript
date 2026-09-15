@@ -893,7 +893,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - `_`-prefixed files are partials and are skipped (not compiled to output).
 - Symlinked files and symlinked directories inside the tree are skipped; a symlinked entry root is rejected at startup.
 - Output extension per file is intrinsic (`.md` or `.json`).
-- With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source.
+- With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source. A source that is not under the build root (not reachable for a walked tree; defence in depth) is written flat as `<out>/<stem>.<ext>` with a warning naming both paths; the warning is not suppressed by `--quiet`.
 - `-o` is rejected for a directory input.
 - Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
 - When the directory contains no `.mds` files at all, exits 1 with `no .mds files found in <dir>; nothing was built` on stderr — emitted even under `--quiet`, like the all-excluded diagnostic — so an empty tree cannot pass a CI gate silently. (Changed in v0.4.3; previously exited 0.) `mds watch <dir>` is unaffected: it starts on an empty tree and compiles files created later.
@@ -998,6 +998,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 
 - Lints every `.mds` file recursively (including `_`-prefixed partials).
 - Accumulate-and-continue: per-file errors do not abort the run.
+- Before any file is linted, every entry is named relative to the lint root; a path that is not valid UTF-8 or that escapes the lint root is an I/O error (`mds::io`, exit 2) for the whole run — no lossy or absolute `file` key is ever emitted.
 - After processing all files, emits one summary line to stderr:
   `N clean, N with warnings, N with errors, N resource-limited`
   Each file falls in exactly one bucket, so the four counts always sum to the number of
@@ -1318,7 +1319,7 @@ Maximum config file size: 1 MB.
 |------|---------|
 | `0` | Success |
 | `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, or all under default-excluded directories) |
-| `2` | I/O or file-system error (file not found, not an MDS file, I/O failure) |
+| `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8) |
 | `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, or frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels) |
 
 **`mds lint`** (see §7.5 for per-code meaning):
@@ -1327,7 +1328,7 @@ Maximum config file size: 1 MB.
 |------|---------|
 | `0` | Clean — no warning- or error-severity findings |
 | `1` | Warning-severity findings only (no errors) |
-| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint) |
+| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8) |
 | `3` | Resource limit exceeded |
 
 ---

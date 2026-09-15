@@ -46,6 +46,11 @@ input. The compiler enforces several defense-in-depth controls:
   boundary rather than being passed to the OS.
 - **Non-UTF-8 paths** are rejected at the public API boundary with an explicit
   error instead of producing corrupted output.
+- **Source-map anchors are byte-faithful**: the project root and `source_map_base`
+  used to decide whether a `sources[]` entry is inside the project are never
+  derived from a lossy string. A root that is empty or not valid UTF-8 is treated
+  as "no root" — entries degrade to basenames — so it can never make the
+  containment check vacuous.
 - **Replace-by-rename writes**: `mds fmt`, `mds lint --fix`, and `mds build`/`mds
   watch` outputs and `.map` sidecars are written to a same-directory temp file and
   renamed over the target after a final symlink re-check (`mds-cli/src/output.rs`,
