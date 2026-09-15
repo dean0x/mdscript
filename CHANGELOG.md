@@ -38,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the call. `mds watch <dir>` is unchanged: it starts on an empty tree and compiles files
   created later. The bare auto-detect form (`mds build` with no argument in a directory
   holding no `.mds` file) already exited non-zero; this aligns the explicit directory form.
+- **BREAKING (CLI): `mds build <dir>` and `mds check <dir>` now exit 1 when every
+  `.mds` file in the tree is a `_`-prefixed partial (#387).** The walker collects
+  partials (they are inputs for `watch`, `fmt` and `lint`) but `build`/`check` never
+  compile them, so a partials-only tree used to end `0 built, 0 failed` with exit 0 —
+  the same silent green pass #204 closed for the empty tree. It now prints `<n> .mds
+  file(s) found in <dir> but all are _-prefixed partials; nothing was built`
+  (`…checked`) on stderr, even under `--quiet`, and exits 1. `mds fmt <dir>` and
+  `mds lint <dir>` are unchanged: they format and lint partials, so a partials-only
+  library is real work for them. `mds watch <dir>` is unchanged and still starts. A
+  partials library that is only ever imported from elsewhere should not be passed to
+  `build`/`check` on its own.
 - **`mds watch --debounce` is now a quiet period with a hard cap (#379).**
   Each content event restarts the window instead of the window expiring at a fixed
   offset from the first event, so a save burst longer than the window coalesces into
