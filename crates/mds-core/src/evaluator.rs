@@ -233,10 +233,19 @@ fn evaluate_nodes(
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 {
                         let abs_out = saved_cursor + output.len() as u32;
-                        debug_assert_eq!(
+                        // Enforced in release builds too (#220): `cursor` is the absolute
+                        // output position every following segment is computed from, so a
+                        // desynchronised cursor mis-attributes the whole rest of the map
+                        // in silence — a source map that points at the wrong bytes is
+                        // worse than no source map. Only a defect in the arms that
+                        // re-anchor the cursor can trip it; no template input can.
+                        // Cost: one u32 compare per node, only while a source map is
+                        // being recorded.
+                        assert_eq!(
                             map.cursor, abs_out,
-                            "cursor invariant violated at Text offset={}",
-                            t.offset
+                            "source-map cursor desynchronised from the output length at \
+                             a Text node: every following segment would map to the wrong \
+                             output offset"
                         );
                         map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
                     }
@@ -250,9 +259,12 @@ fn evaluate_nodes(
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 {
                         let abs_out = saved_cursor + output.len() as u32;
-                        debug_assert_eq!(
+                        // Enforced in release too (#220); see the Text arm above.
+                        assert_eq!(
                             map.cursor, abs_out,
-                            "cursor invariant violated at EscapedBrace offset={offset}"
+                            "source-map cursor desynchronised from the output length at \
+                             an EscapedBrace node: every following segment would map to \
+                             the wrong output offset"
                         );
                         // Source span: `\{{` is 3 source bytes (backslash + two braces).
                         map.push_segment(abs_out, *offset as u32, 3);
@@ -273,10 +285,12 @@ fn evaluate_nodes(
                         // invoke_function will read this anchor as the body's base
                         // output position.
                         let abs_out = saved_cursor + output.len() as u32;
-                        debug_assert_eq!(
+                        // Enforced in release too (#220); see the Text arm above.
+                        assert_eq!(
                             map.cursor, abs_out,
-                            "cursor invariant violated at Interpolation offset={}",
-                            interp.offset
+                            "source-map cursor desynchronised from the output length at \
+                             an Interpolation node: every following segment would map to \
+                             the wrong output offset"
                         );
                     }
                     // Always anchor cursor so inner evaluate_nodes invocations

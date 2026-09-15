@@ -2509,15 +2509,12 @@ fn attach_import_span(
 ) -> MdsError {
     // Compute the span length as the number of bytes from `offset` to the
     // end of the `@import` line (not including the newline character itself),
-    // so the whole directive is underlined.
-    debug_assert!(
-        source.is_char_boundary(offset),
-        "attach_import_span: offset {offset} is not a UTF-8 char boundary in source (len={})",
-        source.len()
-    );
-    let line_len = source[offset..]
-        .find('\n')
-        .unwrap_or(source[offset..].len());
+    // so the whole directive is underlined. A non-boundary or out-of-range
+    // offset can only come from a defect in offset attribution, never from a
+    // template; `line_len_at` degrades it to a zero-length span instead of
+    // slicing (#220) — `MdsError::at` then keeps the numeric offset and drops
+    // the snippet rather than mis-attributing.
+    let line_len = line_len_at(source, offset);
     match err {
         MdsError::FileNotFound { span: None, .. } => {
             MdsError::file_not_found_at(path, file_str, source, offset, line_len)

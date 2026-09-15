@@ -677,8 +677,8 @@ pub(crate) struct RawSegment {
 /// `cursor` must always equal the absolute byte count of compiled output
 /// emitted so far (across all `evaluate_nodes` invocations for this
 /// compilation). `evaluate_nodes` updates `cursor` after every output-
-/// producing node arm. A `debug_assert!` checks the invariant at each
-/// leaf-node record point (when `suppress == 0`).
+/// producing node arm. An unconditional `assert_eq!` checks the invariant at
+/// each leaf-node record point (when `suppress == 0`) (#220).
 ///
 /// # Suppression
 ///

@@ -249,6 +249,11 @@ impl TextEdit {
     /// This is the supported construction path for external crates — struct literals
     /// are not available because this type is `#[non_exhaustive]`.
     ///
+    /// # Panics
+    ///
+    /// Panics when `start > end`, in every build profile, not only debug builds
+    /// (promoted from a debug-only assertion in 0.4.3, #220).
+    ///
     /// # Examples
     ///
     /// ```
@@ -260,7 +265,14 @@ impl TextEdit {
     /// ```
     #[must_use]
     pub fn new(start: usize, end: usize, new_text: impl Into<String>) -> Self {
-        debug_assert!(start <= end, "TextEdit::new: start ({start}) > end ({end})");
+        // Enforced in release builds too (#220): a reversed byte range is not a
+        // representable edit, and every applier in the fix pipeline skips one rather
+        // than failing, so the lint would report a fix it never made.
+        assert!(
+            start <= end,
+            "TextEdit::new: start is greater than end; a reversed byte range is not an \
+             edit and the fix applier would skip it in silence"
+        );
         TextEdit {
             start,
             end,
@@ -323,14 +335,18 @@ impl FixLineSpan {
     /// Both `from` and `to` are byte offsets within their respective lines.
     /// The planner translates them to exact line boundaries.
     ///
-    /// # Panics (debug)
+    /// # Panics
     ///
-    /// Panics in debug builds when `from > to`.
+    /// Panics when `from > to`, in every build profile, not only debug builds
+    /// (promoted from a debug-only assertion in 0.4.3, #220).
     #[must_use]
     pub fn range_inclusive(from: usize, to: usize) -> Self {
-        debug_assert!(
+        // Enforced in release builds too (#220): a reversed line range cannot be turned
+        // into a removal, and the planner drops one rather than failing.
+        assert!(
             from <= to,
-            "FixLineSpan::range_inclusive: from ({from}) > to ({to})"
+            "FixLineSpan::range_inclusive: from is greater than to; a reversed line range \
+             cannot be turned into a removal and the planner would skip it in silence"
         );
         FixLineSpan {
             from,
@@ -344,14 +360,18 @@ impl FixLineSpan {
     /// The line containing `to` is kept; removal stops at the start of that line.
     /// Use this when a closing token (e.g. `@end`) must remain in the source.
     ///
-    /// # Panics (debug)
+    /// # Panics
     ///
-    /// Panics in debug builds when `from > to`.
+    /// Panics when `from > to`, in every build profile, not only debug builds
+    /// (promoted from a debug-only assertion in 0.4.3, #220).
     #[must_use]
     pub fn range_exclusive(from: usize, to: usize) -> Self {
-        debug_assert!(
+        // Enforced in release builds too (#220): a reversed line range cannot be turned
+        // into a removal, and the planner drops one rather than failing.
+        assert!(
             from <= to,
-            "FixLineSpan::range_exclusive: from ({from}) > to ({to})"
+            "FixLineSpan::range_exclusive: from is greater than to; a reversed line range \
+             cannot be turned into a removal and the planner would skip it in silence"
         );
         FixLineSpan {
             from,
@@ -1149,7 +1169,8 @@ fn is_control_char(ch: char) -> bool {
 /// length and therefore needs a different replacement per width. Splitting the
 /// predicate is what keeps that invariant checkable by reading the code rather than
 /// by trusting a comment: a member added to the wrong helper is a byte-width bug the
-/// `debug_assert_eq!` in `neutralize_source_for_render` catches immediately.
+/// `assert_eq!` in `neutralize_source_for_render` catches immediately — in release
+/// builds too (#220).
 ///
 /// See [`is_two_byte_format_hazard`] and [`is_three_byte_format_hazard`] for the
 /// per-width membership and the rationale for each codepoint.
@@ -1239,10 +1260,15 @@ pub fn neutralize_source_for_render(s: &str) -> Cow<'_, str> {
             out.push(c);
         }
     }
-    debug_assert_eq!(
+    // Enforced in release builds too (#220): a width mismatch here does not fail, it
+    // shifts every span offset and caret column that follows the first substitution, so
+    // the rendered diagnostic underlines the wrong bytes. Only a defect in the per-width
+    // helpers can trip it — the hazard class and the substitutions are both in-tree.
+    assert_eq!(
         out.len(),
         s.len(),
-        "neutralize_source_for_render must preserve byte length"
+        "neutralize_source_for_render changed the byte length of the source: every span \
+         offset and caret column after the first substitution would be shifted"
     );
     Cow::Owned(out)
 }
@@ -1501,7 +1527,7 @@ mod tests {
     ///
     /// U+061C is 2 bytes in UTF-8 while the other eleven are 3. Routing it through the
     /// 3-byte branch (→ U+FFFD) would grow the string by one byte per occurrence,
-    /// desynchronising every following span offset. The `debug_assert_eq!` inside
+    /// desynchronising every following span offset. The `assert_eq!` inside
     /// `neutralize_source_for_render` fires on that; this test pins it from outside so
     /// the guarantee is also checked as an observable output property.
     #[test]
