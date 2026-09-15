@@ -40,22 +40,12 @@ const NEEDLES: &[&str] = &["fs::write(", "File::create("];
 /// reported as dead by [`write_sites_are_funnelled`] and by
 /// [`every_allowlist_entry_is_live`], so a removed site cannot leave a stale licence
 /// behind for a future raw write to hide under.
-const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
-    (
-        "main.rs",
-        "fs::write(",
-        1,
-        "mds init scaffolds a fixed public template at a user-typed path, reproducible by \
-         a re-run — NOT because it only ever creates: --force truncates in place and the \
-         write follows a symlink at the target (#227)",
-    ),
-    (
-        "watch.rs",
-        "fs::write(",
-        1,
-        "test-only readiness marker: written to <path>.tmp then renamed — already atomic",
-    ),
-];
+const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[(
+    "watch.rs",
+    "fs::write(",
+    1,
+    "test-only readiness marker: written to <path>.tmp then renamed — already atomic",
+)];
 
 #[test]
 fn write_sites_are_funnelled() {

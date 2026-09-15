@@ -418,15 +418,12 @@ Your items:
 - {{item}}
 @end
 ";
-    // Raw std::fs::write is deliberate (#227). What it is NOT justified by: "init only
-    // ever creates a file". `--force` skips the exists-check above and truncates in
-    // place, and both `exists()` and `write` follow a symlink, so a link at `filename`
-    // — dangling, or live under `--force` — is written through to its target. The raw
-    // write stays because the blast radius is small and entirely user-directed:
-    // `filename` is typed on the command line and `starter` is a fixed public template
-    // that a re-run reproduces. Allow-listed in tests/write_funnel.rs.
-    std::fs::write(&filename, starter)
-        .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
+    // #386: the same replace-by-rename primitive as every other CLI write — a symlink
+    // at `filename` (live under `--force`, dangling without it) is refused instead of
+    // written through; `--force` replaces a regular file by rename with its mode
+    // preserved. `RenameOnly` because the starter is a fixed public template a re-run
+    // reproduces.
+    output::atomic_write_file(&filename, starter, output::Durability::RenameOnly)?;
     if !quiet {
         eprintln!(
             "Created {}\n  Try: mds build {}",
