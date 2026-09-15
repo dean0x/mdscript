@@ -51,9 +51,9 @@ input. The compiler enforces several defense-in-depth controls:
   derived from a lossy string. A root that is empty or not valid UTF-8 is treated
   as "no root" — entries degrade to basenames — so it can never make the
   containment check vacuous.
-- **Replace-by-rename writes**: `mds fmt`, `mds lint --fix`, and `mds build`/`mds
-  watch` outputs and `.map` sidecars are written to a same-directory temp file and
-  renamed over the target after a final symlink re-check (`mds-cli/src/output.rs`,
+- **Replace-by-rename writes**: `mds fmt`, `mds lint --fix`, `mds init`, and `mds
+  build`/`mds watch` outputs and `.map` sidecars are written to a same-directory
+  temp file and renamed over the target after a final symlink re-check (`mds-cli/src/output.rs`,
   `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so a
   crash never leaves a truncated target and a symlinked output path is refused.
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target

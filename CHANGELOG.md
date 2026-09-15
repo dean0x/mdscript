@@ -108,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cannot get metadata` message that #240 emitted on every first write of a
   not-yet-existing file is gone; a stat failure other than "not found" is now a hard
   error rather than a warning (#225). A new test, `write_funnel.rs`, fails CI on any raw
-  `fs::write`/`File::create` in the CLI outside the two justified sites.
+  `fs::write`/`File::create` in the CLI outside the one justified site (the test-only
+  readiness marker in `watch.rs`; `mds init` joined the funnel in #386).
 - **Fix stale `lint_str` rustdoc and lint-rule Tier tables (#329).** `mds-core`'s
   `lint_str` rustdoc said "applies the 9 lint rules" after a 10th rule
   (`legacy-interpolation`) had shipped; the Tier tables in `lint/tier.rs` and
@@ -134,6 +135,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   triggered by template input, only by a defect, and the messages carry no source text.
   On the CLI a tripped invariant is a Rust panic (exit code 101); the napi, WASM and
   Python bindings convert it to `mds::internal` as before.
+- **`mds init` no longer writes through a symlink at the target path (#386).** The
+  starter file is written by the same replace-by-rename primitive as every other CLI
+  write (`atomic_write_file`): a symlink at the target — live under `--force`, or
+  dangling without it — is refused with `cannot write <path>: refusing to replace a
+  symlink` (exit 1) and neither the link nor its target is touched. Previously a
+  dangling link was written through (creating its target) and `--force` truncated a
+  live link's target in place. `--force` on a regular file still replaces it, now
+  atomically with its permission bits preserved; a new file keeps the umask default
+  mode. The `init` entry is gone from the `write_funnel.rs` allow-list, so the CLI's
+  only remaining raw write is the test-only readiness marker in `watch.rs`.
 - **`mds lint <dir>` fails closed on a path it cannot name (#217).** The directory-mode
   `files[].file` key and the sort key are the entry's path relative to the lint root. A
   path that is not valid UTF-8, or that is not under the lint root, previously produced

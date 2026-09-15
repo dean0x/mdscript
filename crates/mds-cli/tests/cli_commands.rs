@@ -131,6 +131,171 @@ fn init_does_not_overwrite_existing_file() {
     assert_eq!(content, "original content");
 }
 
+/// T-D1-1 (#386): `mds init --force` at a live symlink is refused; the link and its
+/// target survive untouched. Positive control in the same test: `mds init` on a plain
+/// (non-symlink) path still succeeds normally.
+#[cfg(unix)]
+#[test]
+fn init_force_symlink_target_refused_plain_path_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.txt");
+    std::fs::write(&real, "REAL").unwrap();
+    let link = dir.path().join("link.mds");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let refused = mds_bin()
+        .args(["init", link.to_str().unwrap(), "--force"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "init --force onto a symlink must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to replace a symlink"),
+        "the refusal must say why; got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "REAL",
+        "the symlink target must not be written through"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink itself must survive the refusal"
+    );
+
+    // Positive control: init on a plain (non-symlink) path still succeeds.
+    let plain = dir.path().join("plain.mds");
+    let ok = mds_bin()
+        .args(["init", plain.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "init on a plain path must still succeed; stderr: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&plain)
+            .unwrap()
+            .contains("Hello {{name}}!"),
+        "init must write the starter template"
+    );
+}
+
+/// T-D1-2 (#386): `mds init` (no `--force`) at a dangling symlink is refused; the
+/// target is never created and the link survives. Positive control in the same test:
+/// `mds init` on a plain (non-symlink) path still succeeds normally.
+#[cfg(unix)]
+#[test]
+fn init_dangling_symlink_refused_without_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.txt");
+    let link = dir.path().join("link.mds");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+    let refused = mds_bin()
+        .args(["init", link.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "init onto a dangling symlink must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to replace a symlink"),
+        "the refusal must say why; got: {stderr}"
+    );
+    assert_eq!(
+        victim.symlink_metadata().unwrap_err().kind(),
+        std::io::ErrorKind::NotFound,
+        "the dangling link's target must not be created"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink itself must survive the refusal"
+    );
+
+    // Positive control: init on a plain (non-symlink) path still succeeds.
+    let plain = dir.path().join("plain.mds");
+    let ok = mds_bin()
+        .args(["init", plain.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "init on a plain path must still succeed; stderr: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&plain)
+            .unwrap()
+            .contains("Hello {{name}}!"),
+        "init must write the starter template"
+    );
+}
+
+/// T-D1-3 (#386, pin): `mds init --force` on a regular file replaces it atomically via
+/// rename, preserving its permission bits, and leaves no `.mds-tmp-` temp file behind.
+/// Already green on `main` before this PR — this test pins the contract stated in the
+/// PR body so a future regression is caught.
+#[cfg(unix)]
+#[test]
+fn init_force_regular_file_replaced_atomically_mode_preserved() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("keep.mds");
+    std::fs::write(&target, "original content").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = mds_bin()
+        .args(["init", target.to_str().unwrap(), "--force"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "init --force on a regular file must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let content = std::fs::read_to_string(&target).unwrap();
+    assert!(
+        content.contains("Hello {{name}}!"),
+        "the overwritten file must contain the starter template; got: {content:?}"
+    );
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "the replaced file must preserve the original permission bits"
+    );
+    let leftover_tmp = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with(".mds-tmp-"));
+    assert!(
+        !leftover_tmp,
+        "no .mds-tmp- temp file should remain in the directory"
+    );
+}
+
 #[test]
 fn set_flag_cli_overrides() {
     // --set name=Test should override the frontmatter variable 'name'

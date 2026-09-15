@@ -211,7 +211,7 @@ Notable divergences worth knowing before touching this file:
 - **Partials are reformatted but `is_partial` still gates output emission elsewhere.** Don't conflate the two meanings of "partial" across `fmt` vs. `build`/`check`.
 - **Hidden FILES are still collected by the walker.** `is_default_excluded_dir` excludes hidden *directories* from recursion, not hidden `.mds` files at the traversed level. A `.dotfile.mds` at the root of a traversed directory is collected and formatted.
 - **`atomic_write_file` is the write primitive — not `std::fs::write`.** `fmt.rs` calls `atomic_write_file` from `output.rs` (shared with `lint.rs`). It provides a TOCTOU guard, Unix permission preservation (`mode & 0o7777`), and `sync_all()` + atomic rename. This means a failed write leaves the original file intact — it does NOT leave a partially-written file. And, since #227, `write_output`/dir-mode build/`.map` sidecars route through it too, with `Durability::RenameOnly` (fmt/lint pass `Fsync`).
-- **`crates/mds-cli/tests/write_funnel.rs` fails CI on any raw `fs::write(` / `File::create(` in `crates/mds-cli/src` outside the two allow-listed sites** (`mds init` in main.rs; the test-only readiness marker in watch.rs).
+- **`crates/mds-cli/tests/write_funnel.rs` fails CI on any raw `fs::write(` / `File::create(` in `crates/mds-cli/src` outside the one allow-listed site** (the test-only readiness marker in watch.rs; `mds init` joined the funnel in #386).
 
 ## Deferred follow-ups (recorded to avoid re-flagging as new debt)
 
