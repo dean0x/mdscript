@@ -132,7 +132,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
   });
 
   test('T-HMR-b (AC-F2): edit transitive @import dep → fresh bundle', async () => {
-    // ADR-014: dep files BEFORE entry
+    // deps-before-entry: dep files BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
       'dep.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
       'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
@@ -236,7 +236,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
   });
 
   test('T-HMR-e (AC-F5): add a second @import dep, edit it → recompile', async () => {
-    // ADR-014: dep files BEFORE entry
+    // deps-before-entry: dep files BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
       'dep1.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
       'entry.mds': '@import { greet } from "./dep1.mds"\n\n{{greet("World")}}',
@@ -317,7 +317,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
 describe('rspack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && 'HMR e2e tests are Linux-gated; set MDS_HMR=1 to run' }, () => {
 
   test('T-E-del (AC-E1): delete @imported dep → rspack errors; recreate → recovers', async () => {
-    // ADR-014: dep BEFORE entry
+    // deps-before-entry: dep BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
       'dep.mds': '@define greet(who):\nHi {{who}}! DEP_MARKER\n@end\n\n@export greet',
       'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',

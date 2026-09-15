@@ -59,7 +59,7 @@ crates/mds-python/dist/
 # Local Cargo config (e.g. sccache workarounds, nextest job overrides) — never commit
 .cargo/
 
-# devflow local state — local-only, not shared via git (reverses ADR-019; see ADR-023)
+# devflow local state — local-only, not shared via git. The v0.3.0 wave (88ddbcc, 2026-06-27) stopped tracking .devflow/ wholesale; the curated re-includes below are the later, narrow exception.
 
 # Devflow runtime data — local by default (memory, learning, docs, locks).
 # Exception: feature knowledge bases under .devflow/features/ are shared via git —

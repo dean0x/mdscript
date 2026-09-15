@@ -61,7 +61,7 @@ const canonCache = new Map<string, string>();
  *
  * Falls back to path.resolve when realpathSync throws (e.g. deleted file, D7).
  * Never throws — a malformed input degrades to "no match" instead of propagating
- * into Vite's HMR dispatch (applies ADR-016: re-validate inputs at runtime).
+ * into Vite's HMR dispatch (inputs are re-validated at runtime rather than trusted from their types).
  */
 function canon(p: string): string {
   try {

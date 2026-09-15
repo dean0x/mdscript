@@ -10,10 +10,10 @@
  * ## Platform gating (decision D5)
  *
  * HMR filesystem-event tests are gated to Linux in CI because:
- *  - macOS FSEvents does not surface read-access events (PF-006) and has
+ *  - macOS FSEvents does not surface read-access events (the read-event self-trigger class that inotify exposes) and has
  *    higher latency, making timing-sensitive HMR tests unreliable.
  *  - Windows uses a different notify backend.
- *  - Linux inotify (after the PF-006 fix in 6b7f2fe) is the reference platform.
+ *  - Linux inotify (after the watcher's self-trigger loop fix) is the reference platform.
  *
  * Set MDS_HMR=1 to force-enable on any platform (local debugging only).
  *
@@ -21,7 +21,7 @@
  *
  * - All polling loops have a fixed upper bound (maxAttempts). No unbounded while(true).
  * - No sleep() calls — all waiting uses polling with bounded retries.
- * - ADR-014: @import dependency files are written BEFORE the entry file
+ * - Deps-before-entry: @import dependency files are written BEFORE the entry file
  *   (mirrors watch.rs deps-before-entry order to ensure watchers see deps first).
  *
  * @module hmr-harness
@@ -50,7 +50,7 @@ export const HMR_ENABLED =
  * Write a temporary project of MDS files under os.tmpdir().
  *
  * Files are written in the order they appear in the `files` array.
- * Per ADR-014, callers MUST list @import dependency files BEFORE the entry
+ * Deps-before-entry: callers MUST list @import dependency files BEFORE the entry
  * file so watchers see dependencies registered before the entry is compiled.
  *
  * @param {Record<string, string>} files - Map of relative filename → content.
