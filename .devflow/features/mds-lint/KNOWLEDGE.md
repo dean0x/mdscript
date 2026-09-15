@@ -11,7 +11,7 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-08-31
+updated: 2026-09-15
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
@@ -348,7 +348,7 @@ Source text passed to `NamedSource` uses a different function: `neutralize_sourc
 - **C1 (U+0080–U+009F) AND U+061C** (both 2-byte UTF-8) → U+00A0 NBSP (2 bytes). U+061C is in the 2-byte branch.
 - **The other 11 format hazards** (U+200E/U+200F, U+2028/U+2029, U+202A–U+202E, U+2066–U+2069, U+FEFF — all 3-byte) → U+FFFD REPLACEMENT CHARACTER (3 bytes).
 
-The split is implemented via two private predicates: `is_two_byte_format_hazard(ch)` (only U+061C) and `is_three_byte_format_hazard(ch)` (the remaining 11). A `debug_assert_eq!` in `neutralize_source_for_render` catches byte-length violations immediately during development.
+The split is implemented via two private predicates: `is_two_byte_format_hazard(ch)` (only U+061C) and `is_three_byte_format_hazard(ch)` (the remaining 11). An unconditional `assert_eq!` (promoted from `debug_assert_eq!`, #220) in `neutralize_source_for_render` catches byte-length violations immediately, in release builds too.
 
 ### `named_source_for_render` — The Single NamedSource Builder
 
@@ -491,7 +491,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 - **Post-processing a rendered miette frame with any sanitizer** (PF-014): Sanitizing the rendered output escapes miette's own ANSI SGR colour codes into `\u001B[33m` noise on TTYs. CI uses `NO_COLOR=1` and piped stderr so this regression would stay green indefinitely. Pre-sanitize inputs before constructing the `Report`.
 
-- **Putting U+061C in the 3-byte neutralization branch**: U+061C is 2 bytes in UTF-8. Routing it through the 3-byte branch (`U+FFFD`) fires the byte-length `debug_assert_eq!` (13 vs 12 bytes). This was proven, not theorized, during the #176 development. U+061C belongs in `is_two_byte_format_hazard`.
+- **Putting U+061C in the 3-byte neutralization branch**: U+061C is 2 bytes in UTF-8. Routing it through the 3-byte branch (`U+FFFD`) fires the byte-length `assert_eq!` (13 vs 12 bytes). This was proven, not theorized, during the #176 development. U+061C belongs in `is_two_byte_format_hazard`.
 
 - **Omitting `0xD8` from the fast-path byte scan in `sanitize_with`**: U+061C is encoded as `0xD8 0x9C`. Without `0xD8` in the fast-path, `sanitize_control_chars("a\u{061C}b")` returns `Borrowed` and skips the character entirely.
 
@@ -569,7 +569,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **`packages/mds` prefers the dev WASM artifact**: `packages/mds/src/backend/wasm.ts` resolves to `crates/mds-wasm/pkg/` (the `wasm-pack` dev output) rather than `packages/mds-wasm/dist/node/`. Rebuilding only the `packages/mds-wasm` npm package leaves a STALE backend active, and the cross-surface differential test fails with convincing-looking divergence that isn't a real bug. Always rebuild via `wasm-pack build crates/mds-wasm` when working on WASM output.
 
-**Directory ordering is byte-wise over `/`-normalized paths**: `relative_display` normalizes path separators to `/` via `components().join("/")` before sorting. The fix was declared BREAKING with zero Windows CI executions; it is now covered by a platform-independent ordering test on Ubuntu and a directory case in `packages/mds/__test__/lint.spec.mjs` (runs on windows-latest). The ordering fixture is separator-sensitive by construction (`/` = 0x2F < `[` = 0x5B < `\` = 0x5C) — any separator regression breaks the fixture on Windows.
+**Directory ordering is byte-wise over `/`-normalized paths**: `relative_display` normalizes path separators to `/` via `components().join("/")` before sorting. The fix was declared BREAKING with zero Windows CI executions; it is now covered by a platform-independent ordering test on Ubuntu and a directory case in `packages/mds/__test__/lint.spec.mjs` (runs on windows-latest). The ordering fixture is separator-sensitive by construction (`/` = 0x2F < `[` = 0x5B < `\` = 0x5C) — any separator regression breaks the fixture on Windows. Since #217 `relative_display` returns `Result<String, MdsError>` (Io on strip_prefix failure or a non-UTF-8 component); `run_lint_directory` computes all display paths into `Vec<(PathBuf, String)>` before sorting and fails the run (envelope + exit 2) on the first `Err`; the per-file helpers receive the precomputed `&str` and `LintDirCtx` no longer carries `lint_root`.
 
 **`FixOutcome::PartiallyFixed` is silently discarded by `_ => {}`**: `PartiallyFixed` is returned only by `apply_fixes_incremental`. A `_ => {}` wildcard arm compiles clean and discards it without warning. `#[must_use]` does NOT catch this — it fires on a dropped value, not a wildcard arm. Always match `PartiallyFixed` explicitly.
 

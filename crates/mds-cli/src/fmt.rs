@@ -96,9 +96,17 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
 /// TOCTOU-safe read-then-size-check instead of a bare `std::fs::read`.
 fn read_source_file(path: &Path) -> Result<String> {
     let canonical = mds::NativeFs::check_symlink(path).map_err(miette::Error::from)?;
+    // `MdsError::Io`, not a bare `miette::miette!`: a `miette!` report does not downcast
+    // to `MdsError`, so `exit_code` fell through to 1 while `check_symlink` one line above
+    // — the same class of failure on the same argument — already exited 2. The message
+    // text is identical to `lint.rs`'s `read_source_file` so the two subcommands report
+    // an undecodable path the same way (#217).
     let path_str = canonical
         .to_str()
-        .ok_or_else(|| miette::miette!("path is not valid UTF-8: {}", path.display()))?;
+        .ok_or_else(|| mds::MdsError::Io {
+            message: format!("path is not valid UTF-8: {}", path.display()),
+        })
+        .map_err(miette::Error::from)?;
     let fs = mds::NativeFs::new();
     // R3 / CWE-209: anchor the display root (project-root walk-up from the
     // file's directory) BEFORE read(), so read-error messages show a

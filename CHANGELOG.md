@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent directory is watched non-recursively, so a sibling scratch write by an editor
   extends a window a real edit has already opened. Either way `npm install` churn or a
   noisy editor can delay a real edit and the idle tick by up to the cap.
+- **`TextEdit::new`, `FixLineSpan::range_inclusive` and `FixLineSpan::range_exclusive`
+  now panic on a reversed range in every build profile (#220).** The `start <= end` /
+  `from <= to` precondition was a debug-only assertion; a release caller passing a
+  reversed range got a value the fix planner later skipped in silence. The rustdoc
+  `# Panics` sections say so. No in-tree caller constructs a reversed range.
 
 ### Fixed
 
@@ -114,6 +119,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crates/mds-python/tests/test_parity.py:201` still says "9 lint rules" — deliberately
   left as-is here since fixing it would touch the release-surface Python test path;
   tracked for a later step.
+- **Release builds no longer panic on a non-boundary import/extends span offset, and a
+  missing skeleton block is an internal error instead of silently rendering the base
+  default (#220).** `attach_import_span` and the `@extends` child-only-blocks check now
+  compute the underline length through the existing char-boundary-safe helper: a byte
+  offset that does not land on a UTF-8 character boundary (a compiler defect, not
+  something a template can cause) yields a zero-length span with the numeric offset and
+  no source snippet, instead of a `byte index … is not a char boundary` panic in
+  release. The skeleton-splice walk asserts in every build profile that each `@block`
+  placeholder has an effective-blocks entry; release builds used to splice the base
+  default in silence — dropping a child's override — where debug builds panicked. The
+  three source-map cursor checks in the evaluator and the byte-length check in
+  `neutralize_source_for_render` are enforced in release now as well; none can be
+  triggered by template input, only by a defect, and the messages carry no source text.
+  On the CLI a tripped invariant is a Rust panic (exit code 101); the napi, WASM and
+  Python bindings convert it to `mds::internal` as before.
+- **`mds lint <dir>` fails closed on a path it cannot name (#217).** The directory-mode
+  `files[].file` key and the sort key are the entry's path relative to the lint root. A
+  path that is not valid UTF-8, or that is not under the lint root, previously produced
+  a lossy (U+FFFD) or absolute key silently; it is now `mds::io` (`path is not valid
+  UTF-8: …` / `path escapes lint root …`) reported before any file is linted — exit 2,
+  with the analysis-failure envelope under `--format json`. Such a file already exited 2
+  as a per-file error; the difference is that the rest of the tree is no longer linted
+  around it and no lossy key is ever emitted.
+- **`mds fmt <file>` on a path that is not valid UTF-8 exits 2 (#217).** It was a generic
+  error (exit 1); it is an I/O error (`mds::io`) like `mds lint` and `mds build`.
+  Directory mode is unchanged (per-file failure, exit 1 with the summary).
+- **Source-map `sources[]` anchors fail closed (#217).** An empty project root, or one
+  that is not valid UTF-8, can no longer make the containment check vacuous:
+  `NativeFs::source_root()` reports no root for a non-UTF-8 root directory, and the
+  relativization choke-point treats an unusable root as "not contained" (basename) and
+  an unusable `source_map_base` as "anchor on the root" — never as an empty prefix every
+  path matches. No change for any UTF-8 root; not reachable from the CLI or the public
+  API today (non-UTF-8 entry paths are rejected before compilation) — closed as a latent
+  hazard.
+- **`mds build`/`mds watch` say so when a source is written flat instead of mirrored
+  (#217).** In `--out-dir` mode a source that is not under the build root is written to
+  `<out>/<stem>.<ext>` (contained, unchanged) and now prints `warning: <source> is
+  outside the build root <root>; its output is written flat as <out> (…)`, not suppressed
+  by `--quiet`. No walked source can trigger it; it is a tripwire for a future caller.
+  Two degenerate fallbacks that could have joined an absolute path into the output
+  directory now use a fixed relative name. `mds watch` no longer probes output paths for
+  a vanished out-of-root dependency, which could drop the write-dedup entry of an in-root
+  source with the same file name.
 
 ### Internal
 

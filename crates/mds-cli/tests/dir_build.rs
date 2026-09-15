@@ -51,6 +51,19 @@ fn build_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+/// Run `mds build <file>` on a single file. Same shape as [`build_dir`]; a separate
+/// helper so call sites stay honest about which input form is under test.
+fn build_file(path: &Path, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .arg("build")
+        .arg(path)
+        .args(extra_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
 fn check_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {
     mds_bin()
         .arg("check")
@@ -1377,5 +1390,191 @@ fn dir_build_source_map_sidecar_symlink_target_rejected() {
         fs::read_to_string(&real).unwrap(),
         "OLD",
         "the symlink target must not be written through"
+    );
+}
+
+// ── #217: output-path invariants (flatten visibility, non-UTF-8 paths) ────────
+
+/// #217: `mds build` on a path that cannot be named in UTF-8 exits 2 and writes
+/// nothing — no compiled output, and no `.map` sidecar.
+///
+/// Positive control (a PIN on existing behaviour): the same invocation on a normally
+/// named file exits 0 and writes a sidecar whose `sources` names the source. Without
+/// it, "no `.map` was written" in the hostile arm would be indistinguishable from a
+/// build that never emits sidecars at all.
+///
+/// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or
+/// raw byte appears in this source file (source hygiene gate).
+#[cfg(unix)]
+#[test]
+fn build_non_utf8_path_exits_2_and_writes_no_map() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // CONTROL ARM — a normally named source, same flags.
+    let control = tempfile::tempdir().unwrap();
+    create_plain_mds(control.path(), "ok.mds");
+    let control_out = build_file(&control.path().join("ok.mds"), &["--source-map"]);
+    let control_stderr = String::from_utf8_lossy(&control_out.stderr);
+    assert_eq!(
+        control_out.status.code(),
+        Some(0),
+        "control: a normally named source must build; stderr: {control_stderr}"
+    );
+    let map_path = control.path().join("ok.md.map");
+    assert!(
+        map_path.is_file(),
+        "control: --source-map must write a sidecar, or the hostile arm's \
+         'no .map' assertion proves nothing"
+    );
+    let map: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&map_path).unwrap()).expect("sidecar is JSON");
+    let sources: Vec<&str> = map["sources"]
+        .as_array()
+        .expect("sources must be an array")
+        .iter()
+        .filter_map(|s| s.as_str())
+        .collect();
+    assert_eq!(
+        sources,
+        vec!["ok.mds"],
+        "control: the sidecar must name the source it was built from"
+    );
+
+    // HOSTILE ARM — a path that is not valid UTF-8.
+    // 0xFF and 0xFE are not legal UTF-8 lead bytes in any position. The `.mds`
+    // extension is itself valid UTF-8, so the extension gate still accepts the entry.
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Vec<u8> = vec![0xff, 0xfe, b'.', b'm', b'd', b's'];
+    let hostile = dir.path().join(OsString::from_vec(raw));
+
+    if fs::write(&hostile, "Hello, world!\n").is_err() {
+        // macOS (APFS / HFS+) enforces valid UTF-8 in filenames and rejects this create
+        // with EILSEQ, so the ON-DISK half is a Linux-CI gate. The control arm above has
+        // already run here. Any OTHER unix filesystem must accept the name and reach the
+        // assertions below — panic rather than skip silently, so a genuine regression
+        // can never masquerade as a skip.
+        #[cfg(not(target_os = "macos"))]
+        panic!(
+            "build_non_utf8_path_exits_2_and_writes_no_map: a non-UTF-8 filename was \
+             rejected by the filesystem — unexpected on this platform"
+        );
+        #[cfg(target_os = "macos")]
+        return;
+    }
+
+    let output = build_file(&hostile, &["--source-map"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "#217: a path that cannot be named must be an I/O failure; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "the diagnostic must say why; got: {stderr}"
+    );
+
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names.len(),
+        1,
+        "neither an output nor a sidecar may be written for a rejected path; got {names:?}"
+    );
+}
+
+/// #217 control: a root reached through a symlinked ANCESTOR still mirrors its subtree,
+/// and the out-of-root flatten is NOT reported.
+///
+/// A symlinked root itself is rejected (`dir_build_symlinked_entry_root_rejected`), so
+/// the non-canonical shape has to come from an ancestor. `run_build_directory` hands the
+/// same raw `dir` value to the walker and to `output_path_for`, so `strip_prefix`
+/// succeeds and the mirror survives. This test is what fails if a future change
+/// canonicalizes one of the two and not the other.
+#[cfg(unix)]
+#[test]
+fn dir_build_symlinked_ancestor_root_mirrors_without_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real_src = tmp.path().join("real").join("src");
+    fs::create_dir_all(real_src.join("sub")).unwrap();
+    create_plain_mds(&real_src, "a.mds");
+    create_plain_mds(&real_src.join("sub"), "b.mds");
+    std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let output = build_dir(
+        &tmp.path().join("link").join("src"),
+        &["--out-dir", out.path().to_str().unwrap()],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a root under a symlinked ancestor must build; stderr: {stderr}"
+    );
+    assert!(
+        out.path().join("a.md").is_file(),
+        "top-level source must mirror into the out-dir; stderr: {stderr}"
+    );
+    assert!(
+        out.path().join("sub").join("b.md").is_file(),
+        "the subtree must be preserved, not flattened; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("2 built, 0 failed"),
+        "control needle: the real summary must be present, or the negative assertion \
+         below would pass on empty stderr; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is outside the build root"),
+        "a mirrored build must not report the out-of-root flatten; got: {stderr}"
+    );
+}
+
+/// #217 control: a root containing a `..` component mirrors its subtree and does not
+/// report the out-of-root flatten. Same property as the symlinked-ancestor test, via
+/// the other way a caller can hand in a non-canonical root.
+#[test]
+fn dir_build_dotdot_root_mirrors_without_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("sub")).unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(src.join("nested")).unwrap();
+    create_plain_mds(&src, "a.mds");
+    create_plain_mds(&src.join("nested"), "b.mds");
+
+    let out = tempfile::tempdir().unwrap();
+    let output = build_dir(
+        &tmp.path().join("sub").join("..").join("src"),
+        &["--out-dir", out.path().to_str().unwrap()],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a root with a '..' component must build; stderr: {stderr}"
+    );
+    assert!(
+        out.path().join("a.md").is_file(),
+        "top-level source must mirror into the out-dir; stderr: {stderr}"
+    );
+    assert!(
+        out.path().join("nested").join("b.md").is_file(),
+        "the subtree must be preserved, not flattened; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("2 built, 0 failed"),
+        "control needle: the real summary must be present, or the negative assertion \
+         below would pass on empty stderr; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is outside the build root"),
+        "a mirrored build must not report the out-of-root flatten; got: {stderr}"
     );
 }

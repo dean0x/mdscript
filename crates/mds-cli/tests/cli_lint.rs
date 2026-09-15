@@ -2077,6 +2077,143 @@ fn directory_json_file_key_escapes_control_bytes_in_paths() {
     );
 }
 
+// ── #217: a directory entry that cannot be NAMED fails the whole run ──────────
+
+/// A directory entry whose name is not valid UTF-8 must abort the whole lint run
+/// with the analysis-failure envelope, not be linted under a lossy key.
+///
+/// Before #217 the key was built with `to_string_lossy`, so the run continued and
+/// emitted a `files[].file` of U+FFFD replacement characters — a wire key that
+/// names no file on disk and collides with every other undecodable name in the
+/// tree. The run now fails BEFORE any file is linted (so no lossy key is ever
+/// constructed), with the same exit code it already used for a per-file
+/// non-UTF-8 path: 2.
+///
+/// Positive controls, both required (an assertion that only ever observes an
+/// absence proves nothing until it is shown to detect the presence):
+/// - the same directory WITHOUT the hostile entry must exit 0 and emit
+///   `files[0].file == "ok.mds"` — otherwise the exit-2 assertion would be
+///   satisfied by a lint that is simply broken;
+/// - the human-mode control must contain the literal needle `clean,` — otherwise
+///   "no summary line in the hostile run" would be indistinguishable from
+///   "the needle never matches anything".
+///
+/// The invalid bytes are built at RUNTIME from numeric values; no escape sequence
+/// or raw byte appears in this source file (Source hygiene gate).
+#[cfg(unix)]
+#[test]
+fn lint_directory_non_utf8_entry_is_an_io_error_exit_2() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // A warn-only source: it emits a `files[]` entry (a clean file emits none, so
+    // it cannot pin the key) and exits 1, which is distinct from the hostile arm's
+    // exit 2 — so the control cannot accidentally satisfy the hostile assertion.
+    let warn = fs::read_to_string(fixture("lint_warn_only.mds")).unwrap();
+
+    // CONTROL ARM — the same directory shape without the hostile entry.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::write(control_dir.path().join("ok.mds"), &warn).unwrap();
+
+    let control_json = lint_path(control_dir.path(), &["--format", "json"]);
+    let control_stdout = String::from_utf8_lossy(&control_json.stdout);
+    assert_eq!(
+        control_json.status.code(),
+        Some(1),
+        "control: a warn-only directory must exit 1, not the hostile arm's 2; \
+         stdout: {control_stdout}"
+    );
+    let cv: serde_json::Value =
+        serde_json::from_str(&control_stdout).expect("control stdout must be valid JSON");
+    assert_eq!(
+        cv["files"]
+            .as_array()
+            .and_then(|f| f.first())
+            .and_then(|f| f["file"].as_str()),
+        Some("ok.mds"),
+        "control: the warn-only file must be linted under its in-root key; \
+         got: {control_stdout}"
+    );
+
+    let control_human = lint_path(control_dir.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control_human.stderr);
+    assert!(
+        control_stderr.contains("clean,"),
+        "control: a real directory summary must contain the exact needle \"clean,\", \
+         otherwise its absence below proves nothing; got: {control_stderr:?}"
+    );
+
+    // HOSTILE ARM — same directory plus an entry that cannot be named in UTF-8.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("ok.mds"), &warn).unwrap();
+
+    // 0xFF and 0xFE are not legal UTF-8 lead bytes in any position. The `.mds`
+    // extension is itself valid UTF-8, so the shared walker still collects the entry.
+    let raw: Vec<u8> = vec![0xff, 0xfe, b'.', b'm', b'd', b's'];
+    let hostile = dir.path().join(OsString::from_vec(raw));
+
+    if fs::write(&hostile, &warn).is_err() {
+        // macOS (APFS / HFS+) enforces valid UTF-8 in filenames and rejects this
+        // create with EILSEQ, so the ON-DISK half of this test is a Linux-CI gate.
+        // The pure-path rejection it pins is covered on every platform by the
+        // `relative_display_rejects_non_utf8_component` unit test in lint.rs, and
+        // the control arm above has already run here. Any OTHER unix filesystem
+        // must accept the name and reach the assertions below — panic rather than
+        // skip silently, so a genuine regression can never masquerade as a skip.
+        #[cfg(not(target_os = "macos"))]
+        panic!(
+            "lint_directory_non_utf8_entry_is_an_io_error_exit_2: a non-UTF-8 filename \
+             was rejected by the filesystem — unexpected on this platform"
+        );
+        #[cfg(target_os = "macos")]
+        return;
+    }
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "#217: a directory entry that cannot be named must fail the run with exit 2; \
+         stdout: {stdout}"
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be the JSON analysis-failure envelope");
+    assert_eq!(
+        v["error"]["code"].as_str(),
+        Some("mds::io"),
+        "#217: the envelope must carry the Io error code; got: {stdout}"
+    );
+    let message = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("not valid UTF-8"),
+        "#217: the envelope message must name the condition; got: {message:?}"
+    );
+    assert!(
+        v.get("files").is_none(),
+        "#217: the analysis-failure envelope must carry no files[] — no file may be \
+         linted under a lossy key; got: {stdout}"
+    );
+
+    let human = lint_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(2),
+        "#217: human mode must fail the run with exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "#217: human mode must report the condition on stderr; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("clean,"),
+        "#217: the run must abort before the per-file loop, so no directory summary \
+         may be emitted; got: {stderr:?}"
+    );
+}
+
 /// Run `mds <subcommand> -` with `input` on stdin.
 fn run_mds_stdin(subcommand: &str, input: &str) -> std::process::Output {
     use std::io::Write;
@@ -6699,5 +6836,72 @@ fn d1_dir_fix_check_json_body_pre_fix_and_exit_2() {
         Some(2),
         "R1: dir --fix --check --format json must emit the envelope AND exit 2 \
          (residual error); stdout: {stdout}"
+    );
+}
+
+/// #217: the SINGLE-FILE arm of `mds lint` also exits 2 for a path that cannot be
+/// named in UTF-8.
+///
+/// Sibling of `lint_directory_non_utf8_entry_is_an_io_error_exit_2` above, which covers
+/// the directory arm. This one is a PIN: `read_source_file` has always raised
+/// `MdsError::Io` here, and `exit_code` has always mapped that to 2. It is recorded
+/// because `mds fmt` is being brought to the same behaviour and needs a pinned
+/// reference to match — the two now emit the identical message text
+/// (`path is not valid UTF-8: …`).
+///
+/// Positive control: the same invocation on a clean, normally named file exits 0, so
+/// the exit-2 assertion cannot be satisfied by a `lint` that is simply broken.
+///
+/// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or
+/// raw byte appears in this source file (source hygiene gate).
+#[cfg(unix)]
+#[test]
+fn lint_single_file_non_utf8_path_exits_2() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let clean = fs::read_to_string(fixture("lint_clean.mds")).unwrap();
+
+    // CONTROL ARM — a normally named file with the same content.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::write(control_dir.path().join("ok.mds"), &clean).unwrap();
+    let control = lint_path(&control_dir.path().join("ok.mds"), &[]);
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "control: a clean file named in UTF-8 must exit 0; stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // HOSTILE ARM — the same content under a name that is not valid UTF-8.
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Vec<u8> = vec![0xff, 0xfe, b'.', b'm', b'd', b's'];
+    let hostile = dir.path().join(OsString::from_vec(raw));
+
+    if fs::write(&hostile, &clean).is_err() {
+        // macOS (APFS / HFS+) enforces valid UTF-8 in filenames and rejects this create
+        // with EILSEQ, so the ON-DISK half is a Linux-CI gate. The control arm above has
+        // already run here. Any OTHER unix filesystem must accept the name and reach the
+        // assertions below — panic rather than skip silently, so a genuine regression
+        // can never masquerade as a skip.
+        #[cfg(not(target_os = "macos"))]
+        panic!(
+            "lint_single_file_non_utf8_path_exits_2: a non-UTF-8 filename was rejected \
+             by the filesystem — unexpected on this platform"
+        );
+        #[cfg(target_os = "macos")]
+        return;
+    }
+
+    let out = lint_path(&hostile, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "#217: a single-file path that cannot be named must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "the diagnostic must say why; got: {stderr}"
     );
 }

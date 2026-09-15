@@ -3190,6 +3190,12 @@ fn parent_dir_drives_nested_file_import_resolution() {
 // These tests verify `line_len_at` degrades to 0 rather than panicking on
 // non-boundary or out-of-bounds offsets, matching the guard in
 // `build_type_mismatch` (evaluator.rs) per ADR-005.
+//
+// Since #220 `line_len_at` is also the helper behind `attach_import_span`
+// (resolver.rs) and `check_child_only_blocks` (resolver/inheritance.rs). Both
+// used to slice `source` directly below a `debug_assert!`, so a non-boundary
+// offset panicked in release; they now route the underline length through this
+// helper and degrade to a zero-length span.
 
 #[test]
 fn line_len_at_out_of_bounds_returns_zero() {
@@ -3255,6 +3261,355 @@ fn line_len_at_offset_at_end_returns_zero() {
         line_len_at(s, 5),
         0,
         "offset == source.len() must return 0 (empty trailing slice)"
+    );
+}
+
+// ── #220: span attribution must hold in RELEASE builds too ───────────────────
+//
+// Two different remedies, chosen per site by what a defect there would cost:
+//
+// * `attach_import_span` and `check_child_only_blocks` DEGRADE. Both used to slice
+//   `source[offset..]` one line below a `debug_assert!` on the very condition the
+//   slice needs, so a bad offset panicked the compiler in release and merely
+//   changed WHICH assert fired in debug. Routing them through `line_len_at` yields
+//   a zero-length span: the numeric offset survives, the snippet is dropped, and no
+//   caret is painted over the wrong bytes.
+// * `spliced_regions` FAILS LOUDLY. Its release fallback spliced the base default in
+//   silence, i.e. dropped a child's `@block` override from the compiled output with
+//   no diagnostic at all — strictly worse than a panic.
+
+/// Render a `catch_unwind` payload as text, for both `&'static str` and `String`
+/// panic payloads (a formatted `assert!` message is always the latter).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+#[test]
+fn attach_import_span_non_boundary_offset_degrades_to_zero_len_span() {
+    // "é" is a 2-byte UTF-8 sequence; byte offset 1 sits inside it and is therefore
+    // never a char boundary.
+    //
+    // The DEBUG-profile branch deliberately depends on `MdsError::at()` (error.rs)
+    // keeping its OWN debug-only canary for the cross-source case. That assert is not
+    // promoted: promoting it would make the release branch below panic as well, which
+    // is exactly the degradation this test exists to forbid.
+    let caught = std::panic::catch_unwind(|| {
+        attach_import_span(
+            MdsError::file_not_found("./x.mds"),
+            "./x.mds",
+            "<child>",
+            "é\n",
+            1,
+        )
+    });
+
+    if cfg!(debug_assertions) {
+        let payload = caught.expect_err("debug builds must still trip the MdsError::at() canary");
+        let msg = panic_message(&*payload);
+        assert!(
+            msg.contains("MdsError::at(): cross-source offset mismatch"),
+            "the surviving debug canary must be the one in MdsError::at(), which proves \
+             attach_import_span degraded to a zero-length span instead of slicing; got: {msg}"
+        );
+        assert!(
+            !msg.contains("attach_import_span:"),
+            "attach_import_span must no longer carry a boundary assert of its own; got: {msg}"
+        );
+    } else {
+        let err = caught.unwrap_or_else(|payload| {
+            panic!(
+                "release builds must not panic on a non-boundary offset; got: {}",
+                panic_message(&*payload)
+            )
+        });
+        match err {
+            MdsError::FileNotFound { span, src, .. } => {
+                let span = span.expect("the numeric offset must survive the degradation");
+                assert_eq!(span.offset(), 1, "the offset must be preserved verbatim");
+                assert_eq!(span.len(), 0, "a degraded span must have zero length");
+                assert!(
+                    src.is_none(),
+                    "no snippet may be attached when the offset cannot be trusted"
+                );
+            }
+            other => panic!("expected a FileNotFound error, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn attach_import_span_out_of_range_offset_on_empty_source_degrades() {
+    // An empty source is `MdsError::at()`'s documented exemption, so no canary fires in
+    // either profile: the only thing that could panic here is the raw `source[offset..]`
+    // slice this site used to perform.
+    let err = attach_import_span(
+        MdsError::file_not_found("./x.mds"),
+        "./x.mds",
+        "<child>",
+        "",
+        1,
+    );
+    match err {
+        MdsError::FileNotFound { span, src, .. } => {
+            let span = span.expect("the numeric offset must survive the degradation");
+            assert_eq!(span.offset(), 1, "the offset must be preserved verbatim");
+            assert_eq!(span.len(), 0, "a degraded span must have zero length");
+            assert!(src.is_none(), "no snippet may be attached");
+        }
+        other => panic!("expected a FileNotFound error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn attach_import_span_valid_offset_spans_whole_directive_and_passes_other_errors() {
+    // Positive control: a trustworthy offset must still underline the whole directive
+    // and still carry the snippet, so the degradation above is not a blanket downgrade.
+    let source = "@import \"./x.mds\"\nnext\n";
+    let err = attach_import_span(
+        MdsError::file_not_found("./x.mds"),
+        "./x.mds",
+        "child.mds",
+        source,
+        0,
+    );
+    match err {
+        MdsError::FileNotFound { span, src, .. } => {
+            let span = span.expect("a valid offset must produce a span");
+            assert_eq!(span.offset(), 0);
+            assert_eq!(
+                span.len(),
+                17,
+                "the span must cover `@import \"./x.mds\"` exactly (17 bytes, no newline)"
+            );
+            assert!(
+                src.is_some(),
+                "a trustworthy offset must still carry the source snippet"
+            );
+        }
+        other => panic!("expected a FileNotFound error, got: {other:?}"),
+    }
+
+    // Control: variants outside the three span-attaching arms are returned unchanged.
+    let passthrough = attach_import_span(MdsError::syntax("x"), "./x.mds", "child.mds", source, 0);
+    match passthrough {
+        MdsError::Syntax { message, span, src } => {
+            assert_eq!(message, "x", "the message must be untouched");
+            assert!(span.is_none(), "no span may be attached to a syntax error");
+            assert!(
+                src.is_none(),
+                "no snippet may be attached to a syntax error"
+            );
+        }
+        other => panic!("expected the syntax error to pass through, got: {other:?}"),
+    }
+}
+
+/// Build the borrowed module context the `@extends` helpers take.
+fn extends_ctx<'a>(source: &'a str, vars: &'a HashMap<String, Value>) -> ModuleCtx<'a> {
+    ModuleCtx {
+        key: "<child>",
+        file_str: "<child>",
+        source,
+        base_dir: ".",
+        runtime_vars: vars,
+    }
+}
+
+#[test]
+fn check_child_only_blocks_non_boundary_offset_degrades() {
+    // Same shape as `attach_import_span`: offset 1 is inside the 2-byte "é".
+    let caught = std::panic::catch_unwind(|| {
+        let vars = HashMap::new();
+        let ctx = extends_ctx("é\n", &vars);
+        let body = vec![Node::EscapedBrace { offset: 1 }];
+        check_child_only_blocks(&body, &ctx)
+    });
+
+    if cfg!(debug_assertions) {
+        let payload = caught.expect_err("debug builds must still trip the MdsError::at() canary");
+        let msg = panic_message(&*payload);
+        assert!(
+            msg.contains("MdsError::at(): cross-source offset mismatch"),
+            "the surviving debug canary must be the one in MdsError::at(), which proves \
+             check_child_only_blocks degraded instead of slicing; got: {msg}"
+        );
+        assert!(
+            !msg.contains("check_child_only_blocks:"),
+            "check_child_only_blocks must no longer carry a boundary assert of its own; got: {msg}"
+        );
+    } else {
+        let result = caught.unwrap_or_else(|payload| {
+            panic!(
+                "release builds must not panic on a non-boundary offset; got: {}",
+                panic_message(&*payload)
+            )
+        });
+        match result {
+            Err(MdsError::Extends { span, src, .. }) => {
+                let span = span.expect("the numeric offset must survive the degradation");
+                assert_eq!(span.offset(), 1, "the offset must be preserved verbatim");
+                assert_eq!(span.len(), 0, "a degraded span must have zero length");
+                assert!(src.is_none(), "no snippet may be attached");
+            }
+            other => panic!("expected an Extends error, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn check_child_only_blocks_out_of_range_offset_on_empty_source_degrades() {
+    let vars = HashMap::new();
+    let ctx = extends_ctx("", &vars);
+    let body = vec![Node::EscapedBrace { offset: 1 }];
+    match check_child_only_blocks(&body, &ctx) {
+        Err(MdsError::Extends { span, src, .. }) => {
+            let span = span.expect("the numeric offset must survive the degradation");
+            assert_eq!(span.offset(), 1, "the offset must be preserved verbatim");
+            assert_eq!(span.len(), 0, "a degraded span must have zero length");
+            assert!(src.is_none(), "no snippet may be attached");
+        }
+        other => panic!("expected an Extends error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn check_child_only_blocks_valid_offset_spans_stray_line_and_accepts_blocks() {
+    // Positive control: a trustworthy offset still underlines the stray line and still
+    // carries the snippet; and a well-formed child body is still accepted.
+    let source = "@block a:\n@end\n\\{{ x\n";
+    let vars = HashMap::new();
+    let ctx = extends_ctx(source, &vars);
+
+    let stray = vec![
+        Node::Block(BlockNode {
+            name: "a".to_string(),
+            body: vec![],
+            offset: 0,
+        }),
+        Node::EscapedBrace { offset: 15 },
+    ];
+    match check_child_only_blocks(&stray, &ctx) {
+        Err(MdsError::Extends { span, src, .. }) => {
+            let span = span.expect("a valid offset must produce a span");
+            assert_eq!(span.offset(), 15);
+            assert_eq!(
+                span.len(),
+                5,
+                "the span must cover the stray `\\{{{{ x` line (5 bytes, no newline)"
+            );
+            assert!(
+                src.is_some(),
+                "a trustworthy offset must still carry the source snippet"
+            );
+        }
+        other => panic!("expected an Extends error, got: {other:?}"),
+    }
+
+    let clean = vec![
+        Node::Block(BlockNode {
+            name: "a".to_string(),
+            body: vec![],
+            offset: 0,
+        }),
+        Node::Text(crate::ast::TextNode {
+            text: "\n".to_string(),
+            offset: 14,
+        }),
+    ];
+    assert!(
+        check_child_only_blocks(&clean, &ctx).is_ok(),
+        "@block nodes plus whitespace-only text must still be accepted"
+    );
+}
+
+#[test]
+#[should_panic(expected = "override map was not built for this skeleton")]
+fn spliced_regions_missing_effective_block_panics_in_every_profile() {
+    let skeleton = vec![Node::Block(BlockNode {
+        name: "content".to_string(),
+        body: vec![],
+        offset: 0,
+    })];
+    let effective: IndexMap<String, EffectiveBlock> = IndexMap::new();
+    let skeleton_origin = Origin {
+        file: Arc::from("base.mds"),
+        display: Arc::from("base.mds"),
+        source: Arc::from("@block content:\n@end\n"),
+    };
+    let _ = spliced_regions(&skeleton, &effective, &skeleton_origin);
+}
+
+#[test]
+fn spliced_regions_pairs_every_skeleton_block_with_its_effective_entry() {
+    // Positive control for the assert above: when the map IS built, every region must
+    // carry the origin of the file its offsets index into — the override's for a block
+    // placeholder, the skeleton's for everything else.
+    let skeleton = vec![
+        Node::Text(crate::ast::TextNode {
+            text: "intro\n".to_string(),
+            offset: 0,
+        }),
+        Node::Block(BlockNode {
+            name: "content".to_string(),
+            body: vec![],
+            offset: 6,
+        }),
+    ];
+    let skeleton_origin = Origin {
+        file: Arc::from("base.mds"),
+        display: Arc::from("base.mds"),
+        source: Arc::from("intro\n@block content:\n@end\n"),
+    };
+    let child_origin = Origin {
+        file: Arc::from("child.mds"),
+        display: Arc::from("child.mds"),
+        source: Arc::from("@extends \"./base.mds\"\n@block content:\nhi\n@end\n"),
+    };
+
+    let mut effective: IndexMap<String, EffectiveBlock> = IndexMap::new();
+    effective.insert(
+        "content".to_string(),
+        EffectiveBlock {
+            node: Arc::new(BlockNode {
+                name: "content".to_string(),
+                body: vec![Node::Text(crate::ast::TextNode {
+                    text: "hi\n".to_string(),
+                    offset: 37,
+                })],
+                offset: 22,
+            }),
+            origin: child_origin,
+        },
+    );
+
+    let regions = spliced_regions(&skeleton, &effective, &skeleton_origin);
+    assert_eq!(
+        regions.len(),
+        2,
+        "one region per skeleton node (text + block placeholder)"
+    );
+    assert_eq!(
+        regions[1].0.len(),
+        1,
+        "the placeholder must yield the effective block's body nodes, not the skeleton's"
+    );
+
+    let entry = effective
+        .get("content")
+        .expect("the effective entry must still be in the map");
+    assert!(
+        Arc::ptr_eq(&regions[1].1.source, &entry.origin.source),
+        "the block region must carry the OVERRIDING file's origin"
+    );
+    assert!(
+        Arc::ptr_eq(&regions[0].1.source, &skeleton_origin.source),
+        "non-block regions must carry the skeleton origin"
     );
 }
 

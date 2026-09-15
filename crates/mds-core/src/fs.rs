@@ -127,6 +127,12 @@ pub trait FileSystem: Send + Sync {
     /// root found by walking up from the entry-point directory).  Returns
     /// `None` if the root has not been established yet (before any
     /// `normalize` or `set_root` call).
+    ///
+    /// # Contract
+    ///
+    /// Implementations must return `None` rather than a lossy string for a root
+    /// that is not valid UTF-8 — a lossy anchor is not byte-faithful and must not
+    /// participate in containment (#217).
     fn source_root(&self) -> Option<String> {
         None
     }
@@ -556,7 +562,14 @@ impl FileSystem for NativeFs {
     }
 
     fn source_root(&self) -> Option<String> {
-        self.root_dir.get().map(|p| p.display().to_string())
+        // `to_str`, not `display()`: a root that is not valid UTF-8 has no
+        // byte-faithful string form, and `None` is the documented "no containment
+        // concept" value every consumer already guards (#217).  Containment itself
+        // is unaffected — `check_path_traversal` compares `Path`s from `root_dir`
+        // directly and never goes through this string.
+        self.root_dir
+            .get()
+            .and_then(|p| p.to_str().map(str::to_owned))
     }
 }
 
@@ -1494,6 +1507,52 @@ mod tests {
             effective_parent(&file_canon),
             "source_root must be exactly the entry-point directory (not a parent); \
              root={root:?} file_canon={file_canon:?}"
+        );
+    }
+
+    /// #217: a root that is not valid UTF-8 has no byte-faithful string form, so
+    /// `source_root()` must report `None` — the documented "no containment concept"
+    /// value, which every consumer already handles with a guarded branch — rather
+    /// than a lossy stand-in. A lossy anchor names a directory that does not exist
+    /// and cannot be compared component-wise against a real source path.
+    ///
+    /// The containment check itself is unaffected: `check_path_traversal` compares
+    /// `Path`s from `root_dir` directly and never goes through this string.
+    ///
+    /// The invalid byte is built at RUNTIME from a numeric value; no escape sequence
+    /// or raw byte appears in this source file (Source hygiene gate).
+    ///
+    /// Positive control: a valid-UTF-8 root set the same way must still be reported.
+    #[cfg(unix)]
+    #[test]
+    fn source_root_is_none_for_non_utf8_root() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // 0xFF is not a legal UTF-8 lead byte in any position.
+        let mut raw = b"/tmp/".to_vec();
+        raw.push(0xff);
+
+        let fs = NativeFs::new();
+        fs.root_dir
+            .set(PathBuf::from(OsString::from_vec(raw)))
+            .expect("root_dir is unset on a fresh NativeFs");
+        assert_eq!(
+            fs.source_root(),
+            None,
+            "a root that is not valid UTF-8 must be reported as absent, never lossily"
+        );
+
+        // CONTROL ARM: a valid-UTF-8 root set the same way is still reported.
+        let control = NativeFs::new();
+        control
+            .root_dir
+            .set(PathBuf::from("/tmp/proj"))
+            .expect("root_dir is unset on a fresh NativeFs");
+        assert_eq!(
+            control.source_root(),
+            Some("/tmp/proj".to_string()),
+            "control: a usable root must still be reported"
         );
     }
 

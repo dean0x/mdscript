@@ -14,7 +14,7 @@ referencedFiles:
   - crates/mds-cli/tests/intrinsic_output.rs
   - crates/mds-cli/Cargo.toml
 created: 2026-06-26
-updated: 2026-06-26
+updated: 2026-09-15
 ---
 
 # MDS CLI (mds-cli)
@@ -168,7 +168,7 @@ let exclude_prefix = match &output_base {
 };
 ```
 
-**AC-M7 path-escape guard** — `output_path_for` has a runtime containment check: if the computed output path somehow escapes `Dir(base)` (e.g. via a malformed strip_prefix result), it falls back to `base/<stem>.<ext>`. A `debug_assert!(false, ...)` fires in debug builds so tests catch regressions.
+**AC-M7 path-escape guard and the flatten report** — both `Dir(_)`-mode oracles now defer to one classifier, `mirror_stem(source, root, d) -> MirroredStem`, whose arms are `Mirrored(path)` (the `strip_prefix` succeeded; the subtree mirror survives) and `Flattened(path)` (`strip_prefix` failed; only the stem survives, joined to the out-dir). `output_base_no_ext` is the silent probe oracle; `output_path_for` is the write oracle and is the **only** site that reports the flattened arm — on stderr, **not** gated on `--quiet`, naming the source, the build root and the flat output. No live caller can reach that arm today (build hands the walker's own prefix back; watch gates event paths on `starts_with(&ctx.root)` and uses canonical keys under a canonical root whose walker skips symlinks), so the message is an invariant report, not user-facing advice. Degenerate stems (`/`, `..`, a bare drive prefix — never a `.mds` file) fall back to the relative name `output`, so `d.join(...)` can never re-root out of the out-dir; the old fallback was `source.as_os_str()`, which was exactly the absolute value that escapes. `output_path_for` keeps its runtime containment check with a `debug_assert!(false, ...)` behind it — deliberately debug-only, because its release fallback is already contained. In `watch.rs`, the ghost-external-dep prune (the vanished-dependency branch of the dir-batch loop, `watch.rs:2858`) skips the output probe via the new `DirWatchState::forget_graph` (graph-only) instead of the full `forget`, so pruning a vanished out-of-root dependency can no longer drop the write-dedup entry of an in-root source that shares its file name.
 
 ### Resource limits
 

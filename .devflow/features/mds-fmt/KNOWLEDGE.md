@@ -20,7 +20,7 @@ referencedFiles:
   - crates/mds-cli/src/build.rs
   - crates/mds-cli/src/watch.rs
 created: 2026-07-03
-updated: 2026-07-19
+updated: 2026-09-15
 ---
 
 # mds fmt — Opinionated Safety-Gated Formatter
@@ -186,7 +186,7 @@ Notable divergences worth knowing before touching this file:
 
 ## Error Handling and Recovery
 
-`MdsError::FormatterInvariant { message: String }` (`error.rs:335-345`, code `mds::formatter_invariant`, constructed via the private `MdsError::formatter_invariant()` helper at `error.rs:686-692`) means **the formatter itself has a bug** — the CLI must never write the file when this occurs. The field name is `message`, matching all other free-form-string variants in `MdsError`. Both `FormatterInvariant` and `Syntax` map to the generic `_ => 1` arm in `exit_code` (`build.rs:372-382`) — no new exit codes were added for `fmt`. The CLI-level contract: `format_str_named` returns `Err`, never a garbled `Ok(String)`, so `fmt.rs` only ever reaches its write call with a value that already passed the gate.
+`MdsError::FormatterInvariant { message: String }` (`error.rs:335-345`, code `mds::formatter_invariant`, constructed via the private `MdsError::formatter_invariant()` helper at `error.rs:686-692`) means **the formatter itself has a bug** — the CLI must never write the file when this occurs. The field name is `message`, matching all other free-form-string variants in `MdsError`. Both `FormatterInvariant` and `Syntax` map to the generic `_ => 1` arm in `exit_code` (`build.rs:372-382`) — no new exit codes were added for `fmt`. Since #217, `mds fmt <file>` on a path that is not valid UTF-8 exits 2 (`mds::io`) like `mds lint` and `mds build`, instead of 1; directory mode is unchanged (per-file failure, exit 1 with the summary). The CLI-level contract: `format_str_named` returns `Err`, never a garbled `Ok(String)`, so `fmt.rs` only ever reaches its write call with a value that already passed the gate.
 
 ## Anti-Patterns
 

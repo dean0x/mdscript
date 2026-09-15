@@ -20,6 +20,7 @@
 //! callers need both single-file and directory logic.
 
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -205,6 +206,15 @@ pub(crate) fn canonicalize_out_dir(out_dir: Option<&PathBuf>) -> Option<PathBuf>
         let abs = if d.is_absolute() {
             d.clone()
         } else {
+            // Fail-OPEN, deliberately left alone here (#217): when `current_dir()` fails
+            // — the cwd was deleted, or is unreadable — the relative `--out-dir` is
+            // anchored at `"."` instead, which resolves against whatever the process's
+            // cwd actually is. The subsequent `canonicalize()` then usually fails too and
+            // the non-absolute form is returned, so `starts_with` containment checks
+            // downstream compare against a path that is not the one they assume.
+            // Turning this into a hard error changes the signature of an infallible
+            // helper and every caller with it; tracked as a follow-up rather than folded
+            // into this change.
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(d)
@@ -248,8 +258,9 @@ pub(crate) fn resolve_output_base(
 ///
 /// Infallible — no directory creation.
 ///
-/// Defined in terms of [`output_base_no_ext`] so the strip_prefix / AC-M7
-/// path-escape logic is kept in one place (issue 5 — single source of truth).
+/// Defined in terms of [`mirror_stem`] so the strip_prefix / AC-M7 path-escape logic is
+/// kept in one place (issue 5 — single source of truth), shared with
+/// [`output_base_no_ext`].
 ///
 /// - `Dir(base)`: mirrors `source` relative to `root` under `base`.
 ///   If `strip_prefix` fails (source not under root after canonicalization),
@@ -258,22 +269,44 @@ pub(crate) fn resolve_output_base(
 /// - `NextToSource`: `source.with_extension(ext)`.
 ///
 /// The `ext` parameter is the output extension without leading `.` (`"md"` or `"json"`).
+///
+/// # This is the WRITE oracle
+///
+/// It is called once per output path actually computed for a write, so it is where the
+/// [`MirroredStem::Flattened`] arm is reported — a warning naming the source, the root
+/// and the flat output. [`output_base_no_ext`] computes the same stem for bookkeeping
+/// probes and stays silent; moving the report there would fire it on paths that are
+/// never written, several times per watch batch (#217).
+///
+/// No live caller can reach the flattened arm: `build` walks `root` and hands the walk's
+/// own prefix back here; `watch` gates event paths on `starts_with(&ctx.root)` and its
+/// startup/baseline loops use canonical keys under a canonical root whose walker skips
+/// symlinks. The warning is therefore an invariant report, not a user-facing condition —
+/// if it is ever seen, one of those gates has moved.
 pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext: &str) -> PathBuf {
-    let no_ext = output_base_no_ext(source, root, base);
     match base {
         OutputBase::Dir(d) => {
+            let mirrored = mirror_stem(source, root, d);
+            let flattened = matches!(mirrored, MirroredStem::Flattened(_));
+            let no_ext = mirrored.into_path();
+            // Invariant: `no_ext` was built by `mirror_stem` as `<something>/<stem>`, so
+            // `file_name()` is `Some`. The literal fallback exists because the previous
+            // one — `source.as_os_str()` — could be absolute, and an absolute name makes
+            // the `join` below re-root out of the out-dir.
             let mut name = no_ext
                 .file_name()
-                .unwrap_or(source.as_os_str())
+                .unwrap_or_else(|| OsStr::new("output"))
                 .to_os_string();
             name.push(".");
             name.push(ext);
             let out = no_ext.parent().unwrap_or(d.as_path()).join(&name);
             // AC-M7 containment invariant: the output path must remain inside the out-dir.
-            // `output_base_no_ext` already guards the strip_prefix escape case by returning
+            // `mirror_stem` already guards the strip_prefix escape case by returning
             // `d/<stem>` for out-of-root sources; the with-extension step cannot escape.
-            // The check here is a defence-in-depth belt-and-suspenders assertion.
-            if out.starts_with(d) {
+            // The check here is a defence-in-depth belt-and-suspenders assertion, and it
+            // stays DEBUG-ONLY on purpose: the release fallback below is contained, so
+            // there is nothing for a release-time check to prevent.
+            let out = if out.starts_with(d) {
                 out
             } else {
                 debug_assert!(
@@ -281,18 +314,34 @@ pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext
                     "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
                 );
                 let flat_name = {
+                    // Invariant: same as above — the join argument must be relative.
                     let mut n = source
                         .file_stem()
-                        .unwrap_or(source.as_os_str())
+                        .unwrap_or_else(|| OsStr::new("output"))
                         .to_os_string();
                     n.push(".");
                     n.push(ext);
                     n
                 };
                 d.join(flat_name)
+            };
+            if flattened {
+                // Invariant report, not gated on --quiet (like the depth-limit and
+                // stale-unlink warnings above). Emitted once per output-path computation:
+                // build — once per file, since its `output_base_no_ext` probes are silent;
+                // watch — once per rebuild (#217).
+                eprint_warning(&format!(
+                    "warning: {} is outside the build root {}; its output is written flat \
+                     as {} (another source outside the root with the same file name would \
+                     overwrite it)",
+                    safe_path(source),
+                    safe_path(root),
+                    safe_path(&out)
+                ));
             }
+            out
         }
-        OutputBase::NextToSource => no_ext.with_extension(ext),
+        OutputBase::NextToSource => output_base_no_ext(source, root, base).with_extension(ext),
     }
 }
 
@@ -392,8 +441,16 @@ pub(crate) fn is_within_default_excluded_dir(root: &Path, path: &Path) -> bool {
     // rel.parent() returns Some("") whose file_name() is None, and
     // "".parent() returns None, ending the loop correctly.
     let rel = match path.strip_prefix(root) {
+        // `false` IS the closed value here (#217): this predicate answers "is `path`
+        // inside a default-excluded subdirectory OF `root`", and a path that is not
+        // under `root` at all has no such subdirectory — the honest answer is no. It is
+        // not a fail-open default, because neither caller acts on this answer alone:
+        // both `handle_fs_event_dir` and `process_dir_batch_incremental` evaluate it
+        // only in conjunction with their own `starts_with(root)` test, so an out-of-root
+        // path is already classified as an external dep (compile for deps, never emit
+        // output) before this function's answer is consulted.
+        Err(_) => return false,
         Ok(r) => r,
-        Err(_) => return false, // path is not under root at all
     };
     let mut ancestor = rel.parent();
     while let Some(dir) = ancestor {
@@ -507,6 +564,13 @@ fn count_mds_in_excluded_dir(dir: &Path, depth: usize, max_depth: usize, count: 
 }
 
 /// Return `true` if `path`'s file name starts with `_` (partial convention, DD2).
+///
+/// A name that is not valid UTF-8 answers `false` — "not a partial", i.e. a source that
+/// should be compiled and written. That is the closed answer, not the open one (#217):
+/// such a source never reaches a write, because every read goes through
+/// `mds-core`'s `path_to_str`, which rejects a non-UTF-8 path with `MdsError::Io`. The
+/// file is reported as a per-file failure (exit 2 in single-file mode, one `failed` in
+/// the directory tally) instead of being silently skipped the way `true` would skip it.
 pub(crate) fn is_partial(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -553,27 +617,68 @@ pub(crate) fn probe_and_remove_stale(base_no_ext: &Path, kind: OutputKind) {
     }
 }
 
+/// Where a `Dir(_)`-mode source landed.
+///
+/// `Flattened` is the `strip_prefix` failure arm: contained by construction (the join
+/// argument is always a relative `OsStr`) but it abandons the subtree mirror, so two
+/// out-of-root sources with the same file name map to the same path. Unreachable from
+/// every live caller — see [`output_path_for`] — and the variant exists so the write
+/// oracle can *say* so instead of silently degrading (#217).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MirroredStem {
+    /// `source` was below `root`: its relative subtree is preserved under the out-dir.
+    Mirrored(PathBuf),
+    /// `source` was not below `root`: only its stem survives, joined to the out-dir.
+    Flattened(PathBuf),
+}
+
+impl MirroredStem {
+    /// The extension-less output path, whichever arm produced it.
+    pub(crate) fn into_path(self) -> PathBuf {
+        match self {
+            Self::Mirrored(p) | Self::Flattened(p) => p,
+        }
+    }
+}
+
+/// Compute the `Dir(_)`-mode extension-less output stem for `source`, classified by
+/// whether the subtree mirror survived.
+///
+/// Single source of truth for both [`output_base_no_ext`] (the silent probe oracle) and
+/// [`output_path_for`] (the write oracle that reports the flatten).
+fn mirror_stem(source: &Path, root: &Path, d: &Path) -> MirroredStem {
+    match source.strip_prefix(root) {
+        Ok(rel) => {
+            // Invariant: `rel` is a non-empty RELATIVE path — `source` is a regular
+            // `.mds` file strictly below `root` — so `file_stem()` is `Some`. For a
+            // single-component `rel` (a bare file name) `parent()` is `Some("")`, not
+            // `None`, and `d.join("")` is `d`, so bare names land directly in the
+            // out-dir rather than re-rooting.
+            let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
+            MirroredStem::Mirrored(d.join(rel.parent().unwrap_or(Path::new(""))).join(stem))
+        }
+        Err(_) => {
+            // Invariant: the join argument must be relative, or `d.join` re-roots and
+            // the result leaves the out-dir entirely (`d.join("/") == "/"`).
+            // `file_stem()` is `None` only for `/`, `..` and a bare drive prefix —
+            // never a `.mds` file — and the fallback that used to stand here,
+            // `source.as_os_str()`, was exactly the absolute value that escapes. A
+            // literal is the only value guaranteed relative for every input.
+            let stem = source.file_stem().unwrap_or_else(|| OsStr::new("output"));
+            MirroredStem::Flattened(d.join(stem))
+        }
+    }
+}
+
 /// Return the path stem (path without extension) for a compiled source.
 ///
 /// Used to construct the `base_no_ext` argument to [`probe_and_remove_stale`].
 ///
-/// For `Dir(base)` mode this mirrors the same strip_prefix logic as [`output_path_for`]
-/// so the stem is always computed consistently.
+/// For `Dir(base)` mode this defers to [`mirror_stem`] so the stem is always computed
+/// consistently with [`output_path_for`].
 pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) -> PathBuf {
     match base {
-        OutputBase::Dir(d) => {
-            let rel = match source.strip_prefix(root) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => {
-                    // Path-escape guard: use filename only (mirrors output_path_for).
-                    let stem = source.file_stem().unwrap_or(source.as_os_str());
-                    return d.join(stem);
-                }
-            };
-            // Build the path with no extension.
-            let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
-            d.join(rel.parent().unwrap_or(Path::new(""))).join(stem)
-        }
+        OutputBase::Dir(d) => mirror_stem(source, root, d).into_path(),
         OutputBase::NextToSource => {
             // source.with_extension("") removes the existing extension.
             source.with_extension("")
@@ -1442,6 +1547,123 @@ mod tests {
             "output must be inside /out; got {result:?}"
         );
         assert_eq!(result, PathBuf::from("/out/page.md"));
+    }
+
+    /// Body of the first `fn` whose header starts with `header`, brace-matched from the
+    /// first `{` after it. Used by the lexical guard below; `None` when the header is
+    /// absent, which the caller turns into a non-vacuity failure.
+    fn fn_body(src: &str, header: &str) -> Option<String> {
+        let start = src.find(header)?;
+        let open = start + src[start..].find('{')?;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(src[open..open + i + 1].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// #217: the `Dir(_)` oracles must be able to say WHICH arm produced a stem — the
+    /// subtree mirror, or the out-of-root flatten that drops the subtree and lets two
+    /// sources with the same file name collide.
+    ///
+    /// Both arms are asserted: an assertion that only ever observes `Flattened` would be
+    /// satisfied by a classifier that returns it unconditionally.
+    #[test]
+    fn mirror_stem_classifies_out_of_root_as_flattened() {
+        assert_eq!(
+            mirror_stem(
+                Path::new("/other/page.mds"),
+                Path::new("/root"),
+                Path::new("/out"),
+            ),
+            MirroredStem::Flattened(PathBuf::from("/out/page")),
+            "a source outside the root loses its subtree and must say so"
+        );
+        assert_eq!(
+            mirror_stem(
+                Path::new("/root/a/page.mds"),
+                Path::new("/root"),
+                Path::new("/out"),
+            ),
+            MirroredStem::Mirrored(PathBuf::from("/out/a/page")),
+            "a source below the root keeps its subtree and must NOT be reported"
+        );
+    }
+
+    /// #217: a stem-less source must never hand `d.join` an absolute argument.
+    ///
+    /// `Path::new("/").file_stem()` is `None`, and the fallback used to be
+    /// `source.as_os_str()` — `"/"`. `Path::new("/out").join("/")` re-roots to `"/"`,
+    /// and the write oracle then built `"/.md"`. Neither is inside the out-dir, and
+    /// neither is a path any source would legitimately compile to.
+    ///
+    /// `output_path_for_outside_root_falls_back_to_flat` above is the control: a source
+    /// that HAS a stem still flattens to `<out-dir>/<stem>.<ext>`.
+    #[test]
+    fn stemless_source_never_escapes_out_dir() {
+        let source = Path::new("/");
+        let root = Path::new("/root");
+        let base = OutputBase::Dir(PathBuf::from("/out"));
+
+        assert_eq!(
+            output_base_no_ext(source, root, &base),
+            PathBuf::from("/out/output"),
+            "the probe oracle must keep a stem-less source inside the out-dir"
+        );
+        assert_eq!(
+            output_path_for(source, root, &base, "md"),
+            PathBuf::from("/out/output.md"),
+            "the write oracle must not join an absolute stem"
+        );
+    }
+
+    /// #217: the out-of-root flatten is reported from the WRITE oracle only.
+    ///
+    /// `output_base_no_ext` is a probe: watch calls it to guess the output siblings of a
+    /// source it is about to forget, repeatedly per batch and for sources that are never
+    /// written. A warning there would fire on bookkeeping rather than on a write.
+    /// `output_path_for` is called once per output path actually computed for a write,
+    /// so that is where the report belongs.
+    ///
+    /// Lexical, because the property being pinned is exactly "which function contains
+    /// the call". Both headers must be found, or the two negative assertions would pass
+    /// on an empty string.
+    #[test]
+    fn flatten_warning_lives_in_the_write_oracle_only() {
+        const SRC: &str = include_str!("output.rs");
+        const NEEDLE: &str = "is outside the build root";
+
+        let oracle = fn_body(SRC, "fn output_path_for(")
+            .expect("non-vacuity: fn output_path_for must be present in this file");
+        let probe = fn_body(SRC, "fn output_base_no_ext(")
+            .expect("non-vacuity: fn output_base_no_ext must be present in this file");
+
+        assert!(
+            oracle.contains("eprint_warning("),
+            "the write oracle must report the flattened arm; body: {oracle}"
+        );
+        assert!(
+            oracle.contains(NEEDLE),
+            "the write oracle's report must name the out-of-root condition; body: {oracle}"
+        );
+        assert!(
+            !probe.contains("eprint_warning("),
+            "the probe oracle must stay silent — it runs on bookkeeping, not on writes; \
+             body: {probe}"
+        );
+        assert!(
+            !probe.contains(NEEDLE),
+            "the probe oracle must not carry the report text either; body: {probe}"
+        );
     }
 
     /// The `.<name>.tmp-<pid>-<n>` temp files an atomic write leaves in flight must

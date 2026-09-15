@@ -67,6 +67,8 @@ pub(super) fn node_offset(node: &Node) -> usize {
 /// `@block` overrides and optional whitespace-only text nodes.
 ///
 /// Returns `Err(mds::extends)` on the first stray node.
+///
+/// A non-boundary offset degrades to a zero-length span (#220).
 pub(super) fn check_child_only_blocks(body: &[Node], ctx: &ModuleCtx<'_>) -> Result<(), MdsError> {
     for node in body {
         match node {
@@ -74,15 +76,10 @@ pub(super) fn check_child_only_blocks(body: &[Node], ctx: &ModuleCtx<'_>) -> Res
             Node::Text(t) if t.text.trim().is_empty() => {}
             other => {
                 let offset = node_offset(other);
-                debug_assert!(
-                    ctx.source.is_char_boundary(offset),
-                    "check_child_only_blocks: offset {offset} is not a UTF-8 char boundary \
-                     in source (len={})",
-                    ctx.source.len()
-                );
-                let line_len = ctx.source[offset..]
-                    .find('\n')
-                    .unwrap_or(ctx.source[offset..].len());
+                // Degrade rather than slice on a non-boundary offset (#220): a
+                // bad offset here is a defect in `node_offset` pairing, not
+                // something a template can produce. See `line_len_at`.
+                let line_len = super::line_len_at(ctx.source, offset);
                 return Err(MdsError::extends_error_at(
                     "an extending template may contain only @block overrides",
                     ctx.file_str,
@@ -155,9 +152,16 @@ pub(super) fn apply_block_overrides(
 /// Any other skeleton node yields a single-element slice and the `skeleton_origin`
 /// (the root-base file).
 ///
-/// Mirrors the missing-block `debug_assert!`/fallback from `splice_skeleton` so both
-/// consumers (splice + validate) have identical coverage. This is the single shared
-/// walk that prevents text/messages mode validate paths from drifting (PF-004).
+/// Every skeleton `@block` is required to have an `effective_blocks` entry, and that
+/// requirement is enforced in release builds too (#220). This is the single shared walk
+/// that prevents text/messages mode validate paths from drifting (PF-004), so both
+/// consumers (splice + validate) have identical coverage of it.
+///
+/// # Panics
+///
+/// Panics when a skeleton `@block` has no `effective_blocks` entry. That pairing is
+/// built from the skeleton itself, so only a defect in the override-map construction
+/// can produce it — no template input can.
 pub(super) fn spliced_regions<'a>(
     skeleton: &'a [Node],
     effective_blocks: &'a IndexMap<String, EffectiveBlock>,
@@ -166,21 +170,22 @@ pub(super) fn spliced_regions<'a>(
     let mut regions = Vec::with_capacity(skeleton.len());
     for node in skeleton {
         if let Node::Block(skeleton_block) = node {
-            if let Some(eff_block) = effective_blocks.get(&skeleton_block.name) {
+            let eff_block = effective_blocks.get(&skeleton_block.name);
+            // Enforced in release too, not `debug_assert!` (#220): the map is built
+            // from this very skeleton by `seed_effective_blocks` /
+            // `apply_block_overrides`, so a skeleton `@block` with no entry can only
+            // be a defect in that pairing — no template input can produce it. The
+            // old release fallback spliced the base default in silence, i.e. dropped
+            // a child's override from the compiled output with no diagnostic.
+            assert!(
+                eff_block.is_some(),
+                "skeleton @block has no effective_blocks entry: the override map was not \
+                 built for this skeleton, so a child's @block override would be silently \
+                 dropped from the compiled output"
+            );
+            if let Some(eff_block) = eff_block {
                 // Block body with its own origin (the winning override file's source).
                 regions.push((eff_block.node.body.as_slice(), &eff_block.origin));
-            } else {
-                // Every block in the skeleton must have an effective_blocks entry.
-                // A missing entry is a compiler bug (apply_block_overrides was not called).
-                debug_assert!(
-                    false,
-                    "spliced_regions: block '{}' in skeleton has no effective_blocks entry — \
-                     this is a compiler bug (apply_block_overrides was not called for this skeleton)",
-                    skeleton_block.name
-                );
-                // Release build: fall back to the skeleton's own default body (same origin
-                // as the skeleton since this is the base's own node).
-                regions.push((skeleton_block.body.as_slice(), skeleton_origin));
             }
         } else {
             // Non-block skeleton nodes: validated against the skeleton origin.
