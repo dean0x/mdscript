@@ -1497,6 +1497,52 @@ mod tests {
         );
     }
 
+    /// #217: a root that is not valid UTF-8 has no byte-faithful string form, so
+    /// `source_root()` must report `None` — the documented "no containment concept"
+    /// value, which every consumer already handles with a guarded branch — rather
+    /// than a lossy stand-in. A lossy anchor names a directory that does not exist
+    /// and cannot be compared component-wise against a real source path.
+    ///
+    /// The containment check itself is unaffected: `check_path_traversal` compares
+    /// `Path`s from `root_dir` directly and never goes through this string.
+    ///
+    /// The invalid byte is built at RUNTIME from a numeric value; no escape sequence
+    /// or raw byte appears in this source file (Source hygiene gate).
+    ///
+    /// Positive control: a valid-UTF-8 root set the same way must still be reported.
+    #[cfg(unix)]
+    #[test]
+    fn source_root_is_none_for_non_utf8_root() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // 0xFF is not a legal UTF-8 lead byte in any position.
+        let mut raw = b"/tmp/".to_vec();
+        raw.push(0xff);
+
+        let fs = NativeFs::new();
+        fs.root_dir
+            .set(PathBuf::from(OsString::from_vec(raw)))
+            .expect("root_dir is unset on a fresh NativeFs");
+        assert_eq!(
+            fs.source_root(),
+            None,
+            "a root that is not valid UTF-8 must be reported as absent, never lossily"
+        );
+
+        // CONTROL ARM: a valid-UTF-8 root set the same way is still reported.
+        let control = NativeFs::new();
+        control
+            .root_dir
+            .set(PathBuf::from("/tmp/proj"))
+            .expect("root_dir is unset on a fresh NativeFs");
+        assert_eq!(
+            control.source_root(),
+            Some("/tmp/proj".to_string()),
+            "control: a usable root must still be reported"
+        );
+    }
+
     #[test]
     fn vfs_source_root_always_none() {
         // VirtualFs has no containment concept — source_root() always returns None.
