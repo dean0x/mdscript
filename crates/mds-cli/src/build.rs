@@ -1577,13 +1577,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// the summary is always emitted so the non-zero exit is never unexplained.
 /// This mirrors the gate used by `mds check` (`main.rs`) and `mds fmt` (`fmt.rs`).
 ///
-/// **Nothing to build is an error (#204):** when the walk yields no files the run
-/// exits 1 with a one-line stderr diagnostic that bypasses `--quiet` — either the
-/// all-excluded count diagnostic or `no .mds files found in <dir>; nothing was built`.
-/// Both call `process::exit` directly: no `MdsError` variant exists for "nothing to
-/// do" and `exit_code` must not grow one for a non-error class.
-/// `mds check` and `mds fmt` mirror this with exit 1, `mds lint` with exit 2;
-/// `mds watch <dir>` deliberately does NOT error on an empty tree.
+/// **Nothing to build is an error (#204, #387):** when the walk yields no files to
+/// compile the run exits 1 with a one-line stderr diagnostic that bypasses `--quiet`.
+/// Three shapes, in the order they are checked: the all-excluded count diagnostic
+/// (every candidate sits under a default-excluded directory), `no .mds files found
+/// in <dir>; nothing was built` (a genuinely empty tree), and the partials-only
+/// count diagnostic (#387 — the tree is non-empty but every candidate is a
+/// `_`-prefixed partial). All three call `process::exit` directly: no `MdsError`
+/// variant exists for "nothing to do" and `exit_code` must not grow one for a
+/// non-error class.
+/// `mds check` mirrors all three with exit 1; `mds fmt` (exit 1) and `mds lint`
+/// (exit 2) mirror only the first two — they iterate every file including partials,
+/// so a partials-only tree is real work for them, not "nothing to do".
+/// `mds watch <dir>` deliberately does NOT error on any of the three.
 ///
 /// **Documented limitation (AC-Q05):** two warning writers reachable from this
 /// function do not accept a `quiet` parameter — `output.rs::collect_mds_files_inner`
@@ -1660,6 +1666,21 @@ fn run_build_directory(
         // later is a valid flow there.
         eprintln!(
             "no .mds files found in {}; nothing was built",
+            crate::output::safe_path(dir)
+        );
+        std::process::exit(1);
+    }
+
+    // #387: a tree whose only .mds files are partials is "nothing to build" too. The
+    // walker collects partials (watch/fmt/lint need them) but this loop skips them, so
+    // without this arm the run ends `0 built, 0 failed`, exit 0 — the silent green pass
+    // #204 closed for the empty tree. Same shape as the all-excluded arm: count-carrying,
+    // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
+    // behaviour; `mds watch <dir>` still starts.
+    if let Some(partials_only_count) = crate::output::partials_only(&files) {
+        eprintln!(
+            "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
+             nothing was built",
             crate::output::safe_path(dir)
         );
         std::process::exit(1);

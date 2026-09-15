@@ -582,12 +582,11 @@ pub(crate) fn is_partial(path: &Path) -> bool {
 /// the "nothing to build/check" case #387 closes; `None` for an empty list (the
 /// empty-tree arm owns that) or when any non-partial entry exists. One predicate for
 /// `run_build_directory` and `run_check_directory` so the two arms cannot drift.
-// SCAFFOLD (#387): body ships as an unconditional `None` in this RED commit — the
-// two call sites (`build.rs`, `main.rs`) land in the very next commit, at which
-// point this is reachable outside `mod tests` and the allow comes off.
-#[allow(dead_code)]
-pub(crate) fn partials_only(_files: &[PathBuf]) -> Option<usize> {
-    None
+pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
+    if files.is_empty() {
+        return None;
+    }
+    files.iter().all(|f| is_partial(f)).then_some(files.len())
 }
 
 // ── Stale-output cleanup ──────────────────────────────────────────────────────

@@ -260,6 +260,13 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
          cannot carry a control byte.",
     ),
     (
+        "build.rs",
+        "partials_only_count",
+        "`usize` count of `.mds` files found in a partials-only tree, bound from \
+         `output::partials_only`'s `Some(n)` in the #387 nothing-to-build diagnostic. \
+         An integer counter cannot carry a control byte.",
+    ),
+    (
         "fmt.rs",
         "walk.excluded_by_default",
         "`usize` count of `.mds` files the default-exclusion walker skipped \
@@ -337,6 +344,13 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "main.rs",
         "fail_count",
         "`usize` tally of files that failed `mds check <dir>`, in its summary line.",
+    ),
+    (
+        "main.rs",
+        "partials_only_count",
+        "`usize` count of `.mds` files found in a partials-only tree, bound from \
+         `output::partials_only`'s `Some(n)` in the #387 nothing-to-check diagnostic. \
+         An integer counter cannot carry a control byte.",
     ),
     (
         "output.rs",

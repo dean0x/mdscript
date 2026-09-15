@@ -352,6 +352,21 @@ fn run_check_directory(
         std::process::exit(1);
     }
 
+    // #387: a tree whose only .mds files are partials is "nothing to check" too. The
+    // walker collects partials (watch/fmt/lint need them) but this loop skips them, so
+    // without this arm the run ends `0 passed, 0 failed`, exit 0 — the silent green pass
+    // #204 closed for the empty tree. Same shape as the all-excluded arm: count-carrying,
+    // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
+    // behaviour; `mds watch <dir>` still starts.
+    if let Some(partials_only_count) = output::partials_only(&files) {
+        eprintln!(
+            "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
+             nothing was checked",
+            output::safe_path(dir)
+        );
+        std::process::exit(1);
+    }
+
     let mut ok_count: usize = 0;
     let mut fail_count: usize = 0;
 
