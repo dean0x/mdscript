@@ -465,6 +465,50 @@ fn dir_check_empty_dir_quiet_still_emits_diagnostic() {
     );
 }
 
+/// #387: `mds check` mirrors `mds build` — a tree whose only `.mds` files are
+/// partials is "nothing to check". Positive control in the same test: adding a
+/// non-partial file flips the tree back to a normal successful check.
+#[test]
+fn dir_check_partials_only_exits_one() {
+    let src = tempfile::tempdir().unwrap();
+
+    create_plain_mds(src.path(), "_only.mds");
+
+    let output = check_dir(src.path(), &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "check on a partials-only dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("nothing was checked"),
+        "stderr must say nothing was checked; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("all are _-prefixed partials"),
+        "stderr must say all are _-prefixed partials; got: {stderr:?}"
+    );
+
+    // Positive control: a non-partial file in the same tree flips this back to a
+    // normal successful check.
+    create_plain_mds(src.path(), "real.mds");
+
+    let output2 = check_dir(src.path(), &[]);
+
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+    assert_eq!(
+        output2.status.code(),
+        Some(0),
+        "check with a real file present must succeed; stderr: {stderr2}"
+    );
+    assert!(
+        stderr2.contains("1 passed, 0 failed"),
+        "stderr must show the check summary; got: {stderr2:?}"
+    );
+}
+
 /// #204 boundary pin: a path that does NOT exist is not a directory, so it takes
 /// the single-file path and exits 2 (`mds::file_not_found`) — unchanged by #204.
 /// GREEN both before and after the fix; it exists to prove the new exit-1 arm
@@ -604,6 +648,94 @@ fn dir_build_empty_dir_quiet_still_emits_diagnostic() {
     assert!(
         stderr.contains("no .mds files found in"),
         "empty-tree diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was built"),
+        "stderr must say nothing was built under --quiet; got: {stderr:?}"
+    );
+}
+
+// ── #387: partials-only directory is "nothing to build" ──────────────────────
+
+/// #387: a tree whose only `.mds` files are `_`-prefixed partials is "nothing to
+/// build" too — the loop skips every partial (T-CLI-13), so without this arm the
+/// run silently ends `0 built, 0 failed`, exit 0: the same silent green pass #204
+/// closed for the empty tree. Positive control in the same test: adding a
+/// non-partial file to the tree flips the run back to a normal successful build.
+#[test]
+fn dir_build_partials_only_exits_one() {
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+
+    create_plain_mds(src.path(), "_only.mds");
+
+    let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "build on a partials-only dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 .mds file(s) found in"),
+        "stderr must carry the partials-only count diagnostic; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("all are _-prefixed partials"),
+        "stderr must say all are _-prefixed partials; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nothing was built"),
+        "stderr must say nothing was built; got: {stderr:?}"
+    );
+    assert!(
+        !out.path().join("_only.md").exists(),
+        "a partial must never produce output"
+    );
+
+    // Positive control: a non-partial file in the same tree flips this back to a
+    // normal successful build — proves the exit-1 arm fires on "all partials",
+    // not on "any partial present".
+    create_plain_mds(src.path(), "real.mds");
+
+    let output2 = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+
+    assert_eq!(
+        output2.status.code(),
+        Some(0),
+        "build with a real file present must succeed; stderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    assert!(
+        out.path().join("real.md").exists(),
+        "real.md should be created"
+    );
+    assert!(
+        !out.path().join("_only.md").exists(),
+        "_only.md must not be created (partials are skipped)"
+    );
+}
+
+/// #387: `--quiet` must not suppress the partials-only diagnostic — mirrors the
+/// empty-tree and all-excluded `--quiet` twins above.
+#[test]
+fn dir_build_partials_only_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    create_plain_mds(src.path(), "_only.mds");
+
+    let output = build_dir(src.path(), &["--quiet"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "build --quiet on a partials-only dir must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet on a partials-only tree"
     );
     assert!(
         stderr.contains("nothing was built"),
@@ -1001,6 +1133,62 @@ fn dir_fmt_empty_dir_check_flag_exits_one() {
     assert!(
         stderr.contains("nothing was formatted"),
         "stderr must say nothing was formatted under --check; got: {stderr:?}"
+    );
+}
+
+// ── #387 pins: fmt/lint are unaffected — they operate on partials ────────────
+
+/// #387 pin: `mds fmt` iterates every file including partials (T-CLI-13 does not
+/// apply to fmt/lint), so a partials-only tree is real formatting work, not
+/// "nothing to do". Must NOT regress into the build/check nothing-to-do wording.
+#[test]
+fn dir_fmt_partials_only_still_formats() {
+    let src = tempfile::tempdir().unwrap();
+
+    create_plain_mds(src.path(), "_only.mds");
+
+    let output = fmt_dir(src.path(), &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fmt on a partials-only dir must still succeed; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 unchanged"),
+        "stderr must show the fmt summary; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("nothing was formatted"),
+        "fmt must not treat a partials-only tree as nothing-to-do; got: {stderr:?}"
+    );
+}
+
+/// #387 pin: `mds lint` iterates every file including partials, so a
+/// partials-only tree is real lint work, not "nothing to do". Must NOT regress
+/// into the build/check nothing-to-do wording.
+#[test]
+fn dir_lint_partials_only_still_lints() {
+    let src = tempfile::tempdir().unwrap();
+
+    create_plain_mds(src.path(), "_only.mds");
+
+    let output = lint_dir(src.path(), &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "lint on a partials-only dir must still succeed; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 clean"),
+        "stderr must show the lint summary; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("nothing was linted"),
+        "lint must not treat a partials-only tree as nothing-to-do; got: {stderr:?}"
     );
 }
 

@@ -578,6 +578,18 @@ pub(crate) fn is_partial(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// `Some(n)` when `files` is non-empty and every entry is a `_`-prefixed partial —
+/// the "nothing to build/check" case #387 closes; `None` for an empty list (the
+/// empty-tree arm owns that) or when any non-partial entry exists. One predicate for
+/// `run_build_directory` and `run_check_directory` so the two arms cannot drift.
+// SCAFFOLD (#387): body ships as an unconditional `None` in this RED commit — the
+// two call sites (`build.rs`, `main.rs`) land in the very next commit, at which
+// point this is reachable outside `mod tests` and the allow comes off.
+#[allow(dead_code)]
+pub(crate) fn partials_only(_files: &[PathBuf]) -> Option<usize> {
+    None
+}
+
 // ── Stale-output cleanup ──────────────────────────────────────────────────────
 
 /// Probe for BOTH possible output siblings and unlink the one that does NOT match `kind`.
@@ -1690,6 +1702,20 @@ mod tests {
         assert!(is_partial(Path::new("/dir/_partial.mds")));
         assert!(!is_partial(Path::new("/dir/main.mds")));
         assert!(!is_partial(Path::new("/dir/not_partial.mds")));
+    }
+
+    #[test]
+    fn partials_only_answers() {
+        assert_eq!(partials_only(&[]), None);
+        assert_eq!(partials_only(&[PathBuf::from("_a.mds")]), Some(1));
+        assert_eq!(
+            partials_only(&[PathBuf::from("_a.mds"), PathBuf::from("b.mds")]),
+            None
+        );
+        assert_eq!(
+            partials_only(&[PathBuf::from("_a.mds"), PathBuf::from("_b.mds")]),
+            Some(2)
+        );
     }
 
     // ── is_default_excluded_dir ───────────────────────────────────────────────
