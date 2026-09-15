@@ -1655,12 +1655,24 @@ impl DirWatchState {
         tracked
     }
 
-    /// Remove all state for a deleted source and its output.
-    fn forget(&mut self, src: &Path, out: &Path) {
-        self.last_written.remove(out);
+    /// Remove every GRAPH record of `src` — its forward edges, its error flag and its
+    /// known-files membership — without touching `last_written`.
+    ///
+    /// This is the whole of `forget` for a source that never had an output of its own:
+    /// an out-of-root dependency, which is a graph node only (DD3). `last_written` is
+    /// keyed by OUTPUT path, and guessing an output path for such a source means running
+    /// it through the out-of-root flatten arm, which yields a key that belongs to an
+    /// in-root source instead (#217).
+    fn forget_graph(&mut self, src: &Path) {
         self.forward_deps.remove(src);
         self.errored.remove(src);
         self.known_files.remove(src);
+    }
+
+    /// Remove all state for a deleted source and its output.
+    fn forget(&mut self, src: &Path, out: &Path) {
+        self.last_written.remove(out);
+        self.forget_graph(src);
     }
 }
 
@@ -1744,6 +1756,12 @@ fn compile_one_source(
 
             // Derive the output path from the compiled kind (intrinsic extension).
             // AC-FUNC-23: a @message template writes .json; a plain template writes .md.
+            //
+            // Invariant: `src` is strictly below `root`, so this never takes the
+            // out-of-root flatten arm and never emits its report (#217). Every path that
+            // reaches here passed `is_in_root` in `process_dir_batch_incremental` or the
+            // equivalent gate in `process_dir_batch_vars_changed`; out-of-root deps take
+            // the dep-refresh-only branch above and never call this function.
             let ext = compiled.kind.extension();
             let out = output_path_for(src, root, output_base, ext);
 
@@ -2390,6 +2408,12 @@ fn dir_watch_startup(
                 // Partials (DD2): track in graph but don't emit their own output.
                 if !is_partial(source) {
                     // Derive the output path from the compiled kind (intrinsic extension).
+                    //
+                    // Invariant: `key` is `graph_key(source)` for a source the walker
+                    // collected under the already-canonical `root`, and the walker skips
+                    // symlinked files and directories — so the canonical key is still
+                    // prefixed by `root` and the out-of-root flatten arm cannot fire
+                    // here (#217).
                     let ext = compiled.kind.extension();
                     let out = output_path_for(&key, &root, &output_base, ext);
                     if let Err(e) = write_output(Some(out.clone()), &compiled.content, quiet, true)
@@ -2458,6 +2482,13 @@ fn dir_watch_startup(
             ) {
                 Ok(compiled) => {
                     // Derive output path from the compiled kind (intrinsic extension).
+                    //
+                    // Invariant: same `key` over the same `all_files` walk as the startup
+                    // loop above — canonical and prefixed by `root` — so this dedup
+                    // baseline computes the same path by the same arm, and the
+                    // out-of-root flatten cannot fire here either (#217). It must agree
+                    // with the startup loop or the `contains_key` check below would miss
+                    // and every source would be rewritten on the first real event.
                     let ext = compiled.kind.extension();
                     let out = output_path_for(&key, &root, &output_base, ext);
                     if state.last_written.contains_key(&out) {
@@ -2811,11 +2842,20 @@ fn process_dir_batch_incremental(
             // `forward_deps`, and `known_files` now so it doesn't accumulate as a ghost
             // entry and waste per-batch allocation on every subsequent real-change event.
             if !deleted.contains(src) {
-                // Source is gone — probe both .md and .json to clean up either sibling.
-                let base_no_ext = output_base_no_ext(src, root, output_base);
-                for ext in &["md", "json"] {
-                    let out = base_no_ext.with_extension(ext);
-                    state.forget(src, &out);
+                if is_in_root {
+                    // Source is gone — probe both .md and .json to clean up either sibling.
+                    let base_no_ext = output_base_no_ext(src, root, output_base);
+                    for ext in &["md", "json"] {
+                        let out = base_no_ext.with_extension(ext);
+                        state.forget(src, &out);
+                    }
+                } else {
+                    // An external dep never had an output, so there is no sibling to
+                    // forget. Probing through `output_base_no_ext` would take the
+                    // out-of-root flatten arm and forget `<out-dir>/<file name>.md` —
+                    // an entry belonging to the IN-ROOT source with that file name,
+                    // whose next rebuild would then rewrite identical bytes (#217).
+                    state.forget_graph(src);
                 }
             }
             continue;
