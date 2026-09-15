@@ -549,7 +549,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **atomic_write_file temp prefix**: The temp file prefix is `.mds-tmp-`. Both lint and fmt share the same `atomic_write_file` from `output.rs`. Shared with `build`/`watch` since #227; third parameter `Durability` (`Fsync` for lint/fmt, `RenameOnly` for build/watch).
 
-**`crates/mds-cli/tests/write_funnel.rs` fails CI on any raw `fs::write(` / `File::create(` in `crates/mds-cli/src`** outside the two allow-listed sites (`mds init` in main.rs; the test-only readiness marker in watch.rs).
+**`crates/mds-cli/tests/write_funnel.rs` fails CI on any raw `fs::write(` / `File::create(` in `crates/mds-cli/src`** outside the one allow-listed site (the test-only readiness marker in watch.rs; `mds init` joined the funnel in #386).
 
 **Python `LintDiagnostic.fix_edits` getter vs `#[pyo3(get)]`**: `Vec<serde_json::Value>` does not implement `IntoPy`. Use the custom `#[getter]` which calls `value_to_py`. Stored internally as `Option<Vec<serde_json::Value>>`.
 
