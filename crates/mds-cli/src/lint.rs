@@ -365,21 +365,33 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
 /// the strip, or that is not valid UTF-8 is an `Io` error — never a lossy
 /// (U+FFFD) or absolute key.
 fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, MdsError> {
-    // RED SCAFFOLD (#217): the interface is already the fail-closed one so the
-    // tests below compile and fail on BEHAVIOUR, not on a type error.  The body
-    // is still the fail-open one; the GREEN commit replaces it.
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    // Hardening: strip_prefix is verified UNREACHABLE today (both call sites pass
-    // ctx.lint_root and every entry originates from read_dir(dir)).  Filter to
-    // Normal components so the fallback degrades to a relative-looking path rather
-    // than joining RootDir/Prefix components into `//foo/bar.mds` (Unix) or
-    // `C:/\/foo/bar.mds` (Windows).
-    Ok(rel
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/"))
+    let escapes = || MdsError::Io {
+        message: format!(
+            "path escapes lint root {}: {}",
+            root.display(),
+            path.display()
+        ),
+    };
+    let rel = path.strip_prefix(root).map_err(|_| escapes())?;
+    let mut out = String::new();
+    for c in rel.components() {
+        // Only `Normal` can follow a successful strip of a read_dir entry; RootDir /
+        // Prefix / ParentDir here means the invariant above is broken — reject rather
+        // than join them into `//foo` (Unix) or `C:/\/foo` (Windows) or drop a `..`.
+        let std::path::Component::Normal(name) = c else {
+            return Err(escapes());
+        };
+        // Same wording as `read_source_file`'s non-UTF-8 rejection, which is what a
+        // per-file read of this entry would have produced before the run-level check.
+        let name = name.to_str().ok_or_else(|| MdsError::Io {
+            message: format!("path is not valid UTF-8: {}", path.display()),
+        })?;
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(name);
+    }
+    Ok(out)
 }
 
 // ── Read source file ──────────────────────────────────────────────────────────
@@ -1211,7 +1223,6 @@ fn run_lint_file(
 /// The `RefCell` provides interior mutability so per-file helpers can populate the
 /// caches through a shared `&LintDirCtx` reference.
 struct LintDirCtx<'a> {
-    lint_root: &'a Path,
     flags: LintFlags,
     runtime_vars: &'a Option<HashMap<String, mds::Value>>,
     /// Fast-path-1 cache: `base_dir → config`. Every directory whose files have
@@ -1380,7 +1391,7 @@ fn run_lint_directory(
     // directory and across subdirectories sharing one root mds.json.
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
-    let mut files = walk.files;
+    let files = walk.files;
 
     // AD-216-9: neither early exit below emits a summary — the per-file loop never
     // runs, so all four counters stay at zero and there is nothing meaningful to
@@ -1409,12 +1420,34 @@ fn run_lint_directory(
         std::process::exit(2);
     }
 
+    // #217: compute every display key BEFORE the sort, so a path that cannot be
+    // named relative to `dir` fails the whole run instead of contributing a lossy
+    // or absolute key.  Ordering matters twice over:
+    //   * before the sort — the sort key IS the display key, so a lossy key that
+    //     only fails later would already have been built and compared here;
+    //   * before the per-file loop — nothing is linted, so no `files[]` entry can
+    //     carry a key that names no file under `dir`.
+    // The failure is NOT propagated with `?`: the caller returns `miette::Result`,
+    // and a bare `?` would render a human diagnostic and drop the JSON
+    // analysis-failure envelope that `--format json` consumers parse.  Same shape
+    // as the symlinked-root rejection at the top of `run_lint`.
+    let mut keyed: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
+    for p in files {
+        match relative_display(&p, dir) {
+            Ok(display) => keyed.push((p, display)),
+            Err(e) => {
+                emit_analysis_failure_json_or_stderr(&e, format, None);
+                std::process::exit(mds_error_exit_code(&e));
+            }
+        }
+    }
+
     // F1: sort by (sanitized_display_key, raw_os_path) so that:
     // 1. Array position is consistent with the sanitized `files[].file` key
     //    emitted by `to_canonical_json` for diagnostic entries (AC-P1-10).
-    // 2. An OsString secondary key breaks any ties when two different non-UTF-8
-    //    filenames produce the same `to_string_lossy` string — rare in practice,
-    //    but ensures deterministic order regardless of readdir enumeration order.
+    // 2. An OsString secondary key breaks any ties when two distinct paths produce
+    //    the same sanitized display key — rare in practice, but ensures
+    //    deterministic order regardless of readdir enumeration order.
     //
     // `Path::Ord` (component-wise) diverges from byte-order when a path-separator
     // character appears WITHIN a filename component — e.g. `api-utils.mds` sorts
@@ -1437,12 +1470,9 @@ fn run_lint_directory(
     //
     // `sort_by_cached_key` computes each key once — O(n) allocations, not O(n log n)
     // (AC-P1-22).
-    files.sort_by_cached_key(|p| {
+    keyed.sort_by_cached_key(|(p, display)| {
         (
-            mds::sanitize_control_chars_wire(
-                &relative_display(p, dir).expect("relative_display is infallible until #217 lands"),
-            )
-            .into_owned(),
+            mds::sanitize_control_chars_wire(display).into_owned(),
             p.as_os_str().to_os_string(),
         )
     });
@@ -1463,24 +1493,30 @@ fn run_lint_directory(
     let mut limit_file_count: usize = 0;
 
     let ctx = LintDirCtx {
-        lint_root: dir,
         flags,
         runtime_vars: &runtime_vars,
         base_dir_cache: RefCell::new(HashMap::new()),
         config_dir_cache: RefCell::new(HashMap::new()),
     };
 
-    for file in &files {
+    for (file, display_path) in &keyed {
         let tally = if format == LintFormat::Json {
             lint_one_file_accumulating(
                 file,
+                display_path,
                 &ctx,
                 &mut json_files,
                 &mut any_truncated,
                 &mut any_would_fix,
             )
         } else {
-            lint_one_file_human(file, &ctx, &mut any_truncated, &mut any_would_fix)
+            lint_one_file_human(
+                file,
+                display_path,
+                &ctx,
+                &mut any_truncated,
+                &mut any_would_fix,
+            )
         };
         // AD-216-5: exhaustive match — a future FileTally variant becomes a compile
         // error here rather than being silently uncounted in the summary.
@@ -1501,7 +1537,7 @@ fn run_lint_directory(
     // suppression, never data corruption.
     debug_assert_eq!(
         clean_count + warn_file_count + error_file_count + limit_file_count,
-        files.len(),
+        keyed.len(),
         "AD-216-5: FileTally partition invariant violated"
     );
 
@@ -1565,6 +1601,7 @@ fn run_lint_directory(
 /// Lint one file in directory mode, accumulating results into a JSON array.
 fn lint_one_file_accumulating(
     file: &Path,
+    display_path: &str,
     ctx: &LintDirCtx<'_>,
     json_files: &mut Vec<serde_json::Value>,
     any_truncated: &mut bool,
@@ -1579,22 +1616,22 @@ fn lint_one_file_accumulating(
         ..
     } = ctx.flags;
 
-    // Compute a display path relative to the lint root so JSON `file` keys
-    // are navigable and unique across the whole directory tree (not just basenames).
-    // `relative_display` normalises to forward slashes.  `to_canonical_json` then
-    // sanitizes the key via `sanitize_control_chars_wire`; `run_lint_directory`
-    // sorts on that same sanitized string, so emitted array order and emitted file
-    // key order are consistent for all inputs including control-byte filenames
-    // (AC-P1-10).
-    let display_path = relative_display(file, ctx.lint_root)
-        .expect("relative_display is infallible until #217 lands");
+    // `display_path` is the lint-root-relative key computed once by
+    // `run_lint_directory`'s pre-pass (#217) — it is never recomputed here, so a
+    // path this helper could not name has already failed the whole run.  It is
+    // navigable and unique across the whole directory tree (not just basenames)
+    // and normalised to forward slashes.  `to_canonical_json` then sanitizes the
+    // key via `sanitize_control_chars_wire`; `run_lint_directory` sorts on that
+    // same sanitized string, so emitted array order and emitted file key order
+    // are consistent for all inputs including control-byte filenames (AC-P1-10).
+    //
     // Error-only entries (`{"file": …, "error": …}`) bypass `to_canonical_json`
     // and therefore bypass its `sanitize_control_chars_wire` pass.  Pre-sanitize
     // here so the `file` key in error entries is treated identically to the `file`
     // key in diagnostic entries — hostile filenames cannot inject control, bidi,
     // or separator characters into either entry type (spec.md §lint-json `file`
     // contract; ADR-008).
-    let file_key = mds::sanitize_control_chars_wire(&display_path).into_owned();
+    let file_key = mds::sanitize_control_chars_wire(display_path).into_owned();
 
     // `source` is only consumed in the fix branch (below); the report-only/JSON
     // path does not need it — mds::lint() reads the file independently (I-06).
@@ -1630,7 +1667,7 @@ fn lint_one_file_accumulating(
         }
     };
     // Remap basename-only file field → relative display path.
-    set_diag_display_path(&mut result, &display_path);
+    set_diag_display_path(&mut result, display_path);
 
     if result.truncated {
         *any_truncated = true;
@@ -1667,7 +1704,7 @@ fn lint_one_file_accumulating(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            &display_path,
+            display_path,
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1757,7 +1794,7 @@ fn lint_one_file_accumulating(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            &display_path,
+            display_path,
         ) {
             PreviewOutcome::WouldFix {
                 ref fixed,
@@ -1795,6 +1832,7 @@ fn lint_one_file_accumulating(
 /// Lint one file in directory mode, rendering diagnostics to stderr (human mode).
 fn lint_one_file_human(
     file: &Path,
+    display_path: &str,
     ctx: &LintDirCtx<'_>,
     any_truncated: &mut bool,
     any_would_fix: &mut bool,
@@ -1807,12 +1845,11 @@ fn lint_one_file_human(
         ..
     } = ctx.flags;
 
-    // Compute a display path relative to the lint root for human rendering.
-    // `relative_display` normalises to forward slashes, matching the unsanitized
-    // base used by `run_lint_directory`'s sort (AC-P1-10).  Human rendering
-    // shows the real filename bytes rather than sanitized `\uXXXX` escapes.
-    let display_path = relative_display(file, ctx.lint_root)
-        .expect("relative_display is infallible until #217 lands");
+    // `display_path` is the lint-root-relative key computed once by
+    // `run_lint_directory`'s pre-pass (#217), normalised to forward slashes and
+    // identical to the unsanitized base used by that pre-pass's sort (AC-P1-10).
+    // Human rendering shows the real filename bytes rather than sanitized
+    // `\uXXXX` escapes.
 
     let source = match read_source_file(file) {
         Ok(s) => s,
@@ -1837,7 +1874,7 @@ fn lint_one_file_human(
     };
 
     // Named source for span rendering: relative display path + source text.
-    let named_source = (display_path.as_str(), source.as_str());
+    let named_source = (display_path, source.as_str());
 
     let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
@@ -1851,7 +1888,7 @@ fn lint_one_file_human(
         }
     };
     // Remap basename-only file field → relative display path.
-    set_diag_display_path(&mut result, &display_path);
+    set_diag_display_path(&mut result, display_path);
 
     if result.truncated {
         *any_truncated = true;
@@ -1874,7 +1911,7 @@ fn lint_one_file_human(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            &display_path,
+            display_path,
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1944,7 +1981,7 @@ fn lint_one_file_human(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            &display_path,
+            display_path,
         ) {
             PreviewOutcome::WouldFix {
                 ref fixed,
