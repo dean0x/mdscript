@@ -2326,7 +2326,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     // Delete the entry file (parent intact).
     std::fs::remove_file(&src).unwrap();
 
-    // Scale-invariant error bound (guards PF-006): run two equal idle windows and assert
+    // Scale-invariant error bound (guards against once-per-tick re-firing — the watcher self-trigger pitfall): run two equal idle windows and assert
     // the error count does NOT grow in the second window.  A per-tick implementation would
     // accumulate one error per tick across BOTH windows; the fix settles quickly after the
     // initial native-event errors and is then silent.
@@ -2788,7 +2788,8 @@ fn watch_dir_mode_persistent_error_bounded_count() {
         "a.md should compile despite bad.mds error"
     );
 
-    // Scale-invariant error bound (applies ADR-021, guards PF-006): run two equal idle
+    // Scale-invariant error bound (applies the reconcile rule — see the `src/watch.rs`
+    // module doc — and guards against once-per-tick re-firing): run two equal idle
     // windows and assert the "undefined variable" count does NOT grow in the second window.
     // A per-tick implementation would fire continuously; error-settle means it fires once at
     // startup and then goes silent.
@@ -2823,7 +2824,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     assert_eq!(
         count_w1, count_w2,
         "error count must not grow in a second idle window (not once-per-tick); \
-         w1={count_w1}, w2={count_w2} (applies ADR-021, guards PF-006); \
+         w1={count_w1}, w2={count_w2} (reconcile rule; no once-per-tick re-firing); \
          stderr:\n{stderr_str}"
     );
 }
@@ -3092,7 +3093,7 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
 
 // ── QA Fix: File-mode parent dir deleted — bounded errors then recovers ───────
 
-/// Regression test for the edge-triggered recovery fix (ADR-021).
+/// Regression test for the edge-triggered recovery fix (reconcile rule).
 ///
 /// When the watched entry's PARENT DIRECTORY is deleted entirely, the per-tick
 /// `watcher.watch()` re-arm fails every idle tick (the parent is missing).  Before the
@@ -3144,7 +3145,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     // Delete the ENTIRE parent directory (not just the file — this is the bug scenario).
     std::fs::remove_dir_all(&src_dir).unwrap();
 
-    // Scale-invariant error bound (guards PF-006, applies ADR-021): run two equal idle
+    // Scale-invariant error bound (reconcile rule; guards against once-per-tick re-firing): run two equal idle
     // windows and assert the error count does NOT grow in the second window.  A per-tick
     // implementation would produce ≥1 error per tick continuously; the fix settles after
     // the initial native-event error(s) and then goes silent.
@@ -3170,7 +3171,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
         count_w1, count_w2,
         "error count must not grow in a second idle window (not once-per-tick); \
          w1={count_w1}, w2={count_w2} — the fix must settle after initial native-event errors \
-         (applies ADR-021, guards PF-006)"
+         (reconcile rule; no once-per-tick re-firing)"
     );
 
     // Recreate the parent directory and write the file with new content.
@@ -3211,16 +3212,16 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
 /// compiles to complete, then idle for ≥10 poll-interval ticks and assert ZERO
 /// "Recompiled" lines in the idle window.
 ///
-/// This is the regression guard for the ADR-021 invariant: "idle cost stays O(1)
+/// This is the regression guard for the reconcile-rule invariant: "idle cost stays O(1)
 /// regardless of tree size."  A per-tick full-tree walk (the anti-pattern) would
 /// manifest as spurious "Recompiled" events under CI load; the edge-triggered
-/// liveness probe (ADR-021) must emit none.
+/// liveness probe (reconcile rule) must emit none.
 ///
 /// An additional positive observable — the sentinel output file's mtime must not
 /// advance during the idle window — makes the failure mode deterministic rather
 /// than relying on timing luck alone.
 ///
-/// applies ADR-021
+/// applies the reconcile rule
 #[test]
 fn watch_dir_mode_idle_500_files_no_recompile() {
     const FILE_COUNT: usize = 500;
@@ -3277,7 +3278,7 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
 
     // Idle for ≥10 ticks at 50ms poll-interval (500ms total, bounded).  A per-tick
     // full-tree walk would trigger O(FILE_COUNT) work per tick; edge-triggered probes
-    // (ADR-021) must emit zero "Recompiled" lines during this window.
+    // (reconcile rule) must emit zero "Recompiled" lines during this window.
     std::thread::sleep(Duration::from_millis(600));
 
     let stderr_str = stderr_tap.finish_text(&mut child);
@@ -3286,7 +3287,7 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
     assert_eq!(
         recompiled_count, 0,
         "AC-P5: idle dir-mode watcher over {FILE_COUNT} files must emit 0 Recompiled \
-         across ≥10 ticks (ADR-021: idle cost is O(1) regardless of tree size); \
+         across ≥10 ticks (reconcile rule: idle cost is O(1) regardless of tree size); \
          got {recompiled_count}; stderr:\n{stderr_str}"
     );
 
@@ -4524,7 +4525,7 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
 // ── I16-I18: duplicate --vars file key warnings under `mds watch` (#326) ─────
 //
 // Unlike I8/I9 (--set/--set-string warn once per SESSION, at startup), a
-// duplicate in the --vars FILE warns at startup AND on every rebuild: ADR-016
+// duplicate in the --vars FILE warns at startup AND on every rebuild: the freshness rule
 // reloads the vars file on every rebuild, so a duplicate present in it is
 // re-reported each time (D9).
 
@@ -4570,7 +4571,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
         "I16: expected exactly 1 warning at startup; stderr:\n{stderr_after_start}"
     );
 
-    // Edit 1: trigger a rebuild — ADR-016 reloads the vars file, re-reporting the
+    // Edit 1: trigger a rebuild — the freshness rule reloads the vars file, re-reporting the
     // duplicate.
     write_atomic(&src, "version 2");
     assert!(

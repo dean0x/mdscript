@@ -1634,7 +1634,7 @@ fn f8_child_can_use_own_fm_import_alias() {
 
 #[test]
 fn f8_duplicate_alias_base_and_child_error() {
-    // F8/ADR-014: same alias in both base and child frontmatter imports → mds::name_collision.
+    // F8 (frontmatter-first import ordering): same alias in both base and child frontmatter imports → mds::name_collision.
     let lib = "@define foo():\nfoo\n@end\n";
     let base = concat!(
         "---\n",

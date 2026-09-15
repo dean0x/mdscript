@@ -965,7 +965,8 @@ impl MdsError {
     /// evaluator runs without source context — see the arity span-divergence
     /// note in `evaluator.rs`), `MixedContent` is a *structural* error about the
     /// template's shape: the offending node's byte offset is known statically
-    /// from the AST, so the diagnostic underlines the orphan content (ADR-022).
+    /// from the AST, so the diagnostic underlines the orphan content (the origin rides
+    /// along the node, so no path→source lookup is needed).
     ///
     /// `offset`/`len` index into `source`; the shared [`at`] guard drops `src`
     /// (keeping raw offset/length for `serialize()`) if they fall out of bounds,
