@@ -11,7 +11,7 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-09-15
+updated: 2026-09-16
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
@@ -346,9 +346,9 @@ Source text passed to `NamedSource` uses a different function: `neutralize_sourc
 
 - **C0/DEL (1-byte)** → `?` (1 byte)
 - **C1 (U+0080–U+009F) AND U+061C** (both 2-byte UTF-8) → U+00A0 NBSP (2 bytes). U+061C is in the 2-byte branch.
-- **The other 11 format hazards** (U+200E/U+200F, U+2028/U+2029, U+202A–U+202E, U+2066–U+2069, U+FEFF — all 3-byte) → U+FFFD REPLACEMENT CHARACTER (3 bytes).
+- **The other 14 format hazards** (U+200E/U+200F, U+2028/U+2029, U+202A–U+202E, U+2066–U+2069, U+FEFF — all 3-byte) → U+FFFD REPLACEMENT CHARACTER (3 bytes).
 
-The split is implemented via two private predicates: `is_two_byte_format_hazard(ch)` (only U+061C) and `is_three_byte_format_hazard(ch)` (the remaining 11). An unconditional `assert_eq!` (promoted from `debug_assert_eq!`, #220) in `neutralize_source_for_render` catches byte-length violations immediately, in release builds too.
+The split is implemented via two private predicates: `is_two_byte_format_hazard(ch)` (only U+061C) and `is_three_byte_format_hazard(ch)` (the remaining 14). An unconditional `assert_eq!` (promoted from `debug_assert_eq!`, #220) in `neutralize_source_for_render` catches byte-length violations immediately, in release builds too.
 
 ### `named_source_for_render` — The Single NamedSource Builder
 
@@ -371,6 +371,7 @@ The auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_sou
 |----------|------|--------|
 | `eprint_error` (output.rs) via `SanitizedReport` | HUMAN for prose | message, help, label text, entire auxiliary graph — every report rendered to CLI stderr |
 | `eprint_warning` (output.rs) | prose HUMAN; interpolated identifiers/paths WIRE | HUMAN for the warning body prose; `safe_path` / `safe_inline` for any untrusted value the caller interpolates into it |
+| `emit_duplicate_vars_file_warnings` (build.rs) | prose HUMAN via `eprint_warning`; interpolated key/path/count WIRE | warns on `--vars`-file duplicate keys (#326) and on the count omitted past `mds::VarsLoad`'s cap; per AD-224-3 every interpolated value is wrapped in `safe_inline`/`safe_path` at the interpolation site, never hoisted into a `let` first; no-op when `quiet` (AD-224-5) |
 | `safe_inline(value)` (output.rs) | WIRE | any single-line untrusted value interpolated into a status, warning, or error line: rule names, config paths, `--format` args, `io::Error` causes |
 | `safe_path(p)` / `safe_file_display(name)` (output.rs) | WIRE | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) |
 | `named_source_for_render(file, source)` (diagnostic.rs) | WIRE for filename; neutralize for source | the single `NamedSource` builder used by `MdsError::at()`, `check_equivalence`, `render_diag_human` |
@@ -423,7 +424,7 @@ The test anchor inventory covers five surfaces across both error and lint paths.
 **T-15** `web.rs` WASM (F5/F5-DEL/F6/F6-C1)  
 **T-16f** `diagnostic.rs` — U+2028 in wire message  
 **T-16g** `diagnostic.rs` — wire-mode newline escaping / HUMAN mode preserves `\n`  
-**T-16h** `diagnostic.rs` — WIRE and HUMAN modes differ only on `\n`  
+**T-16h** `diagnostic.rs` — WIRE and HUMAN modes differ only on `\n`; use a newline-bearing key to catch a dropped sanitizer at runtime  
 **T-16i** `diagnostic.rs` — WIRE mode: borrowed-on-clean, idempotent  
 **T-NS-1/2/3** `diagnostic.rs` — `named_source_for_render`: hostile filename WIRE, hostile filename bidi class, source neutralized without changing byte length  
 **T-AUX-1/2/3** `output.rs` — `SanitizedReport`: cause chain escaped+preserved, related diagnostics escaped+preserved, cyclic cause chain bounded at `MAX_AUX_DEPTH`  
@@ -575,6 +576,8 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **Clippy stale cache can report a pass on dirty code**: Deleting `LintConfig::from_rules` (PR #308) surfaced an unused `use super::helpers::*;` in `crates/mds-core/src/parser_tests.rs`. A `cargo clippy --workspace --all-targets` run immediately after reported a stale cached pass. Touch the file to force a real re-check before trusting a `clippy` clean result after a deletion.
 
+**`safe_inline` is generic over `Display`, including `usize`**: `emit_duplicate_vars_file_warnings` calls `safe_inline(resolved.duplicate_vars_file_keys_omitted)` (build.rs:660) on a plain count, not just on untrusted strings. A `usize` can never carry a control byte, but `print_discipline.rs`'s guard is purely lexical — it matches on the callee name at the interpolation site, not on the argument's type — so skipping the wrapper because "it's just a number" fails the guard exactly like an unwrapped string would. Wrap every interpolated value, even a provably-safe one, or the print-discipline test fails closed.
+
 ## Related Follow-ups / Known Limitations
 
 - **#173**: `run_lint_file` FixFileOutcome 3rd-copy duplication and dir-mode JSON per-file wrapper churn.
@@ -587,7 +590,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 - `crates/mds-core/src/lint/mod.rs` — engine entry point; `lint_source()`, `run_rules()`, partial detection
 - `crates/mds-core/src/lint/tier.rs` — fix tier table (leaf module); `is_output_neutral(rule)`; `first_occurrence` helper
-- `crates/mds-core/src/lint/diagnostic.rs` — `LintDiagnostic`, `LintResult`, `to_canonical_json()` (WIRE: message/help/file key); `sanitize_control_chars` (HUMAN, `Cow`, `#[must_use]`, idempotent); `sanitize_control_chars_wire` (WIRE, new public API, shares one impl via `EscapeMode`); `neutralize_source_for_render` (byte-length-preserving: C0/DEL → `?`, C1+U+061C → NBSP, other 11 hazards → U+FFFD); `named_source_for_render` (new public API, the single `NamedSource` builder); `is_two_byte_format_hazard` / `is_three_byte_format_hazard`
+- `crates/mds-core/src/lint/diagnostic.rs` — `LintDiagnostic`, `LintResult`, `to_canonical_json()` (WIRE: message/help/file key); `sanitize_control_chars` (HUMAN, `Cow`, `#[must_use]`, idempotent); `sanitize_control_chars_wire` (WIRE, new public API, shares one impl via `EscapeMode`); `neutralize_source_for_render` (byte-length-preserving: C0/DEL → `?`, C1+U+061C → NBSP, other 14 hazards → U+FFFD); `named_source_for_render` (new public API, the single `NamedSource` builder); `is_two_byte_format_hazard` / `is_three_byte_format_hazard`
 - `crates/mds-core/src/error.rs` — `MdsError`: `serialize()` (WIRE message/help); `display_sanitized()` (HUMAN Display for TTY); raw `Display` documented as unsanitized; `at()` (uses `named_source_for_render` — inherited by all `*_at` constructors)
 - `crates/mds-core/src/lib.rs` — `CompileResult::to_canonical_json()` (WIRE warnings, distinct from `LintResult::to_canonical_json`); `emit_warnings()` (HUMAN for prose; identifiers WIRE at construction)
 - `crates/mds-core/src/lint/fix.rs` — `plan_fixes_with_options`, `diag_to_edits`, `ByteEdit`, `apply_plan_unchecked`, `dedup_contained_or_identical`, `apply_fixes_incremental`, `FixOutcome`; `reverify_failure_reason()` (sole construction site for `Rejected.reason`, WIRE)

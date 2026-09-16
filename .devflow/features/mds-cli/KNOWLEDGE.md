@@ -14,14 +14,14 @@ referencedFiles:
   - crates/mds-cli/tests/intrinsic_output.rs
   - crates/mds-cli/Cargo.toml
 created: 2026-06-26
-updated: 2026-09-15
+updated: 2026-09-16
 ---
 
 # MDS CLI (mds-cli)
 
 ## Overview
 
-`crates/mds-cli/` implements the `mds` binary with four subcommands: `build`, `check`, `watch`, and `init`. The CLI delegates all compilation to `mds-core`; its job is input resolution, output routing, config loading, and process lifecycle. After the intrinsic-output refactor, **the output extension is derived from the compiled result's kind** — there is no `--format` flag. Markdown templates produce `.md` files; messages templates produce `.json` files.
+`crates/mds-cli/` implements the `mds` binary with six subcommands: `build`, `check`, `fmt`, `lint`, `watch`, and `init`. The CLI delegates all compilation to `mds-core`; its job is input resolution, output routing, config loading, and process lifecycle. After the intrinsic-output refactor, **the output extension is derived from the compiled result's kind** — there is no `--format` flag. Markdown templates produce `.md` files; messages templates produce `.json` files.
 
 The CLI now supports both single-file and directory modes for `build` and `check`. Directory mode (`mds build <dir>` / `mds check <dir>`) recursively compiles all non-partial `.mds` files under the given root, mirrors the subtree into an optional `--out-dir`, and continues on error with a final summary.
 
@@ -205,6 +205,8 @@ Exit codes:
 - Watch mode derives the extension from `compiled.kind.extension()` after each compile. On deletion it must probe both `.md` and `.json` since the kind is not known.
 - The `CompileOutput` struct in `build.rs` is a local CLI struct (content + kind + deps) — not the same as `mds::CompiledOutput` (the Rust enum). The naming is similar but they are different types.
 - `mds.json build.output_dir` rejects `..` components at parse time to prevent path traversal. This check runs in both single-file and directory mode.
+- Debounce is a quiet period, not a fixed window (#379, `watch.rs`): the first relevant content event opens a `--debounce` window and every further content event restarts it (`Access` events and watch errors do not restart it); the window is bounded by `debounce_cap = max(10 × window, 1s)` and `--debounce` itself is clamped to `MAX_DEBOUNCE_MS = 60_000` (60s), with an additional `MAX_DEBOUNCE_MESSAGES = 10_000` drained-message cap; a window's exit reason is one of `DebounceEnd::{Quiet, Cap, MessageLimit, Disabled, Interrupted, Disconnected}`.
+- Every write the CLI performs funnels through `atomic_write_file` (`output.rs`, #227): temp-file + rename, refusing a symlink at the target; `Durability::Fsync` is used for source rewrites (`fmt`, `lint --fix`) and `Durability::RenameOnly` for reproducible derived artifacts (`build`/`watch`/`init`, #386). `crates/mds-cli/tests/write_funnel.rs` is a lexical guard that fails if a new raw `fs::write`/`File::create` site appears in `crates/mds-cli/src/**` outside its allow-list. An empty directory is now a hard failure (not silent success) for `build`/`check`/`fmt`/`lint` (#204), and a directory whose only `.mds` files are partials is the same "nothing to do" failure (#387).
 
 ## Key Files
 

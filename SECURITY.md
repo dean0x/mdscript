@@ -59,6 +59,10 @@ input. The compiler enforces several defense-in-depth controls:
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 
+The symlink, containment, NUL-byte and path-encoding rules above are specified
+normatively — with their error codes and the tests that pin them — in `spec.md`
+§4.6 "Filesystem constraints"; this section is the overview.
+
 ### Resource limits
 
 | Limit | Value | Location |
@@ -85,12 +89,23 @@ growth, or non-termination.
 
 ## ⚠️ The `debug-panics` feature must never ship enabled
 
-`mds-core`, `mds-wasm`, and `mds-napi` expose an off-by-default `debug-panics`
-Cargo feature. It surfaces the raw Rust panic payload (as `err.detail` on
-`mds::internal` errors) to help diagnose unexpected panics during local
-development.
+The three binding crates — `mds-napi`, `mds-wasm` and `mds-python` — declare an
+off-by-default `debug-panics` Cargo feature (`crates/mds-napi/Cargo.toml`,
+`crates/mds-wasm/Cargo.toml`, `crates/mds-python/Cargo.toml`). `mds-core` and
+`mds-cli` have no such feature: the CLI installs no panic hook, so a panic there is
+a plain Rust panic (exit code 101) with no error object to attach a payload to. When
+enabled, the feature surfaces the raw Rust panic payload as `err.detail` on
+`mds::internal` errors thrown at the binding boundary, to help diagnose unexpected
+panics during local development.
 
-**Never enable `debug-panics` in a published or production build.** Panic
-messages can contain absolute filesystem paths and other internal details that
-should not be exposed to template authors or end users. All release builds and
-published artifacts are built with the feature disabled.
+**Never enable `debug-panics` in a published or production build.** Panic messages
+can contain absolute filesystem paths and other internal details that should not be
+exposed to template authors or end users. The feature is off unless opted into
+explicitly: none of the three crates lists it in a `default` feature set
+(`mds-python`'s default is `extension-module` only), and the commands that build the
+published artifacts — `napi build --release` in `release.yml` for the addon, the
+`@mdscript/mds-wasm` build script (`wasm-pack build ../../crates/mds-wasm --target
+nodejs …` and `--target web …`) for the WASM package, and `maturin` with
+`pyproject.toml`'s `features = ["pyo3/abi3-py311"]` for the wheels — pass no
+`--features debug-panics`. No automated gate asserts this; it is checked by reading
+those three build sites.
