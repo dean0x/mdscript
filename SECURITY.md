@@ -59,6 +59,10 @@ input. The compiler enforces several defense-in-depth controls:
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 
+The symlink, containment, NUL-byte and path-encoding rules above are specified
+normatively — with their error codes and the tests that pin them — in `spec.md`
+§4.6 "Filesystem constraints"; this section is the overview.
+
 ### Resource limits
 
 | Limit | Value | Location |
