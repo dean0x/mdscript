@@ -873,6 +873,62 @@ mds::undefined_var
 
 Errors include a diagnostic code (`mds::*`), file path, line number, column, a visual span, and a contextual explanation. Compilation fails fast on first error; no partial output.
 
+### Error Codes
+
+Each `MdsError` the compiler produces, and each error a binding synthesises at its
+boundary, carries a `code` of the form `mds::<name>`. On the CLI the code is the first
+line of the rendered diagnostic (above) and the `error.code` field of the
+`mds lint --format json` envelope; on napi and WASM it is `err.code`; on Python it is
+`MdsError.code`; in `@mdscript/mds` it is the `code` property `isMdsError()` checks.
+Codes are stable identifiers a consumer may branch on; renaming or removing one is a
+breaking change.
+
+"Exit" is the CLI exit class (§7.9) for `mds build`, `mds check`, `mds fmt` and
+`mds watch` startup — 1 template or content error, 2 I/O or file-system error,
+3 resource limit — followed by the `mds lint` code, which reports analysis failures
+as 2 except for the two carve-outs shown.
+
+| Code | Meaning | Raised by | Exit | Surfaces |
+|---|---|---|---|---|
+| `mds::syntax` | Parse error: unexpected token, unclosed block, malformed directive | parser | 1 / 2 | all |
+| `mds::undefined_var` | Variable not defined in frontmatter, imports or runtime vars | validator, evaluator | 1 / 2 | all |
+| `mds::undefined_fn` | Function not defined with `@define` or imported | validator | 1 / 2 | all |
+| `mds::arity` | Wrong number of arguments in a call | validator | 1 / 2 | all |
+| `mds::builtin` | A built-in function rejected its arguments at runtime | evaluator | 1 / 2 | all |
+| `mds::type_error` | `@for` over a value that is not an array | evaluator | 1 / 2 | all |
+| `mds::type_mismatch` | Cross-type `==` / `!=` comparison | evaluator | 1 / 2 | all |
+| `mds::circular_import` | Import graph contains a cycle | resolver | 1 / 2 | all |
+| `mds::file_not_found` | Entry file or import target does not exist (native backend) | `NativeFs`, CLI input check | 2 / 2 | CLI, Rust, napi, Python |
+| `mds::import` | An `@import` the resolver refuses: not `./`/`../`-relative, empty, NUL byte, symlinked final component, escapes the project root, or another import-directive violation (§4.6 "Filesystem constraints") | resolver, `NativeFs`, `VirtualFs` | 1 / 2 | all |
+| `mds::name_collision` | A merge import or definition redefines a name already in scope | resolver | 1 / 2 | all |
+| `mds::not_mds` | Input is not an MDS file (no `.mds` extension and no `type: mds` frontmatter) | CLI input check, file API | 2 / 2 | CLI, Rust |
+| `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; on the CLI also a `--vars` file that is a symlink and a `lint --fix` rewrite refused by the compile-equivalence check | `mds-core` API boundary, CLI | 2 / 2 | CLI, Rust, napi, Python |
+| `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`); bindings also raise it before compilation for oversized sources, module maps and counts | evaluator, resolver, `VirtualFs`, bindings | 3 / 3 | all |
+| `mds::yaml` | Frontmatter YAML the parser itself refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1) | resolver | 1 / 2 | all |
+| `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites | `mds-core` vars API | 1 / 2 | Rust, CLI |
+| `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
+| `mds::var_conflict` | Same key given to both `--set` and `--set-string` | CLI | 1 / 1 | CLI |
+| `mds::module_not_found` | Virtual backend: a key absent from the module map | `VirtualFs` | 1 / 2 | napi, WASM, Python, Rust |
+| `mds::recursion` | A `@define` calls itself, directly or indirectly | evaluator | 1 / 2 | all |
+| `mds::export` | `@export` of a name that is not defined, or an invalid re-export | resolver | 1 / 2 | all |
+| `mds::extends` | Template inheritance error (E1–E10, §4.11) | resolver | 1 / 2 | all |
+| `mds::mixed_content` | Content outside `@message` blocks in a messages template | evaluator | 1 / 2 | all |
+| `mds::expected_markdown` | Rust API only: `CompileResult::into_markdown()` on a messages result | `mds-core` API | n/a | Rust |
+| `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
+| `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
+| `mds::internal` | A panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`) | napi, WASM, Python | n/a | napi, WASM, Python |
+| `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath` | napi, WASM, Python, `@mdscript/mds` | n/a | napi, WASM, Python, `@mdscript/mds` |
+| `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
+| `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
+
+CLI-authored errors that are not `MdsError`s — an unreadable, oversized or malformed
+`mds.json`, `mds init` refusing a `..` path, a failed stdout write — carry no `mds::`
+code; they exit 1 under `build`/`check`/`fmt` and 2 under `lint`. A panic on the CLI is
+not converted into an error object: it is a Rust panic with exit code 101. The
+`mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
+`MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised
+by the bindings and do not exist in `mds-core`.
+
 ---
 
 ## 6. Scoping Rules
@@ -1362,6 +1418,8 @@ Maximum config file size: 1 MB.
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8) |
 | `3` | Resource limit exceeded |
+
+The code-by-code classification behind these tables is the "Error Codes" registry in §5.
 
 ---
 

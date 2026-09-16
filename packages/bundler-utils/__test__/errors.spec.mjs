@@ -10,7 +10,7 @@ import { formatMdsError } from '../dist/index.js';
 // ---------------------------------------------------------------------------
 function makeMdsError(opts = {}) {
   const err = new Error(opts.message ?? 'Something went wrong');
-  err.code = opts.code ?? 'mds::undefined_variable';
+  err.code = opts.code ?? 'mds::undefined_var';
   if (opts.help !== undefined) err.help = opts.help;
   if (opts.span !== undefined) err.span = opts.span;
   return err;

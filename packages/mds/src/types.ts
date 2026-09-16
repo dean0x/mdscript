@@ -397,7 +397,7 @@ export interface MdsErrorSpan {
 
 /** Error thrown by the MDS compiler. Use `isMdsError` to identify these. */
 export interface MdsError extends Error {
-  /** Namespaced error code, e.g. `"mds::undefined_variable"`. */
+  /** Namespaced error code, e.g. `"mds::undefined_var"`. */
   code: string;
   /** Optional human-readable guidance on how to fix the error. */
   help?: string;
