@@ -19,9 +19,11 @@ body:
         - Native addon (`@mdscript/mds-napi`)
         - WASM (`@mdscript/mds-wasm`)
         - Universal bindings (`@mdscript/mds`)
+        - Python (`markdown-script`)
         - Vite plugin
         - Rollup plugin
         - Webpack loader
+        - Rspack loader
         - Other / not sure
     validations:
       required: true
@@ -29,7 +31,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: Crate or npm package version (e.g. `mds-cli 0.1.0`, `@mdscript/mds 0.1.0`).
+      description: Crate, npm package, or PyPI package version (e.g. `mds-cli X.Y.Z`, `@mdscript/mds X.Y.Z`, `markdown-script X.Y.Z`).
       placeholder: "0.1.0"
     validations:
       required: true
@@ -54,7 +56,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS + arch, Node version (if applicable), Rust version (if building from source).
-      placeholder: "macOS 14 arm64, Node 22.3, rustc 1.88"
+      description: OS + arch, Node version (if applicable), Python version (if applicable), Rust version (if building from source).
+      placeholder: "macOS 14 arm64, Node 22.3, Python 3.12, rustc 1.88"
     validations:
       required: false
