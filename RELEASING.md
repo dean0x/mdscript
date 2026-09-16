@@ -341,9 +341,9 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
    printed command without modification.)
 3. **Tag the merged commit and push:**
    Wait for the `CI` workflow run on the merge commit to finish green
-   (`gh run list --commit <sha>` / `gh run watch <id>`): the release's
-   version-gate asserts a completed+success CI run for the tagged SHA and fails
-   closed while it is still running.
+   (`gh run list --commit <sha>` / bounded polling with `gh run view <id> --json
+   status,conclusion`): the release's version-gate asserts a completed+success CI
+   run for the tagged SHA and fails closed while it is still running.
    ```bash
    git tag -a vX.Y.Z -m vX.Y.Z
    git push origin vX.Y.Z
@@ -382,14 +382,46 @@ The `release.yml` workflow runs, in order:
       `load-test-musl-arm64`, `build-python`, AND `rehearse-publish-python`
       succeed. `cargo publish` `mds-core`, polls the crates.io index for up to
       5 min (bounded, max 20 × 15 s), then `mds-cli`.
-   8. **publish-npm** and **publish-python** (parallel, both after publish-crates)
-      — publish npm packages (with provenance) and PyPI `markdown-script` (OIDC
-      trusted publishing + PEP 740 attestations, `skip-existing: true`).
+   8. **publish-npm**, then **publish-python** (`publish-python` `needs`
+      `publish-npm`) — publish npm packages (with provenance) and PyPI
+      `markdown-script` (OIDC trusted publishing + PEP 740 attestations,
+      `skip-existing: true`).
    9. **github-release** — `gh release create` with generated notes; runs only
       after all three publish jobs succeed.
 
    `publish-testpypi` never runs on a tag: it is guarded by `inputs.testpypi`,
    which only a `workflow_dispatch` can set. On a tag push it reports `skipped`.
+
+### When a tag-push release fails part-way
+
+`release.yml` is a chain of gates followed by irreversible publishes. The name of
+the failed job tells you what has already happened: nothing publishes before
+`Publish to crates.io`, and inside that job nothing is irreversible until the
+`Publish mds-core` step succeeds.
+
+| Failed job | Already irreversible | Recovery |
+|---|---|---|
+| `Version gate` — version mismatch, CI-history gate on a still-running CI run, credential or OIDC probe, source hygiene | Nothing | Fix the cause. CI still running or just finished: wait for it, then `gh run rerun <run-id> --failed`. Wrong commit tagged (version mismatch, hygiene): delete the tag (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), land the fix via PR, wait for its CI, re-tag. |
+| `build-napi`, `build-python`, `Stage + verify platform packages`, `Alpine load test (linux-arm64-musl)`, `Rehearse PyPI publish (no upload)` | Nothing | Transient (runner, Docker Hub pull, registry outage): `gh run rerun <run-id> --failed` — re-runs the failed jobs and their dependents; upstream artifacts are reused. Genuine defect: land the fix, bump to the next patch version, tag that. Do not move a tag that a defect was found on. |
+| `Publish to crates.io` at `Publish mds-core` — the v0.4.0 case: HTTP 403 from a revoked token, run 33569514359 | Nothing | Fix the secret or cause, then `gh run rerun <run-id> --failed`. |
+| `Publish to crates.io` after `mds-core` is live — index poll timeout, `Publish mds-cli` failure | `mds-core@X.Y.Z` on crates.io (cannot be deleted; `cargo yank` only hides it from new resolutions) | Transient: `gh run rerun <run-id> --failed` — the `mds-core` step treats "already uploaded" as success and proceeds to `mds-cli`. Defect in `mds-cli`: the version is consumed for the whole workspace (one coordinated version); land the fix, bump to the next patch, optionally `cargo yank --version X.Y.Z mds-core`, and say so in the GitHub Release body. |
+| `Publish to npm` — any point | Both crates on crates.io; zero or more `@mdscript/*` packages at X.Y.Z on npm | `gh run rerun <run-id> --failed`: `napi prepublish` tolerates E403 for platform packages already published and `publish_if_absent` skips versions `npm view` already sees. **Do not publish from a workstation** — a laptop `npm publish` carries no OIDC provenance attestation, and that gap is permanent for the version. If a code or workflow change is required for the re-run to succeed: bump to the next patch; npm unpublish is restricted by registry policy and leaves the version number consumed either way, so retire a partial set with `npm deprecate` rather than trying to remove it. |
+| `Publish to PyPI` — the v0.4.1 case: `manifest unknown` on an annotated-tag-object pin (#350) | crates.io and the npm packages at X.Y.Z; `GitHub Release` was skipped | Transient: `gh run rerun <run-id> --failed` (`skip-existing: true` makes the upload re-run safe). Workflow or pin defect: per the tag-immutability rule above, the fix goes to a new commit rather than the tagged one, so land it and bump to the next patch (v0.4.2 was that release), then create the partial version's GitHub Release by hand so the tag is not left bare — `gh release create vX.Y.Z --title vX.Y.Z --generate-notes --latest=false` — with a body line naming which registries the version reached (v0.4.1 was backfilled this way on 2026-09-04). |
+| `GitHub Release` | Everything is published | `gh run rerun <run-id> --failed`, or by hand: `gh release create vX.Y.Z --title vX.Y.Z --generate-notes` (the job itself falls back to `gh release edit`). |
+
+Across rows:
+
+- Recover with `gh run rerun <run-id> --failed`, not by re-pushing the tag while a
+  run is in flight: the `release-<ref>` concurrency group has
+  `cancel-in-progress: false`, a second push queues behind the first, and a
+  cancelled run reads as not-failed to the pre-merge verifier.
+- Moving a tag is acceptable only while nothing has been published. Once
+  `mds-core` is on crates.io the version belongs to the artifacts built from the
+  tagged commit; re-running later jobs against a different commit would publish npm
+  or PyPI artifacts that do not match what crates.io holds. The next patch version
+  is the recovery.
+- Run the Post-release checks below per registry after a partial recovery — they are
+  how you confirm the recovery reached every leg that had failed.
 
 ## Post-release
 
@@ -400,7 +432,8 @@ The `release.yml` workflow runs, in order:
   - npm: `npm i @mdscript/mds` then `node -e "import('@mdscript/mds').then(m=>m.init())"`
   - Python: `pip install markdown-script` then
     `python -c "import markdown_script as m; print(m.compile('{{x}}', vars={'x':'ok'}).output)"`
-- Open a fresh `## [Unreleased]` section in `CHANGELOG.md`.
+- Confirm `## [Unreleased]` is empty — `bump-version.mjs` inserts the new version
+  heading beneath it and leaves the heading in place.
 
 ## Notes
 
