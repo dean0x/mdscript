@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-09-17
+
 ### Security
 
 - **Frontmatter YAML parsing is bounded (#162).** Adversarial frontmatter can no
@@ -1978,7 +1980,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/dean0x/mdscript/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/dean0x/mdscript/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/dean0x/mdscript/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dean0x/mdscript/compare/v0.3.0...v0.4.0
