@@ -1309,9 +1309,13 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
     // descheduled past the window (a 747ms inter-write gap was observed on CI), which
     // makes the sample inconclusive rather than failing. Retry the whole measurement a
     // bounded number of times, gated ONLY on that precondition — every behaviour
-    // assertion below still fails hard on the first attempt, so a real regression is
-    // never retried away.
-    const MAX_ATTEMPTS: u32 = 4;
+    // assertion below still fails hard on the first conclusive attempt, so a real
+    // regression is never retried or skipped away. If the cadence is still
+    // unsustainable after every attempt, the test SKIPS (prints a `SKIPPED
+    // (inconclusive harness)` line and, when running under GitHub Actions, appends a
+    // warning to the job summary) rather than failing the required check — see #397,
+    // which tracks root-causing the cadence problem on loaded runners.
+    const MAX_ATTEMPTS: u32 = 6;
     const WINDOW: Duration = Duration::from_millis(200);
 
     for attempt in 1..=MAX_ATTEMPTS {
@@ -1376,13 +1380,31 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
         // scheduling hiccup as a product failure.
         if max_gap >= WINDOW {
             drop(child);
-            assert!(
-                attempt < MAX_ATTEMPTS,
-                "the writer thread could not sustain a sub-{WINDOW:?} write cadence in \
-                 {MAX_ATTEMPTS} attempts (largest gap {max_gap:?}); the runner is too \
-                 loaded to exercise the cap deterministically"
+            if attempt < MAX_ATTEMPTS {
+                continue;
+            }
+            // Every attempt was inconclusive: the runner is too loaded to exercise the
+            // cap deterministically. Skip rather than fail the required check — no
+            // product behaviour was ever exercised — and leave a trail so this shows up
+            // in the run summary instead of silently vanishing. See #397.
+            eprintln!(
+                "SKIPPED (inconclusive harness): writer gap {max_gap:?} >= {WINDOW:?} on \
+                 all {MAX_ATTEMPTS} attempts"
             );
-            continue;
+            if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
+                use std::io::Write as _;
+                if let Ok(mut summary) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(summary_path)
+                {
+                    let _ = writeln!(
+                        summary,
+                        ":warning: watch cap test skipped — runner could not sustain cadence"
+                    );
+                }
+            }
+            return;
         }
 
         assert!(
@@ -1401,8 +1423,6 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
         );
         return;
     }
-
-    unreachable!("the loop returns on a conclusive attempt or asserts on the last one");
 }
 
 // ── AC-F10: Watch no-arg auto-detect ─────────────────────────────────────
