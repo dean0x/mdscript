@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- `cli_watch`: `watch_debounce_cap_rebuilds_while_writes_never_stop`'s harness precondition (the writer thread must sustain a sub-200ms write cadence) now retries up to 6 attempts (up from 4) and, when every attempt is still inconclusive, SKIPS with a `SKIPPED (inconclusive harness)` stderr line and a `$GITHUB_STEP_SUMMARY` warning instead of failing the required check — no product behaviour was exercised on that outcome, and every behaviour assertion is unchanged (#397).
+
 ## [0.4.3] — 2026-09-17
 
 ### Security
