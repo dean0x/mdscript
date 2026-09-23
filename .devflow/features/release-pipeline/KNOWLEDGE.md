@@ -256,7 +256,7 @@ Both musl matrix entries (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-mu
 it cannot be combined with `--use-napi-cross`.
 
 **cargo-zigbuild 0.23.0** is pinned via `taiki-e/install-action` at SHA
-`6c6fd71fe4fb72c3697d269963d0e15df8adedad` (= v2.85.10, composite action; SHA pin is correct
+`5b4d68e2e660441203ab128a23676f1e4faf1532` (= v2.86.3, composite action; SHA pin is correct
 per PF-040) with `tool: cargo-zigbuild@0.23.0`, `fallback: none`, placed BEFORE
 `Swatinem/rust-cache`. Step ordering in `build-napi` (musl legs):
 
