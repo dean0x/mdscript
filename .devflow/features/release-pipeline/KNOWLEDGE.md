@@ -5,7 +5,7 @@ description: "Use when modifying release.yml, adding CI jobs, updating TIER_B_EX
 category: architecture
 directories: [.github/workflows, .github/actions, scripts, scripts/__test__]
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-24
 ---
 
 # Release Pipeline Gates
@@ -188,7 +188,7 @@ Steps (in order):
 1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
 2. Assert synchronized versions, no `file:` refs.
 3. Assert no hazardous codepoints in tracked source.
-4. Run `npm run test:gates` — all four spec files, 212 tests including pin-shape specs (S16), per-leg cache key spec (S20), Alpine load test job spec (S21), and the cargo-zigbuild musl-leg spec (S22).
+4. Run `npm run test:gates` — all six spec files, 237 tests (grew from four spec files / 212 tests after `verify-pack-contents.spec.mjs` was added in PR #402), including pin-shape specs (S16), per-leg cache key spec (S20), Alpine load test job spec (S21), the cargo-zigbuild musl-leg spec (S22), and the hermetic pack-contents helper tests (see the pack-contents gate subsection below).
 5. Assert tagged SHA has green CI history (step-skipped on `pull_request`).
 
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA
@@ -303,6 +303,59 @@ skipping them. A comment containing the literal characters `${{` (even `${{ }}`)
 entire workflow invalid with "An expression was expected", producing a zero-job run that
 completes in the same second. `js-yaml`, `actionlint`, and `@action-validator/cli` all pass
 such a file. Never write `${{` in comments; describe it in words.
+
+### pack-contents gate — no dangling source maps (ci.yml `js` job, not release.yml)
+
+`scripts/verify-pack-contents.mjs` + `scripts/__test__/verify-pack-contents.spec.mjs`
+(added in PR #402, commit d3646a4) assert that no publishable npm package ships a
+dangling `.map` file. Root cause: all six TS packages inherit `sourceMap`/`declarationMap`
+from `tsconfig.base.json`; every emitted map's `sources` entry pointed at `../src/*.ts`,
+which no package's `files` allowlist ships and no map embedded via `sourcesContent` —
+roughly 27% of unpacked tarball size was unusable dead weight. PR #402 set both
+`sourceMap` and `declarationMap` to `false` in `tsconfig.base.json`; this gate makes the
+absence durable so a future tsconfig edit (or a package-specific override) cannot
+silently reintroduce the maps.
+
+Two checks per publishable workspace, against the `WORKSPACES` export (8 entries —
+`@mdscript/mds`, `mds-wasm`, `bundler-utils`, `vite-plugin`, `rollup-plugin`,
+`webpack-loader`, `rspack-loader`, `mds-napi`; mirrors `PKG_PATHS` in
+`verify-versions.mjs`, expressed as workspace identifiers):
+
+1. No packed file entry (`npm pack --dry-run --json -w <workspace>`, via `spawnSync`
+   with an argv array — no shell) ends in `.map`.
+2. No packed `.js`/`.cjs`/`.mjs`/`.d.ts`/`.d.cts`/`.d.mts` file contains a
+   `sourceMappingURL=` trailer — a map file can be pruned from `files` while the
+   comment pointing at it still ships, so this check is independent of check 1.
+
+Each workspace's on-disk directory is resolved via `npm exec -w <workspace> -- node -e
+"process.stdout.write(process.cwd())"` (avoids re-deriving the workspaces glob), and
+every packed path is passed through a `resolveSafePath` traversal guard before being
+read — a path that resolves outside the workspace directory is reported as a hit with a
+reason and never opened.
+
+Non-vacuity floors (`summarize()`): `MIN_PACKAGES = 8` (the exact publishable set — a
+lower count means a workspace was skipped, e.g. `npm pack` failed silently) and
+`MIN_FILES_CHECKED = 40` (comfortably below the 59 trailer-candidate files the 8
+packages pack today, so routine content drift never trips it — only a broken/empty scan
+does).
+
+The gate is wired into `ci.yml`'s `js` job as the "Pack-contents gate (no source maps)"
+step, guarded `if: matrix.os == 'ubuntu-latest'` (the check inspects committed tsconfig
+output, not platform-specific binaries, so it is host-independent — running it on all
+three OSes would be redundant), placed AFTER the native addon build, the WASM build, and
+`Build TS packages`, so every one of the 8 workspaces is actually built and packable by
+the time the gate runs.
+
+**Hermetic-spec rule**: `verify-pack-contents.spec.mjs` unit-tests only the exported pure
+helpers (`findMapEntries`, `resolveSafePath`, `findTrailerHits`, `isTrailerCandidate`,
+`summarize`, `WORKSPACES`) against fake listings and a fake file reader — it never shells
+out to `npm pack`. This is required, not incidental: `npm run test:gates` runs inside
+`version-gate`'s "Source hygiene" step with NO prior build step, so a spec under
+`scripts/__test__/*.spec.mjs` that depends on `dist/` or a built package would fail there
+even though the real code is fine. An earlier draft of this spec included a real-tree
+integration block; it was removed for exactly this reason. Rule for future gates: any
+spec picked up by `test:gates` must be buildless; a check that needs built artifacts
+belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
 
 ## Constraints
 
@@ -462,6 +515,21 @@ such a file. Never write `${{` in comments; describe it in words.
   debug namespace to enable, and the wrapper-cache presence check (wrappers found under
   `~/.cache/cargo-zigbuild/0.23.0/wrappers/` by the post-build step) is the run-proof that
   cargo-zigbuild 0.23.0 actually executed in the job.
+- **`NPM_TOKEN` has a roughly 60-day lifetime and must be rotated by hand**: the npm
+  publish token backing `secrets.NPM_TOKEN` (checked by `version-gate`'s `npm whoami`
+  credential probe and consumed by `publish-npm`) was rotated 2026-09-24 (next rotation
+  due roughly 2026-11-20). Because the credential probe runs on `pull_request` events
+  too, not just tag push, an expired token is caught on a release-surface PR run before
+  any tag is pushed — this is how the 2026-09-24 rotation need was caught on PR #399,
+  well before a release. Moving npm publishing to OIDC trusted publishing would remove
+  the rotation burden entirely.
+- **Dependabot may retarget a superseded PR instead of closing it**: when a newer
+  Dependabot PR supersedes an older one for the same dependency, Dependabot can rebase
+  the OLD PR onto the new target rather than closing it, leaving its title and branch
+  name stale (observed with a stale PR during the 2026-09-24 dependency sweep, PRs
+  #398–#402). Adopt the version to bump from the PR's diff, not its title or branch
+  name, and close the superseded PR by hand once you've confirmed which one actually
+  merged.
 
 ## Key Files
 
@@ -472,6 +540,12 @@ such a file. Never write `${{` in comments; describe it in words.
 - `scripts/musl-load-probe.cjs` — Alpine container smoke-test for musl napi addons; accepts
   `linux-x64-musl` or `linux-arm64-musl` as argv[2]; run inside `node:22-alpine` via
   `docker run --rm --network none --pull=never -w /w -v <staged-dir>:/w:ro <image> node /w/probe.cjs <platform>`.
+- `scripts/verify-pack-contents.mjs` — pack-contents gate; no dangling `.map` files or
+  `sourceMappingURL` trailers in any of the 8 publishable npm packages.
+- `scripts/__test__/verify-pack-contents.spec.mjs` — hermetic unit tests for the gate's
+  pure helpers; the real-tree check runs separately in `ci.yml`'s `js` job.
+- `tsconfig.base.json` — `sourceMap`/`declarationMap` both `false`; all six TS packages
+  inherit this, which is why the pack-contents gate can assert their absence globally.
 - `scripts/__test__/verify-pr-checks.spec.mjs` — specs for the verifier (M10c, S13, S18 rules;
   length assertion for `EXPECTED_CONTEXTS`).
 - `scripts/__test__/release-auth-probe.spec.mjs` — specs for release.yml structure: pin shape
