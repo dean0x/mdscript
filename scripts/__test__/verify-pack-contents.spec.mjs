@@ -3,17 +3,15 @@
  *
  * The gate's exported pure helpers are unit-tested directly against fake
  * npm-pack listings and a fake file reader — no real `npm pack` invocation is
- * needed for these cases. A single integration test exercises the real
- * script (via subprocess) against the real repo tree, which is why
- * `npm run test:gates` must be run from a workspace that has already been
- * built (see the gate script's own header comment).
+ * needed for these cases, so this spec is hermetic and does not require a
+ * built workspace. The real-tree check (the gate script run against the
+ * actual, already-built packages) lives in the `js` CI job's
+ * "Pack-contents gate (no source maps)" step, which runs after the
+ * packages are built.
  */
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { join, resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import {
   WORKSPACES,
@@ -23,18 +21,6 @@ import {
   isTrailerCandidate,
   summarize,
 } from '../verify-pack-contents.mjs';
-
-const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
-const SCANNER = join(ROOT, 'scripts/verify-pack-contents.mjs');
-
-function runScanner(opts = {}) {
-  const r = spawnSync(process.execPath, [SCANNER], {
-    cwd: opts.cwd ?? ROOT,
-    encoding: 'utf8',
-    timeout: 120000,
-  });
-  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
-}
 
 // ---------------------------------------------------------------------------
 // findMapEntries — planted positive control
@@ -195,16 +181,5 @@ describe('WORKSPACES', () => {
       '@mdscript/rspack-loader',
       '@mdscript/mds-napi',
     ]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Integration: the real script against the real, already-built repo tree.
-// ---------------------------------------------------------------------------
-describe('real tree (integration)', () => {
-  test('the real script exits 0 against the current built tree', () => {
-    const r = runScanner();
-    assert.equal(r.status, 0, `expected exit 0; stdout: ${r.stdout}\nstderr: ${r.stderr}`);
-    assert.match(r.stdout, /^✓ pack-contents gate: \d+ packages, \d+ files, 0 maps$/m);
   });
 });
