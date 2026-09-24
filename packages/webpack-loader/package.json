@@ -51,10 +51,10 @@
   },
   "devDependencies": {
     "@mdscript/mds": "file:../mds",
-    "@types/node": "^25.9.1",
-    "browserslist": "4.28.7",
+    "@types/node": "^26.2.0",
+    "browserslist": "4.28.8",
     "fast-uri": "^3.1.6",
     "typescript": "^6.0.3",
-    "webpack": "^5.0.0"
+    "webpack": "^5.109.2"
   }
 }
