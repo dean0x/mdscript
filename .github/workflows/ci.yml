@@ -203,6 +203,14 @@ jobs:
         run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
       - name: Build TS packages
         run: npm run build --workspaces --if-present
+      # Every publishable workspace is built by this point (napi addon above,
+      # WASM + TS packages here), so the gate's npm pack --dry-run listings are
+      # complete. ubuntu-only: the check is host-independent (it inspects
+      # committed tsconfig output, not platform-specific binaries), so running
+      # it on all three OSes would be redundant.
+      - name: Pack-contents gate (no source maps)
+        if: matrix.os == 'ubuntu-latest'
+        run: node scripts/verify-pack-contents.mjs
       # Build the mds CLI binary so CF-SM2 can invoke it as the third parity
       # surface.  target/debug/mds is auto-discovered by findMdsCli(); no env
       # var needed.  The Rust toolchain + cache are already set up above, so
