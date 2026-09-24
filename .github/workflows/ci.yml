@@ -152,6 +152,13 @@ jobs:
             #   CI-measured post-change: 839,456 bytes raw, 337,231 bytes gzipped
             #   (Binaryen v129, CI run 33995227961). Delta: +3,330 bytes (+0.40%).
             #   Guard NOT raised: 10,544 bytes (1.24%) headroom.
+            #   chore/deps-cargo-sweep-2026-09b (2026-09-24, PR #401, supersedes
+            #   Dependabot #377): wasm-bindgen family 0.2.126 -> 0.2.127 / 0.3.76
+            #   -> 0.3.77, js-sys 0.3.103 -> 0.3.104; no Rust source change.
+            #   Prior CI baseline: 839,456 bytes (chore/deps-cargo-sweep-2026-09).
+            #   CI-measured post-change: 846,467 bytes raw, 348,783 bytes gzipped
+            #   (Binaryen v129, CI run 35990686937). Delta: +7,011 bytes (+0.84%).
+            #   Guard NOT raised: 3,533 bytes (0.42%) headroom.
             if [ "$raw" -gt 850000 ]; then
               echo "::error::WASM binary exceeds 850,000 byte threshold: ${label} is ${raw} bytes"
               exit 1
