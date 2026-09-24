@@ -56,7 +56,7 @@ const TRAILER_EXTENSIONS = ['.js', '.cjs', '.mjs', '.d.ts', '.d.cts', '.d.mts'];
 // package contents never trips them — only a broken/empty scan does):
 //   8 workspaces is the exact publishable set; a lower count means a workspace
 //   was skipped (npm pack failed silently, or WORKSPACES drifted from reality).
-//   40 files is comfortably below the ~120+ files the 8 packages pack today.
+//   40 files is comfortably below the 59 trailer-candidate files the 8 packages pack today.
 const MIN_PACKAGES = 8;
 const MIN_FILES_CHECKED = 40;
 
