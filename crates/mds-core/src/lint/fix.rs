@@ -1100,6 +1100,26 @@ mod tests {
         }
     }
 
+    // Exact rejection-reason contracts of `apply_fixes_incremental`, written out
+    // literally so a drift in the production text fails a test.
+    const OVERLAP_REASON: &str =
+        "Overlapping fix spans detected \u{2014} batch rejected to avoid data corruption.";
+    const SORTEDNESS_REASON: &str = "Fix edits are not sorted ascending by start offset; \
+         refusing to apply to prevent source corruption (avoids PF-005).";
+    const A5_PREFIX: &str =
+        "could not verify fix \u{2014} the edited source did not re-parse cleanly (";
+    const A5_SUFFIX: &str = "); leaving the file unchanged";
+    const NEW_EMPTY_BLOCK_REASON: &str =
+        "Reverify produced new untargeted diagnostics: [\"empty-block\"]. Edit reverted.";
+
+    /// A diagnostic whose message records the source the reverify closure was given,
+    /// so a test can tell which reverify call produced a returned residual.
+    fn residual_for(rule: &str, candidate: &str) -> LintResult {
+        let mut diag = make_diag(rule, 0, 1);
+        diag.message = candidate.to_string();
+        make_result(vec![diag])
+    }
+
     // ── Tier classification ───────────────────────────────────────────────────
 
     #[test]
@@ -1431,7 +1451,7 @@ mod tests {
     /// drives the real planner path — `dedup_contained_or_identical` retains both
     /// edits because neither is contained, and `has_overlapping_edits` fires —
     /// producing `overlap_rejected = true`, edits cleared, and `FixOutcome::Rejected`
-    /// from `apply_fixes`.
+    /// from `apply_fixes_incremental` with the exact overlap reason and zero reverify calls.
     ///
     /// Math: source = "line0\nline1\nline2\n"
     ///   line0 → bytes [0,  6)
@@ -1452,10 +1472,6 @@ mod tests {
     /// `dedup_contained_or_identical`: B.end=18 > max_end(12) → B is not contained,
     /// both edits are retained.
     /// `has_overlapping_edits`: A.end=12 > B.start=6 → partial overlap → rejected.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
     #[test]
     fn a4_partial_overlap_still_rejected_after_dedup() {
         let source = "line0\nline1\nline2\n";
@@ -1512,12 +1528,23 @@ mod tests {
             plan.edits
         );
 
-        // apply_fixes must surface FixOutcome::Rejected (fail-closed, ADR-004).
-        let outcome = apply_fixes(source, plan, &result, |_| Ok(make_result(vec![])));
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "overlap_rejected plan must surface FixOutcome::Rejected; got: {outcome:?}"
-        );
+        // The overlap is refused fail-closed (ADR-004) before any reverify call.
+        let outcome = apply_fixes_incremental(source, plan, &result, |_| {
+            unreachable!("reverify must not be called for an overlap-rejected plan")
+        });
+        match outcome {
+            FixOutcome::Rejected {
+                source: unchanged,
+                reason,
+            } => {
+                assert_eq!(reason, OVERLAP_REASON);
+                assert_eq!(
+                    unchanged, source,
+                    "a rejected plan returns the source unchanged"
+                );
+            }
+            other => panic!("overlap_rejected plan must surface Rejected; got: {other:?}"),
+        }
     }
 
     // ── Block-span fix tests (FixLineSpan → ByteEdit) ────────────────────────
@@ -1718,50 +1745,30 @@ mod tests {
 
     // ── L-FIX-REV1: Reverify gate ────────────────────────────────────────────
 
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
-    #[test]
-    fn l_fix_rev1_reverify_failure_rejects_fix() {
-        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
-        let diag = make_diag("duplicate-import", 23, "@import".len());
-        let result = make_result(vec![diag]);
-        let plan = plan_fixes(&result, source);
-
-        // Reverify callback that always fails.
-        let outcome = apply_fixes(source, plan, &result, |_fixed| {
-            Err(MdsError::syntax("simulated compile failure after fix"))
-        });
-
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "reverify failure should reject the fix"
-        );
-    }
-
     /// A5: re-parse failure flows through the A5 path and produces the exact stable
-    /// rejection message (defined at apply_fixes / apply_fixes_incremental).
+    /// rejection message (`reverify_failure_reason`).
     ///
     /// Pins the stable prefix and suffix around the embedded error so the human-
     /// readable message cannot drift without a test failure:
     ///   "could not verify fix — the edited source did not re-parse cleanly ({err}); leaving the file unchanged"
     ///
-    /// The embedded `{err}` is asserted non-empty, confirming that a real error
-    /// was propagated rather than a blank placeholder.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
+    /// A single rejected edit's reason is reported verbatim (no "All 1 …" wrapper), and
+    /// the embedded `{err}` is exactly the reverify error's `Display`, confirming that the
+    /// real error was propagated rather than a blank placeholder. Reverify runs twice:
+    /// the batch attempt, then the one per-edit retry.
     #[test]
     fn l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix() {
+        const ERR: &str = "simulated compile failure after fix";
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
         let diag = make_diag("duplicate-import", 23, "@import".len());
         let result = make_result(vec![diag]);
         let plan = plan_fixes(&result, source);
+        assert_eq!(plan.edits.len(), 1, "non-vacuity: exactly one edit planned");
 
-        let outcome = apply_fixes(source, plan, &result, |_fixed| {
-            Err(MdsError::syntax("simulated compile failure after fix"))
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &result, |_fixed| {
+            calls.set(calls.get() + 1);
+            Err(MdsError::syntax(ERR))
         });
 
         let reason = match outcome {
@@ -1769,25 +1776,60 @@ mod tests {
             other => panic!("expected Rejected, got: {other:?}"),
         };
 
-        const PREFIX: &str =
-            "could not verify fix \u{2014} the edited source did not re-parse cleanly (";
-        const SUFFIX: &str = "); leaving the file unchanged";
-
         assert!(
-            reason.starts_with(PREFIX),
-            "A5 reason must start with the stable prefix;\n  reason: {reason:?}\n  prefix: {PREFIX:?}"
+            reason.starts_with(A5_PREFIX),
+            "A5 reason must start with the stable prefix;\n  reason: {reason:?}\n  prefix: {A5_PREFIX:?}"
         );
         assert!(
-            reason.ends_with(SUFFIX),
-            "A5 reason must end with the stable suffix;\n  reason: {reason:?}\n  suffix: {SUFFIX:?}"
+            reason.ends_with(A5_SUFFIX),
+            "A5 reason must end with the stable suffix;\n  reason: {reason:?}\n  suffix: {A5_SUFFIX:?}"
         );
-        // The embedded error message must be non-empty.
-        let embedded = &reason[PREFIX.len()..reason.len() - SUFFIX.len()];
-        assert!(
-            !embedded.is_empty(),
-            "A5 reason must contain a non-empty embedded error between the stable \
+        let embedded = &reason[A5_PREFIX.len()..reason.len() - A5_SUFFIX.len()];
+        assert_eq!(
+            embedded,
+            MdsError::syntax(ERR).to_string(),
+            "A5 reason must embed the reverify error's Display between the stable \
              prefix and suffix; got: {reason:?}"
         );
+        assert!(embedded.contains(ERR), "non-vacuity: {embedded:?}");
+        assert_eq!(calls.get(), 2, "batch(1) + per-edit(1) reverify calls");
+    }
+
+    /// A5 with two edits: when every per-edit retry is rejected, the reasons are joined
+    /// behind an `All {n} fix edits rejected: ` count prefix, separated by `"; "`.
+    /// Reverify runs three times: the batch attempt, then one retry per edit.
+    #[test]
+    fn l_fix_rev1_a5_two_edit_rejection_joins_with_count_prefix() {
+        const ERR: &str = "simulated compile failure after fix";
+        let source = "LineA\nLineB\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "LineA".len()),
+            make_diag("duplicate-import", "LineA\n".len(), "LineB".len()),
+        ]);
+        let plan = plan_fixes(&original, source);
+        assert_eq!(plan.edits.len(), 2, "non-vacuity: two edits planned");
+
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original, |_fixed| {
+            calls.set(calls.get() + 1);
+            Err(MdsError::syntax(ERR))
+        });
+
+        let one = format!("{A5_PREFIX}{}{A5_SUFFIX}", MdsError::syntax(ERR));
+        match outcome {
+            FixOutcome::Rejected {
+                source: unchanged,
+                reason,
+            } => {
+                assert_eq!(reason, format!("All 2 fix edits rejected: {one}; {one}"));
+                assert_eq!(
+                    unchanged, source,
+                    "a rejected plan returns the source unchanged"
+                );
+            }
+            other => panic!("expected Rejected, got: {other:?}"),
+        }
+        assert_eq!(calls.get(), 3, "batch(1) + per-edit(2) reverify calls");
     }
 
     // ── T-REASON: rejection reasons are display-safe by construction (#176) ──────
@@ -1809,40 +1851,10 @@ mod tests {
         ))
     }
 
-    /// T-REASON-1 [security-11 / CWE-117 / PF-013 / #176]: the reverify failure reason
-    /// produced by `apply_fixes` escapes the embedded `MdsError` Display.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
-    #[test]
-    fn apply_fixes_rejection_reason_escapes_embedded_error_display() {
-        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
-        let diag = make_diag("duplicate-import", 23, "@import".len());
-        let result = make_result(vec![diag]);
-        let plan = plan_fixes(&result, source);
-        assert!(
-            !plan.edits.is_empty(),
-            "non-vacuity: the plan must have edits or apply_fixes never reverifies"
-        );
-
-        let outcome = apply_fixes(
-            source,
-            plan,
-            &result,
-            |_fixed| Err(hostile_reverify_error()),
-        );
-        let reason = match outcome {
-            FixOutcome::Rejected { reason, .. } => reason,
-            other => panic!("expected Rejected, got: {other:?}"),
-        };
-
-        assert_reason_is_display_safe(&reason);
-    }
-
-    /// T-REASON-2 [PF-004 / #176]: the per-edit fallback in `apply_fixes_incremental`
-    /// builds its reason through a *second* code path. It must be covered by the same
-    /// choke-point, or the guarantee holds on one path and lapses on its sibling.
+    /// T-REASON-2 [security-11 / CWE-117 / PF-004 / PF-013 / #176]: the reverify failure
+    /// reason that `apply_fixes_incremental` reports for a rejected edit escapes the
+    /// embedded `MdsError` Display — the reason is built by the `reverify_failure_reason`
+    /// choke-point, so the guarantee cannot hold on one path and lapse on a sibling.
     #[test]
     fn incremental_rejection_reason_escapes_embedded_error_display() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
@@ -1869,7 +1881,44 @@ mod tests {
         assert_reason_is_display_safe(&reason);
     }
 
-    /// Shared assertions for T-REASON-1/2: negative, positive, and non-vacuity.
+    /// T-REASON-3 [CWE-117 / PF-013 / #176]: when several edits are rejected, the joined
+    /// `All {n} fix edits rejected: …` reason escapes EVERY embedded error, not only the
+    /// first — each hostile codepoint appears escaped once per rejected edit, and the
+    /// joined reason is still a single line.
+    #[test]
+    fn incremental_multi_rejection_reason_escapes_each_error() {
+        let source = "LineA\nLineB\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "LineA".len()),
+            make_diag("duplicate-import", "LineA\n".len(), "LineB".len()),
+        ]);
+        let plan = plan_fixes(&original, source);
+        assert_eq!(plan.edits.len(), 2, "non-vacuity: two edits planned");
+
+        let outcome = apply_fixes_incremental(source, plan, &original, |_fixed| {
+            Err(hostile_reverify_error())
+        });
+        let reason = match outcome {
+            FixOutcome::Rejected { reason, .. } => reason,
+            other => panic!("expected Rejected, got: {other:?}"),
+        };
+
+        assert!(
+            reason.starts_with("All 2 fix edits rejected: "),
+            "multi-rejection reason must carry the count prefix; got: {reason:?}"
+        );
+        assert_reason_is_display_safe(&reason);
+        for cp in [0x1B_u32, 0x202E, 0x061C, 0x0A] {
+            let escaped = format!("\\u{cp:04X}");
+            assert_eq!(
+                reason.matches(escaped.as_str()).count(),
+                2,
+                "{escaped} must appear once per rejected edit; got: {reason:?}"
+            );
+        }
+    }
+
+    /// Shared assertions for T-REASON-2/3: negative, positive, and non-vacuity.
     fn assert_reason_is_display_safe(reason: &str) {
         // Non-vacuity: the real error text actually reached the reason, so the escape
         // assertions cannot pass by the error being dropped instead of sanitized.
@@ -1903,56 +1952,11 @@ mod tests {
         );
     }
 
-    /// A single non-overlapping `duplicate-import` on line 2 must plan, apply,
-    /// pass the (stubbed) reverify, and return `FixOutcome::Fixed`.
-    ///
-    /// The source has the second `@import` starting at byte 23
-    /// (`"@import \"./a.mds\" as a\n"` = 23 bytes), which is a valid char
-    /// boundary, so `diag_to_edit` succeeds and the plan is non-empty.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
-    #[test]
-    fn reverify_success_returns_fixed() {
-        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
-        let diag = make_diag("duplicate-import", 23, "@import".len());
-        let result = make_result(vec![diag]);
-        let plan = plan_fixes(&result, source);
-
-        // Preconditions (non-vacuous): the plan MUST have edits.
-        assert!(
-            !plan.edits.is_empty(),
-            "duplicate-import at byte 23 must produce an edit (assertion must not be vacuous)"
-        );
-        assert!(
-            !plan.overlap_rejected,
-            "single non-overlapping edit must not be rejected"
-        );
-
-        // Reverify callback that succeeds with an empty residual.
-        let outcome = apply_fixes(source, plan, &result, |_fixed| {
-            Ok(LintResult {
-                diagnostics: vec![],
-                truncated: false,
-                is_standalone: true,
-            })
-        });
-
-        assert!(
-            matches!(outcome, FixOutcome::Fixed { .. }),
-            "successful reverify must return Fixed outcome; got: {outcome:?}"
-        );
-    }
-
     /// AC-F-23 regression guard: a pre-existing untargeted diagnostic (e.g. a Tier C
     /// `unused-variable` that coexists with a fixable `duplicate-import`) survives the
     /// reverify but must NOT cause the fix to be refused — residual findings are
-    /// expected to remain and determine the exit code.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
+    /// expected to remain and determine the exit code. The batch attempt accepts it,
+    /// so reverify runs exactly once.
     #[test]
     fn reverify_preexisting_untargeted_survives_and_fix_applies() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1963,21 +1967,30 @@ mod tests {
         assert!(!plan.overlap_rejected && !plan.edits.is_empty());
 
         // The untargeted unused-variable is still present after the fix — same count.
-        let outcome = apply_fixes(source, plan, &result, |_fixed| {
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &result, |_fixed| {
+            calls.set(calls.get() + 1);
             Ok(make_result(vec![make_diag("unused-variable", 0, 1)]))
         });
-        assert!(
-            matches!(outcome, FixOutcome::Fixed { .. }),
-            "a surviving pre-existing untargeted diagnostic must not refuse the fix"
-        );
+        match outcome {
+            FixOutcome::Fixed { residual, .. } => assert!(
+                residual
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.rule == "unused-variable"),
+                "the pre-existing finding must survive into the residual; got: {residual:?}"
+            ),
+            other => panic!(
+                "a surviving pre-existing untargeted diagnostic must not refuse the fix; \
+                 got: {other:?}"
+            ),
+        }
+        assert_eq!(calls.get(), 1, "the batch attempt alone accepts the fix");
     }
 
     /// A genuinely NEW untargeted diagnostic introduced by the edit IS a regression
-    /// and must refuse the fix.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
+    /// and must refuse the fix. The batch attempt is refused, the one per-edit retry
+    /// is refused for the same reason, and that single reason is reported verbatim.
     #[test]
     fn reverify_new_untargeted_diagnostic_is_rejected() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1987,13 +2000,25 @@ mod tests {
         assert!(!plan.overlap_rejected && !plan.edits.is_empty());
 
         // Reverify surfaces an empty-block diagnostic that was NOT present before.
-        let outcome = apply_fixes(source, plan, &result, |_fixed| {
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &result, |_fixed| {
+            calls.set(calls.get() + 1);
             Ok(make_result(vec![make_diag("empty-block", 0, 1)]))
         });
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "a new untargeted diagnostic must refuse the fix"
-        );
+        match outcome {
+            FixOutcome::Rejected {
+                source: unchanged,
+                reason,
+            } => {
+                assert_eq!(reason, NEW_EMPTY_BLOCK_REASON);
+                assert_eq!(
+                    unchanged, source,
+                    "a rejected plan returns the source unchanged"
+                );
+            }
+            other => panic!("a new untargeted diagnostic must refuse the fix; got: {other:?}"),
+        }
+        assert_eq!(calls.get(), 2, "batch(1) + per-edit(1) reverify calls");
     }
 
     // ── Idempotence (AC-F-25) ─────────────────────────────────────────────────
@@ -2032,23 +2057,19 @@ mod tests {
     ///
     /// This test closes the coverage gap identified in I-13: no test previously
     /// exercised `plan_fixes_with_options(result, source, include_tier_b=true)` through
-    /// `apply_fixes` on a REAL Tier B diagnostic with a real reverify closure.
+    /// `apply_fixes_incremental` on a REAL Tier B diagnostic with a real reverify closure.
     ///
     /// **Why the Fixed path**: `fix_removals` now carries a `FixLineSpan` covering the
     /// whole `@define dead():..@end` block (from `def.offset` to `def.end_offset`,
     /// inclusive). The reverify parses the fixed source cleanly, confirms no output
     /// delta (the dead function was never called so removal is output-neutral), and
-    /// `apply_fixes` returns `Fixed`.
+    /// the batch attempt returns `Fixed` after one reverify call.
     ///
     /// **Why unused-function, not unused-import**: a standalone file has no `@import`
     /// by definition (`is_standalone = !is_partial_or_extends && imports.is_empty()`),
     /// so `unused-import` cannot fire on a standalone file. `unused-function` fires
     /// when `has_explicit_exports && !exported && !called` — achieved here with an
     /// explicit `@export greet` plus an unexported, uncalled `@define dead():`.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
     #[test]
     fn tier_b_unused_function_standalone_apply_succeeds() {
         // Standalone source: no @import, no @extends, has explicit @export.
@@ -2088,7 +2109,11 @@ mod tests {
         // The block-span fix_removals removes the whole `@define dead():\nWorld!\n@end\n`
         // block. The reverify parses the fixed source and confirms output-neutrality
         // (dead() was never called, so output is unchanged) → Fixed.
-        let outcome = apply_fixes(source, plan, &lint_result, crate::lint_str);
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &lint_result, |fixed| {
+            calls.set(calls.get() + 1);
+            crate::lint_str(fixed)
+        });
 
         assert!(
             matches!(outcome, FixOutcome::Fixed { .. }),
@@ -2105,21 +2130,19 @@ mod tests {
                 "fixed source must retain the exported @define greet(); got: {fixed:?}"
             );
         }
+        assert_eq!(calls.get(), 1, "the batch attempt alone accepts the fix");
     }
 
     /// L-FIX-REV1: A reverify closure that detects an output delta MUST cause
-    /// `apply_fixes` to return `FixOutcome::Rejected`.
+    /// `apply_fixes_incremental` to return `FixOutcome::Rejected`.
     ///
     /// White-box test: we inject a synthetic ByteEdit that removes non-dead content
     /// ("World" from "Hello World!\n"), then pass a reverify closure that compares
     /// compiled outputs. The delta (fixed → "Hello !\n") must cause rejection.
     ///
     /// This verifies the mechanism the CLI relies on: when the reverify closure
-    /// returns `Err` due to an output delta, the entire fix batch is refused.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
+    /// returns `Err` due to an output delta, the batch is refused, the per-edit retry
+    /// is refused the same way, and the reason carries the A5 prefix plus the delta.
     #[test]
     fn l_fix_rev1_output_delta_causes_rejection() {
         let source = "Hello World!\n";
@@ -2147,7 +2170,9 @@ mod tests {
             .expect("source should compile cleanly")
             .output;
 
-        let outcome = apply_fixes(source, plan, &original_result, move |fixed| {
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original_result, |fixed| {
+            calls.set(calls.get() + 1);
             // Simulate the CLI output-delta gate (AC-F-20):
             // lint first, then compare compiled outputs.
             let residual = crate::lint_str(fixed)?;
@@ -2162,10 +2187,22 @@ mod tests {
             Ok(residual)
         });
 
+        let reason = match outcome {
+            FixOutcome::Rejected { reason, .. } => reason,
+            other => panic!(
+                "apply_fixes_incremental must return Rejected when reverify detects an \
+                 output delta; got: {other:?}"
+            ),
+        };
         assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "apply_fixes must return Rejected when reverify detects an output delta; got: {outcome:?}"
+            reason.starts_with(A5_PREFIX),
+            "an output-delta refusal is reported through the A5 reason; got: {reason:?}"
         );
+        assert!(
+            reason.contains("would change compiled output"),
+            "the reason must carry the output-delta error; got: {reason:?}"
+        );
+        assert_eq!(calls.get(), 2, "batch(1) + per-edit(1) reverify calls");
     }
 
     // ── apply_fixes_incremental ────────────────────────────────────────────────
@@ -2190,6 +2227,10 @@ mod tests {
     }
 
     /// INC-2: overlap_rejected = true → Rejected immediately, no reverify calls.
+    ///
+    /// The plan's edits are empty (as `plan_fixes` leaves them after an overlap), so
+    /// this also pins the check ORDER: overlap is tested before emptiness, or an
+    /// overlapping batch would be reported as `NothingToFix`.
     #[test]
     fn incremental_overlap_immediate_reject() {
         let source = "Hello!\n";
@@ -2202,10 +2243,10 @@ mod tests {
         let outcome = apply_fixes_incremental(source, plan, &original, |_| {
             unreachable!("no calls expected")
         });
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "overlap must return Rejected; got: {outcome:?}"
-        );
+        match outcome {
+            FixOutcome::Rejected { reason, .. } => assert_eq!(reason, OVERLAP_REASON),
+            other => panic!("overlap must return Rejected; got: {other:?}"),
+        }
     }
 
     /// INC-3: Batch reverify passes → Fixed in exactly 1 reverify call (no per-edit loop).
@@ -2331,7 +2372,8 @@ mod tests {
         );
     }
 
-    /// INC-6: Call count bound — N edits → ≤ N+1 total reverify calls.
+    /// INC-6: Call count bound — N edits → exactly N+1 total reverify calls when the
+    /// batch fails and every per-edit retry passes.
     #[test]
     fn incremental_call_count_bounded() {
         // Three-edit source: "A\nB\nC\n" (each line 2 bytes including \n).
@@ -2360,9 +2402,10 @@ mod tests {
         });
 
         // Batch fails (1 call) + 3 per-edit (3 calls) = 4 = edits.len()+1.
-        assert!(
-            call_count.get() <= 3 + 1,
-            "call count must be ≤ edits.len()+1 = 4; got: {}",
+        assert_eq!(
+            call_count.get(),
+            3 + 1,
+            "call count must be edits.len()+1 = 4; got: {}",
             call_count.get()
         );
         // All per-edit passed → Fixed.
@@ -2414,6 +2457,161 @@ mod tests {
         }
     }
 
+    /// A batch of more than `FALLBACK_MAX_EDITS` edits that passes reverify is `Fixed`
+    /// after the one batch call: the cap bounds only the per-edit fallback.
+    #[test]
+    fn incremental_batch_success_above_cap_is_fixed() {
+        let lines: Vec<String> = (0..=FALLBACK_MAX_EDITS)
+            .map(|i| format!("L{i}\n"))
+            .collect();
+        let source = lines.concat();
+        let mut offset = 0usize;
+        let mut diags = Vec::new();
+        for line in &lines {
+            diags.push(make_diag("duplicate-import", offset, 1));
+            offset += line.len();
+        }
+        let original = make_result(diags);
+        let plan = plan_fixes_with_options(&original, &source, false);
+        assert_eq!(
+            plan.edits.len(),
+            FALLBACK_MAX_EDITS + 1,
+            "one edit over the cap"
+        );
+
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(&source, plan, &original, |_fixed| {
+            calls.set(calls.get() + 1);
+            Ok(make_result(vec![]))
+        });
+
+        match outcome {
+            FixOutcome::Fixed { source: fixed, .. } => {
+                assert_eq!(fixed, "", "every line was removed by the batch")
+            }
+            other => panic!("a passing batch above the cap must be Fixed; got: {other:?}"),
+        }
+        assert_eq!(calls.get(), 1, "the batch attempt alone accepts the fix");
+    }
+
+    /// Every per-edit retry is judged against the FULL targeted set of the plan, not
+    /// the one rule of the edit being retried. Here two targeted rules each keep a
+    /// diagnostic in every per-edit residual (the other edit is not applied yet); a
+    /// gate built from the single retried rule would count the other rule's diagnostic
+    /// as a new untargeted finding and refuse both edits.
+    #[test]
+    fn incremental_per_edit_uses_full_targeted_set() {
+        let source = "LineA\nLineB\nKeep!\n";
+        let original = make_result(vec![
+            make_diag("duplicate-export", 0, "LineA".len()),
+            make_diag("empty-block", "LineA\n".len(), "LineB".len()),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert_eq!(plan.edits.len(), 2, "non-vacuity: one edit per rule");
+
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original, |_fixed| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                return Err(MdsError::syntax("batch-fail"));
+            }
+            Ok(make_result(vec![
+                make_diag("duplicate-export", 0, 1),
+                make_diag("empty-block", 0, 1),
+            ]))
+        });
+
+        match outcome {
+            FixOutcome::Fixed { source: fixed, .. } => assert_eq!(fixed, "Keep!\n"),
+            other => panic!("both per-edit retries must be accepted; got: {other:?}"),
+        }
+        assert_eq!(calls.get(), 3, "batch(1) + per-edit(2) reverify calls");
+    }
+
+    /// When the per-edit fallback accepts several edits, the reported residual is the
+    /// one from the LAST accepted reverify call — the fully fixed source.
+    #[test]
+    fn incremental_residual_is_from_last_accepted_edit() {
+        let source = "AAAA\nBBBB\nKeep!\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "AAAA".len()),
+            make_diag("duplicate-import", "AAAA\n".len(), "BBBB".len()),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert_eq!(plan.edits.len(), 2);
+
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original, |fixed| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                return Err(MdsError::syntax("batch-fail"));
+            }
+            Ok(residual_for("duplicate-import", fixed))
+        });
+
+        match outcome {
+            FixOutcome::Fixed {
+                source: fixed,
+                residual,
+            } => {
+                assert_eq!(fixed, "Keep!\n");
+                assert_eq!(
+                    residual.diagnostics[0].message, "Keep!\n",
+                    "the residual must come from the last accepted candidate"
+                );
+            }
+            other => panic!("expected Fixed; got: {other:?}"),
+        }
+        assert_eq!(calls.get(), 3, "batch(1) + per-edit(2) reverify calls");
+    }
+
+    /// A per-edit retry whose reverify succeeds but introduces a new untargeted
+    /// diagnostic is rejected, and its residual is NOT reported: the outcome keeps the
+    /// residual of the earlier accepted edit.
+    #[test]
+    fn incremental_regressed_last_call_keeps_prior_residual() {
+        let source = "LineA\nLineB\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "LineA".len()),
+            make_diag("duplicate-import", "LineA\n".len(), "LineB".len()),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert_eq!(plan.edits.len(), 2);
+
+        // Call 1: batch fails. Call 2: LineB removal (right-to-left first) is accepted.
+        // Call 3: LineA removal reverifies Ok but surfaces a new empty-block finding.
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original, |fixed| {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1 => Err(MdsError::syntax("batch-fail")),
+                2 => Ok(residual_for("duplicate-import", fixed)),
+                _ => Ok(residual_for("empty-block", fixed)),
+            }
+        });
+
+        match outcome {
+            FixOutcome::PartiallyFixed {
+                source: fixed,
+                residual,
+                rejected,
+            } => {
+                assert_eq!(fixed, "LineA\n");
+                assert_eq!(residual.diagnostics.len(), 1);
+                assert_eq!(residual.diagnostics[0].rule, "duplicate-import");
+                assert_eq!(
+                    residual.diagnostics[0].message, "LineA\n",
+                    "the residual must come from the accepted call, not the regressed one"
+                );
+                assert_eq!(rejected.len(), 1);
+                assert_eq!((rejected[0].edit.start, rejected[0].edit.end), (0, 6));
+                assert_eq!(rejected[0].reason, NEW_EMPTY_BLOCK_REASON);
+            }
+            other => panic!("expected PartiallyFixed; got: {other:?}"),
+        }
+        assert_eq!(calls.get(), 3, "batch(1) + per-edit(2) reverify calls");
+    }
+
     // ── PF-005 regression: sortedness guard ──────────────────────────────────
 
     /// PF-005 regression: `apply_fixes_incremental` with unsorted edits must return
@@ -2431,7 +2629,8 @@ mod tests {
     /// This test would PANIC against the pre-fix code in debug mode (the `debug_assert!`
     /// in `apply_plan_unchecked` fires) and would produce a WRONG outcome (source silently
     /// corrupted, then reverify might return `Fixed`) in a release build.  After the fix,
-    /// it returns `Rejected` in all build modes.
+    /// it returns `Rejected` in all build modes, with the exact sortedness reason and
+    /// before any reverify call.
     #[test]
     fn pf005_unsorted_edits_rejected_in_incremental() {
         let source = "LineA\nLineB\n";
@@ -2458,48 +2657,24 @@ mod tests {
             overlap_rejected: false,
             truncated: false,
         };
-        let outcome = apply_fixes_incremental(source, plan, &original, |_| Ok(make_result(vec![])));
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "unsorted edits must be rejected, not silently applied; got: {outcome:?}"
-        );
-    }
-
-    /// PF-005 regression: `apply_fixes` with unsorted edits must return
-    /// `FixOutcome::Rejected`, NOT silently corrupt the source.
-    #[expect(
-        deprecated,
-        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
-    )]
-    #[test]
-    fn pf005_unsorted_edits_rejected_in_apply_fixes() {
-        let source = "LineA\nLineB\n";
-        let original = make_result(vec![]);
-        let plan = FixPlan {
-            edits: vec![
-                ByteEdit {
-                    start: 6,
-                    end: 12,
-                    rule: "duplicate-import".to_string(),
-                    replacement: String::new(),
-                },
-                ByteEdit {
-                    start: 0,
-                    end: 6,
-                    rule: "duplicate-import".to_string(),
-                    replacement: String::new(),
-                },
-            ],
-            overlap_rejected: false,
-            truncated: false,
-        };
-        let outcome = apply_fixes(source, plan, &original, |_| {
+        let outcome = apply_fixes_incremental(source, plan, &original, |_| {
             unreachable!("reverify must not be called when edits are unsorted")
         });
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "unsorted edits must be rejected in apply_fixes; got: {outcome:?}"
-        );
+        match outcome {
+            FixOutcome::Rejected {
+                source: unchanged,
+                reason,
+            } => {
+                assert_eq!(reason, SORTEDNESS_REASON);
+                assert_eq!(
+                    unchanged, source,
+                    "a rejected plan returns the source unchanged"
+                );
+            }
+            other => {
+                panic!("unsorted edits must be rejected, not silently applied; got: {other:?}")
+            }
+        }
     }
 
     // ── INC-8: FALLBACK_MAX_EDITS cap (PF-004) ──────────────────────────────
@@ -2538,10 +2713,30 @@ mod tests {
         });
 
         // Must be Rejected (cap exceeded) — no per-edit retries.
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "plan exceeding FALLBACK_MAX_EDITS must be Rejected fail-closed; got: {outcome:?}"
-        );
+        match outcome {
+            FixOutcome::Rejected {
+                source: unchanged,
+                reason,
+            } => {
+                assert_eq!(
+                    reason,
+                    format!(
+                        "Fix plan has {} edits; per-edit fallback cap is {} \u{2014} batch was \
+                         rejected by the reverify gate. Re-run --fix after manually reducing \
+                         the issue count (avoids PF-004).",
+                        FALLBACK_MAX_EDITS + 1,
+                        FALLBACK_MAX_EDITS
+                    )
+                );
+                assert_eq!(
+                    unchanged, source,
+                    "a rejected plan returns the source unchanged"
+                );
+            }
+            other => panic!(
+                "plan exceeding FALLBACK_MAX_EDITS must be Rejected fail-closed; got: {other:?}"
+            ),
+        }
         // Only 1 reverify call (batch attempt), not N+1.
         assert_eq!(
             call_count.get(),
@@ -2551,15 +2746,6 @@ mod tests {
         );
     }
 
-    // ── #7 regression: real rejection reasons surfaced (ADR-004) ────────────
-
-    /// #7 regression: when all per-edit retries are rejected, the `reason` in
-    /// `FixOutcome::Rejected` must include the actual reverify failure messages,
-    /// not the former fixed string "All fix edits were rejected…".
-    ///
-    /// Applies ADR-004: a three-tier safety gate is only as useful as its refusal
-    /// reporting — surfacing the real rejection reason is diagnostic infrastructure
-    /// for the whole `--fix` feature.
     /// T-FE-FIX [ADR-008 / Option-B]: the functional `--fix` path reads raw bytes
     /// directly from `LintDiagnostic.fix_edits` and must never sanitize them.
     ///
@@ -2626,6 +2812,15 @@ mod tests {
         );
     }
 
+    // ── #7 regression: real rejection reasons surfaced (ADR-004) ────────────
+
+    /// #7 regression: when all per-edit retries are rejected, the `reason` in
+    /// `FixOutcome::Rejected` must include the actual reverify failure messages,
+    /// not the former fixed string "All fix edits were rejected…".
+    ///
+    /// Applies ADR-004: a three-tier safety gate is only as useful as its refusal
+    /// reporting — surfacing the real rejection reason is diagnostic infrastructure
+    /// for the whole `--fix` feature.
     #[test]
     fn rejected_reason_includes_per_edit_failure_details() {
         let source = "LineA\n";
