@@ -12,6 +12,7 @@ use crate::evaluator::evaluate;
 use crate::evaluator::evaluate_messages_intrinsic;
 use crate::evaluator::evaluate_with_map;
 use crate::evaluator::evaluate_with_map_seeded;
+use crate::evaluator::EvalBudget;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT};
@@ -738,12 +739,11 @@ impl ModuleCache {
 
         // REL-1 / applies PF-004: single cumulative iteration and message-byte budget
         // across ALL regions.  Before this fix each call to evaluate_with_map seeded a
-        // fresh EvalContext (total_iterations = 0) so K regions each got an independent
-        // 1 M budget — CPU/DoS amplification ∝ region count.  Now we thread the running
-        // totals from region to region via evaluate_with_map_seeded so the same cap
-        // applies to the entire @extends compilation, matching the non-map (text) path.
-        let mut running_iterations: usize = 0;
-        let mut running_msg_bytes: usize = 0;
+        // fresh EvalContext so K regions each got an independent 1 M budget —
+        // CPU/DoS amplification ∝ region count.  Now one EvalBudget is threaded from
+        // region to region via evaluate_with_map_seeded so the same cap applies to the
+        // entire @extends compilation, matching the non-map (text) path.
+        let mut budget = EvalBudget::default();
 
         for (nodes, origin) in regions {
             // Switch the builder's current_src to the source that owns this region.
@@ -762,16 +762,8 @@ impl ModuleCache {
             let region_output = if let Some(builder) = current_map.take() {
                 // builder.current_src was set to origin's source index above;
                 // evaluate_with_map_seeded derives file/source from it (issue #58).
-                let (region_out, returned_builder, iters, bytes) = evaluate_with_map_seeded(
-                    nodes,
-                    scope,
-                    warnings,
-                    builder,
-                    running_iterations,
-                    running_msg_bytes,
-                )?;
-                running_iterations = iters;
-                running_msg_bytes = bytes;
+                let (region_out, returned_builder) =
+                    evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut budget)?;
                 current_map = Some(returned_builder);
                 region_out
             } else {

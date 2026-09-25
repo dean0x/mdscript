@@ -26,6 +26,24 @@ const MAX_TOTAL_ITERATIONS: usize = 1_000_000;
 /// Maximum number of accumulated warnings before further warnings are silently dropped.
 const MAX_WARNINGS: usize = 1_000;
 
+/// Cumulative resource budgets spent by one module evaluation.
+///
+/// A module body is usually evaluated in one call, but an `@extends` chain is
+/// evaluated one spliced region at a time. The seeded entry points
+/// ([`evaluate_seeded`], [`evaluate_with_map_seeded`], [`evaluate_messages_seeded`])
+/// take the budget by `&mut`, so every region spends from the same totals: a budget
+/// seeded afresh per region would multiply each cap by the region count (applies
+/// PF-004).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EvalBudget {
+    /// Loop iterations across all `@for` loops (capped at `MAX_TOTAL_ITERATIONS`).
+    iterations: usize,
+    /// Message content bytes collected in messages mode (capped at
+    /// `MAX_MESSAGES_TOTAL_SIZE`). Checked as each message is collected, so runaway
+    /// growth is caught before a giant `Vec` is built.
+    message_bytes: usize,
+}
+
 /// Transient state threaded through the evaluator for a single compilation.
 ///
 /// Bundles the mutable parameters that were previously threaded individually
@@ -34,11 +52,8 @@ pub(crate) struct EvalContext<'a> {
     /// LIFO stack of active function call keys, used to detect direct recursion.
     /// Vec is used for O(n) contains at MAX_CALL_DEPTH=128 — acceptable.
     call_stack: Vec<String>,
-    /// Cumulative loop iterations across all @for loops in one compilation.
-    total_iterations: usize,
-    /// Running byte total of all message content pushed in messages mode.
-    /// Checked incrementally so runaway growth is caught before building a giant Vec.
-    total_message_bytes: usize,
+    /// Cumulative budgets, seeded by the caller and handed back when evaluation ends.
+    budget: EvalBudget,
     /// Accumulated warnings (e.g. empty @include).
     warnings: &'a mut Vec<String>,
     /// Optional source-map builder.  Present when `CompileOptions::source_map` is
@@ -108,10 +123,32 @@ pub fn evaluate(
     file: &str,
     source: &str,
 ) -> Result<String, MdsError> {
+    evaluate_seeded(
+        nodes,
+        scope,
+        warnings,
+        file,
+        source,
+        &mut EvalBudget::default(),
+    )
+}
+
+/// Like [`evaluate`], but spends from the caller's `budget` instead of a fresh one.
+///
+/// Used to evaluate several node slices that make up ONE module (the spliced regions
+/// of an `@extends` chain) under one set of caps. `budget` holds the running totals
+/// when this returns, on success and on error alike.
+pub(crate) fn evaluate_seeded(
+    nodes: &[Node],
+    scope: &mut Scope,
+    warnings: &mut Vec<String>,
+    file: &str,
+    source: &str,
+    budget: &mut EvalBudget,
+) -> Result<String, MdsError> {
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
-        total_iterations: 0,
-        total_message_bytes: 0,
+        budget: *budget,
         warnings,
         map: None,
         fragment_remap_cache: std::collections::HashMap::new(),
@@ -120,7 +157,9 @@ pub fn evaluate(
         source,
         body_origin: None,
     };
-    evaluate_nodes(nodes, scope, &mut ctx)
+    let result = evaluate_nodes(nodes, scope, &mut ctx);
+    *budget = ctx.budget;
+    result
 }
 
 /// Evaluate a module body into a rendered string while recording source-map
@@ -134,7 +173,7 @@ pub fn evaluate(
 /// `builder.current_src` — single source of truth, no redundant parameter
 /// (avoids the dual-channel mis-attribution class fixed in c5a4d65; issue #58).
 ///
-/// Delegates to [`evaluate_with_map_seeded`] with seed counters of 0.
+/// Delegates to [`evaluate_with_map_seeded`] with a fresh [`EvalBudget`].
 /// Use [`evaluate_with_map_seeded`] directly when you need to carry cumulative
 /// resource budgets across multiple invocations (e.g. `@extends` regions).
 pub(crate) fn evaluate_with_map(
@@ -143,16 +182,14 @@ pub(crate) fn evaluate_with_map(
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
-    let (output, map, _, _) = evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0)?;
-    Ok((output, map))
+    evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut EvalBudget::default())
 }
 
-/// Evaluate nodes with source-map recording and pre-seeded cumulative resource budgets.
+/// Evaluate nodes with source-map recording, spending from the caller's `budget`.
 ///
-/// Like [`evaluate_with_map`] but additionally accepts `seed_iterations` and
-/// `seed_msg_bytes` to continue cumulative budgets from prior work (e.g. earlier
-/// `@extends` regions).  Returns `(output, builder, total_iterations, total_msg_bytes)`
-/// so the caller can thread the running totals into the next invocation.
+/// Like [`evaluate_with_map`], but continues cumulative budgets from prior work
+/// (e.g. earlier `@extends` regions); `budget` holds the running totals when this
+/// returns, on success and on error alike.
 ///
 /// `file` and `source` for `EvalContext` diagnostic spans are derived from
 /// `builder.current_src` — the single source of truth.  Callers must update
@@ -170,9 +207,8 @@ pub(crate) fn evaluate_with_map_seeded(
     scope: &mut Scope,
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
-    seed_iterations: usize,
-    seed_msg_bytes: usize,
-) -> Result<(String, crate::sourcemap::MapBuilder, usize, usize), MdsError> {
+    budget: &mut EvalBudget,
+) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
     // Clone display name / source from the builder's current source entry before
     // moving builder into EvalContext.map.  This is the single source of truth for
     // diagnostic span attribution — eliminates the redundant explicit params
@@ -193,8 +229,7 @@ pub(crate) fn evaluate_with_map_seeded(
         .unwrap_or_default();
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
-        total_iterations: seed_iterations,
-        total_message_bytes: seed_msg_bytes,
+        budget: *budget,
         warnings,
         map: Some(builder),
         fragment_remap_cache: std::collections::HashMap::new(),
@@ -203,11 +238,13 @@ pub(crate) fn evaluate_with_map_seeded(
         source: &source_owned,
         body_origin: None,
     };
-    let output = evaluate_nodes(nodes, scope, &mut ctx)?;
+    let result = evaluate_nodes(nodes, scope, &mut ctx);
+    *budget = ctx.budget;
+    let output = result?;
     let map = ctx.map.take().ok_or_else(|| {
         MdsError::syntax("internal: MapBuilder disappeared during evaluate_with_map — compiler bug")
     })?;
-    Ok((output, map, ctx.total_iterations, ctx.total_message_bytes))
+    Ok((output, map))
 }
 
 fn evaluate_nodes(
@@ -1086,8 +1123,8 @@ where
         entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
         for (key, val) in entries {
-            ctx.total_iterations += 1;
-            if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
+            ctx.budget.iterations += 1;
+            if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
                 return Err(MdsError::resource_limit(format!(
                     "total loop iterations exceeded maximum of {} across all loops in this compilation",
                     MAX_TOTAL_ITERATIONS
@@ -1128,8 +1165,8 @@ where
     let items = array.to_vec();
 
     for item in items {
-        ctx.total_iterations += 1;
-        if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
+        ctx.budget.iterations += 1;
+        if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
             return Err(MdsError::resource_limit(format!(
                 "total loop iterations exceeded maximum of {} across all loops in this compilation",
                 MAX_TOTAL_ITERATIONS
@@ -1274,10 +1311,38 @@ pub fn evaluate_messages_intrinsic(
     file: &str,
     source: &str,
 ) -> Result<Vec<EvalMessage>, MdsError> {
+    let mut messages = Vec::new();
+    evaluate_messages_seeded(
+        nodes,
+        scope,
+        warnings,
+        file,
+        source,
+        &mut EvalBudget::default(),
+        &mut messages,
+    )?;
+    Ok(messages)
+}
+
+/// Like [`evaluate_messages_intrinsic`], but appends to the caller's `out` and spends
+/// from the caller's `budget` instead of fresh ones.
+///
+/// Used to collect several node slices that make up ONE module (the spliced regions
+/// of an `@extends` chain) under one set of caps. Sharing `out` shares the
+/// message-count cap too, which counts `out.len()`. `budget` holds the running totals
+/// when this returns, on success and on error alike.
+pub(crate) fn evaluate_messages_seeded(
+    nodes: &[Node],
+    scope: &mut Scope,
+    warnings: &mut Vec<String>,
+    file: &str,
+    source: &str,
+    budget: &mut EvalBudget,
+    out: &mut Vec<EvalMessage>,
+) -> Result<(), MdsError> {
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
-        total_iterations: 0,
-        total_message_bytes: 0,
+        budget: *budget,
         warnings,
         map: None,
         fragment_remap_cache: std::collections::HashMap::new(),
@@ -1286,9 +1351,9 @@ pub fn evaluate_messages_intrinsic(
         source,
         body_origin: None,
     };
-    let mut messages = Vec::new();
-    collect_messages_strict(nodes, scope, &mut ctx, &mut messages, file, source)?;
-    Ok(messages)
+    let result = collect_messages_strict(nodes, scope, &mut ctx, out, file, source);
+    *budget = ctx.budget;
+    result
 }
 
 /// Recursive collector for messages mode. Descends into control-flow nodes
@@ -1418,8 +1483,8 @@ fn collect_single_message(
     // Incremental cumulative-size check (AC-6.3): cap the aggregate content bytes
     // across all messages at MAX_MESSAGES_TOTAL_SIZE (50 MB) — the same ceiling a
     // single text-mode output has.  Checked before pushing so a runaway is caught early.
-    ctx.total_message_bytes = ctx.total_message_bytes.saturating_add(content.len());
-    if ctx.total_message_bytes > MAX_MESSAGES_TOTAL_SIZE {
+    ctx.budget.message_bytes = ctx.budget.message_bytes.saturating_add(content.len());
+    if ctx.budget.message_bytes > MAX_MESSAGES_TOTAL_SIZE {
         return Err(MdsError::resource_limit(format!(
             "total message content exceeds maximum cumulative size of {} bytes",
             MAX_MESSAGES_TOTAL_SIZE
@@ -2642,6 +2707,232 @@ mod tests {
             "expected an EscapedBrace segment at source offset {escape_off} with len 3; \
              got: {:?}",
             map.segments
+        );
+    }
+
+    // ── #114: one budget threaded through seeded evaluations ──────────────────
+    //
+    // An `@extends` chain is evaluated one spliced region at a time, and every region
+    // must spend from the same budget. Each test runs two seeded evaluations over one
+    // `EvalBudget`: the first spends it to exactly the cap (proving the seed is honored
+    // with no off-by-one), the second trips on its very first unit of work.
+
+    const ITERATION_LIMIT_MSG: &str = "total loop iterations exceeded maximum of 1000000";
+    const MESSAGE_BYTES_LIMIT_MSG: &str =
+        "total message content exceeds maximum cumulative size of 52428800 bytes";
+
+    /// Parse `source` into the module body the evaluator consumes.
+    fn parse_body(source: &str) -> Vec<Node> {
+        let tokens = crate::lexer::tokenize(source, "t.mds").expect("fixture must tokenize");
+        crate::parser::parse_with_ctx(&tokens, "t.mds", source)
+            .expect("fixture must parse")
+            .body
+    }
+
+    /// A scope whose `items` array has one element: a loop over it is one iteration.
+    fn one_item_scope() -> Scope {
+        let mut scope = Scope::new();
+        scope.set_var("items", Value::Array(vec![Value::Number(1.0)]));
+        scope
+    }
+
+    fn assert_limit<T>(result: Result<T, MdsError>, expected: &str) {
+        let Err(err) = result else {
+            panic!("a spent budget must trip on the first unit of work, but it evaluated");
+        };
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected mds::resource_limit, got: {err}"
+        );
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_seeded_threads_the_iteration_budget_across_calls() {
+        let body = parse_body("@for i in items:\n.\n@end\n");
+        let mut warnings = vec![];
+
+        // Control: a zero seed runs the loop and records the one iteration it spent.
+        let mut budget = EvalBudget::default();
+        let out = evaluate_seeded(
+            &body,
+            &mut one_item_scope(),
+            &mut warnings,
+            "",
+            "",
+            &mut budget,
+        )
+        .expect("a fresh budget must admit one iteration");
+        assert_eq!(out, ".\n");
+        assert_eq!(budget.iterations, 1);
+
+        // One iteration short of the cap: the loop runs and spends the budget exactly.
+        let mut budget = EvalBudget {
+            iterations: MAX_TOTAL_ITERATIONS - 1,
+            ..EvalBudget::default()
+        };
+        evaluate_seeded(
+            &body,
+            &mut one_item_scope(),
+            &mut warnings,
+            "",
+            "",
+            &mut budget,
+        )
+        .expect("the last iteration under the cap must run");
+        assert_eq!(budget.iterations, MAX_TOTAL_ITERATIONS);
+
+        // The same budget, carried into the next evaluation, trips on its first iteration.
+        assert_limit(
+            evaluate_seeded(
+                &body,
+                &mut one_item_scope(),
+                &mut warnings,
+                "",
+                "",
+                &mut budget,
+            ),
+            ITERATION_LIMIT_MSG,
+        );
+    }
+
+    #[test]
+    fn evaluate_with_map_seeded_threads_the_iteration_budget_across_calls() {
+        let source = "@for i in items:\n.\n@end\n";
+        let body = parse_body(source);
+        let builder = || {
+            crate::sourcemap::MapBuilder::new(
+                "t.mds".to_string(),
+                "t.mds".to_string(),
+                source.to_string(),
+            )
+        };
+        let mut warnings = vec![];
+
+        // Control: a zero seed runs the loop, records it, and counts one iteration.
+        let mut budget = EvalBudget::default();
+        let (out, map) = evaluate_with_map_seeded(
+            &body,
+            &mut one_item_scope(),
+            &mut warnings,
+            builder(),
+            &mut budget,
+        )
+        .expect("a fresh budget must admit one iteration");
+        assert_eq!(out, ".\n");
+        assert_eq!(map.cursor, 2, "the cursor tracks the recorded output");
+        assert_eq!(budget.iterations, 1);
+
+        let mut budget = EvalBudget {
+            iterations: MAX_TOTAL_ITERATIONS - 1,
+            ..EvalBudget::default()
+        };
+        evaluate_with_map_seeded(
+            &body,
+            &mut one_item_scope(),
+            &mut warnings,
+            builder(),
+            &mut budget,
+        )
+        .expect("the last iteration under the cap must run");
+        assert_eq!(budget.iterations, MAX_TOTAL_ITERATIONS);
+
+        assert_limit(
+            evaluate_with_map_seeded(
+                &body,
+                &mut one_item_scope(),
+                &mut warnings,
+                builder(),
+                &mut budget,
+            ),
+            ITERATION_LIMIT_MSG,
+        );
+    }
+
+    #[test]
+    fn evaluate_messages_seeded_threads_both_budgets_across_calls() {
+        let body = parse_body("@for i in items:\n@message user:\nhi\n@end\n@end\n");
+        let mut warnings = vec![];
+
+        // Control: a zero seed collects the message and records what it spent.
+        let mut budget = EvalBudget::default();
+        let mut out = Vec::new();
+        evaluate_messages_seeded(
+            &body,
+            &mut one_item_scope(),
+            &mut warnings,
+            "",
+            "",
+            &mut budget,
+            &mut out,
+        )
+        .expect("a fresh budget must admit one message");
+        assert_eq!(
+            out,
+            [EvalMessage {
+                role: "user".to_string(),
+                content: "hi".to_string()
+            }]
+        );
+        assert_eq!(
+            budget,
+            EvalBudget {
+                iterations: 1,
+                message_bytes: 2
+            }
+        );
+
+        // Message bytes: two bytes short of the cap admits "hi" and spends it exactly;
+        // the same budget then trips on the next message's first byte.
+        let mut budget = EvalBudget {
+            message_bytes: MAX_MESSAGES_TOTAL_SIZE - 2,
+            ..EvalBudget::default()
+        };
+        let mut out = Vec::new();
+        evaluate_messages_seeded(
+            &body,
+            &mut one_item_scope(),
+            &mut warnings,
+            "",
+            "",
+            &mut budget,
+            &mut out,
+        )
+        .expect("the last message under the cap must be collected");
+        assert_eq!(budget.message_bytes, MAX_MESSAGES_TOTAL_SIZE);
+        assert_limit(
+            evaluate_messages_seeded(
+                &body,
+                &mut one_item_scope(),
+                &mut warnings,
+                "",
+                "",
+                &mut budget,
+                &mut out,
+            ),
+            MESSAGE_BYTES_LIMIT_MSG,
+        );
+        assert_eq!(out.len(), 1, "the tripping message is never collected");
+
+        // Iterations: the messages path spends from the same iteration budget.
+        let mut budget = EvalBudget {
+            iterations: MAX_TOTAL_ITERATIONS,
+            ..EvalBudget::default()
+        };
+        assert_limit(
+            evaluate_messages_seeded(
+                &body,
+                &mut one_item_scope(),
+                &mut warnings,
+                "",
+                "",
+                &mut budget,
+                &mut Vec::new(),
+            ),
+            ITERATION_LIMIT_MSG,
         );
     }
 }
