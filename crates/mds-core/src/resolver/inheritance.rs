@@ -150,12 +150,13 @@ pub(super) fn apply_block_overrides(
 /// A `Node::Block` placeholder in the skeleton yields the effective block's body
 /// nodes and the block's own `Origin` (the file whose offsets those nodes index into).
 /// Any other skeleton node yields a single-element slice and the `skeleton_origin`
-/// (the root-base file).
+/// (the root-base file), so between-block spacing (skeleton `Text` nodes) is preserved
+/// (decision #9, F11). The regions, in order, are the child's whole inherited body.
 ///
 /// Every skeleton `@block` is required to have an `effective_blocks` entry, and that
 /// requirement is enforced in release builds too (#220). This is the single shared walk
-/// that prevents text/messages mode validate paths from drifting (PF-004), so both
-/// consumers (splice + validate) have identical coverage of it.
+/// behind validation and every evaluation mode (text, messages, source-mapped), so they
+/// cannot drift apart (PF-004).
 ///
 /// # Panics
 ///
@@ -193,17 +194,4 @@ pub(super) fn spliced_regions<'a>(
         }
     }
     regions
-}
-
-/// Splice the skeleton body by replacing each `@block` placeholder with its
-/// effective body (from the `effective_blocks` override map).
-pub(super) fn splice_skeleton(
-    skeleton: &[Node],
-    effective_blocks: &IndexMap<String, EffectiveBlock>,
-    skeleton_origin: &Origin,
-) -> Vec<Node> {
-    spliced_regions(skeleton, effective_blocks, skeleton_origin)
-        .into_iter()
-        .flat_map(|(nodes, _)| nodes.iter().cloned())
-        .collect()
 }

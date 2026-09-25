@@ -31,8 +31,7 @@ pub(crate) use frontmatter::{
     FrontmatterImport,
 };
 use inheritance::{
-    apply_block_overrides, check_child_only_blocks, seed_effective_blocks, splice_skeleton,
-    spliced_regions,
+    apply_block_overrides, check_child_only_blocks, seed_effective_blocks, spliced_regions,
 };
 
 // `Origin` is defined in `sourcemap.rs` and re-exported above via `pub(crate) use`.
@@ -834,10 +833,10 @@ impl ModuleCache {
     /// `prepend_frontmatter`).
     ///
     /// When the parsed module has an `@extends` directive the shared extends pipeline
-    /// (`resolve_extends_components`) builds `final_body` and `scope` identically to
-    /// text mode — then the dispatch is performed on `final_body` (NOT `module.body`),
-    /// so @message blocks inside base @block defaults are correctly detected (avoids
-    /// PF-004 divergence, decision #8).
+    /// (`resolve_extends_components`) builds the effective blocks and `scope`
+    /// identically to text mode — then the dispatch is performed on the spliced
+    /// regions (NOT `module.body`), so @message blocks inside base @block defaults are
+    /// correctly detected (avoids PF-004 divergence, decision #8).
     fn process_module_intrinsic(
         &mut self,
         ctx: &ModuleCtx<'_>,
@@ -895,7 +894,6 @@ impl ModuleCache {
             }
 
             let ExtendsComponents {
-                final_body,
                 mut scope,
                 merged_frontmatter,
                 effective_skeleton,
@@ -910,7 +908,7 @@ impl ModuleCache {
             // (#114, #115).
             let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
 
-            if has_message_block(&final_body) {
+            if regions.iter().any(|(nodes, _)| has_message_block(nodes)) {
                 // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
                 // The evaluator only has text-stream semantics; messages boundaries don't
                 // have stable byte offsets relative to the source.  Degrade gracefully.
@@ -1314,17 +1312,19 @@ impl ModuleCache {
         Ok((scope, merged_mapping))
     }
 
-    /// Shared extends-pipeline: steps 3a-3e are identical for the text-cached and
+    /// Shared extends-pipeline: steps 3a-3d are identical for the text-cached and
     /// intrinsic paths.
     ///
-    /// Builds the `final_body` (splice of base skeleton with effective block overrides)
-    /// and the `scope` (deep-merged frontmatter + FM imports + functions) needed by
-    /// both `process_module_extends` (cached text path) and `process_module_intrinsic`.
+    /// Builds the effective skeleton and blocks (base skeleton plus the winning block
+    /// overrides, each with its `Origin`) and the `scope` (deep-merged frontmatter + FM
+    /// imports + functions) needed by both `process_module_extends` (cached text path)
+    /// and `process_module_intrinsic`.
     ///
-    /// Callers differ only in the terminal step (step 3f):
-    /// - Cached text path: `validate` → `evaluate(&final_body, …)`
-    /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_messages_intrinsic`
-    ///   (Messages) or `evaluate` + clean/frontmatter (Markdown)
+    /// Callers differ only in the terminal step (step 3e), which walks the skeleton's
+    /// `spliced_regions` and evaluates each against its own origin:
+    /// - Cached text path: `validate` → `evaluate_regions_with_map`
+    /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
+    ///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
     ///
     /// Factoring here enforces that BOTH modes go through the same PF-004-safe
     /// `resolve_by_key_skeleton` path for the base, and share one copy of the
@@ -1396,14 +1396,7 @@ impl ModuleCache {
 
         validate_exports(&explicit_exports, &functions)?;
 
-        // ── Step 3e: splice final_body ────────────────────────────────────────
-        // Linear O(S+B) pass over the skeleton. Each Block in the skeleton is replaced
-        // by its effective body from effective_blocks (O(1) lookup). Non-Block nodes
-        // pass through verbatim. Between-block spacing (Text nodes) is preserved (decision #9, F11).
-        let final_body = splice_skeleton(&effective_skeleton, &effective_blocks, &skeleton_origin);
-
         Ok(ExtendsComponents {
-            final_body,
             scope,
             functions,
             effective_skeleton,
@@ -1428,7 +1421,7 @@ impl ModuleCache {
     /// and `process_module_intrinsic` (@extends branch) — enforcing PF-004 parity: the two
     /// parallel paths can never drift because they share one implementation.
     ///
-    /// Re-validate at the leaf (on `final_body` regions), not at intermediate bases.
+    /// Re-validate at the leaf (on the spliced regions), not at intermediate bases.
     fn validate_extends_components(
         components: &ExtendsComponents,
         scope: &mut Scope,
@@ -1445,8 +1438,8 @@ impl ModuleCache {
 
     /// Evaluate an extending child template in text mode.
     ///
-    /// Delegates the shared pipeline (steps 3a-3e) to `resolve_extends_components`,
-    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3f).
+    /// Delegates the shared pipeline (steps 3a-3d) to `resolve_extends_components`,
+    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3e).
     ///
     /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
     /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
@@ -1461,7 +1454,7 @@ impl ModuleCache {
         let components =
             self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
 
-        // ── Step 3f: validate + evaluate the spliced regions ──────────────────
+        // ── Step 3e: validate + evaluate the spliced regions ──────────────────
         // Validate per-region so each region's offsets are checked against the correct
         // source (fixes the cross-source OutOfBounds diagnostic bug). This is what makes
         // E12 work: a base default block referencing an undefined var is caught HERE
@@ -1481,7 +1474,6 @@ impl ModuleCache {
             has_explicit_exports,
             explicit_exports,
             merged_frontmatter,
-            ..
         } = components;
 
         // Base-skeleton nodes, base defaults and child overrides index into different
@@ -2129,15 +2121,13 @@ struct CollectedDefs {
 
 /// Shared output of [`ModuleCache::resolve_extends_components`].
 ///
-/// Steps 3a-3e (base resolution, child-only-blocks check, effective-blocks construction,
-/// scope merge, and skeleton splice) are identical for text and messages modes. This struct
-/// carries those results so the two terminal steps differ only in the final evaluate call:
-/// - Cached text path: `validator::validate` → `evaluate(&final_body, …)`
-/// - Intrinsic path:   `has_message_block` dispatch → `evaluate_messages_intrinsic`
-///   (Messages) or `evaluate` + clean/frontmatter (Markdown)
+/// Steps 3a-3d (base resolution, child-only-blocks check, effective-blocks construction,
+/// and scope merge) are identical for text and messages modes. This struct carries those
+/// results so the two terminal steps differ only in how the spliced regions are evaluated:
+/// - Cached text path: `validator::validate` → `evaluate_regions_with_map`
+/// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
+///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
 struct ExtendsComponents {
-    /// Spliced final body: base skeleton with effective block bodies inlined.
-    final_body: Vec<Node>,
     /// Merged scope (base < child < runtime), with FM imports and functions loaded.
     scope: Scope,
     /// Merged function map (base functions + child overrides).

@@ -401,9 +401,9 @@ fn evaluate_nodes(
             Node::Block(block) => {
                 // Standalone mode: render the block's default body inline.
                 // The block markers are invisible in text output — @block is a
-                // transparent wrapper in non-extending files.
-                // The resolver splices child overrides before evaluation, so this arm
-                // handles both base defaults and child-override bodies.
+                // transparent wrapper in non-extending files. An `@extends` chain
+                // never reaches this arm: the resolver evaluates each block's
+                // effective body (base default or child override) as its own region.
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
@@ -1422,9 +1422,9 @@ fn collect_messages_strict(
             }
             Node::Block(block) => {
                 // Descend into @block body to surface any @message blocks it contains.
-                // In standalone mode the block body is the default content; in inheritance
-                // mode the resolver has already spliced the final body before evaluation,
-                // so this arm is reached for both cases.
+                // Reached in standalone mode, where the block body is the default
+                // content; an `@extends` chain hands each block's effective body to
+                // the collector as its own region instead.
                 collect_messages_strict(&block.body, scope, ctx, out, file, source)?;
             }
         }

@@ -1975,7 +1975,7 @@ fn f9_messages_mode_default_block_in_message_body() {
 #[test]
 fn e13_extends_no_message_block_compiles_to_markdown() {
     // Base has @block placeholders but no @message. Output shape is intrinsic:
-    // with no @message anywhere in the spliced final_body, the child compiles to
+    // with no @message anywhere in the spliced regions, the child compiles to
     // Markdown (not an error). Extracting messages from it yields ExpectedMessages.
     let base = concat!(
         "You are an assistant.\n",
@@ -2281,7 +2281,7 @@ fn f9_messages_mode_multilevel_chain() {
     );
 }
 
-// ── PF-004 parity: messages-mode @extends path validates final_body ────────
+// ── PF-004 parity: messages-mode @extends path validates the spliced regions ─
 //
 // A check on the primary path (text-mode process_module_extends calls
 // validator::validate before evaluate) must not be absent on the parallel path
@@ -2290,7 +2290,7 @@ fn f9_messages_mode_multilevel_chain() {
 // produces the SAME error (mds::undefined_var) as text mode does.
 
 #[test]
-fn pf004_messages_mode_extends_validates_final_body_parity() {
+fn pf004_messages_mode_extends_validates_spliced_regions_parity() {
     // Base: @block with @message inside, and an undefined variable.
     // Child: @extends the base, provides no override (uses default).
     let base = concat!(

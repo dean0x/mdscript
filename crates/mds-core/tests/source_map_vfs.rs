@@ -289,9 +289,9 @@ fn source_map_extends_multi_source() {
 
 /// AC-PERF-02 (@extends): compiled output for an `@extends` template must be
 /// byte-identical whether source maps are on or off. This is the riskiest path
-/// for divergence because map-on evaluates per spliced region
-/// (`evaluate_regions_with_map`) while map-off evaluates the assembled
-/// `final_body` in one pass — the two must produce the same bytes.
+/// for divergence because both evaluate per spliced region
+/// (`evaluate_regions_with_map`), but only map-on records segments and moves
+/// the builder's cursor — the two must produce the same bytes.
 #[test]
 fn source_map_extends_output_unchanged() {
     let mut modules = HashMap::new();

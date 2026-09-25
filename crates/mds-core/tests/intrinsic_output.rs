@@ -724,8 +724,8 @@ fn check_virtual_raises_mixed_content_on_mixed_template() {
 #[test]
 fn extends_base_with_message_in_block_compiles_to_messages() {
     // AC-FUNC-03: child @extends a base whose @message lives inside a @block.
-    // The child has no literal @message in its own body. After splice, the
-    // has_message_block check on final_body must find the @message from the base
+    // The child has no literal @message in its own body. The has_message_block
+    // check over the spliced regions must find the @message from the base
     // @block default and produce Messages output.
     let mut modules = HashMap::new();
     modules.insert(
