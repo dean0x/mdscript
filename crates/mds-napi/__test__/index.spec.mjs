@@ -1075,6 +1075,29 @@ describe('lintVirtual', () => {
     );
   });
 
+  // #265: a module key a message names is escaped — every forbidden path character,
+  // TAB included — so a hostile key reaches the error as its six-character escape.
+  test('L-NV-5: lintVirtual escapes a hostile module key in its error', () => {
+    for (const cp of [0x09, 0x1b, 0x0a, 0x202e]) {
+      const key = `x${String.fromCodePoint(cp)}.mds`;
+      const escapedKey = `x\\u${cp.toString(16).toUpperCase().padStart(4, '0')}.mds`;
+      assert.throws(
+        () => lintVirtual({ [key]: 5 }, 'main.mds'),
+        (err) => {
+          assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+          assert.equal(err.message, `modules["${escapedKey}"] must be a string source`);
+          assert.ok(!err.message.includes(String.fromCodePoint(cp)), `raw char: ${err.message}`);
+          return true;
+        },
+      );
+    }
+    // Control: a clean key is shown as written.
+    assert.throws(
+      () => lintVirtual({ 'ok.mds': 5 }, 'main.mds'),
+      (err) => err.message === 'modules["ok.mds"] must be a string source',
+    );
+  });
+
   // R6: missing virtual module emits mds::module_not_found, not mds::file_not_found.
   test('R6-NV: lintVirtual on missing entry emits mds::module_not_found', () => {
     assert.throws(

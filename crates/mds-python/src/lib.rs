@@ -1262,11 +1262,14 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
     let mut result = HashMap::with_capacity(map.len());
     let mut aggregate: usize = 0;
     for (key, val) in map {
+        // A key is caller input, escaped wherever a message names it — the same
+        // six-character escapes as the napi and WASM bindings (#265).
+        let shown = mds::escape_path_for_message(&key);
         let serde_json::Value::String(s) = val else {
             return Err(options_error(
                 py,
                 &format!(
-                    "modules[{key:?}] must be a string, got {}",
+                    "modules[\"{shown}\"] must be a string, got {}",
                     json_type_name(&val)
                 ),
             ));
@@ -1275,7 +1278,7 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
             return Err(resource_limit_error(
                 py,
                 &format!(
-                    "modules[{key:?}] exceeds maximum size of {MAX_SOURCE_SIZE} bytes ({} bytes provided)",
+                    "modules[\"{shown}\"] exceeds maximum size of {MAX_SOURCE_SIZE} bytes ({} bytes provided)",
                     s.len()
                 ),
             ));

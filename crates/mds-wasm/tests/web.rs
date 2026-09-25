@@ -362,6 +362,62 @@ fn compile_filename_collision_returns_error() {
     assert_eq!(code, "mds::filename_collision", "got: {code}");
 }
 
+/// #265: a module key or filename an options error names is escaped — every
+/// forbidden path character, TAB included — never shown raw. Covers the
+/// `filename_collision` message and the per-key `modules` messages (compile's
+/// `options.modules` and `lintVirtual`'s `modules`, one parser).
+#[wasm_bindgen_test]
+fn module_key_messages_escape_hostile_keys() {
+    for ch in ['\t', '\x1b', '\n', '\u{202E}'] {
+        let key = format!("x{ch}.mds");
+        let shown = format!("x\\u{:04X}.mds", u32::from(ch));
+
+        let opts = to_js_object(&serde_json::json!({
+            "filename": key,
+            "modules": { key.as_str(): "Other\n" }
+        }));
+        let err = mds_wasm::compile("Hello!\n", opts).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::filename_collision");
+        let message = get_str(&err, "message");
+        assert!(
+            message.starts_with(&format!(
+                "options.modules already contains key \"{shown}\";"
+            )),
+            "got: {message:?}"
+        );
+        assert!(!message.contains(ch), "raw char: {message:?}");
+
+        let err = mds_wasm::compile(
+            "Hello!\n",
+            modules_opts(&serde_json::json!({ key.as_str(): 5 })),
+        )
+        .unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::invalid_options");
+        assert_eq!(
+            get_str(&err, "message"),
+            format!("options.modules[\"{shown}\"] must be a string, got number")
+        );
+
+        let modules = to_js_object(&serde_json::json!({ key.as_str(): 5 }));
+        let err = mds_wasm::lint_virtual(modules, "main.mds", JsValue::UNDEFINED).unwrap_err();
+        assert_eq!(
+            get_str(&err, "message"),
+            format!("modules[\"{shown}\"] must be a string, got number")
+        );
+    }
+
+    // Control: a clean key is shown as written.
+    let err = mds_wasm::compile(
+        "Hello!\n",
+        modules_opts(&serde_json::json!({ "ok.mds": 5 })),
+    )
+    .unwrap_err();
+    assert_eq!(
+        get_str(&err, "message"),
+        "options.modules[\"ok.mds\"] must be a string, got number"
+    );
+}
+
 #[wasm_bindgen_test]
 fn compile_invalid_vars_type_returns_error() {
     // vars must be an object, not a string

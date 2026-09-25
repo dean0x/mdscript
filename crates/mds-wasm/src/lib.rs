@@ -314,12 +314,14 @@ fn parse_modules_from_map(
     let mut aggregate_size: usize = 0;
 
     for (key, val) in mods {
+        // A key is caller input, escaped wherever a message names it (#265).
+        let shown = mds::escape_path_for_message(&key);
         match val {
             serde_json::Value::String(s) => {
                 if s.len() > MAX_SOURCE_SIZE {
                     return Err(js_error(
                         &format!(
-                            "{field_label}[\"{key}\"] exceeds maximum size of {} bytes ({} bytes provided)",
+                            "{field_label}[\"{shown}\"] exceeds maximum size of {} bytes ({} bytes provided)",
                             MAX_SOURCE_SIZE,
                             s.len()
                         ),
@@ -340,7 +342,7 @@ fn parse_modules_from_map(
             }
             other => {
                 return Err(options_error(&format!(
-                    "{field_label}[\"{key}\"] must be a string, got {}",
+                    "{field_label}[\"{shown}\"] must be a string, got {}",
                     json_type_name(&other)
                 )));
             }
@@ -640,7 +642,8 @@ fn build_modules(
     if extra_modules.contains_key(filename) {
         return Err(js_error(
             &format!(
-                "options.modules already contains key \"{filename}\"; this would shadow the source — use a different filename"
+                "options.modules already contains key \"{}\"; this would shadow the source — use a different filename",
+                mds::escape_path_for_message(filename)
             ),
             "mds::filename_collision",
         ));
