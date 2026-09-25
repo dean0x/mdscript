@@ -616,8 +616,20 @@ fn regressed_rules(
 ///
 /// # Panics
 ///
-/// Does not panic — invalid spans produce no change (the edit is skipped with
-/// a `debug_assert` violation in debug builds).
+/// - In every build, when `plan.edits` is not sorted ascending by `start` — an
+///   unconditional `assert!`, because applying unsorted edits right-to-left would
+///   corrupt the source.
+/// - In every build, when an edit within bounds has a `start` or `end` that is not
+///   on a UTF-8 character boundary — `String::replace_range` panics (in debug builds
+///   a `debug_assert!` fails first, naming the offset).
+/// - In debug builds only, when `plan.overlap_rejected` is true, or when an edit is
+///   out of bounds (`end` past the source length, or `start > end`). A release build
+///   does not check the flag and applies the plan's edits as given, and it skips an
+///   out-of-bounds edit, leaving the source unchanged there.
+///
+/// [`plan_fixes`]/[`plan_fixes_with_options`] sort their edits, so a plan they
+/// return never trips the sortedness `assert!`; one they reject for an overlap has
+/// its edits cleared, but still trips the debug-build `overlap_rejected` check.
 pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
     debug_assert!(
         !plan.overlap_rejected,
