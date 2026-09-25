@@ -171,6 +171,32 @@ function fileNotFoundError(shown: string): PathError {
 }
 
 /**
+ * Canonicalize `path`'s parent directory, translating ENOENT (the parent does
+ * not exist) and ENOTDIR (a path component above it is a regular file, not a
+ * directory) into the same `mds::file_not_found` shape `fileNotFoundError`
+ * builds — keyed on `shown`, never the raw absolute path (R3 / CWE-209, #408).
+ * Any other errno is re-thrown unchanged.
+ *
+ * Mirrors Rust `check_symlink_named`, whose `parent.canonicalize()` step maps
+ * every canonicalize failure on the parent — it does not distinguish errno —
+ * to `MdsError::file_not_found(shown)`.
+ *
+ * Shared by buildModulesMap's own entry-directory canonicalization and
+ * openAndValidateModule's per-module one, so the translation is written once.
+ */
+async function realpathParent(path: string, shown: string): Promise<string> {
+  try {
+    return await realpath(dirname(path));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw fileNotFoundError(shown);
+    }
+    throw err;
+  }
+}
+
+/**
  * The refusal for an entry path or virtual entry key, if any — mirrors Rust
  * `validate_entry_path` (empty, then NUL, then the rest of the forbidden class;
  * all `mds::io`).
@@ -347,6 +373,9 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  *   contains NUL or carries a forbidden path character (`mds::import`) (#265)
  * - Rejects a module whose resolved path carries a forbidden path character — a
  *   hostile-named directory reached through a symlink (`mds::io`, #265)
+ * - Reports a module whose directory does not exist, or is blocked by a
+ *   non-directory path component, as `mds::file_not_found` — never the raw,
+ *   resolved-path `ENOENT`/`ENOTDIR` node:fs error (#408)
  * - Enforces module count and aggregate size limits
  */
 export async function buildModulesMap(
@@ -369,8 +398,13 @@ export async function buildModulesMap(
   // Only the PARENT directory is canonicalized, NOT the final path component,
   // which openAndValidateModule judges by its own file type — the pattern of
   // NativeFs::check_symlink_named (Rust).
+  //
+  // A parent directory that does not exist (ENOENT) or is not traversable
+  // (ENOTDIR — a path component above it is a regular file, #408) is reported
+  // as file-not-found, keyed on entryPath as written, rather than leaking this
+  // raw, resolved realpath() error.
   const rawAbsoluteEntry = resolve(entryPath);
-  const canonicalParentDir = await realpath(dirname(rawAbsoluteEntry));
+  const canonicalParentDir = await realpathParent(rawAbsoluteEntry, entryPath);
   const absoluteEntry = canonicalParentDir + sep + rawAbsoluteEntry.slice(rawAbsoluteEntry.lastIndexOf(sep) + 1);
   const projectRoot = findProjectRoot(dirname(absoluteEntry));
   // Virtual keys are always slash-separated to mirror Rust's VirtualFs; on
@@ -443,7 +477,9 @@ export async function buildModulesMap(
     absolutePath: string,
     shown: string,
   ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number; resolved: string }> {
-    const canonicalParent = await realpath(dirname(absolutePath));
+    // See realpathParent: an import whose directory does not exist (or is not
+    // traversable) is reported as file-not-found, keyed on `shown`.
+    const canonicalParent = await realpathParent(absolutePath, shown);
     const joined = join(canonicalParent, basename(absolutePath));
 
     // Security (#265): no forbidden path character anywhere in the canonical
@@ -467,6 +503,11 @@ export async function buildModulesMap(
     const handle = await openNoFollow(joined, shown);
 
     try {
+      // `openNoFollow` above already succeeded, so `joined` names a file that
+      // existed a moment ago; a path-based ENOENT from `lstat`/`realpath` here
+      // can only come from a concurrent external deletion (TOCTOU), not from
+      // caller-supplied input — the case this function exists to translate.
+      // `handle.stat()` is fd-based and carries no path to leak.
       const [stats, linkStats, resolved] = await Promise.all([
         handle.stat(),
         lstat(joined),

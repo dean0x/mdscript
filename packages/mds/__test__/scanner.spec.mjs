@@ -15,8 +15,11 @@ import os from 'node:os';
 import {
   FORBIDDEN_PATH_CODEPOINTS,
   assertNoForbiddenChars,
+  compileFileOutcomes,
   escapeText,
+  loadEngines,
   rejectionOf,
+  requireEngines,
   thrownBy,
   uPlus,
 } from './helpers.mjs';
@@ -47,6 +50,19 @@ function scanImports(source) {
     if (p && !paths.includes(p)) paths.push(p);
   }
   return paths;
+}
+
+/**
+ * A missing file — whether never found (nonexistent name, nonexistent parent or
+ * grandparent directory, ENOENT/ENOTDIR alike) or a mismatched spelling on a
+ * case-sensitive volume (#408) — is reported with the same `mds::file_not_found`
+ * shape the Rust engine reports for a missing file, keyed on `shown` (never a
+ * resolved absolute path, R3 / CWE-209) and never described as a symlink.
+ */
+function assertNotFoundNotSymlink(err, shown, label) {
+  assert.equal(err.code, 'mds::file_not_found', `${label}: ${err.message}`);
+  assert.equal(err.message, `file not found: ${shown}`, label);
+  assert.doesNotMatch(err.message, /symlink/, label);
 }
 
 describe('normalizeVirtualKey', () => {
@@ -197,13 +213,29 @@ describe('buildModulesMap', () => {
     assert.equal(Object.keys(modules).length, 1);
   });
 
-  test('U-SM3: rejects nonexistent file', async () => {
-    await assert.rejects(
-      () => buildModulesMap('/nonexistent/file.mds', scanImports),
-      (err) => {
-        assert.ok(err instanceof Error);
-        return true;
-      },
+  test('U-SM3: rejects nonexistent file with the file-not-found shape, never a raw absolute-path error', async () => {
+    // The entry's parent directory does not exist, so `realpath(dirname(...))`
+    // — called before the filesystem is touched for the entry itself — is what
+    // rejects, not the later O_NOFOLLOW open (#408). Absolute `shown`: the
+    // caller's own path is already absolute, so it is expected back verbatim.
+    const absoluteEntry = '/nonexistent/file.mds';
+    assertNotFoundNotSymlink(
+      await rejectionOf(buildModulesMap(absoluteEntry, scanImports), 'U-SM3a'),
+      absoluteEntry,
+      'U-SM3a',
+    );
+
+    // Relative `shown`: this is the case that actually discriminates the fix from
+    // the raw Node error. A raw ENOENT from `realpath()` reports the *resolved*
+    // (cwd-joined) absolute path in its message, which would satisfy neither the
+    // exact-message assertion above nor the no-leak assertion below for a
+    // relative input — only the translated error reports `shown` unchanged.
+    const relativeEntry = `mds-scanner-u-sm3-${process.pid}-nonexistent/file.mds`;
+    const err = await rejectionOf(buildModulesMap(relativeEntry, scanImports), 'U-SM3b');
+    assertNotFoundNotSymlink(err, relativeEntry, 'U-SM3b');
+    assert.ok(
+      !err.message.includes(process.cwd()),
+      `U-SM3b: message must not leak the resolved absolute path: ${err.message}`,
     );
   });
 
@@ -430,18 +462,6 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     return insensitive;
   }
 
-  /**
-   * On a case-sensitive volume a mismatched spelling is simply not found —
-   * the same `mds::file_not_found` shape the Rust engine reports for a
-   * missing file, keyed on `shown` (never a resolved absolute path, R3 /
-   * CWE-209).
-   */
-  function assertNotFoundNotSymlink(err, shown, label) {
-    assert.equal(err.code, 'mds::file_not_found', `${label}: ${err.message}`);
-    assert.equal(err.message, `file not found: ${shown}`, label);
-    assert.doesNotMatch(err.message, /symlink/, label);
-  }
-
   const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
 
   test('U-SM14: a case-mismatched entry path is never reported as a symlink', async () => {
@@ -553,6 +573,50 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       });
     },
   );
+
+  test('U-SM19: an entry path through a file where a directory is expected (ENOTDIR) is reported as file-not-found', async () => {
+    // Rust's check_symlink_named maps ANY canonicalize() failure on the parent —
+    // ENOENT or ENOTDIR alike — to file_not_found without distinguishing errno;
+    // this mirrors that. `blocker.mds` is a regular file, so the `nested` segment
+    // below it cannot be traversed.
+    await withProject(async (dir) => {
+      const blocker = path.join(dir, 'blocker.mds');
+      await writeFile(blocker, 'not a directory\n');
+      const entry = path.join(blocker, 'nested', 'file.mds');
+      assertNotFoundNotSymlink(await rejectionOf(buildModulesMap(entry, scanImports), 'U-SM19'), entry, 'U-SM19');
+    });
+  });
+
+  test('U-SM20: an import into a missing subdirectory is reported as file-not-found, not a raw ENOENT', async () => {
+    // Exercises openAndValidateModule's own realpath(dirname(...)) (the sibling
+    // of buildModulesMap's top-level one that U-SM3 exercises): the entry exists,
+    // but an imported module's directory does not.
+    await withProject(async (dir) => {
+      const importPath = './missing-subdir/lib.mds';
+      await writeFile(path.join(dir, 'main.mds'), `@import "${importPath}" as l\n`);
+      const err = await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM20');
+      assertNotFoundNotSymlink(err, importPath, 'U-SM20');
+    });
+  });
+
+  test('U-SM21: compileFile on an entry with a missing parent directory — native and WASM backends agree on code and message', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM21')) return;
+    const missing = path.join(FIXTURES, `mds-scanner-u-sm21-${process.pid}-nonexistent`, 'file.mds');
+    const [native] = await compileFileOutcomes('native', [missing]);
+    const [wasm] = await compileFileOutcomes('wasm', [missing]);
+    assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+    assert.equal(native.message, `file not found: ${missing}`, JSON.stringify(native));
+    // code/message only, not the full errorShape: native reaches this error through
+    // Rust's own NativeFs (compileFile calls the napi addon directly, never
+    // buildModulesMap), whose FileNotFound carries a `help` diagnostic
+    // (crates/mds-core/src/error.rs); the WASM backend reaches it through this
+    // file's buildModulesMap, whose PathError type carries no `help` field at all
+    // (true of every mds::io/mds::import/mds::file_not_found refusal built by
+    // pathError() in this file, not something this fix introduces or narrows).
+    assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+    assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+  });
 });
 
 describe('findProjectRoot', () => {

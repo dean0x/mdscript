@@ -15,26 +15,22 @@
  */
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { mkdtemp, mkdir, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  __dirname,
   FORBIDDEN_PATH_CODEPOINTS,
   assertNoForbiddenChars,
+  compileFileOutcomes,
   errorShape,
   escapeText,
+  loadEngines,
+  requireEngines,
   uPlus,
 } from './helpers.mjs';
 
 const { isForbiddenPathChar } = await import('../dist/util/path-chars.js');
 const { normalizeVirtualKey } = await import('../dist/util/module-scanner.js');
-
-const exec = promisify(execFile);
-const pkgRoot = path.join(__dirname, '..');
 
 function codepointRange(first, last) {
   return Array.from({ length: last - first + 1 }, (_, i) => first + i);
@@ -69,41 +65,6 @@ const CODEPOINTS = [
   0x10ffff,
 ];
 
-/**
- * Load the raw native addon and WASM module — the same Rust engine the two
- * `@mdscript/mds` backends call. Either is null when it has not been built.
- */
-async function loadEngines() {
-  let native = null;
-  let wasm = null;
-  try {
-    const require = createRequire(import.meta.url);
-    native = require(path.join(__dirname, '../../../crates/mds-napi/index.js'));
-  } catch {
-    native = null;
-  }
-  try {
-    const { initWasmNode } = await import('../dist/backend/wasm.js');
-    wasm = await initWasmNode();
-  } catch {
-    wasm = null;
-  }
-  return { native, wasm };
-}
-
-/** Skip visibly when an engine is missing — except in CI, where that is a failure. */
-function requireEngines(t, engines, label) {
-  const missing = Object.entries(engines)
-    .filter(([, engine]) => engine === null)
-    .map(([name]) => name);
-  if (missing.length === 0) return true;
-  if (process.env.CI) {
-    throw new Error(`${label}: the ${missing.join(' and ')} backend is required in CI`);
-  }
-  t.skip(`${missing.join(' and ')} backend not built`);
-  return false;
-}
-
 /** The Rust verdict on `modules`/`entry`: the error shape it throws, or 'accepted'. */
 function rustOutcome(engine, modules, entry) {
   try {
@@ -122,39 +83,6 @@ function jsOutcome(fn) {
   } catch (err) {
     return errorShape(err);
   }
-}
-
-/**
- * `compileFile` each of `files` through the public `@mdscript/mds` API with the
- * backend forced by MDS_BACKEND, in a fresh process (the backend is a module-level
- * singleton). Returns the backend that actually ran and, per file, the error shape
- * it threw or `{ output }`.
- */
-async function compileFileOutcomes(backend, files) {
-  const script = `
-    import { init, compileFile, getBackend } from './dist/node.js';
-    const files = JSON.parse(process.env.MDS_TEST_FILES);
-    await init();
-    const outcomes = [];
-    for (const file of files) {
-      try {
-        const r = await compileFile(file);
-        outcomes.push({ output: r.output });
-      } catch (err) {
-        outcomes.push({ code: err.code, message: err.message, help: err.help ?? null, span: err.span ?? null });
-      }
-    }
-    process.stdout.write(JSON.stringify({ backend: getBackend(), outcomes }));
-  `;
-  const { stdout } = await exec(process.execPath, ['--input-type=module', '-e', script], {
-    cwd: pkgRoot,
-    env: { ...process.env, MDS_BACKEND: backend, MDS_TEST_FILES: JSON.stringify(files) },
-    timeout: 60000,
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  const result = JSON.parse(stdout);
-  assert.equal(result.backend, backend, 'the forced backend must be the one that ran');
-  return result.outcomes;
 }
 
 describe('forbidden path characters — Rust↔JS differential (#265)', () => {

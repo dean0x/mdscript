@@ -1,13 +1,19 @@
 /**
  * Shared test helpers for @mdscript/mds tests.
  */
-import { spawnSync } from 'node:child_process';
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { execFile, spawnSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 export const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const FIXTURES = path.join(__dirname, 'fixtures');
+/** The `@mdscript/mds` package root — `cwd` for a forced-backend subprocess. */
+export const pkgRoot = path.join(__dirname, '..');
+const exec = promisify(execFile);
 export const SIMPLE_MDS = path.join(FIXTURES, 'simple.mds');
 export const IMPORT_PROVIDER_MDS = path.join(FIXTURES, 'import_provider.mds');
 export const IMPORT_CONSUMER_MDS = path.join(FIXTURES, 'import_consumer.mds');
@@ -107,6 +113,74 @@ export function errorShape(err) {
     help: err.help ?? null,
     span: err.span ?? null,
   };
+}
+
+/**
+ * Load the raw native addon and WASM module — the same Rust engine the two
+ * `@mdscript/mds` backends call. Either is null when it has not been built.
+ */
+export async function loadEngines() {
+  let native = null;
+  let wasm = null;
+  try {
+    const require = createRequire(import.meta.url);
+    native = require(path.join(__dirname, '../../../crates/mds-napi/index.js'));
+  } catch {
+    native = null;
+  }
+  try {
+    const { initWasmNode } = await import('../dist/backend/wasm.js');
+    wasm = await initWasmNode();
+  } catch {
+    wasm = null;
+  }
+  return { native, wasm };
+}
+
+/** Skip visibly when an engine is missing — except in CI, where that is a failure. */
+export function requireEngines(t, engines, label) {
+  const missing = Object.entries(engines)
+    .filter(([, engine]) => engine === null)
+    .map(([name]) => name);
+  if (missing.length === 0) return true;
+  if (process.env.CI) {
+    throw new Error(`${label}: the ${missing.join(' and ')} backend is required in CI`);
+  }
+  t.skip(`${missing.join(' and ')} backend not built`);
+  return false;
+}
+
+/**
+ * `compileFile` each of `files` through the public `@mdscript/mds` API with the
+ * backend forced by MDS_BACKEND, in a fresh process (the backend is a module-level
+ * singleton). Returns the backend that actually ran and, per file, the error shape
+ * it threw or `{ output }`.
+ */
+export async function compileFileOutcomes(backend, files) {
+  const script = `
+    import { init, compileFile, getBackend } from './dist/node.js';
+    const files = JSON.parse(process.env.MDS_TEST_FILES);
+    await init();
+    const outcomes = [];
+    for (const file of files) {
+      try {
+        const r = await compileFile(file);
+        outcomes.push({ output: r.output });
+      } catch (err) {
+        outcomes.push({ code: err.code, message: err.message, help: err.help ?? null, span: err.span ?? null });
+      }
+    }
+    process.stdout.write(JSON.stringify({ backend: getBackend(), outcomes }));
+  `;
+  const { stdout } = await exec(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: pkgRoot,
+    env: { ...process.env, MDS_BACKEND: backend, MDS_TEST_FILES: JSON.stringify(files) },
+    timeout: 60000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const result = JSON.parse(stdout);
+  assert.equal(result.backend, backend, 'the forced backend must be the one that ran');
+  return result.outcomes;
 }
 
 /** Absolute path to the repo root (three levels above this directory). */
