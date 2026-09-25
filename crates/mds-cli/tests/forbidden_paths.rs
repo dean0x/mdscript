@@ -35,6 +35,7 @@ fn run(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
     let mut child = mds_bin()
         .current_dir(dir)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -477,6 +478,167 @@ fn clean_output_locations_are_accepted() {
 fn write_mds_json(dir: &Path, output_dir: &str) {
     let json = serde_json::json!({ "build": { "output_dir": output_dir } });
     std::fs::write(dir.join("mds.json"), json.to_string()).unwrap();
+}
+
+// ── Output locations: refused by their resolved form ────────────────────────
+//
+// Unix-only: a Windows directory name cannot hold TAB, so the hostile directory a
+// symlinked output location leads into cannot be created there.
+
+#[cfg(unix)]
+mod resolved_output {
+    use super::*;
+    use common::make_symlink;
+
+    /// `in.mds`, `src/a.mds`, a hostile-named directory `x<TAB>y` with `link` → it,
+    /// and a clean directory `clean` with `clean_link` → it. Returns the guard and the
+    /// temp directory's own name, which any absolute path in a message would carry.
+    fn tree() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.mds"), "Hi\n").unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.mds"), "A\n").unwrap();
+        let hostile = dir.path().join("x\ty");
+        std::fs::create_dir(&hostile).unwrap();
+        assert!(make_symlink(&hostile, &dir.path().join("link")));
+        std::fs::create_dir(dir.path().join("clean")).unwrap();
+        assert!(make_symlink(
+            &dir.path().join("clean"),
+            &dir.path().join("clean_link")
+        ));
+        let name = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+        (dir, name)
+    }
+
+    /// `s` without whitespace or miette's `│` frame marker, so a message miette wrapped
+    /// (at a space or after a `/`) compares equal to the unwrapped one.
+    fn squash(s: &str) -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect()
+    }
+
+    /// Assert `text` is the resolved-path refusal of `what` = `shown`: `mds::io`, the
+    /// codepoint, the value as typed, no raw TAB (nor any other hostile character) and
+    /// no absolute path in the refusal.
+    fn assert_resolved_refusal(text: &str, what: &str, shown: &str, tmp_name: &str, label: &str) {
+        let expected =
+            format!("{what} resolved path contains forbidden character U+0009: \"{shown}\"");
+        assert!(
+            squash(text).contains(&squash(&expected)),
+            "{label}: expected {expected:?}; got: {text:?}"
+        );
+        assert_no_control_chars(text, label);
+        assert!(!text.contains('\t'), "{label}: raw TAB; got: {text:?}");
+        // The refusal itself: `watch` announces its (canonical) entry before it.
+        let refusal = &text[text
+            .find("mds::io")
+            .unwrap_or_else(|| panic!("{label}: mds::io; got: {text:?}"))..];
+        assert!(
+            !refusal.contains(tmp_name),
+            "{label}: absolute path; got: {text:?}"
+        );
+    }
+
+    /// `-o` and `--out-dir` pass the typed check but lead, through a symlink, into a
+    /// hostile-named directory: refused by their resolved form (`mds::io`, exit 2)
+    /// before anything is written — including a location below the link that does not
+    /// exist yet — under `build` and `watch`, single-file and directory mode.
+    #[test]
+    fn output_flags_resolving_into_a_hostile_directory_are_refused() {
+        let (dir, tmp_name) = tree();
+        for (args, what, shown) in [
+            (
+                &["build", "in.mds", "--out-dir", "link"][..],
+                "--out-dir",
+                "link",
+            ),
+            (&["build", "src", "--out-dir", "link"], "--out-dir", "link"),
+            (
+                &["build", "in.mds", "--out-dir", "link/new/sub"],
+                "--out-dir",
+                "link/new/sub",
+            ),
+            (
+                &["build", "in.mds", "-o", "link/x.md"],
+                "-o/--output",
+                "link/x.md",
+            ),
+            (
+                &["build", "-", "-o", "link/x.md"],
+                "-o/--output",
+                "link/x.md",
+            ),
+            (
+                &["watch", "in.mds", "--out-dir", "link"],
+                "--out-dir",
+                "link",
+            ),
+            (&["watch", "src", "--out-dir", "link"], "--out-dir", "link"),
+            (
+                &["watch", "in.mds", "-o", "link/x.md"],
+                "-o/--output",
+                "link/x.md",
+            ),
+        ] {
+            let label = args.join(" ");
+            let (code, text) = run(dir.path(), args);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert_resolved_refusal(&text, what, shown, &tmp_name, &label);
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("x\ty")).unwrap().count(),
+            0,
+            "nothing is written into the hostile directory"
+        );
+
+        // Control: the same shapes through a symlink to a clean directory build.
+        for (args, written) in [
+            (&["build", "in.mds", "--out-dir", "clean_link"][..], "in.md"),
+            (&["build", "src", "--out-dir", "clean_link"], "a.md"),
+            (&["build", "in.mds", "-o", "clean_link/x.md"], "x.md"),
+        ] {
+            let (code, text) = run(dir.path(), args);
+            assert_eq!(code, Some(0), "{args:?} control: got: {text}");
+            assert!(dir.path().join("clean").join(written).is_file(), "{args:?}");
+        }
+    }
+
+    /// `mds.json` `build.output_dir` naming a symlink into a hostile-named directory is
+    /// refused where the config is loaded, like the typed check.
+    #[test]
+    fn output_dir_in_mds_json_resolving_into_a_hostile_directory_is_refused() {
+        let (dir, tmp_name) = tree();
+        write_mds_json(dir.path(), "link");
+        for args in [
+            &["build", "in.mds"][..],
+            &["build", "src"],
+            &["lint", "in.mds"],
+            &["watch", "in.mds"],
+        ] {
+            let label = args.join(" ");
+            let (code, text) = run(dir.path(), args);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert_resolved_refusal(
+                &text,
+                "mds.json build.output_dir",
+                "link",
+                &tmp_name,
+                &label,
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("x\ty")).unwrap().count(),
+            0,
+            "nothing is written into the hostile directory"
+        );
+
+        // Control: a symlink to a clean directory works.
+        write_mds_json(dir.path(), "clean_link");
+        let (code, text) = run(dir.path(), &["build", "in.mds"]);
+        assert_eq!(code, Some(0), "got: {text}");
+        assert!(dir.path().join("clean").join("in.md").is_file());
+    }
 }
 
 /// `mds.json` `build.output_dir` carrying a forbidden character is refused where the

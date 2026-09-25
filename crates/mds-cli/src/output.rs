@@ -216,6 +216,56 @@ pub(crate) fn reject_forbidden_output_path(
     }
 }
 
+/// Refuse an output location whose RESOLVED form carries a forbidden path character
+/// (#265): `mds::io`, exit 2.
+///
+/// [`reject_forbidden_output_path`] checks the value as typed; this checks where it
+/// leads. A symlinked directory in it — or, for a relative value, the working
+/// directory above it — can resolve into a hostile-named directory the value never
+/// names. The location need not exist yet (it is created on the first write): its
+/// deepest existing ancestor is canonicalized — the components below that are the
+/// typed ones, already checked — and the whole resolved form is scanned. Callers run
+/// it up front beside the typed check, so a refused location is never created or
+/// written, and no later status line can show it.
+///
+/// The message names `shown`, the value as typed, escaped by
+/// [`mds::escape_path_for_message`] — never the absolute resolved path.
+pub(crate) fn reject_forbidden_resolved_output_path(
+    what: &str,
+    path: &Path,
+    shown: &OsStr,
+) -> std::result::Result<(), mds::MdsError> {
+    let Some(resolved) = resolve_existing_prefix(path) else {
+        return Ok(());
+    };
+    let resolved = resolved.to_string_lossy();
+    match resolved.chars().find(|&ch| mds::is_forbidden_path_char(ch)) {
+        Some(ch) => Err(mds::MdsError::Io {
+            message: format!(
+                "{what} resolved path contains forbidden character U+{:04X}: \"{}\"",
+                u32::from(ch),
+                mds::escape_path_for_message(&shown.to_string_lossy())
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The canonical form of the deepest existing ancestor of `path` (`path` itself when
+/// it exists); a relative `path` is taken against the working directory.
+///
+/// `None` when nothing resolves — the working directory is gone, so there is nothing
+/// on disk the value could lead through, and the typed check stands alone.
+fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    // Bounded: one step per component of `absolute`.
+    absolute.ancestors().find_map(|a| a.canonicalize().ok())
+}
+
 /// Refuse an `mds.json` `build.output_dir` with a `..` component: `mds::io`, exit 2.
 ///
 /// The raw components are checked rather than a canonical form because the
@@ -1482,9 +1532,11 @@ pub(crate) fn colorize_unified_diff(unified: &str) -> String {
 
 /// Sanitize a filesystem path for terminal display (CWE-150 / CWE-117 guard).
 ///
-/// Converts the path to a display string and applies WIRE-mode
-/// [`mds::sanitize_control_chars_wire`] so hostile filenames cannot inject ANSI
-/// terminal commands (e.g. `ESC[2J`) *or* forge additional status lines.
+/// Converts the path to a display string and escapes it with
+/// [`mds::escape_path_for_message`] — WIRE mode ([`mds::sanitize_control_chars_wire`])
+/// plus `\t`, i.e. every forbidden path character (#265) — so hostile filenames cannot
+/// inject ANSI terminal commands (e.g. `ESC[2J`) *or* forge additional status lines,
+/// and no status line shows a raw character that a path may not carry.
 ///
 /// # Why WIRE and not HUMAN
 ///
@@ -1512,7 +1564,7 @@ pub(crate) fn colorize_unified_diff(unified: &str) -> String {
 /// Off Windows that call is a no-op, so every call site gets the conventional
 /// form unconditionally, on every host.
 pub(crate) fn safe_path(p: &std::path::Path) -> String {
-    safe_inline(mds::display_native_path(p).display())
+    safe_file_display(&mds::display_native_path(p).display().to_string())
 }
 
 /// [`safe_path`] for a filename that is already a `&str` (e.g. a `LintDiagnostic::file`
@@ -1522,14 +1574,15 @@ pub(crate) fn safe_path(p: &std::path::Path) -> String {
 /// exact PF-004 shape that left `Clean: {filename}` on HUMAN mode while every other
 /// status line was on WIRE.
 pub(crate) fn safe_file_display(name: &str) -> String {
-    safe_inline(name)
+    mds::escape_path_for_message(name).into_owned()
 }
 
 /// WIRE-escape any untrusted value that is interpolated into a **single-line** status,
 /// warning, or error line.
 ///
 /// This is the general form of [`safe_path`] / [`safe_file_display`]: the same WIRE
-/// escape, for values that are neither a `Path` nor a filename — an `io::Error`
+/// escape (those two also escape `\t`, which a path may not carry), for values that are
+/// neither a `Path` nor a filename — an `io::Error`
 /// `Display` (which embeds a filesystem path), an `mds.json` rule name or config value,
 /// a `--format` argument, a fix-rejection reason.
 ///
@@ -2081,6 +2134,24 @@ mod tests {
     fn safe_path_passes_clean_path_unchanged() {
         let p = std::path::Path::new("dir/normal.mds");
         assert_eq!(safe_path(p), "dir/normal.mds");
+    }
+
+    /// #265: a path is escaped for the whole forbidden-path class, TAB included —
+    /// WIRE mode alone leaves a TAB raw, and a status line showing a path must carry
+    /// none of the 80 codepoints.
+    #[test]
+    fn safe_path_escapes_every_forbidden_char_tab_included() {
+        for ch in ['\t', '\n', '\x1b', '\u{202E}'] {
+            let raw = format!("out{ch}dir/in.md");
+            let got = safe_path(std::path::Path::new(&raw));
+            assert!(!got.contains(ch), "U+{:04X}: {got:?}", u32::from(ch));
+            assert_eq!(
+                got,
+                format!("out\\u{:04X}dir/in.md", u32::from(ch)),
+                "U+{:04X}",
+                u32::from(ch)
+            );
+        }
     }
 
     // ── T-10a/b/c: neutralize_source_for_render + colour path (── PF-014) ────────

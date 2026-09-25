@@ -165,16 +165,21 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
                 .map_err(|e| miette::miette!("invalid UTF-8 in {}: {e}", candidate.display()))?;
             let config: MdsConfig = serde_json::from_str(&raw)
                 .map_err(|e| miette::miette!("invalid mds.json at {}: {e}", candidate.display()))?;
-            // #265: a `build.output_dir` carrying a forbidden path character is refused
+            // #265: a `build.output_dir` carrying a forbidden path character — as
+            // written, or in the form it resolves to under the config directory (a
+            // symlink into a hostile-named directory) — is refused
             // here, at load — `mds::io`, exit 2 — so it never reaches output-path
             // derivation. `load_config` is shared, so this fails every run that loads
             // mds.json, not only the ones that write output: `build`, `watch`, `lint`
             // (every input mode) and `fmt` directory mode. `check` does not load
             // mds.json.
             if let Some(output_dir) = &config.build.output_dir {
-                crate::output::reject_forbidden_output_path(
+                let shown = std::ffi::OsStr::new(output_dir);
+                crate::output::reject_forbidden_output_path("mds.json build.output_dir", shown)?;
+                crate::output::reject_forbidden_resolved_output_path(
                     "mds.json build.output_dir",
-                    std::ffi::OsStr::new(output_dir),
+                    &current.join(output_dir),
+                    shown,
                 )?;
             }
             return Ok(Some((config, current)));
@@ -1252,17 +1257,25 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
 }
 
 /// Refuse `-o/--output` and `--out-dir` values carrying a forbidden path character
-/// (#265): `mds::io`, exit 2. Shared by `build` and `watch`, which both call it
-/// before any other work.
+/// (#265): `mds::io`, exit 2 — as typed, then in the form they resolve to (a symlink
+/// into a hostile-named directory). Shared by `build` and `watch`, which both call it
+/// before any other work, so a refused location is never created or written.
 pub(crate) fn reject_forbidden_output_flags(
     output: Option<&str>,
     out_dir: Option<&Path>,
 ) -> Result<()> {
+    use crate::output::{reject_forbidden_output_path, reject_forbidden_resolved_output_path};
     if let Some(o) = output {
-        crate::output::reject_forbidden_output_path("-o/--output", std::ffi::OsStr::new(o))?;
+        let shown = std::ffi::OsStr::new(o);
+        reject_forbidden_output_path("-o/--output", shown)?;
+        // `-o -` is stdout, not a path.
+        if o != "-" {
+            reject_forbidden_resolved_output_path("-o/--output", Path::new(o), shown)?;
+        }
     }
     if let Some(d) = out_dir {
-        crate::output::reject_forbidden_output_path("--out-dir", d.as_os_str())?;
+        reject_forbidden_output_path("--out-dir", d.as_os_str())?;
+        reject_forbidden_resolved_output_path("--out-dir", d, d.as_os_str())?;
     }
     Ok(())
 }

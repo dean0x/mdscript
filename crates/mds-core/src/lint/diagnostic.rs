@@ -68,7 +68,7 @@
 //! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr on the non-collecting paths. The identifiers its producers interpolate — `resolver.rs`'s imported-module filename, `evaluator.rs`'s `@include` alias — are WIRE-escaped at construction, per the per-field rule |
 //! | `named_source_for_render()` (this module) | **per field** | the single `NamedSource` builder used by `MdsError::at()` (error.rs), `check_equivalence` (formatter.rs) and `render_diag_human` (mds-cli/src/lint.rs): filename WIRE, source via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
 //! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help` (its filename and source go through `named_source_for_render`) |
-//! | `safe_path()` / `safe_file_display()` (mds-cli/src/output.rs) | WIRE | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) |
+//! | `safe_path()` / `safe_file_display()` (mds-cli/src/output.rs) | WIRE + `\t` ([`escape_path_for_message`]) | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) — every forbidden path character escaped, since a path may carry none (#265) |
 //! | `fix::FixOutcome::Rejected.reason` (fix.rs) | WIRE | construction-time: the `MdsError` `Display` embedded in a reverify-failure reason, so the value is display-safe for every consumer of the published `mds::fix` API (PF-004) |
 //! | `MdsError::serialize()` (error.rs) | WIRE | `message`, `help` — covers all three bindings' error path |
 //! | `LintResult::to_canonical_json()` (this module) | WIRE | `message`, `help`, `files[].file` key, `fix_edits[].new_text` |
