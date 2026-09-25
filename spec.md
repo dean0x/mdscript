@@ -411,7 +411,7 @@ filesystem backend is called:
 |---|---|---|
 | An import path — a body directive (`@import`, `@extends`, …) or a frontmatter `imports:` entry | `validate_import_path` in the resolver, for every backend, and `validate_relative_import` again in both built-in backends' `normalize_in_dir`; the frontmatter parser classifies the path with the same `import_path_violation` | `mds::import` |
 | An entry path or virtual entry key (every entry API listed for an empty path, so the WASM `filename` too) | `validate_entry_path` in the resolver (`resolve_entry_key`), for every backend, and again in both built-in backends' `resolve_entry` | `mds::io` |
-| The base directory of a string compile (`compile_str_with`, `check_str_with`, `lint_str_with`, the bindings' `basePath`/`base_path`) | `resolve_base_dir`, on the form as given and on its canonical form | `mds::io` |
+| The base directory of a string compile (`compile_str_with`, `check_str_with`, `lint_str_with`, the bindings' `basePath`/`base_path`) and of the formatter's safety gate (`format_str_with`/`format_str_named`, so `mds fmt`) | `resolve_base_dir`, on the form as given and on its canonical form | `mds::io` |
 | A base directory passed to `ModuleCache::resolve_source*` | the resolver, for every backend, and `NativeFs::anchor_base_dir` again | `mds::io` |
 | A resolved canonical path | `NativeFs`, on every path it canonicalizes — entry, import and base directory — scanned whole, not only its final component | `mds::io` |
 | A file the CLI opens itself — a `mds lint`/`mds fmt` file argument, the `--vars` file | `NativeFs::check_symlink`, on the path as given and on its canonical form (`path contains forbidden character U+XXXX: "<path>"`); a `mds lint`/`mds fmt` file argument is refused with the same message before its existence and `.mds`-extension checks, so a missing or non-`.mds` hostile path reports it too | `mds::io` |
@@ -1091,7 +1091,7 @@ mds fmt template.mds --diff               # Print unified diff without writing
 
 Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside frontmatter and code fences), strips trailing whitespace on directive lines, and ensures exactly one trailing newline. An empty or whitespace-only source formats to 0 bytes (an empty output file). Interior blank lines and blank-line structure within frontmatter and code fences are left verbatim (blank-line collapsing was removed in v0.4.0 to preserve the interior-verbatim whitespace contract). Body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of `@message`/`@define` bodies are left untouched.
 
-Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template.
+Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template. The base directory the gate compiles against (the file's directory; the working directory for stdin) is resolved first, as `mds check` resolves it: one that is refused (§4.6) or cannot be resolved fails `mds fmt` with that error (`mds::io`, exit 2).
 
 | Option | Description |
 |--------|-------------|

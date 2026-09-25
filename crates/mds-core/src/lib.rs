@@ -525,16 +525,19 @@ pub fn check_str(source: &str) -> Result<(), MdsError> {
 ///
 /// This is one of two UTF-8 boundary enforcement points; the other is
 /// [`path_to_str`], which handles the entry-point `path` argument.
-fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
+///
+/// Also called by the formatter's safety gate, before either compile, so a base
+/// directory refused here fails `format_str_with` with this error exactly as it
+/// fails `check_str_with`.
+pub(crate) fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
     // Canonicalize to an absolute path so NativeFs::anchor_base_dir() always
     // receives a path whose file_name() is non-None.
     //
     // Path::parent() on a bare filename (e.g. "hello.mds") returns Some(""),
     // and effective_parent normalises that to Some("."). Neither "" nor "."
     // survive NativeFs::anchor_base_dir() because check_symlink() calls
-    // file_name() on them, which returns None, causing a FileNotFound error
-    // that assert_equivalent's Err(_) arm then silently swallows via
-    // structural_equivalent. avoids PF-006.
+    // file_name() on them, which returns None, causing a FileNotFound error.
+    // avoids PF-006.
     //
     // #265: a base directory carrying a forbidden path character is refused here,
     // where the form the caller typed is still known — the typed form first, then
@@ -743,11 +746,25 @@ pub fn compile_str_collecting_warnings(
     base_dir: Option<&Path>,
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<CompileResult, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
     let dir = resolve_base_dir(base_dir)?;
+    compile_source_in_dir(source, &dir, runtime_vars)
+}
+
+/// [`compile_str_collecting_warnings`] against a base directory that
+/// [`resolve_base_dir`] has already resolved.
+///
+/// The formatter's safety gate resolves the base directory once, up front, so a
+/// refused or unresolvable one is reported as the error it is rather than taken
+/// for a template that does not compile standalone.
+pub(crate) fn compile_source_in_dir(
+    source: &str,
+    dir: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileResult, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    let output = cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
+    let output = cache.resolve_source_intrinsic(source, dir, &vars, &mut warnings)?;
     // resolve_source_intrinsic does not insert the inline source into the modules cache,
     // so cache.dependencies() contains only imported files — no entry-key filtering needed.
     let dependencies = native_dependencies(cache.dependencies());
