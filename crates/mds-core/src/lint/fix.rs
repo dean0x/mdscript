@@ -74,9 +74,12 @@
 //!
 //! ## Reverify gate (AC-F-20)
 //!
-//! After applying all non-overlapping edits right-to-left (one single pass),
-//! the caller invokes a reverify callback with the fixed source. The fix is
-//! REFUSED if the callback reports:
+//! [`apply_fixes_incremental`] first applies every non-overlapping edit
+//! right-to-left in one pass and hands the fixed source to the caller's reverify
+//! callback. If that batch is refused, it retries each edit on its own,
+//! right-to-left, keeping the edits that pass; the retry is skipped (and the plan
+//! refused) above [`FALLBACK_MAX_EDITS`] edits. A candidate is REFUSED if the
+//! callback reports:
 //! - A new compile error (not targeted by the original fixes)
 //! - A new lint diagnostic not present in the original result
 //! - Any compiled-output delta (for Tier B rules)
@@ -263,10 +266,8 @@ pub struct FixPlan {
 /// on this enum. External callers must include a `_ => {}` wildcard arm.
 ///
 /// **Warning:** a bare `_ => {}` arm silently swallows
-/// [`FixOutcome::PartiallyFixed`], which was added in v0.4.0 and is never
-/// returned by the deprecated [`apply_fixes`]. Code migrated from `apply_fixes`
-/// may carry a wildcard arm that discards partial results without any compiler
-/// signal. Match `PartiallyFixed` explicitly if partial results matter.
+/// [`FixOutcome::PartiallyFixed`] (new in v0.4.0) without any compiler signal.
+/// Match `PartiallyFixed` explicitly if partial results matter.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FixOutcome {
@@ -284,10 +285,9 @@ pub enum FixOutcome {
     /// partially-fixed text; `residual` carries the residual diagnostics (from the last
     /// successful per-edit reverify); `rejected` lists every edit that was turned down.
     ///
-    /// **New in v0.4.0.** The deprecated [`apply_fixes`] never returned this variant, so
-    /// code migrated from it may carry a `_ => {}` wildcard arm that silently discards
-    /// partial results — there is no compiler signal when the arm matches. Match this
-    /// variant explicitly if partial results matter.
+    /// **New in v0.4.0.** A `_ => {}` wildcard arm silently discards partial results —
+    /// there is no compiler signal when the arm matches. Match this variant explicitly
+    /// if partial results matter.
     PartiallyFixed {
         /// The partially-fixed source (accepted edits applied, rejected edits untouched).
         source: String,
@@ -631,10 +631,9 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
     // Unconditional assert (not debug_assert) — avoids PF-005: the sortedness
     // precondition for right-to-left accumulation is release-critical; a
     // debug_assert! would be compiled out in release builds, allowing unsorted
-    // edits to silently corrupt the source. The `_unchecked` callers in
-    // `apply_fixes` and `apply_fixes_incremental` perform their own fail-closed
-    // guards before reaching here; this assert is defense-in-depth for direct
-    // external callers who bypass those guards.
+    // edits to silently corrupt the source. `apply_fixes_incremental` performs its
+    // own fail-closed guard before reaching here; this assert is defense-in-depth
+    // for direct external callers who bypass that guard.
     assert!(
         plan.edits.windows(2).all(|w| w[0].start <= w[1].start),
         "apply_plan_unchecked: edits must be sorted ascending by start offset (avoids PF-005)"
@@ -669,158 +668,6 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
     }
 
     result
-}
-
-/// Apply a `FixPlan` with a reverify callback.
-///
-/// # Deprecated (AD-209-1)
-///
-/// Use [`apply_fixes_incremental`] instead. (applies ADR-004)
-///
-/// `apply_fixes` implements the ADR-004 three-tier reverify gate as a single
-/// all-or-nothing call: `reverify` runs once and either the whole batch is
-/// accepted or the whole batch is refused. `apply_fixes_incremental` provides
-/// the same safety contract with a batch-first attempt plus a bounded per-edit
-/// fallback (capped at `FALLBACK_MAX_EDITS = 50`), which salvages the safe
-/// subset rather than refusing wholesale. That is why the deprecation is
-/// correct rather than arbitrary (applies ADR-004).
-///
-/// ## Migration deltas (not a drop-in replacement)
-///
-/// 1. **Closure bound change**: `apply_fixes` takes `F: FnOnce`;
-///    `apply_fixes_incremental` requires `F: Fn` because `reverify` may be
-///    called more than once. A move-once closure cannot migrate mechanically.
-///
-/// 2. **New reachable outcome**: `apply_fixes_incremental` can return
-///    `FixOutcome::PartiallyFixed` (some edits accepted, some refused).
-///    `apply_fixes` never returns `PartiallyFixed`. `FixOutcome` is
-///    `#[non_exhaustive]`, so existing wildcard arms still compile, but a
-///    wildcard that swallows `PartiallyFixed` silently discards partial
-///    results.
-///
-/// 3. **Reverify call count**: `apply_fixes` calls `reverify` exactly once;
-///    `apply_fixes_incremental` calls it up to `plan.edits.len() + 1` times.
-//
-// Why the body was not deleted:
-//
-// `crates/mds-core/src/lint/fix.rs` does not exist at tag `v0.3.0` (the
-// newest published tag at this commit), so `apply_fixes` has never been
-// published to crates.io. However, deleting it would silently drop coverage
-// of six ADR-004 reverify-gate behaviors that are pinned only through this
-// function, with no equivalent on the `apply_fixes_incremental` path. These
-// tests must be ported or retired before removal at v0.5.0. The enumerated
-// list (test names, line numbers, and the behavior each pins) lives in GitHub
-// issue #304 (v0.5.0 removal tracker for `apply_fixes`).
-//
-/// # Behavior
-///
-/// The `reverify` callback is called with the fixed source and must return:
-/// - `Ok(LintResult)`: the lint result of the fixed source (may be empty).
-/// - `Err(MdsError)`: the fixed source failed the check gate.
-///
-/// `original` is the lint result the plan was built from — it establishes the
-/// baseline of diagnostics that already existed BEFORE any fix. Pre-existing
-/// findings (e.g. a Tier C `unused-variable` that coexists with a fixable
-/// `duplicate-import`) are expected to survive into the residual and must NOT
-/// cause the fix to be refused (AC-F-23: residual findings determine the exit
-/// code). Only a genuinely NEW untargeted diagnostic is a regression.
-///
-/// The fix is REFUSED if:
-/// - The plan has `overlap_rejected = true`.
-/// - The `reverify` callback returns `Err`. The CLI reverify path checks three
-///   conditions inside this closure (AC-F-20): (1) recompile-success — the fixed
-///   source must still compile; (2) no-new-untargeted-diagnostics — the residual
-///   must not introduce new findings beyond the targeted rules; (3) output
-///   byte-equality — when the original source is standalone-compilable, compiled
-///   output of the fixed source must be byte-identical to the original (enforced by
-///   the caller returning `Err` on delta). All real auto-fixes are output-neutral
-///   by design; any delta signals a bug in the fix logic and must be refused.
-/// - The residual contains MORE diagnostics of an untargeted rule than `original`
-///   did (i.e. the edit introduced a new, non-fixed problem).
-///
-/// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
-// Deprecation template (align other #[deprecated] attributes in this crate to this form):
-// verb "use" | fully-qualified replacement path | one behavioural-difference clause |
-// explicit removal version | terminal period | #[must_use] with reason string.
-#[deprecated(
-    since = "0.4.0",
-    note = "use `mds::fix::apply_fixes_incremental`; not a drop-in swap — the reverify \
-            closure must be `Fn`, not `FnOnce`, and the replacement can return \
-            `FixOutcome::PartiallyFixed`, which a `_ => {}` wildcard arm silently discards. \
-            To be removed in v0.5.0; see the item docs."
-)]
-#[must_use = "a dropped FixOutcome silently discards the fix result"]
-pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
-where
-    F: FnOnce(&str) -> Result<LintResult, MdsError>,
-{
-    if plan.edits.is_empty() && !plan.overlap_rejected {
-        return FixOutcome::NothingToFix;
-    }
-
-    if plan.overlap_rejected {
-        return FixOutcome::Rejected {
-            source: source.to_string(),
-            reason: "Overlapping fix spans detected — batch rejected to avoid data corruption."
-                .to_string(),
-        };
-    }
-
-    // Sortedness guard (avoids PF-005): edits must be sorted ascending by start offset for the
-    // right-to-left application in apply_plan_unchecked to be correct. A debug_assert!-only guard
-    // is compiled out in release builds, where unsorted edits cause silent source corruption.
-    // This unconditional check returns Rejected before apply_plan_unchecked is reached.
-    if plan.edits.windows(2).any(|w| w[0].start > w[1].start) {
-        return FixOutcome::Rejected {
-            source: source.to_string(),
-            reason: "Fix edits are not sorted ascending by start offset; refusing to apply \
-                     to prevent source corruption (avoids PF-005)."
-                .to_string(),
-        };
-    }
-
-    let fixed_source = apply_plan_unchecked(source, &plan);
-
-    // Build the set of rules targeted by this fix batch.
-    let targeted_rules: std::collections::HashSet<String> =
-        plan.edits.iter().map(|e| e.rule.clone()).collect();
-
-    // Baseline: per-rule count of NON-targeted diagnostics that were already present
-    // before the fix. A pre-existing untargeted finding must not trip the gate — only
-    // an untargeted rule whose count INCREASES is a regression the edit introduced.
-    let baseline = count_untargeted_per_rule(&original.diagnostics, &targeted_rules);
-
-    // Reverify: run the lint engine on the fixed source.
-    match reverify(&fixed_source) {
-        Err(err) => FixOutcome::Rejected {
-            source: source.to_string(),
-            reason: reverify_failure_reason(&err),
-        },
-        Ok(residual) => {
-            // Count untargeted diagnostics in the residual, per rule.
-            let residual_counts = count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
-
-            // A regression is an untargeted rule whose count grew vs. the original —
-            // i.e. a NEW problem the edit introduced (pre-existing findings survive
-            // untouched and are allowed through, per AC-F-23).
-            let regressed = regressed_rules(&residual_counts, &baseline);
-
-            if !regressed.is_empty() {
-                return FixOutcome::Rejected {
-                    source: source.to_string(),
-                    reason: format!(
-                        "Reverify produced new untargeted diagnostics: {regressed:?}. \
-                         Fix batch reverted."
-                    ),
-                };
-            }
-
-            FixOutcome::Fixed {
-                source: fixed_source,
-                residual,
-            }
-        }
-    }
 }
 
 /// Maximum number of edits for which the per-edit fallback path is attempted when the
@@ -860,10 +707,18 @@ pub const FALLBACK_MAX_EDITS: usize = 50;
 ///   messages (applies ADR-004).
 /// - [`FixOutcome::NothingToFix`] — empty plan with no overlap.
 ///
-/// Unlike [`apply_fixes`] which requires `F: FnOnce`, this function requires `F: Fn` because
-/// `reverify` may be called up to `plan.edits.len() + 1` times. It can also return
-/// [`FixOutcome::PartiallyFixed`], which `apply_fixes` never returned — code migrated from
-/// `apply_fixes` may carry a `_ => {}` wildcard arm that silently discards partial results.
+/// # Reverify contract
+///
+/// `reverify` is called with a candidate source and returns its lint result (`Ok`, possibly
+/// empty) or `Err` when the candidate fails the caller's check — the CLI refuses on a compile
+/// failure and, for output-neutral rules, on any compiled-output delta (AC-F-20). It is `F: Fn`
+/// because it may be called up to `plan.edits.len() + 1` times.
+///
+/// `original` is the lint result the plan was built from; it is the baseline of findings that
+/// already existed before any fix. A pre-existing finding (e.g. a Tier C `unused-variable` beside
+/// a fixable `duplicate-import`) may survive into the residual without refusing the fix
+/// (AC-F-23). A candidate is refused only when some rule the plan does not target has MORE
+/// findings in its residual than in `original` — a new problem the edit introduced.
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes_incremental<F>(
     source: &str,

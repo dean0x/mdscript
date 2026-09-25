@@ -2245,60 +2245,7 @@ fn fix_api_incremental_exists() {
     );
 }
 
-/// F-API-3: `apply_fixes` remains reachable on the public API surface while deprecated.
-/// This test pins the function signature and the empty-plan early-return path (the
-/// reverify closure is never invoked when `plan.edits.is_empty()`). Remove at v0.5.0
-/// with the function (AD-209-1).
-///
-/// AD-209-2: `#[expect(deprecated)]` was chosen over a `trybuild` compile-fail fixture
-/// because: (a) trybuild only asserts that the deprecation warning fires; it does not
-/// verify the function's signature or return value; (b) this test asserts the runtime
-/// behavior (NothingToFix for an empty plan -- the `plan.edits.is_empty()` early-return),
-/// giving a stronger pin than a compile-fail fixture alone; and
-/// (c) `#[expect(deprecated)]` fires `unfulfilled_lint_expectations` when the
-/// `#[deprecated]` attribute is removed from `apply_fixes`. The mutation control
-/// (applies ADR-009): removing the attribute leaves the lib rlib compiling clean, so
-/// both the lib-test (fix.rs `#[cfg(test)]`) and integration-test (api_surface) targets
-/// are affected. A single command is insufficient: `cargo clippy --workspace --all-targets
-/// -- -D warnings` emits 10 errors (all in fix.rs) and then cargo aborts compilation of
-/// the lib-test target; the integration-test (`api_surface`) target is never reached in
-/// that invocation. Run `cargo clippy --workspace --all-targets -- -D warnings` to verify.
-/// Total: exactly 10 unfulfilled_lint_expectations, all in fix.rs — one per deprecated
-/// `apply_fixes` call. All expectations are distinct; none is over-broad.
-///
-/// All values constructed via named constructors, never struct literals (applies ADR-010).
-#[expect(
-    deprecated,
-    reason = "AD-209-2: F-API-3 pins the deprecated apply_fixes public API surface; see fix.rs rustdoc"
-)]
-#[test]
-fn fix_api_apply_fixes_exists() {
-    use mds::fix::{apply_fixes, plan_fixes, FixOutcome};
-
-    // Construct via named constructors; never struct literals (applies ADR-010).
-    let source = "Hello!\n";
-    let original = LintResult::new(vec![]);
-    let plan = plan_fixes(&original, source);
-    // The closure moves out of a captured `String`, so it implements `FnOnce` but
-    // NOT `Fn`/`FnMut`. That makes this a real compile-time pin on the `F: FnOnce`
-    // bound: tightening `apply_fixes` to `F: Fn` (the `apply_fixes_incremental`
-    // bound) would break this test's compilation rather than pass silently.
-    let move_once = String::from("consumed-by-value");
-    let outcome = apply_fixes(
-        source,
-        plan,
-        &original,
-        move |_s| -> Result<LintResult, MdsError> {
-            drop(move_once);
-            Ok(LintResult::new(vec![]))
-        },
-    );
-    // Empty source with no diagnostics must return NothingToFix (no reverify called).
-    assert!(
-        matches!(outcome, FixOutcome::NothingToFix),
-        "trivial source with no diagnostics must return NothingToFix; got: {outcome:?}"
-    );
-}
+// F-API-3 (surface pin of the deprecated all-or-nothing fix entry point) retired in v0.5.0 (#304).
 
 /// Regression gate (issue #9): `STRING_SOURCE_MAP_LABEL` must be reachable from
 /// the public `mds` API so every surface can import it rather than redeclaring

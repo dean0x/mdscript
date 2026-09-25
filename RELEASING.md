@@ -119,8 +119,8 @@ node scripts/verify-versions.mjs
 # bump-version.mjs rewrites manifests and CHANGELOG only -- never .rs files.
 # Every hit's version must be <= X.Y.Z. A deprecation introduced in THIS release
 # must equal X.Y.Z; pre-existing ones keep their original version.
-# PF-018: if the grep returns no hits, plant a temporary `since = "x.y.z"` in any
-# .rs file, confirm the grep finds it, then remove it before proceeding.
+# PF-018: REQUIRED while the grep returns no hits (none since #304): plant a temporary
+# `since = "x.y.z"` in any .rs file, confirm the grep finds it, then remove it.
 grep -rn 'since = ' crates/ --include='*.rs'
 
 # Source hygiene and pre-merge check gates
