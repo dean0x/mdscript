@@ -30,10 +30,18 @@
 //! - AC-FUNC-07: messages-mode template → `source_map: None` + warning
 //! - AC-PERF-03: segment cap overflow → `source_map: None` + warning
 //! - AC-PERF-04: large multibyte line — map present and VLQ alphabet clean
+//!
+//! #114 tests pin `@extends` on every evaluation path it can take (maps on, maps
+//! off, messages mode, imported module):
+//!
+//! - ADR-002: inherited output byte-identical with and without source maps
+//! - REL-1: one loop-iteration budget per extends chain, not per spliced region
+//! - AC-114-3: one message-byte budget per extends chain, not per spliced region
+//! - PF-004: one output-size budget per extends chain, not per spliced region
 
 use std::collections::HashMap;
 
-use mds::{CompileOptions, CompileResult, Value};
+use mds::{CompileOptions, CompileResult, CompiledOutput, MdsError, Value};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1023,26 +1031,234 @@ fn source_map_s8_output_unchanged() {
     );
 }
 
-/// RUST-4 / guards ADR-002: @extends compiled output must be byte-identical whether
-/// `source_map` is `true` (region-by-region `evaluate_regions_with_map` path) or
-/// `false` (whole-body `evaluate` path).
-///
-/// This test would catch output drift introduced by the REL-1 budget-threading fix
-/// — if cumulative iteration counting ever altered the output string the assertion
-/// below would fail.
-#[test]
-fn extends_output_byte_identical_with_and_without_source_map() {
-    let mut modules = HashMap::new();
-    // Base has no frontmatter; @block is a body directive, not YAML.
-    modules.insert(
-        "base.mds".to_string(),
-        "@block content:\ndefault\n@end\n".to_string(),
+// ── #114: @extends pins across every evaluation path ─────────────────────────
+//
+// Inheritance is declared ONLY by a body `@extends "./base.mds"` directive; the
+// frontmatter key `extends:` is reserved and never triggers it. Every test below
+// therefore proves the directive ran before trusting any other assertion (PF-013):
+// the output must hold the base skeleton text around the child's override and must
+// not hold the overridden base default. `reserved_frontmatter_extends_key_does_not_inherit`
+// shows that check rejecting output compiled without inheritance.
+//
+// An @extends chain is evaluated as a sequence of spliced regions (base skeleton
+// nodes, base-default blocks, child overrides), and it can be reached with source maps
+// on, with them off, in messages mode, or as an imported module. Each cumulative
+// resource budget is pinned on every path it governs: a budget seeded afresh per
+// region would be multiplied by the region count (applies PF-004).
+
+/// Mirrors the evaluator's private `MAX_TOTAL_ITERATIONS`. The tripping assertions
+/// require the limit message, which prints the real value, so a drift between the
+/// two fails every iteration-budget test below.
+const MAX_TOTAL_ITERATIONS: usize = 1_000_000;
+
+/// Mirrors the private `limits::MAX_OUTPUT_SIZE` (50 MiB = 52,428,800 bytes). Pinned
+/// the same way: the over-cap assertions require the limit message, which prints the
+/// real value.
+const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Mirrors the private `limits::MAX_MESSAGES_TOTAL_SIZE` (= `MAX_OUTPUT_SIZE`). Pinned
+/// the same way, and the at-cap control compiles.
+const MAX_MESSAGES_TOTAL_SIZE: usize = MAX_OUTPUT_SIZE;
+
+/// Outer-loop length for the iteration-budget tests. One loop region runs
+/// `LOOP_OUTER * (inner + 1)` iterations: every outer and every inner pass counts.
+const LOOP_OUTER: usize = 500;
+
+/// `inner` length at which the chain's two loop regions together spend EXACTLY
+/// `MAX_TOTAL_ITERATIONS` (2 × 500 × 1 000 = 1 000 000).
+const AT_BUDGET_INNER: usize = MAX_TOTAL_ITERATIONS / (2 * LOOP_OUTER) - 1;
+
+// The at-budget chain spends the budget exactly; one more inner pass per outer pass
+// leaves each region well under the budget alone, so only a budget shared by both
+// regions can trip. Both lengths stay under the evaluator's 100 000 per-loop cap.
+const _: () = assert!(2 * LOOP_OUTER * (AT_BUDGET_INNER + 1) == MAX_TOTAL_ITERATIONS);
+const _: () = assert!(LOOP_OUTER * (AT_BUDGET_INNER + 2) < MAX_TOTAL_ITERATIONS);
+const _: () = assert!(2 * LOOP_OUTER * (AT_BUDGET_INNER + 2) > MAX_TOTAL_ITERATIONS);
+const _: () = assert!(AT_BUDGET_INNER + 1 < 100_000);
+
+/// Output-parity base: skeleton text around one overridable block.
+const PARITY_BASE: &str =
+    "BASE-SKELETON-HEAD\n\n@block content:\nBASE-DEFAULT-CONTENT\n@end\n\nBASE-SKELETON-TAIL\n";
+const PARITY_CHILD: &str =
+    "@extends \"./base.mds\"\n@block content:\nCHILD-OVERRIDE-CONTENT\n@end\n";
+const PARITY_EXPECTED: &str =
+    "BASE-SKELETON-HEAD\n\nCHILD-OVERRIDE-CONTENT\n\nBASE-SKELETON-TAIL\n";
+
+/// Messages-mode parity base: a skeleton message, one overridable block, a
+/// closing skeleton message.
+const PARITY_BASE_MESSAGES: &str = "@message system:\nBASE-SKELETON-HEAD\n@end\n\n\
+     @block turn:\n@message assistant:\nBASE-DEFAULT-CONTENT\n@end\n@end\n\n\
+     @message system:\nBASE-SKELETON-TAIL\n@end\n";
+const PARITY_CHILD_MESSAGES: &str =
+    "@extends \"./base.mds\"\n@block turn:\n@message user:\nCHILD-OVERRIDE-CONTENT\n@end\n@end\n";
+
+/// Iteration-budget base: one loop region in a base-default block (`warmup`, not
+/// overridden) and one overridable block (`work`).
+const BUDGET_BASE: &str = "BASE-SKELETON-HEAD\n\
+     @block warmup:\n@for o in outer:\n@for i in inner:\n.\n@end\n@end\n@end\n\
+     @block work:\nBASE-DEFAULT-WORK\n@end\n\
+     BASE-SKELETON-TAIL\n";
+/// The child's `work` override is the second loop region.
+const BUDGET_CHILD: &str = "@extends \"./base.mds\"\n\
+     @block work:\nCHILD-OVERRIDE-WORK\n@for o in outer:\n@for i in inner:\n.\n@end\n@end\n@end\n";
+
+/// Messages-mode twin of `BUDGET_BASE`: each loop runs inside a `@message`.
+const BUDGET_BASE_MESSAGES: &str = "@message system:\nBASE-SKELETON-HEAD\n@end\n\
+     @block warmup:\n@message user:\n@for o in outer:\n@for i in inner:\n.\n@end\n@end\n@end\n@end\n\
+     @block work:\n@message user:\nBASE-DEFAULT-WORK\n@end\n@end\n\
+     @message system:\nBASE-SKELETON-TAIL\n@end\n";
+const BUDGET_CHILD_MESSAGES: &str = "@extends \"./base.mds\"\n\
+     @block work:\n@message assistant:\nCHILD-OVERRIDE-WORK\n\
+     @for o in outer:\n@for i in inner:\n.\n@end\n@end\n@end\n@end\n";
+
+/// Message-bytes base: the skeleton's `system` message is the base region; the
+/// child overrides `turn`, whose base default has a different role (`assistant`).
+const MESSAGE_BYTES_BASE: &str = "@message system:\n{{half}}\n@end\n\n\
+     @block turn:\n@message assistant:\nBASE-DEFAULT-TURN\n@end\n@end\n";
+const MESSAGE_BYTES_CHILD: &str =
+    "@extends \"./base.mds\"\n@block turn:\n@message user:\n{{half}}{{tail}}\n@end\n@end\n";
+
+/// Output-size base: the skeleton's first line is the base region; the child
+/// overrides `body`.
+const OUTPUT_SIZE_BASE: &str = "{{half}}\n@block body:\nBASE-DEFAULT-BODY\n@end\n";
+const OUTPUT_SIZE_CHILD: &str = "@extends \"./base.mds\"\n@block body:\n{{half}}{{tail}}\n@end\n";
+
+/// A `base.mds` + `child.mds` module set.
+fn extends_chain(base: &str, child: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("base.mds".to_string(), base.to_string()),
+        ("child.mds".to_string(), child.to_string()),
+    ])
+}
+
+/// True only for output an honored `@extends` can produce: both base skeleton
+/// markers and the child override are present, and the overridden default is not.
+fn honors_extends(text: &str) -> bool {
+    text.contains("BASE-SKELETON-HEAD")
+        && text.contains("BASE-SKELETON-TAIL")
+        && text.contains("CHILD-OVERRIDE")
+        && !text.contains("BASE-DEFAULT")
+}
+
+/// Flatten either output kind to text so the marker checks read the same in every
+/// mode: Markdown as-is, Messages as one `role: content` entry per message.
+fn output_text(output: CompiledOutput) -> String {
+    match output {
+        CompiledOutput::Markdown(text) => text,
+        CompiledOutput::Messages(messages) => messages
+            .iter()
+            .map(|m| format!("{}: {}\n", m.role, m.content))
+            .collect(),
+        other => panic!("unexpected output kind: {other:?}"),
+    }
+}
+
+/// Which `honors_extends` markers `text` holds — a bounded failure message for
+/// outputs that run to megabytes.
+fn marker_report(text: &str) -> String {
+    [
+        "BASE-SKELETON-HEAD",
+        "BASE-SKELETON-TAIL",
+        "CHILD-OVERRIDE",
+        "BASE-DEFAULT",
+    ]
+    .iter()
+    .map(|marker| format!("{marker}={} ", text.contains(marker)))
+    .collect()
+}
+
+/// Assert `result` failed with `mds::resource_limit` and a message containing
+/// `expected`. An `Ok` is reported by kind only: `expect_err` would print the whole
+/// compiled output, which here runs to tens of megabytes.
+fn assert_resource_limit<T>(result: Result<T, MdsError>, context: &str, expected: &str) {
+    let err = match result {
+        Ok(_) => panic!("{context}: compiled successfully, expected a resource limit"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, MdsError::ResourceLimit { .. }),
+        "{context}: expected mds::resource_limit, got: {err}"
     );
-    modules.insert(
-        "child.mds".to_string(),
-        "---\nextends: base.mds\n---\n@block content:\nchild content\n@end\n".to_string(),
+    assert!(
+        err.to_string().contains(expected),
+        "{context}: expected {expected:?}, got: {err}"
+    );
+}
+
+/// Runtime vars for the size-cap chains: `half` fills each region, `tail` is appended
+/// to the child's.
+fn size_vars(half: &str, tail: &str) -> HashMap<String, Value> {
+    HashMap::from([
+        ("half".to_string(), Value::String(half.to_string())),
+        ("tail".to_string(), Value::String(tail.to_string())),
+    ])
+}
+
+/// Runtime vars for the iteration-budget chains.
+fn loop_vars(inner_len: usize) -> HashMap<String, Value> {
+    let numbers = |n: usize| Value::Array((0..n).map(|i| Value::Number(i as f64)).collect());
+    HashMap::from([
+        ("outer".to_string(), numbers(LOOP_OUTER)),
+        ("inner".to_string(), numbers(inner_len)),
+    ])
+}
+
+/// Compile `entry` from `modules` with runtime `vars`, flattening the output to text.
+fn compile_chain(
+    modules: &HashMap<String, String>,
+    entry: &str,
+    vars: HashMap<String, Value>,
+    opts: CompileOptions,
+) -> Result<String, MdsError> {
+    mds::compile_virtual_with_deps_opts(modules.clone(), entry, Some(vars), opts)
+        .map(|result| output_text(result.output))
+}
+
+/// Pin one cumulative iteration budget per extends chain on one evaluation path.
+///
+/// `compile` compiles the path's chain (two loop regions, see `BUDGET_BASE`) with
+/// the given runtime vars. The at-budget control proves the chain honors
+/// `@extends` and runs both loop regions to completion; the tripping case adds one
+/// inner pass per outer pass, which no single region can exceed alone.
+fn assert_iteration_budget_spans_extends_chain(
+    path: &str,
+    compile: impl Fn(HashMap<String, Value>) -> Result<String, MdsError>,
+) {
+    let text = compile(loop_vars(AT_BUDGET_INNER)).unwrap_or_else(|err| {
+        panic!("{path}: a chain spending exactly MAX_TOTAL_ITERATIONS must compile: {err}")
+    });
+    assert!(
+        honors_extends(&text),
+        "{path}: output must come from an honored @extends; markers: {}",
+        marker_report(&text)
+    );
+    assert_eq!(
+        text.matches('.').count(),
+        2 * LOOP_OUTER * AT_BUDGET_INNER,
+        "{path}: the base-default and the child-override loop regions must both run to completion"
     );
 
+    assert_resource_limit(
+        compile(loop_vars(AT_BUDGET_INNER + 1)),
+        &format!(
+            "{path}: REL-1: one iteration budget per extends chain — two regions, each \
+             under MAX_TOTAL_ITERATIONS alone, must trip it together"
+        ),
+        &format!(
+            "total loop iterations exceeded maximum of {MAX_TOTAL_ITERATIONS} across all loops"
+        ),
+    );
+}
+
+/// RUST-4 / guards ADR-002: @extends compiled output must be byte-identical whether
+/// `source_map` is `true` or `false`, and both must be the inherited output.
+///
+/// This test would catch output drift introduced by the REL-1 budget-threading fix
+/// or by region-wise evaluation — if either path ever altered the output string the
+/// assertions below would fail.
+#[test]
+fn extends_output_byte_identical_with_and_without_source_map() {
+    let modules = extends_chain(PARITY_BASE, PARITY_CHILD);
     let with_map = vfs_opts(
         modules.clone(),
         "child.mds",
@@ -1050,6 +1266,14 @@ fn extends_output_byte_identical_with_and_without_source_map() {
     );
     let without_map = vfs_opts(modules, "child.mds", CompileOptions::default());
 
+    // PF-013: prove @extends ran on each path before trusting the parity assertion.
+    for (path, result) in [("maps on", &with_map), ("maps off", &without_map)] {
+        assert_eq!(
+            output_text(result.output.clone()),
+            PARITY_EXPECTED,
+            "{path}: @extends must splice the child override into the base skeleton"
+        );
+    }
     // ADR-002: byte-identical output regardless of source-map mode.
     assert_eq!(
         with_map.output, without_map.output,
@@ -1065,62 +1289,269 @@ fn extends_output_byte_identical_with_and_without_source_map() {
     );
 }
 
+/// Messages-mode twin of `extends_output_byte_identical_with_and_without_source_map`:
+/// an @extends chain that compiles to messages yields the inherited messages whether
+/// or not a source map was requested (messages mode builds no map and warns instead).
+#[test]
+fn extends_output_byte_identical_with_and_without_source_map_messages_mode() {
+    let modules = extends_chain(PARITY_BASE_MESSAGES, PARITY_CHILD_MESSAGES);
+    let with_map = vfs_opts(
+        modules.clone(),
+        "child.mds",
+        CompileOptions::default().with_source_map(true),
+    );
+    let without_map = vfs_opts(modules, "child.mds", CompileOptions::default());
+
+    for (path, result) in [("maps on", &with_map), ("maps off", &without_map)] {
+        assert_eq!(
+            output_text(result.output.clone()),
+            "system: BASE-SKELETON-HEAD\nuser: CHILD-OVERRIDE-CONTENT\nsystem: BASE-SKELETON-TAIL\n",
+            "{path}: @extends must splice the child's override message between the base's messages"
+        );
+        assert!(
+            result.source_map.is_none(),
+            "{path}: messages mode never produces a source map"
+        );
+    }
+    assert_eq!(
+        with_map.output, without_map.output,
+        "messages-mode @extends output must be identical with and without source maps"
+    );
+    assert!(
+        with_map
+            .warnings
+            .iter()
+            .any(|w| w.contains("source maps are not supported for messages-mode templates")),
+        "a requested source map must degrade with a warning; got: {:?}",
+        with_map.warnings
+    );
+}
+
+/// PF-013 control for `honors_extends`: the frontmatter key `extends:` is reserved
+/// and does not trigger inheritance, so the child renders only its own block and
+/// the marker check rejects the output. A test that declares its base this way
+/// never exercises @extends.
+#[test]
+fn reserved_frontmatter_extends_key_does_not_inherit() {
+    let modules = extends_chain(
+        PARITY_BASE,
+        "---\nextends: base.mds\n---\n@block content:\nCHILD-OVERRIDE-CONTENT\n@end\n",
+    );
+    let text = vfs_no_map(modules, "child.mds")
+        .into_markdown()
+        .expect("markdown output");
+
+    assert!(
+        text.contains("CHILD-OVERRIDE-CONTENT"),
+        "the child's own block still renders; got: {text:?}"
+    );
+    assert!(
+        !text.contains("BASE-SKELETON-HEAD"),
+        "a reserved frontmatter key must not pull in the base skeleton; got: {text:?}"
+    );
+    assert!(
+        !honors_extends(&text),
+        "honors_extends must reject output compiled without inheritance; got: {text:?}"
+    );
+    assert!(
+        honors_extends(PARITY_EXPECTED),
+        "honors_extends must accept the inherited output"
+    );
+}
+
 /// REL-1 regression / applies PF-004: the cumulative loop-iteration budget must be
 /// shared across ALL @extends regions when `source_map: true`.
 ///
-/// Before the fix, `evaluate_regions_with_map` called `evaluate_with_map` per region
-/// and each call seeded a FRESH `EvalContext` (total_iterations = 0), giving K regions
-/// an independent 1 M budget — CPU/DoS amplification ∝ region count.
-///
-/// After the fix `evaluate_with_map_seeded` threads the running totals so the same
-/// cumulative cap applies to the entire @extends compilation.
-///
-/// Setup: the child overrides two blocks; each block drives 600 outer × 1 000 inner =
-/// 600 000 iterations.  No single region exceeds the 1 M cap, but the cumulative total
-/// (1 200 000) does.  The outer/inner arrays are injected via runtime_vars to avoid
-/// large YAML in the template.
+/// Each spliced region is evaluated separately; seeding a fresh budget per region
+/// would give K regions an independent 1 M budget — CPU/DoS amplification ∝ region
+/// count. The chain has two loop regions — a base-default block and a child
+/// override — each well under the cap alone and exactly at it together; one more
+/// inner pass per outer pass must trip `MAX_TOTAL_ITERATIONS`. The loop arrays are
+/// injected via runtime_vars to avoid large YAML in the template.
 #[test]
 fn for_max_total_iterations_across_extends_regions_source_map() {
-    // 600 × 1 000 = 600 000 per region; 2 regions = 1 200 000 > MAX_TOTAL_ITERATIONS (1 M).
-    // Each array is well below MAX_LOOP_ITERATIONS (100 000) so the per-loop cap does
-    // not trip — only the cumulative cap fires.
-    let outer: Vec<Value> = (0..600usize).map(|i| Value::Number(i as f64)).collect();
-    let inner: Vec<Value> = (0..1000usize).map(|i| Value::Number(i as f64)).collect();
-    let mut vars = HashMap::new();
-    vars.insert("outer".to_string(), Value::Array(outer));
-    vars.insert("inner".to_string(), Value::Array(inner));
+    let modules = extends_chain(BUDGET_BASE, BUDGET_CHILD);
+    assert_iteration_budget_spans_extends_chain("maps on", |vars| {
+        compile_chain(
+            &modules,
+            "child.mds",
+            vars,
+            CompileOptions::default().with_source_map(true),
+        )
+    });
+}
 
-    let mut modules = HashMap::new();
-    modules.insert(
-        "base.mds".to_string(),
-        "@block loop1:\n@end\n@block loop2:\n@end\n".to_string(),
-    );
-    modules.insert(
-        "child.mds".to_string(),
-        "---\nextends: base.mds\n---\n\
-         @block loop1:\n\
-         @for o in outer:\n@for i in inner:\n{{o}}{{i}}\n@end\n@end\n\
-         @end\n\
-         @block loop2:\n\
-         @for o in outer:\n@for i in inner:\n{{o}}{{i}}\n@end\n@end\n\
-         @end\n"
-            .to_string(),
-    );
+/// REL-1 twin of `for_max_total_iterations_across_extends_regions_source_map` with
+/// source maps disabled.
+#[test]
+fn for_max_total_iterations_across_extends_regions_maps_off() {
+    let modules = extends_chain(BUDGET_BASE, BUDGET_CHILD);
+    assert_iteration_budget_spans_extends_chain("maps off", |vars| {
+        compile_chain(&modules, "child.mds", vars, CompileOptions::default())
+    });
+}
 
-    let err = mds::compile_virtual_with_deps_opts(
-        modules,
+/// REL-1 twin of `for_max_total_iterations_across_extends_regions_source_map` for a
+/// chain that compiles to messages: the loops run inside `@message` bodies spread
+/// over a base-default block and a child override.
+#[test]
+fn for_max_total_iterations_across_extends_regions_messages_mode() {
+    let modules = extends_chain(BUDGET_BASE_MESSAGES, BUDGET_CHILD_MESSAGES);
+    assert_iteration_budget_spans_extends_chain("messages mode", |vars| {
+        compile_chain(&modules, "child.mds", vars, CompileOptions::default())
+    });
+}
+
+/// REL-1 twin of `for_max_total_iterations_across_extends_regions_source_map` for an
+/// extending module reached through `@import` + `@include`: the imported chain's
+/// regions share one budget too (the importer's own evaluation is separate).
+#[test]
+fn for_max_total_iterations_across_extends_regions_imported_module() {
+    let mut modules = extends_chain(BUDGET_BASE, BUDGET_CHILD);
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./child.mds\" as child\n@include child\n".to_string(),
+    );
+    assert_iteration_budget_spans_extends_chain("imported module", |vars| {
+        compile_chain(&modules, "main.mds", vars, CompileOptions::default())
+    });
+}
+
+/// AC-114-3 / applies PF-004: the cumulative message-content cap
+/// (`MAX_MESSAGES_TOTAL_SIZE`) covers the whole extends chain, not each region.
+///
+/// The base skeleton's `system` message and the child's `user` override each carry
+/// half the cap (the child's one byte more when `tail` is set). Neither message comes
+/// near the cap alone, so only a budget shared by both regions can reject the sum.
+/// Content is fed through runtime variables so the 10 MiB per-file cap and the
+/// iteration budget cannot trip first.
+#[test]
+fn messages_total_bytes_cumulative_across_regions() {
+    let modules = extends_chain(MESSAGE_BYTES_BASE, MESSAGE_BYTES_CHILD);
+    let half = "a".repeat(MAX_MESSAGES_TOTAL_SIZE / 2);
+
+    // Control: the two regions sum to exactly the cap — the largest admitted total.
+    let messages = mds::compile_virtual_with_deps_opts(
+        modules.clone(),
         "child.mds",
-        Some(vars),
-        CompileOptions::default().with_source_map(true),
+        Some(size_vars(&half, "")),
+        CompileOptions::default(),
     )
-    .expect_err(
-        "REL-1: cumulative iteration budget across @extends regions must trip MAX_TOTAL_ITERATIONS",
+    .expect("a chain whose messages total exactly MAX_MESSAGES_TOTAL_SIZE must compile")
+    .into_messages()
+    .expect("messages output");
+    // PF-013: the base skeleton's message and the child's override (role `user`, not
+    // the base default's `assistant`) are both present.
+    let summary: Vec<(&str, usize)> = messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.len()))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("system", MAX_MESSAGES_TOTAL_SIZE / 2),
+            ("user", MAX_MESSAGES_TOTAL_SIZE / 2)
+        ],
+        "@extends must emit the base skeleton message then the child override"
+    );
+    assert!(
+        messages.iter().all(|m| m.content == half),
+        "both messages must carry the injected content"
     );
 
-    assert!(
-        format!("{err}").contains("total loop iterations exceeded maximum"),
-        "REL-1: expected total-iterations resource_limit error, got: {err}"
+    // One byte over the cap in total; each region alone stays at about half of it.
+    for source_map in [false, true] {
+        assert_resource_limit(
+            mds::compile_virtual_with_deps_opts(
+                modules.clone(),
+                "child.mds",
+                Some(size_vars(&half, "b")),
+                CompileOptions::default().with_source_map(source_map),
+            ),
+            &format!(
+                "source_map={source_map}: one message-byte budget per extends chain — two \
+                 regions, each under MAX_MESSAGES_TOTAL_SIZE alone, must exceed it together"
+            ),
+            &format!(
+                "total message content exceeds maximum cumulative size of \
+                 {MAX_MESSAGES_TOTAL_SIZE} bytes"
+            ),
+        );
+    }
+}
+
+/// Applies PF-004: the cumulative output cap (`MAX_OUTPUT_SIZE`) covers the whole
+/// extends chain, not each region, on every Markdown path.
+///
+/// The base skeleton's first line and the child's `body` override each carry half
+/// the cap (the child's one byte more when `tail` is set), so only an output guard
+/// shared by both regions can reject the sum. Content is fed through runtime
+/// variables so the 10 MiB per-file cap and the iteration budget cannot trip first.
+///
+/// The imported chain's over-cap case is only imported, never `@include`d: an
+/// included prompt lands in the importer's own output, whose guard would reject it
+/// even if the chain's did not (PF-013 — name the layer that rejects).
+#[test]
+fn output_size_cumulative_across_regions() {
+    let mut modules = extends_chain(OUTPUT_SIZE_BASE, OUTPUT_SIZE_CHILD);
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./child.mds\" as child\n@include child\n".to_string(),
     );
+    modules.insert(
+        "import_only.mds".to_string(),
+        "@import \"./child.mds\" as child\nIMPORTER\n".to_string(),
+    );
+    // (path, control entry, over-cap entry, source maps)
+    let paths = [
+        ("maps on", "child.mds", "child.mds", true),
+        ("maps off", "child.mds", "child.mds", false),
+        ("imported module", "main.mds", "import_only.mds", false),
+    ];
+
+    // Control: each region 16 bytes under half the cap leaves room for the few
+    // newlines around them, so the chain compiles just under the cap.
+    let under = "a".repeat(MAX_OUTPUT_SIZE / 2 - 16);
+    let expected = format!("{under}\n{under}\n");
+    for (path, entry, _, source_map) in paths {
+        let text = compile_chain(
+            &modules,
+            entry,
+            size_vars(&under, ""),
+            CompileOptions::default().with_source_map(source_map),
+        )
+        .unwrap_or_else(|err| {
+            panic!("{path}: a chain just under MAX_OUTPUT_SIZE must compile: {err}")
+        });
+        // PF-013: exactly the base region then the child override — the base default
+        // is gone. Compared whole (a memcmp); lengths only on failure, never 50 MiB.
+        assert!(
+            text == expected,
+            "{path}: expected the base region then the child override ({} bytes), got {} \
+             bytes; {}",
+            expected.len(),
+            text.len(),
+            marker_report(&text)
+        );
+    }
+
+    // One byte over the cap in total; each region alone stays at about half of it.
+    let half = "a".repeat(MAX_OUTPUT_SIZE / 2);
+    for (path, _, entry, source_map) in paths {
+        assert_resource_limit(
+            compile_chain(
+                &modules,
+                entry,
+                size_vars(&half, "b"),
+                CompileOptions::default().with_source_map(source_map),
+            ),
+            &format!(
+                "{path}: one output-size budget per extends chain — two regions, each \
+                 under MAX_OUTPUT_SIZE alone, must exceed it together"
+            ),
+            &format!("output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"),
+        );
+    }
 }
 
 // ── D1: STRING_SOURCE_MAP_LABEL cross-surface parity (PF-007) ────────────────
