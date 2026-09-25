@@ -740,7 +740,10 @@ pub(crate) fn write_output(
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        miette::miette!("cannot create output directory {}: {e}", parent.display())
+                        miette::miette!(
+                            "cannot create output directory {}: {e}",
+                            crate::output::safe_path(parent)
+                        )
                     })?;
                 }
             }

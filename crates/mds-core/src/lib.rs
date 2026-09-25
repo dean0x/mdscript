@@ -582,6 +582,42 @@ fn native_dependencies(keys: impl IntoIterator<Item = String>) -> Vec<String> {
     keys.into_iter().collect()
 }
 
+/// The user-visible form of a filesystem path (#409).
+///
+/// A path that reached the caller through [`FileSystem`] canonicalization — or
+/// through any other `Path::canonicalize()` call, such as a CLI `--out-dir`
+/// resolution — may be a Windows verbatim path (`\\?\C:\…`,
+/// `\\?\UNC\server\share\…`). This rewrites it to the conventional form wherever
+/// [`verbatim::simplify_verbatim`] can do that losslessly, and returns the path
+/// unchanged otherwise (non-verbatim already, another verbatim form such as
+/// `\\?\Volume{…}`, or not representable conventionally — see that function's
+/// doc for the exact rules). Off Windows a canonical path is never verbatim, so
+/// this is a no-op there and callers can invoke it unconditionally regardless of
+/// host platform.
+///
+/// This is the single, documented entry point for a caller — a CLI status line,
+/// an error message, a binding's own diagnostics — that wants to *display* a
+/// path to a user. It is deliberately separate from [`native_dependencies`]
+/// (used only at the `CompileResult.dependencies` boundary): internal
+/// comparisons (containment, module-cache keys, cycle detection) keep comparing
+/// the canonical/verbatim form as-is, never this simplified one.
+#[must_use]
+#[cfg(windows)]
+pub fn display_native_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    match path.to_str().and_then(verbatim::simplify_verbatim) {
+        Some(simplified) => std::borrow::Cow::Owned(std::path::PathBuf::from(simplified)),
+        None => std::borrow::Cow::Borrowed(path),
+    }
+}
+
+/// See the `#[cfg(windows)]` variant above: off Windows a canonical path is
+/// never verbatim, so this returns `path` unchanged.
+#[must_use]
+#[cfg(not(windows))]
+pub fn display_native_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// Print warnings to stderr. Each warning is printed on its own line.
 ///
 /// Sanitizes each warning before printing (issue #176 / CWE-150): warning strings

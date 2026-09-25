@@ -1319,6 +1319,16 @@ respelling, not an escape (pinned on the Windows CI leg by
 `windows_dependencies_carry_no_verbatim_prefix` in `crates/mds-core/tests/api_surface.rs`,
 and on every platform by the `verbatim` unit tests in `crates/mds-core/src/verbatim.rs`).
 
+The CLI's own **display text** — `file` per the per-field rule above — gets the same
+respelling through a separate mechanism, `mds::display_native_path` (a no-op off
+Windows): the diagnostic `file` field is WIRE-escaped for control/bidi/separator
+characters as the table above describes, and independently of that, any path a CLI
+status line or error message shows (a canonicalized `--out-dir`, an `atomic_write_file`
+I/O failure) is passed through `display_native_path` before display, at the CLI's
+`safe_path` choke-point. The two are orthogonal: escaping defends against a hostile
+filename, `display_native_path` respells a canonicalization artefact that is not
+hostile, just platform-specific.
+
 These are **functional references, not display text**. Source Map v3 `file` and
 `sources` are resolved against the filesystem by devtools, bundlers and IDEs;
 `dependencies` is a watch/rebuild input for the bundler plugins. Rewriting a path to a

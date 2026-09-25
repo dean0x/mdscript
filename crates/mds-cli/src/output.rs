@@ -770,6 +770,12 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
     // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
     let parent = effective_parent(path);
 
+    // #409: this primitive writes every `mds build`/`watch` output (under a
+    // possibly-canonicalized `--out-dir`) and every `fmt`/`lint --fix` source
+    // rewrite, so its own error text must show the conventional form too, not a
+    // Windows verbatim prefix. Computed once and reused below.
+    let shown = mds::display_native_path(path);
+
     // #227: `mds build` targets may not exist yet. Probe with lstat, which never
     // follows a symlink: `Ok` means something is there (a regular file, or a
     // symlink — live or dangling — which is refused below); `Err(NotFound)` means
@@ -778,19 +784,19 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
     let existing = match path.symlink_metadata() {
         Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(miette::miette!("cannot stat {}: {e}", path.display())),
+        Err(e) => return Err(miette::miette!("cannot stat {}: {e}", shown.display())),
     };
 
     if let Some(m) = &existing {
         if m.file_type().is_symlink() {
             return Err(miette::miette!(
                 "cannot write {}: refusing to replace a symlink",
-                path.display()
+                shown.display()
             ));
         }
         // Re-check for symlink right before writing (TOCTOU guard).
         NativeFs::check_symlink(path)
-            .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
+            .map_err(|e| miette::miette!("cannot write {}: {e}", shown.display()))?;
     }
 
     // Mode to restore on Unix. The lstat result of a non-symlink IS the file's
@@ -817,7 +823,7 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
     }
     let mut tmp = builder
         .tempfile_in(parent)
-        .map_err(|e| miette::miette!("cannot create temp file for {}: {e}", path.display()))?;
+        .map_err(|e| miette::miette!("cannot create temp file for {}: {e}", shown.display()))?;
 
     // Restore original permissions before writing; mask off file-type bits
     // (high bits of st_mode) so only the permission bits reach from_mode.
@@ -828,13 +834,13 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
             .map_err(|e| {
                 miette::miette!(
                     "cannot set permissions on temp file for {}: {e}",
-                    path.display()
+                    shown.display()
                 )
             })?;
     }
 
     tmp.write_all(content.as_bytes())
-        .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
+        .map_err(|e| miette::miette!("cannot write {}: {e}", shown.display()))?;
 
     // sync_all() flushes data + metadata to storage (flush() is a no-op on
     // unbuffered File and provides no crash durability guarantee). Skipped for
@@ -842,12 +848,12 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
     if durability == Durability::Fsync {
         tmp.as_file()
             .sync_all()
-            .map_err(|e| miette::miette!("cannot fsync {}: {e}", path.display()))?;
+            .map_err(|e| miette::miette!("cannot fsync {}: {e}", shown.display()))?;
     }
 
     // persist() atomically renames the temp file to the target path.
     tmp.persist(path)
-        .map_err(|e| miette::miette!("cannot rename temp file to {}: {e}", path.display()))?;
+        .map_err(|e| miette::miette!("cannot rename temp file to {}: {e}", shown.display()))?;
 
     Ok(())
 }
@@ -1451,8 +1457,14 @@ pub(crate) fn colorize_unified_diff(unified: &str) -> String {
 /// All status-line path interpolations (`Clean:`, `Fixed:`, `Compiled to:`, etc.) in
 /// `lint`, `fmt`, and `build` must route through this helper (avoids PF-004 /
 /// security-5: unsanitized filename vector in status output).
+///
+/// Also the CLI's single choke-point for stripping a Windows verbatim prefix
+/// (`\\?\C:\…`) before display (#409): a canonicalized `--out-dir` join, or any
+/// other canonical path, is passed through [`mds::display_native_path`] first.
+/// Off Windows that call is a no-op, so every call site gets the conventional
+/// form unconditionally, on every host.
 pub(crate) fn safe_path(p: &std::path::Path) -> String {
-    safe_inline(p.display())
+    safe_inline(mds::display_native_path(p).display())
 }
 
 /// [`safe_path`] for a filename that is already a `&str` (e.g. a `LintDiagnostic::file`

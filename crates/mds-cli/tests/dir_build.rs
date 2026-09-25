@@ -1770,3 +1770,83 @@ fn dir_build_dotdot_root_mirrors_without_warning() {
         "a mirrored build must not report the out-of-root flatten; got: {stderr}"
     );
 }
+
+// ── #409: no Windows verbatim prefix in directory-mode `--out-dir` status lines ─
+
+/// #409 (Windows only): directory-mode `build` canonicalizes `--out-dir`
+/// (`canonicalize_out_dir`, used only by `run_build_directory` and directory
+/// `watch` — single-file `-o`/`--out-dir` never canonicalizes). On Windows,
+/// `Path::canonicalize` always returns the verbatim form (`\\?\C:\…`) once the
+/// directory exists, so `--out-dir` must already exist for this test to exercise
+/// the bug. The `Compiled to …` status line — and every other path `--out-dir`
+/// feeds — must show the conventional form instead.
+#[cfg(windows)]
+#[test]
+fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "plain.mds");
+
+    let out = tempfile::tempdir().unwrap();
+    // Positive control (PF-013): canonicalizing the pre-existing --out-dir IS
+    // verbatim on this host, so the absence assertions below can fail.
+    assert!(
+        out.path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(r"\\?\"),
+        "test assumption: canonicalize must yield a verbatim path on Windows"
+    );
+
+    let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "dir build should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Compiled to"),
+        "expected a Compiled to status line; got: {stderr}"
+    );
+    assert!(
+        !stdout.contains(r"\\?\"),
+        "stdout must not contain the Windows verbatim prefix; got: {stdout}"
+    );
+    assert!(
+        !stderr.contains(r"\\?\"),
+        "stderr must not contain the Windows verbatim prefix; got: {stderr}"
+    );
+}
+
+/// Unix control for the Windows test above: off Windows, canonicalizing
+/// `--out-dir` never produces a verbatim path, so `display_native_path` is a
+/// no-op and the `Compiled to …` line names the canonical output path unchanged.
+#[cfg(unix)]
+#[test]
+fn dir_build_out_dir_status_line_unchanged_off_windows() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "plain.mds");
+
+    let out = tempfile::tempdir().unwrap();
+    let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "dir build should succeed; stderr: {stderr}"
+    );
+    let expected_line = format!(
+        "Compiled to {}",
+        out.path()
+            .canonicalize()
+            .unwrap()
+            .join("plain.md")
+            .display()
+    );
+    assert!(
+        stderr.contains(&expected_line),
+        "expected the unchanged canonical status line {expected_line:?}; got: {stderr}"
+    );
+}

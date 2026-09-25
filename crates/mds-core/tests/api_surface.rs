@@ -37,6 +37,30 @@ fn public_functions_exist() {
     let _ = mds::load_vars_str_reporting_duplicates("{}");
 }
 
+/// #409: `display_native_path` is callable via the crate root with the expected
+/// `Path -> Cow<Path>` signature. It is the single public entry point CLI and
+/// binding display sinks use to strip a Windows verbatim prefix (`\\?\C:\…`)
+/// from a path before showing it to a user; off Windows (this host) a canonical
+/// path is never verbatim, so it is a documented no-op — pinned here rather than
+/// under `#[cfg(windows)]`, since every host must have this function.
+#[test]
+fn display_native_path_function_exists() {
+    let _: fn(&Path) -> Cow<'_, Path> = mds::display_native_path;
+    let unchanged = Path::new("relative/path.mds");
+    assert_eq!(&*mds::display_native_path(unchanged), unchanged);
+}
+
+/// #409 (Windows only): `display_native_path` actually strips a lossless
+/// verbatim prefix. The pin test above only exercises the no-op case, which
+/// passes trivially on every host, Windows included.
+#[cfg(windows)]
+#[test]
+fn display_native_path_strips_verbatim_prefix_on_windows() {
+    let verbatim = Path::new(r"\\?\C:\Users\example\file.mds");
+    let shown = mds::display_native_path(verbatim);
+    assert_eq!(shown.as_ref(), Path::new(r"C:\Users\example\file.mds"));
+}
+
 /// #265: `is_forbidden_path_char` and `escape_path_for_message` are callable via
 /// the crate root with the expected signatures. Additive-only for now — nothing
 /// in this crate enforces the predicate yet; enforcement is a follow-up commit.
