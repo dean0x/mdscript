@@ -1361,14 +1361,32 @@ mod tests {
             .anchor_base_dir(&root.display().to_string())
             .expect("anchor_base_dir should succeed for a filesystem root");
 
+        // Compare against the CANONICAL root, not the literal one: `canonical_dir`'s
+        // root branch (used by `anchor_base_dir`) calls `Path::canonicalize`, and on
+        // Windows `std::fs::canonicalize` always returns the verbatim form
+        // (`\\?\C:\`) even for a root that was already absolute (`C:\`). That is the
+        // same, uniform contract the non-root branch has (see
+        // `native_anchor_base_dir_resolves_real_dir` above, which compares against
+        // `sub.canonicalize()`) — containment elsewhere compares verbatim paths
+        // against each other, so the verbatim form is the correct one to assert.
+        let expected = root.canonicalize().unwrap();
         assert_eq!(
             Path::new(&canonical),
-            root.as_path(),
-            "anchor_base_dir(root) must return the root itself, got: {canonical}"
+            expected,
+            "anchor_base_dir(root) must return the canonical root itself, got: {canonical}"
         );
+        // Structural check, independent of the exact string form on any platform:
+        // the result has a root and no parent, i.e. it IS a filesystem root.
+        assert!(
+            Path::new(&canonical).has_root() && Path::new(&canonical).parent().is_none(),
+            "anchor_base_dir(root) must return a filesystem root, got: {canonical}"
+        );
+        // Canonicalize cwd too, so this compares like with like: a non-canonical cwd
+        // and a canonical (possibly verbatim) root are never equal even when the test
+        // fails to reject a cwd fallback, which would make this assertion vacuous.
         assert_ne!(
             Path::new(&canonical),
-            cwd.as_path(),
+            cwd.canonicalize().unwrap(),
             "anchor_base_dir(root) must not resolve to cwd, got: {canonical}"
         );
     }
