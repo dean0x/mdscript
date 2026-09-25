@@ -1430,6 +1430,13 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 /// Duplicate paths are deduplicated while preserving insertion order.
 /// Returns an error if the source has a syntax error.
 ///
+/// The returned paths are exactly as written in the source and are not
+/// validated — including against the forbidden-path-character class (#265).
+/// A caller that opens, resolves or watches one of them must validate it
+/// first (e.g. with [`is_forbidden_path_char`]), the way the resolver and
+/// `@mdscript/mds`'s WASM pre-scanner already do before touching the
+/// filesystem.
+///
 /// # Examples
 ///
 /// ```rust
