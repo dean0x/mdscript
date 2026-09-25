@@ -183,6 +183,59 @@ pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Re
     })
 }
 
+// ── Output-location validation (#265) ─────────────────────────────────────────
+
+/// Refuse an output location that carries a forbidden path character (#265):
+/// `mds::io`, exit 2.
+///
+/// `what` names the setting (`-o/--output`, `--out-dir`, `mds.json build.output_dir`).
+/// Callers run this UP FRONT — before any input is read or compiled — so a hostile
+/// output location never reaches path derivation, `create_dir_all` or the write
+/// guard. The message names the codepoint as `U+XXXX` and shows the value escaped
+/// by [`mds::escape_path_for_message`], so it carries none of the 80 codepoints.
+///
+/// A value that is not valid UTF-8 is scanned lossily: every forbidden codepoint
+/// that is validly encoded survives the conversion.
+pub(crate) fn reject_forbidden_output_path(
+    what: &str,
+    value: &OsStr,
+) -> std::result::Result<(), mds::MdsError> {
+    let text = value.to_string_lossy();
+    match text.chars().find(|&ch| mds::is_forbidden_path_char(ch)) {
+        Some(ch) => Err(mds::MdsError::Io {
+            message: format!(
+                "{what} contains forbidden character U+{:04X}: \"{}\"",
+                u32::from(ch),
+                mds::escape_path_for_message(&text)
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Refuse an `mds.json` `build.output_dir` with a `..` component: `mds::io`, exit 2.
+///
+/// The raw components are checked rather than a canonical form because the
+/// directory may not exist yet (it is created on the first write). Shared by the
+/// single-file (`resolve_output_path_for_kind`) and directory
+/// ([`resolve_output_base`]) resolvers so both refuse it identically.
+pub(crate) fn reject_output_dir_traversal(
+    output_dir: &str,
+) -> std::result::Result<(), mds::MdsError> {
+    let traversal = Path::new(output_dir)
+        .components()
+        .any(|c| c == std::path::Component::ParentDir);
+    if traversal {
+        return Err(mds::MdsError::Io {
+            message: format!(
+                "mds.json output_dir '{}' must not contain '..' components",
+                mds::escape_path_for_message(output_dir)
+            ),
+        });
+    }
+    Ok(())
+}
+
 // ── Output base for directory mode ────────────────────────────────────────────
 
 /// Describes where directory-mode output files are written.
@@ -228,7 +281,7 @@ pub(crate) fn canonicalize_out_dir(out_dir: Option<&PathBuf>) -> Option<PathBuf>
 /// Precedence (mirrors `resolve_output_path` for file mode):
 /// 1. `--out-dir` → `Dir(abs_out_dir)`
 /// 2. `mds.json build.output_dir` → `Dir(config_dir.join(output_dir))`
-///    — rejects `..` components at startup with a hard error.
+///    — rejects `..` components at startup (`mds::io`, exit 2).
 /// 3. Default → `NextToSource`
 pub(crate) fn resolve_output_base(
     abs_out_dir: Option<&Path>,
@@ -239,15 +292,7 @@ pub(crate) fn resolve_output_base(
     }
     if let Some((cfg, config_dir)) = config {
         if let Some(ref output_dir) = cfg.build.output_dir {
-            let traversal = Path::new(output_dir)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir);
-            if traversal {
-                return Err(miette::miette!(
-                    "mds.json output_dir '{}' must not contain '..' components",
-                    output_dir
-                ));
-            }
+            reject_output_dir_traversal(output_dir)?;
             return Ok(OutputBase::Dir(config_dir.join(output_dir)));
         }
     }

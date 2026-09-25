@@ -483,45 +483,50 @@ fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
     // file_name() on them, which returns None, causing a FileNotFound error
     // that assert_equivalent's Err(_) arm then silently swallows via
     // structural_equivalent. avoids PF-006.
+    //
+    // #265: a base directory carrying a forbidden path character is refused here,
+    // where the form the caller typed is still known — the typed form first, then
+    // the canonical one (a symlink can lead into a hostile-named directory), both
+    // named by the typed form so no message shows the absolute resolved path.
     match base_dir {
         // None and the empty-string sentinel both mean "current working directory".
-        None => std::env::current_dir()
-            .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
-            .and_then(|cwd| {
-                cwd.to_str()
-                    .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
-                    .map(str::to_owned)
-            }),
-        Some(d) if d.as_os_str().is_empty() => std::env::current_dir()
-            .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
-            .and_then(|cwd| {
-                cwd.to_str()
-                    .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
-                    .map(str::to_owned)
-            }),
+        None => current_dir_base(),
+        Some(d) if d.as_os_str().is_empty() => current_dir_base(),
         // Canonicalize resolves "." → absolute cwd, relative → absolute, and
         // strips trailing separators so the last component is a real directory name.
         // UTF-8 boundary check runs first so that invalid bytes produce a clear
         // error rather than a confusing "No such file" from canonicalize.
         Some(d) => {
-            if d.to_str().is_none() {
-                return Err(MdsError::io("base_dir path is not valid UTF-8"));
-            }
-            d.canonicalize()
-                .map_err(|e| {
-                    MdsError::io(format!(
-                        "cannot resolve base directory {}: {e}",
-                        d.display()
-                    ))
-                })
-                .and_then(|canonical| {
-                    canonical
-                        .to_str()
-                        .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
-                        .map(str::to_owned)
-                })
+            let typed = d
+                .to_str()
+                .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))?;
+            fs::reject_forbidden_path_chars("base directory", typed)?;
+            let canonical = d.canonicalize().map_err(|e| {
+                MdsError::io(format!(
+                    "cannot resolve base directory {}: {e}",
+                    d.display()
+                ))
+            })?;
+            fs::reject_forbidden_in_path(&canonical, typed)?;
+            canonical
+                .to_str()
+                .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
+                .map(str::to_owned)
         }
     }
+}
+
+/// The current working directory as the base directory of a string compile.
+///
+/// The caller typed no path, so a forbidden character in the working directory
+/// (#265) is reported against `"."` rather than the absolute directory.
+fn current_dir_base() -> Result<String, MdsError> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))?;
+    fs::reject_forbidden_in_path(&cwd, ".")?;
+    cwd.to_str()
+        .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
+        .map(str::to_owned)
 }
 
 /// Check (validate) MDS source from a string with options.

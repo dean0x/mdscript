@@ -35,6 +35,11 @@ const MAX_PATH_SEGMENTS: usize = 256;
 /// - **Null-byte rejection**: `normalize_in_dir` must reject paths containing
 ///   `\0`. The resolver refuses an entry path containing `\0` before
 ///   `resolve_entry` is called.
+/// - **Forbidden path characters** (#265): a path carrying any
+///   [`crate::is_forbidden_path_char`] codepoint is refused. The resolver refuses
+///   such an import string (`mds::import`), entry path or base directory
+///   (`mds::io`) before the backend is called; a backend that resolves symlinks or
+///   otherwise rewrites paths must apply the predicate to the path it resolves.
 /// - **Segment cap**: `resolve_entry` and `normalize_in_dir` must refuse a path
 ///   of more than 256 segments with [`MdsError::ResourceLimit`].
 /// - **File size limits**: `read` must refuse content larger than
@@ -55,14 +60,17 @@ pub trait FileSystem: Send + Sync {
     /// Resolve an entry path — the file a compile starts from — to its key.
     ///
     /// The resolver has already refused an empty entry path or one containing a
-    /// NUL byte (`mds::io`); both built-in backends refuse them again so a direct
-    /// call is covered too. [`NativeFs`] returns the canonical absolute path,
-    /// refuses a symlinked final component, and anchors the project root on its
-    /// first call. [`VirtualFs`] returns the key unchanged.
+    /// NUL byte or another forbidden path character (`mds::io`); both built-in
+    /// backends refuse them again so a direct call is covered too. [`NativeFs`]
+    /// returns the canonical absolute path, refuses a symlinked final component or
+    /// a canonical path carrying a forbidden character, and anchors the project root
+    /// on its first call. [`VirtualFs`] returns the key unchanged.
     ///
     /// # Errors
     ///
-    /// - [`MdsError::Io`] when `path` is empty or contains a null byte (`\0`).
+    /// - [`MdsError::Io`] when `path` is empty or contains a null byte (`\0`) or
+    ///   another [`crate::is_forbidden_path_char`] codepoint; on [`NativeFs`] also
+    ///   when its canonical path carries one.
     /// - [`MdsError::ResourceLimit`] when `path` has more than 256 segments.
     /// - [`MdsError::FileNotFound`] when the path does not exist ([`NativeFs`] only).
     /// - [`MdsError::ImportError`] when the final component is a symlink or the
@@ -84,13 +92,15 @@ pub trait FileSystem: Send + Sync {
     ///
     /// Returns [`MdsError::ImportError`] when:
     /// - `relative` is empty
-    /// - `relative` contains a null byte (`\0`)
+    /// - `relative` contains a null byte (`\0`) or another
+    ///   [`crate::is_forbidden_path_char`] codepoint
     /// - the resolved path traverses above the key-space root (`..` from root)
     /// - the resolved path is a symlink ([`NativeFs`] only)
     /// - the resolved path escapes the established project root ([`NativeFs`] only)
     ///
     /// Returns [`MdsError::ResourceLimit`] when the resolved path exceeds
-    /// `MAX_PATH_SEGMENTS` segments.
+    /// `MAX_PATH_SEGMENTS` segments, and [`MdsError::Io`] when the canonical path
+    /// carries a forbidden path character ([`NativeFs`] only).
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError>;
 
     /// Return the directory portion of a normalized file key.
@@ -114,7 +124,9 @@ pub trait FileSystem: Send + Sync {
     ///
     /// [`crate::resolver::ModuleCache::resolve_source`] and its variants call this
     /// once, before any import resolves, and pass the returned string to
-    /// [`FileSystem::normalize_in_dir`] as the importing directory.
+    /// [`FileSystem::normalize_in_dir`] as the importing directory. They refuse a
+    /// `dir` carrying a forbidden path character (`mds::io`, #265) before calling
+    /// it.
     ///
     /// The default is the identity: `dir` is returned unchanged and nothing is
     /// anchored, which suits an in-memory key-space with no host directories
@@ -126,7 +138,9 @@ pub trait FileSystem: Send + Sync {
     /// # Errors
     ///
     /// The default never fails. [`NativeFs`] returns:
-    /// - [`MdsError::Io`] when `dir` does not exist or cannot be resolved.
+    /// - [`MdsError::Io`] when `dir` does not exist or cannot be resolved, or when
+    ///   `dir` or its canonical path carries a [`crate::is_forbidden_path_char`]
+    ///   codepoint.
     /// - [`MdsError::ImportError`] when the final component of `dir` is a symlink.
     fn anchor_base_dir(&self, dir: &str) -> Result<String, MdsError> {
         Ok(dir.to_string())
@@ -164,10 +178,65 @@ pub trait FileSystem: Send + Sync {
 
 // ── Shared path guards ───────────────────────────────────────────────────────
 
-/// Reject empty import paths and import paths containing null bytes.
+/// The first [`crate::is_forbidden_path_char`] character of `path`, if any (#265).
+pub(crate) fn first_forbidden_char(path: &str) -> Option<char> {
+    path.chars()
+        .find(|&ch| crate::lint::is_forbidden_path_char(ch))
+}
+
+/// The message for a path refused because it carries a forbidden path character
+/// (#265): `<what> contains forbidden character U+XXXX: "<shown>"`.
+///
+/// `shown` is the path as the caller typed it, escaped with
+/// [`crate::escape_path_for_message`], so the message itself carries none of the
+/// 80 forbidden codepoints (TAB included) and never substitutes a resolved absolute
+/// path for what the caller passed.
+pub(crate) fn forbidden_char_message(what: &str, ch: char, shown: &str) -> String {
+    format!(
+        "{what} contains forbidden character U+{:04X}: \"{}\"",
+        u32::from(ch),
+        crate::lint::escape_path_for_message(shown)
+    )
+}
+
+/// Refuse a caller-supplied path — an entry path or a base directory, named by
+/// `what` — that carries a forbidden path character (`mds::io`, #265).
+pub(crate) fn reject_forbidden_path_chars(what: &str, path: &str) -> Result<(), MdsError> {
+    match first_forbidden_char(path) {
+        Some(ch) => Err(MdsError::io(forbidden_char_message(what, ch, path))),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a resolved path that carries a forbidden path character anywhere in it
+/// (`mds::io`, #265).
+///
+/// The typed path has already been checked by the time a path is resolved; this
+/// catches what the typed form cannot show — a symlinked directory whose target has a
+/// hostile name, or a project that lives under one. The WHOLE path is scanned, not
+/// only its final component. The message names `shown`, the path the caller typed,
+/// never the absolute resolved path (R3 / CWE-209).
+///
+/// A path that is not valid UTF-8 is scanned lossily: every forbidden codepoint that
+/// is validly encoded survives the conversion, and a key that is not valid UTF-8
+/// never resolves anyway.
+pub(crate) fn reject_forbidden_in_path(resolved: &Path, shown: &str) -> Result<(), MdsError> {
+    match first_forbidden_char(&resolved.to_string_lossy()) {
+        Some(ch) => Err(MdsError::io(forbidden_char_message(
+            "resolved path",
+            ch,
+            shown,
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Reject an import path that is empty, contains a null byte, or carries any other
+/// forbidden path character (#265).
 ///
 /// Called by `normalize_in_dir` on both `NativeFs` and `VirtualFs`, so the error
-/// strings stay identical across backends.
+/// strings stay identical across backends. The null-byte check runs before the
+/// forbidden-character check (U+0000 is in that class) and keeps its own message.
 fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
     if relative.is_empty() {
         return Err(MdsError::import_error("import path is empty"));
@@ -175,10 +244,18 @@ fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
     if relative.contains('\0') {
         return Err(MdsError::import_error("import path contains null byte"));
     }
+    if let Some(ch) = first_forbidden_char(relative) {
+        return Err(MdsError::import_error(forbidden_char_message(
+            "import path",
+            ch,
+            relative,
+        )));
+    }
     Ok(())
 }
 
-/// Reject an entry path that is empty or contains a null byte (`mds::io`).
+/// Reject an entry path that is empty, contains a null byte, or carries any other
+/// forbidden path character (`mds::io`, #265).
 ///
 /// An entry path names the file a compile starts from. It is caller input, not an
 /// `@import` string, so it reports `mds::io` like the other entry-path checks at
@@ -186,8 +263,9 @@ fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
 /// before [`FileSystem::resolve_entry`], so a custom backend is covered; both
 /// built-in backends run it again so a direct trait call is covered too.
 ///
-/// The path is WIRE-escaped in the message: it is the string the caller passed,
-/// never a resolved absolute path.
+/// The path is escaped in the message: it is the string the caller passed, never a
+/// resolved absolute path. The null-byte check runs before the forbidden-character
+/// check and keeps its own message.
 pub(crate) fn validate_entry_path(path: &str) -> Result<(), MdsError> {
     if path.is_empty() {
         return Err(MdsError::io("entry path is empty"));
@@ -195,10 +273,10 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<(), MdsError> {
     if path.contains('\0') {
         return Err(MdsError::io(format!(
             "entry path contains null byte: \"{}\"",
-            crate::lint::sanitize_control_chars_wire(path)
+            crate::lint::escape_path_for_message(path)
         )));
     }
-    Ok(())
+    reject_forbidden_path_chars("entry path", path)
 }
 
 /// Refuse a path of more than [`MAX_PATH_SEGMENTS`] segments (`mds::resource_limit`).
@@ -402,11 +480,16 @@ impl NativeFs {
     /// - `MdsError::ImportError` — the final path component is a symlink.
     /// - `MdsError::FileNotFound` — the path does not exist or the parent cannot
     ///   be resolved.
+    /// - `MdsError::Io` — `path`, or the canonical path it resolves to, carries a
+    ///   [`crate::is_forbidden_path_char`] codepoint (#265). The typed form is
+    ///   checked before the filesystem is touched.
     pub fn check_symlink(path: &Path) -> Result<PathBuf, MdsError> {
         // Delegate to the named variant using path.display() as the shown string.
         // External callers (CLI lint/fmt/watch/output) pass absolute paths where
         // showing the full path in error messages is appropriate.
-        Self::check_symlink_named(path, &path.display().to_string())
+        let shown = path.display().to_string();
+        reject_forbidden_path_chars("path", &shown)?;
+        Self::check_symlink_named(path, &shown)
     }
 
     /// Canonicalize a directory path, handling the filesystem-root edge case (#371).
@@ -440,6 +523,10 @@ impl NativeFs {
     /// behavior, not a privilege escalation: the base directory is always
     /// caller-chosen, and this function only proves the path exists and is a
     /// directory — it grants no access beyond what the caller already had.
+    ///
+    /// Both branches refuse a canonical path that carries a forbidden path
+    /// character (#265): the root branch here, every other path inside
+    /// `check_symlink_named`.
     fn canonical_dir(path: &Path, shown: &str) -> Result<PathBuf, MdsError> {
         if path.has_root() && path.parent().is_none() {
             let canonical = path
@@ -450,6 +537,7 @@ impl NativeFs {
                     "cannot resolve path {shown}: not a directory"
                 )));
             }
+            reject_forbidden_in_path(&canonical, shown)?;
             Ok(canonical)
         } else {
             Self::check_symlink_named(path, shown)
@@ -527,6 +615,10 @@ impl NativeFs {
     /// never changes the directory. A canonical path whose directory is not the
     /// canonical parent therefore means the component was replaced by a link
     /// between the two calls, and it is refused the same way.
+    ///
+    /// Finally the whole canonical path is refused (`mds::io`) when it carries a
+    /// forbidden path character (#265): a parent directory followed through a
+    /// symlink can have a hostile name the caller never typed.
     fn check_symlink_named(path: &Path, shown: &str) -> Result<PathBuf, MdsError> {
         let file_name = path
             .file_name()
@@ -553,6 +645,7 @@ impl NativeFs {
         if canonical.parent() != Some(canonical_parent.as_path()) {
             return Err(symlink_error());
         }
+        reject_forbidden_in_path(&canonical, shown)?;
         Ok(canonical)
     }
 
@@ -658,8 +751,14 @@ impl FileSystem for NativeFs {
         // directory that passed the check.
         //
         // canonical_dir returns ImportError (symlink), FileNotFound (missing
-        // path) or Io (root branch). FileNotFound is re-wrapped as Io: resolving
-        // a base directory is caller input, not an import step.
+        // path) or Io (root branch, or a forbidden character in the canonical
+        // path). FileNotFound is re-wrapped as Io: resolving a base directory is
+        // caller input, not an import step.
+        //
+        // The typed form is refused first (#265), so no later message can carry a
+        // forbidden character from it; the resolver has already run the same check
+        // for every backend, this covers a direct trait call.
+        reject_forbidden_path_chars("base directory", dir)?;
         let canonical = Self::canonical_dir(Path::new(dir), dir).map_err(|e| match e {
             MdsError::FileNotFound { .. } => {
                 MdsError::io(format!("cannot resolve path {dir}: {e}"))
@@ -1214,6 +1313,175 @@ mod tests {
             "expected {escaped:?} in the message, got: {msg}"
         );
         assert!(!msg.contains('\0'), "raw NUL must not reach the message");
+    }
+
+    // ── Forbidden path characters (#265) ──────────────────────────────────────
+
+    /// Every forbidden codepoint, with a non-vacuity pin on the class size.
+    fn forbidden_chars() -> Vec<char> {
+        let all: Vec<char> = (0..=0x10_FFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|&c| crate::lint::is_forbidden_path_char(c))
+            .collect();
+        assert_eq!(all.len(), 80, "non-vacuity: the class is 80 codepoints");
+        all
+    }
+
+    /// `(U+XXXX, six-char escape text)` for `ch`, built at runtime (PF-018).
+    fn names(ch: char) -> (String, String) {
+        (
+            format!("U+{:04X}", u32::from(ch)),
+            format!("\\u{:04X}", u32::from(ch)),
+        )
+    }
+
+    fn assert_no_forbidden(msg: &str) {
+        assert!(
+            first_forbidden_char(msg).is_none(),
+            "message carries a forbidden char: {msg:?}"
+        );
+    }
+
+    /// A direct `normalize_in_dir` call refuses all 80 in the import string on both
+    /// backends, before the filesystem is touched; NUL keeps its own message.
+    #[test]
+    fn normalize_in_dir_refuses_every_forbidden_char() {
+        let dir = TempDir::new().unwrap();
+        let native_dir = dir.path().display().to_string();
+        let native = NativeFs::new();
+        for ch in forbidden_chars() {
+            let (u, esc) = names(ch);
+            let relative = format!("./a{ch}.mds");
+            let expected = if ch == '\0' {
+                "import path contains null byte".to_string()
+            } else {
+                format!("import path contains forbidden character {u}: \"./a{esc}.mds\"")
+            };
+            for (backend, result) in [
+                ("vfs", vfs().normalize_in_dir("", &relative)),
+                ("native", native.normalize_in_dir(&native_dir, &relative)),
+            ] {
+                let err = result.unwrap_err();
+                assert_eq!(
+                    code_of(&err).as_deref(),
+                    Some("mds::import"),
+                    "{backend} {u}"
+                );
+                let msg = err.to_string();
+                assert!(msg.contains(&expected), "{backend} {u}: {msg}");
+                assert_no_forbidden(&msg);
+            }
+        }
+        // Control: a clean name resolves on both.
+        assert_eq!(vfs().normalize_in_dir("", "./a.mds").unwrap(), "a.mds");
+        make_temp_file(&dir, "a.mds", "x");
+        assert!(native.normalize_in_dir(&native_dir, "./a.mds").is_ok());
+    }
+
+    /// A direct `resolve_entry` call refuses all 80 with `mds::io` on both backends.
+    #[test]
+    fn resolve_entry_refuses_every_forbidden_char() {
+        for ch in forbidden_chars() {
+            let (u, esc) = names(ch);
+            let path = format!("./main{ch}.mds");
+            let expected = if ch == '\0' {
+                format!("entry path contains null byte: \"./main{esc}.mds\"")
+            } else {
+                format!("entry path contains forbidden character {u}: \"./main{esc}.mds\"")
+            };
+            for (backend, result) in [
+                ("vfs", vfs().resolve_entry(&path)),
+                ("native", NativeFs::new().resolve_entry(&path)),
+            ] {
+                let err = result.unwrap_err();
+                assert!(matches!(err, MdsError::Io { .. }), "{backend} {u}: {err:?}");
+                let msg = err.to_string();
+                assert!(msg.contains(&expected), "{backend} {u}: {msg}");
+                assert_no_forbidden(&msg);
+            }
+        }
+    }
+
+    /// `anchor_base_dir` refuses a typed base directory carrying a forbidden
+    /// character before it touches the filesystem (runs on every platform).
+    #[test]
+    fn native_anchor_base_dir_refuses_forbidden_chars() {
+        for ch in ['\x1b', '\t', '\n', '\u{202E}'] {
+            let (u, esc) = names(ch);
+            let err = NativeFs::new()
+                .anchor_base_dir(&format!("base{ch}dir"))
+                .unwrap_err();
+            assert_eq!(code_of(&err).as_deref(), Some("mds::io"), "{u}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "base directory contains forbidden character {u}: \"base{esc}dir\""
+                )),
+                "{msg}"
+            );
+            assert_no_forbidden(&msg);
+        }
+    }
+
+    /// The canonical-path scan. Unix-only: a C0 control cannot appear in a Windows
+    /// file name, so the hostile directory cannot be created there.
+    #[cfg(unix)]
+    #[test]
+    fn native_canonical_path_through_a_hostile_directory_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let hostile = root.join("evil\ndir");
+        let clean = root.join("clean");
+        for d in [&hostile, &clean] {
+            std::fs::create_dir(d).unwrap();
+            std::fs::create_dir(d.join("sub")).unwrap();
+            std::fs::write(d.join("x.mds"), "x").unwrap();
+        }
+        assert!(make_symlink(&hostile, &root.join("alias")));
+        assert!(make_symlink(&clean, &root.join("alias2")));
+        let escaped_lf = format!("\\u{:04X}", 0x0A);
+
+        // anchor_base_dir below the alias (a symlinked FINAL component is refused
+        // as a symlink): the typed form is clean, the canonical one is not. The
+        // message names what was passed, not the canonical path.
+        let alias = root.join("alias").join("sub").display().to_string();
+        let err = NativeFs::new().anchor_base_dir(&alias).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "resolved path contains forbidden character U+000A: \"{alias}\""
+            )),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(&escaped_lf),
+            "canonical path must not be shown: {msg}"
+        );
+
+        // normalize_in_dir through the alias, and check_symlink (the CLI's reader).
+        let fs = NativeFs::new();
+        let err = fs
+            .normalize_in_dir(&root.display().to_string(), "./alias/x.mds")
+            .unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert!(
+            err.to_string()
+                .contains("resolved path contains forbidden character U+000A: \"./alias/x.mds\""),
+            "{err}"
+        );
+        let err = NativeFs::check_symlink(&root.join("alias").join("x.mds")).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+
+        // Controls: the clean alias resolves on every path (a fresh NativeFs each,
+        // so one anchored root does not contain the next).
+        assert!(NativeFs::new()
+            .anchor_base_dir(&root.join("alias2").join("sub").display().to_string())
+            .is_ok());
+        assert!(NativeFs::new()
+            .normalize_in_dir(&root.display().to_string(), "./alias2/x.mds")
+            .is_ok());
+        assert!(NativeFs::check_symlink(&root.join("alias2").join("x.mds")).is_ok());
     }
 
     // ── is_markdown consistency ───────────────────────────────────────────────

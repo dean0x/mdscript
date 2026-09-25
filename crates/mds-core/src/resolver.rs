@@ -350,12 +350,23 @@ impl ModuleCache {
     ///
     /// Entry validation runs here, before the backend is called, so a custom
     /// [`FileSystem`] passed to [`ModuleCache::with_fs`] is covered as well as the
-    /// built-in backends (PF-004): an empty entry path or one containing a null
-    /// byte is refused with `mds::io` and never reaches
-    /// [`FileSystem::resolve_entry`].
+    /// built-in backends (PF-004): an empty entry path, or one containing a null
+    /// byte or another forbidden path character (#265), is refused with `mds::io`
+    /// and never reaches [`FileSystem::resolve_entry`].
     fn resolve_entry_key(&self, path: &str) -> Result<String, MdsError> {
         crate::fs::validate_entry_path(path)?;
         self.fs.resolve_entry(path)
+    }
+
+    /// Validate the base directory of a string compile and anchor it through the
+    /// backend.
+    ///
+    /// The forbidden-character check (#265) runs here, before the backend is
+    /// called, for the same reason entry validation does: a custom [`FileSystem`]
+    /// keeps the default identity `anchor_base_dir` and checks nothing (PF-004).
+    fn anchor_base(&self, base_dir: &str) -> Result<String, MdsError> {
+        crate::fs::reject_forbidden_path_chars("base directory", base_dir)?;
+        self.fs.anchor_base_dir(base_dir)
     }
 
     /// Resolve a module from a filesystem path string.
@@ -531,7 +542,8 @@ impl ModuleCache {
     /// through [`FileSystem::anchor_base_dir`] first: [`crate::NativeFs`]
     /// canonicalizes it, refuses a symlinked directory and anchors the project
     /// root there; the default (in-memory backends) uses it unchanged as a
-    /// key-space directory (`""` is the root).
+    /// key-space directory (`""` is the root). A `base_dir` carrying a forbidden
+    /// path character is refused with `mds::io` before the backend sees it (#265).
     pub fn resolve_source(
         &mut self,
         source: &str,
@@ -543,7 +555,7 @@ impl ModuleCache {
         Self::check_source_size(source)?;
         // Anchor base_dir through the FileSystem abstraction so that custom or
         // virtual backends can override this behaviour (fixes issue #21).
-        let canonical_str = self.fs.anchor_base_dir(base_dir)?;
+        let canonical_str = self.anchor_base(base_dir)?;
 
         // Guard against re-entrant or cyclic calls that could form a cycle
         // back through this root module. Mirrors the resolving bookkeeping in
@@ -664,7 +676,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         Self::check_source_size(source)?;
-        let canonical_str = self.fs.anchor_base_dir(base_dir)?;
+        let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
@@ -690,7 +702,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         Self::check_source_size(source)?;
-        let canonical_str = self.fs.anchor_base_dir(base_dir)?;
+        let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
@@ -2425,21 +2437,68 @@ fn validate_exports(
     Ok(())
 }
 
+/// The first rule an `@import` / `@extends` / frontmatter `imports:` path breaks.
+///
+/// One classification shared by [`validate_import_path`] (body directives) and the
+/// frontmatter `imports:` parser, so both report the same, real reason (#265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ImportPathViolation {
+    /// The path does not start with `./` or `../`.
+    NotRelative,
+    /// The path contains a null byte, which could truncate it in some OS APIs.
+    NullByte,
+    /// The path carries a forbidden path character other than NUL (#265).
+    ForbiddenChar(char),
+}
+
+impl ImportPathViolation {
+    /// The violation as a message fragment: `must start with './' or '../'`,
+    /// `contains null byte`, `contains forbidden character U+XXXX`.
+    pub(super) fn reason(self) -> String {
+        match self {
+            Self::NotRelative => "must start with './' or '../'".to_string(),
+            Self::NullByte => "contains null byte".to_string(),
+            Self::ForbiddenChar(ch) => {
+                format!("contains forbidden character U+{:04X}", u32::from(ch))
+            }
+        }
+    }
+}
+
+/// Classify `path` as an import path: `None` when it is acceptable.
+///
+/// Checked in order — relative form, null byte, then the rest of the forbidden
+/// class — so a NUL keeps its own reason even though U+0000 is forbidden too.
+pub(super) fn import_path_violation(path: &str) -> Option<ImportPathViolation> {
+    if !path.starts_with("./") && !path.starts_with("../") {
+        return Some(ImportPathViolation::NotRelative);
+    }
+    if path.contains('\0') {
+        return Some(ImportPathViolation::NullByte);
+    }
+    crate::fs::first_forbidden_char(path).map(ImportPathViolation::ForbiddenChar)
+}
+
 /// Validate that an import path is safe and relative.
 ///
-/// Rejects absolute paths and paths containing components that could escape
-/// the project directory (e.g., null bytes).
+/// Rejects paths that are not `./`/`../`-relative, contain a null byte, or carry
+/// any other forbidden path character (#265). It runs before the backend is
+/// called, so a custom `with_fs` backend is covered too. The path is escaped in
+/// every message that shows it.
 fn validate_import_path(path: &str) -> Result<(), MdsError> {
-    if !path.starts_with("./") && !path.starts_with("../") {
-        return Err(MdsError::import_error(format!(
-            "import path must be relative (start with './' or '../'): \"{path}\""
-        )));
+    match import_path_violation(path) {
+        None => Ok(()),
+        Some(ImportPathViolation::NotRelative) => Err(MdsError::import_error(format!(
+            "import path must be relative (start with './' or '../'): \"{}\"",
+            crate::lint::escape_path_for_message(path)
+        ))),
+        Some(ImportPathViolation::NullByte) => {
+            Err(MdsError::import_error("import path contains null byte"))
+        }
+        Some(ImportPathViolation::ForbiddenChar(ch)) => Err(MdsError::import_error(
+            crate::fs::forbidden_char_message("import path", ch, path),
+        )),
     }
-    // Reject null bytes which could truncate paths in some OS APIs
-    if path.contains('\0') {
-        return Err(MdsError::import_error("import path contains null byte"));
-    }
-    Ok(())
 }
 
 /// Validate that a file is a valid MDS file.

@@ -15,18 +15,21 @@
 //!
 //! `mds-core` has exactly three warning producers that interpolate a runtime value —
 //! `resolver.rs`'s imported-module filename and `evaluator.rs`'s two `@include` alias
-//! warnings. Only the first can receive a hostile character: a module key is a filesystem
-//! path, and POSIX permits any byte but `/` and NUL in a filename. The parser admits an
-//! `@include` alias only if it matches `[A-Za-z_][A-Za-z0-9_]*`, so a test of the other
-//! two would assert on an input the parser rejects — vacuous, which is the PF-013 failure
-//! mode — and none is written. That asymmetry is stated in `print_discipline.rs`'s module
-//! doc rather than papered over.
+//! warnings. Only the first can receive a hostile character, and since #265 only from a
+//! custom `FileSystem` backend: the built-in backends refuse a forbidden path character
+//! in every import string, entry key and canonical path, so no module key they resolve
+//! can carry one, while a `with_fs` backend that rewrites keys is not bound by that
+//! refusal. The parser admits an `@include` alias only if it matches
+//! `[A-Za-z_][A-Za-z0-9_]*`, so a test of the other two would assert on an input the
+//! parser rejects — vacuous, which is the PF-013 failure mode — and none is written.
+//! That asymmetry is stated in `print_discipline.rs`'s module doc rather than papered
+//! over.
 //!
 //! # PF-013 evidence
 //!
-//! - **Reachable vector:** the module map handed to `compile_virtual_with_deps_opts` is
-//!   keyed by path, and no layer between the caller and the warning rejects a control
-//!   byte in that key. [`hostile_module_name_reaches_the_warning`] proves the hostile
+//! - **Reachable vector:** a custom backend maps the clean import `./big.mds` to a
+//!   hostile key; nothing between the backend and the warning rejects it.
+//!   [`hostile_key_from_a_custom_backend_reaches_the_warning_escaped`] proves the hostile
 //!   name really does reach this producer by finding it, escaped, in the warning text.
 //! - **Positive:** the escaped `\u001B` literal must be present in the warning.
 //! - **Negative:** no raw ESC byte, and no raw `\n`, may appear anywhere in it.
@@ -37,6 +40,13 @@
 //!   `crates/mds-core/src/resolver.rs`'s segment-cap `warnings.push` makes the positive
 //!   assertion fail on the missing `\u001B` literal and the negative assertion fail on
 //!   the raw ESC byte.
+//! - **The built-in route is closed:** [`hostile_import_is_refused_before_the_producer`]
+//!   drives the same hostile name through the built-in virtual backend and asserts it is
+//!   refused (`mds::import`) before any module — and so any warning — exists.
+
+use std::collections::HashMap;
+
+use mds::{FileSystem, MdsError, Value, VirtualFs};
 
 /// A filename that carries two members of the escape class: ESC (U+001B, the CSI
 /// introducer of an ANSI escape sequence) and U+202E RIGHT-TO-LEFT OVERRIDE (Trojan
@@ -48,58 +58,82 @@ const HOSTILE_MODULE: &str = "big\u{1b}[31m\u{202e}.mds";
 const ESCAPED_ESC: &str = "\\u001B";
 const ESCAPED_RLO: &str = "\\u202E";
 
-/// AC / #176: the imported-module filename in `mds-core`'s source-map segment-cap warning
-/// is WIRE-escaped at construction, so the string `mds-cli` hands to `eprint_warning` —
-/// which preserves `\n` — cannot carry a terminal-hazardous byte.
-///
-/// The vector: a module whose evaluation exceeds `MAX_SOURCEMAP_SEGMENTS` (1 000 000),
-/// imported by an entry module. 100 000 iterations x 11 segment-producing nodes =
-/// 1 100 000 segments, which trips the cap inside the *imported* module and takes the
+/// A module whose evaluation exceeds `MAX_SOURCEMAP_SEGMENTS` (1 000 000): 100 000
+/// iterations x 11 segment-producing nodes (6 Text + 5 Interpolation) = 1 100 000
+/// segments, which trips the cap inside the *imported* module and takes the
 /// `resolver.rs` branch that names the module in its warning.
-#[test]
-fn hostile_module_name_reaches_the_warning() {
-    use mds::Value;
+const BIG_MODULE: &str =
+    "@for item in items:\nA{{item}}B{{item}}C{{item}}D{{item}}E{{item}}F\n@end\n";
 
+fn big_vars() -> HashMap<String, Value> {
     let items: Vec<Value> = (0..100_000)
         .map(|_| Value::String("x".to_string()))
         .collect();
-    let mut vars = std::collections::HashMap::new();
-    vars.insert("items".to_string(), Value::Array(items));
+    HashMap::from([("items".to_string(), Value::Array(items))])
+}
 
-    let mut modules = std::collections::HashMap::new();
-    // The resolver requires an explicitly relative specifier; it normalizes back to the
-    // bare module key, which is what `ctx.file_str` — and therefore the warning — carries.
-    modules.insert(
-        "entry.mds".to_string(),
-        format!("@import \"./{HOSTILE_MODULE}\" as big\n@include big\n"),
-    );
-    // 6 Text nodes + 5 Interpolation nodes = 11 segments per iteration.
-    modules.insert(
-        HOSTILE_MODULE.to_string(),
-        "@for item in items:\nA{{item}}B{{item}}C{{item}}D{{item}}E{{item}}F\n@end\n".to_string(),
-    );
-
-    let result = mds::compile_virtual_with_deps_opts(
-        modules,
-        "entry.mds",
-        Some(vars),
-        mds::CompileOptions::default().with_source_map(true),
-    )
-    .expect("compilation must succeed even when the segment cap is hit");
-
-    // Non-vacuity: the producer under test must actually have run. If the cap warning
-    // stops being emitted, every assertion below would hold over an empty haystack.
-    let cap_warning = result
-        .warnings
+/// The imported-module segment-cap warning among `warnings`, failing closed when it is
+/// absent (non-vacuity: every later assertion would otherwise hold over nothing).
+fn cap_warning(warnings: &[String]) -> &str {
+    warnings
         .iter()
         .find(|w| w.contains("segment cap") && w.contains("imported module"))
         .unwrap_or_else(|| {
             panic!(
                 "non-vacuity: the imported-module segment-cap warning must be emitted; \
-                 got warnings: {:?}",
-                result.warnings
+                 got warnings: {warnings:?}"
             )
-        });
+        })
+}
+
+/// A backend with none of the built-in key checks that maps the clean import
+/// `./big.mds` to [`HOSTILE_MODULE`] — the residual #265 leaves to custom backends.
+struct KeyRewritingFs(VirtualFs);
+
+impl FileSystem for KeyRewritingFs {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        Ok(path.to_string())
+    }
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        match relative {
+            "./big.mds" => Ok(HOSTILE_MODULE.to_string()),
+            _ => self.0.normalize_in_dir(dir, relative),
+        }
+    }
+    fn parent_dir(&self, key: &str) -> String {
+        self.0.parent_dir(key)
+    }
+    fn read(&self, normalized: &str) -> Result<String, MdsError> {
+        self.0.read(normalized)
+    }
+    fn is_markdown(&self, normalized: &str) -> bool {
+        self.0.is_markdown(normalized)
+    }
+}
+
+/// AC / #176: the imported-module filename in `mds-core`'s source-map segment-cap warning
+/// is WIRE-escaped at construction, so the string `mds-cli` hands to `eprint_warning` —
+/// which preserves `\n` — cannot carry a terminal-hazardous byte.
+#[test]
+fn hostile_key_from_a_custom_backend_reaches_the_warning_escaped() {
+    let modules = HashMap::from([
+        (
+            "entry.mds".to_string(),
+            "@import \"./big.mds\" as big\n@include big\n".to_string(),
+        ),
+        (HOSTILE_MODULE.to_string(), BIG_MODULE.to_string()),
+    ]);
+    let mut cache = mds::ModuleCache::with_fs(Box::new(KeyRewritingFs(VirtualFs::new(modules))));
+    let mut warnings = vec![];
+    cache
+        .resolve_virtual_intrinsic_opts(
+            "entry.mds",
+            &big_vars(),
+            &mds::CompileOptions::default().with_source_map(true),
+            &mut warnings,
+        )
+        .expect("compilation must succeed even when the segment cap is hit");
+    let cap_warning = cap_warning(&warnings);
 
     // Reachability + positive: the hostile name reached the producer, and both hostile
     // characters arrived as their six-character WIRE literals.
@@ -129,5 +163,48 @@ fn hostile_module_name_reaches_the_warning() {
         !cap_warning.contains('\n'),
         "a raw newline must not survive into a warning string — `eprint_warning` \
          preserves it, so it would forge a standalone status line: {cap_warning:?}"
+    );
+}
+
+/// #265: on the built-in backend the same hostile name cannot reach the producer — the
+/// import string is refused (`mds::import`) before the module is resolved. Control: the
+/// same compile under a clean name does emit the warning, naming the module.
+#[test]
+fn hostile_import_is_refused_before_the_producer() {
+    let compile = |name: &str| {
+        let modules = HashMap::from([
+            (
+                "entry.mds".to_string(),
+                format!("@import \"./{name}\" as big\n@include big\n"),
+            ),
+            (name.to_string(), BIG_MODULE.to_string()),
+        ]);
+        mds::compile_virtual_with_deps_opts(
+            modules,
+            "entry.mds",
+            Some(big_vars()),
+            mds::CompileOptions::default().with_source_map(true),
+        )
+    };
+
+    let err = compile(HOSTILE_MODULE).expect_err("the hostile import must be refused");
+    let code = miette::Diagnostic::code(&err).map(|c| c.to_string());
+    assert_eq!(code.as_deref(), Some("mds::import"), "{err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("import path contains forbidden character U+001B")
+            && msg.contains(ESCAPED_ESC)
+            && msg.contains(ESCAPED_RLO),
+        "the refusal names the codepoint and shows the name escaped: {msg:?}"
+    );
+    assert!(
+        !msg.contains('\u{1b}') && !msg.contains('\u{202e}'),
+        "no raw hostile char in the refusal: {msg:?}"
+    );
+
+    let result = compile("big.mds").expect("control: a clean name compiles");
+    assert!(
+        cap_warning(&result.warnings).contains("big.mds"),
+        "control: the warning names the module"
     );
 }

@@ -3886,3 +3886,70 @@ fn validate_import_path_requires_relative_nul_free_form() {
         assert!(validate_import_path(ok).is_ok(), "{ok:?} must be accepted");
     }
 }
+
+/// #265: the resolver's guard refuses all 80 forbidden codepoints (it is what covers
+/// a custom `with_fs` backend), and `import_path_violation` names the rule each
+/// path breaks — the classification the frontmatter `imports:` parser reports.
+#[test]
+fn validate_import_path_refuses_every_forbidden_char() {
+    let chars: Vec<char> = (0..=0x10_FFFF_u32)
+        .filter_map(char::from_u32)
+        .filter(|&c| crate::lint::is_forbidden_path_char(c))
+        .collect();
+    assert_eq!(chars.len(), 80, "non-vacuity");
+    for ch in chars {
+        let path = format!("./a{ch}.mds");
+        let u = format!("U+{:04X}", u32::from(ch));
+        let err = validate_import_path(&path).unwrap_err();
+        assert!(matches!(err, MdsError::ImportError { .. }), "{u}: {err:?}");
+        let msg = err.to_string();
+        if ch == '\0' {
+            assert_eq!(
+                import_path_violation(&path),
+                Some(ImportPathViolation::NullByte)
+            );
+            assert!(msg.contains("import path contains null byte"), "{msg}");
+        } else {
+            assert_eq!(
+                import_path_violation(&path),
+                Some(ImportPathViolation::ForbiddenChar(ch))
+            );
+            let expected = format!(
+                "import path contains forbidden character {u}: \"./a\\u{:04X}.mds\"",
+                u32::from(ch)
+            );
+            assert!(msg.contains(&expected), "{u}: {msg}");
+        }
+        assert!(
+            !msg.chars().any(crate::lint::is_forbidden_path_char),
+            "{u}: raw char in {msg:?}"
+        );
+    }
+
+    // The relative-form rule is checked first; its message escapes the path too.
+    let hostile_bare = format!("lib{}.mds", '\x1b');
+    assert_eq!(
+        import_path_violation(&hostile_bare),
+        Some(ImportPathViolation::NotRelative)
+    );
+    let msg = validate_import_path(&hostile_bare).unwrap_err().to_string();
+    assert!(
+        msg.contains(&format!(
+            "must be relative (start with './' or '../'): \"lib\\u{:04X}.mds\"",
+            0x1B
+        )),
+        "{msg}"
+    );
+    // Reasons, as the frontmatter parser prints them.
+    assert_eq!(
+        ImportPathViolation::NotRelative.reason(),
+        "must start with './' or '../'"
+    );
+    assert_eq!(ImportPathViolation::NullByte.reason(), "contains null byte");
+    assert_eq!(
+        ImportPathViolation::ForbiddenChar('\u{202E}').reason(),
+        "contains forbidden character U+202E"
+    );
+    // Control: a clean relative path has no violation.
+    assert_eq!(import_path_violation("./a b-\u{00FC}.mds"), None);
+}

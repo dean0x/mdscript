@@ -902,7 +902,9 @@ fn compile_extends_undefined_var_in_base_default_carries_real_span() {
 // Two sub-tests:
 //  F5: error path — @include alias with U+001B mid-token; err.message must
 //      carry the sanitized \uXXXX literal and contain no raw control bytes.
-//  F6: lint path — frontmatter key with U+001B; first diagnostic message clean.
+//  F6: import path — a lintVirtual import naming a module whose name carries
+//      U+001B is refused at the input boundary (#265) with an mds::import error
+//      that names the codepoint and shows it escaped.
 
 /// Assert that a string contains no raw C0 (excl. \t \n), DEL, C1, bidi control,
 /// line/paragraph separator, or BOM codepoint.
@@ -928,6 +930,51 @@ fn assert_no_control_chars(s: &str, label: &str) {
     }
 }
 
+/// The six-character escape text (backslash, `u`, four uppercase hex digits) a
+/// message shows for a hostile codepoint. Built, never written literally (PF-018).
+fn escape_text(ch: char) -> String {
+    format!("\\u{:04X}", u32::from(ch))
+}
+
+/// #265 route A: a lintVirtual import naming a module whose name carries `ch` is
+/// refused at the input boundary with an `mds::import` error that names the
+/// codepoint and shows it escaped. Before #265 the name reached duplicate-import's
+/// diagnostic instead; the route-B siblings (frontmatter keys) keep that
+/// lint-message coverage. The `let … else` fails the test when nothing is thrown,
+/// so the exact-message assertion is always reached (PF-013).
+fn assert_import_refused(ch: char, label: &str) {
+    let module_name = format!("fo{ch}o.mds");
+    let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
+
+    // js_sys::Reflect keeps the raw codepoint in the JS key (a UTF-16 character).
+    let modules_obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str(&module_name),
+        &JsValue::from_str("hi\n"),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str("main.mds"),
+        &JsValue::from_str(&main_src),
+    )
+    .unwrap();
+
+    let Err(err) = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL) else {
+        panic!("{label}: a forbidden character in an import path must be refused");
+    };
+    assert_eq!(get_str(&err, "code"), "mds::import", "{label}");
+    let msg = get_str(&err, "message");
+    let expected = format!(
+        "import error: import path contains forbidden character U+{:04X}: \"./fo{}o.mds\"",
+        u32::from(ch),
+        escape_text(ch)
+    );
+    assert_eq!(msg, expected, "{label}");
+    assert_no_control_chars(&msg, &format!("{label}: err.message"));
+}
+
 #[wasm_bindgen_test]
 fn wasm_control_chars_in_error_message_are_escaped() {
     // T-15 / F5 [AC-F3]: error-path sanitization for WASM surface.
@@ -950,80 +997,10 @@ fn wasm_control_chars_in_error_message_are_escaped() {
 }
 
 #[wasm_bindgen_test]
-fn wasm_lint_virtual_esc_in_module_name_sanitizes_duplicate_import_message() {
-    // T-15 / F6 [AC-F4]: lint-path sanitization via lintVirtual — WASM surface.
-    // Use a module whose NAME contains a raw ESC byte (U+001B), imported twice so
-    // duplicate-import fires and embeds the raw path in its message.
-    // After sanitization: message must contain no raw control bytes and must carry
-    // the sanitized \u001B literal (positive evidence). Mirrors Python E12 pattern.
-    // Verifies:
-    //   (1) No raw C0/DEL/C1 bytes in any diagnostic message.
-    //   (2) Sanitized \u001B literal IS present (positive evidence, non-vacuous).
-    //   (3) Result shape: version 1, duplicate-import rule present.
-    let esc = '\u{001B}';
-    let module_name = format!("fo{esc}o.mds");
-    let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
-
-    // Build the modules JS object with js_sys::Reflect so the key preserves the raw
-    // ESC byte as a JS string character (U+001B in UTF-16).
-    let modules_obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &modules_obj,
-        &JsValue::from_str(&module_name),
-        &JsValue::from_str("hi\n"),
-    )
-    .unwrap();
-    js_sys::Reflect::set(
-        &modules_obj,
-        &JsValue::from_str("main.mds"),
-        &JsValue::from_str(&main_src),
-    )
-    .unwrap();
-
-    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
-        .expect("T-15/F6: lintVirtual must succeed with ESC in module name");
-
-    // (3) Result shape: version 1.
-    let version = get_prop(&result, "version")
-        .as_f64()
-        .expect("T-15/F6: result.version must be a number") as u32;
-    assert_eq!(version, 1, "T-15/F6: result.version must be 1");
-
-    let files = get_prop(&result, "files");
-    let files_arr = js_sys::Array::from(&files);
-    assert!(
-        files_arr.length() > 0,
-        "T-15/F6: expected at least one file entry with diagnostics"
-    );
-
-    let mut all_messages: Vec<String> = Vec::new();
-    for i in 0..files_arr.length() {
-        let file_entry = files_arr.get(i);
-        let diags = get_prop(&file_entry, "diagnostics");
-        let diags_arr = js_sys::Array::from(&diags);
-        for j in 0..diags_arr.length() {
-            let diag = diags_arr.get(j);
-            let msg = get_str(&diag, "message");
-            // (1) No raw control bytes in any diagnostic message.
-            assert_no_control_chars(
-                &msg,
-                &format!("T-15/F6: files[{i}].diagnostics[{j}].message"),
-            );
-            all_messages.push(msg);
-        }
-    }
-
-    assert!(
-        !all_messages.is_empty(),
-        "T-15/F6: expected at least one diagnostic (duplicate-import should fire)"
-    );
-
-    // (2) At least one message contains the sanitized \u001B literal (positive evidence).
-    let has_sanitized = all_messages.iter().any(|m| m.contains("\\u001B"));
-    assert!(
-        has_sanitized,
-        "T-15/F6: expected sanitized \\u001B in at least one message; got: {all_messages:?}"
-    );
+fn wasm_lint_virtual_esc_in_import_path_is_refused() {
+    // T-15 / F6 [AC-F4]: ESC (U+001B) in an imported module name. Mirrors Python E12
+    // (test_e12_lint_virtual_ctrl_in_import_path_is_refused).
+    assert_import_refused('\u{001B}', "T-15/F6");
 }
 
 #[wasm_bindgen_test]
@@ -1047,79 +1024,20 @@ fn wasm_del_in_error_message_is_escaped() {
 }
 
 #[wasm_bindgen_test]
-fn wasm_lint_virtual_nel_in_module_name_sanitizes_message() {
-    // T-15/F6-C1: U+0085 (NEL/C1) in lintVirtual module name — same lint-path pattern
-    // as F6 with a C1 control character. NEL passes serde_yaml_ng (unlike ESC/DEL),
-    // making it a reachable C1 vector. Verifies the sanitized U+0085 literal appears.
-    let nel = '\u{0085}';
-    let module_name = format!("fo{nel}o.mds");
-    let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
-
-    let modules_obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &modules_obj,
-        &JsValue::from_str(&module_name),
-        &JsValue::from_str("hi\n"),
-    )
-    .unwrap();
-    js_sys::Reflect::set(
-        &modules_obj,
-        &JsValue::from_str("main.mds"),
-        &JsValue::from_str(&main_src),
-    )
-    .unwrap();
-
-    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
-        .expect("T-15/F6-C1: lintVirtual must succeed with NEL in module name");
-
-    let version = get_prop(&result, "version")
-        .as_f64()
-        .expect("T-15/F6-C1: result.version must be a number") as u32;
-    assert_eq!(version, 1, "T-15/F6-C1: result.version must be 1");
-
-    let files = get_prop(&result, "files");
-    let files_arr = js_sys::Array::from(&files);
-    assert!(
-        files_arr.length() > 0,
-        "T-15/F6-C1: expected at least one file entry with diagnostics"
-    );
-
-    let mut all_messages: Vec<String> = Vec::new();
-    for i in 0..files_arr.length() {
-        let file_entry = files_arr.get(i);
-        let diags = get_prop(&file_entry, "diagnostics");
-        let diags_arr = js_sys::Array::from(&diags);
-        for j in 0..diags_arr.length() {
-            let diag = diags_arr.get(j);
-            let msg = get_str(&diag, "message");
-            assert_no_control_chars(
-                &msg,
-                &format!("T-15/F6-C1: files[{i}].diagnostics[{j}].message"),
-            );
-            all_messages.push(msg);
-        }
-    }
-
-    assert!(
-        !all_messages.is_empty(),
-        "T-15/F6-C1: expected at least one diagnostic"
-    );
-
-    let has_sanitized_nel = all_messages.iter().any(|m| m.contains("\\u0085"));
-    assert!(
-        has_sanitized_nel,
-        "T-15/F6-C1: expected sanitized \\u0085 in at least one message; got: {all_messages:?}"
-    );
+fn wasm_lint_virtual_nel_in_import_path_is_refused() {
+    // T-15/F6-C1: U+0085 (NEL/C1) in an imported module name — same as F6 with a C1
+    // control character.
+    assert_import_refused('\u{0085}', "T-15/F6-C1");
 }
 
 #[wasm_bindgen_test]
 fn wasm_lint_virtual_nel_in_frontmatter_key_route_b_sanitizes_message() {
     // Route B sibling of T-15/F6-C1: same NEL (U+0085) control character, but
     // carried by an UNUSED FRONTMATTER KEY (unused-variable) rather than an import
-    // path / module name (duplicate-import). #265 will reject hostile
-    // paths/module names at the input boundary, retiring route-A coverage for NEL —
-    // a frontmatter key is not a path, so this route stays reachable and green
-    // after enforcement lands, keeping message-escaping coverage alive.
+    // path / module name (duplicate-import). #265 rejects hostile paths/module
+    // names at the input boundary, which retired route-A coverage for NEL — a
+    // frontmatter key is not a path, so this route stays reachable and keeps
+    // message-escaping coverage alive.
     //
     // Written as a YAML double-quoted key with a YAML `\x85` escape so the .mds
     // source text itself carries no raw control byte (PF-018); serde_yaml_ng
@@ -1184,91 +1102,63 @@ fn wasm_lint_virtual_nel_in_frontmatter_key_route_b_sanitizes_message() {
 }
 
 #[wasm_bindgen_test]
-fn wasm_lint_virtual_bidi_override_in_module_name_is_escaped() {
-    // T-15/F6-BIDI: U+202E RIGHT-TO-LEFT OVERRIDE in a lintVirtual module name.
-    // U+202E is outside C0/DEL/C1, so it used to reach the wire untouched and
-    // reverse the display order of the rest of the line in any bidi-aware renderer
-    // (Trojan Source, CVE-2021-42574). "fo<RLO>gnp.mds" renders as "fopng.mds".
-    // Verifies:
-    //   (1) No raw hostile codepoint in any diagnostic message or file key.
-    //   (2) The escaped \\u202E literal IS present (positive evidence, non-vacuous).
-    //   (3) Result shape: version 1, duplicate-import rule present.
-    let rlo = '\u{202E}';
-    let module_name = format!("fo{rlo}gnp.mds");
-    let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
+fn wasm_lint_virtual_bidi_override_in_import_path_is_refused() {
+    // T-15/F6-BIDI: U+202E RIGHT-TO-LEFT OVERRIDE in an imported module name
+    // (Trojan Source, CVE-2021-42574) — a raw RLO in the message would reverse how
+    // the rest of it displays.
+    assert_import_refused('\u{202E}', "T-15/F6-BIDI");
+}
 
-    let modules_obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &modules_obj,
-        &JsValue::from_str(&module_name),
-        &JsValue::from_str("hi\n"),
-    )
-    .unwrap();
-    js_sys::Reflect::set(
-        &modules_obj,
-        &JsValue::from_str("main.mds"),
-        &JsValue::from_str(&main_src),
-    )
-    .unwrap();
-
-    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
-        .expect("T-15/F6-BIDI: lintVirtual must succeed with RLO in module name");
-
-    let version = get_prop(&result, "version")
-        .as_f64()
-        .expect("T-15/F6-BIDI: result.version must be a number") as u32;
-    assert_eq!(version, 1, "T-15/F6-BIDI: result.version must be 1");
-
-    let files = get_prop(&result, "files");
-    let files_arr = js_sys::Array::from(&files);
-    assert!(
-        files_arr.length() > 0,
-        "T-15/F6-BIDI: expected at least one file entry with diagnostics"
-    );
-
-    let mut all_messages: Vec<String> = Vec::new();
-    let mut all_rules: Vec<String> = Vec::new();
-    for i in 0..files_arr.length() {
-        let file_entry = files_arr.get(i);
-        // Cheap invariant check only — NOT coverage of the `file`-key escape.
-        // The hostile RLO is in the *imported* module's name, but this key is the
-        // *entry* filename ("main.mds"), so no hostile byte ever reaches it and this
-        // assertion cannot fail via this vector (PF-013: it would pass even if the
-        // `file`-key sanitizer were deleted). Real coverage of the `file` key lives in
-        // mds-core `to_canonical_json_escapes_bidi_override`, which constructs a
-        // diagnostic with `file: Some("ma\u{202E}in.mds")` directly.
-        assert_no_control_chars(
-            &get_str(&file_entry, "file"),
-            &format!("T-15/F6-BIDI: files[{i}].file"),
+#[wasm_bindgen_test]
+fn wasm_entry_key_with_forbidden_char_is_refused_as_io() {
+    // #265: the WASM `filename` (the virtual entry key) and a lintVirtual entry key
+    // are caller input, not import strings, so a forbidden codepoint in either is
+    // `mds::io` — refused before the module map is consulted. TAB and LF are the two
+    // members outside the display-escape class; the rest cover C0, DEL, C1, a bidi
+    // override and the BOM.
+    for ch in [
+        '\t', '\n', '\u{001B}', '\u{007F}', '\u{0085}', '\u{202E}', '\u{FEFF}',
+    ] {
+        let label = format!("U+{:04X}", u32::from(ch));
+        let key = format!("fo{ch}o.mds");
+        let expected = format!(
+            "entry path contains forbidden character {label}: \"fo{}o.mds\"",
+            escape_text(ch)
         );
-        let diags = get_prop(&file_entry, "diagnostics");
-        let diags_arr = js_sys::Array::from(&diags);
-        for j in 0..diags_arr.length() {
-            let diag = diags_arr.get(j);
-            let msg = get_str(&diag, "message");
-            assert_no_control_chars(
-                &msg,
-                &format!("T-15/F6-BIDI: files[{i}].diagnostics[{j}].message"),
-            );
-            all_messages.push(msg);
-            all_rules.push(get_str(&diag, "rule"));
+
+        let modules_obj = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &modules_obj,
+            &JsValue::from_str(&key),
+            &JsValue::from_str("hi\n"),
+        )
+        .unwrap();
+
+        let outcomes = [
+            (
+                "compile",
+                mds_wasm::compile("Hello!\n", filename_opts(&key)),
+            ),
+            ("check", mds_wasm::check("Hello!\n", filename_opts(&key))),
+            ("lint", mds_wasm::lint("Hello!\n", filename_opts(&key))),
+            (
+                "lintVirtual",
+                mds_wasm::lint_virtual(modules_obj.into(), &key, JsValue::NULL),
+            ),
+        ];
+        for (surface, outcome) in outcomes {
+            let Err(err) = outcome else {
+                panic!("{label} {surface}: a forbidden character in the entry key must be refused");
+            };
+            assert_eq!(get_str(&err, "code"), "mds::io", "{label} {surface}");
+            assert_eq!(get_str(&err, "message"), expected, "{label} {surface}");
         }
     }
 
-    assert!(
-        !all_messages.is_empty(),
-        "T-15/F6-BIDI: expected at least one diagnostic"
-    );
-    assert!(
-        all_rules.iter().any(|r| r == "duplicate-import"),
-        "T-15/F6-BIDI: expected duplicate-import; got rules: {all_rules:?}"
-    );
-
-    let has_escaped_rlo = all_messages.iter().any(|m| m.contains("\\u202E"));
-    assert!(
-        has_escaped_rlo,
-        "T-15/F6-BIDI: expected escaped \\u202E in at least one message; got: {all_messages:?}"
-    );
+    // Control: a key with a space and non-ASCII letters compiles.
+    let ok = mds_wasm::compile("Hello!\n", filename_opts("a b-ünï.mds"))
+        .expect("a clean entry key must compile");
+    assert_eq!(get_str(&ok, "output"), "Hello!\n");
 }
 
 #[wasm_bindgen_test]

@@ -933,7 +933,9 @@ as 2 except for the two carve-outs shown.
 
 CLI-authored errors that are not `MdsError`s — an unreadable, oversized or malformed
 `mds.json`, `mds init` refusing a `..` path, a failed stdout write — carry no `mds::`
-code; they exit 1 under `build`/`check`/`fmt` and 2 under `lint`. A panic on the CLI is
+code; they exit 1 under `build`/`check`/`fmt` and 2 under `lint`. A `build.output_dir`
+containing a `..` component or a forbidden path character, and a `-o`/`--out-dir` value
+containing a forbidden path character, are `mds::io` (exit 2) instead. A panic on the CLI is
 not converted into an error object: it is a Rust panic with exit code 101. The
 `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
 `MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised
@@ -1340,8 +1342,10 @@ unescaped: escaping the artefact corrupts the artefact.
 Consequently, and normatively:
 
 > **Consumers of a source map or of `dependencies` MUST treat every path they contain
-> as untrusted input.** A path may contain any byte a filesystem permits, including C0
-> control characters, `\n`, bidi controls and U+FEFF. A consumer that prints such a path
+> as untrusted input.** A path produced by a custom `FileSystem` backend may contain any
+> byte that backend's keys permit, including C0 control characters, `\n`, bidi controls
+> and U+FEFF; the built-in backends refuse those characters at input (#265, below), but a
+> consumer cannot tell which backend produced a map. A consumer that prints such a path
 > to a terminal, writes it into a log line, or interpolates it into HTML must escape it
 > for that destination itself. JSON string encoding is *not* that escaping: it makes the
 > document parseable, and a decoded `"\n"` is a real newline again.
@@ -1350,9 +1354,14 @@ The CLI does not rely on this contract for its own output: the `Compiled to …`
 `Source map written to …` status lines print the path through `safe_path`, so they carry
 the WIRE-escaped form even though the sidecar they name does not.
 
-Closing this differently — rejecting control characters in filenames at the input
-boundary rather than escaping them at output — is a plausible longer-term design and is
-deliberately not specified here.
+Since #265 the built-in backends and the CLI also refuse every forbidden path character
+(`mds::is_forbidden_path_char`: C0 including `\n` and `\t`, DEL, C1 and the bidi/format
+hazards) at the input boundary — import strings (`mds::import`), and entry paths, entry
+keys, base directories, resolved canonical paths and the CLI's `-o`/`--out-dir`/
+`build.output_dir` (`mds::io`) — so the paths those backends resolve cannot carry one.
+The carve-out still stands as written: the paths are still emitted verbatim, and the MUST
+above still binds consumers, because a custom `FileSystem` backend is not bound by that
+refusal.
 
 ##### Escaping is one-way
 
@@ -1418,7 +1427,7 @@ Place `mds.json` in the repository root or any ancestor directory of the input f
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `build.output_dir` | string | Relative path to output directory. Must not contain `..` components. |
+| `build.output_dir` | string | Relative path to output directory. Must not contain `..` components or a forbidden path character (#265); either is refused with `mds::io`, exit 2. |
 | `build.source_map` | bool | Enable source-map generation for all builds (equivalent to `--source-map`). Ignored for messages-mode templates. Default: `false`. |
 | `build.embed_sources` | bool | Embed source file contents in `sourcesContent[]` (equivalent to `--embed-sources`). Has no effect when `build.source_map` is `false`. Default: `false`. |
 | `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr and is suppressed by `--quiet`; `mds build`, `mds check`, `mds fmt`, and `mds watch` also read this file but do not emit the unknown-rule warning. On the `lint` API surfaces it is returned in `lint_warnings`. |

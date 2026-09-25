@@ -1,6 +1,12 @@
 import { open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { resolve, dirname, relative, isAbsolute, sep } from 'node:path';
+import {
+  escapePathForMessage,
+  firstForbiddenChar,
+  forbiddenCharMessage,
+  importPathViolation,
+} from './path-chars.js';
 
 // O_NOFOLLOW prevents the kernel from following a symlink at the final path
 // component. Using it closes the TOCTOU window between lstat and open.
@@ -121,6 +127,98 @@ async function openNoFollow(absolutePath: string): Promise<Awaited<ReturnType<ty
   }
 }
 
+// ---------------------------------------------------------------------------
+// Path refusals shared with the Rust engine (#265)
+// ---------------------------------------------------------------------------
+
+/**
+ * A path refusal carrying the code the Rust engine reports for the same input.
+ * Each message is byte-identical to that engine error's message as the native
+ * backend throws it, so the WASM backend's file operations fail exactly like
+ * the native ones.
+ */
+type PathError = Error & { code: 'mds::import' | 'mds::io' };
+
+function pathError(code: PathError['code'], message: string): PathError {
+  const err = new Error(message) as PathError;
+  err.code = code;
+  return err;
+}
+
+/** `mds::import`, with the `import error: ` prefix the Rust error's display adds. */
+function importError(detail: string): PathError {
+  return pathError('mds::import', `import error: ${detail}`);
+}
+
+/**
+ * The refusal for an entry path or virtual entry key, if any — mirrors Rust
+ * `validate_entry_path` (empty, then NUL, then the rest of the forbidden class;
+ * all `mds::io`).
+ */
+function entryPathError(path: string): PathError | undefined {
+  if (path.length === 0) {
+    return pathError('mds::io', 'entry path is empty');
+  }
+  if (path.includes('\0')) {
+    return pathError('mds::io', `entry path contains null byte: "${escapePathForMessage(path)}"`);
+  }
+  const cp = firstForbiddenChar(path);
+  return cp === undefined ? undefined : pathError('mds::io', forbiddenCharMessage('entry path', cp, path));
+}
+
+/**
+ * The refusal for an import resolved within a directory, if any — mirrors Rust
+ * `validate_relative_import`, which `VirtualFs::normalize_in_dir` runs (empty,
+ * then NUL, then the rest of the forbidden class; all `mds::import`).
+ */
+function relativeImportError(relative: string): PathError | undefined {
+  if (relative.length === 0) {
+    return importError('import path is empty');
+  }
+  if (relative.includes('\0')) {
+    return importError('import path contains null byte');
+  }
+  const cp = firstForbiddenChar(relative);
+  return cp === undefined ? undefined : importError(forbiddenCharMessage('import path', cp, relative));
+}
+
+/**
+ * The refusal for an import string as written in a module, if any — mirrors the
+ * Rust resolver's `validate_import_path`, which runs before any filesystem
+ * backend is called (relative form, then NUL, then the forbidden class).
+ */
+function importPathError(importPath: string): PathError | undefined {
+  const violation = importPathViolation(importPath);
+  if (violation === undefined) {
+    return undefined;
+  }
+  switch (violation.kind) {
+    case 'not-relative':
+      return importError(
+        `import path must be relative (start with './' or '../'): "${escapePathForMessage(importPath)}"`,
+      );
+    case 'null-byte':
+      return importError('import path contains null byte');
+    case 'forbidden-char':
+      return importError(forbiddenCharMessage('import path', violation.codePoint, importPath));
+    default: {
+      const exhaustive: never = violation;
+      throw new Error(`unknown import path violation: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * The refusal for a resolved path that carries a forbidden character anywhere,
+ * if any — mirrors Rust `reject_forbidden_in_path`. This is what catches a
+ * hostile directory name the caller never wrote, reached through a symlinked
+ * directory. `shown` is the path as written; the resolved one is never shown.
+ */
+function resolvedPathError(resolved: string, shown: string): PathError | undefined {
+  const cp = firstForbiddenChar(resolved);
+  return cp === undefined ? undefined : pathError('mds::io', forbiddenCharMessage('resolved path', cp, shown));
+}
+
 export interface ModuleScannerOptions {
   maxModules?: number;
   maxAggregateSize?: number;
@@ -148,23 +246,29 @@ export interface BuildModulesMapResult {
  * Given a base key (the key of the importing module) and a relative import path,
  * resolve the import path to a canonical slash-separated key.
  *
+ * An entry key that is empty, contains NUL or carries a forbidden path character
+ * (#265) is refused with `mds::io`; an import with the same defects with
+ * `mds::import` — each with the message the Rust backend reports.
+ *
  * MUST exactly mirror the Rust implementation to ensure import resolution matches.
  */
 export function normalizeVirtualKey(base: string, relative: string): string {
-  if (relative.length === 0) {
-    throw new Error('import path is empty');
-  }
-  if (relative.includes('\0')) {
-    throw new Error('import path contains null byte');
-  }
-
   if (base.length === 0) {
+    const entryErr = entryPathError(relative);
+    if (entryErr !== undefined) {
+      throw entryErr;
+    }
     // Root entry point — use key as-is, but still enforce the segment limit.
     const segmentCount = relative.split('/').filter((s) => s.length > 0 && s !== '.').length;
     if (segmentCount > MAX_PATH_SEGMENTS) {
       throw new Error(`import path exceeds maximum segment count of ${MAX_PATH_SEGMENTS}`);
     }
     return relative;
+  }
+
+  const importErr = relativeImportError(relative);
+  if (importErr !== undefined) {
+    throw importErr;
   }
 
   // Resolve relative to the directory portion of base (split on '/').
@@ -214,7 +318,12 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  * Security checks performed:
  * - Rejects symlinks (O_NOFOLLOW open; realpath check on Windows fallback)
  * - Rejects paths that escape the project root (discovered via .git/.mdsroot markers)
- * - Rejects paths with null bytes or empty segments
+ * - Rejects, before the filesystem is touched and with the Rust engine's code and
+ *   message: an entry path that is empty, contains NUL or carries a forbidden path
+ *   character (`mds::io`), and an import string that is not `./`/`../`-relative,
+ *   contains NUL or carries a forbidden path character (`mds::import`) (#265)
+ * - Rejects a module whose resolved path carries a forbidden path character — a
+ *   hostile-named directory reached through a symlink (`mds::io`, #265)
  * - Enforces module count and aggregate size limits
  */
 export async function buildModulesMap(
@@ -224,6 +333,11 @@ export async function buildModulesMap(
 ): Promise<BuildModulesMapResult> {
   const maxModules = options?.maxModules ?? DEFAULT_MAX_MODULES;
   const maxAggregateSize = options?.maxAggregateSize ?? DEFAULT_MAX_AGGREGATE_SIZE;
+
+  const entryErr = entryPathError(entryPath);
+  if (entryErr !== undefined) {
+    throw entryErr;
+  }
 
   // Resolve the parent directory to its canonical form before computing the
   // project root and security boundaries.  This eliminates false-positive
@@ -261,12 +375,12 @@ export async function buildModulesMap(
    * path within the project root. Returns the resolved absolute path.
    */
   function validateImportPath(importPath: string, absoluteDir: string): string {
-    // Security: reject null bytes and empty paths.
-    if (importPath.includes('\0')) {
-      throw new Error('security: import path contains null byte');
-    }
-    if (importPath.trim().length === 0) {
-      throw new Error('security: import path is empty');
+    // Security: classify the import string exactly as the Rust resolver will, so
+    // it is refused before the filesystem is touched and with the error the
+    // native backend throws for the same input.
+    const importErr = importPathError(importPath);
+    if (importErr !== undefined) {
+      throw importErr;
     }
 
     const childAbsolute = resolve(absoluteDir, importPath);
@@ -294,9 +408,13 @@ export async function buildModulesMap(
    * content access. If the path is a symlink, O_NOFOLLOW causes open() to fail
    * with ELOOP, which we surface as a security error. On Windows (where O_NOFOLLOW=0),
    * a post-open realpath check is performed instead.
+   *
+   * `shown` is the path as written — the entry path the caller passed, or the
+   * import string — and is what a refusal of the resolved path names.
    */
   async function openAndValidateModule(
     absolutePath: string,
+    shown: string,
   ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number }> {
     // Security: verify path is within project root before opening.
     if (!isWithinRoot(projectRoot, absolutePath)) {
@@ -337,6 +455,14 @@ export async function buildModulesMap(
         );
       }
 
+      // Security (#265): no forbidden path character anywhere in the resolved
+      // path — a directory the caller never named, reached through a symlink,
+      // can carry one.
+      const resolvedErr = resolvedPathError(resolved, shown);
+      if (resolvedErr !== undefined) {
+        throw resolvedErr;
+      }
+
       return { handle, size: stats.size };
     } catch (err) {
       await handle.close();
@@ -344,7 +470,12 @@ export async function buildModulesMap(
     }
   }
 
-  async function scan(absolutePath: string, virtualKey: string, depth: number = 0): Promise<void> {
+  async function scan(
+    absolutePath: string,
+    virtualKey: string,
+    shown: string,
+    depth: number = 0,
+  ): Promise<void> {
     // Reliability: bound recursion depth explicitly — maxModules limits total
     // nodes but not stack frames; a linear chain of 256 imports would create
     // 256 frames without this guard.
@@ -367,7 +498,7 @@ export async function buildModulesMap(
       );
     }
 
-    const { handle, size: fileSize } = await openAndValidateModule(absolutePath);
+    const { handle, size: fileSize } = await openAndValidateModule(absolutePath, shown);
 
     let content: string;
     try {
@@ -404,14 +535,14 @@ export async function buildModulesMap(
         const childAbsolute = validateImportPath(importPath, absoluteDir);
         // Compute virtual key using normalizeVirtualKey to mirror Rust's VirtualFs::normalize_in_dir().
         const childVirtualKey = normalizeVirtualKey(virtualKey, importPath);
-        await scan(childAbsolute, childVirtualKey, depth + 1);
+        await scan(childAbsolute, childVirtualKey, importPath, depth + 1);
       }
     }
     const slots = Math.min(MAX_CONCURRENT_OPENS, importPaths.length);
     await Promise.all(Array.from({ length: slots }, worker));
   }
 
-  await scan(absoluteEntry, entryFilename);
+  await scan(absoluteEntry, entryFilename, entryPath);
 
   return { entryFilename, modules };
 }

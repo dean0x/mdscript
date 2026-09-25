@@ -5,6 +5,7 @@
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { compile, check, isMdsError, init, lintVirtual } from '../dist/node.js';
+import { assertNoForbiddenChars, errorShape, escapeText, thrownBy } from './helpers.mjs';
 
 describe('error shape', () => {
   before(() => init());
@@ -163,45 +164,34 @@ describe('error shape', () => {
     }
   });
 
-  test('U-E12: U+0085 (NEL/C1) in lintVirtual module name is sanitized in diagnostic message', () => {
-    // U+0085 (NEL) is a C1 control char that passes serde_yaml_ng YAML parsing
-    // (unlike ESC/DEL), making it a reachable C1 ESC-injection vector for lintVirtual.
-    // The duplicate-import rule fires and embeds the raw module name in its message.
-    const nel = String.fromCharCode(0x85);
+  test('U-E12: U+0085 (NEL/C1) in an import path is refused with an escaped mds::import error', () => {
+    // Route A (the import path / module name). Before #265 the hostile name reached
+    // the lint rules and duplicate-import embedded it in a diagnostic; the import
+    // string is now refused at the input boundary, so the error itself must carry
+    // the escaped form. Message-escaping coverage for NEL lives on in route B below.
+    const nel = String.fromCodePoint(0x85);
     const moduleName = `fo${nel}o.mds`;
     const modules = {
       [moduleName]: 'hi\n',
       'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
     };
-    const result = lintVirtual(modules, 'main.mds');
-    assert.equal(result.version, 1, 'U-E12: version must be 1');
-    const allDiags = result.files.flatMap((f) => f.diagnostics);
-    assert.ok(
-      allDiags.length > 0,
-      'U-E12: expected at least one diagnostic; got: ' + JSON.stringify(allDiags),
+    const err = thrownBy(() => lintVirtual(modules, 'main.mds'), 'U-E12');
+    assert.ok(isMdsError(err), `U-E12: expected MdsError, got: ${err}`);
+    assert.equal(err.code, 'mds::import');
+    assert.equal(
+      err.message,
+      `import error: import path contains forbidden character U+0085: "./fo${escapeText(0x85)}o.mds"`,
     );
-    for (const diag of allDiags) {
-      if (typeof diag.message === 'string') {
-        assertNoControlChars(diag.message, `U-E12: diag[${diag.rule}].message`);
-      }
-    }
-    const hasSanitizedNel = allDiags.some(
-      (d) => typeof d.message === 'string' && d.message.includes('\\u0085'),
-    );
-    assert.ok(
-      hasSanitizedNel,
-      'U-E12: expected \\u0085 in at least one diagnostic message; got: ' +
-        JSON.stringify(allDiags.map((d) => d.message)),
-    );
+    assertNoForbiddenChars(err.message, 'U-E12: err.message');
   });
 
   test('U-E12 (route B): NEL in a frontmatter key is sanitized in unused-variable message', () => {
     // Route B sibling of U-E12: same NEL (U+0085) control character, but carried by
     // an UNUSED FRONTMATTER KEY (unused-variable) rather than an import path /
-    // module name (duplicate-import). #265 will reject hostile paths/module names
-    // at the input boundary, retiring route-A coverage for NEL — a frontmatter key
-    // is not a path, so this route stays reachable and green after enforcement
-    // lands, keeping message-escaping coverage alive.
+    // module name (duplicate-import). #265 rejects hostile paths/module names at the
+    // input boundary, which retired route-A coverage for NEL — a frontmatter key is
+    // not a path, so this route stays reachable and keeps message-escaping coverage
+    // alive.
     //
     // Written as a YAML double-quoted key with a YAML `\x85` escape so the .mds
     // source text itself carries no raw control byte (PF-018); serde_yaml_ng
@@ -240,41 +230,26 @@ describe('error shape', () => {
     );
   });
 
-  test('U-E13: U+202E (RLO) in lintVirtual module name is escaped on the wire', () => {
-    // Trojan Source (CVE-2021-42574). U+202E is outside C0/DEL/C1, so it used to
-    // reach the wire untouched and reverse how the rest of the line displays.
-    const rlo = String.fromCharCode(0x202e);
+  test('U-E13: U+202E (RLO) in an import path is refused with an escaped mds::import error', () => {
+    // Trojan Source (CVE-2021-42574): "fo<RLO>gnp.mds" renders as "fopng.mds". Route A
+    // (see U-E12): the import string is refused at the input boundary, and the error
+    // must name the codepoint and show it escaped — a raw RLO in the message would
+    // reverse how the rest of it displays. Route B below keeps the lint-message
+    // escaping coverage.
+    const rlo = String.fromCodePoint(0x202e);
     const moduleName = `fo${rlo}gnp.mds`;
     const modules = {
       [moduleName]: 'hi\n',
       'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
     };
-    const result = lintVirtual(modules, 'main.mds');
-    assert.equal(result.version, 1, 'U-E13: version must be 1');
-    const allDiags = result.files.flatMap((f) => f.diagnostics);
-    assert.ok(
-      allDiags.some((d) => d.rule === 'duplicate-import'),
-      'U-E13: expected duplicate-import; got rules: ' +
-        JSON.stringify(allDiags.map((d) => d.rule)),
+    const err = thrownBy(() => lintVirtual(modules, 'main.mds'), 'U-E13');
+    assert.ok(isMdsError(err), `U-E13: expected MdsError, got: ${err}`);
+    assert.equal(err.code, 'mds::import');
+    assert.equal(
+      err.message,
+      `import error: import path contains forbidden character U+202E: "./fo${escapeText(0x202e)}gnp.mds"`,
     );
-    for (const diag of allDiags) {
-      if (typeof diag.message === 'string') {
-        assertNoControlChars(diag.message, `U-E13: diag[${diag.rule}].message`);
-      }
-    }
-    // Cheap invariant check only — NOT coverage of the `file`-key escape. The
-    // hostile RLO is in the *imported* module's name, but this key is the *entry*
-    // filename ("main.mds"), so no hostile byte reaches it and this cannot fail via
-    // this vector (PF-013). Real `file`-key coverage: mds-core
-    // `to_canonical_json_escapes_bidi_override`.
-    for (const f of result.files) {
-      assertNoControlChars(f.file, 'U-E13: files[].file');
-    }
-    assert.ok(
-      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u202E')),
-      'U-E13: expected \\u202E in at least one diagnostic message; got: ' +
-        JSON.stringify(allDiags.map((d) => d.message)),
-    );
+    assertNoForbiddenChars(err.message, 'U-E13: err.message');
   });
 
   test('U-E13 (route B): RLO in a frontmatter key is escaped on the wire', () => {
@@ -351,12 +326,15 @@ describe('error shape', () => {
     );
   });
 
-  test('U-E-DIFF: native and WASM lintVirtual produce identical results for ESC-injection input', async () => {
-    // Differential assertion: the same ESC-injection input run through both the
-    // native (napi) and WASM backends must produce deeply equal results.
-    // Skips gracefully when either backend is unavailable locally; must run in CI
-    // where both backends are built.
-    let native;
+  test('U-E-DIFF: native and WASM lintVirtual throw identical errors for a hostile import path', async (t) => {
+    // Differential assertion: the same hostile import run through the native (napi)
+    // and WASM backends must throw deeply equal errors. Before #265 this vector
+    // produced a lint result (duplicate-import carried the name); both backends now
+    // refuse the import string at the input boundary, so parity is asserted on the
+    // thrown error. Lint-RESULT parity for the same escape class lives on in
+    // U-E-DIFF (route B) below. Both backends are required in CI; locally a missing
+    // one skips visibly.
+    let native = null;
     try {
       const { createNativeBackend } = await import('../dist/backend/native.js');
       const { createRequire } = await import('node:module');
@@ -367,73 +345,67 @@ describe('error shape', () => {
       const napiAddon = require(join(testDir, '../../../crates/mds-napi/index.js'));
       native = createNativeBackend(napiAddon);
     } catch {
-      return; // native backend not available — skip
+      native = null;
     }
 
-    let wasm;
+    let wasm = null;
     try {
       const { initWasmNode, createWasmBackend } = await import('../dist/backend/wasm.js');
       const wasmModule = await initWasmNode();
       wasm = createWasmBackend(wasmModule);
     } catch {
-      return; // WASM backend not available — skip
+      wasm = null;
     }
 
-    // One vector covering every escape class: C0 (ESC), C1 (NEL), bidi override
-    // (RLO), JS line separator, BOM — carried in the module NAME — plus the
-    // wire-mode newline, carried in a YAML double-quoted frontmatter key (a
-    // newline inside an `@import "..."` path is rejected by the lexer, so the
-    // module-name route is unreachable for that one character).
-    // PF-007: a per-surface golden cannot catch cross-surface divergence, so the
-    // widened class has to be exercised through the differential too.
-    const esc = String.fromCharCode(0x1b);
-    const nel = String.fromCharCode(0x85);
-    const rlo = String.fromCharCode(0x202e);
-    const ls = String.fromCharCode(0x2028);
-    const bom = String.fromCharCode(0xfeff);
-    const moduleName = `fo${esc}${nel}${rlo}${ls}${bom}o.mds`;
-    const mainSource =
-      '---\n"a\\nerror[mds::forged]: FAKE\\nb": 1\n---\n' +
-      `@import "./${moduleName}"\n@import "./${moduleName}"\n`;
+    if (native === null || wasm === null) {
+      if (process.env.CI) {
+        throw new Error('U-E-DIFF: both the native and the WASM backend are required in CI');
+      }
+      t.skip('native or WASM backend not built');
+      return;
+    }
+
+    // One vector covering every escape class, carried in the module NAME: C0 (ESC),
+    // C1 (NEL), bidi override (RLO), JS line separator, BOM. PF-007: a per-surface
+    // golden cannot catch cross-surface divergence, so the whole class goes through
+    // the differential.
+    const hostile = [0x1b, 0x85, 0x202e, 0x2028, 0xfeff];
+    const moduleName = `fo${String.fromCodePoint(...hostile)}o.mds`;
     const modules = {
       [moduleName]: 'hi\n',
-      'main.mds': mainSource,
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
     };
 
-    const nativeResult = native.lintVirtual(modules, 'main.mds');
-    const wasmResult = wasm.lintVirtual(modules, 'main.mds');
+    const nativeErr = thrownBy(() => native.lintVirtual(modules, 'main.mds'), 'U-E-DIFF native');
+    const wasmErr = thrownBy(() => wasm.lintVirtual(modules, 'main.mds'), 'U-E-DIFF wasm');
 
-    // Non-vacuity: the differential is worthless if neither backend produced
-    // diagnostics carrying the escaped forms. duplicate-import carries the module
-    // name (ESC/NEL/RLO/LS/BOM); unused-variable carries the frontmatter key (\n).
-    const nativeMessages = nativeResult.files
-      .flatMap((f) => f.diagnostics)
-      .map((d) => d.message)
-      .filter((m) => typeof m === 'string');
-    for (const escaped of ['\\u001B', '\\u0085', '\\u202E', '\\u2028', '\\uFEFF', '\\u000A']) {
-      assert.ok(
-        nativeMessages.some((m) => m.includes(escaped)),
-        `U-E-DIFF: expected ${escaped} in some message; got: ` +
-          JSON.stringify(nativeMessages),
-      );
-    }
+    // Non-vacuity (PF-013): the native error is the forbidden-character refusal —
+    // naming the FIRST forbidden codepoint and showing all five escaped — not some
+    // unrelated failure the two backends happen to share.
+    assert.deepEqual(errorShape(nativeErr), {
+      code: 'mds::import',
+      message:
+        'import error: import path contains forbidden character U+001B: ' +
+        `"./fo${hostile.map(escapeText).join('')}o.mds"`,
+      help: null,
+      span: null,
+    });
+    assertNoForbiddenChars(nativeErr.message, 'U-E-DIFF: native err.message');
 
-    // deepEqual of plain-object round-trip proves wire-format parity.
     assert.deepEqual(
-      JSON.parse(JSON.stringify(nativeResult)),
-      JSON.parse(JSON.stringify(wasmResult)),
-      'U-E-DIFF: native and WASM lintVirtual must produce identical results for the same input',
+      errorShape(wasmErr),
+      errorShape(nativeErr),
+      'U-E-DIFF: native and WASM lintVirtual must throw identical errors for the same input',
     );
   });
 
   test('U-E-DIFF (route B): native and WASM lintVirtual produce identical lint results for a frontmatter-key control-char vector', async () => {
     // Route B sibling of U-E-DIFF: U-E-DIFF's vector carries ESC/NEL/RLO/LS/BOM in
-    // the *module name* (route A, via duplicate-import) — #265 will make that vector
-    // throw instead of returning a lint result, so U-E-DIFF itself is flipped to a
-    // thrown-error-parity assertion in that step. This sibling carries the SAME
-    // escape class entirely in an UNUSED FRONTMATTER KEY (route B, via
-    // unused-variable) instead, so cross-surface lint-RESULT parity for the
-    // widened escape class survives after enforcement lands.
+    // the *module name* (route A, via duplicate-import) — #265 makes that vector
+    // throw instead of returning a lint result, so U-E-DIFF asserts thrown-error
+    // parity. This sibling carries the SAME escape class entirely in an UNUSED
+    // FRONTMATTER KEY (route B, via unused-variable) instead, so cross-surface
+    // lint-RESULT parity for the widened escape class survives the enforcement.
     //
     // Written as a YAML double-quoted key with YAML escapes so the .mds source text
     // itself carries no raw control byte (PF-018); serde_yaml_ng decodes each escape

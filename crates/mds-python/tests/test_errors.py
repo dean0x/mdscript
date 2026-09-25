@@ -236,94 +236,50 @@ def test_e11_control_chars_in_message_are_escaped() -> None:
 
 
 @pytest.mark.parametrize(
-    "ctrl_char,expected_escape",
-    [
-        ("\x1b", "\\u001B"),  # ESC (U+001B) — C0 control char
-        ("\x7f", "\\u007F"),  # DEL (U+007F) — serde_json does not auto-escape 0x7F
-        # U+0085 NEL (C1) — passes serde_yaml_ng where ESC/DEL are rejected in YAML keys;
-        # the reachable YAML vector per KB Gotchas. Also exercised here via lint_virtual
-        # (module names are plain strings, not YAML, so all three chars reach the engine).
-        ("\x85", "\\u0085"),
-        # Widened escape class (#176): none of these are C0/DEL/C1, and all of them
-        # used to travel the wire untouched. Written as escapes, never as raw
-        # characters -- a literal RLO would reverse how this source file displays.
-        ("\u202e", "\\u202E"),  # RLO - Trojan Source display reversal (CVE-2021-42574)
-        ("\u2066", "\\u2066"),  # LRI - bidi isolate
-        ("\u2028", "\\u2028"),  # LINE SEPARATOR - terminates a JS string literal
-        ("\ufeff", "\\uFEFF"),  # BOM / ZWNBSP - invisible in every renderer
-    ],
+    "codepoint",
+    # ESC (C0), DEL, NEL (C1), and the widened display-hazard class (#176): RLO
+    # (Trojan Source, CVE-2021-42574), LRI (bidi isolate), LINE SEPARATOR (ends a JS
+    # string literal), BOM (invisible). Numeric, never raw characters -- a literal
+    # RLO would reverse how this source file displays.
+    [0x1B, 0x7F, 0x85, 0x202E, 0x2066, 0x2028, 0xFEFF],
     ids=["ESC", "DEL", "NEL", "RLO", "LRI", "LS", "BOM"],
 )
-def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
-    ctrl_char: str, expected_escape: str
-) -> None:
-    """T-14 / E12 [AC-F4]: Python typed LintDiagnostic.message and as_json() sanitization.
+def test_e12_lint_virtual_ctrl_in_import_path_is_refused(codepoint: int) -> None:
+    """T-14 / E12 [AC-F4]: a hostile import path is refused with an escaped error (#265).
 
-    Uses the lint_virtual API with a module whose NAME contains a raw control byte
-    to trigger a duplicate-import rule whose message embeds the raw path — a reachable
-    end-to-end vector that exercises the Python typed surface without touching YAML parsing.
+    lint_virtual with an import naming a module whose NAME contains a raw control or
+    format codepoint. Before #265 the name reached the duplicate-import rule, whose
+    message embedded it; the import string is now refused at the input boundary, so
+    the error itself must name the codepoint and show it escaped. The lint-message
+    coverage this vector used to give lives on in the route-B sibling below.
 
-    Parametrized over ESC, DEL, and U+0085 NEL (PF-007 python-7).
-
-    Verifies:
-    (a) LintDiagnostic.message contains no raw C0/DEL/C1 bytes (typed attribute clean)
-    (b) LintDiagnostic.message contains the sanitized escape literal (explicit evidence)
-    (c) LintDiagnostic.to_dict()["message"] is identical to .message (parity guard, PF-007)
-    (d) LintFileReport.file contains no raw control bytes (python-3 regression anchor)
+    Verifies (``pytest.raises`` fails when nothing is raised, so every assertion
+    below is reached -- PF-013):
+    (a) the error code is ``mds::import``;
+    (b) the message is exactly the forbidden-character refusal, naming ``U+XXXX`` and
+        showing the codepoint as its six-character escape;
+    (c) the message carries no raw hostile codepoint, and ``str(e) == e.message``.
     """
-    # Module whose name contains the raw control byte — import path embeds it in the message.
-    module_name = f"fo{ctrl_char}o.mds"
+    module_name = f"fo{chr(codepoint)}o.mds"
     modules = {
         module_name: "hi\n",
-        # Import the same module twice to trigger duplicate-import; message will embed module_name.
         "main.mds": f'@import "./{module_name}"\n@import "./{module_name}"\n',
     }
-    result = m.lint_virtual(modules, "main.mds")
+    with pytest.raises(m.MdsError) as excinfo:
+        m.lint_virtual(modules, "main.mds")
+    e = excinfo.value
 
-    files = result.files
-    assert files, "expected at least one LintFileReport from lint_virtual"
-
-    # (d) Cheap invariant check only -- NOT coverage of the ``file``-key escape. The
-    # hostile codepoint is in the *imported* module's name, but this key is the *entry*
-    # filename, so no hostile byte reaches it and this cannot fail via this vector
-    # (PF-013). Real ``file``-key coverage: ``test_par7_...``, which constructs a
-    # LintResult with ``"file": "fo\u202egnp.mds"`` directly.
-    for fr in files:
-        _assert_no_control_chars(fr.file, "LintFileReport.file")
-
-    all_diags = [d for fr in files for d in fr.diagnostics]
-    assert all_diags, (
-        "expected at least one LintDiagnostic (duplicate-import should fire for "
-        "the twice-imported module)"
+    # (a)
+    assert e.code == "mds::import", e.message
+    # (b) The escape text is built, never written literally (PF-018).
+    escaped = "\\u" + f"{codepoint:04X}"
+    assert e.message == (
+        "import error: import path contains forbidden character "
+        f'U+{codepoint:04X}: "./fo{escaped}o.mds"'
     )
-
-    # (a) No raw C0/DEL/C1 bytes in typed .message attribute.
-    for diag in all_diags:
-        msg = diag.message
-        assert isinstance(msg, str) and msg, "message must be a non-empty string"
-        _assert_no_control_chars(msg, "LintDiagnostic.message")
-
-    # (b) At least one diagnostic must carry the sanitized escape literal —
-    #     confirming the control byte in the module name was sanitized, not dropped.
-    #     (Only the duplicate-import diagnostic embeds the path; check all.)
-    found_escaped = [d for d in all_diags if expected_escape in d.message]
-    assert found_escaped, (
-        f"expected at least one diagnostic whose message carries the sanitized "
-        f"{expected_escape!r} literal (module path); got: "
-        + str([d.message for d in all_diags])
-    )
-
-    # (c) Parity guard: to_dict()["message"] must equal .message (PF-007).
-    # as_json() / to_dict() must not re-introduce raw control bytes from pyclass fields.
-    for diag in all_diags:
-        d_dict = diag.to_dict()
-        assert isinstance(d_dict, dict), "to_dict() must return a dict"
-        dict_msg = d_dict.get("message", "")
-        assert isinstance(dict_msg, str), "to_dict()[message] must be a string"
-        assert dict_msg == diag.message, (
-            f"to_dict()[message] must equal .message; "
-            f"typed={diag.message!r}, dict={dict_msg!r}"
-        )
+    # (c)
+    _assert_no_control_chars(e.message, "e.message")
+    assert str(e) == e.message
 
 
 @pytest.mark.parametrize(
@@ -342,14 +298,13 @@ def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
 def test_e12_route_b_lint_virtual_ctrl_in_frontmatter_key_message_sanitized(
     ctrl_char: str, expected_escape: str, yaml_escape: str
 ) -> None:
-    """Route B sibling of test_e12_lint_virtual_ctrl_in_import_path_message_sanitized.
+    """Route B sibling of test_e12_lint_virtual_ctrl_in_import_path_is_refused.
 
     Same control-char set, but carried by an UNUSED FRONTMATTER KEY (unused-variable)
-    rather than an import path / module name (duplicate-import). #265 will reject
-    hostile paths/module names at the input boundary, retiring route-A coverage for
-    these characters -- a frontmatter key is not a path, so this route stays
-    reachable and green after enforcement lands, keeping message-escaping coverage
-    alive.
+    rather than an import path / module name (duplicate-import). #265 rejects
+    hostile paths/module names at the input boundary, which retired route-A coverage
+    for these characters -- a frontmatter key is not a path, so this route stays
+    reachable and keeps message-escaping coverage alive.
 
     Written as a YAML double-quoted key with a YAML escape (e.g. ``\\x1B``) so the
     .mds source text itself carries no raw control byte (PF-018); serde_yaml_ng

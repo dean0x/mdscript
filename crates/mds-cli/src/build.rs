@@ -165,6 +165,18 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
                 .map_err(|e| miette::miette!("invalid UTF-8 in {}: {e}", candidate.display()))?;
             let config: MdsConfig = serde_json::from_str(&raw)
                 .map_err(|e| miette::miette!("invalid mds.json at {}: {e}", candidate.display()))?;
+            // #265: a `build.output_dir` carrying a forbidden path character is refused
+            // here, at load — `mds::io`, exit 2 — so it never reaches output-path
+            // derivation. `load_config` is shared, so this fails every run that loads
+            // mds.json, not only the ones that write output: `build`, `watch`, `lint`
+            // (every input mode) and `fmt` directory mode. `check` does not load
+            // mds.json.
+            if let Some(output_dir) = &config.build.output_dir {
+                crate::output::reject_forbidden_output_path(
+                    "mds.json build.output_dir",
+                    std::ffi::OsStr::new(output_dir),
+                )?;
+            }
             return Ok(Some((config, current)));
         }
         match current.parent() {
@@ -354,18 +366,9 @@ pub(crate) fn resolve_output_path_for_kind(
     // 5. `mds.json` output_dir
     if let Some((cfg, config_dir)) = config {
         if let Some(ref output_dir) = cfg.build.output_dir {
-            // Reject path traversal: `output_dir` must not contain `..` components.
-            // We check raw path components rather than canonicalizing because the
-            // directory may not exist yet (it gets created by create_dir_all below).
-            let traversal = Path::new(output_dir)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir);
-            if traversal {
-                return Err(miette::miette!(
-                    "mds.json output_dir '{}' must not contain '..' components",
-                    output_dir
-                ));
-            }
+            // Reject path traversal: `output_dir` must not contain `..` components
+            // (exit 2). A forbidden character was already refused by `load_config`.
+            crate::output::reject_output_dir_traversal(output_dir)?;
             let dir = config_dir.join(output_dir);
             return Ok(Some(prepare_output_dir_for_kind(&dir, input_path, kind)?));
         }
@@ -1238,6 +1241,22 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
     }
 }
 
+/// Refuse `-o/--output` and `--out-dir` values carrying a forbidden path character
+/// (#265): `mds::io`, exit 2. Shared by `build` and `watch`, which both call it
+/// before any other work.
+pub(crate) fn reject_forbidden_output_flags(
+    output: Option<&str>,
+    out_dir: Option<&Path>,
+) -> Result<()> {
+    if let Some(o) = output {
+        crate::output::reject_forbidden_output_path("-o/--output", std::ffi::OsStr::new(o))?;
+    }
+    if let Some(d) = out_dir {
+        crate::output::reject_forbidden_output_path("--out-dir", d.as_os_str())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let BuildArgs {
         input,
@@ -1252,6 +1271,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         inline,
         embed_sources: flag_embed_sources,
     } = args;
+    // #265: refuse a hostile output location before anything is read or compiled.
+    reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
     let resolved = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,

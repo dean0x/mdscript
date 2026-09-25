@@ -11,6 +11,14 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { mkdtemp, mkdir, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
+import {
+  FORBIDDEN_PATH_CODEPOINTS,
+  assertNoForbiddenChars,
+  escapeText,
+  rejectionOf,
+  thrownBy,
+  uPlus,
+} from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -93,6 +101,78 @@ describe('normalizeVirtualKey', () => {
   test('U-S10: no trailing slash in result', () => {
     const key = normalizeVirtualKey('dir/main.mds', './sub/lib.mds');
     assert.ok(!key.endsWith('/'), `key should not end with slash: ${key}`);
+  });
+});
+
+// #265: the pre-scanner refuses the same 80 forbidden path codepoints as the Rust
+// resolver, with the same error codes and messages — an import string is
+// `mds::import`, an entry key is `mds::io`. The Rust↔JS differential over the whole
+// class lives in forbidden-path-chars.spec.mjs; these pin the scanner's own API.
+const NUL = 0x00;
+const HOSTILE_NAME_CODEPOINTS = FORBIDDEN_PATH_CODEPOINTS.filter((cp) => cp !== NUL);
+
+describe('normalizeVirtualKey — forbidden path characters (#265)', () => {
+  test('U-S11: an import carrying any forbidden codepoint is refused as mds::import', () => {
+    assert.equal(FORBIDDEN_PATH_CODEPOINTS.length, 80, 'the class has 80 codepoints');
+    for (const cp of HOSTILE_NAME_CODEPOINTS) {
+      const label = `U-S11 ${uPlus(cp)}`;
+      const relative = `./a${String.fromCodePoint(cp)}b.mds`;
+      const err = thrownBy(() => normalizeVirtualKey('dir/main.mds', relative), label);
+      assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+      assert.equal(
+        err.message,
+        `import error: import path contains forbidden character ${uPlus(cp)}: "./a${escapeText(cp)}b.mds"`,
+        label,
+      );
+      assertNoForbiddenChars(err.message, label);
+    }
+  });
+
+  test('U-S12: a NUL in an import keeps its own null-byte message, checked before the class', () => {
+    const err = thrownBy(
+      () => normalizeVirtualKey('main.mds', `./a${String.fromCodePoint(NUL)}b.mds`),
+      'U-S12',
+    );
+    assert.equal(err.code, 'mds::import');
+    assert.equal(err.message, 'import error: import path contains null byte');
+  });
+
+  test('U-S13: an entry key (empty base) carrying any forbidden codepoint is refused as mds::io', () => {
+    for (const cp of HOSTILE_NAME_CODEPOINTS) {
+      const label = `U-S13 ${uPlus(cp)}`;
+      const err = thrownBy(() => normalizeVirtualKey('', `a${String.fromCodePoint(cp)}b.mds`), label);
+      assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+      assert.equal(
+        err.message,
+        `entry path contains forbidden character ${uPlus(cp)}: "a${escapeText(cp)}b.mds"`,
+        label,
+      );
+      assertNoForbiddenChars(err.message, label);
+    }
+  });
+
+  test('U-S14: an empty or NUL entry key reports the entry-path messages as mds::io', () => {
+    const empty = thrownBy(() => normalizeVirtualKey('', ''), 'U-S14 empty');
+    assert.equal(empty.code, 'mds::io');
+    assert.equal(empty.message, 'entry path is empty');
+
+    const nul = thrownBy(
+      () => normalizeVirtualKey('', `a${String.fromCodePoint(NUL)}b.mds`),
+      'U-S14 NUL',
+    );
+    assert.equal(nul.code, 'mds::io');
+    assert.equal(nul.message, `entry path contains null byte: "a${escapeText(NUL)}b.mds"`);
+  });
+
+  test('U-S15: spaces, non-ASCII letters and the class neighbours are accepted (control)', () => {
+    assert.equal(normalizeVirtualKey('dir/main.mds', './a b-ünï.mds'), 'dir/a b-ünï.mds');
+    assert.equal(normalizeVirtualKey('', 'a b-ünï.mds'), 'a b-ünï.mds');
+    // Each sits next to a member of the class without being one.
+    for (const cp of [0x20, 0xa0, 0x061b, 0x061d, 0x200b, 0x200d, 0x2027, 0x202f, 0x2065, 0x206a, 0xfefe, 0x1f600]) {
+      const c = String.fromCodePoint(cp);
+      assert.equal(normalizeVirtualKey('main.mds', `./a${c}b.mds`), `a${c}b.mds`, uPlus(cp));
+      assert.equal(normalizeVirtualKey('', `a${c}b.mds`), `a${c}b.mds`, uPlus(cp));
+    }
   });
 });
 
@@ -192,6 +272,137 @@ describe('buildModulesMap', () => {
     assert.ok(helperKey, `sibling dir module should be included, got keys: ${Object.keys(modules)}`);
     assert.equal(Object.keys(modules).length, 2, 'should have exactly entry + helper');
   });
+});
+
+describe('buildModulesMap — forbidden path characters (#265)', () => {
+  /** Run `fn` against a fresh project directory (marked by `.mdsroot`). */
+  async function withProject(fn) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-265-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      return await fn(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('U-SM9: an import carrying a forbidden codepoint is refused as mds::import before it is opened', async () => {
+    await withProject(async (dir) => {
+      const entry = path.join(dir, 'main.mds');
+      await writeFile(entry, 'hi\n');
+      for (const cp of HOSTILE_NAME_CODEPOINTS) {
+        const label = `U-SM9 ${uPlus(cp)}`;
+        // The injected scanner reports the hostile import for the entry. No file of
+        // that name exists, so a scan that reached the filesystem would reject with
+        // ENOENT rather than this error.
+        const importPath = `./a${String.fromCodePoint(cp)}b.mds`;
+        const err = await rejectionOf(buildModulesMap(entry, () => [importPath]), label);
+        assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+        assert.equal(
+          err.message,
+          `import error: import path contains forbidden character ${uPlus(cp)}: "./a${escapeText(cp)}b.mds"`,
+          label,
+        );
+        assertNoForbiddenChars(err.message, label);
+      }
+    });
+  });
+
+  test('U-SM10: import strings are classified in the resolver order — relative form, NUL, then the class', async () => {
+    await withProject(async (dir) => {
+      const entry = path.join(dir, 'main.mds');
+      await writeFile(entry, 'hi\n');
+      const esc = String.fromCodePoint(0x1b);
+      const cases = [
+        ['lib.mds', `import error: import path must be relative (start with './' or '../'): "lib.mds"`],
+        // Not relative AND hostile: the relative-form rule is reported, the name escaped.
+        [`fo${esc}o.mds`, `import error: import path must be relative (start with './' or '../'): "fo${escapeText(0x1b)}o.mds"`],
+        ['', `import error: import path must be relative (start with './' or '../'): ""`],
+        [`./a${String.fromCodePoint(NUL)}b${esc}.mds`, 'import error: import path contains null byte'],
+      ];
+      for (const [importPath, expected] of cases) {
+        const label = `U-SM10 ${JSON.stringify(importPath)}`;
+        const err = await rejectionOf(buildModulesMap(entry, () => [importPath]), label);
+        assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+        assert.equal(err.message, expected, label);
+      }
+    });
+  });
+
+  test('U-SM11: an entry path carrying a forbidden codepoint is refused as mds::io before the filesystem is touched', async () => {
+    await withProject(async (dir) => {
+      for (const cp of HOSTILE_NAME_CODEPOINTS) {
+        const label = `U-SM11 ${uPlus(cp)}`;
+        const typed = path.join(dir, `a${String.fromCodePoint(cp)}b.mds`);
+        const err = await rejectionOf(buildModulesMap(typed, scanImports), label);
+        assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+        assert.equal(
+          err.message,
+          `entry path contains forbidden character ${uPlus(cp)}: "${path.join(dir, `a${escapeText(cp)}b.mds`)}"`,
+          label,
+        );
+        assertNoForbiddenChars(err.message, label);
+      }
+
+      const nul = await rejectionOf(
+        buildModulesMap(path.join(dir, `a${String.fromCodePoint(NUL)}b.mds`), scanImports),
+        'U-SM11 NUL',
+      );
+      assert.equal(nul.code, 'mds::io');
+      assert.equal(nul.message, `entry path contains null byte: "${path.join(dir, `a${escapeText(NUL)}b.mds`)}"`);
+
+      const empty = await rejectionOf(buildModulesMap('', scanImports), 'U-SM11 empty');
+      assert.equal(empty.code, 'mds::io');
+      assert.equal(empty.message, 'entry path is empty');
+    });
+  });
+
+  test('U-SM12: a clean name with spaces and non-ASCII letters is imported (control)', async () => {
+    await withProject(async (dir) => {
+      const entry = path.join(dir, 'main.mds');
+      await writeFile(entry, 'hi\n');
+      await writeFile(path.join(dir, 'a b-ünï.mds'), 'there\n');
+      const { entryFilename, modules } = await buildModulesMap(entry, (src) =>
+        src === 'hi\n' ? ['./a b-ünï.mds'] : [],
+      );
+      assert.equal(entryFilename, 'main.mds');
+      assert.deepEqual(Object.keys(modules).sort(), ['a b-ünï.mds', 'main.mds']);
+    });
+  });
+
+  // Windows file names cannot carry C0 controls, so the hostile directory this
+  // needs cannot be created there.
+  test(
+    'U-SM13: an entry reached through a symlink into a hostile-named directory is refused as mds::io',
+    { skip: process.platform === 'win32' && 'C0 controls are not valid in Windows file names' },
+    async () => {
+      await withProject(async (dir) => {
+        for (const cp of [0x09, 0x0a, 0x1b, 0x7f, 0x85, 0x202e, 0xfeff]) {
+          const label = `U-SM13 ${uPlus(cp)}`;
+          const hostile = path.join(dir, `ho${String.fromCodePoint(cp)}stile-${cp}`);
+          await mkdir(hostile);
+          await writeFile(path.join(hostile, 'main.mds'), 'hi\n');
+          const alias = path.join(dir, `alias-${cp}`);
+          await symlink(hostile, alias, 'dir');
+
+          // The typed path is clean; only its canonical form carries the codepoint.
+          const typed = path.join(alias, 'main.mds');
+          const err = await rejectionOf(buildModulesMap(typed, scanImports), label);
+          assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+          // The message shows the path as typed, never the resolved one.
+          assert.equal(err.message, `resolved path contains forbidden character ${uPlus(cp)}: "${typed}"`, label);
+        }
+
+        // Control: the same layout with a clean target directory builds.
+        const clean = path.join(dir, 'clean');
+        await mkdir(clean);
+        await writeFile(path.join(clean, 'main.mds'), 'hi\n');
+        await symlink(clean, path.join(dir, 'alias-clean'), 'dir');
+        const { modules } = await buildModulesMap(path.join(dir, 'alias-clean', 'main.mds'), scanImports);
+        assert.deepEqual(Object.values(modules), ['hi\n']);
+      });
+    },
+  );
 });
 
 describe('findProjectRoot', () => {

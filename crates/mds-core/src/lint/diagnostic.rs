@@ -1178,13 +1178,13 @@ fn is_control_char(ch: char) -> bool {
 /// it at every output site, never by refusing it before it reaches the
 /// filesystem.
 ///
-/// This predicate is the **public contract** for any custom `FileSystem`
-/// backend passed to `ModuleCache::with_fs`: applying it to every path segment
-/// accepted from untrusted input is the input-boundary half of the #265
-/// defense (see the `FileSystem` trait's Security Contract doc). This function
-/// is additive only — nothing in this crate calls it yet; enforcement across
-/// the built-in backends, the resolver and the CLI lands in a follow-up commit
-/// for #265.
+/// This predicate is the input-boundary half of the #265 defense. The resolver
+/// applies it to every import string (`mds::import`), entry path and base
+/// directory (`mds::io`) before any `FileSystem` backend is called, and
+/// `NativeFs` applies it to every canonical path it resolves. It is also the
+/// **public contract** for a custom `FileSystem` backend passed to
+/// `ModuleCache::with_fs` that rewrites paths (see the trait's Security
+/// Contract doc).
 #[must_use]
 pub fn is_forbidden_path_char(ch: char) -> bool {
     is_control_char(ch) || ch == '\n' || ch == '\t'

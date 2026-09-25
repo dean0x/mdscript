@@ -398,15 +398,23 @@ pub(crate) fn external_recovery_decision(
 /// Falls back to the raw path when the file does not yet exist (the user may create
 /// it later; the vars file is reloaded on every rebuild — freshness rule — so a duplicate
 /// key introduced after startup is caught on the next rebuild, #326).
+///
+/// Only the symlink refusal (`ImportError`) is reworded for the `--vars` flag; every
+/// other `check_symlink` error — a forbidden path character (#265), or a file removed
+/// since the `exists` probe — keeps its own message and code.
 pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<PathBuf>, MdsError> {
     match vars {
-        Some(p) if p.exists() => {
-            mds::NativeFs::check_symlink(&p)
-                .map(Some)
-                .map_err(|_| MdsError::Io {
-                    message: format!("--vars file must not be a symlink: {}", p.display()),
-                })
-        }
+        Some(p) if p.exists() => mds::NativeFs::check_symlink(&p)
+            .map(Some)
+            .map_err(|e| match e {
+                MdsError::ImportError { .. } => MdsError::Io {
+                    message: format!(
+                        "--vars file must not be a symlink: {}",
+                        mds::escape_path_for_message(&p.to_string_lossy())
+                    ),
+                },
+                other => other,
+            }),
         other => Ok(other),
     }
 }
@@ -834,6 +842,9 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         quiet,
         poll_interval,
     } = args;
+
+    // #265: refuse a hostile output location before anything is read or compiled.
+    crate::build::reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
 
     // ── Input mode dispatch ───────────────────────────────────────────────────
 
