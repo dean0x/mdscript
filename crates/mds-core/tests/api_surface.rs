@@ -62,8 +62,9 @@ fn display_native_path_strips_verbatim_prefix_on_windows() {
 }
 
 /// #265: `is_forbidden_path_char` and `escape_path_for_message` are callable via
-/// the crate root with the expected signatures. Additive-only for now — nothing
-/// in this crate enforces the predicate yet; enforcement is a follow-up commit.
+/// the crate root with the expected signatures, the predicate classifies TAB as
+/// forbidden and `a` as allowed, and the escaper renders TAB as its six-character
+/// escape.
 #[test]
 fn forbidden_path_char_functions_exist() {
     let _: fn(char) -> bool = mds::is_forbidden_path_char;
