@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
-import { writeFile, rm } from 'node:fs/promises';
+import { writeFile, rm, symlink } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -161,6 +161,25 @@ export function requireEngines(t, engines, label) {
   }
   t.skip(`${missing.join(' and ')} backend not built`);
   return false;
+}
+
+/**
+ * Create a symlink, or skip visibly where Windows refuses it for want of Developer
+ * Mode or `SeCreateSymbolicLinkPrivilege` (`EPERM`) — never in CI, whose Windows
+ * runners have Developer Mode, so a refusal there is a failure. Mirrors the Rust
+ * test helper `make_symlink`. Returns `false` when the caller should stop.
+ */
+export async function symlinkOrSkip(t, target, link, type) {
+  try {
+    await symlink(target, link, type);
+    return true;
+  } catch (err) {
+    if (process.platform === 'win32' && err.code === 'EPERM' && !process.env.CI) {
+      t.skip('creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege on Windows');
+      return false;
+    }
+    throw err;
+  }
 }
 
 /**

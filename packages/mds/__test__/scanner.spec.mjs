@@ -21,6 +21,7 @@ import {
   pkgRoot,
   rejectionOf,
   requireEngines,
+  symlinkOrSkip,
   thrownBy,
   uPlus,
 } from './helpers.mjs';
@@ -780,25 +781,24 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
     assertNotFoundNotSymlink(err, importPath, `${label} import`);
   }
 
-  test(
-    'U-SM25: a symlink loop in a directory (ELOOP) is file-not-found, as native reports it',
-    { skip: process.platform === 'win32' && 'a directory symlink loop needs a symlink privilege on Windows' },
-    async (t) => {
-      await withProject(async (dir) => {
-        await symlink(path.join(dir, 'loop'), path.join(dir, 'loop'), 'dir');
-        const entry = path.join(dir, 'loop', 'x.mds');
-        await assertNotFoundAsEntryAndImport(dir, entry, './loop/x.mds', 'U-SM25');
+  // Windows resolves a self-referencing directory link no more than POSIX does
+  // (its reparse-point limit), and both sides report ANY failure to resolve the
+  // directory as file-not-found, whatever its errno.
+  test('U-SM25: a symlink loop in a directory (ELOOP) is file-not-found, as native reports it', async (t) => {
+    await withProject(async (dir) => {
+      if (!(await symlinkOrSkip(t, path.join(dir, 'loop'), path.join(dir, 'loop'), 'dir'))) return;
+      const entry = path.join(dir, 'loop', 'x.mds');
+      await assertNotFoundAsEntryAndImport(dir, entry, './loop/x.mds', 'U-SM25');
 
-        const engines = await loadEngines();
-        if (!requireEngines(t, engines, 'U-SM25')) return;
-        const [native] = await compileFileOutcomes('native', [entry]);
-        const [wasm] = await compileFileOutcomes('wasm', [entry]);
-        assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
-        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
-        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
-      });
-    },
-  );
+      const engines = await loadEngines();
+      if (!requireEngines(t, engines, 'U-SM25')) return;
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+      assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+      assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+    });
+  });
 
   test('U-SM26: a name too long to resolve (ENAMETOOLONG) is file-not-found, as native reports it', async (t) => {
     await withProject(async (dir) => {
