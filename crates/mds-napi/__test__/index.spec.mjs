@@ -1460,6 +1460,13 @@ describe('source maps (F-SM)', () => {
   });
 });
 
+// Hex digits of a codepoint (`U+XXXX`'s tail) and the six-character escape text
+// (backslash, `u`, four uppercase hex digits) a message shows in its place. Built,
+// never written literally (PF-018). Shared by the ESC-injection and #265
+// forbidden-path-character suites below.
+const hex4 = (cp) => cp.toString(16).toUpperCase().padStart(4, '0');
+const escapeText = (cp) => '\\u' + hex4(cp);
+
 // ── T-12/T-13 (E-10/E-11): ESC-injection hardening — napi direct (issue #176 / CWE-150) ────────
 //
 // Four vectors (E-10..E-13):
@@ -1500,10 +1507,6 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     }
   }
 
-  // The six-character escape text (backslash, `u`, four uppercase hex digits) a
-  // message shows for a hostile codepoint. Built, never written literally (PF-018).
-  const escapeText = (cp) => '\\u' + cp.toString(16).toUpperCase().padStart(4, '0');
-
   // #265 route A: a lintVirtual import naming a module whose name carries `cp` is
   // refused at the input boundary. assert.throws fails when nothing is thrown, so the
   // exact-message assertion below is always reached (PF-013).
@@ -1513,14 +1516,13 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
       [moduleName]: 'hi\n',
       'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
     };
-    const hex = cp.toString(16).toUpperCase().padStart(4, '0');
     assert.throws(
       () => lintVirtual(modules, 'main.mds'),
       (err) => {
         assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
         assert.equal(
           err.message,
-          `import error: import path contains forbidden character U+${hex}: "./fo${escapeText(cp)}o.mds"`,
+          `import error: import path contains forbidden character U+${hex4(cp)}: "./fo${escapeText(cp)}o.mds"`,
           label,
         );
         assertNoControlChars(err.message, `${label}: err.message`);
@@ -1716,9 +1718,6 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
 // caller input, not import strings, so a forbidden codepoint there is mds::io.
 
 describe('forbidden path characters in entry paths and base directories (#265)', () => {
-  const hex4 = (cp) => cp.toString(16).toUpperCase().padStart(4, '0');
-  // Built, never written literally (PF-018).
-  const escapeText = (cp) => '\\u' + hex4(cp);
   // TAB and LF (the two members outside the display-escape class), C0, DEL, C1,
   // a bidi override and the BOM.
   const HOSTILE = [0x09, 0x0a, 0x1b, 0x7f, 0x85, 0x202e, 0xfeff];

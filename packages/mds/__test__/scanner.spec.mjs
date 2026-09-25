@@ -9,12 +9,12 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
   FORBIDDEN_PATH_CODEPOINTS,
   assertNoForbiddenChars,
+  caseInsensitive,
   compileFileOutcomes,
   escapeText,
   loadEngines,
@@ -452,14 +452,6 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }
-
-  /** Whether the volume holding `dir` resolves names case-insensitively. */
-  async function caseInsensitive(dir) {
-    await writeFile(path.join(dir, 'probe.txt'), '');
-    const insensitive = existsSync(path.join(dir, 'PROBE.TXT'));
-    await rm(path.join(dir, 'probe.txt'));
-    return insensitive;
   }
 
   const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';

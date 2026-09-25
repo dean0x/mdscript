@@ -10,10 +10,9 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { SIMPLE_MDS, IMPORT_CONSUMER_MDS, ENTRY_MDS, __dirname } from './helpers.mjs';
+import { SIMPLE_MDS, IMPORT_CONSUMER_MDS, ENTRY_MDS, __dirname, caseInsensitive } from './helpers.mjs';
 import path from 'node:path';
 import os from 'node:os';
-import { existsSync } from 'node:fs';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 
 const exec = promisify(execFile);
@@ -247,8 +246,7 @@ describe('WASM backend — compileFile/checkFile', () => {
         path.join(dir, 'footer.mds'),
         '@import "./HEADER.mds" as h\n@define bye():\n{{h.hi()}} bye\n@end\n',
       );
-      await writeFile(path.join(dir, 'probe.txt'), '');
-      const insensitive = existsSync(path.join(dir, 'PROBE.TXT'));
+      const insensitive = await caseInsensitive(dir);
 
       const script = `
         import { init, compileFile, getBackend } from './dist/node.js';

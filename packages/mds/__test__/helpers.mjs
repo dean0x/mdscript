@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
+import { writeFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -103,6 +104,18 @@ export async function rejectionOf(promise, label) {
     return err;
   }
   throw new Error(`${label}: expected a rejection, but the promise resolved`);
+}
+
+/**
+ * Whether the volume holding `dir` resolves file names case-insensitively
+ * (the macOS and Windows default) — used by the #408 case-mismatch tests.
+ * Writes and removes a scratch probe file inside `dir` to test it.
+ */
+export async function caseInsensitive(dir) {
+  await writeFile(path.join(dir, 'probe.txt'), '');
+  const insensitive = existsSync(path.join(dir, 'PROBE.TXT'));
+  await rm(path.join(dir, 'probe.txt'));
+  return insensitive;
 }
 
 /** The binding-visible fields of an MDS error, for cross-backend `deepEqual`. */
