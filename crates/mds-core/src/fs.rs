@@ -382,10 +382,11 @@ impl NativeFs {
         }
     }
 
-    /// Canonicalize `path` and detect symlinks without a TOCTOU window.
+    /// Canonicalize `path`, refusing it when its final component is a symlink.
     ///
-    /// Strategy: canonicalize parent dir (resolves dir-level symlinks), then
-    /// canonicalize the full path. If they differ, the final component is a symlink.
+    /// Symlinks in the parent directories are followed (the parent is
+    /// canonicalized first); only the final component is checked, by its file
+    /// type — see `check_symlink_named` for the exact rule.
     ///
     /// Returns the canonical `PathBuf` for valid (non-symlinked) paths, or an error
     /// if the final path component is a symlink. This makes it a drop-in replacement
@@ -411,12 +412,11 @@ impl NativeFs {
     /// Canonicalize a directory path, handling the filesystem-root edge case (#371).
     ///
     /// A filesystem root (`/` on Unix, or a drive root such as `C:\` on
-    /// Windows) has no parent component, so `check_symlink_named`'s
-    /// parent-then-child double-canonicalize dance — which canonicalizes the
-    /// PARENT directory before joining the final path component — has no
-    /// parent to canonicalize; `Path::file_name()` returns `None` for a root,
-    /// so `check_symlink_named` fails immediately with `FileNotFound`, before
-    /// any syscall (`#371`).
+    /// Windows) has no parent component, so `check_symlink_named` — which
+    /// canonicalizes the PARENT directory before checking the final path
+    /// component — has no parent to canonicalize; `Path::file_name()` returns
+    /// `None` for a root, so `check_symlink_named` fails immediately with
+    /// `FileNotFound`, before any syscall (`#371`).
     ///
     /// Detect that case via `path.has_root() && path.parent().is_none()` and
     /// canonicalize the root directly instead: a filesystem root can never
@@ -508,6 +508,25 @@ impl NativeFs {
     /// Separates the path used for OS calls from the string shown to the user,
     /// so import errors report the relative import string rather than the
     /// absolute joined path (R3 / CWE-209).
+    ///
+    /// The parent directory is canonicalized (its symlinks are followed) and the
+    /// final component is joined to it as written. That component is refused when
+    /// its own file type — `symlink_metadata`, which does not follow it — is a
+    /// symlink. On Windows `is_symlink` is true for every name-surrogate reparse
+    /// point, so a junction is refused as well as a symbolic link.
+    ///
+    /// The file type decides, not a comparison of the canonical path with the
+    /// joined one: on a case-insensitive volume (default macOS APFS, NTFS) the
+    /// canonical path carries the on-disk spelling of the name (its case), so
+    /// `./Header.mds` for `header.mds` differs from its canonical form without
+    /// being a symlink (#408). The canonical path is what this returns, so a
+    /// module's key is its on-disk spelling and every spelling of one file shares
+    /// one key.
+    ///
+    /// Canonicalizing a non-symlink final component only respells its name; it
+    /// never changes the directory. A canonical path whose directory is not the
+    /// canonical parent therefore means the component was replaced by a link
+    /// between the two calls, and it is refused the same way.
     fn check_symlink_named(path: &Path, shown: &str) -> Result<PathBuf, MdsError> {
         let file_name = path
             .file_name()
@@ -517,16 +536,22 @@ impl NativeFs {
         let canonical_parent = parent
             .canonicalize()
             .map_err(|_| MdsError::file_not_found(shown.to_string()))?;
-        let canonical_without_following_last = canonical_parent.join(file_name);
+        let joined = canonical_parent.join(file_name);
+        let symlink_error =
+            || MdsError::import_error(format!("symlinks are not allowed in imports: {shown}"));
 
-        let canonical = canonical_without_following_last
+        let file_type = std::fs::symlink_metadata(&joined)
+            .map_err(|_| MdsError::file_not_found(shown.to_string()))?
+            .file_type();
+        if file_type.is_symlink() {
+            return Err(symlink_error());
+        }
+
+        let canonical = joined
             .canonicalize()
             .map_err(|_| MdsError::file_not_found(shown.to_string()))?;
-
-        if canonical != canonical_without_following_last {
-            return Err(MdsError::import_error(format!(
-                "symlinks are not allowed in imports: {shown}"
-            )));
+        if canonical.parent() != Some(canonical_parent.as_path()) {
+            return Err(symlink_error());
         }
         Ok(canonical)
     }
@@ -1834,6 +1859,188 @@ mod tests {
             err.to_string().contains("escapes project directory"),
             "a `..` key leaving the anchored root must be refused, got: {err}"
         );
+    }
+
+    // ── #408: a case-mismatched name is not a symlink ─────────────────────────
+    //
+    // Each test probes the tempdir volume instead of assuming a platform: a
+    // case-insensitive volume (default macOS APFS, NTFS on the Windows CI leg)
+    // resolves the mismatched spelling, a case-sensitive one (Linux CI) reports
+    // it missing. Neither may report a symlink.
+
+    /// Whether the volume holding `dir` resolves names case-insensitively.
+    fn case_insensitive(dir: &Path) -> bool {
+        let probe = dir.join("probe.txt");
+        std::fs::write(&probe, "").unwrap();
+        let insensitive = dir.join("PROBE.TXT").exists();
+        std::fs::remove_file(&probe).unwrap();
+        insensitive
+    }
+
+    fn assert_not_a_symlink_error(result: &Result<crate::CompileResult, MdsError>) {
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("symlink"),
+                "a case-mismatched name must never be reported as a symlink: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_mismatched_import_is_not_a_symlink() {
+        let (_guard, root) = marked_project("@import \"./Header.mds\" as h\n{{h.hi()}}\n");
+        std::fs::write(root.join("header.mds"), "@define hi():\nHi\n@end\n").unwrap();
+
+        let result = crate::compile_with_deps(root.join("main.mds"), None);
+        assert_not_a_symlink_error(&result);
+        if case_insensitive(&root) {
+            let compiled = result.expect("the OS resolves the mismatched spelling");
+            assert_eq!(
+                compiled.output,
+                crate::CompiledOutput::Markdown("Hi\n".into())
+            );
+            // The module key is the on-disk spelling, not the typed one.
+            let [dep] = compiled.dependencies.as_slice() else {
+                panic!("expected one dependency, got {:?}", compiled.dependencies);
+            };
+            assert_eq!(
+                Path::new(dep).file_name().and_then(|n| n.to_str()),
+                Some("header.mds")
+            );
+        } else {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, MdsError::FileNotFound { .. }),
+                "case-sensitive volume: expected FileNotFound, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_mismatched_entry_is_not_a_symlink() {
+        let (_guard, root) = marked_project("Hello!\n");
+        let typed = root.join("MAIN.mds");
+
+        let result = crate::compile_with_deps(&typed, None);
+        assert_not_a_symlink_error(&result);
+        let key = NativeFs::new().resolve_entry(typed.to_str().unwrap());
+        if case_insensitive(&root) {
+            assert_eq!(
+                result
+                    .expect("the OS resolves the mismatched spelling")
+                    .output,
+                crate::CompiledOutput::Markdown("Hello!\n".into())
+            );
+            // The entry key is the on-disk spelling too.
+            assert_eq!(Path::new(&key.unwrap()), root.join("main.mds"));
+        } else {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, MdsError::FileNotFound { .. }),
+                "case-sensitive volume: expected FileNotFound, got {err:?}"
+            );
+            assert!(matches!(key, Err(MdsError::FileNotFound { .. })));
+        }
+    }
+
+    /// Every spelling of one file shares its on-disk key, so a module imported
+    /// under two spellings (twice from one file, and again through a diamond) is
+    /// loaded once — no duplicate dependency and no false cycle.
+    #[test]
+    fn case_variant_imports_share_one_module() {
+        let (_guard, root) = marked_project(
+            "@import \"./Header.mds\" as a\n\
+             @import \"./header.mds\" as b\n\
+             @import \"./footer.mds\" as f\n\
+             {{a.hi()}}{{b.hi()}}{{f.bye()}}\n",
+        );
+        if !case_insensitive(&root) {
+            eprintln!("skipping: two spellings name two files on a case-sensitive volume");
+            return;
+        }
+        std::fs::write(root.join("header.mds"), "@define hi():\nHi\n@end\n").unwrap();
+        std::fs::write(
+            root.join("footer.mds"),
+            "@import \"./HEADER.mds\" as h\n@define bye():\n{{h.hi()}} bye\n@end\n",
+        )
+        .unwrap();
+
+        let compiled = crate::compile_with_deps(root.join("main.mds"), None)
+            .expect("one module under several spellings compiles");
+        let names: Vec<_> = compiled
+            .dependencies
+            .iter()
+            .map(|d| {
+                Path::new(d)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["header.mds", "footer.mds"],
+            "each file once, under its on-disk spelling"
+        );
+    }
+
+    /// Control: the file-type check reads the final component as written, so a
+    /// symlink is refused under any spelling of its own name.
+    #[test]
+    fn case_mismatched_symlink_is_still_refused() {
+        let (_guard, root) = marked_project("@import \"./LINK.mds\" as l\n");
+        std::fs::write(root.join("target.mds"), "@define hi():\nHi\n@end\n").unwrap();
+        if !make_symlink(&root.join("target.mds"), &root.join("link.mds")) {
+            return;
+        }
+        let err = crate::compile(root.join("main.mds"), None).unwrap_err();
+        if case_insensitive(&root) {
+            assert!(
+                err.to_string().contains("symlinks are not allowed"),
+                "a mismatched spelling of a symlink must still be refused, got: {err}"
+            );
+        } else {
+            assert!(
+                matches!(err, MdsError::FileNotFound { .. }),
+                "case-sensitive volume: expected FileNotFound, got {err:?}"
+            );
+        }
+        // Exact spelling: refused on every volume.
+        std::fs::write(root.join("main.mds"), "@import \"./link.mds\" as l\n").unwrap();
+        let err = crate::compile(root.join("main.mds"), None).unwrap_err();
+        assert!(
+            err.to_string().contains("symlinks are not allowed"),
+            "got: {err}"
+        );
+    }
+
+    /// On Windows `is_symlink` covers every name-surrogate reparse point, so a
+    /// junction — which needs no privilege to create — is refused like a
+    /// symbolic link.
+    #[cfg(windows)]
+    #[test]
+    fn junction_final_component_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let junction = dir.path().join("junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+
+        let err = NativeFs::check_symlink(&junction).unwrap_err();
+        assert!(
+            err.to_string().contains("symlinks are not allowed"),
+            "a junction must be refused, got: {err}"
+        );
+        // Control: the junction's target directory is accepted.
+        NativeFs::check_symlink(&target).expect("control: a plain directory");
     }
 
     // ── source_root ───────────────────────────────────────────────────────────

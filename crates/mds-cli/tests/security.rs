@@ -172,6 +172,46 @@ fn symlink_import_rejected() {
     );
 }
 
+/// #408: a mismatched spelling of an entry file or an import is resolved the way
+/// the OS resolves it — on a case-insensitive volume (default macOS APFS, NTFS on
+/// the Windows CI leg) it builds, on a case-sensitive one (Linux) it is a missing
+/// file (exit 2). It is never reported as a symlink. The volume is probed, not
+/// assumed.
+#[test]
+fn case_mismatched_entry_and_import_are_not_symlink_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("entry.mds"), "Hello!\n").unwrap();
+    std::fs::write(dir.path().join("header.mds"), "@define hi():\nHi\n@end\n").unwrap();
+    std::fs::write(
+        dir.path().join("main.mds"),
+        "@import \"./Header.mds\" as h\n{{h.hi()}}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("probe.txt"), "").unwrap();
+    let insensitive = dir.path().join("PROBE.TXT").exists();
+
+    // (argument, stdout on a case-insensitive volume)
+    for (arg, expected) in [("Entry.mds", "Hello!\n"), ("main.mds", "Hi\n")] {
+        let out = mds_bin()
+            .args(["build", arg, "-o", "-"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("symlink"),
+            "{arg}: a case mismatch must never be a symlink error: {stderr}"
+        );
+        if insensitive {
+            assert!(out.status.success(), "{arg}: {stderr}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{arg}");
+        } else {
+            assert_eq!(out.status.code(), Some(2), "{arg}: {stderr}");
+            assert!(stderr.contains("file not found"), "{arg}: {stderr}");
+        }
+    }
+}
+
 #[test]
 fn nested_loop_total_iteration_limit() {
     // Two nested loops of 1001 × 1000 = 1,001,000 total iterations must be rejected.
