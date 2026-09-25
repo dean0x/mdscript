@@ -78,11 +78,15 @@
 //! right-to-left in one pass and hands the fixed source to the caller's reverify
 //! callback. If that batch is refused, it retries each edit on its own,
 //! right-to-left, keeping the edits that pass; the retry is skipped (and the plan
-//! refused) above [`FALLBACK_MAX_EDITS`] edits. A candidate is REFUSED if the
-//! callback reports:
-//! - A new compile error (not targeted by the original fixes)
-//! - A new lint diagnostic not present in the original result
-//! - Any compiled-output delta (for Tier B rules)
+//! refused) above [`FALLBACK_MAX_EDITS`] edits. A candidate is REFUSED in two ways:
+//! - by the reverify callback, which returns `Err` — the CLI's does so when the
+//!   candidate no longer compiles, and, when every edit in the plan is
+//!   output-neutral ([`is_output_neutral`] — every fixable rule except
+//!   `legacy-interpolation`, in Tier A and Tier B alike) and the original
+//!   compiled, on any compiled-output delta;
+//! - by the gate itself, when the callback's lint result has a finding the edit
+//!   introduced: a rule the plan does not target with more findings than in the
+//!   original lint result.
 //!
 //! ## Idempotence note (AC-F-25)
 //!
