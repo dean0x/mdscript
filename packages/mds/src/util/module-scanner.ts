@@ -365,6 +365,9 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  * - Rejects a module whose final path component is a symlink, judged by that
  *   component's own file type (O_NOFOLLOW open; `lstat` where O_NOFOLLOW is
  *   unavailable). Symlinked parent directories are followed, as NativeFs does
+ * - Rejects an import that leaves a symlinked directory through `..`
+ *   (`mds::import`): the engine resolves it by name to another file than the
+ *   one NativeFs reads (#408)
  * - Rejects paths that escape the project root (discovered via .git/.mdsroot
  *   markers), checked on the canonical path
  * - Rejects, before the filesystem is touched and with the Rust engine's code and
@@ -446,6 +449,41 @@ export async function buildModulesMap(
     }
 
     return childAbsolute;
+  }
+
+  /**
+   * Refuse an import whose module key names another directory than the one the
+   * native backend reads it from.
+   *
+   * The WASM engine resolves an import by name, from the importing module's key.
+   * NativeFs resolves it on disk, from the importing module's canonical directory,
+   * where the OS applies each `..` after the symbolic links before it. The two
+   * agree for every import except one that leaves a symlinked directory through
+   * `..`: its key names the directory beside the link, while the file on disk sits
+   * beside the link's target. Whichever file were stored under that key, the
+   * engine would compile a module the native backend never reads (#408).
+   */
+  async function assertKeyMatchesDisk(
+    importerDir: string,
+    importPath: string,
+    childKey: string,
+  ): Promise<void> {
+    // realpath() resolves each `..` physically, after the links before it — the
+    // directory NativeFs reads from. A missing directory is file-not-found there.
+    const onDisk = await realpathParent(importerDir + sep + importPath, importPath);
+    // The directory the engine's key names. If it cannot be resolved at all, it
+    // is not the directory above, and the import is refused below.
+    let byName: string | undefined;
+    try {
+      byName = await realpath(dirname(join(projectRoot, ...childKey.split('/'))));
+    } catch {
+      byName = undefined;
+    }
+    if (byName !== onDisk) {
+      throw importError(
+        `import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "${escapePathForMessage(importPath)}"`,
+      );
+    }
   }
 
   /**
@@ -557,10 +595,12 @@ export async function buildModulesMap(
       );
     }
 
-    if (visited.has(absolutePath)) {
+    // Keyed by virtual key, not by path: through a symlinked directory one file
+    // can sit under two keys, and the engine looks up each of them (#408).
+    if (visited.has(virtualKey)) {
       return;
     }
-    visited.add(absolutePath);
+    visited.add(virtualKey);
 
     // Resource limit: check module count immediately after marking visited so
     // the count is O(1) and there is no off-by-one from checking after the write.
@@ -609,6 +649,7 @@ export async function buildModulesMap(
         const childAbsolute = validateImportPath(importPath, absoluteDir);
         // Compute virtual key using normalizeVirtualKey to mirror Rust's VirtualFs::normalize_in_dir().
         const childVirtualKey = normalizeVirtualKey(virtualKey, importPath);
+        await assertKeyMatchesDisk(absoluteDir, importPath, childVirtualKey);
         await scan(childAbsolute, childVirtualKey, importPath, depth + 1);
       }
     }

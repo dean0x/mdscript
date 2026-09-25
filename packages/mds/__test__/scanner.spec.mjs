@@ -622,6 +622,86 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
   });
 
+  // The WASM engine resolves an import BY NAME, from the importing module's key;
+  // NativeFs resolves it ON DISK, from the importing module's canonical directory.
+  // Through a symlinked directory the two agree for every import except one that
+  // leaves the link through `..`: its key names the directory beside the link,
+  // the file NativeFs reads sits beside the link's target.
+
+  /** sub -> deep/other; sub/y.mds imports ../z.mds; both z.mds files exist. */
+  async function dotDotOutOfLink(dir, linked) {
+    await mkdir(path.join(dir, 'deep', 'other'), { recursive: true });
+    const yDir = linked ? path.join(dir, 'deep', 'other') : path.join(dir, 'sub');
+    if (linked) {
+      await symlink(path.join(dir, 'deep', 'other'), path.join(dir, 'sub'), dirLinkType);
+    } else {
+      await mkdir(yDir);
+    }
+    await writeFile(path.join(yDir, 'y.mds'), '@import "../z.mds" as dz\nY=\n@include dz\n');
+    await writeFile(path.join(dir, 'deep', 'z.mds'), 'DEEP-Z\n');
+    await writeFile(path.join(dir, 'z.mds'), 'ROOT-Z\n');
+    await writeFile(path.join(dir, 'main.mds'), '@import "./sub/y.mds" as y\n@import "./z.mds" as rz\n@include rz\n@include y\n');
+    return path.join(dir, 'main.mds');
+  }
+
+  test("U-SM22: an import that leaves a symlinked directory through '..' is refused, never read from the other side", async () => {
+    await withProject(async (dir) => {
+      const main = await dotDotOutOfLink(dir, true);
+      const err = await rejectionOf(buildModulesMap(main, scanImports), 'U-SM22');
+      assert.equal(err.code, 'mds::import', err.message);
+      assert.equal(
+        err.message,
+        `import error: import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "../z.mds"`,
+      );
+    });
+    // Control: the same tree with `sub` a real directory builds, and `../z.mds`
+    // from sub/y.mds is the root z.mds under both resolutions.
+    await withProject(async (dir) => {
+      const { modules } = await buildModulesMap(await dotDotOutOfLink(dir, false), scanImports);
+      assert.equal(modules['z.mds'], 'ROOT-Z\n');
+      assert.equal(modules['sub/y.mds'], '@import "../z.mds" as dz\nY=\n@include dz\n');
+    });
+  });
+
+  test('U-SM23: a file reached through a symlinked directory is stored under every key the engine looks up', async () => {
+    await withProject(async (dir) => {
+      await mkdir(path.join(dir, 'lib'));
+      await writeFile(path.join(dir, 'lib', 'x.mds'), 'X\n');
+      await writeFile(path.join(dir, 'lib', 'y.mds'), '@import "./x.mds" as x\n');
+      await symlink(path.join(dir, 'lib'), path.join(dir, 'alias'), dirLinkType);
+      await writeFile(path.join(dir, 'main.mds'), '@import "./lib/x.mds" as a\n@import "./alias/y.mds" as b\n');
+      const { modules } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      // lib/x.mds and alias/x.mds are one file on disk, but the engine resolves
+      // alias/y.mds's `./x.mds` to the key alias/x.mds: both keys must be present.
+      assert.equal(modules['lib/x.mds'], 'X\n');
+      assert.equal(modules['alias/x.mds'], 'X\n');
+    });
+  });
+
+  test('U-SM24: through a symlinked directory, the WASM backend compiles what the native backend compiles, or refuses', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM24')) return;
+    await withProject(async (dir) => {
+      // Both backends compile the alias layout identically.
+      await mkdir(path.join(dir, 'lib'));
+      await writeFile(path.join(dir, 'lib', 'x.mds'), 'X\n');
+      await writeFile(path.join(dir, 'lib', 'y.mds'), '@import "./x.mds" as x\nY\n@include x\n');
+      await symlink(path.join(dir, 'lib'), path.join(dir, 'alias'), dirLinkType);
+      const alias = path.join(dir, 'alias-main.mds');
+      await writeFile(alias, '@import "./lib/x.mds" as a\n@import "./alias/y.mds" as b\n@include a\n@include b\n');
+      // `..` out of the link: NativeFs reads deep/z.mds; the WASM backend refuses
+      // rather than compile the root z.mds its engine would look up by name.
+      const dotDot = await dotDotOutOfLink(dir, true);
+
+      const [nativeAlias, nativeDotDot] = await compileFileOutcomes('native', [alias, dotDot]);
+      const [wasmAlias, wasmDotDot] = await compileFileOutcomes('wasm', [alias, dotDot]);
+      assert.equal(nativeAlias.output, 'X\nY\nX\n', JSON.stringify(nativeAlias));
+      assert.deepEqual(wasmAlias, nativeAlias);
+      assert.equal(nativeDotDot.output, 'ROOT-Z\nY=\nDEEP-Z\n', JSON.stringify(nativeDotDot));
+      assert.equal(wasmDotDot.code, 'mds::import', JSON.stringify(wasmDotDot));
+      assert.equal(wasmDotDot.output, undefined, JSON.stringify(wasmDotDot));
+    });
+  });
 });
 
 describe('findProjectRoot', () => {
