@@ -864,6 +864,9 @@ mod tests {
     ///
     /// Positive control: the same root spelled in valid UTF-8 must still emit the
     /// root-relative path.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStrExt` (arbitrary bytes), a
+    /// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
     #[cfg(unix)]
     #[test]
     fn non_utf8_root_degrades_to_basename() {
@@ -904,6 +907,9 @@ mod tests {
     /// Positive control: a usable base under the same root must still shift the
     /// emitted path by the map-directory offset (`../src/a.mds`), so this test
     /// cannot pass by ignoring `base` altogether.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStrExt` (arbitrary bytes), a
+    /// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
     #[cfg(unix)]
     #[test]
     fn non_utf8_base_falls_back_to_root_anchor() {

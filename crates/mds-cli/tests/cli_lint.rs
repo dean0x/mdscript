@@ -2111,6 +2111,9 @@ fn json_files_array_is_path_sorted_in_directory_mode() {
 /// The byte is constructed at runtime from a numeric escape and never typed as a
 /// literal into this file (PF-018 — the editing tooling decodes such escapes into
 /// real bytes in tracked source, and the `Source hygiene` CI job rejects them).
+///
+/// `#[cfg(unix)]`: builds the control-byte name with `OsStringExt`, a Unix-only API, and
+/// a Windows file name cannot hold a C0 control anyway (#147).
 #[cfg(unix)]
 #[test]
 fn directory_json_file_key_escapes_control_bytes_in_paths() {
@@ -2199,6 +2202,9 @@ fn directory_json_file_key_escapes_control_bytes_in_paths() {
 ///
 /// The invalid bytes are built at RUNTIME from numeric values; no escape sequence
 /// or raw byte appears in this source file (Source hygiene gate).
+///
+/// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStringExt` (arbitrary bytes), a
+/// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
 #[cfg(unix)]
 #[test]
 fn lint_directory_non_utf8_entry_is_an_io_error_exit_2() {
@@ -3233,6 +3239,8 @@ fn lint_json_newline_in_frontmatter_key_is_escaped_on_the_wire() {
 /// file-type bits (`mode & 0o7777`) ensures `Permissions::from_mode` receives
 /// only the permission bits.  This test locks in that guarantee for the lint path
 /// now that `atomic_write_file` lives in `output.rs` and is shared with `fmt`.
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_preserves_mode_0644() {
@@ -3273,6 +3281,9 @@ fn lint_fix_preserves_mode_0644() {
 /// Previously only the `persist()` error carried the path; all other paths
 /// (temp-file creation, permission set, write, fsync) emitted generic messages.
 /// Fixed by step 9.1 (all 5 non-persist errors now include `path.display()`).
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_write_failure_includes_filename_in_stderr() {
@@ -3320,6 +3331,9 @@ fn lint_write_failure_includes_filename_in_stderr() {
 /// immediately by "error writing …/e1.mds" — actively lying about the
 /// outcome.  `fmt.rs:284` already does this correctly (write first, label on
 /// `Ok(())`); this test locks in parity for both lint modes.
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
@@ -3362,6 +3376,9 @@ fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
 /// Regression gate (directory mode): when `atomic_write_file` fails,
 /// stderr must NOT contain "Fixed: <file>" — mirrors the single-file check
 /// above for the `lint_one_file_human` code path (lint.rs:1227).
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
@@ -3406,6 +3423,9 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
 ///
 /// Positive control (PF-013/ADR-009): a writable directory run confirms "Fixed:"
 /// DOES appear so the absence assertion below cannot be vacuous.
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
@@ -3470,6 +3490,8 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
 // Fix: attempt the write FIRST; on failure push a structured `{"file":…,"error":…}`
 // entry matching the read-failure shape, then return FileTally::Error.
 
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
@@ -6040,6 +6062,8 @@ fn lint_directory_all_excluded_quiet_no_summary() {
 // Since #265 the file is refused at the input boundary (`mds::io`) and counted as an
 // error-severity file; its name still appears in the refusal, escaped.
 
+/// `#[cfg(unix)]`: a Windows file name cannot hold a C0 control, so the hostile file
+/// cannot be created there (#147).
 #[cfg(unix)]
 #[test]
 fn lint_directory_summary_is_not_forgeable() {
@@ -6926,6 +6950,9 @@ fn d1_dir_fix_check_json_body_pre_fix_and_exit_2() {
 ///
 /// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or
 /// raw byte appears in this source file (source hygiene gate).
+///
+/// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStringExt` (arbitrary bytes), a
+/// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
 #[cfg(unix)]
 #[test]
 fn lint_single_file_non_utf8_path_exits_2() {

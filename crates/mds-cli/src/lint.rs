@@ -2300,6 +2300,9 @@ mod tests {
     /// sequence or raw byte appears in this source file (Source hygiene gate).
     ///
     /// Positive control: the valid-UTF-8 arm must still return `Ok`.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStrExt` (arbitrary bytes), a
+    /// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
     #[cfg(unix)]
     #[test]
     fn relative_display_rejects_non_utf8_component() {
@@ -2346,6 +2349,9 @@ mod tests {
     ///
     /// Path construction uses Rust string literals containing a backslash byte
     /// (0x5C) — not a control byte, so the Source hygiene gate does not flag it.
+    ///
+    /// `#[cfg(unix)]`: on Windows `\` is a path separator, so there is no literal
+    /// backslash name byte to preserve (#147).
     #[cfg(unix)]
     #[test]
     fn relative_display_preserves_literal_backslash_on_unix() {
@@ -2398,7 +2404,9 @@ mod tests {
     /// The control byte is constructed at runtime via char::from(1u8) so that no
     /// literal control byte or \uXXXX escape appears in the source file (PF-018 /
     /// Source hygiene gate).
-    #[cfg(unix)]
+    ///
+    /// Runs on every host: the paths are only built and compared in memory, never
+    /// created on disk, so a Windows file name's character rules do not apply (#147).
     #[test]
     fn sort_key_sanitizes_control_byte_filenames() {
         use super::relative_display;

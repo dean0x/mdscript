@@ -2382,6 +2382,9 @@ mod tests {
     /// or raw byte appears in this source file (Source hygiene gate).
     ///
     /// Positive control: a valid-UTF-8 root set the same way must still be reported.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStringExt` (arbitrary bytes), a
+    /// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
     #[cfg(unix)]
     #[test]
     fn source_root_is_none_for_non_utf8_root() {
