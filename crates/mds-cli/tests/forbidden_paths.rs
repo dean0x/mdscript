@@ -389,3 +389,41 @@ fn output_dir_traversal_is_io_exit_2() {
     }
     assert!(!dir.path().parent().unwrap().join("escaped").exists());
 }
+
+// ── mds init: refused up front ────────────────────────────────────────────
+
+/// `mds init <filename>` refuses a forbidden character the same way `-o`/
+/// `--out-dir`/`build.output_dir` do: `mds::io`, exit 2, before the starter
+/// file is written.
+#[test]
+fn init_filename_is_refused_up_front() {
+    let dir = tempfile::tempdir().unwrap();
+    for ch in [ESC, '\t', '\n', '\u{202E}'] {
+        let value = format!("out{ch}x");
+        let (code, text) = run(dir.path(), &["init", value.as_str()]);
+        let label = format!("init U+{:04X}", u32::from(ch));
+        assert_eq!(code, Some(2), "{label}: got: {text}");
+        assert!(
+            text.contains(&format!(
+                "init filename contains forbidden character U+{:04X}",
+                u32::from(ch)
+            )),
+            "{label}: got: {text}"
+        );
+        assert_refusal(&text, ch, &format!("out{}x", escaped(ch)), &label);
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "nothing is created"
+    );
+}
+
+/// Control: a clean filename still creates the starter file.
+#[test]
+fn init_clean_filename_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, text) = run(dir.path(), &["init", "hello.mds"]);
+    assert_eq!(code, Some(0), "got: {text}");
+    assert!(dir.path().join("hello.mds").is_file());
+}

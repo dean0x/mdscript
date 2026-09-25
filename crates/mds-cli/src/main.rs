@@ -405,6 +405,10 @@ fn run_check_directory(
 }
 
 fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
+    // #265: refuse a hostile filename before anything is read or written — the
+    // same up-front check `-o`/`--out-dir`/`build.output_dir` apply
+    // (`reject_forbidden_output_flags`, build.rs).
+    output::reject_forbidden_output_path("init filename", filename.as_os_str())?;
     if filename
         .components()
         .any(|c| c == std::path::Component::ParentDir)
