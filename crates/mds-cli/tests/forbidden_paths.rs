@@ -201,16 +201,23 @@ mod walker {
 
     /// Watch starts, refuses the hostile file, builds the sibling, and keeps running:
     /// an edit to the sibling after the refusal is still rebuilt.
+    ///
+    /// The refusal names the file as walked from the root as typed — `src/evil…` for
+    /// `watch src`, the form `build src` shows — never the canonical absolute path
+    /// watch matches its events against.
     #[test]
     fn watch_refuses_the_hostile_file_and_keeps_running() {
-        let (dir, shown) = tree();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("ok.mds"), "Hello!\n").unwrap();
+        std::fs::write(src.join(format!("evil{ESC}[31m.mds")), "Evil!\n").unwrap();
+        let shown = format!("evil{}[31m.mds", escaped(ESC));
         let out = dir.path().join("out");
         let (child, tap, _) = spawn_watch_ready(
             mds_bin()
-                .arg("watch")
-                .arg(dir.path())
-                .arg("--out-dir")
-                .arg(&out)
+                .current_dir(dir.path())
+                .args(["watch", "src", "--out-dir", "out"])
                 .args(["--debounce", "0"])
                 .stdout(Stdio::null()),
         );
@@ -232,7 +239,7 @@ mod walker {
             "sibling built at startup"
         );
 
-        write_atomic(&dir.path().join("ok.mds"), "Edited!\n");
+        write_atomic(&src.join("ok.mds"), "Edited!\n");
         assert!(
             wait_for(&out.join("ok.md"), "Edited!"),
             "watch keeps running after the refusal; stderr: {}",
@@ -245,9 +252,37 @@ mod walker {
 
         let stderr = tap.finish_text(&mut child);
         assert_refusal(&stderr, ESC, &shown, "watch");
+        assert_names_as_typed(&stderr, &format!("src/{shown}"), dir.path(), "watch");
         assert!(
             !out.join(format!("evil{ESC}[31m.md")).exists(),
             "nothing is written for the refused file"
+        );
+    }
+
+    /// File mode names a hostile file argument as typed, too.
+    #[test]
+    fn watch_file_mode_names_the_hostile_file_as_typed() {
+        let (dir, shown) = tree();
+        let hostile = format!("evil{ESC}[31m.mds");
+        let (code, text) = run(dir.path(), &["watch", hostile.as_str()]);
+        assert_eq!(code, Some(2), "refused at startup; got: {text}");
+        assert_refusal(&text, ESC, &shown, "watch file");
+        assert_names_as_typed(&text, &shown, dir.path(), "watch file");
+    }
+
+    /// `text` quotes the refused path exactly as `shown` and never quotes the
+    /// canonical absolute path of `root` — status lines may name that, a refusal may
+    /// not.
+    fn assert_names_as_typed(text: &str, shown: &str, root: &Path, label: &str) {
+        let text = squash(text);
+        let canonical = root.canonicalize().unwrap();
+        assert!(
+            !text.contains(&squash(&format!("\"{}", canonical.display()))),
+            "{label}: must not quote the absolute path; got: {text}"
+        );
+        assert!(
+            text.contains(&squash(&format!("\"{shown}\""))),
+            "{label}: must quote {shown:?} as typed; got: {text}"
         );
     }
 
