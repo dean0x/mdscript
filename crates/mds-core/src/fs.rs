@@ -91,7 +91,7 @@ pub trait FileSystem: Send + Sync {
     ///
     /// - [`MdsError::Io`] when `path` is empty or contains a null byte (`\0`) or
     ///   another [`crate::is_forbidden_path_char`] codepoint; on [`NativeFs`] also
-    ///   when its canonical path carries one.
+    ///   when its canonical path carries one or is not valid UTF-8.
     /// - [`MdsError::ResourceLimit`] when `path` has more than 256 segments.
     /// - [`MdsError::FileNotFound`] when the path does not exist ([`NativeFs`] only).
     /// - [`MdsError::ImportError`] when the final component is a symlink or the
@@ -121,7 +121,7 @@ pub trait FileSystem: Send + Sync {
     ///
     /// Returns [`MdsError::ResourceLimit`] when the resolved path exceeds
     /// `MAX_PATH_SEGMENTS` segments, and [`MdsError::Io`] when the canonical path
-    /// carries a forbidden path character ([`NativeFs`] only).
+    /// carries a forbidden path character or is not valid UTF-8 ([`NativeFs`] only).
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError>;
 
     /// Return the directory portion of a normalized file key.
@@ -159,9 +159,9 @@ pub trait FileSystem: Send + Sync {
     /// # Errors
     ///
     /// The default never fails. [`NativeFs`] returns:
-    /// - [`MdsError::Io`] when `dir` does not exist or cannot be resolved, or when
+    /// - [`MdsError::Io`] when `dir` does not exist or cannot be resolved, when
     ///   `dir` or its canonical path carries a [`crate::is_forbidden_path_char`]
-    ///   codepoint.
+    ///   codepoint, or when its canonical path is not valid UTF-8.
     /// - [`MdsError::ImportError`] when the final component of `dir` is a symlink.
     fn anchor_base_dir(&self, dir: &str) -> Result<String, MdsError> {
         Ok(dir.to_string())
@@ -239,8 +239,8 @@ pub(crate) fn reject_forbidden_path_chars(what: &str, path: &str) -> Result<(), 
 /// never the absolute resolved path (R3 / CWE-209).
 ///
 /// A path that is not valid UTF-8 is scanned lossily: every forbidden codepoint that
-/// is validly encoded survives the conversion, and a key that is not valid UTF-8
-/// never resolves anyway.
+/// is validly encoded survives the conversion, and `key_of` then refuses the path
+/// rather than turn it into a key.
 pub(crate) fn reject_forbidden_in_path(resolved: &Path, shown: &str) -> Result<(), MdsError> {
     match first_forbidden_char(&resolved.to_string_lossy()) {
         Some(ch) => Err(MdsError::io(forbidden_char_message(
@@ -250,6 +250,23 @@ pub(crate) fn reject_forbidden_in_path(resolved: &Path, shown: &str) -> Result<(
         ))),
         None => Ok(()),
     }
+}
+
+/// The key of a resolved `canonical` path: its exact UTF-8 string form.
+///
+/// A resolved path that is not valid UTF-8 is refused (`mds::io`), naming `shown`,
+/// the path as written. Its lossy form would replace each invalid sequence with
+/// U+FFFD and so name a DIFFERENT path — a valid-UTF-8 "twin" that `read` would then
+/// open with none of the symlink, containment and forbidden-character checks the
+/// real path passed. A symlinked parent directory can lead into such a name even
+/// though every path a caller writes is UTF-8.
+fn key_of(canonical: &Path, shown: &str) -> Result<String, MdsError> {
+    canonical.to_str().map(str::to_owned).ok_or_else(|| {
+        MdsError::io(format!(
+            "resolved path is not valid UTF-8: \"{}\"",
+            crate::lint::escape_path_for_message(shown)
+        ))
+    })
 }
 
 /// Reject an import path that is empty, contains a null byte, or carries any other
@@ -690,7 +707,7 @@ impl NativeFs {
         // string (what the user typed) rather than the absolute joined path (R3 / CWE-209).
         let canonical = Self::check_symlink_named(&path, relative)?;
         self.check_path_traversal(&canonical, relative)?;
-        Ok(canonical.display().to_string())
+        key_of(&canonical, relative)
     }
 
     /// Initialize root_dir from a canonical entry-point directory.
@@ -719,12 +736,14 @@ impl FileSystem for NativeFs {
         // caller-supplied entry path and path.display() == path, so there is no
         // leakage risk.
         let canonical = Self::check_symlink(Path::new(path))?;
+        // Before the root is anchored: a path refused here must not anchor it.
+        let key = key_of(&canonical, path)?;
         // Anchor the security root on first entry-point resolution.
         // effective_parent is safe even if canonical is somehow relative — avoids PF-006.
         let entry_dir = effective_parent(&canonical);
         self.init_root(entry_dir);
         self.check_path_traversal(&canonical, path)?;
-        Ok(canonical.display().to_string())
+        Ok(key)
     }
 
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
@@ -788,9 +807,11 @@ impl FileSystem for NativeFs {
             }
             other => other,
         })?;
+        // Before the root is anchored: a directory refused here must not anchor it.
+        let key = key_of(&canonical, dir)?;
         // First writer wins: init_root never moves an established root.
         self.init_root(&canonical);
-        Ok(canonical.display().to_string())
+        Ok(key)
     }
 
     fn source_root(&self) -> Option<String> {
@@ -1462,6 +1483,116 @@ mod tests {
             .normalize_in_dir(&root.display().to_string(), "./alias2/x.mds")
             .is_ok());
         assert!(NativeFs::check_symlink(&root.join("alias2").join("x.mds")).is_ok());
+    }
+
+    // ── Non-UTF-8 resolved paths: refused, never keyed lossily ────────────────
+
+    /// A resolved path that is not valid UTF-8 has no exact string key. Its lossy
+    /// form replaces each invalid sequence with U+FFFD and so names a DIFFERENT
+    /// path, which a later `read` would open with none of the checks the real path
+    /// passed. `key_of` refuses it instead (`mds::io`), naming the path as written.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 path with `OsStringExt` (arbitrary bytes),
+    /// a Unix-only API; Windows paths are UTF-16. It is only built in memory, so it
+    /// runs on macOS too, whose filesystem refuses such a name.
+    #[cfg(unix)]
+    #[test]
+    fn key_of_refuses_a_non_utf8_resolved_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let resolved = PathBuf::from(OsString::from_vec(b"/p/sub\xFF/x.mds".to_vec()));
+        let err = key_of(&resolved, "./link/x.mds").expect_err("a non-UTF-8 path has no key");
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert_eq!(
+            err.to_string(),
+            "resolved path is not valid UTF-8: \"./link/x.mds\""
+        );
+
+        // Control: a UTF-8 path is its own key, unchanged.
+        assert_eq!(
+            key_of(Path::new("/p/sub/x.mds"), "./x.mds").unwrap(),
+            "/p/sub/x.mds"
+        );
+    }
+
+    /// End to end: an entry, import or base directory reached through a symlink into
+    /// a directory whose name is not valid UTF-8 is refused — where a lossy key would
+    /// have opened the valid-UTF-8 "twin", the same name with U+FFFD, unchecked. In
+    /// an untrusted repository the twin's file can be a symlink to anything.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStringExt` (arbitrary bytes),
+    /// a Unix-only API. macOS (APFS / HFS+) refuses the name, so the on-disk half is
+    /// a Linux-CI gate; `key_of_refuses_a_non_utf8_resolved_path` covers the refusal
+    /// on every unix host.
+    #[cfg(unix)]
+    #[test]
+    fn native_non_utf8_resolved_path_is_refused_not_read_as_its_twin() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let hostile = root.join(OsString::from_vec(b"sub\xFF".to_vec()));
+        if std::fs::create_dir(&hostile).is_err() {
+            // Any unix filesystem other than macOS's must accept the name and reach
+            // the assertions below — never a silent skip there.
+            #[cfg(not(target_os = "macos"))]
+            panic!("a non-UTF-8 directory name was rejected by the filesystem");
+            #[cfg(target_os = "macos")]
+            return;
+        }
+        std::fs::create_dir(hostile.join("sub")).unwrap();
+        std::fs::write(hostile.join("x.mds"), "real\n").unwrap();
+        assert!(make_symlink(&hostile, &root.join("link")));
+        // The twin the lossy key names, holding a different file.
+        let twin = root.join(format!("sub{}", char::REPLACEMENT_CHARACTER));
+        std::fs::create_dir(&twin).unwrap();
+        std::fs::create_dir(twin.join("sub")).unwrap();
+        std::fs::write(twin.join("x.mds"), "twin\n").unwrap();
+        let root_str = root.display().to_string();
+
+        let assert_refused = |err: MdsError, shown: &str| {
+            assert_eq!(code_of(&err).as_deref(), Some("mds::io"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                format!("resolved path is not valid UTF-8: \"{shown}\"")
+            );
+        };
+
+        let err = NativeFs::new()
+            .normalize_in_dir(&root_str, "./link/x.mds")
+            .expect_err("an import through the link must be refused, not read as its twin");
+        assert_refused(err, "./link/x.mds");
+
+        let entry = root.join("link").join("x.mds").display().to_string();
+        let err = NativeFs::new()
+            .resolve_entry(&entry)
+            .expect_err("an entry through the link must be refused");
+        assert_refused(err, &entry);
+
+        let base = root.join("link").join("sub").display().to_string();
+        let fs = NativeFs::new();
+        let err = fs
+            .anchor_base_dir(&base)
+            .expect_err("a base directory through the link must be refused");
+        assert_refused(err, &base);
+        assert_eq!(
+            fs.source_root(),
+            None,
+            "a refused base must not anchor the root"
+        );
+
+        // Control: the twin, named directly, resolves and reads as itself — the file
+        // a lossy key would have read in place of the real one.
+        let fs = NativeFs::new();
+        let key = fs
+            .normalize_in_dir(
+                &root_str,
+                &format!("./sub{}/x.mds", char::REPLACEMENT_CHARACTER),
+            )
+            .unwrap();
+        assert_eq!(fs.read(&key).unwrap(), "twin\n");
     }
 
     // ── is_markdown consistency ───────────────────────────────────────────────

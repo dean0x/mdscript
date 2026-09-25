@@ -67,7 +67,9 @@ input. The compiler enforces several defense-in-depth controls:
   name that reaches one is displayed as `\uXXXX` text instead of being interpreted
   by the terminal.
 - **Non-UTF-8 paths** are rejected at the public API boundary with an explicit
-  error instead of producing corrupted output.
+  error instead of producing corrupted output. A resolved path that is not valid
+  UTF-8 — reached through a symbolic link into such a directory — is refused too,
+  never turned into a lossy key, which would name a different, unchecked file.
 - **Path segment cap**: an entry path or import path of more than 256 segments is
   refused (`mds::resource_limit`) on both built-in backends.
 - **Source-map anchors are byte-faithful**: the project root and `source_map_base`
