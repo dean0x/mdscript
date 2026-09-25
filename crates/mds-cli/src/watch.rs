@@ -3416,7 +3416,12 @@ mod tests {
         assert!(now_missing.is_empty());
     }
 
-    // snapshot_state / state_differs.
+    // snapshot_state / state_differs: the size leg of the (mtime, size) stamp.
+    //
+    // The rewrite changes the length, so the change is visible however coarse the
+    // filesystem's mtime clock is. Two back-to-back writes of equal length can share
+    // one mtime tick (NTFS, FAT, jiffy-granular ext4) — the mtime leg is pinned
+    // deterministically by `snapshot_and_diff_detect_same_size_mtime_change`.
     #[test]
     fn snapshot_and_diff_detect_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -3429,8 +3434,53 @@ mod tests {
         assert!(!state_differs(&paths, &snap));
 
         // Modify the file.
-        std::fs::write(&f, "v2").unwrap();
+        std::fs::write(&f, "v2 — longer").unwrap();
         assert!(state_differs(&paths, &snap), "should detect content change");
+    }
+
+    // snapshot_state / state_differs: the mtime leg of the (mtime, size) stamp.
+    //
+    // A same-size rewrite is detectable only through mtime, so the test sets the
+    // mtime explicitly instead of relying on the clock ticking between two writes.
+    #[test]
+    fn snapshot_and_diff_detect_same_size_mtime_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("test.mds");
+        std::fs::write(&f, "v1").unwrap();
+
+        let paths: HashSet<PathBuf> = std::iter::once(f.clone()).collect();
+        let snap = snapshot_state(&paths);
+        let (t0, size0) = snap[&f];
+        let t0 = t0.expect("mtime must be readable on the test filesystem");
+
+        std::fs::write(&f, "v2").unwrap();
+        let set_mtime = |t: std::time::SystemTime| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&f)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().len(),
+            size0.unwrap(),
+            "precondition: the rewrite keeps the size, so only mtime can differ"
+        );
+
+        // Control: with the mtime restored to the snapshot's, the stamp is identical —
+        // this is the coarse-clock case, and it proves the setter controls the stamp.
+        set_mtime(t0);
+        assert!(
+            !state_differs(&paths, &snap),
+            "control: same size and same mtime must compare equal"
+        );
+
+        set_mtime(t0 + Duration::from_secs(2));
+        assert!(
+            state_differs(&paths, &snap),
+            "should detect an mtime-only change"
+        );
     }
 
     // snapshot_state: disappearing file detected.
