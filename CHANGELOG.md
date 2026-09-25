@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (Rust API): `FileSystem::normalize` is replaced by the required `FileSystem::resolve_entry` (#155).** `normalize(base, relative)` mixed two jobs: with `base == ""` it resolved an entry path (and, on `NativeFs`, anchored the project root), and with a non-empty `base` it resolved an import — a branch no production caller ever used. Entry resolution is now `resolve_entry(path)`; import resolution stays `normalize_in_dir(parent_dir(key), relative)`. Custom backends passed to `ModuleCache::with_fs` must implement `resolve_entry` instead of `normalize` (return the key unchanged for an in-memory backend). The resolver now validates every entry path itself before calling the backend, so a custom backend never receives an empty entry path or one containing a NUL byte. `NativeFs` now enforces the documented 256-segment cap on entry paths and imports (only `VirtualFs` did before). An entry path that is empty or contains a NUL byte now reports `mds::io` (was `mds::import`), with the path escaped in the message; a NUL byte in an `@import` string is still `mds::import`.
+
 ### Fixed
 
 - A base directory at the filesystem root (`/`, or a Windows drive root) now anchors resolution AT the root instead of silently falling back to the current working directory. This fixed `mds::compile_str_with`/`check_str_with`/`lint_str_with`, CLI stdin (`mds build/check/lint -`) whose implicit base directory is the process cwd, the napi and Python bindings' `basePath`/`base_path` options, and the `@mdscript/mds` native backend's default — all of which previously failed with `cannot resolve path /: file not found: /` whenever the base directory resolved to a filesystem root (found by the release pipeline's Alpine load test, whose container has no `WORKDIR` and therefore a cwd of `/`, #371). `mds lint`/`mds fmt` on a file that lives directly at the filesystem root no longer silently downgrades to the weaker structural-equivalence fallback either — the fix lets the strong compile-and-diff safety gate run as intended.

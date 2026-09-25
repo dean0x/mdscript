@@ -3858,3 +3858,31 @@ fn import_through_root_base_dir_resolves() {
         .expect("markdown output expected");
     assert_eq!(output, "Hello World!\n");
 }
+
+// ── validate_import_path ──────────────────────────────────────────────────
+
+/// The resolver's own import-string guard (it runs before any backend, so it covers
+/// custom `with_fs` backends): an import must be `./`/`../`-relative and NUL-free.
+#[test]
+fn validate_import_path_requires_relative_nul_free_form() {
+    for bad in ["lib.mds", "/abs/lib.mds", "", "sub/../lib.mds"] {
+        let err = validate_import_path(bad).unwrap_err();
+        assert!(
+            matches!(err, MdsError::ImportError { .. }),
+            "{bad:?}: expected ImportError, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("import path must be relative"),
+            "{bad:?}: got {err}"
+        );
+    }
+    let err = validate_import_path("./a\0b.mds").unwrap_err();
+    assert!(
+        err.to_string().contains("import path contains null byte"),
+        "got {err}"
+    );
+    // Controls: both relative forms pass.
+    for ok in ["./lib.mds", "../lib.mds"] {
+        assert!(validate_import_path(ok).is_ok(), "{ok:?} must be accepted");
+    }
+}

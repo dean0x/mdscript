@@ -359,6 +359,143 @@ fn module_cache_with_fs_constructor() {
     let _cache = ModuleCache::with_fs(fs);
 }
 
+// ── FileSystem required-method set + resolver entry validation (#155) ─────────
+
+/// A custom backend implementing EXACTLY the required `FileSystem` methods.
+///
+/// This impl is the pin: a new required method fails to compile here (E0046), and
+/// so does removing one of these five (E0407). `resolve_entry` is an identity
+/// function that performs NO validation of its own and counts its calls, so the
+/// tests below can prove the resolver validates entry paths before a custom
+/// backend is ever reached.
+struct IdentityFs {
+    inner: VirtualFs,
+    resolve_entry_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl IdentityFs {
+    fn new(
+        modules: HashMap<String, String>,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fs = Self {
+            inner: VirtualFs::new(modules),
+            resolve_entry_calls: std::sync::Arc::clone(&calls),
+        };
+        (fs, calls)
+    }
+}
+
+impl FileSystem for IdentityFs {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        self.resolve_entry_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(path.to_string())
+    }
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        self.inner.normalize_in_dir(dir, relative)
+    }
+    fn parent_dir(&self, key: &str) -> String {
+        self.inner.parent_dir(key)
+    }
+    fn read(&self, key: &str) -> Result<String, MdsError> {
+        self.inner.read(key)
+    }
+    fn is_markdown(&self, key: &str) -> bool {
+        self.inner.is_markdown(key)
+    }
+}
+
+fn diagnostic_code(err: &MdsError) -> Option<String> {
+    miette::Diagnostic::code(err).map(|c| c.to_string())
+}
+
+#[test]
+fn filesystem_trait_required_methods_pin() {
+    let modules = HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
+    let (fs, calls) = IdentityFs::new(modules);
+    let fs: Box<dyn FileSystem> = Box::new(fs);
+    let mut cache = ModuleCache::with_fs(fs);
+    let output = cache
+        .resolve_path_intrinsic("main.mds", &HashMap::new(), &mut vec![])
+        .expect("a backend with only the required methods must resolve an entry");
+    assert!(
+        matches!(&output, CompiledOutput::Markdown(s) if s == "Hello!\n"),
+        "unexpected output: {output:?}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the entry must be resolved through FileSystem::resolve_entry"
+    );
+}
+
+/// AC-155-5: entry validation runs in the resolver, so a custom backend whose
+/// `resolve_entry` validates nothing still never sees an empty or NUL entry path.
+#[test]
+fn custom_backend_entry_validation_runs_before_backend() {
+    for bad in ["", "a\0b.mds"] {
+        let (fs, calls) = IdentityFs::new(HashMap::new());
+        let mut cache = ModuleCache::with_fs(Box::new(fs));
+        let err = cache
+            .resolve_path(bad, &HashMap::new(), &mut vec![])
+            .unwrap_err();
+        assert_eq!(
+            diagnostic_code(&err).as_deref(),
+            Some("mds::io"),
+            "entry {bad:?}: expected mds::io, got {err:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "entry {bad:?}: the backend must not be called"
+        );
+    }
+
+    // Control: a valid entry path does reach the backend.
+    let modules = HashMap::from([("main.mds".to_string(), "Hi\n".to_string())]);
+    let (fs, calls) = IdentityFs::new(modules);
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    cache
+        .resolve_path("main.mds", &HashMap::new(), &mut vec![])
+        .expect("control: a valid entry resolves");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A NUL byte in an entry path is caller input, not an `@import` string: it
+/// reports `mds::io` through the public compile API and on the virtual backend.
+#[test]
+fn nul_in_entry_path_is_io_error() {
+    let err = mds::compile("./\0evil.mds", None).unwrap_err();
+    assert_eq!(
+        diagnostic_code(&err).as_deref(),
+        Some("mds::io"),
+        "compile: got {err:?}"
+    );
+
+    let mut cache = ModuleCache::virtual_fs(HashMap::new());
+    let err = cache
+        .resolve_path("a\0b.mds", &HashMap::new(), &mut vec![])
+        .unwrap_err();
+    assert_eq!(
+        diagnostic_code(&err).as_deref(),
+        Some("mds::io"),
+        "virtual: got {err:?}"
+    );
+
+    // Control: a NUL byte in an @import string stays mds::import.
+    let modules = HashMap::from([(
+        "main.mds".to_string(),
+        "@import \"./a\0b.mds\"\n".to_string(),
+    )]);
+    let err = mds::compile_virtual(modules, "main.mds", None).unwrap_err();
+    assert_eq!(
+        diagnostic_code(&err).as_deref(),
+        Some("mds::import"),
+        "import control: got {err:?}"
+    );
+}
+
 #[test]
 fn module_cache_new_still_works() {
     let _cache = ModuleCache::new();

@@ -592,7 +592,7 @@ pub fn compile_collecting_warnings(
     // imported sub-modules are inserted), so `dependencies()` normally already
     // excludes the entry. Filter the canonical entry key anyway to also drop it in
     // the edge case where a transitive import re-imports the entry. check_symlink
-    // mirrors the normalize("", path) the resolver already performed — no extra I/O.
+    // mirrors the NativeFs::resolve_entry the resolver already performed — no extra I/O.
     let canonical_entry = NativeFs::check_symlink(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path_str.to_owned());

@@ -346,11 +346,23 @@ impl ModuleCache {
         Ok(())
     }
 
+    /// Validate an entry path and resolve it to its key through the backend.
+    ///
+    /// Entry validation runs here, before the backend is called, so a custom
+    /// [`FileSystem`] passed to [`ModuleCache::with_fs`] is covered as well as the
+    /// built-in backends (PF-004): an empty entry path or one containing a null
+    /// byte is refused with `mds::io` and never reaches
+    /// [`FileSystem::resolve_entry`].
+    fn resolve_entry_key(&self, path: &str) -> Result<String, MdsError> {
+        crate::fs::validate_entry_path(path)?;
+        self.fs.resolve_entry(path)
+    }
+
     /// Resolve a module from a filesystem path string.
     ///
     /// `path` is a UTF-8 string representation of the OS path (callers convert
     /// `&Path` to `&str` at the public API boundary via `path_to_str`).
-    /// Normalizes `path` to a canonical key via the underlying [`FileSystem`],
+    /// Validates `path` and resolves it to a key via [`FileSystem::resolve_entry`],
     /// then resolves through the module cache with cycle detection and depth guarding.
     pub fn resolve_path(
         &mut self,
@@ -358,7 +370,7 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        let key = self.fs.normalize("", path)?;
+        let key = self.resolve_entry_key(path)?;
         self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
@@ -366,16 +378,16 @@ impl ModuleCache {
     ///
     /// Output shape is intrinsic to the template: a template containing any `@message`
     /// block resolves to [`crate::CompiledOutput::Messages`], otherwise to
-    /// [`crate::CompiledOutput::Markdown`]. Routes the entry through the filesystem
-    /// normalizer (so `check_symlink` and `MAX_FILE_SIZE` are enforced on the entry),
-    /// then resolves via `process_module_intrinsic`.
+    /// [`crate::CompiledOutput::Markdown`]. Routes the entry through entry validation
+    /// and [`FileSystem::resolve_entry`] (so `check_symlink` and `MAX_FILE_SIZE` are
+    /// enforced on the entry), then resolves via `process_module_intrinsic`.
     pub fn resolve_path_intrinsic(
         &mut self,
         path: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        let key = self.fs.normalize("", path)?;
+        let key = self.resolve_entry_key(path)?;
         self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
@@ -388,7 +400,7 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
-        let key = self.fs.normalize("", path)?;
+        let key = self.resolve_entry_key(path)?;
         self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
     }
 
@@ -912,7 +924,7 @@ impl ModuleCache {
             // the published map.  Unconditional — never opt-in, never debug_assert.
             //
             // Defense-in-depth: establish root from base_dir if it was not set by
-            // the entry-point normalize() / set_root() call (guards against a future
+            // the entry-point resolve_entry() / set_root() call (guards against a future
             // alternate code path that bypasses root establishment — PF-004 shape).
             // No-op for VirtualFs: its source_root() always returns None regardless.
             if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
@@ -994,7 +1006,7 @@ impl ModuleCache {
         // the published map.  Unconditional — never opt-in, never debug_assert.
         //
         // Defense-in-depth: establish root from base_dir if it was not set by
-        // the entry-point normalize() / set_root() call (guards against a future
+        // the entry-point resolve_entry() / set_root() call (guards against a future
         // alternate code path that bypasses root establishment — PF-004 shape).
         // No-op for VirtualFs: its source_root() always returns None regardless.
         if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
@@ -2123,9 +2135,10 @@ struct ModuleCtx<'a> {
     /// Canonical key of the source file.
     ///
     /// For `NativeFs` compiles this is the absolute canonical path returned by
-    /// `fs.normalize()`.  For string-source compiles this is `SOURCE_LABEL`.  Used
-    /// for source-map interning (`MapBuilder::new` / `Origin::file`) — must be the
-    /// stable, dedup-safe identity key, never the display-friendly path.
+    /// `fs.resolve_entry()` (the entry) or `fs.normalize_in_dir()` (an import).  For
+    /// string-source compiles this is `SOURCE_LABEL`.  Used for source-map interning
+    /// (`MapBuilder::new` / `Origin::file`) — must be the stable, dedup-safe identity
+    /// key, never the display-friendly path.
     key: &'a str,
     /// Display-safe (root-relative) path for user-visible strings — error messages,
     /// `NamedSource` names, validator diagnostics (R3 / CWE-209).

@@ -258,7 +258,7 @@ fn module_not_found() {
 #[test]
 fn cross_subdirectory_import() {
     // pages/main.mds imports ../shared/utils.mds using a relative path that
-    // crosses a subdirectory boundary. This exercises VirtualFs::normalize for
+    // crosses a subdirectory boundary. This exercises VirtualFs::normalize_in_dir for
     // the ".." traversal case across the full compile pipeline.
     let mut modules = HashMap::new();
     modules.insert(

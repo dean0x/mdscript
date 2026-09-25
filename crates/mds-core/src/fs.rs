@@ -30,14 +30,17 @@ const MAX_PATH_SEGMENTS: usize = 256;
 /// Custom implementations provided via [`crate::resolver::ModuleCache::with_fs`]
 /// MUST uphold the following minimum obligations:
 ///
-/// - **Path traversal prevention**: `normalize` and `normalize_in_dir` must
+/// - **Path traversal prevention**: `resolve_entry` and `normalize_in_dir` must
 ///   reject paths that escape the intended root (e.g., `../../../etc/passwd`).
-/// - **Null-byte rejection**: `normalize` and `normalize_in_dir` must reject
-///   paths containing `\0`.
+/// - **Null-byte rejection**: `normalize_in_dir` must reject paths containing
+///   `\0`. The resolver refuses an entry path containing `\0` before
+///   `resolve_entry` is called.
+/// - **Segment cap**: `resolve_entry` and `normalize_in_dir` must refuse a path
+///   of more than 256 segments with [`MdsError::ResourceLimit`].
 /// - **File size limits**: `read` must refuse content larger than
 ///   [`crate::MAX_FILE_SIZE`] bytes (10 MB) to prevent resource exhaustion.
-/// - **Input sanitization**: `normalize` and `normalize_in_dir` must reject
-///   empty paths.
+/// - **Input sanitization**: `normalize_in_dir` must reject empty paths. The
+///   resolver refuses an empty entry path before `resolve_entry` is called.
 /// - **`dir == ""`** (empty string) in `normalize_in_dir` means "virtual root" or
 ///   "no directory prefix" — resolve `relative` from the root of the key-space.
 ///
@@ -45,21 +48,33 @@ const MAX_PATH_SEGMENTS: usize = 256;
 /// by [`NativeFs`] and may expose the host system to arbitrary file reads or
 /// denial-of-service attacks.
 pub trait FileSystem: Send + Sync {
-    /// Normalize a path relative to a base key.
+    /// Resolve an entry path — the file a compile starts from — to its key.
     ///
-    /// - `base == ""` means entry point (root-level resolution)
-    /// - `base != ""` means importing from within an already-resolved module
-    fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError>;
+    /// The resolver has already refused an empty entry path or one containing a
+    /// NUL byte (`mds::io`); both built-in backends refuse them again so a direct
+    /// call is covered too. [`NativeFs`] returns the canonical absolute path,
+    /// refuses a symlinked final component, and anchors the project root on its
+    /// first call. [`VirtualFs`] returns the key unchanged.
+    ///
+    /// # Errors
+    ///
+    /// - [`MdsError::Io`] when `path` is empty or contains a null byte (`\0`).
+    /// - [`MdsError::ResourceLimit`] when `path` has more than 256 segments.
+    /// - [`MdsError::FileNotFound`] when the path does not exist ([`NativeFs`] only).
+    /// - [`MdsError::ImportError`] when the final component is a symlink or the
+    ///   path escapes an already-established project root ([`NativeFs`] only).
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError>;
 
-    /// Resolve `relative` directly within directory `dir`.
+    /// Resolve `relative` directly within directory `dir` (import resolution).
     ///
-    /// Unlike `normalize`, which derives the directory by calling `parent()` on a
-    /// *file* key, this method receives the directory explicitly — no sentinel
-    /// filename, no `parent()` coupling, no Windows verbatim-path hazard (PF-003).
+    /// The directory is passed explicitly — callers derive it from the importing
+    /// module's key with [`FileSystem::parent_dir`] — so there is no sentinel
+    /// filename and no Windows verbatim-path hazard (PF-003).
     ///
     /// `dir == ""` means resolve from the root of the key-space (the same as an
     /// import from a top-level file). Implementations must enforce all traversal,
-    /// null-byte, and empty-path guards as described in the security contract above.
+    /// null-byte, empty-path and segment-cap guards as described in the security
+    /// contract above.
     ///
     /// # Errors
     ///
@@ -93,7 +108,7 @@ pub trait FileSystem: Send + Sync {
     /// Pre-initialize the project root before imports resolve.
     ///
     /// Default: no-op. [`VirtualFs`] ignores this; [`NativeFs`] uses it for
-    /// `resolve_source` paths that don't go through [`FileSystem::normalize`].
+    /// `resolve_source` paths that don't go through [`FileSystem::resolve_entry`].
     fn set_root(&self, _base: &str) -> Result<(), MdsError> {
         Ok(())
     }
@@ -126,7 +141,7 @@ pub trait FileSystem: Send + Sync {
     /// [`NativeFs`] returns the path established by `init_root` (the project
     /// root found by walking up from the entry-point directory).  Returns
     /// `None` if the root has not been established yet (before any
-    /// `normalize` or `set_root` call).
+    /// `resolve_entry` or `set_root` call).
     ///
     /// # Contract
     ///
@@ -138,13 +153,12 @@ pub trait FileSystem: Send + Sync {
     }
 }
 
-// ── VirtualFs shared segment logic ───────────────────────────────────────────
+// ── Shared path guards ───────────────────────────────────────────────────────
 
-/// Reject empty paths and paths containing null bytes.
+/// Reject empty import paths and import paths containing null bytes.
 ///
-/// Called at every normalization entry point; extracted to eliminate copy-paste
-/// and ensure the error strings remain consistent across `normalize` and
-/// `normalize_in_dir` on both `NativeFs` and `VirtualFs`.
+/// Called by `normalize_in_dir` on both `NativeFs` and `VirtualFs`, so the error
+/// strings stay identical across backends.
 fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
     if relative.is_empty() {
         return Err(MdsError::import_error("import path is empty"));
@@ -154,6 +168,51 @@ fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
     }
     Ok(())
 }
+
+/// Reject an entry path that is empty or contains a null byte (`mds::io`).
+///
+/// An entry path names the file a compile starts from. It is caller input, not an
+/// `@import` string, so it reports `mds::io` like the other entry-path checks at
+/// the API boundary (a path that is not valid UTF-8). The resolver runs this
+/// before [`FileSystem::resolve_entry`], so a custom backend is covered; both
+/// built-in backends run it again so a direct trait call is covered too.
+///
+/// The path is WIRE-escaped in the message: it is the string the caller passed,
+/// never a resolved absolute path.
+pub(crate) fn validate_entry_path(path: &str) -> Result<(), MdsError> {
+    if path.is_empty() {
+        return Err(MdsError::io("entry path is empty"));
+    }
+    if path.contains('\0') {
+        return Err(MdsError::io(format!(
+            "entry path contains null byte: \"{}\"",
+            crate::lint::sanitize_control_chars_wire(path)
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a path of more than [`MAX_PATH_SEGMENTS`] segments (`mds::resource_limit`).
+///
+/// Counts the non-empty segments other than `.`, split on the platform's path
+/// separators (`/`, and also `\` on Windows); `..` counts. Shared by both
+/// backends' `resolve_entry` and by `NativeFs::normalize_in_dir`, so the cap and
+/// its message are the same wherever it applies.
+fn check_segment_count(path: &str) -> Result<(), MdsError> {
+    let segments = path
+        .split(std::path::is_separator)
+        .filter(|s| !s.is_empty() && *s != ".")
+        .count();
+    if segments > MAX_PATH_SEGMENTS {
+        return Err(MdsError::resource_limit(format!(
+            "import path exceeds maximum segment count ({MAX_PATH_SEGMENTS}): \"{}\"",
+            crate::lint::sanitize_control_chars_wire(path)
+        )));
+    }
+    Ok(())
+}
+
+// ── VirtualFs segment logic ──────────────────────────────────────────────────
 
 /// Resolve a relative path string against a pre-split directory segment stack.
 ///
@@ -166,8 +225,7 @@ fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
 /// - empty resolved key
 /// - exceeding [`MAX_PATH_SEGMENTS`]
 ///
-/// Shared by [`VirtualFs::normalize`] and [`VirtualFs::normalize_in_dir`] so
-/// both can never silently drift in their path-resolution semantics.
+/// The path-resolution core of [`VirtualFs::normalize_in_dir`].
 fn resolve_relative_segments<'a>(
     mut dir_segments: Vec<&'a str>,
     relative: &'a str,
@@ -224,32 +282,15 @@ impl VirtualFs {
 }
 
 impl FileSystem for VirtualFs {
-    /// Resolve `relative` against the directory portion of `base`.
+    /// Return the entry key unchanged.
     ///
-    /// When `base == ""` the relative path is used as-is (root entry point).
-    /// Rejects: empty paths, null bytes, traversal above the virtual root.
-    fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
-        validate_relative_import(relative)?;
-
-        if base.is_empty() {
-            // Root entry point — use key as-is, but still enforce the segment limit.
-            let segment_count = relative
-                .split('/')
-                .filter(|s| !s.is_empty() && *s != ".")
-                .count();
-            if segment_count > MAX_PATH_SEGMENTS {
-                return Err(MdsError::resource_limit(format!(
-                    "import path exceeds maximum segment count ({MAX_PATH_SEGMENTS}): \"{relative}\""
-                )));
-            }
-            return Ok(relative.to_string());
-        }
-
-        // Delegate to normalize_in_dir with the parent directory of `base`.
-        // `rsplit_once('/')` gives the directory part of the key, or "" for a
-        // top-level key (no directory component).
-        let base_dir = base.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        self.normalize_in_dir(base_dir, relative)
+    /// The key is not rewritten (no `.`/`..` collapsing): it must match a key of
+    /// the module map exactly. Rejects empty keys and null bytes (`mds::io`) and
+    /// keys of more than 256 segments.
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        validate_entry_path(path)?;
+        check_segment_count(path)?;
+        Ok(path.to_string())
     }
 
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
@@ -324,7 +365,7 @@ pub fn effective_parent(path: &Path) -> &Path {
 impl NativeFs {
     /// Create a new `NativeFs` with no root directory set.
     ///
-    /// The root is established on the first call to [`FileSystem::normalize`]
+    /// The root is established on the first call to [`FileSystem::resolve_entry`]
     /// or [`FileSystem::set_root`].
     pub fn new() -> Self {
         Self {
@@ -429,7 +470,7 @@ impl NativeFs {
     ///
     /// Uses [`crate::source_path::relativize_source`] so the result is never an
     /// absolute path (R3 / CWE-209).  Falls back to the basename when the root has
-    /// not been established yet (e.g. before the first `normalize` call).
+    /// not been established yet (e.g. before the first `resolve_entry` call).
     fn display_of(&self, path: &Path) -> String {
         let path_str = path.display().to_string();
         let root_str = self.source_root();
@@ -484,15 +525,16 @@ impl NativeFs {
     /// Resolve `relative` within `dir` (given as a `&Path`) using the established
     /// security primitives — no `Path`→`String`→`Path` round-trip on the hot path.
     ///
-    /// Validates `relative` (null-byte, empty), joins with `dir` via `Path::join`
-    /// (verbatim-path-safe on Windows; avoids PF-003 / #133), then runs
+    /// Validates `relative` (null-byte, empty, segment cap), joins with `dir` via
+    /// `Path::join` (verbatim-path-safe on Windows; avoids PF-003 / #133), then runs
     /// `check_symlink` and `check_path_traversal` before returning the canonical
     /// key string.
     ///
-    /// Does NOT call `init_root` — only entry-point resolution (the `base == ""`
-    /// branch in `normalize`) anchors the security root.
+    /// Does NOT call `init_root` — only entry-point resolution
+    /// ([`FileSystem::resolve_entry`]) anchors the security root.
     fn normalize_in_dir_impl(&self, dir: &Path, relative: &str) -> Result<String, MdsError> {
         validate_relative_import(relative)?;
+        check_segment_count(relative)?;
         let path = dir.join(relative);
         // Use check_symlink_named so the error message shows the relative import
         // string (what the user typed) rather than the absolute joined path (R3 / CWE-209).
@@ -520,28 +562,19 @@ impl Default for NativeFs {
 }
 
 impl FileSystem for NativeFs {
-    fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
-        validate_relative_import(relative)?;
-
-        if base.is_empty() {
-            // Root entry point: treat `relative` as a filesystem path.
-            // Use check_symlink (shows path.display()) here — at the root entry point
-            // `relative` is the user-supplied path and path.display() == relative, so
-            // there is no leakage risk.
-            let canonical = Self::check_symlink(Path::new(relative))?;
-            // Anchor the security root on first entry-point resolution.
-            // effective_parent is safe even if canonical is somehow relative — avoids PF-006.
-            let entry_dir = effective_parent(&canonical);
-            self.init_root(entry_dir);
-            self.check_path_traversal(&canonical, relative)?;
-            Ok(canonical.display().to_string())
-        } else {
-            // Import from within a resolved module: resolve against the parent
-            // directory of `base` via the Path-typed helper (no String round-trip).
-            // effective_parent guards against an empty parent — avoids PF-006.
-            let base_dir = effective_parent(Path::new(base));
-            self.normalize_in_dir_impl(base_dir, relative)
-        }
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        validate_entry_path(path)?;
+        check_segment_count(path)?;
+        // Use check_symlink (shows path.display()) here — `path` is the
+        // caller-supplied entry path and path.display() == path, so there is no
+        // leakage risk.
+        let canonical = Self::check_symlink(Path::new(path))?;
+        // Anchor the security root on first entry-point resolution.
+        // effective_parent is safe even if canonical is somehow relative — avoids PF-006.
+        let entry_dir = effective_parent(&canonical);
+        self.init_root(entry_dir);
+        self.check_path_traversal(&canonical, path)?;
+        Ok(canonical.display().to_string())
     }
 
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
@@ -635,77 +668,113 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    // ── VirtualFs::normalize ──────────────────────────────────────────────────
+    // ── VirtualFs::resolve_entry ──────────────────────────────────────────────
 
     fn vfs() -> VirtualFs {
         VirtualFs::new(HashMap::new())
     }
 
-    #[test]
-    fn vfs_normalize_same_dir_sibling() {
-        let result = vfs().normalize("components/header.mds", "./footer.mds");
-        assert_eq!(result.unwrap(), "components/footer.mds");
+    /// `n` path segments `seg0/seg1/…` joined by `/`.
+    fn segments(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("seg{i}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The `mds::…` diagnostic code of an error.
+    fn code_of(err: &MdsError) -> Option<String> {
+        miette::Diagnostic::code(err).map(|c| c.to_string())
     }
 
     #[test]
-    fn vfs_normalize_parent_dir() {
-        let result = vfs().normalize("components/header.mds", "../shared.mds");
-        assert_eq!(result.unwrap(), "shared.mds");
+    fn vfs_resolve_entry_returns_key_unchanged() {
+        assert_eq!(vfs().resolve_entry("main.mds").unwrap(), "main.mds");
+        // The key is NOT rewritten: `.`/`..` collapsing is import resolution
+        // (`normalize_in_dir`), and an entry key must match a module-map key
+        // exactly. Control: the same string through normalize_in_dir IS rewritten.
+        let raw = "./a/../main.mds";
+        assert_eq!(vfs().resolve_entry(raw).unwrap(), raw);
+        assert_eq!(vfs().normalize_in_dir("", raw).unwrap(), "main.mds");
     }
 
     #[test]
-    fn vfs_normalize_two_levels_up() {
-        let result = vfs().normalize("a/b/c.mds", "../../d.mds");
+    fn vfs_resolve_entry_null_byte_is_io_error() {
+        let err = vfs().resolve_entry("a\0b.mds").unwrap_err();
+        assert!(
+            matches!(err, MdsError::Io { .. }),
+            "expected Io, got {err:?}"
+        );
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        let msg = err.to_string();
+        // The key is shown WIRE-escaped: the escape is present, the raw NUL is not.
+        let escaped = format!("a\\u{:04X}b.mds", 0);
+        assert!(
+            msg.contains("null byte") && msg.contains(&escaped),
+            "expected {escaped:?} in the message, got: {msg}"
+        );
+        assert!(!msg.contains('\0'), "raw NUL must not reach the message");
+    }
+
+    #[test]
+    fn vfs_resolve_entry_empty_is_io_error() {
+        let err = vfs().resolve_entry("").unwrap_err();
+        assert!(
+            matches!(err, MdsError::Io { .. }),
+            "expected Io, got {err:?}"
+        );
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert!(
+            err.to_string().contains("entry path is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn vfs_resolve_entry_segment_cap() {
+        let err = vfs()
+            .resolve_entry(&segments(MAX_PATH_SEGMENTS + 1))
+            .unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit, got {err:?}"
+        );
+        // Control: exactly at the cap is accepted, unchanged.
+        let at_cap = segments(MAX_PATH_SEGMENTS);
+        assert_eq!(vfs().resolve_entry(&at_cap).unwrap(), at_cap);
+    }
+
+    // ── VirtualFs::normalize_in_dir relative to a module's parent_dir ─────────
+
+    #[test]
+    fn vfs_normalize_in_dir_two_levels_up() {
+        let fs = vfs();
+        let result = fs.normalize_in_dir(&fs.parent_dir("a/b/c.mds"), "../../d.mds");
         assert_eq!(result.unwrap(), "d.mds");
     }
 
     #[test]
-    fn vfs_normalize_escapes_root() {
-        // "a.mds" has no parent directory segment, so ".." would go above root.
-        let result = vfs().normalize("a.mds", "../../x.mds");
-        assert!(result.is_err(), "expected Err, got {result:?}");
-    }
-
-    #[test]
-    fn vfs_normalize_dot_segments_collapsed() {
-        let result = vfs().normalize("a/b.mds", "./././c.mds");
+    fn vfs_normalize_in_dir_dot_segments_collapsed() {
+        let fs = vfs();
+        let result = fs.normalize_in_dir(&fs.parent_dir("a/b.mds"), "./././c.mds");
         assert_eq!(result.unwrap(), "a/c.mds");
     }
 
     #[test]
-    fn vfs_normalize_empty_path_errors() {
-        let result = vfs().normalize("a.mds", "");
-        assert!(result.is_err(), "expected Err for empty path");
-    }
-
-    #[test]
-    fn vfs_normalize_null_byte_errors() {
-        let result = vfs().normalize("a.mds", "./\0bad.mds");
-        assert!(result.is_err(), "expected Err for null byte");
-    }
-
-    #[test]
-    fn vfs_normalize_root_entry_point() {
-        let result = vfs().normalize("", "main.mds");
-        assert_eq!(result.unwrap(), "main.mds");
-    }
-
-    #[test]
-    fn vfs_normalize_deep_traversal_at_boundary() {
+    fn vfs_normalize_in_dir_deep_traversal_at_boundary() {
         // "deep/nested/file.mds" has dir = "deep/nested"; three ".." would escape.
-        let result = vfs().normalize("deep/nested/file.mds", "../../../x.mds");
+        let fs = vfs();
+        let result = fs.normalize_in_dir(&fs.parent_dir("deep/nested/file.mds"), "../../../x.mds");
         assert!(result.is_err(), "expected Err when escaping root");
+        // Control: two ".." stay at the root.
+        let ok = fs.normalize_in_dir(&fs.parent_dir("deep/nested/file.mds"), "../../x.mds");
+        assert_eq!(ok.unwrap(), "x.mds");
     }
 
     #[test]
-    fn vfs_normalize_sibling_flat() {
-        let result = vfs().normalize("a.mds", "./b.mds");
-        assert_eq!(result.unwrap(), "b.mds");
-    }
-
-    #[test]
-    fn vfs_normalize_subdirectory() {
-        let result = vfs().normalize("a/b.mds", "./c/d.mds");
+    fn vfs_normalize_in_dir_subdirectory() {
+        let fs = vfs();
+        let result = fs.normalize_in_dir(&fs.parent_dir("a/b.mds"), "./c/d.mds");
         assert_eq!(result.unwrap(), "a/c/d.mds");
     }
 
@@ -801,38 +870,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_normalize_entry_point() {
-        let dir = TempDir::new().unwrap();
-        let file = make_temp_file(&dir, "main.mds", "hello");
-        let fs = NativeFs::new();
-        let result = fs.normalize("", &file.display().to_string());
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-        // The result should be a canonical absolute path string.
-        let key = result.unwrap();
-        assert!(key.contains("main.mds"), "key should contain filename");
+    /// A relative import that climbs out of any project directory and lands on
+    /// `target`: `"../"` × 20, then `target`'s normal components joined by `/`.
+    ///
+    /// The root/drive prefix is dropped on purpose — `..` clamps at the filesystem
+    /// root on Unix and Windows alike (`Path::join` + canonicalize pop only normal
+    /// components), so this resolves to `target` wherever the importing directory
+    /// is, and the containment check is what must reject it on every platform.
+    /// Embedding the absolute path instead would put a `C:` component mid-path on
+    /// Windows and fail as "file not found" before containment is ever reached.
+    fn escape_to(target: &Path) -> String {
+        let tail: Vec<String> = target
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        "../".repeat(20) + &tail.join("/")
     }
 
     #[test]
-    fn native_normalize_import_from_base() {
+    fn native_resolve_entry_returns_canonical_key() {
         let dir = TempDir::new().unwrap();
         let file = make_temp_file(&dir, "main.mds", "hello");
-        make_temp_file(&dir, "sibling.mds", "world");
+        let fs = NativeFs::new();
+        let key = fs
+            .resolve_entry(&file.display().to_string())
+            .expect("resolve_entry");
+        assert_eq!(
+            Path::new(&key),
+            file.canonicalize().unwrap(),
+            "the entry key must be the canonical absolute path"
+        );
+    }
+
+    #[test]
+    fn native_normalize_in_dir_from_entry_parent_dir() {
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let sibling = make_temp_file(&dir, "sibling.mds", "world");
 
         let fs = NativeFs::new();
-        // First normalize the entry point to establish the root and get its key.
+        // Resolve the entry point to establish the root and get its key.
         let base_key = fs
-            .normalize("", &file.display().to_string())
-            .expect("entry point normalize failed");
-        // Now resolve a sibling relative to it.
-        let result = fs.normalize(&base_key, "./sibling.mds");
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-        let key = result.unwrap();
-        assert!(key.contains("sibling.mds"));
+            .resolve_entry(&file.display().to_string())
+            .expect("resolve_entry failed");
+        // Now resolve a sibling from the entry's directory, as the resolver does.
+        let key = fs
+            .normalize_in_dir(&fs.parent_dir(&base_key), "./sibling.mds")
+            .expect("sibling import");
+        assert_eq!(Path::new(&key), sibling.canonicalize().unwrap());
     }
 
     #[test]
-    fn native_normalize_symlink_rejected() {
+    fn native_resolve_entry_symlink_rejected() {
         let dir = TempDir::new().unwrap();
         let target = make_temp_file(&dir, "target.mds", "hello");
         let link_path = dir.path().join("link.mds");
@@ -841,12 +933,57 @@ mod tests {
         }
 
         let fs = NativeFs::new();
-        let result = fs.normalize("", &link_path.display().to_string());
+        let result = fs.resolve_entry(&link_path.display().to_string());
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("symlinks"),
             "expected symlinks in error, got: {msg}"
+        );
+        // Control: the symlink's real target resolves.
+        assert!(fs.resolve_entry(&target.display().to_string()).is_ok());
+    }
+
+    #[test]
+    fn native_resolve_entry_segment_cap() {
+        // A relative entry path, resolved against the test's cwd: nothing on disk
+        // is needed, because the cap fires before the filesystem is touched.
+        let err = NativeFs::new()
+            .resolve_entry(&segments(MAX_PATH_SEGMENTS + 1))
+            .unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit, got {err:?}"
+        );
+        // Control: exactly at the cap passes the check and reaches the
+        // filesystem, where the path does not exist.
+        let err = NativeFs::new()
+            .resolve_entry(&segments(MAX_PATH_SEGMENTS))
+            .unwrap_err();
+        assert!(
+            matches!(err, MdsError::FileNotFound { .. }),
+            "control: expected FileNotFound at the cap, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn native_normalize_in_dir_segment_cap() {
+        let dir = TempDir::new().unwrap();
+        let dir_str = dir.path().display().to_string();
+        let fs = NativeFs::new();
+        let over = format!("./{}", segments(MAX_PATH_SEGMENTS + 1));
+        let err = fs.normalize_in_dir(&dir_str, &over).unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit, got {err:?}"
+        );
+        // Control: exactly at the cap (the leading "." does not count) reaches
+        // the filesystem, where the path does not exist.
+        let at_cap = format!("./{}", segments(MAX_PATH_SEGMENTS));
+        let err = fs.normalize_in_dir(&dir_str, &at_cap).unwrap_err();
+        assert!(
+            matches!(err, MdsError::FileNotFound { .. }),
+            "control: expected FileNotFound at the cap, got {err:?}"
         );
     }
 
@@ -865,8 +1002,8 @@ mod tests {
 
         let fs = NativeFs::new();
         // Establish root via a real (non-symlinked) entry point.
-        fs.normalize("", &target.display().to_string())
-            .expect("entry normalize should succeed");
+        fs.resolve_entry(&target.display().to_string())
+            .expect("resolve_entry should succeed");
 
         let dir_str = dir.path().display().to_string();
         let result = fs.normalize_in_dir(&dir_str, "./link.mds");
@@ -879,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn native_normalize_absolute_path_injection_rejected() {
+    fn native_normalize_in_dir_absolute_path_injection_rejected() {
         // Security boundary: an absolute path outside the established project root
         // must be rejected with "escapes project directory".
         let project_dir = TempDir::new().unwrap();
@@ -891,41 +1028,11 @@ mod tests {
         let fs = NativeFs::new();
         // Establish root via entry point.
         let base_key = fs
-            .normalize("", &entry.display().to_string())
-            .expect("entry point normalize should succeed");
+            .resolve_entry(&entry.display().to_string())
+            .expect("resolve_entry should succeed");
 
         // Absolute path pointing outside the project root.
-        let result = fs.normalize(&base_key, &outside.display().to_string());
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("escapes project"),
-            "expected 'escapes project' in error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn native_normalize_relative_traversal_rejected() {
-        // Security boundary: a relative `../` sequence that escapes the project
-        // root must be rejected with "escapes project directory".
-        let project_dir = TempDir::new().unwrap();
-        let outside_dir = TempDir::new().unwrap();
-
-        let entry = make_temp_file(&project_dir, "main.mds", "hello");
-        // Place a real file outside so canonicalization has a target to resolve.
-        let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
-
-        let fs = NativeFs::new();
-        // Establish root via entry point.
-        let base_key = fs
-            .normalize("", &entry.display().to_string())
-            .expect("entry point normalize should succeed");
-
-        // Build a relative path using many ".." segments to escape the project
-        // dir, then re-root into the outside directory.
-        let outside_str = outside.display().to_string();
-        let escape = "../".repeat(20) + outside_str.trim_start_matches('/');
-        let result = fs.normalize(&base_key, &escape);
+        let result = fs.normalize_in_dir(&fs.parent_dir(&base_key), &outside.display().to_string());
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -937,7 +1044,7 @@ mod tests {
     #[test]
     fn native_set_root_rejects_paths_outside_root() {
         // set_root should initialize the root directory so that subsequent
-        // normalize calls reject paths outside that root.
+        // imports reject paths outside that root.
         let project_dir = TempDir::new().unwrap();
         let outside_dir = TempDir::new().unwrap();
 
@@ -945,20 +1052,19 @@ mod tests {
         let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
 
         let fs = NativeFs::new();
-        // Initialize root explicitly via set_root, not via normalize.
+        // Initialize root explicitly via set_root, not via resolve_entry.
         fs.set_root(&project_dir.path().display().to_string())
             .expect("set_root should succeed for a real directory");
 
-        // normalize uses "" base for entry points, which would re-init root;
-        // test the already-set root by normalizing a non-entry import instead.
-        // First establish a valid base key by normalizing the entry point
-        // (set_root already won the OnceLock race, so root stays as project_dir).
+        // Establish a valid base key by resolving the entry point (set_root already
+        // won the OnceLock race, so the root stays as project_dir), then test the
+        // already-set root with an import rather than another entry.
         let base_key = fs
-            .normalize("", &entry.display().to_string())
-            .expect("entry point normalize should succeed");
+            .resolve_entry(&entry.display().to_string())
+            .expect("resolve_entry should succeed");
 
         // A path outside the root must be rejected.
-        let result = fs.normalize(&base_key, &outside.display().to_string());
+        let result = fs.normalize_in_dir(&fs.parent_dir(&base_key), &outside.display().to_string());
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -973,8 +1079,8 @@ mod tests {
         let file = make_temp_file(&dir, "hello.mds", "Hello World!");
         let fs = NativeFs::new();
         let key = fs
-            .normalize("", &file.display().to_string())
-            .expect("normalize");
+            .resolve_entry(&file.display().to_string())
+            .expect("resolve_entry");
         let content = fs.read(&key).expect("read");
         assert_eq!(content, "Hello World!");
     }
@@ -1024,32 +1130,22 @@ mod tests {
     // ── NativeFs null-byte rejection ──────────────────────────────────────────
 
     #[test]
-    fn native_normalize_null_byte_errors() {
-        let fs = NativeFs::new();
-        let result = fs.normalize("", "./\0evil.mds");
-        let err = result.unwrap_err();
-        let msg = err.to_string();
+    fn native_resolve_entry_null_byte_is_io_error() {
+        // An entry path is caller input, not an @import string: mds::io.
+        let err = NativeFs::new().resolve_entry("./\0evil.mds").unwrap_err();
         assert!(
-            msg.contains("null byte"),
-            "expected null byte in error, got: {msg}"
+            matches!(err, MdsError::Io { .. }),
+            "expected Io, got {err:?}"
         );
-    }
-
-    #[test]
-    fn native_normalize_null_byte_in_import_errors() {
-        let dir = TempDir::new().unwrap();
-        let file = make_temp_file(&dir, "main.mds", "hello");
-        let fs = NativeFs::new();
-        let base_key = fs
-            .normalize("", &file.display().to_string())
-            .expect("entry normalize");
-        let result = fs.normalize(&base_key, "./\0evil.mds");
-        let err = result.unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
         let msg = err.to_string();
+        // The path is shown WIRE-escaped: the escape is present, the raw NUL is not.
+        let escaped = format!("./\\u{:04X}evil.mds", 0);
         assert!(
-            msg.contains("null byte"),
-            "expected null byte in error, got: {msg}"
+            msg.contains("null byte") && msg.contains(&escaped),
+            "expected {escaped:?} in the message, got: {msg}"
         );
+        assert!(!msg.contains('\0'), "raw NUL must not reach the message");
     }
 
     // ── is_markdown consistency ───────────────────────────────────────────────
@@ -1093,29 +1189,31 @@ mod tests {
         );
     }
 
-    // ── NativeFs::normalize empty-path guard ─────────────────────────────────
+    // ── NativeFs empty-path guards ────────────────────────────────────────────
 
     #[test]
-    fn native_normalize_empty_path_errors() {
-        let fs = NativeFs::new();
-        let result = fs.normalize("", "");
-        let err = result.unwrap_err();
-        let msg = err.to_string();
+    fn native_resolve_entry_empty_path_is_io_error() {
+        let err = NativeFs::new().resolve_entry("").unwrap_err();
         assert!(
-            msg.contains("empty"),
-            "expected 'empty' in error, got: {msg}"
+            matches!(err, MdsError::Io { .. }),
+            "expected Io, got {err:?}"
+        );
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert!(
+            err.to_string().contains("entry path is empty"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn native_normalize_empty_import_path_errors() {
+    fn native_normalize_in_dir_empty_relative_errors() {
         let dir = TempDir::new().unwrap();
         let file = make_temp_file(&dir, "main.mds", "hello");
         let fs = NativeFs::new();
         let base_key = fs
-            .normalize("", &file.display().to_string())
-            .expect("entry normalize");
-        let result = fs.normalize(&base_key, "");
+            .resolve_entry(&file.display().to_string())
+            .expect("resolve_entry");
+        let result = fs.normalize_in_dir(&fs.parent_dir(&base_key), "");
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1231,36 +1329,12 @@ mod tests {
     // ── VirtualFs segment limit ───────────────────────────────────────────────
 
     #[test]
-    fn vfs_normalize_too_many_segments_errors() {
-        // Import paths (non-root base) are bounded by MAX_PATH_SEGMENTS.
-        // Use "root.mds" as base so base_dir_segments is empty, then provide
-        // MAX_PATH_SEGMENTS + 1 segments in the relative path to exceed the cap.
-        let long_relative = (0..=MAX_PATH_SEGMENTS)
-            .map(|i| format!("seg{i}"))
-            .collect::<Vec<_>>()
-            .join("/");
-        let result = vfs().normalize("root.mds", &long_relative);
-        assert!(
-            result.is_err(),
-            "expected Err for path with too many segments, got {result:?}"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, MdsError::ResourceLimit { .. }),
-            "expected ResourceLimit variant, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn vfs_normalize_exactly_at_segment_limit_ok() {
-        // Exactly MAX_PATH_SEGMENTS segments must succeed.
-        // Use "root.mds" as base so base_dir_segments is empty, then provide
-        // exactly MAX_PATH_SEGMENTS segments in the relative path.
-        let exactly = (0..MAX_PATH_SEGMENTS)
-            .map(|i| format!("seg{i}"))
-            .collect::<Vec<_>>()
-            .join("/");
-        let result = vfs().normalize("root.mds", &exactly);
+    fn vfs_normalize_in_dir_exactly_at_segment_limit_ok() {
+        // Exactly MAX_PATH_SEGMENTS segments must succeed. An import from the
+        // top-level "root.mds" resolves from the key-space root (parent_dir is
+        // ""), so the relative path carries every segment.
+        let fs = vfs();
+        let result = fs.normalize_in_dir(&fs.parent_dir("root.mds"), &segments(MAX_PATH_SEGMENTS));
         assert!(
             result.is_ok(),
             "expected Ok for path at segment limit, got {result:?}"
@@ -1310,6 +1384,23 @@ mod tests {
     }
 
     #[test]
+    fn vfs_normalize_in_dir_empty_key_errors() {
+        // Climbing back to the key-space root without naming a file resolves to
+        // no key at all, which must be refused rather than read as "".
+        let err = vfs().normalize_in_dir("a", "../").unwrap_err();
+        assert!(
+            matches!(err, MdsError::ImportError { .. }),
+            "expected ImportError, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("resolves to empty key"),
+            "got: {err}"
+        );
+        // Control: the same climb that names a file resolves.
+        assert_eq!(vfs().normalize_in_dir("a", "../b.mds").unwrap(), "b.mds");
+    }
+
+    #[test]
     fn vfs_normalize_in_dir_null_byte_errors() {
         let result = vfs().normalize_in_dir("a", "./\0evil.mds");
         assert!(result.is_err(), "expected Err for null byte in path");
@@ -1343,24 +1434,6 @@ mod tests {
         assert_eq!(result.unwrap(), "main.mds");
     }
 
-    // ── normalize_in_dir consistency: must match normalize for same inputs ────
-
-    #[test]
-    fn vfs_normalize_in_dir_matches_normalize() {
-        // For a non-empty base, normalize_in_dir(parent_dir(base), rel)
-        // must produce the same result as normalize(base, rel).
-        let base = "components/header.mds";
-        let rel = "./footer.mds";
-        let via_normalize = vfs().normalize(base, rel).unwrap();
-        let via_in_dir = vfs()
-            .normalize_in_dir(vfs().parent_dir(base).as_str(), rel)
-            .unwrap();
-        assert_eq!(
-            via_normalize, via_in_dir,
-            "normalize and normalize_in_dir must agree for same effective directory"
-        );
-    }
-
     // ── NativeFs::parent_dir ──────────────────────────────────────────────────
 
     #[test]
@@ -1386,7 +1459,7 @@ mod tests {
         let fs = NativeFs::new();
         // Establish root first.
         let entry = dir.path().join("main.mds").display().to_string();
-        fs.normalize("", &entry).expect("entry normalize");
+        fs.resolve_entry(&entry).expect("resolve_entry");
 
         let dir_str = dir.path().display().to_string();
         let result = fs.normalize_in_dir(&dir_str, "./sibling.mds");
@@ -1400,26 +1473,35 @@ mod tests {
 
     #[test]
     fn native_normalize_in_dir_traversal_rejected() {
+        // Security boundary: a relative `../` sequence that escapes the project
+        // root must be rejected with "escapes project directory".
         let project_dir = TempDir::new().unwrap();
         let outside_dir = TempDir::new().unwrap();
 
         let entry = make_temp_file(&project_dir, "main.mds", "hello");
+        // Place a real file outside so canonicalization has a target to resolve.
         let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
 
         let fs = NativeFs::new();
-        fs.normalize("", &entry.display().to_string())
-            .expect("entry normalize");
+        fs.resolve_entry(&entry.display().to_string())
+            .expect("resolve_entry");
 
         let dir_str = project_dir.path().display().to_string();
-        let outside_str = outside.display().to_string();
-        let escape = "../".repeat(20) + outside_str.trim_start_matches('/');
-        let result = fs.normalize_in_dir(&dir_str, &escape);
+        let result = fs.normalize_in_dir(&dir_str, &escape_to(&outside));
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("escapes project"),
             "expected 'escapes project' in error, got: {msg}"
         );
+
+        // Control: the same vector shape aimed at a file INSIDE the project
+        // resolves to it, proving the traversal lands on its target and that the
+        // rejection above comes from containment, not from a malformed path.
+        let inside = fs
+            .normalize_in_dir(&dir_str, &escape_to(&entry))
+            .expect("control: escape_to(entry) must resolve inside the project");
+        assert_eq!(Path::new(&inside), entry.canonicalize().unwrap());
     }
 
     #[test]
@@ -1454,14 +1536,8 @@ mod tests {
     }
 
     impl super::FileSystem for TestFs {
-        fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
-            if relative.is_empty() {
-                return Err(MdsError::import_error("empty path"));
-            }
-            if base.is_empty() {
-                return Ok(relative.to_string());
-            }
-            self.normalize_in_dir(&self.parent_dir(base), relative)
+        fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+            Ok(path.to_string())
         }
 
         fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
@@ -1598,31 +1674,32 @@ mod tests {
     // ── source_root ───────────────────────────────────────────────────────────
 
     #[test]
-    fn native_source_root_none_before_any_normalize() {
-        // Before normalize() or set_root() is called, root has not been established.
+    fn native_source_root_none_before_any_resolve_entry() {
+        // Before resolve_entry() or set_root() is called, root has not been established.
         let fs = NativeFs::new();
         assert_eq!(
             fs.source_root(),
             None,
-            "source_root() must be None before any normalize call"
+            "source_root() must be None before any resolve_entry call"
         );
     }
 
     #[test]
-    fn native_source_root_set_after_normalize() {
-        // After the first normalize() call the root is established and
+    fn native_source_root_set_after_resolve_entry() {
+        // After the first resolve_entry() call the root is established and
         // source_root() returns Some.
         let dir = TempDir::new().unwrap();
         let file = make_temp_file(&dir, "main.mds", "hello");
         let fs = NativeFs::new();
-        fs.normalize("", &file.display().to_string()).unwrap();
-        let root = fs.source_root();
-        assert!(root.is_some(), "source_root() must be Some after normalize");
-        // The returned root must be an absolute path.
+        fs.resolve_entry(&file.display().to_string()).unwrap();
+        let root = fs
+            .source_root()
+            .expect("source_root() must be Some after resolve_entry");
+        // The returned root must be an absolute path (`\\?\C:\…` on Windows, so
+        // test with `Path::is_absolute`, never a leading `/`).
         assert!(
-            root.as_deref().unwrap_or("").starts_with('/'),
-            "source_root() must be absolute, got {:?}",
-            root
+            Path::new(&root).is_absolute(),
+            "source_root() must be absolute, got {root:?}"
         );
     }
 
@@ -1637,8 +1714,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = make_temp_file(&dir, "main.mds", "hello");
         let fs = NativeFs::new();
-        fs.normalize("", &file.display().to_string()).unwrap();
-        let root = fs.source_root().expect("root must be set after normalize");
+        fs.resolve_entry(&file.display().to_string()).unwrap();
+        let root = fs
+            .source_root()
+            .expect("root must be set after resolve_entry");
         let file_canon = file.canonicalize().unwrap();
         let root_path = std::path::PathBuf::from(&root);
         // Canonicalize root_path to resolve macOS /var → /private/var so the

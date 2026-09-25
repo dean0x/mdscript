@@ -141,7 +141,9 @@ export interface BuildModulesMapResult {
 }
 
 /**
- * Normalize a virtual module key the same way VirtualFs::normalize() does in Rust.
+ * Normalize a virtual module key the same way the Rust resolver does on VirtualFs:
+ * `VirtualFs::normalize_in_dir(parent_dir(base), relative)` for an import, and
+ * `VirtualFs::resolve_entry(relative)` (key unchanged) when `base` is empty.
  *
  * Given a base key (the key of the importing module) and a relative import path,
  * resolve the import path to a canonical slash-separated key.
@@ -400,7 +402,7 @@ export async function buildModulesMap(
       let importPath: string | undefined;
       while ((importPath = queue.shift()) !== undefined) {
         const childAbsolute = validateImportPath(importPath, absoluteDir);
-        // Compute virtual key using normalizeVirtualKey to mirror Rust's VirtualFs::normalize().
+        // Compute virtual key using normalizeVirtualKey to mirror Rust's VirtualFs::normalize_in_dir().
         const childVirtualKey = normalizeVirtualKey(virtualKey, importPath);
         await scan(childAbsolute, childVirtualKey, depth + 1);
       }

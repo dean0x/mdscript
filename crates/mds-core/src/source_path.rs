@@ -1140,7 +1140,7 @@ mod tests {
     struct FakeFs(Option<String>);
 
     impl crate::fs::FileSystem for FakeFs {
-        fn normalize(&self, _base: &str, _rel: &str) -> Result<String, crate::MdsError> {
+        fn resolve_entry(&self, _path: &str) -> Result<String, crate::MdsError> {
             unimplemented!()
         }
         fn normalize_in_dir(&self, _dir: &str, _rel: &str) -> Result<String, crate::MdsError> {

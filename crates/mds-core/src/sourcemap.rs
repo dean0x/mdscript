@@ -128,8 +128,8 @@ pub(crate) struct Origin {
     /// Canonical key of the file (used for source-map interning in `MapBuilder::source_index`).
     ///
     /// For `NativeFs` compiles this is the absolute canonical path returned by
-    /// `fs.normalize()`.  For `VirtualFs` / string-source compiles it is the virtual key
-    /// or the `SOURCE_LABEL` sentinel.
+    /// `fs.resolve_entry()` or `fs.normalize_in_dir()`.  For `VirtualFs` / string-source
+    /// compiles it is the virtual key or the `SOURCE_LABEL` sentinel.
     ///
     /// **Never** use this for user-visible strings — use `display` instead (R3 / CWE-209).
     pub(crate) file: Arc<str>,
