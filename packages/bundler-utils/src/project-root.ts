@@ -25,8 +25,10 @@ const VERBATIM_PREFIX_RE = /^[\\/][\\/]\?[\\/]/;
 /**
  * Strip the Windows verbatim (extended-length) prefix from a path, if present.
  *
- * The native backend reports dependencies as canonical paths; on Windows,
- * `std::fs::canonicalize` returns them in verbatim form (`\\?\D:\...`).
+ * The native backend reports dependencies as canonical paths. On Windows it
+ * drops the verbatim prefix `std::fs::canonicalize` adds wherever the
+ * conventional form names the same file, but keeps it (`\\?\D:\...`) on a path
+ * that form cannot express — one longer than MAX_PATH, say (#409).
  * `path.relative` cannot bridge a verbatim path and a non-verbatim root (no
  * common component — it returns the absolute `to` path), so without this strip
  * every native dependency degrades to its basename in the emitted metadata and

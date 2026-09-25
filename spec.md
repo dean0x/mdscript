@@ -1312,6 +1312,13 @@ neutralization — in every one of these positions:
   the napi / WASM / Python compile results;
 - the `dependencies` array of `CompileResult::to_canonical_json()`.
 
+Emitted verbatim means not escaped. It does not mean byte-identical to the internal
+module key: on Windows a native `dependencies` entry is the conventional spelling of the
+canonical path (`C:\…`, not `\\?\C:\…`) wherever that names the same file — a lossless
+respelling, not an escape (pinned on the Windows CI leg by
+`windows_dependencies_carry_no_verbatim_prefix` in `crates/mds-core/tests/api_surface.rs`,
+and on every platform by the `verbatim` unit tests in `crates/mds-core/src/verbatim.rs`).
+
 These are **functional references, not display text**. Source Map v3 `file` and
 `sources` are resolved against the filesystem by devtools, bundlers and IDEs;
 `dependencies` is a watch/rebuild input for the bundler plugins. Rewriting a path to a

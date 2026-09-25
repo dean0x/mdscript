@@ -817,7 +817,10 @@ pub(crate) struct CompileOutput {
     pub(crate) content: String,
     /// The output kind (derived intrinsically from the compiled output).
     pub(crate) kind: OutputKind,
-    /// Transitive dependency paths (empty when no `@import`s).
+    /// Transitive dependency paths (empty when no `@import`s), as watch graph keys
+    /// ([`crate::watch::graph_key`]): the canonical form notify event paths are
+    /// compared in. `CompileResult.dependencies` is the conventional form, which on
+    /// Windows drops the `\\?\` prefix the watcher's own paths carry (#409).
     pub(crate) dependencies: Vec<String>,
     /// Source map if `opts.source_map` was `true` and the compilation produced one.
     pub(crate) source_map: Option<mds::SourceMap>,
@@ -892,10 +895,19 @@ pub(crate) fn compile_to_content(
     // Move result.output into serialize_output so the Markdown arm avoids a clone
     // (the kind was already derived from the borrow above — issue 2).
     let content = serialize_output(result.output)?;
+    let dependencies = result
+        .dependencies
+        .iter()
+        .map(|dep| {
+            crate::watch::graph_key(Path::new(dep))
+                .display()
+                .to_string()
+        })
+        .collect();
     Ok(CompileOutput {
         content,
         kind,
-        dependencies: result.dependencies,
+        dependencies,
         source_map,
     })
 }
@@ -1873,6 +1885,39 @@ fn run_build_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #409: the watch loop compares dependency paths with canonical event paths
+    /// and graph keys, so `compile_to_content` hands it graph keys, not the
+    /// conventional form `CompileResult.dependencies` carries.
+    #[test]
+    fn compile_to_content_reports_dependencies_as_graph_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("main.mds"),
+            "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
+        let main = dir.path().join("main.mds");
+
+        let compiled =
+            compile_to_content(&main, None, true, mds::CompileOptions::default()).unwrap();
+        let expected = crate::watch::graph_key(&dir.path().join("lib.mds"));
+        assert_eq!(
+            compiled.dependencies,
+            [expected.display().to_string()],
+            "the dependency is the watch graph key of the imported file"
+        );
+
+        // On Windows the graph key is verbatim while the library result is not:
+        // this is the mismatch the mapping exists for.
+        #[cfg(windows)]
+        {
+            let library = mds::compile_with_deps(&main, None).unwrap().dependencies;
+            assert!(compiled.dependencies[0].starts_with(r"\\?\"));
+            assert!(!library[0].starts_with(r"\\?\"));
+        }
+    }
 
     // ── compute_source_map_base ───────────────────────────────────────────────
     //

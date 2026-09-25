@@ -628,6 +628,90 @@ fn module_cache_new_still_works() {
 
 // ── CompileResult / CompiledOutput / dependency graph API ─────────────────────
 
+/// A project whose `main.mds` imports `lib.mds`; returns the guard, the entry
+/// path and the canonical path of `lib.mds`.
+fn project_with_one_import() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+    std::fs::write(
+        dir.path().join("main.mds"),
+        "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
+    let lib = std::fs::canonicalize(dir.path().join("lib.mds")).unwrap();
+    let main = dir.path().join("main.mds");
+    (dir, main, lib)
+}
+
+/// The `dependencies` of every native compile entry point that reports them.
+fn native_dependency_lists(main: &Path) -> Vec<(&'static str, Vec<String>)> {
+    let source = std::fs::read_to_string(main).unwrap();
+    let base = main.parent();
+    vec![
+        (
+            "compile_with_deps",
+            mds::compile_with_deps(main, None).unwrap().dependencies,
+        ),
+        (
+            "compile_with_deps_opts",
+            mds::compile_with_deps_opts(main, None, mds::CompileOptions::default())
+                .unwrap()
+                .dependencies,
+        ),
+        (
+            "compile_str_with_deps",
+            mds::compile_str_with_deps(&source, base, None)
+                .unwrap()
+                .dependencies,
+        ),
+        (
+            "compile_str_with_deps_opts",
+            mds::compile_str_with_deps_opts(&source, base, None, mds::CompileOptions::default())
+                .unwrap()
+                .dependencies,
+        ),
+    ]
+}
+
+/// #409: on Windows, canonicalization yields verbatim `\\?\C:\…` module keys;
+/// a native compile reports each dependency in its conventional form instead,
+/// still naming the same file.
+#[cfg(windows)]
+#[test]
+fn windows_dependencies_carry_no_verbatim_prefix() {
+    let (_guard, main, lib) = project_with_one_import();
+    // Positive control (PF-013): the canonical key IS verbatim here, so the
+    // absence assertion below can fail.
+    assert!(lib.to_str().unwrap().starts_with(r"\\?\"), "{lib:?}");
+    for (api, deps) in native_dependency_lists(&main) {
+        let [dep] = deps.as_slice() else {
+            panic!("{api}: expected one dependency, got {deps:?}");
+        };
+        assert!(
+            !dep.starts_with(r"\\?\"),
+            "{api}: a dependency must not carry the verbatim prefix: {dep}"
+        );
+        assert!(Path::new(dep).is_absolute(), "{api}: {dep}");
+        assert_eq!(
+            std::fs::canonicalize(dep).unwrap(),
+            lib,
+            "{api}: the dependency must name the imported file"
+        );
+    }
+}
+
+/// #409 control: off Windows a canonical path has no verbatim form, and each
+/// dependency is exactly the canonical path of the imported file.
+#[cfg(not(windows))]
+#[test]
+fn dependencies_are_the_canonical_paths_off_windows() {
+    let (_guard, main, lib) = project_with_one_import();
+    for (api, deps) in native_dependency_lists(&main) {
+        assert_eq!(deps, [lib.to_str().unwrap()], "{api}");
+    }
+}
+
 #[test]
 fn compile_result_type_importable() {
     // CompileResult is produced by the compile API (it is #[non_exhaustive] — not externally

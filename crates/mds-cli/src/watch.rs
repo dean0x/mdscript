@@ -1572,7 +1572,8 @@ const MAX_COLLECT_DEPTH: usize = 64;
 /// Mutable state for the directory-mode watch loop.
 struct DirWatchState {
     /// Forward dependency map: canonical source → its canonical (transitive) deps.
-    /// Dep values are already canonical from `compile_with_deps`; do not re-canonicalize.
+    /// Dep values are graph keys already: `compile_to_content` maps them through
+    /// [`graph_key`]; do not re-canonicalize.
     forward_deps: HashMap<PathBuf, Vec<PathBuf>>,
     /// Sources whose last compile attempt failed. Re-seeded into every batch that
     /// carries a real change, so a fix to whatever broke them is picked up.
@@ -2384,7 +2385,7 @@ fn dir_watch_startup(
             mds::CompileOptions::default(),
         ) {
             Ok(compiled) => {
-                // Collect dep paths (already canonical from mds-core).
+                // Collect dep paths (graph keys from compile_to_content).
                 let dep_paths: Vec<PathBuf> =
                     compiled.dependencies.iter().map(PathBuf::from).collect();
 

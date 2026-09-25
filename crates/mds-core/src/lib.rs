@@ -58,6 +58,8 @@ pub(crate) mod sourcemap;
 pub(crate) mod validator;
 pub(crate) mod value;
 pub(crate) mod vars_json;
+#[cfg(any(windows, test))]
+pub(crate) mod verbatim;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
@@ -142,8 +144,15 @@ pub struct CompileResult {
     pub output: CompiledOutput,
     /// Warnings emitted during compilation (e.g. empty `@include`).
     pub warnings: Vec<String>,
-    /// Normalized keys of all modules imported during compilation, in
-    /// first-resolution (depth-first) order. Excludes the entry module.
+    /// The modules imported during compilation, in first-resolution (depth-first)
+    /// order. Excludes the entry module.
+    ///
+    /// A virtual compile reports module keys. A native compile reports the
+    /// absolute path of each file, spelled as it is on disk; on Windows the
+    /// verbatim `\\?\` prefix that canonicalization adds is dropped (`C:\…`,
+    /// `\\server\share\…`) wherever the conventional form names the same file,
+    /// and kept on a path it cannot name exactly — one longer than `MAX_PATH`, or
+    /// with a component such as a reserved device name or a trailing dot.
     ///
     /// These are **functional path references**, not display text: bundler plugins feed
     /// them straight back into a watcher. They are a named carve-out from the
@@ -552,6 +561,26 @@ fn path_to_str(path: &Path) -> Result<&str, MdsError> {
         .ok_or_else(|| MdsError::io("path is not valid UTF-8"))
 }
 
+/// The user-visible form of a native compile's module keys (#409).
+///
+/// A native key is a canonical path, which on Windows is a verbatim `\\?\` path;
+/// each is rewritten to its conventional form where that is lossless. Keys stay
+/// verbatim inside the resolver, where containment compares canonical paths.
+/// Virtual keys never come through here: they are the caller's own module names.
+#[cfg(windows)]
+fn native_dependencies(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    keys.into_iter()
+        .map(|key| verbatim::simplify_verbatim(&key).unwrap_or(key))
+        .collect()
+}
+
+/// The user-visible form of a native compile's module keys: off Windows a
+/// canonical path is never verbatim, so the keys are the dependencies as they are.
+#[cfg(not(windows))]
+fn native_dependencies(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    keys.into_iter().collect()
+}
+
 /// Print warnings to stderr. Each warning is printed on its own line.
 ///
 /// Sanitizes each warning before printing (issue #176 / CWE-150): warning strings
@@ -596,11 +625,12 @@ pub fn compile_collecting_warnings(
     let canonical_entry = NativeFs::check_symlink(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path_str.to_owned());
-    let dependencies = cache
-        .dependencies()
-        .into_iter()
-        .filter(|k| k != &canonical_entry)
-        .collect();
+    let dependencies = native_dependencies(
+        cache
+            .dependencies()
+            .into_iter()
+            .filter(|k| k != &canonical_entry),
+    );
     Ok(CompileResult {
         output,
         warnings,
@@ -626,7 +656,7 @@ pub fn compile_str_collecting_warnings(
     let output = cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     // resolve_source_intrinsic does not insert the inline source into the modules cache,
     // so cache.dependencies() contains only imported files — no entry-key filtering needed.
-    let dependencies = cache.dependencies();
+    let dependencies = native_dependencies(cache.dependencies());
     Ok(CompileResult {
         output,
         warnings,
@@ -1015,11 +1045,12 @@ pub fn compile_with_deps_opts(
     let canonical_entry = NativeFs::check_symlink(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path_str.to_owned());
-    let dependencies = cache
-        .dependencies()
-        .into_iter()
-        .filter(|k| k != &canonical_entry)
-        .collect();
+    let dependencies = native_dependencies(
+        cache
+            .dependencies()
+            .into_iter()
+            .filter(|k| k != &canonical_entry),
+    );
     Ok(CompileResult {
         output,
         warnings,
@@ -1057,7 +1088,7 @@ pub fn compile_str_with_deps_opts(
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_source_intrinsic_opts(source, &dir, &vars, &opts, &mut warnings)?;
-    let dependencies = cache.dependencies();
+    let dependencies = native_dependencies(cache.dependencies());
     Ok(CompileResult {
         output,
         warnings,

@@ -549,13 +549,14 @@ describe('dependency path contracts (J1)', () => {
     const root = makeTmpRoot('verbatim');
     try {
       // On Windows, std::fs::canonicalize returns extended-length verbatim
-      // paths (`\\?\D:\...`), and the native backend reports dependencies in
-      // that form. path.relative cannot bridge a verbatim path and a
-      // non-verbatim root (no common component → it returns the absolute `to`
-      // path), so without stripping, every native dep degrades to its basename
-      // in metadata and the watch dep diverges from the wasm leg (PF-007
-      // parity). The `\\?\` prefix is a pure string prefix on every platform,
-      // so this replicates the Windows condition platform-agnostically.
+      // paths (`\\?\D:\...`), and the native backend keeps that form for a
+      // dependency the conventional form cannot express (#409). path.relative
+      // cannot bridge a verbatim path and a non-verbatim root (no common
+      // component → it returns the absolute `to` path), so without stripping,
+      // every native dep degrades to its basename in metadata and the watch
+      // dep diverges from the wasm leg (PF-007 parity). The `\\?\` prefix is a
+      // pure string prefix on every platform, so this replicates the Windows
+      // condition platform-agnostically.
       const plain = join(root, 'lib', 'helper.mds');
       const transformer = createMdsTransformer(mdsWithDeps(['\\\\?\\' + plain]));
       const result = await transformer.transform(join(root, 'src', 'module.mds'));
