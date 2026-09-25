@@ -10,6 +10,8 @@
 //! - E5 CLI:   circular and self-extension → mds::circular_import
 //! - A2 CLI:   compile_with_deps dependency order (base first)
 //! - P2 perf:  wide base (~200 @block slots, child overrides all) compiles < 1s
+//! - E12 CLI:  inherited validation errors render a frame from base.mds, root-relative
+//! - #114 CLI: an inherited evaluation error (type_mismatch) renders against base.mds
 
 mod common;
 use common::{fixture, mds_bin};
@@ -504,6 +506,8 @@ fn e12_base_default_undefined_var_render_points_at_base() {
     let base_path = dir.path().join("base.mds");
     let child_path = dir.path().join("child.mds");
 
+    // The marker pins the project root, so the display path is exactly `base.mds`.
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
     std::fs::write(
         &base_path,
         "@block greeting:\nHello {{customer_name}}, welcome.\n@end\n",
@@ -526,9 +530,11 @@ fn e12_base_default_undefined_var_render_points_at_base() {
         !stderr.contains("OutOfBounds"),
         "E12 CLI: stderr must NOT contain 'OutOfBounds'; got: {stderr}"
     );
+    // #114 / AC-114-2: the frame names base.mds by its root-relative display. An
+    // absolute canonical path would also contain "base.mds", so pin the whole header.
     assert!(
-        stderr.contains("base.mds"),
-        "E12 CLI: stderr must name base.mds; got: {stderr}"
+        stderr.contains("[base.mds:2:7]"),
+        "E12 CLI: the frame must name base.mds root-relative at the reference; got: {stderr}"
     );
     // The label text "not defined" appears only when the span renders against a readable source.
     assert!(
@@ -545,6 +551,7 @@ fn e12_check_and_build_diagnostics_match() {
     let base_path = dir.path().join("base.mds");
     let child_path = dir.path().join("child.mds");
 
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
     std::fs::write(&base_path, "@block content:\n{{missing_var}}\n@end\n").unwrap();
     std::fs::write(&child_path, "@extends \"./base.mds\"\n").unwrap();
 
@@ -563,13 +570,14 @@ fn e12_check_and_build_diagnostics_match() {
         "E12 A5: check stderr must contain mds::undefined_var; got: {check_stderr}"
     );
 
+    // Root-relative frame header (an absolute path would also contain "base.mds").
     assert!(
-        build_stderr.contains("base.mds"),
-        "E12 A5: build stderr must name base.mds; got: {build_stderr}"
+        build_stderr.contains("[base.mds:2:1]"),
+        "E12 A5: build stderr must frame base.mds root-relative; got: {build_stderr}"
     );
     assert!(
-        check_stderr.contains("base.mds"),
-        "E12 A5: check stderr must name base.mds; got: {check_stderr}"
+        check_stderr.contains("[base.mds:2:1]"),
+        "E12 A5: check stderr must frame base.mds root-relative; got: {check_stderr}"
     );
 
     assert!(
@@ -579,5 +587,44 @@ fn e12_check_and_build_diagnostics_match() {
     assert!(
         !check_stderr.contains("Failed to read contents"),
         "E12 A5: check must not render OutOfBounds; got: {check_stderr}"
+    );
+}
+
+// ── #114 CLI: inherited evaluation error renders against base.mds ─────────────
+
+#[test]
+fn extends_base_type_mismatch_render_points_at_base() {
+    // #114: a cross-type comparison in the base skeleton fails at evaluation time, after
+    // validation. With source maps off it must still render a frame from base.mds at
+    // the `@if` line — as the validation errors above do — not a frameless error.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+    std::fs::write(
+        dir.path().join("base.mds"),
+        "---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n",
+    )
+    .unwrap();
+    let child_path = dir.path().join("child.mds");
+    std::fs::write(
+        &child_path,
+        "@extends \"./base.mds\"\n@block body:\noverride\n@end\n",
+    )
+    .unwrap();
+
+    let (_, stderr, ok) = build_file(child_path.to_str().unwrap());
+
+    assert!(!ok, "#114 CLI: compile must fail; stderr: {stderr}");
+    assert!(
+        stderr.contains("mds::type_mismatch"),
+        "#114 CLI: stderr must contain mds::type_mismatch; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("[base.mds:4:1]"),
+        "#114 CLI: the frame must name base.mds at the @if line; got: {stderr}"
+    );
+    // The label renders only when the span is paired with its own readable source.
+    assert!(
+        stderr.contains("cross-type comparison"),
+        "#114 CLI: the span label must render against base.mds; got: {stderr}"
     );
 }

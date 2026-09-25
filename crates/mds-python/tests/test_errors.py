@@ -548,3 +548,39 @@ def test_d2_type_mismatch_span_is_not_none() -> None:
         assert e.span.column is not None, "span.column must be present for @if type_mismatch"
     else:
         pytest.fail("expected MdsError")
+
+
+# ── D3 (#114): inherited type_mismatch spans the file it is written in ──────────
+
+_BASE_WITH_IF = "---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n"
+_BASE_PLAIN = "---\nn: hi\n---\n@block body:\ndefault\n@end\n"
+
+
+@pytest.mark.parametrize(
+    "base,child,expected",
+    [
+        (
+            _BASE_WITH_IF,
+            '@extends "./base.mds"\n@block body:\noverride\n@end\n',
+            (14, 11, 4, 1),
+        ),
+        (
+            _BASE_PLAIN,
+            '@extends "./base.mds"\n@block body:\n@if n == 5:\nx\n@end\n@end\n',
+            (35, 11, 3, 1),
+        ),
+    ],
+    ids=["base-skeleton", "child-override"],
+)
+def test_d3_extends_type_mismatch_spans_its_own_file(
+    base: str, child: str, expected: tuple[int, int, int, int]
+) -> None:
+    """D3: a cross-type comparison fails at evaluation time; in the base skeleton it is
+    spanned on the base's @if line, in a child override on the child's (source maps off).
+    """
+    with pytest.raises(m.MdsError) as ei:
+        m.compile_virtual({"base.mds": base, "child.mds": child}, "child.mds")
+    err = ei.value
+    assert err.code == "mds::type_mismatch", f"expected type_mismatch, got: {err.code}"
+    assert err.span is not None, "an inherited type_mismatch must carry a span"
+    assert (err.span.offset, err.span.length, err.span.line, err.span.column) == expected

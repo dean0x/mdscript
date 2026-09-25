@@ -24,14 +24,14 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compile, compileFile, checkFile, lintFile, isMdsError, init } from '../dist/node.js';
-import { SIMPLE_MDS } from './helpers.mjs';
+import { SIMPLE_MDS, findPythonForMarkdownScript } from './helpers.mjs';
 import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
 import { buildModulesMap } from '../dist/util/module-scanner.js';
 
 // ---------------------------------------------------------------------------
-// CF-SM helpers — locate CLI binary and Python interpreter for 4-surface
-// differential tests.  Both searches follow the same priority as conftest.py:
-// explicit env var > freshest build artifact > system PATH.
+// CF-SM helpers — locate the CLI binary for the 4-surface differential tests
+// (the Python interpreter search lives in helpers.mjs).  Both searches follow the
+// same priority as conftest.py: explicit env var > freshest build artifact > PATH.
 // ---------------------------------------------------------------------------
 
 /** Absolute path to the repo root (three levels above this test file). */
@@ -53,30 +53,6 @@ function findMdsCli() {
     .filter(existsSync);
   if (!candidates.length) return null;
   return candidates.reduce((a, b) => statSync(a).mtimeMs >= statSync(b).mtimeMs ? a : b);
-}
-
-/**
- * Return the path to a Python interpreter that can import `markdown_script`, or null.
- *
- * Resolution order:
- *   1. MDS_PYTHON_BIN env var (set by CI to the pip-managed interpreter).
- *   2. Repo-local venv at .venv/bin/python3 (set up by `maturin develop`).
- *   3. System `python3` on PATH (best-effort fallback for local dev).
- *
- * Returns null only when none of the above is found.  In CI (process.env.CI)
- * the caller must treat null as a hard failure — see PF-007.
- */
-function findPythonForMarkdownScript() {
-  const envBin = process.env.MDS_PYTHON_BIN;
-  if (envBin) {
-    if (!existsSync(envBin)) throw new Error(`MDS_PYTHON_BIN=${envBin} does not exist`);
-    return envBin;
-  }
-  const venvPy = join(REPO_ROOT, '.venv', 'bin', 'python3');
-  if (existsSync(venvPy)) return venvPy;
-  const res = spawnSync('which', ['python3'], { encoding: 'utf-8' });
-  if (res.status === 0 && res.stdout.trim()) return res.stdout.trim();
-  return null;
 }
 
 // ---------------------------------------------------------------------------

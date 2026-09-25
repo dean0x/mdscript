@@ -41,7 +41,9 @@
 
 use std::collections::HashMap;
 
-use mds::{CompileOptions, CompileResult, CompiledOutput, MdsError, Value};
+use mds::{
+    CompileOptions, CompileResult, CompiledOutput, MdsError, SerializedError, SerializedSpan, Value,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1551,6 +1553,123 @@ fn output_size_cumulative_across_regions() {
             ),
             &format!("output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"),
         );
+    }
+}
+
+/// Evaluation-error fixtures, one per kind of spliced region: `n` is a string, so the
+/// region's `@if n == 5:` (11 bytes, always at column 1) is a cross-type comparison.
+/// Columns: region kind, base, child, the file the comparison is written in, and the
+/// comparison's byte offset and line in that file.
+const EXTENDS_EVAL_ERROR_CASES: [(&str, &str, &str, &str, usize, usize); 3] = [
+    (
+        "base skeleton",
+        "---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\nBASE-DEFAULT\n@end\n",
+        "@extends \"./base.mds\"\n@block body:\nCHILD-OVERRIDE\n@end\n",
+        "base.mds",
+        14,
+        4,
+    ),
+    (
+        "base-default block",
+        "---\nn: hi\n---\n@block head:\n@if n == 5:\nx\n@end\n@end\n\
+         @block body:\nBASE-DEFAULT\n@end\n",
+        "@extends \"./base.mds\"\n@block body:\nCHILD-OVERRIDE\n@end\n",
+        "base.mds",
+        27,
+        5,
+    ),
+    (
+        "child override",
+        "---\nn: hi\n---\n@block body:\nBASE-DEFAULT\n@end\n",
+        "@extends \"./base.mds\"\n@block body:\n@if n == 5:\nx\n@end\n@end\n",
+        "child.mds",
+        35,
+        3,
+    ),
+];
+
+/// Assert `result` is the cross-type comparison of `EXTENDS_EVAL_ERROR_CASES`,
+/// reported against `file` with a span on the `@if` line at `offset` / `line`, and
+/// return the serialized error.
+fn assert_eval_error_spans(
+    result: Result<CompileResult, MdsError>,
+    context: &str,
+    file: &str,
+    offset: usize,
+    line: usize,
+) -> SerializedError {
+    let err = result.expect_err(&format!("{context}: a cross-type comparison must fail"));
+    let serialized = err.serialize();
+    assert_eq!(serialized.code, "mds::type_mismatch", "{context}: {err}");
+    assert_eq!(
+        err.source_name(),
+        Some(file),
+        "{context}: the error must name the file the comparison is written in"
+    );
+    assert_eq!(
+        serialized.span,
+        Some(
+            SerializedSpan::new(offset, 11)
+                .with_line(line)
+                .with_column(1)
+        ),
+        "{context}: the span must underline the comparison's @if line"
+    );
+    serialized
+}
+
+/// AC-114-1 / AC-114-5: an evaluation error in any spliced region of an @extends chain
+/// (base skeleton, base-default block, child override) is reported against the file the
+/// region came from, and the serialized error is identical with source maps on and off.
+#[test]
+fn extends_eval_error_spans_its_own_file_with_and_without_source_map() {
+    for (region, base, child, file, offset, line) in EXTENDS_EVAL_ERROR_CASES {
+        let [off, on] = [false, true].map(|source_map| {
+            assert_eval_error_spans(
+                mds::compile_virtual_with_deps_opts(
+                    extends_chain(base, child),
+                    "child.mds",
+                    None,
+                    CompileOptions::default().with_source_map(source_map),
+                ),
+                &format!("{region}, source_map={source_map}"),
+                file,
+                offset,
+                line,
+            )
+        });
+        assert_eq!(
+            off, on,
+            "{region}: the serialized error must not depend on source maps"
+        );
+    }
+}
+
+/// #114: an extending module reached through `@import` is evaluated region by region
+/// too, so an evaluation error inside it is reported against the file each region came
+/// from — not dropped to spanless — whether or not the importer asked for a source map.
+#[test]
+fn imported_extending_module_eval_error_spans_its_own_file() {
+    for (region, base, child, file, offset, line) in EXTENDS_EVAL_ERROR_CASES {
+        let mut modules = extends_chain(base, child);
+        modules.insert(
+            "main.mds".to_string(),
+            "@import \"./child.mds\" as child\n@include child\n".to_string(),
+        );
+        for source_map in [false, true] {
+            assert_eval_error_spans(
+                mds::compile_virtual_with_deps_opts(
+                    modules.clone(),
+                    "main.mds",
+                    None,
+                    CompileOptions::default().with_source_map(source_map),
+                ),
+                &format!("imported {region}, source_map={source_map}"),
+                file,
+                offset,
+                line,
+            );
+        }
     }
 }
 

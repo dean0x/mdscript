@@ -10,6 +10,7 @@ use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node}
 use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::evaluator::evaluate_messages_intrinsic;
+use crate::evaluator::evaluate_seeded;
 use crate::evaluator::evaluate_with_map;
 use crate::evaluator::evaluate_with_map_seeded;
 use crate::evaluator::EvalBudget;
@@ -718,16 +719,20 @@ impl ModuleCache {
         Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
 
-    /// Evaluate spliced `@extends` regions, accumulating output while recording
-    /// source-map segments.
+    /// Evaluate spliced `@extends` regions in order, accumulating their output and,
+    /// when a `MapBuilder` is supplied, recording source-map segments.
     ///
-    /// Each region carries its own [`Origin`] so the builder's `current_src` is
-    /// updated to the correct source index before evaluating that region.  Scope
-    /// is shared across all regions (functions defined in earlier regions are
-    /// visible to later ones).
+    /// Each region is evaluated against its own [`Origin`] — the file its node
+    /// offsets index into — so a span-bearing error names that file (#114). With a
+    /// builder, its `current_src` is switched to the region's source; without one,
+    /// the region's display path and source are passed directly. Never
+    /// `origin.file`: that is the canonical key (absolute for `NativeFs`) and must
+    /// not reach a diagnostic (R3 / CWE-209). Scope is shared across all regions
+    /// (functions defined in earlier regions are visible to later ones).
     ///
-    /// PF-004: cumulative output size is checked after each region rather than
-    /// only at the end so runaway base templates are caught early.
+    /// PF-004: one [`EvalBudget`] covers every region, and the cumulative output
+    /// size is checked after each region, so each cap applies to the whole module
+    /// evaluation rather than to each region.
     fn evaluate_regions_with_map(
         regions: &[(&[crate::ast::Node], &Origin)],
         scope: &mut crate::scope::Scope,
@@ -738,11 +743,8 @@ impl ModuleCache {
         let mut current_map = map;
 
         // REL-1 / applies PF-004: single cumulative iteration and message-byte budget
-        // across ALL regions.  Before this fix each call to evaluate_with_map seeded a
-        // fresh EvalContext so K regions each got an independent 1 M budget —
-        // CPU/DoS amplification ∝ region count.  Now one EvalBudget is threaded from
-        // region to region via evaluate_with_map_seeded so the same cap applies to the
-        // entire @extends compilation, matching the non-map (text) path.
+        // across ALL regions.  A fresh budget per region would give K regions an
+        // independent 1 M budget each — CPU/DoS amplification ∝ region count.
         let mut budget = EvalBudget::default();
 
         for (nodes, origin) in regions {
@@ -767,12 +769,13 @@ impl ModuleCache {
                 current_map = Some(returned_builder);
                 region_out
             } else {
-                evaluate(
+                evaluate_seeded(
                     nodes,
                     scope,
                     warnings,
-                    origin.file.as_ref(),
-                    origin.source.as_ref(),
+                    &origin.display,
+                    &origin.source,
+                    &mut budget,
                 )?
             };
 
@@ -892,34 +895,24 @@ impl ModuleCache {
                 ));
             }
 
-            let (body_raw, map_out) = if opts.source_map {
-                // Per-region evaluation so each block's segments carry the
-                // correct source origin (base template vs. child override).
-                let regions =
-                    spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
-                // Seed builder with the skeleton's root file.
-                let builder = crate::sourcemap::MapBuilder::new(
+            // Per-region evaluation, with or without a source map: base-skeleton
+            // nodes, base defaults and child overrides index into different files, so
+            // each region is evaluated against its own origin (#114).
+            let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
+            // Seed builder with the skeleton's root file (source maps only).
+            let builder = opts.source_map.then(|| {
+                crate::sourcemap::MapBuilder::new(
                     skeleton_origin.file.to_string(),
                     skeleton_origin.display.to_string(),
                     skeleton_origin.source.to_string(),
-                );
-                let (raw, maybe_builder) =
-                    Self::evaluate_regions_with_map(&regions, &mut scope, warnings, Some(builder))?;
-                // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-                match maybe_builder {
-                    Some(b) => apply_map_degradation(raw, b, opts, warnings),
-                    None => (raw, None),
-                }
-            } else {
-                // `final_body` is spliced from base-skeleton nodes (base-relative
-                // offsets) and child block overrides (child-relative offsets), so no
-                // single source can attribute every node's offset (#114). Pass empty
-                // file/source so `build_type_mismatch` degrades a `type_mismatch` to
-                // spanless rather than anchoring a base-relative offset against the
-                // child source (ADR-005 "degrade rather than mis-attribute"). The
-                // source-map branch above keeps spans correct by evaluating per-region
-                // with each region's own origin.
-                (evaluate(&final_body, &mut scope, warnings, "", "")?, None)
+                )
+            });
+            let (raw, maybe_builder) =
+                Self::evaluate_regions_with_map(&regions, &mut scope, warnings, builder)?;
+            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
+            let (body_raw, map_out) = match maybe_builder {
+                Some(b) => apply_map_degradation(raw, b, opts, warnings),
+                None => (raw, None),
             };
 
             let body_clean = crate::clean_output(&body_raw);
@@ -1399,8 +1392,10 @@ impl ModuleCache {
     ///
     /// Walks `spliced_regions` and calls `validator::validate` per region so each region's
     /// AST node offsets are paired with the correct source string (fixing the cross-source
-    /// OutOfBounds diagnostic bug). The scope is threaded through all regions so `@define`
-    /// / `@for` scope push/pop behaves identically to a whole-slice validate.
+    /// OutOfBounds diagnostic bug), under the region's display path — never the canonical
+    /// `origin.file`, which is absolute for `NativeFs` (R3 / CWE-209, #114). The scope is
+    /// threaded through all regions so `@define` / `@for` scope push/pop behaves
+    /// identically to a whole-slice validate.
     ///
     /// This single helper is called by BOTH `process_module_extends` (cached text path)
     /// and `process_module_intrinsic` (@extends branch) — enforcing PF-004 parity: the two
@@ -1416,7 +1411,7 @@ impl ModuleCache {
             &components.effective_blocks,
             &components.skeleton_origin,
         ) {
-            validator::validate(nodes, scope, &origin.file, &origin.source)?;
+            validator::validate(nodes, scope, &origin.display, &origin.source)?;
         }
         Ok(())
     }
@@ -1424,7 +1419,7 @@ impl ModuleCache {
     /// Evaluate an extending child template in text mode.
     ///
     /// Delegates the shared pipeline (steps 3a-3e) to `resolve_extends_components`,
-    /// then runs `validate_extends_components` + `evaluate` on `final_body` (step 3f).
+    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3f).
     ///
     /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
     /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
@@ -1439,7 +1434,7 @@ impl ModuleCache {
         let components =
             self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
 
-        // ── Step 3f: validate + evaluate on final_body ────────────────────────
+        // ── Step 3f: validate + evaluate the spliced regions ──────────────────
         // Validate per-region so each region's offsets are checked against the correct
         // source (fixes the cross-source OutOfBounds diagnostic bug). This is what makes
         // E12 work: a base default block referencing an undefined var is caught HERE
@@ -1451,7 +1446,6 @@ impl ModuleCache {
         }
 
         let ExtendsComponents {
-            final_body,
             mut scope,
             functions,
             effective_skeleton,
@@ -1460,22 +1454,22 @@ impl ModuleCache {
             has_explicit_exports,
             explicit_exports,
             merged_frontmatter,
+            ..
         } = components;
 
-        // `final_body` splices base-skeleton nodes (base-relative offsets) with child
-        // block overrides (child-relative offsets); a single `ctx.source` cannot attribute
-        // both. Pass empty file/source so a `type_mismatch` in an inherited condition
-        // degrades to spanless instead of mis-attributing a base-relative offset onto the
-        // child source (ADR-005 "degrade rather than mis-attribute"). Per-region source
-        // attribution for `@extends` is tracked as #114; spanless is the safe interim.
-        let prompt_body = evaluate(&final_body, &mut scope, warnings, "", "")?;
+        // Base-skeleton nodes, base defaults and child overrides index into different
+        // files, so each region is evaluated against its own origin (#114). No
+        // MapBuilder: an extending module carries no FragmentMap (below).
+        let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
+        let (prompt_body, _) =
+            Self::evaluate_regions_with_map(&regions, &mut scope, warnings, None)?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
         Ok(ResolvedModule {
             functions,
             prompt_body,
-            // @extends modules do not carry a FragmentMap in S6; multi-source
-            // region attribution for extending modules is tracked as #114.
+            // An extending module builds no FragmentMap, so the text an `@include` of
+            // it contributes to a source-mapped importer carries no segments.
             prompt_map: None,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.

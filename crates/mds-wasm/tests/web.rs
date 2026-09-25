@@ -897,6 +897,52 @@ fn compile_extends_undefined_var_in_base_default_carries_real_span() {
         .expect("WASM C4: span.column must be a number, not undefined");
 }
 
+#[wasm_bindgen_test]
+fn compile_extends_type_mismatch_spans_the_file_it_is_written_in() {
+    // #114 (WASM): a cross-type comparison fails at evaluation time. In the base
+    // skeleton it is spanned on the base's `@if` line (offset 14, line 4); in a child
+    // override, on the child's (offset 35, line 3). `@if n == 5:` is 11 bytes.
+    let base_with_if = "---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n";
+    let base_plain = "---\nn: hi\n---\n@block body:\ndefault\n@end\n";
+    let cases = [
+        (
+            "base skeleton",
+            base_with_if,
+            "@extends \"./base.mds\"\n@block body:\noverride\n@end\n",
+            14.0,
+            4.0,
+        ),
+        (
+            "child override",
+            base_plain,
+            "@extends \"./base.mds\"\n@block body:\n@if n == 5:\nx\n@end\n@end\n",
+            35.0,
+            3.0,
+        ),
+    ];
+    for (region, base_src, child_src, offset, line) in cases {
+        let opts = inheritance_modules_opts(child_src, base_src);
+        let err = mds_wasm::compile(child_src, opts).unwrap_err();
+        assert_eq!(
+            get_str(&err, "code"),
+            "mds::type_mismatch",
+            "WASM #114 {region}: code"
+        );
+        let span = get_prop(&err, "span");
+        let field = |key: &str| get_prop(&span, key).as_f64();
+        assert_eq!(
+            [
+                field("offset"),
+                field("length"),
+                field("line"),
+                field("column")
+            ],
+            [Some(offset), Some(11.0), Some(line), Some(1.0)],
+            "WASM #114 {region}: span must underline the @if line in its own file"
+        );
+    }
+}
+
 // ── T-15: ESC-injection hardening — WASM surface (issue #176 / CWE-150) ──────
 //
 // Two sub-tests:

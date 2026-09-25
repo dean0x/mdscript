@@ -1,6 +1,8 @@
 /**
  * Shared test helpers for @mdscript/mds tests.
  */
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -105,4 +107,31 @@ export function errorShape(err) {
     help: err.help ?? null,
     span: err.span ?? null,
   };
+}
+
+/** Absolute path to the repo root (three levels above this directory). */
+const REPO_ROOT = path.resolve(__dirname, '../../..');
+
+/**
+ * Return the path to a Python interpreter that can import `markdown_script`, or null.
+ *
+ * Resolution order:
+ *   1. MDS_PYTHON_BIN env var (set by CI to the pip-managed interpreter).
+ *   2. Repo-local venv at .venv/bin/python3 (set up by `maturin develop`).
+ *   3. System `python3` on PATH (best-effort fallback for local dev).
+ *
+ * Returns null only when none of the above is found.  In CI (process.env.CI)
+ * the caller must treat null as a hard failure — see PF-007.
+ */
+export function findPythonForMarkdownScript() {
+  const envBin = process.env.MDS_PYTHON_BIN;
+  if (envBin) {
+    if (!existsSync(envBin)) throw new Error(`MDS_PYTHON_BIN=${envBin} does not exist`);
+    return envBin;
+  }
+  const venvPy = path.join(REPO_ROOT, '.venv', 'bin', 'python3');
+  if (existsSync(venvPy)) return venvPy;
+  const res = spawnSync('which', ['python3'], { encoding: 'utf-8' });
+  if (res.status === 0 && res.stdout.trim()) return res.stdout.trim();
+  return null;
 }

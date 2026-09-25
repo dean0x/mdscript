@@ -3767,6 +3767,56 @@ fn r3_map_mode_eval_diagnostic_display_is_root_relative() {
     );
 }
 
+#[test]
+fn r3_extends_errors_name_the_base_root_relative() {
+    // #114 / AC-114-2: an error raised inside inherited base content names the base by
+    // its root-relative display, never its absolute canonical key — for validation
+    // (an undefined variable in a base-default block) and for evaluation (a cross-type
+    // comparison in the base skeleton), with source maps on and off.
+    let (_guard, root) = r3_project();
+    let cases = [
+        (
+            "validation",
+            "@block greeting:\nHello {{customer_name}}, welcome.\n@end\n",
+            "mds::undefined_var",
+        ),
+        (
+            "evaluation",
+            "---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n",
+            "mds::type_mismatch",
+        ),
+    ];
+    for (stage, base, code) in cases {
+        let dir = root.join(stage);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("base.mds"), base).unwrap();
+        let child = dir.join("child.mds");
+        std::fs::write(&child, "@extends \"./base.mds\"\n").unwrap();
+
+        // Positive control (PF-013): the base's canonical key IS absolute, so the
+        // equality below fails if it leaks into the name.
+        assert!(
+            dir.join("base.mds").canonicalize().unwrap().is_absolute(),
+            "positive control: canonical key must be absolute"
+        );
+        for source_map in [false, true] {
+            let opts = crate::CompileOptions::default().with_source_map(source_map);
+            let err = crate::compile_with_deps_opts(&child, None, opts).unwrap_err();
+            assert_eq!(
+                err.serialize().code,
+                code,
+                "{stage}, source_map={source_map}: {err}"
+            );
+            assert_eq!(
+                err.source_name(),
+                Some(format!("{stage}/base.mds").as_str()),
+                "{stage}, source_map={source_map}: the error must name the base by its \
+                 root-relative display"
+            );
+        }
+    }
+}
+
 // ── #371: filesystem-root base dir ────────────────────────────────────────
 //
 // A base directory that IS the filesystem root (`/` on Unix, a drive root

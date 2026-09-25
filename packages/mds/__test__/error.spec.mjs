@@ -5,7 +5,18 @@
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { compile, check, isMdsError, init, lintVirtual } from '../dist/node.js';
-import { assertNoForbiddenChars, errorShape, escapeText, thrownBy } from './helpers.mjs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import {
+  assertNoForbiddenChars,
+  errorShape,
+  escapeText,
+  findPythonForMarkdownScript,
+  rejectionOf,
+  thrownBy,
+} from './helpers.mjs';
 
 describe('error shape', () => {
   before(() => init());
@@ -480,5 +491,109 @@ describe('error shape', () => {
       JSON.parse(JSON.stringify(wasmResult)),
       'U-E-DIFF (route B): native and WASM lintVirtual must produce identical results',
     );
+  });
+
+  test('U-E-EXT: napi, WASM and Python report an inherited type_mismatch identically', async (t) => {
+    // PF-007 differential for #114: an evaluation error inside an @extends chain must
+    // serialize identically on every surface, with source maps on and off, and the
+    // shared value must be the span on the file the comparison is written in — the
+    // base skeleton's `@if n == 5:` (11 bytes at offset 14, line 4). Per-surface goldens
+    // cannot see a divergence between surfaces; this compares them to each other.
+    // Every surface is required in CI; locally a missing one skips visibly.
+    let native = null;
+    try {
+      const { createNativeBackend } = await import('../dist/backend/native.js');
+      const { createRequire } = await import('node:module');
+      const { fileURLToPath } = await import('node:url');
+      const { dirname } = await import('node:path');
+      const testDir = dirname(fileURLToPath(import.meta.url));
+      const require = createRequire(import.meta.url);
+      native = createNativeBackend(require(join(testDir, '../../../crates/mds-napi/index.js')));
+    } catch {
+      native = null;
+    }
+    let wasmModule = null;
+    try {
+      const { initWasmNode } = await import('../dist/backend/wasm.js');
+      wasmModule = await initWasmNode();
+    } catch {
+      wasmModule = null;
+    }
+    const python = findPythonForMarkdownScript();
+    if (native === null || wasmModule === null || python === null) {
+      if (process.env.CI) {
+        throw new Error('U-E-EXT: the native, WASM and Python surfaces are all required in CI');
+      }
+      t.skip('native, WASM or Python surface unavailable');
+      return;
+    }
+    const { createWasmBackend } = await import('../dist/backend/wasm.js');
+    const { buildModulesMap } = await import('../dist/util/module-scanner.js');
+    const wasm = createWasmBackend(wasmModule);
+
+    const dir = await mkdtemp(join(tmpdir(), 'u-e-ext-'));
+    try {
+      // The marker pins the project root, so buildModulesMap keys are root-relative.
+      await writeFile(join(dir, '.mdsroot'), '');
+      await writeFile(
+        join(dir, 'base.mds'),
+        '---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n',
+      );
+      const childPath = join(dir, 'child.mds');
+      await writeFile(childPath, '@extends "./base.mds"\n@block body:\noverride\n@end\n');
+
+      const shapes = {};
+      for (const sourceMap of [false, true]) {
+        shapes[`napi sourceMap=${sourceMap}`] = errorShape(
+          await rejectionOf(native.compileFile(childPath, { sourceMap }), 'U-E-EXT napi'),
+        );
+        // The WASM compileFile path: pre-scan the modules, then compile the entry.
+        const { entryFilename, modules } = await buildModulesMap(childPath, (src) =>
+          wasmModule.scanImports(src),
+        );
+        const entrySource = modules[entryFilename];
+        delete modules[entryFilename];
+        shapes[`wasm sourceMap=${sourceMap}`] = errorShape(
+          thrownBy(
+            () => wasm.compile(entrySource, { filename: entryFilename, modules, sourceMap }),
+            'U-E-EXT wasm',
+          ),
+        );
+      }
+      const pyScript = [
+        'import json, sys',
+        'import markdown_script as m',
+        'out = []',
+        'for source_map in (False, True):',
+        '    try:',
+        '        m.compile_file(sys.argv[1], source_map=source_map)',
+        '        out.append(None)',
+        '    except m.MdsError as e:',
+        '        s = e.span',
+        '        span = None if s is None else {"offset": s.offset, "length": s.length,',
+        '                                       "line": s.line, "column": s.column}',
+        '        out.append({"code": e.code, "message": e.message, "help": e.help, "span": span})',
+        'print(json.dumps(out))',
+      ].join('\n');
+      const py = spawnSync(python, ['-c', pyScript, childPath], { encoding: 'utf-8' });
+      assert.equal(py.status, 0, `U-E-EXT: Python compile_file failed: ${py.stderr}`);
+      const [pyOff, pyOn] = JSON.parse(py.stdout.trim());
+      shapes['python source_map=False'] = pyOff;
+      shapes['python source_map=True'] = pyOn;
+
+      // Non-vacuity (PF-013): the shared value is the type_mismatch spanned on the base.
+      const reference = shapes['napi sourceMap=false'];
+      assert.equal(reference.code, 'mds::type_mismatch', JSON.stringify(reference));
+      assert.deepEqual(
+        reference.span,
+        { offset: 14, length: 11, line: 4, column: 1 },
+        'U-E-EXT: the error must be spanned on the base skeleton\'s @if line',
+      );
+      for (const [surface, shape] of Object.entries(shapes)) {
+        assert.deepEqual(shape, reference, `U-E-EXT: ${surface} must match napi sourceMap=false`);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

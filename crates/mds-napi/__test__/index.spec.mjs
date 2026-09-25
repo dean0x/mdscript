@@ -724,6 +724,42 @@ describe('template inheritance', () => {
       );
     });
   });
+
+  // INH-4 (#114): a cross-type comparison fails at evaluation time. In the base skeleton
+  // it is spanned on the base's `@if` line; in a child override, on the child's.
+  // `@if n == 5:` is 11 bytes. Source maps off (the default).
+  test('INH-4: an inherited type_mismatch is spanned on the file the comparison is written in', () => {
+    const cases = [
+      {
+        region: 'base skeleton',
+        base: '---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n',
+        child: '@extends "./base.mds"\n@block body:\noverride\n@end\n',
+        span: { offset: 14, length: 11, line: 4, column: 1 },
+      },
+      {
+        region: 'child override',
+        base: '---\nn: hi\n---\n@block body:\ndefault\n@end\n',
+        child: '@extends "./base.mds"\n@block body:\n@if n == 5:\nx\n@end\n@end\n',
+        span: { offset: 35, length: 11, line: 3, column: 1 },
+      },
+    ];
+    for (const { region, base, child, span } of cases) {
+      withInheritanceFixtures(base, child, (childPath) => {
+        assert.throws(
+          () => compileFile(childPath),
+          (err) => {
+            assert.equal(err.code, 'mds::type_mismatch', `INH-4 ${region}: code`);
+            assert.deepEqual(
+              err.span,
+              span,
+              `INH-4 ${region}: span must underline the @if line in its own file`,
+            );
+            return true;
+          },
+        );
+      });
+    }
+  });
 });
 
 // ── Intrinsic output shape tests (AC-API-04, AC-API-05, AC-API-13) ────────────
