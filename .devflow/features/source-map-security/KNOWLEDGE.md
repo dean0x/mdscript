@@ -8,7 +8,7 @@ directories:
   - crates/mds-cli/src
   - packages/mds/src
 created: 2026-07-19
-updated: 2026-09-25
+updated: 2026-09-26
 ---
 
 # Source Map Security and Path Containment
@@ -75,12 +75,15 @@ fn source_root(&self) -> Option<String> {
 
 ```rust
 // resolver.rs — at both finalize sites, before calling relativize_source:
-// Defense-in-depth: if root was not established yet, establish it now.
-// No-op for VirtualFs (source_root() always None, ctx.base_dir empty).
-if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-    let _ = self.fs.anchor_base_dir(ctx.base_dir);
+self.anchor_root_for_source_map(ctx.base_dir);
+
+// ModuleCache::anchor_root_for_source_map — best-effort by design:
+if self.fs.source_root().is_none() && !base_dir.is_empty() {
+    let _ = self.fs.anchor_base_dir(base_dir);
 }
 ```
+
+The anchor is never propagated (c615ace): only a custom backend without a `source_root` of its own reaches it, after it accepted the entry, so a refusal must not fail the compile — it leaves `source_root()` at `None` and absolute sources degrade to basenames. `source_map_root_safety_net_never_fails_a_compile` pins it.
 
 ## Technical Implementation Patterns
 
@@ -235,7 +238,7 @@ The Windows verbatim lesson is the same on both sides: the TS must strip verbati
 
 - `crates/mds-core/src/source_path.rs` — `relativize_source` (the single choke-point; 10-step guard algorithm; `path_to_unified` with verbatim-prefix strip; `basename_fallback` using normalized components; `core_rule_map_relative` and `core_rule_source_outside_root` discriminating test pair); `display_path_for` (R3 display-path wrapper, root-relative for NativeFs, verbatim for VirtualFs)
 - `crates/mds-core/src/fs.rs:111-132` — `FileSystem::source_root()` (defaulted `None`; NativeFs override at line 522)
-- `crates/mds-core/src/resolver.rs` — two finalize sites in `process_module_intrinsic_opts` (grep `Step 5 — single choke-point`); both call `relativize_source` unconditionally; both include the defense-in-depth `anchor_base_dir` guard
+- `crates/mds-core/src/resolver.rs` — two finalize sites in `process_module_intrinsic_opts` (grep `Step 5 — single choke-point`); both call `relativize_source` unconditionally; both call the best-effort defense-in-depth `anchor_root_for_source_map` first
 - `crates/mds-core/src/sourcemap.rs` — `Origin` struct (`file: Arc<str>` canonical key; `display: Arc<str>` root-relative display path, populated via `display_path_for`); `MapBuilder` (`sources[]` + parallel `display_names[]`; 3-arg `new` and `source_index`); `CompileOptions` struct (`source_map_base: Option<PathBuf>`); `SourceMap` struct carries `#[non_exhaustive]`, `CompileOptions` does not
 - `crates/mds-cli/src/build.rs` — `compute_source_map_base` (pure oracle; uses `compute_output_dir_path_for_kind`); `apply_source_map_file_label` (two-job post-processor: `sm.file` + `<stdin>` relabel)
 - `crates/mds-cli/src/lint.rs` — `read_source_file` / `read_canonical_source`: `fs.anchor_base_dir(effective_parent(&canonical))?` before `fs.read()` to anchor display roots (lint and fmt)
