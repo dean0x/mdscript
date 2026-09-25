@@ -371,6 +371,25 @@ impl ModuleCache {
         self.fs.anchor_base_dir(base_dir)
     }
 
+    /// Anchor the project root at a module's `base_dir` when no entry call has
+    /// established one, before `sources[]` is relativized — the defense-in-depth
+    /// half of the source-map choke point, against a future entry path that skips
+    /// root establishment (PF-004 shape).
+    ///
+    /// Best-effort by design, never propagated. Every built-in entry API anchors
+    /// first, so [`NativeFs`] never reaches the call without a root, and the
+    /// default `anchor_base_dir` ([`VirtualFs`]) cannot fail — nor does it give
+    /// `source_root` a value. Only a custom backend without a `source_root` of its
+    /// own reaches it, for a directory it may never have been asked to anchor, and
+    /// that backend has already accepted the entry: a refusal must not fail the
+    /// compile. It leaves `source_root()` at `None`, and `relativize_source` then
+    /// degrades each absolute source to its basename — never an absolute path.
+    fn anchor_root_for_source_map(&self, base_dir: &str) {
+        if self.fs.source_root().is_none() && !base_dir.is_empty() {
+            let _ = self.fs.anchor_base_dir(base_dir);
+        }
+    }
+
     /// Resolve a module from a filesystem path string.
     ///
     /// `path` is a UTF-8 string representation of the OS path (callers convert
@@ -949,14 +968,7 @@ impl ModuleCache {
             // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
             // relativize ALL sources[] entries so no absolute path can leak into
             // the published map.  Unconditional — never opt-in, never debug_assert.
-            //
-            // Defense-in-depth: establish root from base_dir if it was not set by
-            // the entry-point resolve_entry() / anchor_base_dir() call (guards against a future
-            // alternate code path that bypasses root establishment — PF-004 shape).
-            // No-op for VirtualFs: its source_root() always returns None regardless.
-            if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-                let _ = self.fs.anchor_base_dir(ctx.base_dir);
-            }
+            self.anchor_root_for_source_map(ctx.base_dir);
             let source_map = source_map.map(|mut sm| {
                 let root_str = self.fs.source_root();
                 let root = root_str.as_deref().map(std::path::Path::new);
@@ -1031,14 +1043,7 @@ impl ModuleCache {
         // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
         // relativize ALL sources[] entries so no absolute path can leak into
         // the published map.  Unconditional — never opt-in, never debug_assert.
-        //
-        // Defense-in-depth: establish root from base_dir if it was not set by
-        // the entry-point resolve_entry() / anchor_base_dir() call (guards against a future
-        // alternate code path that bypasses root establishment — PF-004 shape).
-        // No-op for VirtualFs: its source_root() always returns None regardless.
-        if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-            let _ = self.fs.anchor_base_dir(ctx.base_dir);
-        }
+        self.anchor_root_for_source_map(ctx.base_dir);
         let source_map = source_map.map(|mut sm| {
             let root_str = self.fs.source_root();
             let root = root_str.as_deref().map(std::path::Path::new);

@@ -4003,3 +4003,85 @@ fn validate_import_path_refuses_every_forbidden_char() {
     // Control: a clean relative path has no violation.
     assert_eq!(import_path_violation("./a b-\u{00FC}.mds"), None);
 }
+
+/// A custom backend of the one kind that reaches the source-map root safety net:
+/// absolute keys, no root concept (`source_root` stays `None`), and an
+/// `anchor_base_dir` that refuses every directory and counts its calls.
+struct UnanchorableFs {
+    anchor_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FileSystem for UnanchorableFs {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        Ok(path.to_string())
+    }
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        Ok(format!("{dir}/{}", relative.trim_start_matches("./")))
+    }
+    fn parent_dir(&self, key: &str) -> String {
+        key.rsplit_once('/').map_or("", |(dir, _)| dir).to_string()
+    }
+    fn read(&self, key: &str) -> Result<String, MdsError> {
+        match key {
+            "/proj/main.mds" => Ok("Hello!\n".to_string()),
+            "/proj/child.mds" => Ok("@extends \"./base.mds\"\n".to_string()),
+            "/proj/base.mds" => Ok("Base\n@block body:\ndefault\n@end\n".to_string()),
+            _ => Err(MdsError::module_not_found(key)),
+        }
+    }
+    fn is_markdown(&self, _key: &str) -> bool {
+        false
+    }
+    fn anchor_base_dir(&self, dir: &str) -> Result<String, MdsError> {
+        self.anchor_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(MdsError::io(format!("refused: {dir}")))
+    }
+}
+
+/// #155: the source-map root safety net is best-effort. A backend that refuses to
+/// anchor the entry's directory there still compiles — it accepted the entry — and
+/// its absolute `sources[]` keys degrade to basenames, never to absolute paths.
+/// Standalone and `@extends` entries each reach their own call site.
+#[test]
+fn source_map_root_safety_net_never_fails_a_compile() {
+    for (entry, source, output) in [
+        ("/proj/main.mds", "main.mds", "Hello!\n"),
+        ("/proj/child.mds", "base.mds", "Base\ndefault\n"),
+    ] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = ModuleCache::with_fs(Box::new(UnanchorableFs {
+            anchor_calls: Arc::clone(&calls),
+        }));
+        let opts = crate::CompileOptions::default().with_source_map(true);
+        let (compiled, sm) = cache
+            .resolve_virtual_intrinsic_opts(entry, &HashMap::new(), &opts, &mut vec![])
+            .unwrap_or_else(|e| panic!("{entry}: a refused anchor must not fail the compile: {e}"));
+        // Reachability (PF-013): the refusal below was actually returned.
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "{entry}: the safety net must have called anchor_base_dir"
+        );
+        assert!(
+            matches!(&compiled, crate::CompiledOutput::Markdown(s) if s == output),
+            "{entry}: unexpected output {compiled:?}"
+        );
+        let sm = sm.expect("source map must be emitted");
+        // Positive control (PF-013): the raw key IS absolute.
+        assert!(
+            entry.starts_with('/'),
+            "positive control: raw key is absolute"
+        );
+        assert_eq!(
+            sm.sources.first().map(String::as_str),
+            Some(source),
+            "{entry}"
+        );
+        for s in &sm.sources {
+            assert!(
+                !s.starts_with('/'),
+                "{entry}: sources[] must never be absolute; got {s}"
+            );
+        }
+    }
+}
