@@ -110,18 +110,29 @@ function isWithinRoot(root: string, candidate: string): boolean {
 /**
  * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP /
  * ENOTDIR errors that the kernel emits when the path is a symlink into a clear
- * security error. All other OS errors are re-thrown unchanged.
+ * security error, and ENOENT (no such file — e.g. a case-mismatched spelling on
+ * a case-sensitive volume, #408) into the same `mds::file_not_found` shape the
+ * Rust engine reports for a missing file, keyed on `shown` rather than the
+ * resolved `absolutePath` (R3 / CWE-209 — the raw Node error otherwise leaks the
+ * resolved filesystem path in its message). All other OS errors are re-thrown
+ * unchanged.
  *
  * Module-level helper (not a closure) so that openAndValidateModule's own
  * try/catch only handles post-open validation, keeping nesting shallow.
  */
-async function openNoFollow(absolutePath: string): Promise<Awaited<ReturnType<typeof open>>> {
+async function openNoFollow(
+  absolutePath: string,
+  shown: string,
+): Promise<Awaited<ReturnType<typeof open>>> {
   try {
     return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ELOOP' || code === 'ENOTDIR') {
       throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
+    }
+    if (code === 'ENOENT') {
+      throw fileNotFoundError(shown);
     }
     throw err;
   }
@@ -137,7 +148,7 @@ async function openNoFollow(absolutePath: string): Promise<Awaited<ReturnType<ty
  * backend throws it, so the WASM backend's file operations fail exactly like
  * the native ones.
  */
-type PathError = Error & { code: 'mds::import' | 'mds::io' };
+type PathError = Error & { code: 'mds::import' | 'mds::io' | 'mds::file_not_found' };
 
 function pathError(code: PathError['code'], message: string): PathError {
   const err = new Error(message) as PathError;
@@ -148,6 +159,15 @@ function pathError(code: PathError['code'], message: string): PathError {
 /** `mds::import`, with the `import error: ` prefix the Rust error's display adds. */
 function importError(detail: string): PathError {
   return pathError('mds::import', `import error: ${detail}`);
+}
+
+/**
+ * `mds::file_not_found`, matching Rust `MdsError::file_not_found`'s message
+ * shape (`"file not found: {path}"`) exactly, keyed on `shown` — the path as
+ * written — never the resolved filesystem path.
+ */
+function fileNotFoundError(shown: string): PathError {
+  return pathError('mds::file_not_found', `file not found: ${shown}`);
 }
 
 /**
@@ -444,7 +464,7 @@ export async function buildModulesMap(
 
     // O_NOFOLLOW | O_RDONLY: if the final component is a symlink the kernel
     // rejects it with ELOOP before our code reads a single byte.
-    const handle = await openNoFollow(joined);
+    const handle = await openNoFollow(joined, shown);
 
     try {
       const [stats, linkStats, resolved] = await Promise.all([

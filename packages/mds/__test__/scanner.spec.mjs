@@ -430,9 +430,15 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     return insensitive;
   }
 
-  /** On a case-sensitive volume a mismatched spelling is simply not found. */
-  function assertNotFoundNotSymlink(err, label) {
-    assert.equal(err.code, 'ENOENT', `${label}: ${err.message}`);
+  /**
+   * On a case-sensitive volume a mismatched spelling is simply not found —
+   * the same `mds::file_not_found` shape the Rust engine reports for a
+   * missing file, keyed on `shown` (never a resolved absolute path, R3 /
+   * CWE-209).
+   */
+  function assertNotFoundNotSymlink(err, shown, label) {
+    assert.equal(err.code, 'mds::file_not_found', `${label}: ${err.message}`);
+    assert.equal(err.message, `file not found: ${shown}`, label);
     assert.doesNotMatch(err.message, /symlink/, label);
   }
 
@@ -441,14 +447,23 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
   test('U-SM14: a case-mismatched entry path is never reported as a symlink', async () => {
     await withProject(async (dir) => {
       await writeFile(path.join(dir, 'main.mds'), 'Hello!\n');
-      const build = buildModulesMap(path.join(dir, 'MAIN.mds'), scanImports);
-      if (await caseInsensitive(dir)) {
+      // Resolve case-sensitivity BEFORE starting the build: the build's
+      // rejection on a case-sensitive volume can settle before an interleaved
+      // await elsewhere in this function attaches a handler, which Node's
+      // unhandled-rejection detector flags even though the rejection is
+      // handled moments later (a `PromiseRejectionHandledWarning`, not a
+      // silently dropped error). Starting `build` last means the very next
+      // expression always consumes it, on either branch.
+      const insensitive = await caseInsensitive(dir);
+      const entry = path.join(dir, 'MAIN.mds');
+      const build = buildModulesMap(entry, scanImports);
+      if (insensitive) {
         // The entry is keyed as typed: that key is what the WASM engine is handed.
         const { entryFilename, modules } = await build;
         assert.equal(entryFilename, 'MAIN.mds');
         assert.deepEqual(modules, { 'MAIN.mds': 'Hello!\n' });
       } else {
-        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM14'), 'U-SM14');
+        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM14'), entry, 'U-SM14');
       }
     });
   });
@@ -457,14 +472,17 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     await withProject(async (dir) => {
       await writeFile(path.join(dir, 'main.mds'), '@import "./Header.mds" as h\n');
       await writeFile(path.join(dir, 'header.mds'), 'hi\n');
+      // See U-SM14: resolve case-sensitivity before starting the build so
+      // nothing is left unhandled across an interleaved await.
+      const insensitive = await caseInsensitive(dir);
       const build = buildModulesMap(path.join(dir, 'main.mds'), scanImports);
-      if (await caseInsensitive(dir)) {
+      if (insensitive) {
         // Keyed as written, since the engine's virtual filesystem looks the import
         // up under exactly that key.
         const { modules } = await build;
         assert.equal(modules['Header.mds'], 'hi\n');
       } else {
-        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM15'), 'U-SM15');
+        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM15'), './Header.mds', 'U-SM15');
       }
     });
   });
@@ -484,7 +502,7 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       if (insensitive) {
         await assert.rejects(mismatched, /security.*symlink/);
       } else {
-        assertNotFoundNotSymlink(await rejectionOf(mismatched, 'U-SM16'), 'U-SM16');
+        assertNotFoundNotSymlink(await rejectionOf(mismatched, 'U-SM16'), './LINK.mds', 'U-SM16');
       }
     });
   });
