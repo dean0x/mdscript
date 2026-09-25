@@ -810,6 +810,7 @@ impl FileSystem for NativeFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::make_symlink;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -969,50 +970,6 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
-    }
-
-    /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
-    ///
-    /// Unix symlink creation needs no special privilege. On Windows it needs
-    /// either Developer Mode or `SeCreateSymbolicLinkPrivilege` (an elevated
-    /// process) — GitHub's `windows-latest` runners have Developer Mode enabled,
-    /// so a failure there is a genuine regression and must panic. Locally,
-    /// without that privilege, the OS reports `ERROR_PRIVILEGE_NOT_HELD` (raw
-    /// error 1314); this helper treats exactly that failure as a skip (never a
-    /// false pass) when the `CI` env var is unset, printing a one-line reason.
-    /// Returns `false` when the caller should skip the rest of the test.
-    fn make_symlink(target: &Path, link: &Path) -> bool {
-        #[cfg(unix)]
-        let result = std::os::unix::fs::symlink(target, link);
-        #[cfg(windows)]
-        let result = if target.is_dir() {
-            std::os::windows::fs::symlink_dir(target, link)
-        } else {
-            std::os::windows::fs::symlink_file(target, link)
-        };
-
-        match result {
-            Ok(()) => true,
-            Err(err) => {
-                #[cfg(windows)]
-                {
-                    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
-                    if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
-                        && std::env::var_os("CI").is_none()
-                    {
-                        eprintln!(
-                            "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
-                        );
-                        return false;
-                    }
-                }
-                panic!(
-                    "failed to create symlink {} -> {}: {err}",
-                    target.display(),
-                    link.display()
-                );
-            }
-        }
     }
 
     /// A relative import that climbs out of any project directory and lands on

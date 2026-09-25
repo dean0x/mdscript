@@ -305,6 +305,58 @@ pub(crate) fn compile_virtual_md(
     compile_virtual(modules, entry, runtime_vars).and_then(CompileResult::into_markdown)
 }
 
+// ── Test-only filesystem helpers ───────────────────────────────────────────────
+//
+// Shared by `fs.rs`'s and this file's own unit tests (both compiled into this
+// crate's `#[cfg(test)]` build); integration-test binaries under `tests/` link
+// against the non-test build and cannot see `pub(crate)` items, so they keep
+// their own copy (#147).
+
+/// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
+///
+/// Unix symlink creation needs no special privilege. On Windows it needs
+/// either Developer Mode or `SeCreateSymbolicLinkPrivilege` (an elevated
+/// process) — GitHub's `windows-latest` runners have Developer Mode enabled,
+/// so a failure there is a genuine regression and must panic. Locally,
+/// without that privilege, the OS reports `ERROR_PRIVILEGE_NOT_HELD` (raw
+/// error 1314); this helper treats exactly that failure as a skip (never a
+/// false pass) when the `CI` env var is unset, printing a one-line reason.
+/// Returns `false` when the caller should skip the rest of the test.
+#[cfg(test)]
+pub(crate) fn make_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            #[cfg(windows)]
+            {
+                const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                    && std::env::var_os("CI").is_none()
+                {
+                    eprintln!(
+                        "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
+                    );
+                    return false;
+                }
+            }
+            panic!(
+                "failed to create symlink {} -> {}: {err}",
+                target.display(),
+                link.display()
+            );
+        }
+    }
+}
+
 /// Maximum file size accepted for compilation (10 MB).
 ///
 /// This is the single source of truth shared by the file resolver and the
@@ -2230,46 +2282,6 @@ mod tests {
             .expect("should load the 1003-duplicate fixture");
         assert_eq!(loaded.duplicate_keys.len(), 1_000);
         assert_eq!(loaded.duplicate_keys_omitted, 3);
-    }
-
-    /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
-    ///
-    /// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name and
-    /// contract (#147); duplicated rather than shared because that helper is
-    /// private to `fs.rs`'s own `mod tests` and this file's `mod tests` is a
-    /// separate module.
-    fn make_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
-        #[cfg(unix)]
-        let result = std::os::unix::fs::symlink(target, link);
-        #[cfg(windows)]
-        let result = if target.is_dir() {
-            std::os::windows::fs::symlink_dir(target, link)
-        } else {
-            std::os::windows::fs::symlink_file(target, link)
-        };
-
-        match result {
-            Ok(()) => true,
-            Err(err) => {
-                #[cfg(windows)]
-                {
-                    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
-                    if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
-                        && std::env::var_os("CI").is_none()
-                    {
-                        eprintln!(
-                            "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
-                        );
-                        return false;
-                    }
-                }
-                panic!(
-                    "failed to create symlink {} -> {}: {err}",
-                    target.display(),
-                    link.display()
-                );
-            }
-        }
     }
 
     /// Mirrors `security.rs:400-422` (mds-cli): the same symlink guard applies to

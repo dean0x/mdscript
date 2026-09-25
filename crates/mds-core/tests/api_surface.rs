@@ -1514,10 +1514,10 @@ fn compile_with_deps_messages_excludes_entry_from_dependencies() {
 
 /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
 ///
-/// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name and
-/// contract (#147); duplicated rather than shared because that helper is
-/// private to `fs.rs`'s own `mod tests` and this file is a separate
-/// integration-test binary.
+/// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
+/// name and contract (#147); duplicated rather than shared because that
+/// helper is `pub(crate)` and this file is a separate integration-test
+/// binary that links against the non-test build.
 fn make_symlink(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(target, link);

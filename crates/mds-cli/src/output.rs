@@ -2718,8 +2718,8 @@ mod tests {
 
     /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
     ///
-    /// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name
-    /// and contract (#147): Unix needs no privilege; Windows needs Developer
+    /// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
+    /// name and contract (#147): Unix needs no privilege; Windows needs Developer
     /// Mode or an elevated process (GitHub's `windows-latest` runners have
     /// Developer Mode enabled, so a failure there is a genuine regression and
     /// must panic), and only the unprivileged local case — `CI` unset plus raw

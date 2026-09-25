@@ -35,10 +35,10 @@ pub fn mds_bin() -> std::process::Command {
 /// `CI` env var is unset, printing a one-line reason. Returns `false` when the
 /// caller should skip the rest of the test.
 ///
-/// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name and
-/// contract (#147); duplicated rather than shared because `mds-core`'s helper
-/// is `cfg(test)`-private to that crate and each `mds-cli` integration test
-/// file compiles `tests/common/mod.rs` as its own module.
+/// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
+/// name and contract (#147); duplicated rather than shared because
+/// `mds-core`'s helper is `pub(crate)` to that crate and each `mds-cli`
+/// integration test file compiles `tests/common/mod.rs` as its own module.
 #[allow(dead_code)]
 pub fn make_symlink(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
