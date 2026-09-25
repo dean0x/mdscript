@@ -1534,6 +1534,55 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     );
   });
 
+  test('T-13/E-11 (route B): ESC in a frontmatter key sanitizes unused-variable message', () => {
+    // Route B sibling of T-13/E-11: same ESC (U+001B) control character, but carried
+    // by an UNUSED FRONTMATTER KEY (unused-variable) rather than an import path /
+    // module name (duplicate-import). #265 will reject hostile paths/module names at
+    // the input boundary, retiring route-A coverage for ESC — a frontmatter key is
+    // not a path, so this route stays reachable and green after enforcement lands,
+    // keeping message-escaping coverage alive.
+    //
+    // Written as a YAML double-quoted key with a YAML `\x1B` escape so the .mds
+    // source text itself carries no raw control byte (PF-018); serde_yaml_ng decodes
+    // the escape into a real ESC codepoint, which unused-variable embeds verbatim in
+    // its message before WIRE-sanitization escapes it back out.
+    const source = '---\n"a\\x1Bpayload\\x1Bb": 1\n---\nHello\n';
+    // Route-B contract check: the constructed .mds source carries no raw ESC byte —
+    // only the two-character YAML escape text.
+    assert.ok(
+      !source.includes(String.fromCharCode(0x1b)),
+      'T-13/E-11 (route B): source must carry no raw ESC byte, only the YAML escape',
+    );
+
+    const result = lint(source);
+    assert.equal(result.version, 1, 'T-13/E-11 (route B): version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'T-13/E-11 (route B): expected unused-variable; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, 'T-13/E-11 (route B): diag.message');
+      }
+    }
+    // (2) Positive control (PF-013): the sanitized \u001B literal IS present — proof
+    // the raw ESC codepoint really reached the parsed frontmatter key before the
+    // WIRE sanitizer escaped it back out.
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u001B')),
+      'T-13/E-11 (route B): expected \\u001B in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+    // Escaped, not stripped — the payload text around it survives verbatim.
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('payload')),
+      'T-13/E-11 (route B): message body must be preserved verbatim; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
   test('E-12: error path — compile error message sanitized for DEL (U+007F) in alias', () => {
     // DEL (U+007F) in @include alias; parser rejects the invalid alias and embeds
     // the raw bytes in the error message. After fix, serialize() sanitizes DEL to \u007F.
@@ -1551,6 +1600,41 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
         `E-12: sanitized \\u007F must appear in err.message; got: ${JSON.stringify(msg)}`
       );
     }
+  });
+
+  test('E-12 (route B): DEL in a frontmatter key sanitizes unused-variable message', () => {
+    // Route B sibling of E-12: same DEL (U+007F) control character, but carried by an
+    // UNUSED FRONTMATTER KEY (unused-variable) rather than an @include alias (compile
+    // error). See T-13/E-11 (route B) above for the full rationale.
+    const source = '---\n"a\\x7Fpayload\\x7Fb": 1\n---\nHello\n';
+    assert.ok(
+      !source.includes(String.fromCharCode(0x7f)),
+      'E-12 (route B): source must carry no raw DEL byte, only the YAML escape',
+    );
+
+    const result = lint(source);
+    assert.equal(result.version, 1, 'E-12 (route B): version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'E-12 (route B): expected unused-variable; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, 'E-12 (route B): diag.message');
+      }
+    }
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u007F')),
+      'E-12 (route B): expected \\u007F in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('payload')),
+      'E-12 (route B): message body must be preserved verbatim; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
   });
 
   test('E-13: lint path — lintVirtual with U+0085 (NEL/C1) in module name sanitizes message', () => {

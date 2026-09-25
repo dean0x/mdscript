@@ -1113,6 +1113,77 @@ fn wasm_lint_virtual_nel_in_module_name_sanitizes_message() {
 }
 
 #[wasm_bindgen_test]
+fn wasm_lint_virtual_nel_in_frontmatter_key_route_b_sanitizes_message() {
+    // Route B sibling of T-15/F6-C1: same NEL (U+0085) control character, but
+    // carried by an UNUSED FRONTMATTER KEY (unused-variable) rather than an import
+    // path / module name (duplicate-import). #265 will reject hostile
+    // paths/module names at the input boundary, retiring route-A coverage for NEL —
+    // a frontmatter key is not a path, so this route stays reachable and green
+    // after enforcement lands, keeping message-escaping coverage alive.
+    //
+    // Written as a YAML double-quoted key with a YAML `\x85` escape so the .mds
+    // source text itself carries no raw control byte (PF-018); serde_yaml_ng
+    // decodes the escape into a real NEL codepoint, which unused-variable embeds
+    // verbatim in its message before WIRE-sanitization escapes it back out.
+    let source = "---\n\"a\\x85payload\\x85b\": 1\n---\nHello\n";
+    assert!(
+        !source.contains('\u{0085}'),
+        "T-15/F6-C1 (route B): source must carry no raw NEL byte, only the YAML escape"
+    );
+
+    let modules_obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str("main.mds"),
+        &JsValue::from_str(source),
+    )
+    .unwrap();
+
+    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
+        .expect("T-15/F6-C1 (route B): lintVirtual must succeed with NEL in a frontmatter key");
+
+    let version = get_prop(&result, "version")
+        .as_f64()
+        .expect("T-15/F6-C1 (route B): result.version must be a number") as u32;
+    assert_eq!(version, 1, "T-15/F6-C1 (route B): result.version must be 1");
+
+    let files_arr = js_sys::Array::from(&get_prop(&result, "files"));
+    let mut all_messages: Vec<String> = Vec::new();
+    let mut all_rules: Vec<String> = Vec::new();
+    for i in 0..files_arr.length() {
+        let file_entry = files_arr.get(i);
+        let diags_arr = js_sys::Array::from(&get_prop(&file_entry, "diagnostics"));
+        for j in 0..diags_arr.length() {
+            let diag = diags_arr.get(j);
+            let msg = get_str(&diag, "message");
+            assert_no_control_chars(
+                &msg,
+                &format!("T-15/F6-C1 (route B): files[{i}].diagnostics[{j}].message"),
+            );
+            all_messages.push(msg);
+            all_rules.push(get_str(&diag, "rule"));
+        }
+    }
+
+    assert!(
+        all_rules.iter().any(|r| r == "unused-variable"),
+        "T-15/F6-C1 (route B): expected unused-variable; got rules: {all_rules:?}"
+    );
+
+    // Positive control (PF-013): the escaped form must be present.
+    assert!(
+        all_messages.iter().any(|m| m.contains("\\u0085")),
+        "T-15/F6-C1 (route B): expected escaped \\u0085 in at least one message; got: {all_messages:?}"
+    );
+
+    // Escaped, not stripped — the payload text around it survives verbatim.
+    assert!(
+        all_messages.iter().any(|m| m.contains("payload")),
+        "T-15/F6-C1 (route B): message body must be preserved verbatim; got: {all_messages:?}"
+    );
+}
+
+#[wasm_bindgen_test]
 fn wasm_lint_virtual_bidi_override_in_module_name_is_escaped() {
     // T-15/F6-BIDI: U+202E RIGHT-TO-LEFT OVERRIDE in a lintVirtual module name.
     // U+202E is outside C0/DEL/C1, so it used to reach the wire untouched and
@@ -1197,6 +1268,76 @@ fn wasm_lint_virtual_bidi_override_in_module_name_is_escaped() {
     assert!(
         has_escaped_rlo,
         "T-15/F6-BIDI: expected escaped \\u202E in at least one message; got: {all_messages:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_virtual_bidi_override_in_frontmatter_key_route_b_is_escaped() {
+    // Route B sibling of T-15/F6-BIDI: same U+202E RIGHT-TO-LEFT OVERRIDE, but
+    // carried by an UNUSED FRONTMATTER KEY (unused-variable) rather than an import
+    // path / module name (duplicate-import). See the NEL route-B sibling above for
+    // the full rationale (#265 retires route-A coverage; a frontmatter key is not a
+    // path, so this route survives enforcement).
+    //
+    // Written as a YAML double-quoted key with a YAML U+202E escape sequence so
+    // the .mds source text itself carries no raw control byte (PF-018).
+    let source = "---\n\"a\\u202Epayload\\u202Eb\": 1\n---\nHello\n";
+    assert!(
+        !source.contains('\u{202E}'),
+        "T-15/F6-BIDI (route B): source must carry no raw RLO byte, only the YAML escape"
+    );
+
+    let modules_obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str("main.mds"),
+        &JsValue::from_str(source),
+    )
+    .unwrap();
+
+    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
+        .expect("T-15/F6-BIDI (route B): lintVirtual must succeed with RLO in a frontmatter key");
+
+    let version = get_prop(&result, "version")
+        .as_f64()
+        .expect("T-15/F6-BIDI (route B): result.version must be a number") as u32;
+    assert_eq!(
+        version, 1,
+        "T-15/F6-BIDI (route B): result.version must be 1"
+    );
+
+    let files_arr = js_sys::Array::from(&get_prop(&result, "files"));
+    let mut all_messages: Vec<String> = Vec::new();
+    let mut all_rules: Vec<String> = Vec::new();
+    for i in 0..files_arr.length() {
+        let file_entry = files_arr.get(i);
+        let diags_arr = js_sys::Array::from(&get_prop(&file_entry, "diagnostics"));
+        for j in 0..diags_arr.length() {
+            let diag = diags_arr.get(j);
+            let msg = get_str(&diag, "message");
+            assert_no_control_chars(
+                &msg,
+                &format!("T-15/F6-BIDI (route B): files[{i}].diagnostics[{j}].message"),
+            );
+            all_messages.push(msg);
+            all_rules.push(get_str(&diag, "rule"));
+        }
+    }
+
+    assert!(
+        all_rules.iter().any(|r| r == "unused-variable"),
+        "T-15/F6-BIDI (route B): expected unused-variable; got rules: {all_rules:?}"
+    );
+
+    let has_escaped_rlo = all_messages.iter().any(|m| m.contains("\\u202E"));
+    assert!(
+        has_escaped_rlo,
+        "T-15/F6-BIDI (route B): expected escaped \\u202E in at least one message; got: {all_messages:?}"
+    );
+
+    assert!(
+        all_messages.iter().any(|m| m.contains("payload")),
+        "T-15/F6-BIDI (route B): message body must be preserved verbatim; got: {all_messages:?}"
     );
 }
 

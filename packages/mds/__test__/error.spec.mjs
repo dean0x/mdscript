@@ -195,6 +195,51 @@ describe('error shape', () => {
     );
   });
 
+  test('U-E12 (route B): NEL in a frontmatter key is sanitized in unused-variable message', () => {
+    // Route B sibling of U-E12: same NEL (U+0085) control character, but carried by
+    // an UNUSED FRONTMATTER KEY (unused-variable) rather than an import path /
+    // module name (duplicate-import). #265 will reject hostile paths/module names
+    // at the input boundary, retiring route-A coverage for NEL — a frontmatter key
+    // is not a path, so this route stays reachable and green after enforcement
+    // lands, keeping message-escaping coverage alive.
+    //
+    // Written as a YAML double-quoted key with a YAML `\x85` escape so the .mds
+    // source text itself carries no raw control byte (PF-018); serde_yaml_ng
+    // decodes the escape into a real NEL codepoint, which unused-variable embeds
+    // verbatim in its message before WIRE-sanitization escapes it back out.
+    const source = '---\n"a\\x85payload\\x85b": 1\n---\nHello\n';
+    assert.ok(
+      !source.includes(String.fromCharCode(0x85)),
+      'U-E12 (route B): source must carry no raw NEL byte, only the YAML escape',
+    );
+    const result = lintVirtual({ 'main.mds': source }, 'main.mds');
+    assert.equal(result.version, 1, 'U-E12 (route B): version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'U-E12 (route B): expected unused-variable; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, `U-E12 (route B): diag[${diag.rule}].message`);
+      }
+    }
+    const hasSanitizedNel = allDiags.some(
+      (d) => typeof d.message === 'string' && d.message.includes('\\u0085'),
+    );
+    assert.ok(
+      hasSanitizedNel,
+      'U-E12 (route B): expected \\u0085 in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('payload')),
+      'U-E12 (route B): message body must be preserved verbatim; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
   test('U-E13: U+202E (RLO) in lintVirtual module name is escaped on the wire', () => {
     // Trojan Source (CVE-2021-42574). U+202E is outside C0/DEL/C1, so it used to
     // reach the wire untouched and reverse how the rest of the line displays.
@@ -228,6 +273,43 @@ describe('error shape', () => {
     assert.ok(
       allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u202E')),
       'U-E13: expected \\u202E in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
+  test('U-E13 (route B): RLO in a frontmatter key is escaped on the wire', () => {
+    // Route B sibling of U-E13: same U+202E RIGHT-TO-LEFT OVERRIDE, but carried by
+    // an UNUSED FRONTMATTER KEY (unused-variable) rather than an import path /
+    // module name (duplicate-import). See U-E12 (route B) above for the full
+    // rationale (#265 retires route-A coverage; a frontmatter key is not a path, so
+    // this route survives enforcement).
+    const rlo = '\\u202E'; // YAML escape text, not a raw RLO byte (PF-018).
+    const source = `---\n"a${rlo}payload${rlo}b": 1\n---\nHello\n`;
+    assert.ok(
+      !source.includes(String.fromCharCode(0x202e)),
+      'U-E13 (route B): source must carry no raw RLO byte, only the YAML escape',
+    );
+    const result = lintVirtual({ 'main.mds': source }, 'main.mds');
+    assert.equal(result.version, 1, 'U-E13 (route B): version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'U-E13 (route B): expected unused-variable; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, `U-E13 (route B): diag[${diag.rule}].message`);
+      }
+    }
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u202E')),
+      'U-E13 (route B): expected \\u202E in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('payload')),
+      'U-E13 (route B): message body must be preserved verbatim; got: ' +
         JSON.stringify(allDiags.map((d) => d.message)),
     );
   });
@@ -341,6 +423,90 @@ describe('error shape', () => {
       JSON.parse(JSON.stringify(nativeResult)),
       JSON.parse(JSON.stringify(wasmResult)),
       'U-E-DIFF: native and WASM lintVirtual must produce identical results for the same input',
+    );
+  });
+
+  test('U-E-DIFF (route B): native and WASM lintVirtual produce identical lint results for a frontmatter-key control-char vector', async () => {
+    // Route B sibling of U-E-DIFF: U-E-DIFF's vector carries ESC/NEL/RLO/LS/BOM in
+    // the *module name* (route A, via duplicate-import) — #265 will make that vector
+    // throw instead of returning a lint result, so U-E-DIFF itself is flipped to a
+    // thrown-error-parity assertion in that step. This sibling carries the SAME
+    // escape class entirely in an UNUSED FRONTMATTER KEY (route B, via
+    // unused-variable) instead, so cross-surface lint-RESULT parity for the
+    // widened escape class survives after enforcement lands.
+    //
+    // Written as a YAML double-quoted key with YAML escapes so the .mds source text
+    // itself carries no raw control byte (PF-018); serde_yaml_ng decodes each escape
+    // into its real codepoint, which unused-variable embeds verbatim in its message
+    // before WIRE-sanitization escapes it back out.
+    let native;
+    try {
+      const { createNativeBackend } = await import('../dist/backend/native.js');
+      const { createRequire } = await import('node:module');
+      const { fileURLToPath } = await import('node:url');
+      const { join, dirname } = await import('node:path');
+      const testDir = dirname(fileURLToPath(import.meta.url));
+      const require = createRequire(import.meta.url);
+      const napiAddon = require(join(testDir, '../../../crates/mds-napi/index.js'));
+      native = createNativeBackend(napiAddon);
+    } catch {
+      return; // native backend not available — skip
+    }
+
+    let wasm;
+    try {
+      const { initWasmNode, createWasmBackend } = await import('../dist/backend/wasm.js');
+      const wasmModule = await initWasmNode();
+      wasm = createWasmBackend(wasmModule);
+    } catch {
+      return; // WASM backend not available — skip
+    }
+
+    // ESC, DEL, NEL, RLO, LS, BOM — all six via one YAML double-quoted key.
+    const source =
+      '---\n"a\\x1B\\x7F\\x85\\u202E\\u2028\\uFEFFpayload\\x1B\\x7F\\x85\\u202E\\u2028\\uFEFFb": 1\n' +
+      '---\nHello\n';
+    for (const raw of [0x1b, 0x7f, 0x85, 0x202e, 0x2028, 0xfeff]) {
+      assert.ok(
+        !source.includes(String.fromCharCode(raw)),
+        `U-E-DIFF (route B): source must carry no raw U+${raw.toString(16).toUpperCase()} byte, only the YAML escape`,
+      );
+    }
+    const modules = { 'main.mds': source };
+
+    const nativeResult = native.lintVirtual(modules, 'main.mds');
+    const wasmResult = wasm.lintVirtual(modules, 'main.mds');
+
+    // Non-vacuity (PF-013): the differential is worthless if unused-variable never
+    // fired or never carried the escaped forms.
+    const nativeMessages = nativeResult.files
+      .flatMap((f) => f.diagnostics)
+      .map((d) => d.message)
+      .filter((m) => typeof m === 'string');
+    assert.ok(
+      nativeResult.files.some((f) => f.diagnostics.some((d) => d.rule === 'unused-variable')),
+      'U-E-DIFF (route B): expected unused-variable to fire; got: ' +
+        JSON.stringify(nativeResult.files),
+    );
+    for (const escaped of ['\\u001B', '\\u007F', '\\u0085', '\\u202E', '\\u2028', '\\uFEFF']) {
+      assert.ok(
+        nativeMessages.some((m) => m.includes(escaped)),
+        `U-E-DIFF (route B): expected ${escaped} in some message; got: ` +
+          JSON.stringify(nativeMessages),
+      );
+    }
+    assert.ok(
+      nativeMessages.some((m) => m.includes('payload')),
+      'U-E-DIFF (route B): message body must be preserved verbatim; got: ' +
+        JSON.stringify(nativeMessages),
+    );
+
+    // deepEqual of plain-object round-trip proves wire-format parity for the
+    // route-B-only vector — the property that must survive #265 enforcement.
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(nativeResult)),
+      JSON.parse(JSON.stringify(wasmResult)),
+      'U-E-DIFF (route B): native and WASM lintVirtual must produce identical results',
     );
   });
 });

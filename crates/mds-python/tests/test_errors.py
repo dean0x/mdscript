@@ -326,6 +326,84 @@ def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
         )
 
 
+@pytest.mark.parametrize(
+    "ctrl_char,expected_escape,yaml_escape",
+    [
+        ("\x1b", "\\u001B", "\\x1B"),  # ESC (U+001B) — C0 control char
+        ("\x7f", "\\u007F", "\\x7F"),  # DEL (U+007F)
+        ("\x85", "\\u0085", "\\x85"),  # NEL (C1) — passes serde_yaml_ng
+        (chr(0x202E), "\\u202E", "\\u202E"),  # RLO - Trojan Source display reversal
+        (chr(0x2066), "\\u2066", "\\u2066"),  # LRI - bidi isolate
+        (chr(0x2028), "\\u2028", "\\u2028"),  # LINE SEPARATOR
+        (chr(0xFEFF), "\\uFEFF", "\\uFEFF"),  # BOM / ZWNBSP
+    ],
+    ids=["ESC", "DEL", "NEL", "RLO", "LRI", "LS", "BOM"],
+)
+def test_e12_route_b_lint_virtual_ctrl_in_frontmatter_key_message_sanitized(
+    ctrl_char: str, expected_escape: str, yaml_escape: str
+) -> None:
+    """Route B sibling of test_e12_lint_virtual_ctrl_in_import_path_message_sanitized.
+
+    Same control-char set, but carried by an UNUSED FRONTMATTER KEY (unused-variable)
+    rather than an import path / module name (duplicate-import). #265 will reject
+    hostile paths/module names at the input boundary, retiring route-A coverage for
+    these characters -- a frontmatter key is not a path, so this route stays
+    reachable and green after enforcement lands, keeping message-escaping coverage
+    alive.
+
+    Written as a YAML double-quoted key with a YAML escape (e.g. ``\\x1B``) so the
+    .mds source text itself carries no raw control byte (PF-018); serde_yaml_ng
+    decodes the escape into the real control codepoint, which unused-variable embeds
+    verbatim in its message before WIRE-sanitization escapes it back out.
+    """
+    source = f'---\n"a{yaml_escape}payload{yaml_escape}b": 1\n---\nHello\n'
+    # Route-B contract check: the constructed .mds source carries no raw control
+    # byte -- only the YAML escape text.
+    assert ctrl_char not in source, (
+        f"route B: source must carry no raw {ctrl_char!r} byte, only the YAML escape; "
+        f"got: {source!r}"
+    )
+
+    result = m.lint_virtual({"main.mds": source}, "main.mds")
+    all_diags = [d for fr in result.files for d in fr.diagnostics]
+    assert any(d.rule == "unused-variable" for d in all_diags), (
+        "route B: expected unused-variable to fire; got rules: "
+        + str([d.rule for d in all_diags])
+    )
+
+    # (a) No raw control bytes in typed .message attribute.
+    for diag in all_diags:
+        msg = diag.message
+        assert isinstance(msg, str) and msg, "message must be a non-empty string"
+        _assert_no_control_chars(msg, "LintDiagnostic.message (route B)")
+
+    # (b) Positive control (PF-013): the sanitized literal IS present -- proof the
+    # raw control codepoint really reached the parsed frontmatter key before the
+    # WIRE sanitizer escaped it back out.
+    found_escaped = [d for d in all_diags if expected_escape in d.message]
+    assert found_escaped, (
+        f"route B: expected at least one diagnostic whose message carries the "
+        f"sanitized {expected_escape!r} literal (frontmatter key); got: "
+        + str([d.message for d in all_diags])
+    )
+
+    # Escaped, not stripped -- the payload text around it survives verbatim.
+    assert any("payload" in d.message for d in all_diags), (
+        "route B: message body must be preserved verbatim; got: "
+        + str([d.message for d in all_diags])
+    )
+
+    # (c) Parity guard: to_dict()["message"] must equal .message (PF-007).
+    for diag in all_diags:
+        d_dict = diag.to_dict()
+        assert isinstance(d_dict, dict), "to_dict() must return a dict"
+        dict_msg = d_dict.get("message", "")
+        assert dict_msg == diag.message, (
+            f"to_dict()[message] must equal .message; "
+            f"typed={diag.message!r}, dict={dict_msg!r}"
+        )
+
+
 def test_e13_lint_virtual_newline_in_frontmatter_key_escaped_on_wire() -> None:
     """T-14 / E13 [AC-F4]: WIRE-mode newline escaping on the Python surface.
 
