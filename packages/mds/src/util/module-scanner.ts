@@ -108,14 +108,14 @@ function isWithinRoot(root: string, candidate: string): boolean {
 }
 
 /**
- * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP /
- * ENOTDIR errors that the kernel emits when the path is a symlink into a clear
- * security error, and ENOENT (no such file — e.g. a case-mismatched spelling on
- * a case-sensitive volume, #408) into the same `mds::file_not_found` shape the
- * Rust engine reports for a missing file, keyed on `shown` rather than the
- * resolved `absolutePath` (R3 / CWE-209 — the raw Node error otherwise leaks the
- * resolved filesystem path in its message). All other OS errors are re-thrown
- * unchanged.
+ * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP error
+ * the kernel emits when the path is a symlink into a clear security error, and
+ * ENOENT (no such file — e.g. a case-mismatched spelling on a case-sensitive
+ * volume, #408) or ENOTDIR (the immediate parent, which realpath() accepted, is a
+ * regular file) into the same `mds::file_not_found` shape the Rust engine reports
+ * for a missing file, keyed on `shown` rather than the resolved `absolutePath`
+ * (R3 / CWE-209 — the raw Node error otherwise leaks the resolved filesystem path
+ * in its message). All other OS errors are re-thrown unchanged.
  *
  * Module-level helper (not a closure) so that openAndValidateModule's own
  * try/catch only handles post-open validation, keeping nesting shallow.
@@ -128,10 +128,10 @@ async function openNoFollow(
     return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ELOOP' || code === 'ENOTDIR') {
+    if (code === 'ELOOP') {
       throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
     }
-    if (code === 'ENOENT') {
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
       throw fileNotFoundError(shown);
     }
     throw err;

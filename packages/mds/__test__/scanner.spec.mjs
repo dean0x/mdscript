@@ -576,6 +576,18 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       await writeFile(blocker, 'not a directory\n');
       const entry = path.join(blocker, 'nested', 'file.mds');
       assertNotFoundNotSymlink(await rejectionOf(buildModulesMap(entry, scanImports), 'U-SM19'), entry, 'U-SM19');
+
+      // One level down, the regular file IS the immediate parent: realpath() of it
+      // succeeds, and it is the open() of the file below it that fails with ENOTDIR
+      // — still a missing file, never a symlink.
+      const direct = path.join(blocker, 'file.mds');
+      assertNotFoundNotSymlink(await rejectionOf(buildModulesMap(direct, scanImports), 'U-SM19 direct'), direct, 'U-SM19 direct');
+      await writeFile(path.join(dir, 'main.mds'), '@import "./blocker.mds/file.mds" as f\n');
+      assertNotFoundNotSymlink(
+        await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM19 import'),
+        './blocker.mds/file.mds',
+        'U-SM19 import',
+      );
     });
   });
 
@@ -609,6 +621,7 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
     assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
   });
+
 });
 
 describe('findProjectRoot', () => {
