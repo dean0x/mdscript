@@ -462,6 +462,80 @@ fn custom_backend_entry_validation_runs_before_backend() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// AC-155-1: `canonicalize`, `set_root` and `normalize` are not `FileSystem`
+/// methods — not even DEFAULTED ones, which `IdentityFs` cannot pin (it only stops
+/// compiling when the REQUIRED set changes).
+///
+/// Method lookup on a `dyn FileSystem` prefers the trait's own methods over any
+/// other trait's, so each probe answers `"probe"` only while `FileSystem` has no
+/// method of that name; if one came back, its call below would stop compiling or
+/// stop answering `"probe"`.
+trait TraitMethodProbe {
+    fn canonicalize(&self, _path: &str) -> &'static str {
+        "probe"
+    }
+    fn set_root(&self, _base: &str) -> &'static str {
+        "probe"
+    }
+    fn normalize(&self, _base: &str, _relative: &str) -> &'static str {
+        "probe"
+    }
+    // Never called while the trait has `anchor_base_dir` — its method shadows
+    // this one. If the trait lost it, this probe would be called and the
+    // `expect` would go unfulfilled: a warning, fatal under `-D warnings`.
+    #[expect(
+        dead_code,
+        reason = "shadowed by FileSystem::anchor_base_dir (positive control)"
+    )]
+    fn anchor_base_dir(&self, _dir: &str) -> &'static str {
+        "probe"
+    }
+}
+impl<T: FileSystem + ?Sized> TraitMethodProbe for T {}
+
+#[test]
+fn filesystem_trait_removed_methods_pin() {
+    let fs: &dyn FileSystem = &VirtualFs::new(HashMap::new());
+    assert_eq!(fs.canonicalize("x"), "probe");
+    assert_eq!(fs.set_root("x"), "probe");
+    assert_eq!(fs.normalize("", "x"), "probe");
+    // Positive control: a method the trait DOES have shadows its probe — this
+    // binding only compiles because the trait's `anchor_base_dir` was chosen.
+    let anchored: Result<String, MdsError> = fs.anchor_base_dir("x");
+    assert_eq!(anchored.unwrap(), "x");
+}
+
+/// A custom backend that does not override `anchor_base_dir` gets the identity:
+/// the base directory of a string compile is used unchanged as a key-space
+/// directory, and imports resolve from it.
+#[test]
+fn anchor_base_dir_default_is_identity_for_custom_backends() {
+    let modules = HashMap::from([(
+        "virtual/dir/lib.mds".to_string(),
+        "@define hi():\nHi from lib\n@end\n".to_string(),
+    )]);
+    let (fs, _calls) = IdentityFs::new(modules);
+    // Fully qualified: `TraitMethodProbe` above also names `anchor_base_dir`.
+    assert_eq!(
+        FileSystem::anchor_base_dir(&fs, "virtual/dir").unwrap(),
+        "virtual/dir"
+    );
+
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let output = cache
+        .resolve_source_intrinsic(
+            "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
+            "virtual/dir",
+            &HashMap::new(),
+            &mut vec![],
+        )
+        .expect("imports resolve from the unchanged base directory");
+    assert!(
+        matches!(&output, CompiledOutput::Markdown(s) if s.contains("Hi from lib")),
+        "unexpected output: {output:?}"
+    );
+}
+
 /// A NUL byte in an entry path is caller input, not an `@import` string: it
 /// reports `mds::io` through the public compile API and on the virtual backend.
 #[test]
@@ -494,6 +568,57 @@ fn nul_in_entry_path_is_io_error() {
         Some("mds::import"),
         "import control: got {err:?}"
     );
+}
+
+/// AC-155-3: every virtual entry API validates the entry key before resolving it.
+/// The module map DOES contain the bad key, so an unvalidated path would read and
+/// compile it; the refusal can only come from entry validation.
+#[test]
+fn virtual_entry_apis_validate_the_entry_key() {
+    type EntryApi = fn(HashMap<String, String>, &str) -> Result<(), MdsError>;
+    let apis: [(&str, EntryApi); 6] = [
+        ("ModuleCache::resolve_virtual_intrinsic", |m, e| {
+            ModuleCache::virtual_fs(m)
+                .resolve_virtual_intrinsic(e, &HashMap::new(), &mut vec![])
+                .map(drop)
+        }),
+        ("ModuleCache::resolve_virtual_intrinsic_opts", |m, e| {
+            ModuleCache::virtual_fs(m)
+                .resolve_virtual_intrinsic_opts(
+                    e,
+                    &HashMap::new(),
+                    &mds::CompileOptions::default(),
+                    &mut vec![],
+                )
+                .map(drop)
+        }),
+        ("ModuleCache::resolve_key", |m, e| {
+            ModuleCache::virtual_fs(m)
+                .resolve_key(e, &HashMap::new(), &mut vec![])
+                .map(drop)
+        }),
+        ("compile_virtual", |m, e| {
+            mds::compile_virtual(m, e, None).map(drop)
+        }),
+        ("check_virtual", |m, e| mds::check_virtual(m, e, None)),
+        ("lint_virtual", |m, e| {
+            mds::lint_virtual(m, e, None, &LintConfig::default()).map(drop)
+        }),
+    ];
+    for (name, api) in apis {
+        for bad in ["", "a\0b.mds"] {
+            let modules = HashMap::from([(bad.to_string(), "Hello!\n".to_string())]);
+            let err = api(modules, bad).unwrap_err();
+            assert_eq!(
+                diagnostic_code(&err).as_deref(),
+                Some("mds::io"),
+                "{name} with entry {bad:?}: expected mds::io, got {err:?}"
+            );
+        }
+        // Control: a valid key in the same position resolves.
+        let modules = HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
+        api(modules, "main.mds").unwrap_or_else(|e| panic!("{name} control: {e:?}"));
+    }
 }
 
 #[test]

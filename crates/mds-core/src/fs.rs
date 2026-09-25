@@ -41,6 +41,10 @@ const MAX_PATH_SEGMENTS: usize = 256;
 ///   [`crate::MAX_FILE_SIZE`] bytes (10 MB) to prevent resource exhaustion.
 /// - **Input sanitization**: `normalize_in_dir` must reject empty paths. The
 ///   resolver refuses an empty entry path before `resolve_entry` is called.
+/// - **Base directories**: a backend whose keys are host paths must override
+///   `anchor_base_dir` to validate the base directory of a string compile and
+///   establish the containment root there; the default passes it through
+///   unchanged and anchors nothing.
 /// - **`dir == ""`** (empty string) in `normalize_in_dir` means "virtual root" or
 ///   "no directory prefix" — resolve `relative` from the root of the key-space.
 ///
@@ -105,22 +109,27 @@ pub trait FileSystem: Send + Sync {
     /// Return `true` if the key refers to a `.md` (Markdown) file rather than `.mds`.
     fn is_markdown(&self, normalized: &str) -> bool;
 
-    /// Pre-initialize the project root before imports resolve.
+    /// Anchor the base directory of a string compile and return the directory
+    /// imports resolve from.
     ///
-    /// Default: no-op. [`VirtualFs`] ignores this; [`NativeFs`] uses it for
-    /// `resolve_source` paths that don't go through [`FileSystem::resolve_entry`].
-    fn set_root(&self, _base: &str) -> Result<(), MdsError> {
-        Ok(())
-    }
-
-    /// Resolve a path to its canonical (absolute, symlink-free) form.
+    /// [`crate::resolver::ModuleCache::resolve_source`] and its variants call this
+    /// once, before any import resolves, and pass the returned string to
+    /// [`FileSystem::normalize_in_dir`] as the importing directory.
     ///
-    /// The default implementation is an identity function — suitable for
-    /// virtual or in-memory filesystems where canonicalization is a no-op.
+    /// The default is the identity: `dir` is returned unchanged and nothing is
+    /// anchored, which suits an in-memory key-space with no host directories
+    /// ([`VirtualFs`] uses it; `""` is the key-space root). [`NativeFs`] returns
+    /// the canonical absolute directory, refuses one whose final component is a
+    /// symlink, and anchors the project root at the first call — a later call
+    /// never moves a root that is already established.
     ///
-    /// [`NativeFs`] overrides this to call [`std::fs::canonicalize`].
-    fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
-        Ok(path.to_string())
+    /// # Errors
+    ///
+    /// The default never fails. [`NativeFs`] returns:
+    /// - [`MdsError::Io`] when `dir` does not exist or cannot be resolved.
+    /// - [`MdsError::ImportError`] when the final component of `dir` is a symlink.
+    fn anchor_base_dir(&self, dir: &str) -> Result<String, MdsError> {
+        Ok(dir.to_string())
     }
 
     /// Return the established project root directory as a string, if any.
@@ -141,7 +150,7 @@ pub trait FileSystem: Send + Sync {
     /// [`NativeFs`] returns the path established by `init_root` (the project
     /// root found by walking up from the entry-point directory).  Returns
     /// `None` if the root has not been established yet (before any
-    /// `resolve_entry` or `set_root` call).
+    /// `resolve_entry` or `anchor_base_dir` call).
     ///
     /// # Contract
     ///
@@ -366,7 +375,7 @@ impl NativeFs {
     /// Create a new `NativeFs` with no root directory set.
     ///
     /// The root is established on the first call to [`FileSystem::resolve_entry`]
-    /// or [`FileSystem::set_root`].
+    /// or [`FileSystem::anchor_base_dir`].
     pub fn new() -> Self {
         Self {
             root_dir: OnceLock::new(),
@@ -614,38 +623,27 @@ impl FileSystem for NativeFs {
         Path::new(normalized).extension().and_then(|e| e.to_str()) == Some("md")
     }
 
-    fn set_root(&self, base: &str) -> Result<(), MdsError> {
-        let canonical = Path::new(base)
-            .canonicalize()
-            .map_err(|e| MdsError::io(format!("cannot resolve base directory {base}: {e}")))?;
+    fn anchor_base_dir(&self, dir: &str) -> Result<String, MdsError> {
+        // canonical_dir, not check_symlink, so that a filesystem-root base
+        // directory (`/`, a Windows drive root) anchors at the root instead of
+        // hitting the `file_name() == None` cwd trap (#371). For every other
+        // path canonical_dir is check_symlink_named, so a symlinked directory is
+        // refused BEFORE it can anchor the security root at an
+        // attacker-controlled location (#21) — the root is only anchored at a
+        // directory that passed the check.
+        //
+        // canonical_dir returns ImportError (symlink), FileNotFound (missing
+        // path) or Io (root branch). FileNotFound is re-wrapped as Io: resolving
+        // a base directory is caller input, not an import step.
+        let canonical = Self::canonical_dir(Path::new(dir), dir).map_err(|e| match e {
+            MdsError::FileNotFound { .. } => {
+                MdsError::io(format!("cannot resolve path {dir}: {e}"))
+            }
+            other => other,
+        })?;
+        // First writer wins: init_root never moves an established root.
         self.init_root(&canonical);
-        Ok(())
-    }
-
-    fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
-        // Delegate to canonical_dir() rather than calling check_symlink()
-        // directly so that a filesystem-root path (`/`, a Windows drive root)
-        // is handled correctly instead of hitting the `path.file_name() ==
-        // None` cwd trap (#371) — see canonical_dir's doc comment.
-        //
-        // For every other path, canonical_dir is exactly check_symlink_named,
-        // so symlinked directories are still rejected before they can
-        // re-anchor the security root to an attacker-controlled location
-        // (issue #21).
-        //
-        // canonical_dir returns ImportError (symlink detected), FileNotFound
-        // (path does not exist), or an already-Io error (root branch).
-        // ImportError and Io pass through; FileNotFound is re-wrapped as Io
-        // because canonicalize is a resolution operation, not an import step.
-        Self::canonical_dir(Path::new(path), path)
-            .map(|p| p.display().to_string())
-            .map_err(|e| match e {
-                MdsError::ImportError { .. } => e,
-                MdsError::FileNotFound { .. } => {
-                    MdsError::io(format!("cannot resolve path {path}: {e}"))
-                }
-                other => other,
-            })
+        Ok(canonical.display().to_string())
     }
 
     fn source_root(&self) -> Option<String> {
@@ -1042,8 +1040,8 @@ mod tests {
     }
 
     #[test]
-    fn native_set_root_rejects_paths_outside_root() {
-        // set_root should initialize the root directory so that subsequent
+    fn native_anchor_base_dir_rejects_paths_outside_root() {
+        // anchor_base_dir initializes the root directory so that subsequent
         // imports reject paths outside that root.
         let project_dir = TempDir::new().unwrap();
         let outside_dir = TempDir::new().unwrap();
@@ -1052,12 +1050,12 @@ mod tests {
         let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
 
         let fs = NativeFs::new();
-        // Initialize root explicitly via set_root, not via resolve_entry.
-        fs.set_root(&project_dir.path().display().to_string())
-            .expect("set_root should succeed for a real directory");
+        // Initialize root explicitly via anchor_base_dir, not via resolve_entry.
+        fs.anchor_base_dir(&project_dir.path().display().to_string())
+            .expect("anchor_base_dir should succeed for a real directory");
 
-        // Establish a valid base key by resolving the entry point (set_root already
-        // won the OnceLock race, so the root stays as project_dir), then test the
+        // Establish a valid base key by resolving the entry point (the anchor
+        // already set the root, so it stays at project_dir), then test the
         // already-set root with an import rather than another entry.
         let base_key = fs
             .resolve_entry(&entry.display().to_string())
@@ -1069,7 +1067,52 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("escapes project"),
-            "expected 'escapes project' after set_root, got: {msg}"
+            "expected 'escapes project' after anchor_base_dir, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_anchor_base_dir_first_writer_wins() {
+        // The first anchor establishes the root; a later anchor validates and
+        // returns its own directory but never moves the root. Each project
+        // carries a `.mdsroot` marker so the walk-up stops at it.
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let first_root = first.path().canonicalize().unwrap();
+        let second_root = second.path().canonicalize().unwrap();
+        std::fs::write(first_root.join(".mdsroot"), "").unwrap();
+        std::fs::write(second_root.join(".mdsroot"), "").unwrap();
+        let second_file = make_temp_file(&second, "x.mds", "x");
+
+        let fs = NativeFs::new();
+        fs.anchor_base_dir(first_root.to_str().unwrap()).unwrap();
+        let returned = fs.anchor_base_dir(second_root.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            Path::new(&returned),
+            second_root,
+            "a later anchor still returns its own canonical directory"
+        );
+        assert_eq!(
+            fs.source_root().map(PathBuf::from),
+            Some(first_root.clone()),
+            "the first anchor's root must stay in place"
+        );
+        // The unmoved root is what containment enforces: a file in the second
+        // directory is outside it.
+        let err = fs.normalize_in_dir(&returned, "./x.mds").unwrap_err();
+        assert!(
+            err.to_string().contains("escapes project"),
+            "containment must use the first root, got: {err}"
+        );
+        // Control: a fresh backend anchored at the second directory accepts it.
+        let control = NativeFs::new();
+        let dir = control
+            .anchor_base_dir(second_root.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            Path::new(&control.normalize_in_dir(&dir, "./x.mds").unwrap()),
+            second_file.canonicalize().unwrap()
         );
     }
 
@@ -1222,59 +1265,58 @@ mod tests {
         );
     }
 
-    // ── FileSystem::canonicalize ──────────────────────────────────────────────
+    // ── FileSystem::anchor_base_dir ───────────────────────────────────────────
 
     #[test]
-    fn vfs_canonicalize_returns_identity() {
-        // VirtualFs inherits the default implementation — returns path unchanged.
-        let key = "some/virtual/path.mds";
-        let result = vfs().canonicalize(key);
+    fn vfs_anchor_base_dir_is_identity() {
+        // VirtualFs inherits the default implementation — returns dir unchanged.
+        let dir = "some/virtual/dir";
         assert_eq!(
-            result.unwrap(),
-            key,
-            "VirtualFs canonicalize should be identity"
+            vfs().anchor_base_dir(dir).unwrap(),
+            dir,
+            "VirtualFs anchor_base_dir should be identity"
         );
+        assert_eq!(vfs().anchor_base_dir("").unwrap(), "", "the key-space root");
     }
 
     #[test]
-    fn native_canonicalize_resolves_real_path() {
-        // NativeFs should resolve a real file to its canonical absolute path.
+    fn native_anchor_base_dir_resolves_real_dir() {
+        // NativeFs resolves a real directory to its canonical absolute path and
+        // anchors the root.
         let dir = TempDir::new().unwrap();
-        let file = make_temp_file(&dir, "real.mds", "content");
+        let sub = dir.path().join("real");
+        std::fs::create_dir(&sub).unwrap();
         let fs = NativeFs::new();
-        let result = fs.canonicalize(&file.display().to_string());
-        let canonical = result.expect("canonicalize should succeed for real file");
-        // The canonical path must be absolute and contain the filename.
+        let canonical = fs
+            .anchor_base_dir(&sub.display().to_string())
+            .expect("anchor_base_dir should succeed for a real directory");
+        assert_eq!(Path::new(&canonical), sub.canonicalize().unwrap());
         assert!(
-            canonical.contains("real.mds"),
-            "canonical path should contain filename, got: {canonical}"
-        );
-        // Must be an absolute path.
-        assert!(
-            Path::new(&canonical).is_absolute(),
-            "canonical path should be absolute, got: {canonical}"
+            fs.source_root().is_some(),
+            "the first anchor establishes the root"
         );
     }
 
     #[test]
-    fn native_canonicalize_nonexistent_errors() {
-        // NativeFs should return an Io error for a nonexistent path.
+    fn native_anchor_base_dir_nonexistent_is_io_error() {
         let fs = NativeFs::new();
-        let result = fs.canonicalize("/nonexistent/path/does/not/exist.mds");
-        let err = result.unwrap_err();
+        let err = fs
+            .anchor_base_dir("/nonexistent/path/does/not/exist")
+            .unwrap_err();
         assert!(
             matches!(err, MdsError::Io { .. }),
             "expected Io error for nonexistent path, got: {err:?}"
         );
+        assert_eq!(fs.source_root(), None, "a failed anchor anchors nothing");
     }
 
     #[test]
-    fn native_canonicalize_root_returns_root_not_cwd() {
-        // #371 cwd trap regression: canonicalize() on a filesystem root must
-        // anchor AT the root, never silently fall back to the current working
-        // directory. A naive fix that funneled the root case through
-        // `effective_parent` (which maps an absent/empty parent to ".") would
-        // reintroduce exactly this bug.
+    fn native_anchor_base_dir_root_returns_root_not_cwd() {
+        // #371 cwd trap regression: anchoring a filesystem root must anchor AT
+        // the root, never silently fall back to the current working directory.
+        // A naive fix that funneled the root case through `effective_parent`
+        // (which maps an absent/empty parent to ".") would reintroduce exactly
+        // this bug.
         //
         // The root is obtained portably -- the topmost ancestor of a real
         // tempdir path -- so this runs unchanged on the Windows CI leg (a
@@ -1290,25 +1332,27 @@ mod tests {
         assert_ne!(cwd, root, "test assumption: cwd is not the filesystem root");
 
         let fs = NativeFs::new();
-        let result = fs.canonicalize(&root.display().to_string());
-        let canonical = result.expect("canonicalize should succeed for a filesystem root");
+        let canonical = fs
+            .anchor_base_dir(&root.display().to_string())
+            .expect("anchor_base_dir should succeed for a filesystem root");
 
         assert_eq!(
             Path::new(&canonical),
             root.as_path(),
-            "canonicalize(root) must return the root itself, got: {canonical}"
+            "anchor_base_dir(root) must return the root itself, got: {canonical}"
         );
         assert_ne!(
             Path::new(&canonical),
             cwd.as_path(),
-            "canonicalize(root) must not resolve to cwd, got: {canonical}"
+            "anchor_base_dir(root) must not resolve to cwd, got: {canonical}"
         );
     }
 
     #[test]
-    fn native_canonicalize_symlink_rejected() {
-        // Security boundary: canonicalize() must reject symlinked directories so that
-        // a symlinked base_dir cannot re-anchor the security root to an arbitrary location.
+    fn native_anchor_base_dir_symlink_rejected() {
+        // Security boundary: a symlinked base directory is refused BEFORE it can
+        // anchor the security root at an arbitrary location (#21), so a failed
+        // check leaves no root behind.
         let real_dir = TempDir::new().unwrap();
         let link_parent = TempDir::new().unwrap();
         let link_path = link_parent.path().join("link_to_dir");
@@ -1317,13 +1361,49 @@ mod tests {
         }
 
         let fs = NativeFs::new();
-        let result = fs.canonicalize(&link_path.display().to_string());
-        let err = result.unwrap_err();
-        let msg = err.to_string();
+        let err = fs
+            .anchor_base_dir(&link_path.display().to_string())
+            .unwrap_err();
         assert!(
-            msg.contains("symlinks"),
-            "expected 'symlinks' in error when canonicalizing a symlink, got: {msg}"
+            matches!(err, MdsError::ImportError { .. }) && err.to_string().contains("symlinks"),
+            "expected a symlink rejection, got: {err:?}"
         );
+        assert_eq!(fs.source_root(), None, "the root must not be anchored");
+
+        // Control: the link's real target is accepted and anchors the root.
+        fs.anchor_base_dir(&real_dir.path().display().to_string())
+            .expect("control: the real directory anchors");
+        assert!(fs.source_root().is_some());
+    }
+
+    /// The base directory handed to `ModuleCache::resolve_source*` goes through
+    /// `anchor_base_dir`, so a symlinked one is refused there. The string-compile
+    /// functions canonicalize their base directory first (`resolve_base_dir`), so
+    /// the same symlink is followed and the compile succeeds — spec §4.6
+    /// "Symlink rejection" states exactly this split.
+    #[test]
+    fn symlinked_base_dir_refused_by_resolve_source_followed_by_string_api() {
+        let real_dir = TempDir::new().unwrap();
+        make_temp_file(&real_dir, "lib.mds", "@define hi():\nHi\n@end\n");
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("link_to_dir");
+        if !make_symlink(real_dir.path(), &link) {
+            return;
+        }
+        let source = "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n";
+
+        let mut cache = crate::resolver::ModuleCache::native();
+        let err = cache
+            .resolve_source_intrinsic(source, link.to_str().unwrap(), &HashMap::new(), &mut vec![])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("symlinks are not allowed"),
+            "resolve_source_intrinsic must refuse a symlinked base dir, got: {err}"
+        );
+
+        let out = crate::compile_str_with(source, Some(&link), None)
+            .expect("the string API follows a symlinked base dir");
+        assert_eq!(out.into_markdown().unwrap(), "Hi\n");
     }
 
     // ── VirtualFs segment limit ───────────────────────────────────────────────
@@ -1671,11 +1751,96 @@ mod tests {
         );
     }
 
+    // ── ModuleCache::resolve_key on NativeFs (#155) ───────────────────────────
+
+    /// A project directory with a `.mdsroot` marker (so the root walk-up stops
+    /// there) holding `main.mds` with `content`. Returns the guard and the
+    /// canonical project directory.
+    fn marked_project(content: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join(".mdsroot"), "").unwrap();
+        std::fs::write(root.join("main.mds"), content).unwrap();
+        (dir, root)
+    }
+
+    fn resolve_key_native(key: &Path) -> Result<Option<String>, MdsError> {
+        let mut cache = crate::resolver::ModuleCache::native();
+        cache
+            .resolve_key(key.to_str().unwrap(), &HashMap::new(), &mut vec![])
+            .map(|m| m.prompt_body.clone())
+    }
+
+    #[test]
+    fn native_resolve_key_plain_entry_resolves() {
+        let (_guard, root) = marked_project("@import \"./lib.mds\" as lib\n{{lib.hi()}}\n");
+        std::fs::write(root.join("lib.mds"), "@define hi():\nHello!\n@end\n").unwrap();
+        let body = resolve_key_native(&root.join("main.mds"))
+            .expect("a plain entry key resolves")
+            .unwrap_or_default();
+        assert!(body.contains("Hello!"), "got: {body}");
+    }
+
+    #[test]
+    fn native_resolve_key_rejects_symlinked_entry() {
+        let (_guard, root) = marked_project("Hello!\n");
+        let link = root.join("link.mds");
+        if !make_symlink(&root.join("main.mds"), &link) {
+            return;
+        }
+        let err = resolve_key_native(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("symlinks are not allowed"),
+            "a symlinked entry key must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn native_resolve_key_anchors_the_root_for_imports() {
+        // The entry key anchors the project root, so an import that climbs out of
+        // it is refused by containment.
+        let outside_dir = TempDir::new().unwrap();
+        let outside = make_temp_file(&outside_dir, "secret.mds", "secret\n");
+        let (_guard, root) = marked_project(&format!("@import \"{}\" as s\n", escape_to(&outside)));
+        let err = resolve_key_native(&root.join("main.mds")).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes project directory"),
+            "an import escaping the anchored root must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn native_resolve_key_outside_anchored_root_rejected() {
+        // Once a key has anchored the root, a later `..` key that leaves it is
+        // refused — the same rule `resolve_path` applies to a second entry.
+        let (_guard, root) = marked_project("Hello!\n");
+        let outside_dir = TempDir::new().unwrap();
+        make_temp_file(&outside_dir, "outside.mds", "outside\n");
+        let outside_name = outside_dir.path().file_name().unwrap();
+        let escaping = root.join("..").join(outside_name).join("outside.mds");
+
+        let mut cache = crate::resolver::ModuleCache::native();
+        cache
+            .resolve_key(
+                root.join("main.mds").to_str().unwrap(),
+                &HashMap::new(),
+                &mut vec![],
+            )
+            .expect("the first key anchors the root");
+        let err = cache
+            .resolve_key(escaping.to_str().unwrap(), &HashMap::new(), &mut vec![])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes project directory"),
+            "a `..` key leaving the anchored root must be refused, got: {err}"
+        );
+    }
+
     // ── source_root ───────────────────────────────────────────────────────────
 
     #[test]
     fn native_source_root_none_before_any_resolve_entry() {
-        // Before resolve_entry() or set_root() is called, root has not been established.
+        // Before resolve_entry() or anchor_base_dir() is called, root has not been established.
         let fs = NativeFs::new();
         assert_eq!(
             fs.source_root(),
@@ -1807,7 +1972,7 @@ mod tests {
         std::fs::write(root.join(".mdsroot"), "").unwrap();
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let fs = NativeFs::new();
-        fs.set_root(root.to_str().unwrap()).unwrap();
+        fs.anchor_base_dir(root.to_str().unwrap()).unwrap();
         (dir, root, fs)
     }
 

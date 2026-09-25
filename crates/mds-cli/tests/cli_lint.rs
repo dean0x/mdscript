@@ -390,7 +390,7 @@ fn stdin_lint_with_root_cwd_succeeds() {
 
 /// #371 (Windows-only): `mds lint`/`mds fmt` on a file that lives at a REAL
 /// drive root (not just a subdirectory) must exercise the fixed root-anchor
-/// path in `NativeFs::canonicalize`/`canonical_dir`, not the cwd-trap bug.
+/// path in `NativeFs::anchor_base_dir`/`canonical_dir`, not the cwd-trap bug.
 /// A writable filesystem root isn't available on CI/macOS/Linux (`/` isn't
 /// writable there), so this test uses Windows' `subst` to mount a tempdir as
 /// a drive root -- the only way to get a real, writable root on this

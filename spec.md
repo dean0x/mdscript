@@ -367,29 +367,33 @@ The resolver applies the rules below to the paths it opens — the entry file, e
 `@import` target (body directives and frontmatter `imports:` entries alike), and the
 base directory of a string compile — on the native filesystem backend (`NativeFs`:
 the CLI, the Rust API, and the file-path entry points of the napi and Python
-bindings). The in-memory backend (`VirtualFs`: `compile_virtual`, `lint_virtual`, and
-the WASM binding) has no symlinks and no host paths; the NUL-byte, empty-path and
-containment rules apply to it unchanged. Each rule is a compilation error, reported
-with the code shown.
+bindings). The in-memory backend (`VirtualFs`: `compile_virtual`, `check_virtual`,
+`lint_virtual`, and the WASM binding) has no symlinks and no host paths; the NUL-byte,
+empty-path and segment-count rules apply to its entry keys and import paths alike,
+and the containment rule to its import paths. Each rule is a compilation error,
+reported with the code shown.
 
 | Constraint | Rule | Code and message |
 |---|---|---|
 | Relative form | An import path starts with `./` or `../`; bare module names and absolute paths are refused before any filesystem access. | `mds::import` — `import path must be relative (start with './' or '../'): "<path>"` |
-| Empty path | An empty import path is refused. An empty entry file path (the native file-path APIs and `ModuleCache::resolve_path*`) is refused by the resolver before the backend is called. | Import: `mds::import` — `import path is empty`. Entry: `mds::io` — `entry path is empty` |
-| NUL bytes | A path containing U+0000 is refused before it reaches the operating system. An entry file path containing it (the native file-path APIs and `ModuleCache::resolve_path*`) is refused by the resolver before the backend is called, so a custom `FileSystem` backend is covered too. | Import: `mds::import` — `import path contains null byte`. Entry: `mds::io` — `entry path contains null byte: "<path>"` (the path escaped per §7.5) |
-| Symlink rejection | A path whose final component is a symbolic link is refused. The check canonicalizes the parent directory, joins the file name, canonicalizes the result and compares the two, so it is the resolved target that is validated, not the string the template wrote. Symbolic links in parent directories are followed, and the resolved path is then subject to the containment rule. Applies to the entry file, each import target and the base directory of a string compile; the CLI applies the same check to the `--vars` file. | `mds::import` — `symlinks are not allowed in imports: <path>` |
+| Empty path | An empty import path is refused. An empty entry path is refused by the resolver before the backend is called, on every entry API: the file-path APIs, `ModuleCache::resolve_path*`, `resolve_key` and `resolve_virtual_intrinsic*`, and the entry key of `compile_virtual`, `check_virtual` and `lint_virtual`. | Import: `mds::import` — `import path is empty`. Entry: `mds::io` — `entry path is empty` |
+| NUL bytes | A path containing U+0000 is refused before it reaches the operating system. An entry path containing it is refused by the resolver before the backend is called, on every entry API listed for an empty path, so a custom `FileSystem` backend is covered too. | Import: `mds::import` — `import path contains null byte`. Entry: `mds::io` — `entry path contains null byte: "<path>"` (the path escaped per §7.5) |
+| Symlink rejection | A path whose final component is a symbolic link is refused. The check canonicalizes the parent directory, joins the file name, canonicalizes the result and compares the two, so it is the resolved target that is validated, not the string the template wrote. Symbolic links in parent directories are followed, and the resolved path is then subject to the containment rule. Applies to the entry file (a `ModuleCache::resolve_key` key included), each import target, and a base directory passed to `ModuleCache::resolve_source*` (through `FileSystem::anchor_base_dir`, before the project root is anchored there); the CLI applies the same check to the `--vars` file. The string-compile functions (`compile_str_with`, `check_str_with`, `lint_str_with` and the bindings' `basePath`/`base_path`) resolve their base directory to its canonical form first, so a symbolic link there is followed rather than refused, and the resolved directory anchors containment. | `mds::import` — `symlinks are not allowed in imports: <path>` |
 | Root containment | After resolution the canonical path must lie inside the project root (§5 Project Root). A `..` sequence or a symlinked parent that leads outside the root is refused; on the virtual backend, `..` above the virtual root is refused. | `mds::import` — `import path escapes project directory: "<path>"` |
 | Path encoding | An entry path or base directory that is not valid UTF-8 is refused at the public API boundary rather than converted lossily. On the CLI this is exit 2 (§7.9). | `mds::io` — `path is not valid UTF-8` (entry path) or `base_dir path is not valid UTF-8` (base directory) |
 | Segment count | An import path of more than 256 segments is refused on both backends (on the virtual backend it is counted after it resolves against the importing directory), as is an entry file path resolved through `FileSystem::resolve_entry`. | `mds::resource_limit` — `import path exceeds maximum segment count (256)` |
 
 Enforced by `validate_relative_import`, `validate_entry_path`, `check_segment_count`,
-`NativeFs::check_symlink` and `NativeFs::check_path_traversal`
+`NativeFs::check_symlink`, `NativeFs::anchor_base_dir` and `NativeFs::check_path_traversal`
 (`crates/mds-core/src/fs.rs`), `validate_import_path` and `resolve_entry_key`
 (`crates/mds-core/src/resolver.rs`) and `path_to_str` / `resolve_base_dir`
 (`crates/mds-core/src/lib.rs`); pinned by the `native_resolve_entry_*`,
-`native_normalize_in_dir_*`, `vfs_resolve_entry_*` and `vfs_normalize_in_dir_*` tests in
-`fs.rs`, `custom_backend_entry_validation_runs_before_backend` and
-`nul_in_entry_path_is_io_error` in `crates/mds-core/tests/api_surface.rs`, `symlink_import_rejected` and
+`native_normalize_in_dir_*`, `native_anchor_base_dir_*`, `native_resolve_key_*`,
+`vfs_resolve_entry_*` and `vfs_normalize_in_dir_*` tests and
+`symlinked_base_dir_refused_by_resolve_source_followed_by_string_api` in `fs.rs`,
+`custom_backend_entry_validation_runs_before_backend`,
+`virtual_entry_apis_validate_the_entry_key` and `nul_in_entry_path_is_io_error` in
+`crates/mds-core/tests/api_surface.rs`, `symlink_import_rejected` and
 `path_traversal_import_rejected` in `crates/mds-cli/tests/security.rs`, and the
 `*_rejects_non_utf8_*` tests in `crates/mds-core/tests/api_surface.rs`. Directory-mode
 commands additionally skip symlinked entries inside the tree (§7.2).

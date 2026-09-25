@@ -464,12 +464,12 @@ pub fn check_str(source: &str) -> Result<(), MdsError> {
 /// This is one of two UTF-8 boundary enforcement points; the other is
 /// [`path_to_str`], which handles the entry-point `path` argument.
 fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
-    // Canonicalize to an absolute path so NativeFs::canonicalize() always
+    // Canonicalize to an absolute path so NativeFs::anchor_base_dir() always
     // receives a path whose file_name() is non-None.
     //
     // Path::parent() on a bare filename (e.g. "hello.mds") returns Some(""),
     // and effective_parent normalises that to Some("."). Neither "" nor "."
-    // survive NativeFs::canonicalize() because check_symlink() calls
+    // survive NativeFs::anchor_base_dir() because check_symlink() calls
     // file_name() on them, which returns None, causing a FileNotFound error
     // that assert_equivalent's Err(_) arm then silently swallows via
     // structural_equivalent. avoids PF-006.
@@ -1310,18 +1310,18 @@ pub fn lint_virtual(
     config: &LintConfig,
 ) -> Result<LintResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    // Get the entry source before moving `modules` into the check gate.
-    // R6: VirtualFs missing keys are ModuleNotFound, not FileNotFound.
-    let source = modules
-        .get(entry)
-        .ok_or_else(|| MdsError::module_not_found(entry))?
-        .clone();
+    // Take the entry source before moving `modules` into the check gate, but
+    // report nothing about it until the gate has run: the gate validates the
+    // entry key first (an empty or NUL key is `mds::io` on every virtual entry
+    // API) and reports a missing key as ModuleNotFound (R6), like compile_virtual.
+    let source = modules.get(entry).cloned();
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
     {
         let mut cache = ModuleCache::virtual_fs(modules);
         let mut warnings = vec![];
         cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
     }
+    let source = source.ok_or_else(|| MdsError::module_not_found(entry))?;
     // Step 2: lint the entry source.
     lint::lint_source(&source, entry, config)
 }

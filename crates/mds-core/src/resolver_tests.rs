@@ -3775,7 +3775,7 @@ fn r3_map_mode_eval_diagnostic_display_is_root_relative() {
 // via a tempdir's topmost ancestor -- never a hardcoded "/" -- so these tests
 // run unchanged on the Windows CI leg (#147).
 //
-// Before the #371 fix, `NativeFs::canonicalize` routed every path (including
+// Before the #371 fix, NativeFs's base-directory resolution routed every path (including
 // the root) through `check_symlink_named`, whose first step is
 // `path.file_name()` -- `None` for a root path -- so ANY string
 // compile/check/lint call whose base_dir resolved to the root failed with

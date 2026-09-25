@@ -396,22 +396,29 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
 
 // ── Read source file ──────────────────────────────────────────────────────────
 
-/// Read raw source of `path`: symlink-checked and size-capped (mirrors fmt.rs).
+/// Read raw source of `path`: symlink-checked, size-capped and UTF-8-validated.
 ///
-/// Returns `MdsError` (not `miette::Error`) so callers can feed the error into
-/// `emit_analysis_failure_json_or_stderr` without downcasting (AC-F-14).
-fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
+/// Shared by `mds lint` and `mds fmt`, which both need the RAW source text rather
+/// than a compiled result. Returns `MdsError` (not `miette::Error`) so callers can
+/// feed the error into `emit_analysis_failure_json_or_stderr` without downcasting
+/// (AC-F-14).
+pub(crate) fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
     let canonical = NativeFs::check_symlink(path)?;
+    read_canonical_source(&canonical, path)
+}
+
+/// Read the already symlink-checked `canonical` path of `path` through `NativeFs`.
+///
+/// R3 / CWE-209: the display root (project-root walk-up from the file's
+/// directory) is anchored BEFORE `read()`, so read-error messages show a
+/// project-root-relative path instead of the bare basename. A failure to anchor
+/// it is reported, not swallowed (PF-004) — `mds::io`, exit 2.
+fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<String, MdsError> {
     let path_str = canonical.to_str().ok_or_else(|| MdsError::Io {
         message: format!("path is not valid UTF-8: {}", path.display()),
     })?;
     let fs = NativeFs::new();
-    // R3 / CWE-209: anchor the display root (project-root walk-up from the
-    // file's directory) BEFORE read(), so read-error messages show a
-    // project-root-relative path instead of falling back to the bare basename.
-    // Best-effort like the resolver's defense-in-depth guard: on failure the
-    // display degrades to the basename fallback, which is still never absolute.
-    let _ = fs.set_root(&effective_parent(&canonical).display().to_string());
+    fs.anchor_base_dir(&effective_parent(canonical).display().to_string())?;
     fs.read(path_str)
 }
 
@@ -2540,6 +2547,40 @@ mod tests {
             display, "sub/c.mds",
             "relative_display must emit forward-slash separator on Windows; \
              got {display:?} — native backslash must not appear in the wire key"
+        );
+    }
+
+    /// PF-004: a failure to anchor the display root is reported, not swallowed.
+    ///
+    /// `read_source_file` only reaches `read_canonical_source` after
+    /// `check_symlink` has canonicalized the path, so the anchor cannot fail
+    /// through it without a race; the split exists so this is testable. A
+    /// canonical path whose directory is missing makes the anchor fail. With the
+    /// failure swallowed the read would then fail instead, as `cannot read
+    /// x.mds` — the message this test tells apart.
+    #[test]
+    fn read_canonical_source_reports_an_anchor_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let missing = root.join("gone").join("x.mds");
+
+        let err = super::read_canonical_source(&missing, &missing).unwrap_err();
+        assert!(
+            matches!(err, mds::MdsError::Io { .. }),
+            "expected mds::io, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("cannot resolve path"),
+            "the anchor failure must surface, got: {err}"
+        );
+        assert_eq!(super::mds_error_exit_code(&err), 2);
+
+        // Control: an existing file under an anchorable directory reads.
+        let file = root.join("ok.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        assert_eq!(
+            super::read_canonical_source(&file, &file).unwrap(),
+            "Hello!\n"
         );
     }
 }

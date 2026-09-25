@@ -507,26 +507,31 @@ impl ModuleCache {
         self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
-    /// Resolve a module by its normalized key.
+    /// Resolve an entry module by its key.
     ///
     /// This is the entry point for virtual filesystems where there is no OS path.
     /// Use this with [`ModuleCache::virtual_fs`] or a custom [`FileSystem`] backend.
+    /// The key is an entry path like any other: it is validated and resolved
+    /// through [`FileSystem::resolve_entry`] first, so on [`crate::NativeFs`] a
+    /// symlinked key is refused, the first key anchors the project root, and a
+    /// later key outside that root is refused.
     pub fn resolve_key(
         &mut self,
         key: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        self.resolve_by_key(key, runtime_vars, warnings)
+        let key = self.resolve_entry_key(key)?;
+        self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
     /// Resolve a module from an in-memory source string.
     ///
-    /// Imports within the source are resolved relative to `base_dir`.
-    ///
-    /// **NativeFs-only**: this method calls `canonicalize()` and `fs.set_root()`,
-    /// which only make sense for OS-backed filesystems. For virtual or
-    /// WASM environments use [`ModuleCache::resolve_key`] instead.
+    /// Imports within the source are resolved relative to `base_dir`, which goes
+    /// through [`FileSystem::anchor_base_dir`] first: [`crate::NativeFs`]
+    /// canonicalizes it, refuses a symlinked directory and anchors the project
+    /// root there; the default (in-memory backends) uses it unchanged as a
+    /// key-space directory (`""` is the root).
     pub fn resolve_source(
         &mut self,
         source: &str,
@@ -536,10 +541,9 @@ impl ModuleCache {
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         // Entry-size backstop for the string funnel (PF-004) — before any IO or parse.
         Self::check_source_size(source)?;
-        // Canonicalize base_dir via the FileSystem abstraction so that custom
-        // or virtual backends can override this behaviour (fixes issue #21).
-        let canonical_str = self.fs.canonicalize(base_dir)?;
-        self.fs.set_root(&canonical_str)?;
+        // Anchor base_dir through the FileSystem abstraction so that custom or
+        // virtual backends can override this behaviour (fixes issue #21).
+        let canonical_str = self.fs.anchor_base_dir(base_dir)?;
 
         // Guard against re-entrant or cyclic calls that could form a cycle
         // back through this root module. Mirrors the resolving bookkeeping in
@@ -567,14 +571,16 @@ impl ModuleCache {
     /// block resolves to [`crate::CompiledOutput::Messages`], otherwise to
     /// [`crate::CompiledOutput::Markdown`]. This is the entry point for virtual
     /// filesystems (use with [`ModuleCache::virtual_fs`]); the entry source is read
-    /// from the cache's [`FileSystem`] backend.
+    /// from the cache's [`FileSystem`] backend. The entry key is validated and
+    /// resolved through [`FileSystem::resolve_entry`] first, like every entry path.
     pub fn resolve_virtual_intrinsic(
         &mut self,
         entry: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
+        let key = self.resolve_entry_key(entry)?;
+        self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
     /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -586,7 +592,8 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
-        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
+        let key = self.resolve_entry_key(entry)?;
+        self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
     }
 
     /// Resolve a module by its normalized key, dispatching on output shape.
@@ -657,8 +664,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         Self::check_source_size(source)?;
-        let canonical_str = self.fs.canonicalize(base_dir)?;
-        self.fs.set_root(&canonical_str)?;
+        let canonical_str = self.fs.anchor_base_dir(base_dir)?;
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
@@ -684,8 +690,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         Self::check_source_size(source)?;
-        let canonical_str = self.fs.canonicalize(base_dir)?;
-        self.fs.set_root(&canonical_str)?;
+        let canonical_str = self.fs.anchor_base_dir(base_dir)?;
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
@@ -924,11 +929,11 @@ impl ModuleCache {
             // the published map.  Unconditional — never opt-in, never debug_assert.
             //
             // Defense-in-depth: establish root from base_dir if it was not set by
-            // the entry-point resolve_entry() / set_root() call (guards against a future
+            // the entry-point resolve_entry() / anchor_base_dir() call (guards against a future
             // alternate code path that bypasses root establishment — PF-004 shape).
             // No-op for VirtualFs: its source_root() always returns None regardless.
             if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-                let _ = self.fs.set_root(ctx.base_dir);
+                let _ = self.fs.anchor_base_dir(ctx.base_dir);
             }
             let source_map = source_map.map(|mut sm| {
                 let root_str = self.fs.source_root();
@@ -1006,11 +1011,11 @@ impl ModuleCache {
         // the published map.  Unconditional — never opt-in, never debug_assert.
         //
         // Defense-in-depth: establish root from base_dir if it was not set by
-        // the entry-point resolve_entry() / set_root() call (guards against a future
+        // the entry-point resolve_entry() / anchor_base_dir() call (guards against a future
         // alternate code path that bypasses root establishment — PF-004 shape).
         // No-op for VirtualFs: its source_root() always returns None regardless.
         if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-            let _ = self.fs.set_root(ctx.base_dir);
+            let _ = self.fs.anchor_base_dir(ctx.base_dir);
         }
         let source_map = source_map.map(|mut sm| {
             let root_str = self.fs.source_root();

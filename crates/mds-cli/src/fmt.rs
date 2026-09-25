@@ -25,7 +25,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use mds::{effective_parent, FileSystem};
+use mds::effective_parent;
 use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
@@ -90,32 +90,12 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
 /// Read the raw source of `path` for formatting: symlink-checked, size-capped,
 /// UTF-8-validated (PF-004 parity with `read_stdin` and the resolver).
 ///
-/// `mds fmt` needs the RAW, unparsed source text (not a compiled result), so
-/// it can't go through `mds::compile*`. Reuses `NativeFs::check_symlink`
-/// (never re-implements canonicalize — PF-003) and `NativeFs::read`'s
-/// TOCTOU-safe read-then-size-check instead of a bare `std::fs::read`.
+/// `mds fmt` needs the RAW, unparsed source text (not a compiled result), so it
+/// can't go through `mds::compile*`. It shares `mds lint`'s reader, so the two
+/// subcommands report an unreadable, symlinked or undecodable path identically —
+/// as an `MdsError`, which `exit_code` maps to exit 2 (#217).
 fn read_source_file(path: &Path) -> Result<String> {
-    let canonical = mds::NativeFs::check_symlink(path).map_err(miette::Error::from)?;
-    // `MdsError::Io`, not a bare `miette::miette!`: a `miette!` report does not downcast
-    // to `MdsError`, so `exit_code` fell through to 1 while `check_symlink` one line above
-    // — the same class of failure on the same argument — already exited 2. The message
-    // text is identical to `lint.rs`'s `read_source_file` so the two subcommands report
-    // an undecodable path the same way (#217).
-    let path_str = canonical
-        .to_str()
-        .ok_or_else(|| mds::MdsError::Io {
-            message: format!("path is not valid UTF-8: {}", path.display()),
-        })
-        .map_err(miette::Error::from)?;
-    let fs = mds::NativeFs::new();
-    // R3 / CWE-209: anchor the display root (project-root walk-up from the
-    // file's directory) BEFORE read(), so read-error messages show a
-    // project-root-relative path instead of falling back to the bare basename.
-    // Best-effort like the resolver's defense-in-depth guard: on failure the
-    // display degrades to the basename fallback, which is still never absolute.
-    // Mirrors lint.rs read_source_file exactly.
-    let _ = fs.set_root(&effective_parent(&canonical).display().to_string());
-    fs.read(path_str).map_err(miette::Error::from)
+    crate::lint::read_source_file(path).map_err(miette::Error::from)
 }
 
 /// The result of formatting one file's content: whether it changed, and the

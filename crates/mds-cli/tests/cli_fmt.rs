@@ -1108,7 +1108,7 @@ fn dir_check_summary_includes_unchanged_count() {
 /// the syntax diagnostic.
 ///
 /// Regression for PF-006: `path.parent()` on a bare filename returns `Some("")`.
-/// `NativeFs::canonicalize("")` failed with `MdsError::Io`, which the
+/// Resolving the empty base directory `""` failed with `MdsError::Io`, which the
 /// `assert_equivalent` fallback path silently swallowed (fell through to
 /// `structural_equivalent`) instead of propagating the `MdsError::Syntax` error.
 /// After the `resolve_base_dir` + `effective_parent` fix the syntax error must

@@ -1003,7 +1003,7 @@ mod tests {
         //
         // Which arm runs is gated entirely by whether
         // `compile_str_collecting_warnings(source, base_dir, None)` succeeds.
-        // Before the #371 fix, `NativeFs::canonicalize("/")` always errored
+        // Before the #371 fix, resolving the base directory `/` always errored
         // (`check_symlink_named` calls `path.file_name()`, which is `None`
         // for a filesystem root) -- so EVERY format call whose base_dir
         // resolved to a root, even for a perfectly valid template, took the

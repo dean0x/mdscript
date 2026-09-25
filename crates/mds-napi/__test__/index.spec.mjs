@@ -1242,7 +1242,7 @@ describe('lint parity (AC-API-06 guard)', () => {
 describe('#371: filesystem-root base dir', () => {
   // A base directory that IS the filesystem root must resolve successfully,
   // not fail with "cannot resolve path /: file not found: /" (the cwd trap
-  // in NativeFs::canonicalize, fixed core-side by NativeFs::canonical_dir).
+  // in NativeFs's base-directory resolution, fixed core-side by NativeFs::canonical_dir).
   // On Windows, "/" resolves to the root of the current drive -- this stays
   // portable without hardcoding a drive letter.
   test('#371: compile/check/lint with basePath "/" succeed', () => {

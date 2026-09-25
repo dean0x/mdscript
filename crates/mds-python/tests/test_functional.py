@@ -61,8 +61,8 @@ def test_f4_empty_base_path_is_invalid_options() -> None:
 # ── #371: filesystem-root base_dir ───────────────────────────────────────────
 #
 # A base_path that IS the filesystem root must resolve successfully, not fail
-# with "cannot resolve path /: file not found: /" (the cwd trap in
-# NativeFs::canonicalize, fixed core-side by NativeFs::canonical_dir). On
+# with "cannot resolve path /: file not found: /" (the cwd trap in NativeFs's
+# base-directory resolution, fixed core-side by NativeFs::canonical_dir). On
 # Windows, "/" resolves to the root of the current drive.
 
 
