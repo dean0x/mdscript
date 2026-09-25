@@ -273,6 +273,65 @@ mod walker {
     }
 }
 
+// ── Single-file inputs: refused before the existence check ──────────────────
+
+/// A file argument carrying a forbidden character is refused (`mds::io`, exit 2, the
+/// name escaped) whether or not the file exists and whatever its extension. `lint`
+/// and `fmt` check that the argument names an existing `.mds` file before they read
+/// it; the refusal must come first, or the `file not found` / `not an MDS file` error
+/// shows the name with the raw character in it.
+///
+/// Portable: no hostile file is created — every path here is missing.
+#[test]
+fn single_file_argument_is_refused_before_the_existence_check() {
+    let dir = tempfile::tempdir().unwrap();
+    for ch in [ESC, '\t', '\n', '\u{202E}'] {
+        for ext in ["mds", "txt"] {
+            let value = format!("in{ch}x.{ext}");
+            let shown = format!("in{}x.{ext}", escaped(ch));
+            for sub in ["build", "check", "lint", "fmt", "watch"] {
+                let (code, text) = run(dir.path(), &[sub, value.as_str()]);
+                let label = format!("{sub} in<U+{:04X}>x.{ext}", u32::from(ch));
+                assert_eq!(code, Some(2), "{label}: got: {text}");
+                assert_refusal(&text, ch, &shown, &label);
+                assert!(!text.contains(&value), "{label}: raw name; got: {text}");
+                assert!(
+                    !text.contains("not found") && !text.contains("not an MDS file"),
+                    "{label}: the refusal comes first; got: {text}"
+                );
+            }
+
+            // The JSON envelope carries the same refusal.
+            let (code, text) = run(dir.path(), &["lint", "--format", "json", value.as_str()]);
+            let label = format!("lint --format json in<U+{:04X}>x.{ext}", u32::from(ch));
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            let json: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{label}: stdout must be JSON ({e}); got: {text}"));
+            assert_eq!(json["error"]["code"], "mds::io", "{label}: got: {text}");
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&format!(
+                    "contains forbidden character U+{:04X}",
+                    u32::from(ch)
+                )) && message.contains(&shown),
+                "{label}: got: {message:?}"
+            );
+            assert!(!message.contains(ch), "{label}: raw char; got: {message:?}");
+        }
+    }
+
+    // Control: a clean missing file still reports `file not found`, so the refusal
+    // above is not every missing path's error.
+    for sub in ["lint", "fmt"] {
+        let (code, text) = run(dir.path(), &[sub, "missing.mds"]);
+        assert_eq!(code, Some(2), "{sub} control: got: {text}");
+        assert!(
+            text.contains("mds::file_not_found") && text.contains("missing.mds"),
+            "{sub} control: got: {text}"
+        );
+    }
+}
+
 // ── Output locations: refused up front ──────────────────────────────────────
 
 /// `-o` and `--out-dir` values carrying a forbidden character are refused before the

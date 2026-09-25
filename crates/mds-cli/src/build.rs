@@ -479,14 +479,20 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
 
 // ── Input-validation helpers ──────────────────────────────────────────────────
 
-/// Validate `path` for single-file build/fmt/lint: existence is checked first
-/// (→ `mds::file_not_found`, exit 2) and then the `.mds` extension (→
+/// Validate `path` for single-file build/fmt/lint: a forbidden path character is
+/// refused first (→ `mds::io`, exit 2, #265), then existence is checked (→
+/// `mds::file_not_found`, exit 2) and then the `.mds` extension (→
 /// `mds::not_mds_file`, exit 2).
+///
+/// The refusal comes first because the two errors after it show the path as
+/// given, unescaped; it is worded like `NativeFs::check_symlink`'s, so a hostile
+/// file argument reports the same error whether or not the file exists.
 ///
 /// Existence-before-extension ordering is required so that a user pointing at a
 /// non-existent path without `.mds` receives a "file not found" error rather than
 /// the confusing "not an .mds file" error (C4/F6).
 pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
+    crate::output::reject_forbidden_output_path("path", path.as_os_str())?;
     let exists = path.try_exists().map_err(|e| MdsError::Io {
         message: format!("cannot check {}: {e}", path.display()),
     })?;

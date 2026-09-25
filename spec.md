@@ -414,7 +414,7 @@ filesystem backend is called:
 | The base directory of a string compile (`compile_str_with`, `check_str_with`, `lint_str_with`, the bindings' `basePath`/`base_path`) | `resolve_base_dir`, on the form as given and on its canonical form | `mds::io` |
 | A base directory passed to `ModuleCache::resolve_source*` | the resolver, for every backend, and `NativeFs::anchor_base_dir` again | `mds::io` |
 | A resolved canonical path | `NativeFs`, on every path it canonicalizes — entry, import and base directory — scanned whole, not only its final component | `mds::io` |
-| A file the CLI opens itself — a `mds lint`/`mds fmt` file argument, the `--vars` file | `NativeFs::check_symlink`, on the path as given and on its canonical form (`path contains forbidden character U+XXXX: "<path>"`) | `mds::io` |
+| A file the CLI opens itself — a `mds lint`/`mds fmt` file argument, the `--vars` file | `NativeFs::check_symlink`, on the path as given and on its canonical form (`path contains forbidden character U+XXXX: "<path>"`); a `mds lint`/`mds fmt` file argument is refused with the same message before its existence and `.mds`-extension checks, so a missing or non-`.mds` hostile path reports it too | `mds::io` |
 | `-o`/`--output` and `--out-dir` (`mds build`, `mds watch`); `mds.json` `build.output_dir`, checked when the config is loaded — by `build`, `watch`, `lint` and directory-mode `fmt`, not by `check`, which does not read `mds.json`; `mds init <filename>` | the CLI, before any input is read or any file is written | `mds::io`, exit 2 |
 | The entry path and imports of `@mdscript/mds`'s `compileFile`/`checkFile`/`lintFile` on the WASM backend | the package's JS pre-scanner (`packages/mds/src/util/path-chars.ts`, used by `module-scanner.ts`), before it opens any file: the entry path and each import string as written, then each resolved path — with the same codes and messages as the native backend | `mds::import` / `mds::io` |
 
@@ -434,9 +434,10 @@ and `native_canonical_path_through_a_hostile_directory_is_refused` in `fs.rs`, t
 in `crates/mds-core/tests/forbidden_path_chars.rs` (import, entry-key, base-directory,
 custom-backend and symlinked-hostile-directory cases) and
 `crates/mds-cli/tests/forbidden_paths.rs` (the directory-walker matrix over `build`,
-`check`, `fmt`, `lint` and `watch`, the output locations and `mds init`), and U-FP1–U-FP5
-in `packages/mds/__test__/forbidden-path-chars.spec.mjs`, which compare the JS
-pre-scanner with the native and WASM engines over all 80 codepoints.
+`check`, `fmt`, `lint` and `watch`, single-file arguments, the output locations and
+`mds init`), and U-FP1–U-FP5 in `packages/mds/__test__/forbidden-path-chars.spec.mjs`,
+which compare the JS pre-scanner with the native and WASM engines over all 80
+codepoints.
 
 ---
 

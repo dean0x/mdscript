@@ -194,6 +194,9 @@ pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Re
 /// guard. The message names the codepoint as `U+XXXX` and shows the value escaped
 /// by [`mds::escape_path_for_message`], so it carries none of the 80 codepoints.
 ///
+/// `ensure_existing_mds_file` also runs it on a single-file argument (`what` =
+/// `path`), before that file's existence check.
+///
 /// A value that is not valid UTF-8 is scanned lossily: every forbidden codepoint
 /// that is validly encoded survives the conversion.
 pub(crate) fn reject_forbidden_output_path(
