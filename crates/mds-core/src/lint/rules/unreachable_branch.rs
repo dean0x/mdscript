@@ -767,4 +767,352 @@ mod tests {
             spans[0]
         );
     }
+
+    // ── Golden pins: exact fields for every case A–G ──────────────────────────
+    //
+    // The a3_case_* tests above pin each fix's shape; these pin every field
+    // exactly, so a refactor of check_if_block cannot drift a message, a help
+    // text, an anchor or a removal boundary without a red test. `FixLineSpan`
+    // has no `PartialEq`, so spans are compared as `(from, to, to_inclusive)`.
+
+    const MSG_IF_TRUE: &str =
+        "@if condition is always true — @elseif/@else branches are unreachable.";
+    const HELP_IF_TRUE: &str =
+        "Replace the constant condition with a variable or remove later branches.";
+    const MSG_IF_FALSE: &str = "@if condition is always false — the then-body is dead code.";
+    const HELP_DEAD: &str =
+        "Replace the constant condition with a variable or remove the dead branch.";
+    const MSG_ELSEIF_FALSE: &str = "@elseif condition is always false — this branch is dead code.";
+    const MSG_ELSEIF_TRUE: &str = "@elseif condition is always true.";
+    const HELP_ELSEIF_TRUE: &str = "Replace the constant condition with a variable.";
+    const MSG_DUPLICATE: &str = "@elseif condition is structurally identical to an earlier \
+                                 branch — this branch can never be reached.";
+    const HELP_DUPLICATE: &str = "Remove the duplicate @elseif branch or change its condition.";
+    /// Span length of a finding anchored on `@if`.
+    const IF_LEN: usize = 3;
+    /// Span length of a finding anchored on `@elseif`.
+    const ELSEIF_LEN: usize = 7;
+
+    /// One expected finding: `(message, help, offset, length, fix spans)`.
+    type Golden = (
+        &'static str,
+        &'static str,
+        usize,
+        usize,
+        Option<&'static [(usize, usize, bool)]>,
+    );
+
+    /// One actual finding in the [`Golden`] shape; `help` stays optional so a
+    /// finding that lost its help text cannot compare equal.
+    type Fields<'a> = (
+        &'a str,
+        Option<&'a str>,
+        usize,
+        usize,
+        Option<Vec<(usize, usize, bool)>>,
+    );
+
+    fn span_tuples(spans: &[FixLineSpan]) -> Vec<(usize, usize, bool)> {
+        spans
+            .iter()
+            .map(|s| (s.from, s.to, s.to_inclusive))
+            .collect()
+    }
+
+    /// The unreachable-branch findings in `diags`, in order, as [`Fields`].
+    fn ub_fields(diags: &[LintDiagnostic]) -> Vec<Fields<'_>> {
+        diags
+            .iter()
+            .filter(|d| d.rule == RULE)
+            .map(|d| {
+                let span = d.span.as_ref().expect("every finding carries a span");
+                let fix = d.fix_removals.as_deref().map(span_tuples);
+                (
+                    d.message.as_str(),
+                    d.help.as_deref(),
+                    span.offset,
+                    span.length,
+                    fix,
+                )
+            })
+            .collect()
+    }
+
+    fn expected(golden: &[Golden]) -> Vec<Fields<'static>> {
+        golden
+            .iter()
+            .map(|&(message, help, offset, length, fix)| {
+                (message, Some(help), offset, length, fix.map(<[_]>::to_vec))
+            })
+            .collect()
+    }
+
+    /// `(label, source, expected findings in offset order)`. Offsets are the byte
+    /// offsets of the directives in each source, noted per row.
+    const GOLDEN_CASES: &[(&str, &str, &[Golden])] = &[
+        (
+            // @elseif 21, @else 43, @end 55: later branches start at the @elseif.
+            "A: always-true @if, @elseif then @else",
+            "@if \"x\" == \"x\":\nthen\n@elseif z == \"b\":\nmid\n@else:\nlast\n@end\n",
+            &[(MSG_IF_TRUE, HELP_IF_TRUE, 0, IF_LEN, Some(&[(0, 0, true), (21, 55, true)]))],
+        ),
+        (
+            // @else 21, @end 33: with no @elseif, later branches start at @else.
+            "A: always-true @if, @else only",
+            "@if \"x\" == \"x\":\nthen\n@else:\nlast\n@end\n",
+            &[(MSG_IF_TRUE, HELP_IF_TRUE, 0, IF_LEN, Some(&[(0, 0, true), (21, 33, true)]))],
+        ),
+        (
+            // @end 21: the whole block goes.
+            "B: always-false @if, no other branch",
+            "@if \"x\" == \"y\":\nthen\n@end\n",
+            &[(MSG_IF_FALSE, HELP_DEAD, 0, IF_LEN, Some(&[(0, 21, true)]))],
+        ),
+        (
+            // Inner @if 14, inner @end 36, outer @end 41: the finding is on the nested
+            // block and its removal stops at the inner @end.
+            "B: nested always-false @if",
+            "@if z == \"a\":\n@if \"x\" == \"y\":\ninner\n@end\n@end\n",
+            &[(MSG_IF_FALSE, HELP_DEAD, 14, IF_LEN, Some(&[(14, 36, true)]))],
+        ),
+        (
+            // @else 21, @end 33: @if..@else: inclusive, then the @end line.
+            "C: always-false @if, @else only",
+            "@if \"x\" == \"y\":\nthen\n@else:\nlast\n@end\n",
+            &[(MSG_IF_FALSE, HELP_DEAD, 0, IF_LEN, Some(&[(0, 21, true), (33, 33, true)]))],
+        ),
+        (
+            "D: always-false @if, @elseif",
+            "@if \"x\" == \"y\":\nthen\n@elseif z == \"b\":\nmid\n@end\n",
+            &[(MSG_IF_FALSE, HELP_DEAD, 0, IF_LEN, None)],
+        ),
+        (
+            "D: always-false @if, @elseif then @else",
+            "@if \"x\" == \"y\":\nthen\n@elseif z == \"b\":\nmid\n@else:\nlast\n@end\n",
+            &[(MSG_IF_FALSE, HELP_DEAD, 0, IF_LEN, None)],
+        ),
+        (
+            // @elseif 16, next @elseif 38: the boundary is the next @elseif.
+            "E: always-false @elseif, another @elseif follows",
+            "@if z == \"a\":\nA\n@elseif \"x\" == \"y\":\nB\n@elseif z == \"c\":\nC\n@else:\nD\n@end\n",
+            &[(MSG_ELSEIF_FALSE, HELP_DEAD, 16, ELSEIF_LEN, Some(&[(16, 38, false)]))],
+        ),
+        (
+            // @elseif 16, @else 38: the last @elseif's boundary is @else.
+            "E: always-false last @elseif, @else follows",
+            "@if z == \"a\":\nA\n@elseif \"x\" == \"y\":\nB\n@else:\nC\n@end\n",
+            &[(MSG_ELSEIF_FALSE, HELP_DEAD, 16, ELSEIF_LEN, Some(&[(16, 38, false)]))],
+        ),
+        (
+            // @elseif 16, @end 38: no @else, so the boundary is @end.
+            "E: always-false last @elseif, no @else",
+            "@if z == \"a\":\nA\n@elseif \"x\" == \"y\":\nB\n@end\n",
+            &[(MSG_ELSEIF_FALSE, HELP_DEAD, 16, ELSEIF_LEN, Some(&[(16, 38, false)]))],
+        ),
+        (
+            "F: always-true @elseif",
+            "@if z == \"a\":\nA\n@elseif \"x\" == \"x\":\nB\n@else:\nC\n@end\n",
+            &[(MSG_ELSEIF_TRUE, HELP_ELSEIF_TRUE, 16, ELSEIF_LEN, None)],
+        ),
+        (
+            // @elseif 16, @end 36.
+            "G: duplicate last @elseif, no @else",
+            "@if x == \"a\":\nA\n@elseif x == \"a\":\nB\n@end\n",
+            &[(MSG_DUPLICATE, HELP_DUPLICATE, 16, ELSEIF_LEN, Some(&[(16, 36, false)]))],
+        ),
+        (
+            // @elseif 16, next @elseif 36: the boundary is the next @elseif.
+            "G: duplicate @elseif, another @elseif follows",
+            "@if x == \"a\":\nA\n@elseif x == \"a\":\nB\n@elseif x == \"c\":\nC\n@else:\nD\n@end\n",
+            &[(MSG_DUPLICATE, HELP_DUPLICATE, 16, ELSEIF_LEN, Some(&[(16, 36, false)]))],
+        ),
+        (
+            // @elseif 18, @end 40. M4: the duplicate is reported once, as G, never
+            // also as F.
+            "A + G: always-true @if with an identical @elseif",
+            "@if \"a\" == \"a\":\nA\n@elseif \"a\" == \"a\":\nB\n@end\n",
+            &[
+                (MSG_IF_TRUE, HELP_IF_TRUE, 0, IF_LEN, Some(&[(0, 0, true), (18, 40, true)])),
+                (MSG_DUPLICATE, HELP_DUPLICATE, 18, ELSEIF_LEN, Some(&[(18, 40, false)])),
+            ],
+        ),
+    ];
+
+    /// Golden: every case A–G, including each removal-boundary fallback, pins the
+    /// exact message, help, span offset, span length and fix spans, plus the fields
+    /// every finding shares.
+    #[test]
+    fn ub_golden_exact_fields() {
+        for &(label, src, golden) in GOLDEN_CASES {
+            let diags = lint_src(src);
+            for d in diags.iter().filter(|d| d.rule == RULE) {
+                assert_eq!(d.severity, Severity::Error, "{label}: severity");
+                assert_eq!(d.file.as_deref(), Some("test.mds"), "{label}: file");
+                assert!(d.fix_edits.is_none(), "{label}: fix_edits must be None");
+                let span = d.span.as_ref().expect("every finding carries a span");
+                assert_eq!(
+                    (span.line, span.column),
+                    (None, None),
+                    "{label}: line/column"
+                );
+            }
+            assert_eq!(
+                ub_fields(&diags),
+                expected(golden),
+                "{label}\nsource: {src:?}"
+            );
+        }
+    }
+
+    // ── Seen-conditions semantics ─────────────────────────────────────────────
+
+    /// A classified (always-false) @elseif condition still enters the seen set, so a
+    /// later identical @elseif is reported as a duplicate (G), not as a second
+    /// always-false branch (E).
+    #[test]
+    fn ub_seen_conditions_include_classified_nonduplicates() {
+        // @elseif 16, second @elseif 38, @end 60.
+        let src =
+            "@if z == \"a\":\nA\n@elseif \"x\" == \"y\":\nB\n@elseif \"x\" == \"y\":\nC\n@end\n";
+        assert_eq!(
+            ub_fields(&lint_src(src)),
+            expected(&[
+                (
+                    MSG_ELSEIF_FALSE,
+                    HELP_DEAD,
+                    16,
+                    ELSEIF_LEN,
+                    Some(&[(16, 38, false)])
+                ),
+                (
+                    MSG_DUPLICATE,
+                    HELP_DUPLICATE,
+                    38,
+                    ELSEIF_LEN,
+                    Some(&[(38, 60, false)])
+                ),
+            ])
+        );
+    }
+
+    /// Every earlier branch condition is compared, not only the @if's: a repeat of an
+    /// earlier (unclassifiable) @elseif is a duplicate. Distinct conditions are not.
+    #[test]
+    fn ub_seen_conditions_cover_every_earlier_branch() {
+        // @elseif 16, second @elseif 36, @end 56.
+        let repeat = "@if x == \"a\":\nA\n@elseif x == \"b\":\nB\n@elseif x == \"b\":\nC\n@end\n";
+        assert_eq!(
+            ub_fields(&lint_src(repeat)),
+            expected(&[(
+                MSG_DUPLICATE,
+                HELP_DUPLICATE,
+                36,
+                ELSEIF_LEN,
+                Some(&[(36, 56, false)])
+            )])
+        );
+
+        let distinct = "@if x == \"a\":\nA\n@elseif x == \"b\":\nB\n@elseif x == \"c\":\nC\n@end\n";
+        assert_eq!(ub_fields(&lint_src(distinct)), expected(&[]));
+    }
+
+    /// Three identical conditions: the @if itself is fine, and each later @elseif is
+    /// a duplicate — exactly two findings, each removing only its own branch.
+    #[test]
+    fn ub_triple_identical_yields_two_duplicates() {
+        // @elseif 16, second @elseif 36, @end 56.
+        let src = "@if x == \"a\":\nA\n@elseif x == \"a\":\nB\n@elseif x == \"a\":\nC\n@end\n";
+        assert_eq!(
+            ub_fields(&lint_src(src)),
+            expected(&[
+                (
+                    MSG_DUPLICATE,
+                    HELP_DUPLICATE,
+                    16,
+                    ELSEIF_LEN,
+                    Some(&[(16, 36, false)])
+                ),
+                (
+                    MSG_DUPLICATE,
+                    HELP_DUPLICATE,
+                    36,
+                    ELSEIF_LEN,
+                    Some(&[(36, 56, false)])
+                ),
+            ])
+        );
+    }
+
+    // ── Diagnostic cap ────────────────────────────────────────────────────────
+
+    fn filler_diag() -> LintDiagnostic {
+        LintDiagnostic {
+            rule: "filler".to_string(),
+            severity: Severity::Warn,
+            message: String::new(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: None,
+            fix_edits: None,
+        }
+    }
+
+    /// Run the rule on a builder already holding `prefill` unrelated diagnostics;
+    /// returns the built diagnostics and the `truncated` flag.
+    fn lint_src_prefilled(src: &str, prefill: usize) -> (Vec<LintDiagnostic>, bool) {
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let module = parse_with_ctx(&tokens, "test.mds", src).unwrap();
+        let ctx = collect_facts(&module, false, src).unwrap();
+        let mut builder = LintResultBuilder::new();
+        for _ in 0..prefill {
+            assert!(
+                builder.push(filler_diag()),
+                "prefill must fit under the cap"
+            );
+        }
+        let config = LintConfig::default();
+        check(&module, &ctx, "test.mds", &config, &mut builder);
+        let result = builder.build(false);
+        (result.diagnostics, result.truncated)
+    }
+
+    /// The rule stops exactly at `MAX_DIAGNOSTICS`: with `headroom` free slots it
+    /// keeps its first `headroom` findings in execution order (the @if before its
+    /// @elseif branches), and sets `truncated` only when a finding was dropped.
+    #[test]
+    fn ub_respects_diagnostic_cap() {
+        use crate::limits::MAX_DIAGNOSTICS;
+
+        // D on the @if (0), then G on the second @elseif (38, boundary @end 58).
+        let src = "@if \"x\" == \"y\":\nA\n@elseif x == \"b\":\nB\n@elseif x == \"b\":\nC\n@end\n";
+        let all: [Golden; 2] = [
+            (MSG_IF_FALSE, HELP_DEAD, 0, IF_LEN, None),
+            (
+                MSG_DUPLICATE,
+                HELP_DUPLICATE,
+                38,
+                ELSEIF_LEN,
+                Some(&[(38, 58, false)]),
+            ),
+        ];
+        assert_eq!(
+            ub_fields(&lint_src(src)),
+            expected(&all),
+            "uncapped control"
+        );
+
+        for headroom in 0..=all.len() + 1 {
+            let (diags, truncated) = lint_src_prefilled(src, MAX_DIAGNOSTICS - headroom);
+            let kept = headroom.min(all.len());
+            let label = format!("headroom {headroom}");
+            assert_eq!(
+                diags.len(),
+                MAX_DIAGNOSTICS - headroom + kept,
+                "{label}: total"
+            );
+            assert_eq!(ub_fields(&diags), expected(&all[..kept]), "{label}: kept");
+            assert_eq!(truncated, headroom < all.len(), "{label}: truncated");
+        }
+    }
 }
