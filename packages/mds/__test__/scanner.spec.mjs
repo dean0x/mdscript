@@ -9,7 +9,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { mkdtemp, mkdir, symlink, writeFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
   FORBIDDEN_PATH_CODEPOINTS,
@@ -702,6 +702,163 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       assert.equal(wasmDotDot.output, undefined, JSON.stringify(wasmDotDot));
     });
   });
+});
+
+describe('buildModulesMap — a filesystem error is coded, never a raw Node error (#408)', () => {
+  async function withProject(fn) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-errno-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      return await fn(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // Permission bits do not bind root, and Windows has no POSIX modes to strip.
+  const noModes =
+    (process.platform === 'win32' && 'POSIX permission bits are not enforced on Windows') ||
+    (typeof process.getuid === 'function' && process.getuid() === 0 && 'root bypasses permission bits');
+
+  /** Build `entry` and return its rejection — with every forbidden character absent. */
+  async function refusal(entry, label) {
+    const err = await rejectionOf(buildModulesMap(entry, scanImports), label);
+    assertNoForbiddenChars(err.message, label);
+    return err;
+  }
+
+  /**
+   * The scanner's refusal for `entry` and for the same file imported as
+   * `importPath` by a sibling `main.mds` — both `file not found`, keyed on the path
+   * as written, the shape NativeFs gives any failure to resolve a path (it maps
+   * every errno of that step to `mds::file_not_found`).
+   */
+  async function assertNotFoundAsEntryAndImport(dir, entry, importPath, label) {
+    assertNotFoundNotSymlink(await refusal(entry, `${label} entry`), entry, `${label} entry`);
+    await writeFile(path.join(dir, 'main.mds'), `@import "${importPath}" as x\n`);
+    const err = await refusal(path.join(dir, 'main.mds'), `${label} import`);
+    assertNotFoundNotSymlink(err, importPath, `${label} import`);
+  }
+
+  test(
+    'U-SM25: a symlink loop in a directory (ELOOP) is file-not-found, as native reports it',
+    { skip: process.platform === 'win32' && 'a directory symlink loop needs a symlink privilege on Windows' },
+    async (t) => {
+      await withProject(async (dir) => {
+        await symlink(path.join(dir, 'loop'), path.join(dir, 'loop'), 'dir');
+        const entry = path.join(dir, 'loop', 'x.mds');
+        await assertNotFoundAsEntryAndImport(dir, entry, './loop/x.mds', 'U-SM25');
+
+        const engines = await loadEngines();
+        if (!requireEngines(t, engines, 'U-SM25')) return;
+        const [native] = await compileFileOutcomes('native', [entry]);
+        const [wasm] = await compileFileOutcomes('wasm', [entry]);
+        assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+      });
+    },
+  );
+
+  test('U-SM26: a name too long to resolve (ENAMETOOLONG) is file-not-found, as native reports it', async (t) => {
+    await withProject(async (dir) => {
+      const long = 'n'.repeat(300);
+      // The final component (the open fails) and a directory above it (realpath fails).
+      const file = path.join(dir, `${long}.mds`);
+      await assertNotFoundAsEntryAndImport(dir, file, `./${long}.mds`, 'U-SM26 file');
+      const nested = path.join(dir, long, 'x.mds');
+      await assertNotFoundAsEntryAndImport(dir, nested, `./${long}/x.mds`, 'U-SM26 dir');
+
+      const engines = await loadEngines();
+      if (!requireEngines(t, engines, 'U-SM26')) return;
+      const nativeOutcomes = await compileFileOutcomes('native', [file, nested]);
+      const wasmOutcomes = await compileFileOutcomes('wasm', [file, nested]);
+      for (const [i, native] of nativeOutcomes.entries()) {
+        const wasm = wasmOutcomes[i];
+        assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+      }
+    });
+  });
+
+  test('U-SM27: a directory that cannot be searched (EACCES) is file-not-found, as native reports it', { skip: noModes }, async (t) => {
+    await withProject(async (dir) => {
+      const locked = path.join(dir, 'locked');
+      await mkdir(path.join(locked, 'sub'), { recursive: true });
+      await writeFile(path.join(locked, 'sub', 'x.mds'), 'X\n');
+      await chmod(locked, 0o000);
+      try {
+        const entry = path.join(locked, 'sub', 'x.mds');
+        await assertNotFoundAsEntryAndImport(dir, entry, './locked/sub/x.mds', 'U-SM27');
+
+        const engines = await loadEngines();
+        if (!requireEngines(t, engines, 'U-SM27')) return;
+        const [native] = await compileFileOutcomes('native', [entry]);
+        const [wasm] = await compileFileOutcomes('wasm', [entry]);
+        assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+      } finally {
+        await chmod(locked, 0o755);
+      }
+    });
+  });
+
+  test('U-SM28: a file that exists but cannot be read (EACCES) is mds::io, as native reports it', { skip: noModes }, async (t) => {
+    await withProject(async (dir) => {
+      const secret = path.join(dir, 'secret.mds');
+      await writeFile(secret, 'S\n');
+      await chmod(secret, 0o000);
+      try {
+        const err = await refusal(secret, 'U-SM28 entry');
+        assert.equal(err.code, 'mds::io', err.message);
+        assert.equal(err.message, `cannot read ${secret}: EACCES`);
+
+        await writeFile(path.join(dir, 'main.mds'), '@import "./secret.mds" as s\n');
+        const imported = await refusal(path.join(dir, 'main.mds'), 'U-SM28 import');
+        assert.equal(imported.code, 'mds::io', imported.message);
+        assert.equal(imported.message, 'cannot read ./secret.mds: EACCES');
+
+        const engines = await loadEngines();
+        if (!requireEngines(t, engines, 'U-SM28')) return;
+        const [native] = await compileFileOutcomes('native', [secret]);
+        const [wasm] = await compileFileOutcomes('wasm', [secret]);
+        // The code agrees; the message names the path as written and the errno name,
+        // where native names its root-relative display path and the OS error text.
+        assert.equal(native.code, 'mds::io', JSON.stringify(native));
+        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+      } finally {
+        await chmod(secret, 0o644);
+      }
+    });
+  });
+
+  // Windows file names cannot carry C0 controls, so the hostile directory this
+  // needs cannot be created there.
+  test(
+    'U-SM29: under a hostile-named working directory, an unsearchable directory names only the path as written',
+    { skip: noModes || (process.platform === 'win32' && 'C0 controls are not valid in Windows file names') },
+    async () => {
+      await withProject(async (dir) => {
+        const hostile = path.join(dir, `ho${String.fromCodePoint(0x1b)}stile`);
+        const locked = path.join(hostile, 'locked');
+        await mkdir(path.join(locked, 'sub'), { recursive: true });
+        await writeFile(path.join(locked, 'sub', 'x.mds'), 'X\n');
+        await chmod(locked, 0o000);
+        const cwd = process.cwd();
+        process.chdir(hostile);
+        try {
+          // Node's own EACCES message names the absolute path, raw ESC included.
+          const err = await refusal('locked/sub/x.mds', 'U-SM29');
+          assertNotFoundNotSymlink(err, 'locked/sub/x.mds', 'U-SM29');
+        } finally {
+          process.chdir(cwd);
+          await chmod(locked, 0o755);
+        }
+      });
+    },
+  );
 });
 
 describe('findProjectRoot', () => {

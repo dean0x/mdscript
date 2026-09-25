@@ -110,12 +110,17 @@ function isWithinRoot(root: string, candidate: string): boolean {
 /**
  * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP error
  * the kernel emits when the path is a symlink into a clear security error, and
- * ENOENT (no such file — e.g. a case-mismatched spelling on a case-sensitive
- * volume, #408) or ENOTDIR (the immediate parent, which realpath() accepted, is a
- * regular file) into the same `mds::file_not_found` shape the Rust engine reports
- * for a missing file, keyed on `shown` rather than the resolved `absolutePath`
- * (R3 / CWE-209 — the raw Node error otherwise leaks the resolved filesystem path
- * in its message). All other OS errors are re-thrown unchanged.
+ * every other failure into the error the Rust engine reports at the same step,
+ * keyed on `shown` rather than the resolved `absolutePath` (R3 / CWE-209 — the raw
+ * Node error names the resolved filesystem path in its message).
+ *
+ * NativeFs stats the final component (`symlink_metadata`) before it reads it and
+ * maps any failure of that step to `mds::file_not_found`: so does this, when the
+ * failed path cannot be `lstat`ed either — no such file (ENOENT; e.g. a
+ * case-mismatched spelling on a case-sensitive volume, #408), a regular file where
+ * a directory is expected (ENOTDIR), a name too long (ENAMETOOLONG), a directory
+ * that cannot be searched (EACCES). A file that stats but cannot be opened (EACCES
+ * on the file itself) failed at NativeFs's read step instead: `mds::io`.
  *
  * Module-level helper (not a closure) so that openAndValidateModule's own
  * try/catch only handles post-open validation, keeping nesting shallow.
@@ -127,15 +132,24 @@ async function openNoFollow(
   try {
     return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ELOOP') {
+    if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
       throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
     }
-    if (code === 'ENOENT' || code === 'ENOTDIR') {
-      throw fileNotFoundError(shown);
-    }
-    throw err;
+    throw await lstat(absolutePath).then(
+      () => readError(shown, err),
+      () => fileNotFoundError(shown),
+    );
   }
+}
+
+/**
+ * Close `handle`, reporting a failure as the read failure it is (`readError`), never
+ * as Node's raw error.
+ */
+async function closeModule(handle: Awaited<ReturnType<typeof open>>, shown: string): Promise<void> {
+  await handle.close().catch((err: unknown) => {
+    throw readError(shown, err);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -165,17 +179,35 @@ function importError(detail: string): PathError {
  * `mds::file_not_found`, matching Rust `MdsError::file_not_found`'s message
  * shape (`"file not found: {path}"`) exactly, keyed on `shown` — the path as
  * written — never the resolved filesystem path.
+ *
+ * `shown` has passed `entryPathError`/`importPathError` by the time a file is
+ * looked for, so escaping it changes nothing; it is escaped anyway so no message
+ * this module builds can carry a forbidden character.
  */
 function fileNotFoundError(shown: string): PathError {
-  return pathError('mds::file_not_found', `file not found: ${shown}`);
+  return pathError('mds::file_not_found', `file not found: ${escapePathForMessage(shown)}`);
 }
 
 /**
- * Canonicalize `path`'s parent directory, translating ENOENT (the parent does
- * not exist) and ENOTDIR (a path component above it is a regular file, not a
- * directory) into the same `mds::file_not_found` shape `fileNotFoundError`
- * builds — keyed on `shown`, never the raw absolute path (R3 / CWE-209, #408).
- * Any other errno is re-thrown unchanged.
+ * `mds::io` for a file that resolves but cannot be read — NativeFs's `cannot read
+ * …` I/O error — naming `shown`, the path as written, and the errno name (`EACCES`),
+ * never Node's message, which names the resolved absolute path. Native names its
+ * root-relative display path and the OS error text instead, so the two agree on the
+ * code, not on the message.
+ */
+function readError(shown: string, err: unknown): PathError {
+  const errno = (err as NodeJS.ErrnoException | undefined)?.code;
+  const reason = typeof errno === 'string' ? escapePathForMessage(errno) : 'I/O error';
+  return pathError('mds::io', `cannot read ${escapePathForMessage(shown)}: ${reason}`);
+}
+
+/**
+ * Canonicalize `path`'s parent directory, translating every failure — the parent
+ * does not exist (ENOENT), a path component above it is a regular file (ENOTDIR),
+ * a symlink loop (ELOOP), a name too long (ENAMETOOLONG), a directory that cannot
+ * be searched (EACCES) — into the `mds::file_not_found` shape `fileNotFoundError`
+ * builds, keyed on `shown`, never Node's error, which names the raw absolute path
+ * (R3 / CWE-209, #408).
  *
  * Mirrors Rust `check_symlink_named`, whose `parent.canonicalize()` step maps
  * every canonicalize failure on the parent — it does not distinguish errno —
@@ -187,12 +219,8 @@ function fileNotFoundError(shown: string): PathError {
 async function realpathParent(path: string, shown: string): Promise<string> {
   try {
     return await realpath(dirname(path));
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') {
-      throw fileNotFoundError(shown);
-    }
-    throw err;
+  } catch {
+    throw fileNotFoundError(shown);
   }
 }
 
@@ -376,9 +404,12 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  *   contains NUL or carries a forbidden path character (`mds::import`) (#265)
  * - Rejects a module whose resolved path carries a forbidden path character — a
  *   hostile-named directory reached through a symlink (`mds::io`, #265)
- * - Reports a module whose directory does not exist, or is blocked by a
- *   non-directory path component, as `mds::file_not_found` — never the raw,
- *   resolved-path `ENOENT`/`ENOTDIR` node:fs error (#408)
+ * - Reports a filesystem failure with the code the Rust engine gives the same
+ *   step, never Node's raw error, which names the resolved absolute path (#408):
+ *   a module or directory that cannot be resolved — missing, blocked by a
+ *   non-directory path component, a symlink loop, a name too long, a directory
+ *   that cannot be searched — is `mds::file_not_found`; a file that resolves but
+ *   cannot be read is `mds::io` (`cannot read <path as written>: <errno name>`)
  * - Enforces module count and aggregate size limits
  */
 export async function buildModulesMap(
@@ -542,14 +573,20 @@ export async function buildModulesMap(
 
     try {
       // `openNoFollow` above already succeeded, so `joined` names a file that
-      // existed a moment ago; a path-based ENOENT from `lstat`/`realpath` here
-      // can only come from a concurrent external deletion (TOCTOU), not from
-      // caller-supplied input — the case this function exists to translate.
-      // `handle.stat()` is fd-based and carries no path to leak.
+      // existed a moment ago; a failure here can only come from a concurrent
+      // change (TOCTOU). It is still reported as the engine would report it:
+      // `lstat`/`realpath` are NativeFs's stat and canonicalize steps
+      // (file-not-found), the fd-based `stat` is part of reading the file.
       const [stats, linkStats, resolved] = await Promise.all([
-        handle.stat(),
-        lstat(joined),
-        realpath(joined),
+        handle.stat().catch((err: unknown) => {
+          throw readError(shown, err);
+        }),
+        lstat(joined).catch(() => {
+          throw fileNotFoundError(shown);
+        }),
+        realpath(joined).catch(() => {
+          throw fileNotFoundError(shown);
+        }),
       ]);
 
       // The final component's own file type — the check that stands in for
@@ -575,7 +612,7 @@ export async function buildModulesMap(
 
       return { handle, size: stats.size, resolved };
     } catch (err) {
-      await handle.close();
+      await closeModule(handle, shown);
       throw err;
     }
   }
@@ -626,9 +663,11 @@ export async function buildModulesMap(
         );
       }
 
-      content = await handle.readFile({ encoding: 'utf-8' });
+      content = await handle.readFile({ encoding: 'utf-8' }).catch((err: unknown) => {
+        throw readError(shown, err);
+      });
     } finally {
-      await handle.close();
+      await closeModule(handle, shown);
     }
 
     modules[virtualKey] = content;
