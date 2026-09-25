@@ -127,9 +127,10 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
     use crate::output::STDIN_DISPLAY_LABEL;
 
     let FmtFlags { check, diff, quiet } = flags;
-    let (source, cwd) = read_stdin()?;
+    let source = read_stdin()?;
     // AD-211-3: one definition of the stdin sentinel, shared with lint/check/build.
-    let result = format_source_named(&source, Some(&cwd), STDIN_DISPLAY_LABEL)?;
+    // `None` is the working directory, shown as "." (see `read_stdin`).
+    let result = format_source_named(&source, None, STDIN_DISPLAY_LABEL)?;
 
     if diff {
         print_diff(&render_unified_diff(

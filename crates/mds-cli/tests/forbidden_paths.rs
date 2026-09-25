@@ -273,6 +273,95 @@ mod walker {
     }
 }
 
+// ── Stdin: the working directory is shown as "." ────────────────────────────
+//
+// Unix-only: a Windows directory name cannot hold a C0 control such as TAB or ESC,
+// so the hostile working directory cannot be created there.
+
+#[cfg(unix)]
+mod stdin_cwd {
+    use super::*;
+    use std::io::Write;
+
+    /// Run `mds` with `args` in `dir`, feeding `input` on stdin; `(exit code, stdout +
+    /// stderr)`. Bounded like [`run`]: killed after 20 s.
+    fn run_stdin(dir: &Path, args: &[&str], input: &str) -> (Option<i32>, String) {
+        let mut child = mds_bin()
+            .current_dir(dir)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        // Bounded: at most 20 s / 10 ms iterations.
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("mds {args:?} was still running after 20 s");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = child.wait_with_output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    }
+
+    /// `-` compiles against the working directory, a path the caller never typed. A
+    /// working directory whose name carries a forbidden character is refused under
+    /// `build`, `check`, `lint` and `fmt` alike (`mds::io`, exit 2) as the resolved
+    /// form of `"."`, and the message names it `"."` — never its absolute path, never a
+    /// raw character.
+    #[test]
+    fn stdin_refuses_a_hostile_working_directory_shown_as_dot() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The temp directory's own name appears in its absolute path whatever the
+        // symlinks above it resolve to (macOS `/var` → `/private/var`).
+        let tmp_name = tmp.path().file_name().unwrap().to_str().unwrap().to_owned();
+        for ch in ['\t', ESC] {
+            let cwd = tmp.path().join(format!("d{ch}e"));
+            std::fs::create_dir(&cwd).unwrap();
+            for sub in ["build", "check", "lint", "fmt"] {
+                let (code, text) = run_stdin(&cwd, &[sub, "-"], "Hello\n");
+                let label = format!("{sub} - in d<U+{:04X}>e", u32::from(ch));
+                assert_eq!(code, Some(2), "{label}: got: {text}");
+                assert!(
+                    text.contains(&format!(
+                        "resolved path contains forbidden character U+{:04X}: \".\"",
+                        u32::from(ch)
+                    )),
+                    "{label}: got: {text:?}"
+                );
+                assert_refusal(&text, ch, "\".\"", &label);
+                assert!(!text.contains(ch), "{label}: raw char; got: {text:?}");
+                assert!(
+                    !text.contains(&tmp_name),
+                    "{label}: absolute path; got: {text:?}"
+                );
+            }
+        }
+
+        // Control: the same input in a clean working directory succeeds.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir(&clean).unwrap();
+        for sub in ["build", "check", "lint", "fmt"] {
+            let (code, text) = run_stdin(&clean, &[sub, "-"], "Hello\n");
+            assert_eq!(code, Some(0), "{sub} - control: got: {text}");
+        }
+    }
+}
+
 // ── Single-file inputs: refused before the existence check ──────────────────
 
 /// A file argument carrying a forbidden character is refused (`mds::io`, exit 2, the

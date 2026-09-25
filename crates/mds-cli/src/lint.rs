@@ -854,9 +854,12 @@ fn run_lint_stdin(
         format,
     } = flags;
 
-    let (source, cwd) = read_stdin()?;
+    let source = read_stdin()?;
+    // The working directory, as the caller did not type it: `"."` anchors at it and is
+    // what a refusal of it shows (see `read_stdin`).
+    let cwd = Path::new(".");
     // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(&cwd, quiet) {
+    let config = match load_lint_config(cwd, quiet) {
         Ok(c) => c,
         Err(e) => {
             let mds_err = MdsError::Io {
@@ -871,7 +874,7 @@ fn run_lint_stdin(
         }
     };
 
-    let mut result = match mds::lint_str_with(&source, Some(&cwd), runtime_vars.clone(), &config) {
+    let mut result = match mds::lint_str_with(&source, Some(cwd), runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(e) => {
             // AD-211-5: relabel <source> → <stdin> in the rendered failure envelope.
@@ -908,7 +911,7 @@ fn run_lint_stdin(
             let preview = preview_fixes(
                 &result,
                 &source,
-                &cwd,
+                cwd,
                 runtime_vars.clone(),
                 &config,
                 STDIN_DISPLAY_LABEL,
@@ -958,7 +961,7 @@ fn run_lint_stdin(
         let fix_outcome = plan_and_apply_fixes(
             result,
             &source,
-            &cwd,
+            cwd,
             runtime_vars,
             &config,
             STDIN_DISPLAY_LABEL,

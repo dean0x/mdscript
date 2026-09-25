@@ -701,11 +701,17 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
     }
 }
 
-/// Read from stdin and return the source string along with the current working directory.
+/// Read the source from stdin.
 ///
 /// Reads at most `MAX_FILE_SIZE + 1` bytes so we can detect over-sized input without
 /// buffering the entire stream first.
-pub(crate) fn read_stdin() -> Result<(String, PathBuf)> {
+///
+/// A stdin source resolves its imports against the working directory. Callers pass
+/// `None` as the base directory for that, never the absolute `current_dir()`: core
+/// anchors `None` at the working directory itself, and a refusal of it (a forbidden
+/// path character, #265) then names it `"."` — the caller typed no path, so no
+/// message shows the absolute one.
+pub(crate) fn read_stdin() -> Result<String> {
     let mut source = String::new();
     std::io::stdin()
         .take(MAX_FILE_SIZE + 1)
@@ -714,9 +720,7 @@ pub(crate) fn read_stdin() -> Result<(String, PathBuf)> {
     if source.len() as u64 > MAX_FILE_SIZE {
         return Err(miette::miette!("stdin input exceeds maximum size of 10 MB"));
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
-    Ok((source, cwd))
+    Ok(source)
 }
 
 /// Write compiled output to a file or stdout.
@@ -882,13 +886,13 @@ pub(crate) fn compile_to_content(
     opts: mds::CompileOptions,
 ) -> Result<CompileOutput> {
     let result = if input == Path::new("-") {
-        // Stdin: compile from source string using cwd as base_dir.
-        // read_stdin enforces MAX_FILE_SIZE (PF-004).
-        let (source, cwd) = read_stdin()?;
+        // Stdin: compile from source string with the working directory as base_dir
+        // (`None` — see `read_stdin`). read_stdin enforces MAX_FILE_SIZE (PF-004).
+        let source = read_stdin()?;
         // AD-211-1 / AD-211-5: a string-source compile labels its errors `<source>`
         // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
         // boundary that knows the input was stdin.
-        mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
+        mds::compile_str_with_deps_opts(&source, None, runtime_vars, opts)
             .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?
     } else {
         // File path: compile_with_deps_opts routes through the resolver which enforces
@@ -1377,9 +1381,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             .with_include_sources_content(use_embed_sources)
             .with_source_map_base(source_map_base);
 
-        let (source, cwd) = read_stdin()?;
-        // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`.
-        let result = mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
+        let source = read_stdin()?;
+        // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`; `None` is the
+        // working directory, shown as "." (see `read_stdin`).
+        let result = mds::compile_str_with_deps_opts(&source, None, runtime_vars, opts)
             .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
         if !quiet {
             for w in &result.warnings {

@@ -290,11 +290,12 @@ fn run_check(
 
     // Single-file / stdin path.
     if input == std::path::Path::new("-") {
-        let (source, cwd) = read_stdin()?;
+        let source = read_stdin()?;
         // AD-211-1 / AD-211-5: a string-source check labels its errors `<source>`
         // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
-        // boundary that knows the input was stdin.
-        let ((), warnings) = mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
+        // boundary that knows the input was stdin. `None` is the working directory,
+        // shown as "." (see `read_stdin`).
+        let ((), warnings) = mds::check_str_collecting_warnings(&source, None, runtime_vars)
             .map_err(|e| output::relabel_stdin_error(&e, &source))?;
         if !quiet {
             for w in &warnings {
