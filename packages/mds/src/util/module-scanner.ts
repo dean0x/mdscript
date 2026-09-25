@@ -109,10 +109,11 @@ function isWithinRoot(root: string, candidate: string): boolean {
 
 /**
  * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP error
- * the kernel emits when the path is a symlink into a clear security error, and
- * every other failure into the error the Rust engine reports at the same step,
- * keyed on `shown` rather than the resolved `absolutePath` (R3 / CWE-209 — the raw
- * Node error names the resolved filesystem path in its message).
+ * the kernel emits when the path is a symlink into NativeFs's symlink refusal
+ * (`symlinkError`), and every other failure into the error the Rust engine reports
+ * at the same step — each keyed on `shown` rather than the resolved `absolutePath`
+ * (R3 / CWE-209 — the raw Node error names the resolved filesystem path in its
+ * message).
  *
  * NativeFs stats the final component (`symlink_metadata`) before it reads it and
  * maps any failure of that step to `mds::file_not_found`: so does this, when the
@@ -133,7 +134,7 @@ async function openNoFollow(
     return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
-      throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
+      throw symlinkError(shown);
     }
     throw await lstat(absolutePath).then(
       () => readError(shown, err),
@@ -190,15 +191,39 @@ function fileNotFoundError(shown: string): PathError {
 
 /**
  * `mds::io` for a file that resolves but cannot be read — NativeFs's `cannot read
- * …` I/O error — naming `shown`, the path as written, and the errno name (`EACCES`),
- * never Node's message, which names the resolved absolute path. Native names its
- * root-relative display path and the OS error text instead, so the two agree on the
- * code, not on the message.
+ * …` I/O error — naming `shown`, the path as written, and `reason`: an errno name
+ * (`EACCES`), never Node's message, which names the resolved absolute path. Native
+ * names its root-relative display path and the OS error text instead, so the two
+ * agree on the code, not on the message.
  */
+function cannotReadError(shown: string, reason: string): PathError {
+  return pathError(
+    'mds::io',
+    `cannot read ${escapePathForMessage(shown)}: ${escapePathForMessage(reason)}`,
+  );
+}
+
+/** `cannotReadError` for a failed Node call, with its errno name as the reason. */
 function readError(shown: string, err: unknown): PathError {
   const errno = (err as NodeJS.ErrnoException | undefined)?.code;
-  const reason = typeof errno === 'string' ? escapePathForMessage(errno) : 'I/O error';
-  return pathError('mds::io', `cannot read ${escapePathForMessage(shown)}: ${reason}`);
+  return cannotReadError(shown, typeof errno === 'string' ? errno : 'I/O error');
+}
+
+/**
+ * `mds::import` for a module whose final path component is a symlink — the refusal
+ * NativeFs::check_symlink_named makes for an entry path and an import alike —
+ * keyed on `shown`, the path as written.
+ */
+function symlinkError(shown: string): PathError {
+  return importError(`symlinks are not allowed in imports: ${escapePathForMessage(shown)}`);
+}
+
+/**
+ * `mds::import` for a module outside the project root — NativeFs's
+ * `check_path_traversal` — keyed on `shown`, the import as written.
+ */
+function escapesProjectError(shown: string): PathError {
+  return importError(`import path escapes project directory: "${escapePathForMessage(shown)}"`);
 }
 
 /**
@@ -392,12 +417,17 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  * Security checks performed:
  * - Rejects a module whose final path component is a symlink, judged by that
  *   component's own file type (O_NOFOLLOW open; `lstat` where O_NOFOLLOW is
- *   unavailable). Symlinked parent directories are followed, as NativeFs does
+ *   unavailable), with NativeFs's refusal (`mds::import`, `symlinks are not allowed
+ *   in imports: <path as written>`). Symlinked parent directories are followed, as
+ *   NativeFs does
  * - Rejects an import that leaves a symlinked directory through `..`
  *   (`mds::import`): the engine resolves it by name to another file than the
  *   one NativeFs reads (#408)
  * - Rejects paths that escape the project root (discovered via .git/.mdsroot
- *   markers), checked on the canonical path
+ *   markers), checked on the canonical path, with NativeFs's refusal
+ *   (`mds::import`, `import path escapes project directory: "<import as written>"`)
+ * - Rejects a module that is not a regular file — a directory, device, FIFO or
+ *   socket — as unreadable (`mds::io`, `cannot read <path as written>: …`)
  * - Rejects, before the filesystem is touched and with the Rust engine's code and
  *   message: an entry path that is empty, contains NUL or carries a forbidden path
  *   character (`mds::io`), and an import string that is not `./`/`../`-relative,
@@ -472,11 +502,11 @@ export async function buildModulesMap(
 
     const childAbsolute = resolve(absoluteDir, importPath);
 
-    // Security: verify child is within project root.
+    // Security: verify child is within project root — lexically, before anything
+    // outside the root is touched. NativeFs resolves the file first, so for a
+    // MISSING file outside the root it reports `file not found` where this refuses.
     if (!isWithinRoot(projectRoot, childAbsolute)) {
-      throw new Error(
-        `security: import path escapes project root: ${childAbsolute} is outside ${projectRoot}`,
-      );
+      throw escapesProjectError(importPath);
     }
 
     return childAbsolute;
@@ -562,9 +592,7 @@ export async function buildModulesMap(
     // Security: containment is decided on the canonical path, so a symlinked
     // directory cannot lead outside the project root.
     if (!isWithinRoot(projectRoot, joined)) {
-      throw new Error(
-        `security: path escapes project root: ${joined} is outside ${projectRoot}`,
-      );
+      throw escapesProjectError(shown);
     }
 
     // O_NOFOLLOW | O_RDONLY: if the final component is a symlink the kernel
@@ -592,22 +620,22 @@ export async function buildModulesMap(
       // The final component's own file type — the check that stands in for
       // O_NOFOLLOW where the platform lacks it.
       if (linkStats.isSymbolicLink()) {
-        throw new Error(`security: symlink detected at ${joined} — symlinks are not allowed`);
+        throw symlinkError(shown);
       }
 
       // fstat on the opened fd: verify it is a regular file (not a device,
-      // directory, socket, etc.).
+      // directory, socket, etc.). NativeFs fails such a module at its read step
+      // (`mds::io`); a directory is named by the errno reading it reports.
       if (!stats.isFile()) {
-        throw new Error(`security: ${joined} is not a regular file`);
+        throw cannotReadError(shown, stats.isDirectory() ? 'EISDIR' : 'not a regular file');
       }
 
       // Canonicalizing a non-symlink final component only respells its name;
       // it never changes the directory. A canonical path in another directory
-      // means the component was replaced by a link after the checks above.
+      // means the component was replaced by a link after the checks above —
+      // refused as NativeFs refuses it, as a symlink.
       if (dirname(resolved) !== canonicalParent) {
-        throw new Error(
-          `security: path ${joined} resolved to unexpected location ${resolved} — possible symlink`,
-        );
+        throw symlinkError(shown);
       }
 
       return { handle, size: stats.size, resolved };
