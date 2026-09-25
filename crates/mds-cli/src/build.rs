@@ -130,6 +130,12 @@ const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 ///
 /// The `config_dir` is the directory that *contains* `mds.json` — used to
 /// resolve relative `output_dir` values.
+///
+/// Every error names the file by the path `start` leads to it — `./mds.json`,
+/// `sub/../mds.json` — escaped by [`crate::output::safe_path`], never by the
+/// canonical path the walk uses: that one is absolute, which the caller did not
+/// type, and it can carry a forbidden character from a hostile-named directory above
+/// the project, since the config loads before the input is validated (#265).
 pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> {
     // Walk upward from `start` (which may be a file; begin at its parent).
     // avoids PF-006: a relative start_dir (e.g. "" or ".") causes current.parent()
@@ -142,6 +148,8 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
         effective_parent(start).to_path_buf()
     };
 
+    // The directory as `start` names it, one `..` per step up: what an error shows.
+    let mut shown_dir = raw_start_dir.clone();
     let mut current = match raw_start_dir.canonicalize() {
         Ok(p) => p,
         Err(_) => raw_start_dir,
@@ -150,21 +158,30 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
     for _ in 0..MAX_TRAVERSAL_DEPTH {
         let candidate = current.join("mds.json");
         if candidate.is_file() {
+            let shown = crate::output::safe_path(&shown_dir.join("mds.json"));
             // Read the file first, then check size — avoids a TOCTOU race between
             // a separate metadata() call and the actual read().
-            let bytes = std::fs::read(&candidate)
-                .map_err(|e| miette::miette!("cannot read {}: {e}", candidate.display()))?;
+            let bytes = std::fs::read(&candidate).map_err(|e| {
+                miette::miette!("cannot read {shown}: {}", crate::output::safe_inline(&e))
+            })?;
             if bytes.len() as u64 > MAX_CONFIG_SIZE {
                 return Err(miette::miette!(
-                    "mds.json at {} is too large ({} bytes; maximum is 1 MB)",
-                    candidate.display(),
+                    "mds.json at {shown} is too large ({} bytes; maximum is 1 MB)",
                     bytes.len()
                 ));
             }
-            let raw = String::from_utf8(bytes)
-                .map_err(|e| miette::miette!("invalid UTF-8 in {}: {e}", candidate.display()))?;
-            let config: MdsConfig = serde_json::from_str(&raw)
-                .map_err(|e| miette::miette!("invalid mds.json at {}: {e}", candidate.display()))?;
+            let raw = String::from_utf8(bytes).map_err(|e| {
+                miette::miette!(
+                    "invalid UTF-8 in {shown}: {}",
+                    crate::output::safe_inline(&e)
+                )
+            })?;
+            let config: MdsConfig = serde_json::from_str(&raw).map_err(|e| {
+                miette::miette!(
+                    "invalid mds.json at {shown}: {}",
+                    crate::output::safe_inline(&e)
+                )
+            })?;
             // #265: a `build.output_dir` carrying a forbidden path character — as
             // written, or in the form it resolves to under the config directory (a
             // symlink into a hostile-named directory) — is refused
@@ -188,6 +205,7 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
             Some(parent) => current = parent.to_path_buf(),
             None => break,
         }
+        shown_dir.push("..");
     }
     Ok(None)
 }

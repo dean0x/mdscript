@@ -85,6 +85,15 @@ fn assert_refusal(text: &str, ch: char, shown_escaped: &str, label: &str) {
     assert_no_control_chars(text, label);
 }
 
+/// `s` without whitespace or miette's `│` frame marker, so a message miette wrapped
+/// (at a space or after a `/`) compares equal to the unwrapped one.
+#[cfg(unix)]
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+        .collect()
+}
+
 // ── Walker matrix ───────────────────────────────────────────────────────────
 //
 // Unix-only: a Windows file name cannot hold a C0 control, so the hostile file the
@@ -510,14 +519,6 @@ mod resolved_output {
         (dir, name)
     }
 
-    /// `s` without whitespace or miette's `│` frame marker, so a message miette wrapped
-    /// (at a space or after a `/`) compares equal to the unwrapped one.
-    fn squash(s: &str) -> String {
-        s.chars()
-            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
-            .collect()
-    }
-
     /// Assert `text` is the resolved-path refusal of `what` = `shown`: `mds::io`, the
     /// codepoint, the value as typed, no raw TAB (nor any other hostile character) and
     /// no absolute path in the refusal.
@@ -698,6 +699,82 @@ fn output_dir_traversal_is_io_exit_2() {
         );
     }
     assert!(!dir.path().parent().unwrap().join("escaped").exists());
+}
+
+// ── mds.json load errors: the file as the input reaches it ──────────────────
+//
+// Unix-only: a Windows directory name cannot hold TAB, so the hostile working
+// directory cannot be created there.
+
+#[cfg(unix)]
+mod config_errors {
+    use super::*;
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Every `mds.json` load error names the file by the path the input leads to it —
+    /// `./mds.json`, `sub/../mds.json` — escaped, never by the canonical absolute path
+    /// the upward walk uses. That path is what a hostile-named directory above the
+    /// project would put a raw TAB into, before the input itself is validated.
+    #[test]
+    fn config_load_errors_name_the_file_as_reached_from_the_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_name = tmp.path().file_name().unwrap().to_str().unwrap().to_owned();
+        let cwd = tmp.path().join("d\te");
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        std::fs::write(cwd.join("in.mds"), "Hi\n").unwrap();
+        std::fs::write(cwd.join("sub").join("in.mds"), "Hi\n").unwrap();
+        let config = cwd.join("mds.json");
+
+        // (content, mode, expected message around the shown path)
+        let mut cases: Vec<(Vec<u8>, u32, &str, &str)> = vec![
+            (b"{".to_vec(), 0o644, "invalid mds.json at ", ":"),
+            (
+                vec![b' '; 1024 * 1024 + 1],
+                0o644,
+                "mds.json at ",
+                " is too large",
+            ),
+            (vec![0xFF, 0xFE], 0o644, "invalid UTF-8 in ", ":"),
+        ];
+        // An unreadable mds.json — unless this process can read it anyway (root).
+        std::fs::write(&config, "{}").unwrap();
+        set_mode(&config, 0o000);
+        if std::fs::read(&config).is_err() {
+            cases.push((b"{}".to_vec(), 0o000, "cannot read ", ":"));
+        }
+
+        for (content, mode, before, after) in &cases {
+            set_mode(&config, 0o644);
+            std::fs::write(&config, content).unwrap();
+            set_mode(&config, *mode);
+            for (args, shown, exit) in [
+                (&["build", "in.mds"][..], "./mds.json", 1),
+                (&["build", "sub/in.mds"], "sub/../mds.json", 1),
+                (&["lint", "in.mds"], "./mds.json", 2),
+                (&["fmt", "."], "./mds.json", 1),
+            ] {
+                let label = format!("{} [{before}]", args.join(" "));
+                let (code, text) = run(&cwd, args);
+                assert_eq!(code, Some(exit), "{label}: got: {text:?}");
+                let expected = format!("{before}{shown}{after}");
+                assert!(
+                    squash(&text).contains(&squash(&expected)),
+                    "{label}: expected {expected:?}; got: {text:?}"
+                );
+                assert_no_control_chars(&text, &label);
+                assert!(!text.contains('\t'), "{label}: raw TAB; got: {text:?}");
+                assert!(
+                    !text.contains(&tmp_name),
+                    "{label}: absolute path; got: {text:?}"
+                );
+            }
+        }
+        set_mode(&config, 0o644);
+    }
 }
 
 // ── mds init: refused up front ────────────────────────────────────────────
