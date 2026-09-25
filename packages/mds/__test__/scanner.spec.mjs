@@ -9,6 +9,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
@@ -400,6 +401,137 @@ describe('buildModulesMap — forbidden path characters (#265)', () => {
         await symlink(clean, path.join(dir, 'alias-clean'), 'dir');
         const { modules } = await buildModulesMap(path.join(dir, 'alias-clean', 'main.mds'), scanImports);
         assert.deepEqual(Object.values(modules), ['hi\n']);
+      });
+    },
+  );
+});
+
+// #408: the scanner decides "symlink" from the final component's own file type
+// and checks the canonical parent — as NativeFs does — instead of comparing a
+// realpath with the path as written. On a case-insensitive volume (the macOS and
+// Windows default) realpath returns the on-disk spelling, so the comparison used to
+// report `Entry.mds` for `entry.mds` as a possible symlink.
+describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => {
+  async function withProject(fn) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-408-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      return await fn(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  /** Whether the volume holding `dir` resolves names case-insensitively. */
+  async function caseInsensitive(dir) {
+    await writeFile(path.join(dir, 'probe.txt'), '');
+    const insensitive = existsSync(path.join(dir, 'PROBE.TXT'));
+    await rm(path.join(dir, 'probe.txt'));
+    return insensitive;
+  }
+
+  /** On a case-sensitive volume a mismatched spelling is simply not found. */
+  function assertNotFoundNotSymlink(err, label) {
+    assert.equal(err.code, 'ENOENT', `${label}: ${err.message}`);
+    assert.doesNotMatch(err.message, /symlink/, label);
+  }
+
+  const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+
+  test('U-SM14: a case-mismatched entry path is never reported as a symlink', async () => {
+    await withProject(async (dir) => {
+      await writeFile(path.join(dir, 'main.mds'), 'Hello!\n');
+      const build = buildModulesMap(path.join(dir, 'MAIN.mds'), scanImports);
+      if (await caseInsensitive(dir)) {
+        // The entry is keyed as typed: that key is what the WASM engine is handed.
+        const { entryFilename, modules } = await build;
+        assert.equal(entryFilename, 'MAIN.mds');
+        assert.deepEqual(modules, { 'MAIN.mds': 'Hello!\n' });
+      } else {
+        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM14'), 'U-SM14');
+      }
+    });
+  });
+
+  test('U-SM15: a case-mismatched import is never reported as a symlink', async () => {
+    await withProject(async (dir) => {
+      await writeFile(path.join(dir, 'main.mds'), '@import "./Header.mds" as h\n');
+      await writeFile(path.join(dir, 'header.mds'), 'hi\n');
+      const build = buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      if (await caseInsensitive(dir)) {
+        // Keyed as written, since the engine's virtual filesystem looks the import
+        // up under exactly that key.
+        const { modules } = await build;
+        assert.equal(modules['Header.mds'], 'hi\n');
+      } else {
+        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM15'), 'U-SM15');
+      }
+    });
+  });
+
+  test('U-SM16: a symlink is still refused, under its exact and a mismatched spelling (control)', async () => {
+    await withProject(async (dir) => {
+      await writeFile(path.join(dir, 'target.mds'), 'hi\n');
+      await symlink(path.join(dir, 'target.mds'), path.join(dir, 'link.mds'));
+      const insensitive = await caseInsensitive(dir);
+
+      await writeFile(path.join(dir, 'main.mds'), '@import "./link.mds" as l\n');
+      await assert.rejects(buildModulesMap(path.join(dir, 'main.mds'), scanImports), /security.*symlink/);
+      await assert.rejects(buildModulesMap(path.join(dir, 'link.mds'), scanImports), /security.*symlink/);
+
+      await writeFile(path.join(dir, 'main.mds'), '@import "./LINK.mds" as l\n');
+      const mismatched = buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      if (insensitive) {
+        await assert.rejects(mismatched, /security.*symlink/);
+      } else {
+        assertNotFoundNotSymlink(await rejectionOf(mismatched, 'U-SM16'), 'U-SM16');
+      }
+    });
+  });
+
+  test('U-SM17: a symlinked directory is followed inside the project and refused when it leads outside', async () => {
+    await withProject(async (dir) => {
+      // Inside: the parent directory is canonicalized (its link followed) and the
+      // final component checked, as NativeFs does.
+      await mkdir(path.join(dir, 'real'));
+      await writeFile(path.join(dir, 'real', 'lib.mds'), 'lib\n');
+      await symlink(path.join(dir, 'real'), path.join(dir, 'alias'), dirLinkType);
+      await writeFile(path.join(dir, 'main.mds'), '@import "./alias/lib.mds" as l\n');
+      const { modules } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      assert.equal(modules['alias/lib.mds'], 'lib\n');
+
+      // Outside: the canonical path is what containment is checked on.
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-408-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.mds'), 'secret\n');
+        await symlink(outside, path.join(dir, 'escape'), dirLinkType);
+        await writeFile(path.join(dir, 'main.mds'), '@import "./escape/secret.mds" as s\n');
+        await assert.rejects(
+          buildModulesMap(path.join(dir, 'main.mds'), scanImports),
+          /security: path escapes project root/,
+        );
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // Windows file names cannot carry C0 controls, so the hostile directory this
+  // needs cannot be created there.
+  test(
+    'U-SM18: an import through a symlink into a hostile-named directory is refused as mds::io (#265)',
+    { skip: process.platform === 'win32' && 'C0 controls are not valid in Windows file names' },
+    async () => {
+      await withProject(async (dir) => {
+        const hostile = path.join(dir, `ho${String.fromCodePoint(0x1b)}stile`);
+        await mkdir(hostile);
+        await writeFile(path.join(hostile, 'lib.mds'), 'lib\n');
+        await symlink(hostile, path.join(dir, 'alias'), 'dir');
+        await writeFile(path.join(dir, 'main.mds'), '@import "./alias/lib.mds" as l\n');
+        const err = await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM18');
+        assert.equal(err.code, 'mds::io', err.message);
+        // Names the import as written, never the resolved path.
+        assert.equal(err.message, 'resolved path contains forbidden character U+001B: "./alias/lib.mds"');
       });
     },
   );

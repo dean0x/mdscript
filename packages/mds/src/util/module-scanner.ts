@@ -1,6 +1,6 @@
-import { open, realpath } from 'node:fs/promises';
+import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
-import { resolve, dirname, relative, isAbsolute, sep } from 'node:path';
+import { resolve, dirname, basename, join, relative, isAbsolute, sep } from 'node:path';
 import {
   escapePathForMessage,
   firstForbiddenChar,
@@ -316,8 +316,11 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  * relative path.
  *
  * Security checks performed:
- * - Rejects symlinks (O_NOFOLLOW open; realpath check on Windows fallback)
- * - Rejects paths that escape the project root (discovered via .git/.mdsroot markers)
+ * - Rejects a module whose final path component is a symlink, judged by that
+ *   component's own file type (O_NOFOLLOW open; `lstat` where O_NOFOLLOW is
+ *   unavailable). Symlinked parent directories are followed, as NativeFs does
+ * - Rejects paths that escape the project root (discovered via .git/.mdsroot
+ *   markers), checked on the canonical path
  * - Rejects, before the filesystem is touched and with the Rust engine's code and
  *   message: an entry path that is empty, contains NUL or carries a forbidden path
  *   character (`mds::io`), and an import string that is not `./`/`../`-relative,
@@ -340,16 +343,12 @@ export async function buildModulesMap(
   }
 
   // Resolve the parent directory to its canonical form before computing the
-  // project root and security boundaries.  This eliminates false-positive
-  // "possible symlink" errors on platforms with OS-level directory symlinks
-  // (e.g. macOS /var → /private/var), where realpath(absolutePath) differs
-  // from absolutePath even for a regular non-symlink file.
+  // project root and security boundaries, so an OS-level directory symlink
+  // (e.g. macOS /var → /private/var) does not move the root.
   //
-  // Only the PARENT directory is canonicalized, NOT the final path component.
-  // A symlink at the file level is still caught by O_NOFOLLOW (openNoFollow)
-  // and the post-open realpath mismatch check inside openAndValidateModule.
-  // This mirrors the pattern in NativeFs::check_symlink (Rust): canonicalize
-  // the parent, join the filename, then check the file for symlinks.
+  // Only the PARENT directory is canonicalized, NOT the final path component,
+  // which openAndValidateModule judges by its own file type — the pattern of
+  // NativeFs::check_symlink_named (Rust).
   const rawAbsoluteEntry = resolve(entryPath);
   const canonicalParentDir = await realpath(dirname(rawAbsoluteEntry));
   const absoluteEntry = canonicalParentDir + sep + rawAbsoluteEntry.slice(rawAbsoluteEntry.lastIndexOf(sep) + 1);
@@ -397,17 +396,25 @@ export async function buildModulesMap(
 
   /**
    * Open a file with O_NOFOLLOW and validate its security properties (symlink check,
-   * path confinement, regular-file check). Returns the open file handle and the
-   * file's byte size from fstat.
+   * path confinement, regular-file check). Returns the open file handle, the
+   * file's byte size from fstat, and its canonical path.
    *
    * The caller is responsible for closing the handle (use try/finally).
    * Separating open+validate from read allows the aggregate size check to happen
    * before file content is loaded into memory, bounding worst-case memory use.
    *
-   * Uses O_NOFOLLOW to eliminate the TOCTOU race window between validation and
-   * content access. If the path is a symlink, O_NOFOLLOW causes open() to fail
-   * with ELOOP, which we surface as a security error. On Windows (where O_NOFOLLOW=0),
-   * a post-open realpath check is performed instead.
+   * Mirrors NativeFs::check_symlink_named (Rust): the parent directory is
+   * canonicalized (its symlinks followed), the final component is joined as
+   * written, and that component is refused when its own file type is a symlink.
+   * The file type decides, never a comparison of the canonical path with the
+   * path as written: on a case-insensitive volume (the macOS and Windows
+   * default) realpath returns the on-disk spelling, so `Entry.mds` for
+   * `entry.mds` differs from its canonical form without being a symlink (#408).
+   *
+   * O_NOFOLLOW makes open() fail with ELOOP on a symlinked final component, so no
+   * link is followed between the check and the read. Where O_NOFOLLOW is
+   * unavailable (Windows) open() follows it, and `lstat` — which reports a
+   * junction as a symlink too — refuses it before a byte is read.
    *
    * `shown` is the path as written — the entry path the caller passed, or the
    * import string — and is what a refusal of the resolved path names.
@@ -415,55 +422,59 @@ export async function buildModulesMap(
   async function openAndValidateModule(
     absolutePath: string,
     shown: string,
-  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number }> {
-    // Security: verify path is within project root before opening.
-    if (!isWithinRoot(projectRoot, absolutePath)) {
+  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number; resolved: string }> {
+    const canonicalParent = await realpath(dirname(absolutePath));
+    const joined = join(canonicalParent, basename(absolutePath));
+
+    // Security (#265): no forbidden path character anywhere in the canonical
+    // path — a directory the caller never named, reached through a symlink, can
+    // carry one. Checked before anything under it is opened.
+    const hostileErr = resolvedPathError(joined, shown);
+    if (hostileErr !== undefined) {
+      throw hostileErr;
+    }
+
+    // Security: containment is decided on the canonical path, so a symlinked
+    // directory cannot lead outside the project root.
+    if (!isWithinRoot(projectRoot, joined)) {
       throw new Error(
-        `security: path escapes project root: ${absolutePath} is outside ${projectRoot}`,
+        `security: path escapes project root: ${joined} is outside ${projectRoot}`,
       );
     }
 
-    // O_NOFOLLOW | O_RDONLY: if absolutePath is a symlink the kernel rejects it
-    // with ELOOP before our code reads a single byte — no TOCTOU window.
-    const handle = await openNoFollow(absolutePath);
+    // O_NOFOLLOW | O_RDONLY: if the final component is a symlink the kernel
+    // rejects it with ELOOP before our code reads a single byte.
+    const handle = await openNoFollow(joined);
 
     try {
-      const [stats, resolved] = await Promise.all([
+      const [stats, linkStats, resolved] = await Promise.all([
         handle.stat(),
-        realpath(absolutePath),
+        lstat(joined),
+        realpath(joined),
       ]);
 
-      // fstat on the opened fd: verify it is a regular file (not a device,
-      // directory, socket, etc.). Note: fstat never reports isSymbolicLink()
-      // because it operates on the resolved fd, not the path — symlink
-      // detection is handled by O_NOFOLLOW (ELOOP) and the realpath check below.
-      if (!stats.isFile()) {
-        throw new Error(`security: ${absolutePath} is not a regular file`);
+      // The final component's own file type — the check that stands in for
+      // O_NOFOLLOW where the platform lacks it.
+      if (linkStats.isSymbolicLink()) {
+        throw new Error(`security: symlink detected at ${joined} — symlinks are not allowed`);
       }
 
-      // On platforms where O_NOFOLLOW=0 (e.g. Windows), the open() above did
-      // not prevent symlink traversal. A post-open realpath comparison catches
-      // a symlink that was in place at open time. Windows' filesystem is
-      // case-insensitive and `realpath` may return a different drive-letter
-      // case than `resolve` produced, so compare case-insensitively there.
-      const realpathMismatch = process.platform === 'win32'
-        ? resolved.toLowerCase() !== absolutePath.toLowerCase()
-        : resolved !== absolutePath;
-      if (realpathMismatch) {
+      // fstat on the opened fd: verify it is a regular file (not a device,
+      // directory, socket, etc.).
+      if (!stats.isFile()) {
+        throw new Error(`security: ${joined} is not a regular file`);
+      }
+
+      // Canonicalizing a non-symlink final component only respells its name;
+      // it never changes the directory. A canonical path in another directory
+      // means the component was replaced by a link after the checks above.
+      if (dirname(resolved) !== canonicalParent) {
         throw new Error(
-          `security: path ${absolutePath} resolved to unexpected location ${resolved} — possible symlink`,
+          `security: path ${joined} resolved to unexpected location ${resolved} — possible symlink`,
         );
       }
 
-      // Security (#265): no forbidden path character anywhere in the resolved
-      // path — a directory the caller never named, reached through a symlink,
-      // can carry one.
-      const resolvedErr = resolvedPathError(resolved, shown);
-      if (resolvedErr !== undefined) {
-        throw resolvedErr;
-      }
-
-      return { handle, size: stats.size };
+      return { handle, size: stats.size, resolved };
     } catch (err) {
       await handle.close();
       throw err;
@@ -498,7 +509,7 @@ export async function buildModulesMap(
       );
     }
 
-    const { handle, size: fileSize } = await openAndValidateModule(absolutePath, shown);
+    const { handle, size: fileSize, resolved } = await openAndValidateModule(absolutePath, shown);
 
     let content: string;
     try {
@@ -522,7 +533,9 @@ export async function buildModulesMap(
     modules[virtualKey] = content;
 
     const importPaths = scanImports(content);
-    const absoluteDir = dirname(absolutePath);
+    // Imports resolve from the module's canonical directory, as NativeFs resolves
+    // them from its canonical key.
+    const absoluteDir = dirname(resolved);
 
     // Bounded-concurrency fan-out: limit simultaneous child opens to
     // MAX_CONCURRENT_OPENS to avoid exhausting file descriptors on modules

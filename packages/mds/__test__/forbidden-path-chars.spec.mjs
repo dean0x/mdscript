@@ -306,7 +306,7 @@ describe('forbidden path characters — Rust↔JS differential (#265)', () => {
   // Windows file names cannot carry C0 controls, so the hostile directory this
   // needs cannot be created there.
   test(
-    'U-FP5: compileFile through a symlink into a hostile-named directory — both backends throw the same mds::io error',
+    'U-FP5: compileFile of an entry or import through a symlink into a hostile-named directory — both backends throw the same mds::io error',
     { skip: process.platform === 'win32' && 'C0 controls are not valid in Windows file names' },
     async (t) => {
       if (!requireEngines(t, engines, 'U-FP5')) return;
@@ -322,6 +322,9 @@ describe('forbidden path characters — Rust↔JS differential (#265)', () => {
           await symlink(hostile, path.join(dir, `alias-${cp}`), 'dir');
           // The typed path is clean; only its canonical form carries the codepoint.
           files.push(path.join(dir, `alias-${cp}`, 'main.mds'));
+          // The same directory reached by an import string.
+          await writeFile(path.join(dir, `imp-${cp}.mds`), `@import "./alias-${cp}/main.mds" as m\n`);
+          files.push(path.join(dir, `imp-${cp}.mds`));
         }
         // Control: the same layout with a clean target directory compiles.
         await mkdir(path.join(dir, 'clean'));
@@ -335,14 +338,21 @@ describe('forbidden path characters — Rust↔JS differential (#265)', () => {
         // Non-vacuity (PF-013): native refused each hostile path for this reason,
         // naming the path as typed, and compiled the control.
         hostileCps.forEach((cp, i) => {
-          assert.deepEqual(native[i], {
+          assert.deepEqual(native[2 * i], {
             code: 'mds::io',
-            message: `resolved path contains forbidden character ${uPlus(cp)}: "${files[i]}"`,
+            message: `resolved path contains forbidden character ${uPlus(cp)}: "${files[2 * i]}"`,
+            help: null,
+            span: null,
+          });
+          // An import names the import string, not the resolved path.
+          assert.deepEqual(native[2 * i + 1], {
+            code: 'mds::io',
+            message: `resolved path contains forbidden character ${uPlus(cp)}: "./alias-${cp}/main.mds"`,
             help: null,
             span: null,
           });
         });
-        assert.deepEqual(native[hostileCps.length], { output: 'hi\n' });
+        assert.deepEqual(native[2 * hostileCps.length], { output: 'hi\n' });
 
         assert.deepEqual(wasm, native);
       } finally {
