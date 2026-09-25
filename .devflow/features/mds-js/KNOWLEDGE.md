@@ -1,7 +1,7 @@
 ---
 feature: mds-js
 name: "@mdscript/mds universal JS package — option forwarding, backends, published TS types"
-description: "Use when modifying the JS/TS public API surface, adding backend methods, changing option types, debugging basePath rejection behaviour, changing result types, updating the backend contract, working on WASM/native backend validation, or debugging why a backend result is rejected. Keywords: compileFile, compile, check, checkFile, lint, lintFile, lintVirtual, CompileResult, MarkdownResult, MessagesResult, CheckResult, LintResult, LintDiagnostic, LintFileOptions, CompileFileOptions, FileOptions, assertResultShape, validateBackendMethods, METHOD_KEYS, forwardOpts, assertKnownKeys, getBasePathError, BASEPATH_REJECTORS, BASE_METHODS, NODE_METHODS, WASM_EXPORTS, discriminated union, kind, mds::invalid_backend_result, mds::invalid_options, basePath, synchronous throw, native.ts, wasm.ts, contract.ts, types.ts, node.ts, browser.ts, options.ts."
+description: "Use when modifying the JS/TS public API surface, adding backend methods, changing option types, debugging basePath rejection behaviour, changing result types, updating the backend contract, working on WASM/native backend validation, debugging why a backend result is rejected, or changing the WASM backend's JS file pre-scanner (module-scanner.ts / path-chars.ts: path refusals, forbidden path characters, symlink and not-found handling). Keywords: compileFile, compile, check, checkFile, lint, lintFile, lintVirtual, CompileResult, MarkdownResult, MessagesResult, CheckResult, LintResult, LintDiagnostic, LintFileOptions, CompileFileOptions, FileOptions, assertResultShape, validateBackendMethods, METHOD_KEYS, forwardOpts, assertKnownKeys, getBasePathError, BASEPATH_REJECTORS, BASE_METHODS, NODE_METHODS, WASM_EXPORTS, discriminated union, kind, mds::invalid_backend_result, mds::invalid_options, basePath, synchronous throw, native.ts, wasm.ts, contract.ts, types.ts, node.ts, browser.ts, options.ts, module-scanner.ts, path-chars.ts, buildModulesMap, normalizeVirtualKey, isForbiddenPathChar, escapePathForMessage, forbiddenCharMessage, importPathViolation, PathError, realpathParent, openNoFollow, mds::file_not_found, mds::io, mds::import, O_NOFOLLOW, U-FP, U-SM, #265, #408."
 category: component-patterns
 directories: ["packages/mds/src", "packages/mds/__test__"]
 referencedFiles:
@@ -15,8 +15,12 @@ referencedFiles:
   - packages/mds/__test__/options-validation.spec.mjs
   - packages/mds/__test__/types/consumer-node.ts
   - packages/mds/__test__/types/consumer-browser.ts
+  - packages/mds/src/util/module-scanner.ts
+  - packages/mds/src/util/path-chars.ts
+  - packages/mds/__test__/scanner.spec.mjs
+  - packages/mds/__test__/forbidden-path-chars.spec.mjs
 created: 2026-06-26
-updated: 2026-08-31
+updated: 2026-09-25
 ---
 
 # @mdscript/mds Universal JS Package
@@ -123,6 +127,18 @@ Exports `compile`, `check`, `lint`, `lintVirtual`, `scanImports`. `lintFile` is 
 
 `createNativeBackend` and `createWasmBackend`'s `wrapWithFileOps` each carry per-method `basePath` guards (citing `avoids PF-004`) in addition to the public wrapper's, covering `compileFile`, `checkFile`, `lintFile`, and `lintVirtual`. An internal caller that obtains a backend directly and bypasses the public wrapper's `BASEPATH_REJECTORS` is caught here. Without these backend-level guards, `forwardOpts` would silently drop `basePath` on native (since it's absent from `METHOD_KEYS` for those surfaces) while WASM would throw — producing asymmetric behavior on the same call.
 
+## WASM-backend File Pre-scanner (`util/module-scanner.ts`, `util/path-chars.ts`)
+
+The WASM engine has no filesystem, so `compileFile`/`checkFile`/`lintFile` on the WASM backend first read the entry file and its transitive imports in JS (`buildModulesMap`) and hand the engine a virtual module map. The scanner is therefore a second, JS implementation of the native backend's path rules, and its refusals must match the native engine's error CODE and MESSAGE byte for byte.
+
+- **`path-chars.ts`** mirrors Rust `mds::is_forbidden_path_char` / `escape_path_for_message` / `forbidden_char_message` / `import_path_violation` (#265): the same 80 codepoints, classified in the same order (relative form → NUL → the rest of the class), the same message text. Pure functions — browser-safe.
+- **Error shape**: `PathError` = `Error` + `code: 'mds::import' | 'mds::io' | 'mds::file_not_found'`. An entry path that is empty, contains NUL or carries a forbidden character → `mds::io` (`entry path …`); an import string that is not `./`/`../`-relative, contains NUL or carries one → `mds::import` with the `import error: ` prefix the Rust error's display adds; a resolved path carrying one (a symlinked directory into a hostile-named directory) → `mds::io` (`resolved path …`, naming the path as written).
+- **Not found** (#408): a missing file (`openNoFollow` ENOENT), a missing directory or a path running through a regular file (`realpathParent` ENOENT/ENOTDIR) → `mds::file_not_found` with `file not found: <path as written>` — never Node's raw error, which names the absolute resolved path. Other errnos are re-thrown.
+- **Symlinks** mirror `NativeFs::check_symlink_named`: canonicalize the parent (`realpathParent`), join the name as written, refuse by the final component's OWN file type (`O_NOFOLLOW` open → ELOOP/ENOTDIR; `lstat` where `O_NOFOLLOW` is 0, i.e. Windows, which also reports junctions). Never compare the canonical path with the written one — on case-insensitive volumes that misreports a case-mismatched name as a symlink (#408). Containment in the project root is decided on the canonical path.
+- **`normalizeVirtualKey`** mirrors `VirtualFs::resolve_entry` (empty base: key unchanged, entry checks, segment cap) and `VirtualFs::normalize_in_dir` (imports).
+- **Residuals**: the scanner's `security: …` errors (symlink detected, escapes project root, project root cannot be filesystem root) are uncoded and name absolute paths; a `PathError` carries no `help` field at all, while the native `mds::file_not_found` has one — so cross-backend tests compare `code` and `message` only.
+- **Tests**: `__test__/forbidden-path-chars.spec.mjs` U-FP1–U-FP5 — the Rust↔JS differential over all 80 codepoints (predicate, entry keys, import strings, and `compileFile` through both backends incl. a symlink into a hostile-named directory); `__test__/scanner.spec.mjs` U-S11–U-S15 (normalizeVirtualKey), U-SM9–U-SM13/U-SM18 (#265 refusals), U-SM3/U-SM14–U-SM17/U-SM19–U-SM21 (#408 symlink and not-found shapes; U-SM21 asserts native and WASM agree on code and message). The WASM side of a differential loads `crates/mds-wasm/pkg/` first — rebuild it from the current tree before running these.
+
 ## Synchronous Throws Contract
 
 `compileFile`, `checkFile`, and `lintFile` are non-`async` functions that return Promises. All option-validation errors (unknown keys AND basePath) throw **synchronously**, before any I/O. Callers using `try { compileFile(f, opts) } catch` capture both error classes synchronously. `.catch()` on the returned promise does NOT receive option-validation errors.
@@ -182,6 +198,8 @@ export const WASM_EXPORTS = [...BASE_METHODS, 'scanImports'] as const;
 - `packages/mds/src/backend/wasm.ts` — `WasmModule` interface, `createWasmBackend`, `fileOpts`, WASM basePath error
 - `packages/mds/src/node.ts` — `wrapWithFileOps`, all seven public functions, type re-exports
 - `packages/mds/src/browser.ts` — browser-safe re-exports; no file operations
+- `packages/mds/src/util/module-scanner.ts` — `buildModulesMap`, `normalizeVirtualKey`, `PathError`, `realpathParent`, `openNoFollow` (WASM-backend file pre-scanner)
+- `packages/mds/src/util/path-chars.ts` — JS mirror of the #265 forbidden-path-character rule
 - `packages/mds/__test__/options-validation.spec.mjs` — U-OV-1..U-OV-36; option validation, basePath forwarding, synchronous-throw contract, byte-identical message parity
 - `packages/mds/__test__/types/consumer-node.ts` — AC-P3-20/21 type-level matrix for Node entry
 - `packages/mds/__test__/types/consumer-browser.ts` — AC-P3-16/20 type-level matrix for browser entry

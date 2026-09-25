@@ -1,7 +1,7 @@
 ---
 feature: mds-compiler
 name: MDS Compiler Core (mds-core)
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, working with @message blocks, the intrinsic output format, CompiledOutput, CompileResult, or mixed-content errors. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, include, define, for, if, message, @message, CompiledOutput, CompileResult, into_markdown, into_messages, intrinsic, mixed_content, MixedContent, has_message_block, process_module_intrinsic, collect_messages_strict, evaluate_messages_intrinsic, TextNode.offset."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, working with @message blocks, the intrinsic output format, CompiledOutput, CompileResult, mixed-content errors, the FileSystem trait / path security (entry and import resolution, base-directory anchoring, forbidden path characters, Windows verbatim paths), or @extends region-by-region evaluation and its budgets. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, include, define, for, if, message, @message, CompiledOutput, CompileResult, into_markdown, into_messages, intrinsic, mixed_content, MixedContent, has_message_block, process_module_intrinsic, collect_messages_strict, evaluate_messages_intrinsic, TextNode.offset, FileSystem, NativeFs, VirtualFs, resolve_entry, normalize_in_dir, anchor_base_dir, parent_dir, source_root, validate_entry_path, validate_relative_import, validate_import_path, import_path_violation, resolve_entry_key, anchor_base, check_segment_count, MAX_PATH_SEGMENTS, check_symlink, check_symlink_named, canonical_dir, init_root, resolve_base_dir, is_forbidden_path_char, escape_path_for_message, reject_forbidden_in_path, with_fs, display_native_path, native_dependencies, simplify_verbatim, verbatim.rs, EvalBudget, evaluate_seeded, evaluate_with_map_seeded, evaluate_messages_seeded, evaluate_regions_with_map, evaluate_message_regions, process_module_extends, validate_extends_components, spliced_regions, Origin."
 category: domain-knowledge
 directories: ["crates/mds-core/"]
 referencedFiles:
@@ -15,8 +15,12 @@ referencedFiles:
   - crates/mds-core/src/limits.rs
   - crates/mds-core/src/scope.rs
   - crates/mds-core/src/value.rs
+  - crates/mds-core/src/fs.rs
+  - crates/mds-core/src/verbatim.rs
+  - crates/mds-core/src/lint/diagnostic.rs
+  - crates/mds-core/tests/forbidden_path_chars.rs
 created: 2026-06-26
-updated: 2026-06-26
+updated: 2026-09-25
 ---
 
 # MDS Compiler Core (mds-core)
@@ -158,6 +162,42 @@ pub fn resolve_key_intrinsic(&mut self, key, vars, warnings) -> Result<CompiledO
 
 These are what the `compile_*` lib.rs functions call internally.
 
+## Filesystem Boundary (v0.5.0 Wave 1: #155, #265, #371, #408, #409)
+
+Normative rules, codes and pinning tests: `spec.md` §4.6 "Filesystem constraints" and its "Forbidden-character enforcement" table. This section is the implementer's map.
+
+### `FileSystem` trait (`fs.rs`) — BREAKING in v0.5.0 (#155)
+
+- **Required**: `resolve_entry(path) -> Result<String>` (an entry path → its key; `NativeFs` returns the canonical absolute path, refuses a symlinked final component and anchors the project root on first call; `VirtualFs` returns the key UNCHANGED — no `.`/`..` collapsing, it must match a module-map key), `normalize_in_dir(dir, relative)` (imports; `dir` comes from `parent_dir(importer_key)`, `""` = key-space root), `parent_dir`, `read`, `is_markdown`.
+- **Defaulted**: `anchor_base_dir(dir)` — identity by default (nothing anchored; right for an in-memory key-space). `NativeFs` = `canonical_dir` + `init_root`: canonicalizes, refuses a symlinked final component, anchors the project root FIRST-WRITER-WINS (a later call never moves it). `source_root()` — `None` by default.
+- **Removed**: `normalize` (its `base == ""` branch is `resolve_entry`; the non-empty branch had no production caller), `canonicalize` and `set_root` (merged into `anchor_base_dir`; `set_root` anchored with no symlink check). Pinned by `filesystem_trait_required_methods_pin` (`IdentityFs`) and `filesystem_trait_removed_methods_pin` (method-probe trait) in `tests/api_surface.rs`.
+- Callers: `ModuleCache::resolve_entry_key` (validate, then `fs.resolve_entry`) serves `resolve_path*`, `resolve_key` and `resolve_virtual_intrinsic*`; `ModuleCache::anchor_base` (forbidden-char check, then `fs.anchor_base_dir`) serves `resolve_source*`. The CLI's `read_canonical_source` (lint.rs, shared by `mds fmt`) PROPAGATES an anchor failure (`mds::io`, exit 2) — it used to be `let _ =` (PF-004). The two source-map finalize sites still call `let _ = self.fs.anchor_base_dir(ctx.base_dir)` as a defense-in-depth root guard when `source_root()` is `None`.
+- `resolve_key` on `NativeFs` now validates, refuses a symlinked key and anchors the root, so the imports of a `resolve_key` entry are contained (before, no root was ever set). Pinned by `native_resolve_key_*` in `fs.rs`.
+
+### Guards and where they run
+
+- `validate_entry_path` (empty → NUL → forbidden char; all `mds::io`, path escaped) runs in the resolver for every backend AND again inside both built-in `resolve_entry`s, so a direct trait call is covered. NUL-in-entry was `mds::import` before v0.5.0.
+- `validate_import_path` / `import_path_violation` (resolver; relative form → NUL → forbidden char, `mds::import`) runs before `normalize_in_dir` for every backend; `validate_relative_import` repeats empty/NUL/forbidden inside both built-in `normalize_in_dir`s. The frontmatter `imports:` parser uses `import_path_violation` so it reports the real reason (`imports[<n>]: invalid path "<p>": contains forbidden character U+XXXX`).
+- `check_segment_count` (256, `mds::resource_limit`) on both backends' `resolve_entry` and on `NativeFs::normalize_in_dir`'s `relative`; `VirtualFs` counts segments after resolving against `dir` (`resolve_relative_segments`). `NativeFs` never enforced the documented cap before #155.
+- `NativeFs::check_symlink_named`: canonicalize the PARENT, join the name as written, refuse when `symlink_metadata` (not followed) says symlink — on Windows every name-surrogate reparse point, so junctions too — then canonicalize and refuse a result whose parent is not the canonical parent (swap race), then `reject_forbidden_in_path` over the WHOLE canonical path. The file type decides, never a canonical-vs-joined string compare: that compare produced false "symlinks are not allowed" errors for case-mismatched names on case-insensitive volumes (#408). A module is keyed by its on-disk spelling.
+- `NativeFs::canonical_dir` (#371): a filesystem root (`has_root() && parent().is_none()`) is canonicalized directly + `is_dir()`; everything else goes through `check_symlink_named`. It must never call `effective_parent` on a root — that maps to `"."` and silently re-anchors at the cwd.
+- String compiles (`compile_str_with`/`check_str_with`/`lint_str_with`, bindings' `basePath`) pre-resolve the base dir in `lib.rs::resolve_base_dir` (typed-form forbidden check → `std::fs::canonicalize` → canonical-form forbidden check), so a symlinked base dir is FOLLOWED there; the base-dir symlink refusal applies only at `ModuleCache::resolve_source*` / trait level (spec F2 narrowing; `symlinked_base_dir_refused_by_resolve_source_followed_by_string_api`).
+
+### Forbidden path characters (#265)
+
+`mds::is_forbidden_path_char` (`lint/diagnostic.rs`) = `is_control_char` (78: C0 minus LF/TAB, DEL, C1, U+061C, U+200E/F, U+202A–E, U+2066–9, U+2028/9, U+FEFF) + LF + TAB = exactly 80 (`forbidden_path_char_class_is_exactly_80`). `mds::escape_path_for_message` = WIRE sanitize + TAB escaped (WIRE alone leaves TAB raw); its output carries none of the 80 (`escape_path_for_message_leaves_no_forbidden_char`). Messages are `<what> contains forbidden character U+XXXX: "<shown, escaped>"` where `<what>` is `import path` / `entry path` / `base directory` / `resolved path` / `path` (`check_symlink`) — built by `fs::forbidden_char_message`; `shown` is always what the caller typed, never the absolute resolved path. NUL keeps its own `contains null byte` message (checked first). The residual is a custom `with_fs` backend's OWN paths (keys it rewrites, links it follows): the trait's Security Contract requires it to apply `is_forbidden_path_char`. A project located under a hostile-named directory now fails entirely, by design.
+
+### Windows verbatim paths (#409)
+
+`verbatim::simplify_verbatim` (compiled on Windows only; string logic tested on every host) rewrites `\\?\C:\…` → `C:\…` and `\\?\UNC\server\share\…` → `\\server\share\…` only when lossless (≤ MAX_PATH, no reserved device name, no trailing dot/space, no `.`/`..` component). Two users: `native_dependencies` (the `CompileResult.dependencies` boundary of native compiles) and the public `mds::display_native_path` (a no-op off Windows; the CLI's `safe_path` routes every displayed path through it). Keys inside the resolver stay verbatim — containment compares canonical paths.
+
+## `@extends` Evaluation (#114, #115)
+
+- Every `@extends` path — markdown with source maps on (`evaluate_regions_with_map` with a `MapBuilder`), maps off (same function, `None` builder), an extending module reached through `@import` (`process_module_extends`), and messages mode (`evaluate_message_regions`) — evaluates the spliced regions (`spliced_regions(skeleton, effective_blocks, skeleton_origin)`) ONE REGION AT A TIME against the region's own `Origin` (`origin.display` + `origin.source`), so an error spans the file it is written in (base or child). Never pass `origin.file` to a diagnostic: it is the canonical key, absolute on `NativeFs`. `validate_extends_components` validates per region with `origin.display` too.
+- `evaluator::EvalBudget { iterations, message_bytes }` (private fields, `Default`) is threaded `&mut` through `evaluate_seeded` / `evaluate_with_map_seeded` / `evaluate_messages_seeded`; one budget per module evaluation / extends chain, plus a cumulative output-size check after each region and one shared message vector in messages mode — a fresh budget per region would multiply every cap by the region count (PF-004). Pinned by `for_max_total_iterations_across_extends_regions_{source_map,maps_off,messages_mode,imported_module}`, `message_count_cumulative_across_regions`, `messages_total_bytes_cumulative_across_regions`, `output_size_cumulative_across_regions` (`tests/source_map_vfs.rs`).
+- `splice_skeleton` and `ExtendsComponents::final_body` are deleted; `has_message_block` is decided across the regions.
+- Known gap: an extending module reached through `@include` contributes no `FragmentMap` (`process_module_extends` sets `prompt_map: None`), so those output bytes carry no source-map segments.
+
 ## State Transitions
 
 Template compilation follows: parse → resolve imports → evaluate → intrinsic-dispatch output wrapping. The intrinsic dispatch is a one-way gate: once `has_message_block` returns true the evaluator is `evaluate_messages_intrinsic` and any orphan text triggers `MixedContent`.
@@ -214,6 +254,9 @@ Mixed-content errors surface as `mds::mixed_content` from both `compile*` and `c
 - `crates/mds-core/src/resolver.rs` — `process_module_intrinsic`, `has_message_block`, `resolve_*_intrinsic`
 - `crates/mds-core/src/evaluator.rs` — `evaluate_messages_intrinsic`, `EvalMessage`
 - `crates/mds-core/src/ast.rs` — `TextNode` with `offset: usize` field
+- `crates/mds-core/src/fs.rs` — `FileSystem` trait (Security Contract rustdoc), `NativeFs`, `VirtualFs`, shared path guards
+- `crates/mds-core/src/verbatim.rs` — `simplify_verbatim` (Windows verbatim → conventional, lossless only)
+- `crates/mds-core/tests/forbidden_path_chars.rs` — #265 import/entry/base-dir/custom-backend/symlinked-hostile-directory cases
 
 ## Related
 

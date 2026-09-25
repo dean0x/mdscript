@@ -1,7 +1,7 @@
 ---
 feature: mds-cli
 name: MDS CLI (mds-cli)
-description: "Use when adding new subcommands, changing output-path resolution logic, modifying the watch architecture, adding new compile paths, updating mds.json config handling, debugging stdout/stderr stream separation, investigating exit codes, adding directory-mode build/check support, or working on stale-output cleanup. Keywords: mds build, mds check, mds watch, mds init, OutputKind, run_build, run_watch, build.rs, output.rs, watch.rs, mds.json, output_dir, resolve_output_base, OutputBase, output_path_for, compile_and_write, compile_to_content, intrinsic extension, run_build_directory, run_check_directory, is_partial, collect_mds_files, probe_and_remove_stale, canonicalize_out_dir, output_base_no_ext, continue-on-error, subtree mirror, symlink guard, 10 MiB cap."
+description: "Use when adding new subcommands, changing output-path resolution logic, modifying the watch architecture, adding new compile paths, updating mds.json config handling, debugging stdout/stderr stream separation, investigating exit codes, adding directory-mode build/check support, working on stale-output cleanup, or on the CLI's input refusals (forbidden path characters in files and output locations). Keywords: mds build, mds check, mds watch, mds init, OutputKind, run_build, run_watch, build.rs, output.rs, watch.rs, mds.json, output_dir, resolve_output_base, OutputBase, output_path_for, compile_and_write, compile_to_content, intrinsic extension, run_build_directory, run_check_directory, is_partial, collect_mds_files, probe_and_remove_stale, canonicalize_out_dir, output_base_no_ext, continue-on-error, subtree mirror, symlink guard, 10 MiB cap, load_config, reject_forbidden_output_flags, reject_forbidden_output_path, forbidden path characters, #265, read_canonical_source, safe_path, display_native_path, #409, mds init filename."
 category: component-patterns
 directories: ["crates/mds-cli/"]
 referencedFiles:
@@ -14,7 +14,7 @@ referencedFiles:
   - crates/mds-cli/tests/intrinsic_output.rs
   - crates/mds-cli/Cargo.toml
 created: 2026-06-26
-updated: 2026-09-16
+updated: 2026-09-25
 ---
 
 # MDS CLI (mds-cli)
@@ -184,8 +184,8 @@ The CLI uses `mds::compile_with_deps` and `mds::compile_str_with_deps` (never ba
 
 Exit codes:
 - 0: success
-- 1: compile/logic error, or `fail_count > 0` in directory mode (`std::process::exit(1)`)
-- 2: I/O or filesystem error (`MdsError::Io`, `FileNotFound`, `NotMdsFile`)
+- 1: compile/logic error, or `fail_count > 0` in directory mode (`std::process::exit(1)`) whatever the failing file's error
+- 2: I/O or filesystem error (`MdsError::Io`, `FileNotFound`, `NotMdsFile`) — including (#265) an `-o`/`--out-dir`/`mds.json build.output_dir`/`mds init <filename>` value carrying a forbidden path character, and a `build.output_dir` with a `..` component (was exit 1)
 - 3: resource limit exceeded (`MdsError::ResourceLimit`)
 
 `run_build_directory` calls `std::process::exit(1)` directly (not via the `Result` chain) when fail_count > 0, matching other CLI exit points in `build.rs`.
@@ -204,7 +204,12 @@ Exit codes:
 - `canonicalize_out_dir` resolves relative paths against `current_dir` and then canonicalizes. It must be called BEFORE `resolve_output_base` so that `starts_with` checks inside `run_build_directory` are reliable across relative/absolute paths.
 - Watch mode derives the extension from `compiled.kind.extension()` after each compile. On deletion it must probe both `.md` and `.json` since the kind is not known.
 - The `CompileOutput` struct in `build.rs` is a local CLI struct (content + kind + deps) — not the same as `mds::CompiledOutput` (the Rust enum). The naming is similar but they are different types.
-- `mds.json build.output_dir` rejects `..` components at parse time to prevent path traversal. This check runs in both single-file and directory mode.
+- `mds.json build.output_dir` rejects `..` components (`mds::io`, exit 2 — exit 1 before v0.5.0; value escaped in the message) to prevent path traversal. This check runs in both single-file and directory mode.
+- Forbidden path characters (#265) are refused UP FRONT, before any input is read: `-o`/`--output` and `--out-dir` by `build::reject_forbidden_output_flags` (build and watch), `mds.json build.output_dir` inside `load_config` (so it fails every subcommand that loads the config: `build`, `watch`, `lint`, directory-mode `fmt`), and `mds init <filename>` in `main.rs` — all via `output::reject_forbidden_output_path` (`mds::io`, exit 2, value shown through `mds::escape_path_for_message`). A hostile-named FILE is different: the directory walker still collects it and it fails on its own (`mds::io`) while siblings are processed; `watch` keeps running. Pinned by `crates/mds-cli/tests/forbidden_paths.rs`.
+- `mds check` never loads `mds.json` (a malformed or hostile config does not fail it — `output_dir_in_mds_json_is_refused_at_load` asserts exit 0 for `check`). `fmt` loads it only in directory mode.
+- `mds watch --vars` maps a vars-path error to "must not be a symlink" only when it IS a symlink error; any other refusal (a forbidden character, a file removed since startup) keeps its own message (`watch_vars_errors_keep_their_real_message`).
+- `lint`/`fmt` read a file through `read_source_file` → `read_canonical_source`, which anchors the display root with `NativeFs::anchor_base_dir` and PROPAGATES a failure (`mds::io`, exit 2; it was `let _ =` before #155).
+- Status-line and error-message paths go through `output::safe_path`, which applies `mds::display_native_path` (strips a lossless Windows `\\?\` prefix, #409) and then WIRE-escapes.
 - Debounce is a quiet period, not a fixed window (#379, `watch.rs`): the first relevant content event opens a `--debounce` window and every further content event restarts it (`Access` events and watch errors do not restart it); the window is bounded by `debounce_cap = max(10 × window, 1s)` and `--debounce` itself is clamped to `MAX_DEBOUNCE_MS = 60_000` (60s), with an additional `MAX_DEBOUNCE_MESSAGES = 10_000` drained-message cap; a window's exit reason is one of `DebounceEnd::{Quiet, Cap, MessageLimit, Disabled, Interrupted, Disconnected}`.
 - Every write the CLI performs funnels through `atomic_write_file` (`output.rs`, #227): temp-file + rename, refusing a symlink at the target; `Durability::Fsync` is used for source rewrites (`fmt`, `lint --fix`) and `Durability::RenameOnly` for reproducible derived artifacts (`build`/`watch`/`init`, #386). `crates/mds-cli/tests/write_funnel.rs` is a lexical guard that fails if a new raw `fs::write`/`File::create` site appears in `crates/mds-cli/src/**` outside its allow-list. An empty directory is now a hard failure (not silent success) for `build`/`check`/`fmt`/`lint` (#204), and a directory whose only `.mds` files are partials is the same "nothing to do" failure (#387).
 
@@ -212,7 +217,8 @@ Exit codes:
 
 - `crates/mds-cli/src/main.rs` — clap argument parsing; `run_build`/`run_check`/`run_watch` dispatch; `mod output`
 - `crates/mds-cli/src/build.rs` — `OutputKind`, `compile_to_content`, `compile_and_write`, `run_build`, `run_build_directory`, all output-path helpers for single-file mode
-- `crates/mds-cli/src/output.rs` — `OutputBase`, `resolve_output_base`, `output_path_for`, `collect_mds_files`, `is_partial`, `probe_and_remove_stale`, `canonicalize_out_dir`, `output_base_no_ext`
+- `crates/mds-cli/src/output.rs` — `OutputBase`, `resolve_output_base`, `output_path_for`, `collect_mds_files`, `is_partial`, `probe_and_remove_stale`, `canonicalize_out_dir`, `output_base_no_ext`, `reject_forbidden_output_path`, `safe_path`
+- `crates/mds-cli/tests/forbidden_paths.rs` — #265 walker matrix (build/check/fmt/lint/watch), output-location and `mds init` refusals, `--vars` message
 - `crates/mds-cli/src/watch.rs` — watch loop; uses `compiled.kind.extension()` and `probe_and_remove_stale`
 - `crates/mds-cli/tests/dir_build.rs` — 14 integration tests for directory mode (T-CLI-12–21 / FUNC-16–26)
 - `crates/mds-cli/tests/intrinsic_output.rs` — tests asserting `--format` is rejected
