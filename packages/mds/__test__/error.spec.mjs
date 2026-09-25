@@ -5,7 +5,7 @@
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { compile, check, isMdsError, init, lintVirtual } from '../dist/node.js';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -493,13 +493,13 @@ describe('error shape', () => {
     );
   });
 
-  test('U-E-EXT: napi, WASM and Python report an inherited type_mismatch identically', async (t) => {
-    // PF-007 differential for #114: an evaluation error inside an @extends chain must
+  test('U-E-EXT: napi, WASM and Python report errors in inherited content identically', async (t) => {
+    // PF-007 differential for #114/#115: an error inside inherited @extends content must
     // serialize identically on every surface, with source maps on and off, and the
-    // shared value must be the span on the file the comparison is written in — the
-    // base skeleton's `@if n == 5:` (11 bytes at offset 14, line 4). Per-surface goldens
-    // cannot see a divergence between surfaces; this compares them to each other.
-    // Every surface is required in CI; locally a missing one skips visibly.
+    // shared value must be the span on the BASE, where the offending node is written —
+    // a cross-type comparison in a Markdown chain and orphan text in a messages chain.
+    // Per-surface goldens cannot see a divergence between surfaces; this compares them
+    // to each other. Every surface is required in CI; locally a missing one skips visibly.
     let native = null;
     try {
       const { createNativeBackend } = await import('../dist/backend/native.js');
@@ -531,17 +531,39 @@ describe('error shape', () => {
     const { buildModulesMap } = await import('../dist/util/module-scanner.js');
     const wasm = createWasmBackend(wasmModule);
 
+    const fixtures = [
+      {
+        name: 'markdown: base-skeleton type mismatch',
+        base: '---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n',
+        child: '@extends "./base.mds"\n@block body:\noverride\n@end\n',
+        code: 'mds::type_mismatch',
+        span: { offset: 14, length: 11, line: 4, column: 1 },
+      },
+      {
+        name: 'messages: base-skeleton stray text',
+        base: '@message system:\nhi\n@end\nSTRAY TEXT\n@block turn:\n@message user:\nx\n@end\n@end\n',
+        child: '@extends "./base.mds"\n@block turn:\n@message user:\ny\n@end\n@end\n',
+        code: 'mds::mixed_content',
+        span: { offset: 25, length: 10, line: 4, column: 1 },
+      },
+    ];
     const dir = await mkdtemp(join(tmpdir(), 'u-e-ext-'));
     try {
       // The marker pins the project root, so buildModulesMap keys are root-relative.
       await writeFile(join(dir, '.mdsroot'), '');
-      await writeFile(
-        join(dir, 'base.mds'),
-        '---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n',
-      );
-      const childPath = join(dir, 'child.mds');
-      await writeFile(childPath, '@extends "./base.mds"\n@block body:\noverride\n@end\n');
+      for (const [i, fixture] of fixtures.entries()) {
+        const fixtureDir = join(dir, `f${i}`);
+        await mkdir(fixtureDir);
+        await writeFile(join(fixtureDir, 'base.mds'), fixture.base);
+        await writeFile(join(fixtureDir, 'child.mds'), fixture.child);
+        await assertInheritedErrorParity(join(fixtureDir, 'child.mds'), fixture);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
 
+    /** Compile `childPath` on every surface, maps on and off; all must match `fixture`. */
+    async function assertInheritedErrorParity(childPath, fixture) {
       const shapes = {};
       for (const sourceMap of [false, true]) {
         shapes[`napi sourceMap=${sourceMap}`] = errorShape(
@@ -581,19 +603,21 @@ describe('error shape', () => {
       shapes['python source_map=False'] = pyOff;
       shapes['python source_map=True'] = pyOn;
 
-      // Non-vacuity (PF-013): the shared value is the type_mismatch spanned on the base.
+      // Non-vacuity (PF-013): the shared value is the fixture's error, spanned on the base.
       const reference = shapes['napi sourceMap=false'];
-      assert.equal(reference.code, 'mds::type_mismatch', JSON.stringify(reference));
+      assert.equal(reference.code, fixture.code, `${fixture.name}: ${JSON.stringify(reference)}`);
       assert.deepEqual(
         reference.span,
-        { offset: 14, length: 11, line: 4, column: 1 },
-        'U-E-EXT: the error must be spanned on the base skeleton\'s @if line',
+        fixture.span,
+        `U-E-EXT ${fixture.name}: the error must be spanned on the base`,
       );
       for (const [surface, shape] of Object.entries(shapes)) {
-        assert.deepEqual(shape, reference, `U-E-EXT: ${surface} must match napi sourceMap=false`);
+        assert.deepEqual(
+          shape,
+          reference,
+          `U-E-EXT ${fixture.name}: ${surface} must match napi sourceMap=false`,
+        );
       }
-    } finally {
-      await rm(dir, { recursive: true, force: true });
     }
   });
 });

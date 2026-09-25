@@ -1300,10 +1300,9 @@ pub struct EvalMessage {
 /// span: when orphan content is found, the offending node's byte offset (already
 /// captured by the parser on every `TextNode`/`Interpolation`) is paired with
 /// `source` so the error underlines the prose (origin rides along the data, not a
-/// path→source lookup). For the `@extends` path the
-/// offsets may originate in a base template rather than `source`; the shared `at()`
-/// guard drops the source in that out-of-bounds case so no miette `OutOfBounds`
-/// render can occur (the raw offset/length are still preserved in `serialize()`).
+/// path→source lookup). Every node's offsets must therefore index into `source`: an
+/// `@extends` chain, whose regions come from different files, is collected region by
+/// region through [`evaluate_messages_seeded`] instead.
 pub fn evaluate_messages_intrinsic(
     nodes: &[Node],
     scope: &mut Scope,

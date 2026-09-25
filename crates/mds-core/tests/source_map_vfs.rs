@@ -1062,6 +1062,10 @@ const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 /// the same way, and the at-cap control compiles.
 const MAX_MESSAGES_TOTAL_SIZE: usize = MAX_OUTPUT_SIZE;
 
+/// Mirrors the private `limits::MAX_MESSAGE_COUNT`. Pinned the same way: the over-cap
+/// assertion requires the limit message, which prints the real value.
+const MAX_MESSAGE_COUNT: usize = 10_000;
+
 /// Outer-loop length for the iteration-budget tests. One loop region runs
 /// `LOOP_OUTER * (inner + 1)` iterations: every outer and every inner pass counts.
 const LOOP_OUTER: usize = 500;
@@ -1124,6 +1128,14 @@ const MESSAGE_BYTES_CHILD: &str =
 /// overrides `body`.
 const OUTPUT_SIZE_BASE: &str = "{{half}}\n@block body:\nBASE-DEFAULT-BODY\n@end\n";
 const OUTPUT_SIZE_CHILD: &str = "@extends \"./base.mds\"\n@block body:\n{{half}}{{tail}}\n@end\n";
+
+/// Message-count base: the skeleton's loop emits one `system` message per `base_items`
+/// element; the child overrides `turn`, whose base default has a different role.
+const MESSAGE_COUNT_BASE: &str = "@for i in base_items:\n@message system:\n.\n@end\n@end\n\
+     @block turn:\n@message assistant:\nBASE-DEFAULT-TURN\n@end\n@end\n";
+/// The child's `turn` override emits one `user` message per `child_items` element.
+const MESSAGE_COUNT_CHILD: &str =
+    "@extends \"./base.mds\"\n@block turn:\n@for i in child_items:\n@message user:\n.\n@end\n@end\n@end\n";
 
 /// A `base.mds` + `child.mds` module set.
 fn extends_chain(base: &str, child: &str) -> HashMap<String, String> {
@@ -1419,6 +1431,59 @@ fn for_max_total_iterations_across_extends_regions_imported_module() {
     });
 }
 
+/// #115 / applies PF-004: the message-count cap (`MAX_MESSAGE_COUNT`) covers the whole
+/// extends chain, not each region: every region appends to one message list.
+///
+/// The base skeleton's loop and the child's override loop each emit half the cap (the
+/// child's one more in the tripping case), so only a count shared by both regions can
+/// reject the sum.
+#[test]
+fn message_count_cumulative_across_regions() {
+    let modules = extends_chain(MESSAGE_COUNT_BASE, MESSAGE_COUNT_CHILD);
+    let items = |n: usize| Value::Array((0..n).map(|i| Value::Number(i as f64)).collect());
+    let vars = |child_len: usize| {
+        HashMap::from([
+            ("base_items".to_string(), items(MAX_MESSAGE_COUNT / 2)),
+            ("child_items".to_string(), items(child_len)),
+        ])
+    };
+
+    // Control: the two regions emit exactly the cap — the largest admitted count.
+    let messages = mds::compile_virtual_with_deps_opts(
+        modules.clone(),
+        "child.mds",
+        Some(vars(MAX_MESSAGE_COUNT / 2)),
+        CompileOptions::default(),
+    )
+    .expect("a chain emitting exactly MAX_MESSAGE_COUNT messages must compile")
+    .into_messages()
+    .expect("messages output");
+    // PF-013: the base skeleton's messages come first, then the child override's (role
+    // `user`, not the base default's `assistant`).
+    let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+    let mut expected = vec!["system"; MAX_MESSAGE_COUNT / 2];
+    expected.extend(vec!["user"; MAX_MESSAGE_COUNT / 2]);
+    assert!(
+        roles == expected,
+        "@extends must emit the base skeleton's messages then the child override's; got {} \
+         messages",
+        roles.len()
+    );
+
+    // One message over the cap in total; each region alone stays at about half of it.
+    assert_resource_limit(
+        mds::compile_virtual_with_deps_opts(
+            modules,
+            "child.mds",
+            Some(vars(MAX_MESSAGE_COUNT / 2 + 1)),
+            CompileOptions::default(),
+        ),
+        "one message count per extends chain — two regions, each under MAX_MESSAGE_COUNT \
+         alone, must exceed it together",
+        &format!("message count exceeded maximum of {MAX_MESSAGE_COUNT}"),
+    );
+}
+
 /// AC-114-3 / applies PF-004: the cumulative message-content cap
 /// (`MAX_MESSAGES_TOTAL_SIZE`) covers the whole extends chain, not each region.
 ///
@@ -1641,6 +1706,114 @@ fn extends_eval_error_spans_its_own_file_with_and_without_source_map() {
         assert_eq!(
             off, on,
             "{region}: the serialized error must not depend on source maps"
+        );
+    }
+}
+
+/// One messages-mode error case (#115): an extends chain whose child overrides `turn`,
+/// with the error placed in a different spliced region per case.
+struct MessagesErrorCase {
+    region: &'static str,
+    base: &'static str,
+    child: &'static str,
+    code: &'static str,
+    /// The file the offending node is written in.
+    file: &'static str,
+    /// Byte offset, length and line of the span in `file` (column is always 1).
+    span: (usize, usize, usize),
+}
+
+/// A child that overrides `turn` with one message.
+const MESSAGES_CHILD: &str =
+    "@extends \"./base.mds\"\n@block turn:\n@message user:\ny\n@end\n@end\n";
+
+const EXTENDS_MESSAGES_ERROR_CASES: [MessagesErrorCase; 5] = [
+    MessagesErrorCase {
+        region: "base skeleton stray text",
+        base: "@message system:\nhi\n@end\nSTRAY TEXT\n@block turn:\n@message user:\nx\n@end\n@end\n",
+        child: MESSAGES_CHILD,
+        code: "mds::mixed_content",
+        file: "base.mds",
+        span: (25, 10, 4),
+    },
+    MessagesErrorCase {
+        // The frontmatter pushes the stray text past the end of the child source.
+        region: "base skeleton stray text past the child's length",
+        base: "---\npadding: ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\
+               ppppppppppppppppppp\n---\n\
+               @message system:\nhi\n@end\nSTRAY TEXT\n@block turn:\n@message user:\nx\n@end\n@end\n",
+        child: MESSAGES_CHILD,
+        code: "mds::mixed_content",
+        file: "base.mds",
+        span: (123, 10, 7),
+    },
+    MessagesErrorCase {
+        region: "base-default block stray text",
+        base: "@message system:\nhi\n@end\n@block head:\nSTRAY TEXT\n@end\n\
+               @block turn:\n@message user:\nx\n@end\n@end\n",
+        child: MESSAGES_CHILD,
+        code: "mds::mixed_content",
+        file: "base.mds",
+        span: (38, 10, 5),
+    },
+    MessagesErrorCase {
+        region: "child override stray text",
+        base: "@message system:\nhi\n@end\n@block turn:\n@message user:\nx\n@end\n@end\n",
+        child: "@extends \"./base.mds\"\n@block turn:\nCHILD STRAY\n@message user:\ny\n@end\n@end\n",
+        code: "mds::mixed_content",
+        file: "child.mds",
+        span: (35, 11, 3),
+    },
+    MessagesErrorCase {
+        region: "base skeleton type mismatch",
+        base: "---\nn: hi\n---\n@if n == 5:\n@message system:\nx\n@end\n@end\n\
+               @block turn:\n@message user:\nx\n@end\n@end\n",
+        child: MESSAGES_CHILD,
+        code: "mds::type_mismatch",
+        file: "base.mds",
+        span: (14, 11, 4),
+    },
+];
+
+/// #115 / AC-114-1: in messages mode, an error in any spliced region of an @extends
+/// chain — orphan text outside a `@message` (`mds::mixed_content`) or a cross-type
+/// comparison — is reported against the file the region came from, whether or not a
+/// source map was requested (messages mode builds none).
+#[test]
+fn extends_messages_error_spans_its_own_file() {
+    for case in EXTENDS_MESSAGES_ERROR_CASES {
+        let (offset, length, line) = case.span;
+        let [off, on] = [false, true].map(|source_map| {
+            let context = format!("{}, source_map={source_map}", case.region);
+            let err = mds::compile_virtual_with_deps_opts(
+                extends_chain(case.base, case.child),
+                "child.mds",
+                None,
+                CompileOptions::default().with_source_map(source_map),
+            )
+            .expect_err(&format!("{context}: the chain must fail"));
+            let serialized = err.serialize();
+            assert_eq!(serialized.code, case.code, "{context}: {err}");
+            assert_eq!(
+                err.source_name(),
+                Some(case.file),
+                "{context}: the error must name the file the offending node is written in"
+            );
+            assert_eq!(
+                serialized.span,
+                Some(
+                    SerializedSpan::new(offset, length)
+                        .with_line(line)
+                        .with_column(1)
+                ),
+                "{context}: the span must underline the offending node"
+            );
+            serialized
+        });
+        assert_eq!(
+            off, on,
+            "{}: messages-mode errors ignore source maps",
+            case.region
         );
     }
 }

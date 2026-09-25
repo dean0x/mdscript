@@ -10,6 +10,7 @@ use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node}
 use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::evaluator::evaluate_messages_intrinsic;
+use crate::evaluator::evaluate_messages_seeded;
 use crate::evaluator::evaluate_seeded;
 use crate::evaluator::evaluate_with_map;
 use crate::evaluator::evaluate_with_map_seeded;
@@ -793,6 +794,36 @@ impl ModuleCache {
         Ok((output, current_map))
     }
 
+    /// Messages-mode twin of [`Self::evaluate_regions_with_map`]: collect the
+    /// `@message` blocks of spliced `@extends` regions in order.
+    ///
+    /// Each region is evaluated against its own [`Origin`]'s display path and source,
+    /// so a span-bearing error — orphan text outside a `@message`
+    /// (`mds::mixed_content`) or a cross-type comparison — names the file the region
+    /// came from (#115). PF-004: one message vector and one [`EvalBudget`] cover every
+    /// region, so the message-count, message-byte and iteration caps apply to the
+    /// whole module evaluation rather than to each region.
+    fn evaluate_message_regions(
+        regions: &[(&[crate::ast::Node], &Origin)],
+        scope: &mut crate::scope::Scope,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<crate::evaluator::EvalMessage>, MdsError> {
+        let mut budget = EvalBudget::default();
+        let mut messages = Vec::new();
+        for (nodes, origin) in regions {
+            evaluate_messages_seeded(
+                nodes,
+                scope,
+                warnings,
+                &origin.display,
+                &origin.source,
+                &mut budget,
+                &mut messages,
+            )?;
+        }
+        Ok(messages)
+    }
+
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
     /// output shape.
     ///
@@ -873,6 +904,12 @@ impl ModuleCache {
                 ..
             } = components;
 
+            // Per-region evaluation in both modes, with or without a source map:
+            // base-skeleton nodes, base defaults and child overrides index into
+            // different files, so each region is evaluated against its own origin
+            // (#114, #115).
+            let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
+
             if has_message_block(&final_body) {
                 // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
                 // The evaluator only has text-stream semantics; messages boundaries don't
@@ -880,13 +917,7 @@ impl ModuleCache {
                 if opts.source_map {
                     warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
                 }
-                let messages = evaluate_messages_intrinsic(
-                    &final_body,
-                    &mut scope,
-                    warnings,
-                    ctx.file_str,
-                    ctx.source,
-                )?;
+                let messages = Self::evaluate_message_regions(&regions, &mut scope, warnings)?;
                 return Ok((
                     crate::CompiledOutput::Messages(
                         messages.into_iter().map(crate::Message::from).collect(),
@@ -895,10 +926,6 @@ impl ModuleCache {
                 ));
             }
 
-            // Per-region evaluation, with or without a source map: base-skeleton
-            // nodes, base defaults and child overrides index into different files, so
-            // each region is evaluated against its own origin (#114).
-            let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
             // Seed builder with the skeleton's root file (source maps only).
             let builder = opts.source_map.then(|| {
                 crate::sourcemap::MapBuilder::new(

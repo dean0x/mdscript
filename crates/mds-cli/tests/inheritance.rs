@@ -12,6 +12,7 @@
 //! - P2 perf:  wide base (~200 @block slots, child overrides all) compiles < 1s
 //! - E12 CLI:  inherited validation errors render a frame from base.mds, root-relative
 //! - #114 CLI: an inherited evaluation error (type_mismatch) renders against base.mds
+//! - #115 CLI: messages mode — orphan text in the base renders against base.mds
 
 mod common;
 use common::{fixture, mds_bin};
@@ -626,5 +627,37 @@ fn extends_base_type_mismatch_render_points_at_base() {
     assert!(
         stderr.contains("cross-type comparison"),
         "#114 CLI: the span label must render against base.mds; got: {stderr}"
+    );
+}
+
+#[test]
+fn extends_base_stray_text_messages_render_points_at_base() {
+    // #115: in a messages-mode chain, prose outside every @message in the BASE skeleton
+    // is mixed content. The frame must name base.mds at the stray line; the chain used
+    // to be evaluated against the child's source, landing the caret in the child.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+    std::fs::write(
+        dir.path().join("base.mds"),
+        "@message system:\nhi\n@end\nSTRAY TEXT\n@block turn:\n@message user:\nx\n@end\n@end\n",
+    )
+    .unwrap();
+    let child_path = dir.path().join("child.mds");
+    std::fs::write(
+        &child_path,
+        "@extends \"./base.mds\"\n@block turn:\n@message user:\ny\n@end\n@end\n",
+    )
+    .unwrap();
+
+    let (_, stderr, ok) = build_file(child_path.to_str().unwrap());
+
+    assert!(!ok, "#115 CLI: compile must fail; stderr: {stderr}");
+    assert!(
+        stderr.contains("mds::mixed_content"),
+        "#115 CLI: stderr must contain mds::mixed_content; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("[base.mds:4:1]"),
+        "#115 CLI: the frame must name base.mds at the stray line; got: {stderr}"
     );
 }
