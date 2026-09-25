@@ -431,6 +431,41 @@ fn single_file_argument_is_refused_before_the_existence_check() {
     }
 }
 
+/// `mds watch --vars` with a path carrying a forbidden character is refused up front
+/// (`mds::io`, exit 2) in file and directory mode — before its directory is watched,
+/// so no "failed to watch vars directory" warning shows the raw name.
+///
+/// Portable: nothing is created — the `--vars` path does not exist.
+#[test]
+fn watch_vars_path_is_refused_before_it_is_watched() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.mds"), "Hi\n").unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("a.mds"), "A\n").unwrap();
+    for ch in [ESC, '\t', '\u{202E}'] {
+        let vars = format!("v{ch}q/x.json");
+        let shown = format!("\"v{}q/x.json\"", escaped(ch));
+        for target in ["in.mds", "src"] {
+            let label = format!("watch {target} --vars v<U+{:04X}>q/x.json", u32::from(ch));
+            let (code, text) = run(dir.path(), &["watch", target, "--vars", vars.as_str()]);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert!(
+                text.contains(&format!(
+                    "path contains forbidden character U+{:04X}",
+                    u32::from(ch)
+                )),
+                "{label}: got: {text:?}"
+            );
+            assert_refusal(&text, ch, &shown, &label);
+            assert!(!text.contains(ch), "{label}: raw char; got: {text:?}");
+            assert!(
+                !text.contains("failed to watch"),
+                "{label}: refused before it is watched; got: {text:?}"
+            );
+        }
+    }
+}
+
 // ── Output locations: refused up front ──────────────────────────────────────
 
 /// `-o` and `--out-dir` values carrying a forbidden character are refused before the

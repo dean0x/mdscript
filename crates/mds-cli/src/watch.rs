@@ -399,10 +399,17 @@ pub(crate) fn external_recovery_decision(
 /// it later; the vars file is reloaded on every rebuild — freshness rule — so a duplicate
 /// key introduced after startup is caught on the next rebuild, #326).
 ///
+/// A path carrying a forbidden path character (#265) is refused first, before the
+/// `exists` probe — so before its directory is ever watched — with the message
+/// `check_symlink` gives an existing one (`mds::io`).
+///
 /// Only the symlink refusal (`ImportError`) is reworded for the `--vars` flag; every
-/// other `check_symlink` error — a forbidden path character (#265), or a file removed
-/// since the `exists` probe — keeps its own message and code.
+/// other `check_symlink` error — a forbidden character in the resolved path, or a
+/// file removed since the `exists` probe — keeps its own message and code.
 pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<PathBuf>, MdsError> {
+    if let Some(p) = &vars {
+        crate::output::reject_forbidden_output_path("path", p.as_os_str())?;
+    }
     match vars {
         Some(p) if p.exists() => mds::NativeFs::check_symlink(&p)
             .map(Some)
@@ -2968,6 +2975,38 @@ fn process_dir_batch_incremental(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// #265: a `--vars` path carrying a forbidden character is refused before the
+    /// filesystem is touched — whether or not it exists — with the message
+    /// `NativeFs::check_symlink` gives an existing one; a clean missing path is still
+    /// kept for later creation (control).
+    #[test]
+    fn canonicalize_vars_path_refuses_a_forbidden_char_before_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        for ch in ['\t', '\x1b', '\n', '\u{202E}'] {
+            let hostile = dir.path().join(format!("v{ch}q")).join("x.json");
+            let err = canonicalize_vars_path(Some(hostile.clone()))
+                .expect_err("a hostile --vars path is refused");
+            let s = err.serialize();
+            assert_eq!(s.code, "mds::io", "U+{:04X}", u32::from(ch));
+            assert!(
+                s.message.starts_with(&format!(
+                    "path contains forbidden character U+{:04X}: \"",
+                    u32::from(ch)
+                )),
+                "got: {}",
+                s.message
+            );
+            assert!(!s.message.contains(ch), "raw char: {:?}", s.message);
+        }
+
+        let clean = dir.path().join("missing.json");
+        assert_eq!(
+            canonicalize_vars_path(Some(clean.clone())).unwrap(),
+            Some(clean),
+            "control: a clean missing --vars path is kept"
+        );
+    }
 
     // T-U1: dirs_to_watch deduplicates parents.
     #[test]
