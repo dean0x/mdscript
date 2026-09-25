@@ -64,9 +64,10 @@ pub(crate) mod verbatim;
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{
-    find_unknown_rule_names, fix, format_unknown_rule_names_warning, named_source_for_render,
-    neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire, FixLineSpan,
-    LintConfig, LintDiagnostic, LintResult, Severity, TextEdit, UnknownRuleNames, KNOWN_LINT_RULES,
+    escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
+    is_forbidden_path_char, named_source_for_render, neutralize_source_for_render,
+    sanitize_control_chars, sanitize_control_chars_wire, FixLineSpan, LintConfig, LintDiagnostic,
+    LintResult, Severity, TextEdit, UnknownRuleNames, KNOWN_LINT_RULES,
 };
 pub use options::{
     attach_lint_warnings, format_unknown_keys_error, json_type_name, parse_json_vars,

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -34,6 +35,18 @@ fn public_functions_exist() {
     let _ = mds::load_vars_str("{}");
     let _ = mds::load_vars_file_reporting_duplicates(Path::new("nonexistent.json"));
     let _ = mds::load_vars_str_reporting_duplicates("{}");
+}
+
+/// #265: `is_forbidden_path_char` and `escape_path_for_message` are callable via
+/// the crate root with the expected signatures. Additive-only for now — nothing
+/// in this crate enforces the predicate yet; enforcement is a follow-up commit.
+#[test]
+fn forbidden_path_char_functions_exist() {
+    let _: fn(char) -> bool = mds::is_forbidden_path_char;
+    let _: fn(&str) -> Cow<'_, str> = mds::escape_path_for_message;
+    assert!(mds::is_forbidden_path_char('\t'));
+    assert!(!mds::is_forbidden_path_char('a'));
+    assert_eq!(&*mds::escape_path_for_message("a\tb"), "a\\u0009b");
 }
 
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`

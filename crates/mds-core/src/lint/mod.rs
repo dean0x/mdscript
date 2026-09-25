@@ -37,8 +37,9 @@ pub use config::{
     KNOWN_LINT_RULES,
 };
 pub use diagnostic::{
-    named_source_for_render, neutralize_source_for_render, sanitize_control_chars,
-    sanitize_control_chars_wire, FixLineSpan, LintDiagnostic, LintResult, Severity, TextEdit,
+    escape_path_for_message, is_forbidden_path_char, named_source_for_render,
+    neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire, FixLineSpan,
+    LintDiagnostic, LintResult, Severity, TextEdit,
 };
 
 use crate::error::MdsError;
