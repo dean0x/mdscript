@@ -597,8 +597,10 @@ mod tests {
     // ── A3 case matrix: fix_removals descriptor for each case A–G ─────────────
     //
     // Each test pins the fix_removals shape (Some/None, span count, to_inclusive)
-    // for every removal case defined in check_if_block. The letter labels (A–G)
-    // follow the case labels in the source comments.
+    // for every removal case defined in check_if_block's helpers: A in
+    // primary_true_fix, B–D in primary_false_fix, E and F in
+    // constant_elseif_finding, G in elseif_diag. The letter labels (A–G) follow
+    // the case labels in those helpers' comments.
 
     /// A3-Case A: always-true @if with later branches → fix_removals = Some(two spans).
     ///

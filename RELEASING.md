@@ -435,9 +435,79 @@ Across rows:
 - Confirm `## [Unreleased]` is empty — `bump-version.mjs` inserts the new version
   heading beneath it and leaves the heading in place.
 
+## Branch protection
+
+`main` requires every repo-owned `ci.yml` context to pass (ADR-013); third-party and
+analysis contexts (CodeQL, Snyk) report but are deliberately not required, so a
+vendor outage cannot block a merge. `enforce_admins` is `false` and must stay
+`false`: the sole code owner cannot self-approve, so `--admin` merges (through the
+command `scripts/verify-pr-checks.mjs` prints) are the only merge path.
+
+### Adding a required CI context
+
+A new `ci.yml` job cannot block a merge until branch protection lists it, so adding
+one is a three-place change: the job, `EXPECTED_CONTEXTS` in
+`scripts/verify-pr-checks.mjs`, and `main`'s required status checks. The worked
+example is `Rust — clippy, test (windows-latest)` (#147), which takes protection
+from 15 to 16 required contexts.
+
+1. **In the PR that adds the job**, list the job's `name:` in `EXPECTED_CONTEXTS`
+   (Tier A+) and raise the `EXPECTED_CONTEXTS.length` assertion in
+   `scripts/__test__/verify-pr-checks.spec.mjs`. Tier A+ fails the verifier when
+   the job is absent or not `completed+success` whether or not protection lists
+   it yet, so the adding PR is already gated on its own job. Copy the name
+   byte-for-byte from `ci.yml` (the dash is an em dash, U+2014), and confirm the
+   job has no `paths:`/`paths-ignore:` filter and no job-level `if:` — a required
+   context that never reports blocks every PR.
+2. **Save the current protection** before changing it:
+   ```bash
+   gh api repos/dean0x/mdscript/branches/main/protection > protection-saved.json
+   gh api repos/dean0x/mdscript/branches/main/protection/required_status_checks \
+     --jq '{strict: .strict, checks: [.checks[] | {context, app_id}]}' > checks-saved.json
+   ```
+3. **PATCH only `required_status_checks`** — once the PR head is fully green,
+   including the new job, and immediately before merging. Send the existing
+   checks plus the new one, each with `app_id` 15368 (GitHub Actions), and keep
+   `strict` as it is:
+   ```bash
+   gh api repos/dean0x/mdscript/branches/main/protection/required_status_checks \
+     --jq '{strict: .strict, checks: ([.checks[] | {context, app_id}]
+            + [{context: "Rust — clippy, test (windows-latest)", app_id: 15368}])}' \
+     > checks-new.json
+   gh api --method PATCH repos/dean0x/mdscript/branches/main/protection/required_status_checks \
+     --input checks-new.json
+   ```
+   Never use the whole-protection `PUT repos/dean0x/mdscript/branches/main/protection`:
+   it replaces the entire object and resets every field it is not sent — the
+   pull-request review rules included. The scoped endpoint leaves `enforce_admins`
+   untouched.
+4. **GET-verify** the count, the names and `enforce_admins`:
+   ```bash
+   gh api repos/dean0x/mdscript/branches/main/protection/required_status_checks \
+     --jq '(.checks | length), .strict, (.checks[].context)'
+   gh api repos/dean0x/mdscript/branches/main/protection/enforce_admins --jq .enabled
+   ```
+   Expect the old count plus one (16 for #147), `strict` unchanged, the new name
+   exactly as the job reports it, and `false`.
+5. **Merge** as usual: `node scripts/verify-pr-checks.mjs <pr>` now lists the new
+   context under Tier A; run the `gh pr merge` command it prints.
+
+**Rollback**: PATCH the saved checks back and GET-verify the old count:
+
+```bash
+gh api --method PATCH repos/dean0x/mdscript/branches/main/protection/required_status_checks \
+  --input checks-saved.json
+```
+
+Roll back whenever the merge slips after the PATCH. Until the job exists on `main`,
+every open PR — Dependabot's included — runs the old `ci.yml`, never reports the new
+context, and cannot merge. After the merge, an open PR still needs a rebase onto
+the new `main` before its head runs the new job; Dependabot rebases its own PRs when
+`main` moves (or comment `@dependabot rebase`).
+
 ## Notes
 
-- The 7 native napi targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs cross-compile with `napi build … -x` (cargo-zigbuild 0.23.0) — the `-x` flag makes `@napi-rs/cli` 3.8.6 run `cargo zigbuild` instead of `cargo build`; cargo-zigbuild 0.23.0 is installed by the SHA-pinned `taiki-e/install-action` (v2.86.3) with `fallback: none` placed BEFORE `Swatinem/rust-cache` (rust-cache deletes `~/.cargo/bin` binaries on save, so installing after cache would be wiped on a warm hit) and asserted after rust-cache and re-asserted after the build (napi's detector is presence-only — `cargo help zigbuild` — and silently runs an unpinned `cargo install cargo-zigbuild` when zigbuild is absent, reverting the pin); zig 0.16.0 via the SHA-pinned `mlugg/setup-zig`; cargo-zigbuild 0.23.0 owns the full linker-arg filter (`--fix-cortex-a53-843419`, `--no-undefined-version`, `-lgcc_s` to `-lunwind`, self-contained musl CRT skip, response files), its CI tests zig 0.16.0, and nothing in 0.23.2–0.23.4 touches x86_64/aarch64 musl — bumping zig OR cargo-zigbuild is a deliberate, paired decision; never set a musl linker export (`CARGO_TARGET_*_MUSL_LINKER`) — cargo-zigbuild's `add_env_if_missing` yields to a pre-set value and a leftover export would silently revert the migration; the version-keyed wrapper cache (`~/.cache/cargo-zigbuild/0.23.0/…`) is always fresh per version and is deliberately NOT cached (post-build presence proves cargo-zigbuild 0.23.0 ran in that job, not a prior version from cache); the readelf gate uses `ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'` with a planted `libunwind.so.1` positive control, and the Alpine load tests are the acceptance instrument for any linkage delta (a NEEDED soname Alpine does not ship is invisible to readelf — only a real `docker run node:22-alpine` catches it). Both musl addons are load-tested on `node:22-alpine` before anything publishes: the x64 load test is the last step of `stage-and-verify-napi` (placed after the staged artifact upload so the artifact is preserved even when the x64 test fails), and the arm64 load test runs in the separate unguarded `load-test-musl-arm64` job on a native `ubuntu-24.04-arm` runner using the `napi-staged` artifact. The fixture is `index.js` + `scripts/musl-load-probe.cjs` + only the musl platform package under `node_modules/@mdscript/`, so a pass is proof the loader's `isMusl()` returned true; a control fixture without the package must fail first (PF-013). `publish-crates` blocks on both via its `needs:` list AND its `if:` conjunct (PF-047). The readelf gate proves ELF metadata (no glibc soname) but not that the addon dlopens on Alpine — a NEEDED entry that Alpine does not ship (e.g. `libunwind.so.1`) is invisible to it; only a real load on `node:22-alpine` catches that (PF-038 shape). When the x64 load test fails, the arm64 job is skipped (its `if:` requires `stage-and-verify-napi` to succeed) and both tests are re-run together after the fix. The container runs with `-w /w` because `node:22-alpine` has no `WORKDIR` and mds-core rejects a filesystem-root base directory (#371, surfaced by this gate's first run on PR #370); `musl-load-probe.cjs` asserts `process.cwd() === '/w'` so a dropped flag fails loudly.
+- The 7 native napi targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs cross-compile with `napi build … -x` (cargo-zigbuild 0.23.0) — the `-x` flag makes `@napi-rs/cli` 3.8.6 run `cargo zigbuild` instead of `cargo build`; cargo-zigbuild 0.23.0 is installed by the SHA-pinned `taiki-e/install-action` (v2.86.3) with `fallback: none` placed BEFORE `Swatinem/rust-cache` (rust-cache deletes `~/.cargo/bin` binaries on save, so installing after cache would be wiped on a warm hit) and asserted after rust-cache and re-asserted after the build (napi's detector is presence-only — `cargo help zigbuild` — and silently runs an unpinned `cargo install cargo-zigbuild` when zigbuild is absent, reverting the pin); zig 0.16.0 via the SHA-pinned `mlugg/setup-zig`; cargo-zigbuild 0.23.0 owns the full linker-arg filter (`--fix-cortex-a53-843419`, `--no-undefined-version`, `-lgcc_s` to `-lunwind`, self-contained musl CRT skip, response files), its CI tests zig 0.16.0, and nothing in 0.23.2–0.23.4 touches x86_64/aarch64 musl — bumping zig OR cargo-zigbuild is a deliberate, paired decision; never set a musl linker export (`CARGO_TARGET_*_MUSL_LINKER`) — cargo-zigbuild's `add_env_if_missing` yields to a pre-set value and a leftover export would silently revert the migration; the version-keyed wrapper cache (`~/.cache/cargo-zigbuild/0.23.0/…`) is always fresh per version and is deliberately NOT cached (post-build presence proves cargo-zigbuild 0.23.0 ran in that job, not a prior version from cache); the readelf gate uses `ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'` with a planted `libunwind.so.1` positive control, and the Alpine load tests are the acceptance instrument for any linkage delta (a NEEDED soname Alpine does not ship is invisible to readelf — only a real `docker run node:22-alpine` catches it). Both musl addons are load-tested on `node:22-alpine` before anything publishes: the x64 load test is the last step of `stage-and-verify-napi` (placed after the staged artifact upload so the artifact is preserved even when the x64 test fails), and the arm64 load test runs in the separate unguarded `load-test-musl-arm64` job on a native `ubuntu-24.04-arm` runner using the `napi-staged` artifact. The fixture is `index.js` + `scripts/musl-load-probe.cjs` + only the musl platform package under `node_modules/@mdscript/`, so a pass is proof the loader's `isMusl()` returned true; a control fixture without the package must fail first (PF-013). `publish-crates` blocks on both via its `needs:` list AND its `if:` conjunct (PF-047). The readelf gate proves ELF metadata (no glibc soname) but not that the addon dlopens on Alpine — a NEEDED entry that Alpine does not ship (e.g. `libunwind.so.1`) is invisible to it; only a real load on `node:22-alpine` catches that (PF-038 shape). When the x64 load test fails, the arm64 job is skipped (its `if:` requires `stage-and-verify-napi` to succeed) and both tests are re-run together after the fix. The container runs with `-w /w`: `node:22-alpine` has no `WORKDIR`, and its default cwd of `/` made every mds-core string compile fail until #371 was fixed (surfaced by this gate's first run on PR #370). The flag is kept as a regression tripwire — `musl-load-probe.cjs` asserts `process.cwd() === '/w'`, so a dropped flag fails loudly.
 - The 8 Python artifacts (7 `cp311-abi3` wheels + 1 sdist): manylinux x86_64 and aarch64, musllinux_1_2 x86_64 and aarch64, macOS x86_64 and arm64, Windows x86_64, plus one source distribution. Built by `PyO3/maturin-action@v1.51.0` (maturin 1.13.3). The musl and manylinux legs run inside Docker containers that maturin-action manages; the readelf linkage gate asserts the `.so` inside each Linux wheel links the correct libc (musl or glibc), with a positive control and a non-vacuity guard (PF-038). Platform wheels cannot be built or validated locally — use the branch dry-run workflow instead.
 - wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...] is enabled in crates/mds-wasm/Cargo.toml; CI installs wasm-pack and Binaryen v129 via the composite action at .github/actions/setup-wasm/ (version pins live there). Local builds do not need system Binaryen — wasm-pack auto-downloads wasm-opt (v117) on first use; install Binaryen v129+ (brew install binaryen / apt install binaryen) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer.
 - Platform packages are generated in CI only — they cannot be validated with a local npm pack; use the dry-run workflow instead.

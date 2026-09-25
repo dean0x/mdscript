@@ -20,36 +20,57 @@ const MAX_PATH_SEGMENTS: usize = 256;
 
 /// Filesystem abstraction for module resolution.
 ///
-/// Implementations provide path normalization, file reading, and file-type
-/// detection. Security properties (symlink rejection, traversal prevention)
-/// are implementation-specific: [`NativeFs`] enforces them for OS access,
-/// while [`VirtualFs`] relies on its closed key-space.
+/// Implementations provide entry and import path resolution, base-directory
+/// anchoring, file reading, and file-type detection. Security properties
+/// (symlink rejection, traversal prevention) are implementation-specific:
+/// [`NativeFs`] enforces them for OS access, while [`VirtualFs`] relies on its
+/// closed key-space.
 ///
 /// # Security Contract
 ///
-/// Custom implementations provided via [`crate::resolver::ModuleCache::with_fs`]
-/// MUST uphold the following minimum obligations:
+/// The resolver ([`crate::resolver::ModuleCache`]) checks every path a caller
+/// supplies before any backend method sees it, so these refusals cover a custom
+/// backend passed to [`crate::resolver::ModuleCache::with_fs`] as well as the
+/// built-in ones:
 ///
+/// - an entry path or virtual entry key that is empty, contains `\0`, or carries
+///   a [`crate::is_forbidden_path_char`] codepoint is refused with `mds::io` before
+///   [`FileSystem::resolve_entry`] is called;
+/// - an import string that is not `./`/`../`-relative, contains `\0`, or carries
+///   a forbidden codepoint is refused with `mds::import` before
+///   [`FileSystem::normalize_in_dir`] is called;
+/// - a base directory carrying a forbidden codepoint is refused with `mds::io`
+///   before [`FileSystem::anchor_base_dir`] is called.
+///
+/// These are pinned for a custom backend by the `custom_backend_never_sees_a_*`
+/// tests in `crates/mds-core/tests/forbidden_path_chars.rs` and
+/// `custom_backend_entry_validation_runs_before_backend` in
+/// `crates/mds-core/tests/api_surface.rs`.
+///
+/// A custom implementation MUST uphold the rest itself:
+///
+/// - **Forbidden path characters** (#265): every path the backend produces — a
+///   key it rewrites, a symlink it follows, a canonical form it computes — MUST be
+///   refused when it carries a codepoint for which [`crate::is_forbidden_path_char`]
+///   returns `true`. The resolver never sees those paths, so this is the one check
+///   it cannot make on the backend's behalf. [`NativeFs`] scans every canonical path
+///   it resolves (`mds::io`); [`VirtualFs`] composes its keys only from entry keys,
+///   import strings and base directories the resolver has already checked.
 /// - **Path traversal prevention**: `resolve_entry` and `normalize_in_dir` must
 ///   reject paths that escape the intended root (e.g., `../../../etc/passwd`).
-/// - **Null-byte rejection**: `normalize_in_dir` must reject paths containing
-///   `\0`. The resolver refuses an entry path containing `\0` before
-///   `resolve_entry` is called.
-/// - **Forbidden path characters** (#265): a path carrying any
-///   [`crate::is_forbidden_path_char`] codepoint is refused. The resolver refuses
-///   such an import string (`mds::import`), entry path or base directory
-///   (`mds::io`) before the backend is called; a backend that resolves symlinks or
-///   otherwise rewrites paths must apply the predicate to the path it resolves.
+/// - **Direct calls**: `resolve_entry` and `normalize_in_dir` must refuse an empty
+///   path and one containing `\0` or a forbidden path character even when called
+///   directly rather than through the resolver, as both built-in backends do.
 /// - **Segment cap**: `resolve_entry` and `normalize_in_dir` must refuse a path
-///   of more than 256 segments with [`MdsError::ResourceLimit`].
+///   of more than 256 segments with [`MdsError::ResourceLimit`]. Both built-in
+///   backends enforce it on entry paths and on imports.
 /// - **File size limits**: `read` must refuse content larger than
 ///   [`crate::MAX_FILE_SIZE`] bytes (10 MB) to prevent resource exhaustion.
-/// - **Input sanitization**: `normalize_in_dir` must reject empty paths. The
-///   resolver refuses an empty entry path before `resolve_entry` is called.
 /// - **Base directories**: a backend whose keys are host paths must override
-///   `anchor_base_dir` to validate the base directory of a string compile and
-///   establish the containment root there; the default passes it through
-///   unchanged and anchors nothing.
+///   `anchor_base_dir` to validate the base directory of a string compile —
+///   refusing a symlinked final component and a canonical form that carries a
+///   forbidden path character — and establish the containment root there; the
+///   default returns the directory unchanged and anchors nothing.
 /// - **`dir == ""`** (empty string) in `normalize_in_dir` means "virtual root" or
 ///   "no directory prefix" — resolve `relative` from the root of the key-space.
 ///
@@ -372,8 +393,9 @@ impl FileSystem for VirtualFs {
     /// Return the entry key unchanged.
     ///
     /// The key is not rewritten (no `.`/`..` collapsing): it must match a key of
-    /// the module map exactly. Rejects empty keys and null bytes (`mds::io`) and
-    /// keys of more than 256 segments.
+    /// the module map exactly. Rejects an empty key and one containing a null byte
+    /// or another [`crate::is_forbidden_path_char`] codepoint (`mds::io`), and keys
+    /// of more than 256 segments (`mds::resource_limit`).
     fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
         validate_entry_path(path)?;
         check_segment_count(path)?;
@@ -652,10 +674,11 @@ impl NativeFs {
     /// Resolve `relative` within `dir` (given as a `&Path`) using the established
     /// security primitives — no `Path`→`String`→`Path` round-trip on the hot path.
     ///
-    /// Validates `relative` (null-byte, empty, segment cap), joins with `dir` via
-    /// `Path::join` (verbatim-path-safe on Windows; avoids PF-003 / #133), then runs
-    /// `check_symlink` and `check_path_traversal` before returning the canonical
-    /// key string.
+    /// Validates `relative` (empty, null byte, forbidden path characters, segment
+    /// cap), joins with `dir` via `Path::join` (verbatim-path-safe on Windows;
+    /// avoids PF-003 / #133), then runs `check_symlink_named` (which also refuses a
+    /// forbidden character anywhere in the canonical path) and
+    /// `check_path_traversal` before returning the canonical key string.
     ///
     /// Does NOT call `init_root` — only entry-point resolution
     /// ([`FileSystem::resolve_entry`]) anchors the security root.

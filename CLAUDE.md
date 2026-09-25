@@ -8,6 +8,10 @@ Composable LLM prompt template compiler. Rust core (`crates/`) with WASM, native
 cargo test --workspace                        # 590+ Rust tests
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps   # CI rustdoc gate: catches broken intra-doc links
+# Windows local twin — clippy only (cannot link/run). Windows tests run only in the
+# `rust-windows` CI job (`Rust — clippy, test (windows-latest)`):
+rustup target add x86_64-pc-windows-msvc
+cargo clippy -p mds-core -p mds-cli --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 npm ci && npm run build -w @mdscript/mds-wasm && npm run build --workspaces --if-present
 # The native addon is NOT built by `--workspaces` (its script is `build:native`, not
 # `build`); needs the Rust toolchain. Without it @mdscript/mds silently falls back to WASM.
@@ -46,6 +50,8 @@ See @RELEASING.md for the full runbook.
 - `cargo publish -p mds-cli --dry-run` fails locally because mds-cli has a path+version dep on mds-core — this is expected; CI publishes mds-core first
 - `scripts/verify-napi-names.mjs` (A3 gate) is critical — if the hand-written `crates/mds-napi/index.js` loader drifts from generated platform packages, the universal package silently fails to load native binaries at runtime
 - Stale `.node` files silently serve old behavior — `crates/mds-napi/` can hold multiple addon vintages (`mds-napi.node` from `build:native`, platform-suffixed `mds-napi.<triple>.node` from `napi build --platform`), and the test harness loads the base `mds-napi.node` by name. After any Rust change, rebuild with `npm run build:native -w @mdscript/mds-napi` or the suite exercises an old binary (PF-035)
+- Stale WASM is the same trap: `@mdscript/mds`'s Node WASM backend loads `crates/mds-wasm/pkg/` FIRST (`packages/mds/src/backend/wasm.ts`), the directory `wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg` (the WASM-size measurement) writes — not `packages/mds-wasm/dist/`. After any Rust change, rebuild `pkg/` from the current tree before `npm test`
+- Never share `target/` (or `CARGO_TARGET_DIR`) between two source trees — worktrees or exported old commits: cargo reuses the other tree's artifacts, reports a false-fresh build, and before/after comparisons (WASM sizes included) read identical. Give each tree its own target dir
 - `NPM_CONFIG_ACCESS=public` is required for first-time publishes of scoped `@mdscript/*` packages with provenance
 - `debug-panics` Cargo feature must never ship enabled (all three binding crates) — it attaches raw panic payloads (may contain filesystem paths) to errors
 - `startup-race-probe` Cargo feature (`mds-cli`) must never ship enabled — it injects a 200 ms sleep into `mds watch` startup as the positive control for the arm-before-publish ordering (#317). It is non-default, but `mds-cli` publishes to crates.io, so `cargo install mds-cli --features startup-race-probe` would ship the delay to a user. It is exercised only by the `Watch startup race (probe)` CI job

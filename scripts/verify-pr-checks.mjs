@@ -35,14 +35,16 @@
  *                                (TIER_B_EXPECTED_SKIPPED + D-PR8 suite keying).
  *   Tier C  (legacy statuses):   advisory unless the context is required
  *
- * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing even though
- * they are not (yet) in branch protection. Currently: all five non-required CI jobs —
- * 'Source hygiene' (control-byte gate, #288), 'Python — build & test',
- * 'examples/ gitignore coverage', 'Python — wheel install smoke', and
- * 'Rust — clippy, test (windows-latest)' (#147, the Windows Rust leg). Tier B alone
- * cannot make them binding because Tier B only iterates runs that ALREADY EXIST;
- * an absent job has nothing to iterate. Tier A+ fills this gap by asserting presence
- * (applies ADR-009, avoids PF-013: absence is never evidence of success).
+ * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing whether or
+ * not branch protection lists them — the local mirror of the required set, so a job
+ * is binding from the PR that adds it, before protection is PATCHed to require it
+ * (RELEASING.md "Adding a required CI context"). Currently five: 'Source hygiene'
+ * (control-byte gate, #288), 'Python — build & test', 'examples/ gitignore coverage',
+ * 'Python — wheel install smoke', and 'Rust — clippy, test (windows-latest)' (#147,
+ * the Windows Rust leg). Tier B alone cannot make them binding because Tier B only
+ * iterates runs that ALREADY EXIST; an absent job has nothing to iterate. Tier A+
+ * fills this gap by asserting presence (applies ADR-009, avoids PF-013: absence is
+ * never evidence of success).
  * Matrix jobs are matched by prefix: 'Python — build & test' matches any run whose
  * name starts with 'Python — build & test ('.
  *
@@ -144,7 +146,8 @@ const MIN_GH_MINOR = 31;
 /**
  * D-PR3b: Locally-expected contexts — enforced with Tier A semantics regardless
  * of whether they appear in branch protection. An absent job is FAIL, not
- * advisory (applies ADR-009, avoids PF-013).
+ * advisory (applies ADR-009, avoids PF-013). A new required ci.yml job is added
+ * here first, in the PR that adds it (RELEASING.md "Adding a required CI context").
  *
  * Each entry is the job-level `name:` field from .github/workflows/ci.yml.
  * Matrix jobs (e.g. 'Python — build & test') are matched by prefix: any

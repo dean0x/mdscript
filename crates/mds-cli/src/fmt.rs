@@ -299,8 +299,8 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     const MAX_DEPTH: usize = 64;
 
     // Validate mds.json even though `fmt` doesn't act on its `fmt` section's
-    // content yet — consistent with build/check, which also fail loudly on a
-    // malformed config rather than silently ignoring it.
+    // content yet — consistent with build, lint and watch, which also fail loudly
+    // on a malformed config rather than silently ignoring it.
     let _ = load_config(dir)?;
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
