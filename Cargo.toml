@@ -3,7 +3,7 @@ members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm", "crates/mds-n
 resolver = "2"
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 rust-version = "1.88" # napi 3.12.2 sets rust-version = "1.88" in its published Cargo.toml
 license = "MIT"
