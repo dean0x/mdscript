@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A base directory at the filesystem root (`/`, or a Windows drive root) now anchors resolution AT the root instead of silently falling back to the current working directory. This fixed `mds::compile_str_with`/`check_str_with`/`lint_str_with`, CLI stdin (`mds build/check/lint -`) whose implicit base directory is the process cwd, the napi and Python bindings' `basePath`/`base_path` options, and the `@mdscript/mds` native backend's default — all of which previously failed with `cannot resolve path /: file not found: /` whenever the base directory resolved to a filesystem root (found by the release pipeline's Alpine load test, whose container has no `WORKDIR` and therefore a cwd of `/`, #371). `mds lint`/`mds fmt` on a file that lives directly at the filesystem root no longer silently downgrades to the weaker structural-equivalence fallback either — the fix lets the strong compile-and-diff safety gate run as intended.
+
 ### Internal
 
 - Added a `rust-windows` CI job (`Rust — clippy, test (windows-latest)`) that runs `cargo clippy --workspace --all-targets` and `cargo test --workspace` on `windows-latest`, and registered it in `scripts/verify-pr-checks.mjs`'s `EXPECTED_CONTEXTS` so the pre-merge verifier requires it. Fixed the Windows portability gaps it surfaced: `mds-core`'s `fs.rs` unit tests now create symlinks through a cross-platform `make_symlink` helper (skipping only on an unprivileged Windows without `CI` set, never silently), a Windows-only dead-code helper in `mds-cli`'s `dir_build.rs` test suite is now `#[cfg(unix)]`, and `source_path.rs`'s platform-conditional path-component comparison was restructured into one shared `comp_eq` helper (#147).

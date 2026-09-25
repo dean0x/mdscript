@@ -361,6 +361,105 @@ fn stdin_mode_report_only_sends_diagnostics_to_stderr() {
     );
 }
 
+// ── #371: filesystem-root base dir ───────────────────────────────────────────
+
+#[test]
+fn stdin_lint_with_root_cwd_succeeds() {
+    // #371: `mds lint -` with no explicit base_dir resolves it from cwd. A
+    // process whose cwd IS the filesystem root must not fail to lint.
+    let out = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            let _ = child.stdin.take().unwrap().write_all(b"Hello World!\n");
+            child.wait_with_output()
+        })
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "lint stdin with cwd=/ should exit 0 for clean input; stderr: {stderr}"
+    );
+}
+
+/// #371 (Windows-only): `mds lint`/`mds fmt` on a file that lives at a REAL
+/// drive root (not just a subdirectory) must exercise the fixed root-anchor
+/// path in `NativeFs::canonicalize`/`canonical_dir`, not the cwd-trap bug.
+/// A writable filesystem root isn't available on CI/macOS/Linux (`/` isn't
+/// writable there), so this test uses Windows' `subst` to mount a tempdir as
+/// a drive root -- the only way to get a real, writable root on this
+/// platform. It does not exist on unix (there is no portable, writable
+/// filesystem root to mount there) rather than being `#[ignore]`d, per the
+/// gating rule: gate only when the behavior genuinely doesn't exist on the
+/// platform, never to hide a product bug.
+#[cfg(windows)]
+#[test]
+fn windows_lint_and_fmt_at_real_drive_root() {
+    use std::process::Command;
+
+    /// Always `subst <letter>: /D` on drop, even if an assertion panics.
+    struct SubstGuard(char);
+    impl Drop for SubstGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("subst")
+                .args([&format!("{}:", self.0), "/D"])
+                .output();
+        }
+    }
+
+    // Pick the first free drive letter, scanning from Z downward.
+    let letter = ('A'..='Z')
+        .rev()
+        .find(|c| !std::path::Path::new(&format!("{c}:\\")).exists())
+        .expect("at least one free drive letter must exist");
+
+    let dir = tempfile::tempdir().unwrap();
+    let status = Command::new("subst")
+        .args([&format!("{letter}:"), dir.path().to_str().unwrap()])
+        .status()
+        .expect("subst must be available on Windows");
+    assert!(status.success(), "subst must succeed to map a drive root");
+    let _guard = SubstGuard(letter);
+
+    let file_path = format!("{letter}:\\root.mds");
+    std::fs::write(&file_path, "Hello   \r\n\r\n\r\nworld\r\n").unwrap();
+
+    // `mds lint` on a file at the drive root must succeed -- no crash from
+    // the cwd trap when anchoring the security root at the drive root.
+    let lint_output = mds_bin()
+        .args(["lint", &file_path])
+        .output()
+        .expect("run mds lint");
+    assert!(
+        lint_output.status.success(),
+        "lint at a real drive root should succeed; stderr: {}",
+        String::from_utf8_lossy(&lint_output.stderr)
+    );
+
+    // `mds fmt` on the same file must take the strong compile-equivalence
+    // path (not silently downgrade to the structural fallback) and succeed.
+    let fmt_output = mds_bin()
+        .args(["fmt", &file_path])
+        .output()
+        .expect("run mds fmt");
+    assert!(
+        fmt_output.status.success(),
+        "fmt at a real drive root should succeed; stderr: {}",
+        String::from_utf8_lossy(&fmt_output.stderr)
+    );
+    let formatted = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        formatted, "Hello   \n\n\nworld\n",
+        "fmt at a real drive root must apply R1/R2 exactly like anywhere else"
+    );
+}
+
 // ── L-CLI-STDIN2: --fix stdin ────────────────────────────────────────────────
 
 #[test]

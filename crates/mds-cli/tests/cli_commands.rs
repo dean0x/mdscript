@@ -27,6 +27,35 @@ fn check_stdin_valid() {
 }
 
 #[test]
+fn check_stdin_with_root_cwd_succeeds() {
+    // #371: `mds check -` with no explicit base_dir resolves it from cwd. A
+    // process whose cwd IS the filesystem root must not fail to check.
+    let mut child = mds_bin()
+        .args(["check", "-"])
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "check stdin with cwd=/ should succeed for valid input; stderr: {stderr}"
+    );
+}
+
+#[test]
 fn check_invalid_exits_nonzero() {
     let output = mds_bin()
         .args(["check", fixture("undefined_var.mds").to_str().unwrap()])

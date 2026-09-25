@@ -1561,8 +1561,10 @@ describe('B3a: Alpine musl load tests (#340)', () => {
     );
     assert.ok(
       !missingNetwork.includes('-w /w'),
-      'S21/PC-G: a step text missing -w /w must be detectable — a root cwd trips the ' +
-      'mds-core base-directory defect (#371, PF-013, #340)',
+      'S21/PC-G: a step text missing -w /w must be detectable — the flag now guards a ' +
+      'fixed defect (#371: a root cwd used to trip the mds-core base-directory bug; ' +
+      'NativeFs::canonical_dir fixed it, and -w /w stays as a regression tripwire; ' +
+      'PF-013, #340)',
     );
 
     // S21/PC-H: extractNeeds strips comment lines before matching (hardening).

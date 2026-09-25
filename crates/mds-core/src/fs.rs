@@ -358,6 +358,54 @@ impl NativeFs {
         Self::check_symlink_named(path, &path.display().to_string())
     }
 
+    /// Canonicalize a directory path, handling the filesystem-root edge case (#371).
+    ///
+    /// A filesystem root (`/` on Unix, or a drive root such as `C:\` on
+    /// Windows) has no parent component, so `check_symlink_named`'s
+    /// parent-then-child double-canonicalize dance — which canonicalizes the
+    /// PARENT directory before joining the final path component — has no
+    /// parent to canonicalize; `Path::file_name()` returns `None` for a root,
+    /// so `check_symlink_named` fails immediately with `FileNotFound`, before
+    /// any syscall (`#371`).
+    ///
+    /// Detect that case via `path.has_root() && path.parent().is_none()` and
+    /// canonicalize the root directly instead: a filesystem root can never
+    /// itself be a symlink (there is nothing "above" it to substitute it
+    /// with), so a plain `canonicalize()` plus an `is_dir()` check is
+    /// sufficient and correct. Every other path — including a file that
+    /// happens to live directly under a root, like `/x.mds`, whose
+    /// `parent()` is `Some("/")`, not `None` — still goes through the
+    /// unchanged `check_symlink_named` path.
+    ///
+    /// Deliberately never calls [`effective_parent`] on the root branch:
+    /// `effective_parent` exists to map a BARE FILENAME's empty parent to
+    /// `"."` (current working directory) so single-segment relative paths
+    /// resolve. A root path's absent parent means something different —
+    /// there is no parent because the root IS the top of the filesystem —
+    /// and mapping it to `"."` would silently re-anchor resolution at the
+    /// current working directory instead of the root the caller asked for
+    /// (the cwd trap, #371).
+    ///
+    /// A base directory of `/` (or a drive root) is intended, supported
+    /// behavior, not a privilege escalation: the base directory is always
+    /// caller-chosen, and this function only proves the path exists and is a
+    /// directory — it grants no access beyond what the caller already had.
+    fn canonical_dir(path: &Path, shown: &str) -> Result<PathBuf, MdsError> {
+        if path.has_root() && path.parent().is_none() {
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| MdsError::io(format!("cannot resolve path {shown}: {e}")))?;
+            if !canonical.is_dir() {
+                return Err(MdsError::io(format!(
+                    "cannot resolve path {shown}: not a directory"
+                )));
+            }
+            Ok(canonical)
+        } else {
+            Self::check_symlink_named(path, shown)
+        }
+    }
+
     /// Walk up from a directory to find the project root.
     ///
     /// Looks for `.git` or `.mdsroot` markers.
@@ -542,15 +590,21 @@ impl FileSystem for NativeFs {
     }
 
     fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
-        // Use check_symlink() rather than std::fs::canonicalize() directly so that
-        // symlinked directories are rejected before they can re-anchor the security
-        // root to an attacker-controlled location (issue #21).
+        // Delegate to canonical_dir() rather than calling check_symlink()
+        // directly so that a filesystem-root path (`/`, a Windows drive root)
+        // is handled correctly instead of hitting the `path.file_name() ==
+        // None` cwd trap (#371) — see canonical_dir's doc comment.
         //
-        // check_symlink() returns ImportError (symlink detected) or FileNotFound
-        // (path does not exist). ImportError passes through; FileNotFound is
-        // re-wrapped as Io because canonicalize is a resolution operation, not
-        // an import step.
-        Self::check_symlink(Path::new(path))
+        // For every other path, canonical_dir is exactly check_symlink_named,
+        // so symlinked directories are still rejected before they can
+        // re-anchor the security root to an attacker-controlled location
+        // (issue #21).
+        //
+        // canonical_dir returns ImportError (symlink detected), FileNotFound
+        // (path does not exist), or an already-Io error (root branch).
+        // ImportError and Io pass through; FileNotFound is re-wrapped as Io
+        // because canonicalize is a resolution operation, not an import step.
+        Self::canonical_dir(Path::new(path), path)
             .map(|p| p.display().to_string())
             .map_err(|e| match e {
                 MdsError::ImportError { .. } => e,
@@ -1113,6 +1167,43 @@ mod tests {
         assert!(
             matches!(err, MdsError::Io { .. }),
             "expected Io error for nonexistent path, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn native_canonicalize_root_returns_root_not_cwd() {
+        // #371 cwd trap regression: canonicalize() on a filesystem root must
+        // anchor AT the root, never silently fall back to the current working
+        // directory. A naive fix that funneled the root case through
+        // `effective_parent` (which maps an absent/empty parent to ".") would
+        // reintroduce exactly this bug.
+        //
+        // The root is obtained portably -- the topmost ancestor of a real
+        // tempdir path -- so this runs unchanged on the Windows CI leg (a
+        // drive root there, `/` on Unix), never a hardcoded "/".
+        //
+        // The test process's cwd during `cargo test`/nextest is the crate
+        // directory, never the filesystem root, so this naturally exercises
+        // "cwd != root" without mutating global process state (which would
+        // race other tests running in parallel).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().ancestors().last().unwrap().to_path_buf();
+        let cwd = std::env::current_dir().unwrap();
+        assert_ne!(cwd, root, "test assumption: cwd is not the filesystem root");
+
+        let fs = NativeFs::new();
+        let result = fs.canonicalize(&root.display().to_string());
+        let canonical = result.expect("canonicalize should succeed for a filesystem root");
+
+        assert_eq!(
+            Path::new(&canonical),
+            root.as_path(),
+            "canonicalize(root) must return the root itself, got: {canonical}"
+        );
+        assert_ne!(
+            Path::new(&canonical),
+            cwd.as_path(),
+            "canonicalize(root) must not resolve to cwd, got: {canonical}"
         );
     }
 

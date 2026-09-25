@@ -989,4 +989,47 @@ mod tests {
              (clean_output is interior-verbatim; a 3-newline run != 2-newline run)"
         );
     }
+
+    // ── #371: filesystem-root base dir must not downgrade the safety gate ──
+
+    #[test]
+    fn fmt_root_base_dir_takes_compile_path() {
+        // A root base dir must let `assert_equivalent`'s strong compile-and-
+        // diff path run (the `Ok(orig) => ...` arm, which recompiles both the
+        // original and formatted strings and diffs their real output), not
+        // silently downgrade to the weaker `structural_equivalent` fallback
+        // reserved for sources that genuinely fail to compile standalone
+        // (the `Err(_) => ...` arm).
+        //
+        // Which arm runs is gated entirely by whether
+        // `compile_str_collecting_warnings(source, base_dir, None)` succeeds.
+        // Before the #371 fix, `NativeFs::canonicalize("/")` always errored
+        // (`check_symlink_named` calls `path.file_name()`, which is `None`
+        // for a filesystem root) -- so EVERY format call whose base_dir
+        // resolved to a root, even for a perfectly valid template, took the
+        // structural fallback instead of the real compile-equivalence check.
+        //
+        // Root obtained portably (a tempdir's topmost ancestor), matching
+        // every other root-base-dir test in this crate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().ancestors().last().unwrap();
+        let source = "Hello world\n";
+
+        // This is exactly the call assert_equivalent makes to decide which
+        // branch to take (formatter.rs's `assert_equivalent`, `Ok(orig) =>`
+        // vs `Err(_) =>`). If it errs, formatting silently downgrades.
+        let compiled = crate::compile_str_collecting_warnings(source, Some(root), None);
+        assert!(
+            compiled.is_ok(),
+            "compile with a root base_dir should succeed so the formatter's \
+             safety gate takes the strong compile-equivalence path, not the \
+             structural fallback: {compiled:?}"
+        );
+
+        // And the public API surface reflects the same: formatting must
+        // succeed and be a no-op on already-clean source.
+        let formatted = format_str_with(source, Some(root))
+            .expect("format_str_with with a root base_dir must succeed");
+        assert_eq!(formatted, source);
+    }
 }

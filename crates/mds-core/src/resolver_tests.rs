@@ -3766,3 +3766,95 @@ fn r3_map_mode_eval_diagnostic_display_is_root_relative() {
         "map-mode diagnostic label must never be absolute; got: {name}"
     );
 }
+
+// ── #371: filesystem-root base dir ────────────────────────────────────────
+//
+// A base directory that IS the filesystem root (`/` on Unix, a drive root
+// like `C:\` on Windows) must anchor resolution AT the root, never silently
+// fall back to the current working directory. The root is obtained portably
+// via a tempdir's topmost ancestor -- never a hardcoded "/" -- so these tests
+// run unchanged on the Windows CI leg (#147).
+//
+// Before the #371 fix, `NativeFs::canonicalize` routed every path (including
+// the root) through `check_symlink_named`, whose first step is
+// `path.file_name()` -- `None` for a root path -- so ANY string
+// compile/check/lint call whose base_dir resolved to the root failed with
+// "cannot resolve path /: file not found: /" before a single syscall ran.
+
+#[test]
+fn compile_str_with_root_base_dir_no_imports_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().ancestors().last().unwrap();
+    let result = crate::compile_str_with("Hello world\n", Some(root), None);
+    assert!(
+        result.is_ok(),
+        "compile_str_with with a root base_dir and no imports must succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn check_str_with_root_base_dir_no_imports_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().ancestors().last().unwrap();
+    let result = crate::check_str_with("Hello world\n", Some(root), None);
+    assert!(
+        result.is_ok(),
+        "check_str_with with a root base_dir and no imports must succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn lint_str_with_root_base_dir_no_imports_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().ancestors().last().unwrap();
+    let result = crate::lint_str_with(
+        "Hello world\n",
+        Some(root),
+        None,
+        &crate::LintConfig::default(),
+    );
+    assert!(
+        result.is_ok(),
+        "lint_str_with with a root base_dir and no imports must succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn import_through_root_base_dir_resolves() {
+    // A real @import, resolved through a base_dir that IS the filesystem
+    // root, using a canonicalized tempdir path stripped down to a
+    // root-relative import string -- the shape any real root-anchored
+    // compile hits (e.g. `docker run` with no WORKDIR set, cwd == "/").
+    //
+    // Both `root` and `canonical_lib` are derived from `canonicalize()`
+    // output (never a mix of canonical and non-canonical forms): on Windows,
+    // `canonicalize()` returns a verbatim (`\\?\`) path, and stripping a
+    // non-verbatim root from a verbatim file path would fail to find a
+    // common prefix.
+    let dir = tempfile::TempDir::new().unwrap();
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("tempdir must canonicalize");
+    let root = canonical_dir.ancestors().last().unwrap().to_path_buf();
+
+    let lib_path = dir.path().join("lib.mds");
+    std::fs::write(&lib_path, "@define greet(x):\nHello {{x}}!\n@end\n").unwrap();
+    let canonical_lib = lib_path
+        .canonicalize()
+        .expect("temp file must canonicalize");
+
+    let relative = canonical_lib
+        .strip_prefix(&root)
+        .expect("a filesystem root is a prefix of every absolute path under it")
+        .to_str()
+        .expect("temp path must be valid UTF-8")
+        .replace(std::path::MAIN_SEPARATOR, "/");
+
+    let source = format!("@import \"./{relative}\"\n{{{{greet(\"World\")}}}}\n");
+    let output = crate::compile_str_with(&source, Some(&root), None)
+        .expect("compile through a root base_dir with a real import must succeed")
+        .into_markdown()
+        .expect("markdown output expected");
+    assert_eq!(output, "Hello World!\n");
+}

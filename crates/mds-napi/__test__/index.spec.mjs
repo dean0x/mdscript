@@ -1237,6 +1237,58 @@ describe('lint parity (AC-API-06 guard)', () => {
   });
 });
 
+// ── #371: filesystem-root base dir ────────────────────────────────────────────
+
+describe('#371: filesystem-root base dir', () => {
+  // A base directory that IS the filesystem root must resolve successfully,
+  // not fail with "cannot resolve path /: file not found: /" (the cwd trap
+  // in NativeFs::canonicalize, fixed core-side by NativeFs::canonical_dir).
+  // On Windows, "/" resolves to the root of the current drive -- this stays
+  // portable without hardcoding a drive letter.
+  test('#371: compile/check/lint with basePath "/" succeed', () => {
+    const result = compile('Hello World!\n', { basePath: '/' });
+    assert.equal(result.kind, 'markdown');
+    assert.equal(result.output, 'Hello World!\n');
+
+    assert.doesNotThrow(
+      () => check('Hello World!\n', { basePath: '/' }),
+      'check with basePath "/" should not throw',
+    );
+
+    const lintResult = lint('Hello World!\n', { basePath: '/' });
+    assert.deepEqual(lintResult.files, [], `expected no diagnostics, got: ${JSON.stringify(lintResult)}`);
+  });
+
+  // Proves the addon itself (not just an explicit basePath option) works
+  // when the HOST PROCESS's cwd is the filesystem root -- the exact shape
+  // that surfaced #371 in production: `docker run` on `node:22-alpine` sets
+  // no WORKDIR, so the process cwd is "/" and the implicit (no basePath)
+  // compile path resolves base_dir from cwd.
+  test('#371: addon compiles successfully when the process cwd is the filesystem root', () => {
+    const script =
+      `const addon = require(${JSON.stringify(ADDON_PATH)});` +
+      `const result = addon.compile('Hello World!\\n');` +
+      `if (result.output !== 'Hello World!\\n') { ` +
+      `throw new Error('unexpected output: ' + JSON.stringify(result.output)); }` +
+      `process.stdout.write('OK');`;
+
+    const proc = spawnSync(process.execPath, ['-e', script], {
+      cwd: '/',
+      encoding: 'utf-8',
+    });
+    assert.equal(
+      proc.status,
+      0,
+      `child process at cwd=/ should exit 0; stderr: ${proc.stderr}`,
+    );
+    assert.equal(
+      proc.stdout,
+      'OK',
+      `expected 'OK' from child process at cwd=/, got stdout: ${proc.stdout}`,
+    );
+  });
+});
+
 // ── Source map tests ──────────────────────────────────────────────────────────
 
 describe('source maps (F-SM)', () => {

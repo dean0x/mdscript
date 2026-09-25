@@ -537,9 +537,11 @@ jobs:
           # Go template braces on the next line, not an Actions expression (Actions interpolates only
           # the dollar form), same as the rehearsal job's digest print.
           docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
-          # node:22-alpine sets no WORKDIR; the default cwd is /; mds-core rejects a filesystem-root
-          # base directory (#371, found by this gate's first run); the workdir flag (-w) is set to /w
-          # (fixture dir, the shape any real non-root cwd has); probe asserts cwd; dropped flag exits 1.
+          # node:22-alpine sets no WORKDIR; the default cwd is /. This gate's first run
+          # surfaced mds-core rejecting a filesystem-root base directory (#371, since fixed:
+          # NativeFs::canonical_dir anchors a root base dir at the root instead of erroring).
+          # The workdir flag (-w) is still set to /w (fixture dir, the shape any real non-root
+          # cwd has) and kept as a regression tripwire: probe asserts cwd; dropped flag exits 1.
           # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
           # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
           if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -w /w -e NODE_PATH= -e NODE_OPTIONS= \
@@ -638,9 +640,11 @@ jobs:
           # Go template braces on the next line, not an Actions expression (Actions interpolates only
           # the dollar form), same as the rehearsal job's digest print.
           docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
-          # node:22-alpine sets no WORKDIR; the default cwd is /; mds-core rejects a filesystem-root
-          # base directory (#371, found by this gate's first run); the workdir flag (-w) is set to /w
-          # (fixture dir, the shape any real non-root cwd has); probe asserts cwd; dropped flag exits 1.
+          # node:22-alpine sets no WORKDIR; the default cwd is /. This gate's first run
+          # surfaced mds-core rejecting a filesystem-root base directory (#371, since fixed:
+          # NativeFs::canonical_dir anchors a root base dir at the root instead of erroring).
+          # The workdir flag (-w) is still set to /w (fixture dir, the shape any real non-root
+          # cwd has) and kept as a regression tripwire: probe asserts cwd; dropped flag exits 1.
           # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
           # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
           if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -w /w -e NODE_PATH= -e NODE_OPTIONS= \

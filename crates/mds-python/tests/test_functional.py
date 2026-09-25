@@ -58,6 +58,37 @@ def test_f4_empty_base_path_is_invalid_options() -> None:
     assert ei.value.code == "mds::invalid_options"
 
 
+# ── #371: filesystem-root base_dir ───────────────────────────────────────────
+#
+# A base_path that IS the filesystem root must resolve successfully, not fail
+# with "cannot resolve path /: file not found: /" (the cwd trap in
+# NativeFs::canonicalize, fixed core-side by NativeFs::canonical_dir). On
+# Windows, "/" resolves to the root of the current drive.
+
+
+def test_371_base_path_root_compile_check_lint_succeed() -> None:
+    r = m.compile("Hello World!\n", base_path="/")
+    assert r.kind == "markdown"
+    assert r.output == "Hello World!\n"
+
+    check_result = m.check("Hello World!\n", base_path="/")
+    assert check_result.warnings == []
+
+    lint_result = m.lint("Hello World!\n", base_path="/")
+    assert lint_result.to_dict()["files"] == []
+
+
+def test_371_root_cwd_compile_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Proves the addon works when the HOST PROCESS's cwd is the filesystem
+    # root -- the exact shape that surfaced #371 in production: `docker run`
+    # on `node:22-alpine` sets no WORKDIR, so the process cwd is "/" and the
+    # implicit (no base_path) compile path resolves base_dir from cwd.
+    monkeypatch.chdir("/")
+    r = m.compile("Hello World!\n")
+    assert r.kind == "markdown"
+    assert r.output == "Hello World!\n"
+
+
 # ── compile_file: str / PathLike, deps (F5) ─────────────────────────────────────
 
 
