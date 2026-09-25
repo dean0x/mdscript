@@ -322,6 +322,17 @@ fn apply_relative(mut anchor: Vec<String>, rel_parts: &[String]) -> Option<Vec<S
     Some(anchor)
 }
 
+/// True when two path components are equal, using platform case-sensitivity
+/// (ASCII case-insensitive on Windows, exact match elsewhere).
+#[cfg(windows)]
+fn comp_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+#[cfg(not(windows))]
+fn comp_eq(a: &str, b: &str) -> bool {
+    a == b
+}
+
 /// True when `path` component-wise starts with `prefix`.
 ///
 /// On Windows, component comparison is ASCII-case-insensitive.
@@ -329,16 +340,10 @@ fn starts_with_comps(path: &[String], prefix: &[String]) -> bool {
     if path.len() < prefix.len() {
         return false;
     }
-    #[cfg(windows)]
-    return path[..prefix.len()]
-        .iter()
-        .zip(prefix.iter())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b));
-    #[cfg(not(windows))]
     path[..prefix.len()]
         .iter()
         .zip(prefix.iter())
-        .all(|(a, b)| a == b)
+        .all(|(a, b)| comp_eq(a, b))
 }
 
 /// Compute the `/`-separated relative path from `from` to `to`.
@@ -350,17 +355,10 @@ fn starts_with_comps(path: &[String], prefix: &[String]) -> bool {
 /// absolute-path failure fallback is replaced with the basename fallback to
 /// close that leak path (build.rs:978 bug class).
 fn component_diff(from: &[String], to: &[String]) -> String {
-    #[cfg(windows)]
     let common = from
         .iter()
         .zip(to.iter())
-        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
-        .count();
-    #[cfg(not(windows))]
-    let common = from
-        .iter()
-        .zip(to.iter())
-        .take_while(|(a, b)| a == b)
+        .take_while(|(a, b)| comp_eq(a, b))
         .count();
 
     let ups = from.len() - common;

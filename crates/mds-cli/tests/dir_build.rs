@@ -53,6 +53,10 @@ fn build_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {
 
 /// Run `mds build <file>` on a single file. Same shape as [`build_dir`]; a separate
 /// helper so call sites stay honest about which input form is under test.
+///
+/// `#[cfg(unix)]`: its only caller, `build_non_utf8_path_exits_2_and_writes_no_map`,
+/// is itself Unix-only (constructs a non-UTF-8 filename via `OsStringExt`).
+#[cfg(unix)]
 fn build_file(path: &Path, extra_args: &[&str]) -> std::process::Output {
     mds_bin()
         .arg("build")

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- Added a `rust-windows` CI job (`Rust — clippy, test (windows-latest)`) that runs `cargo clippy --workspace --all-targets` and `cargo test --workspace` on `windows-latest`, and registered it in `scripts/verify-pr-checks.mjs`'s `EXPECTED_CONTEXTS` so the pre-merge verifier requires it. Fixed the Windows portability gaps it surfaced: `mds-core`'s `fs.rs` unit tests now create symlinks through a cross-platform `make_symlink` helper (skipping only on an unprivileged Windows without `CI` set, never silently), a Windows-only dead-code helper in `mds-cli`'s `dir_build.rs` test suite is now `#[cfg(unix)]`, and `source_path.rs`'s platform-conditional path-component comparison was restructured into one shared `comp_eq` helper (#147).
+
 ## [0.4.4] — 2026-09-25
 
 ### Changed

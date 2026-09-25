@@ -44,6 +44,55 @@ jobs:
       - name: Rustdoc (warnings are errors)
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps
 
+  # ---------------------------------------------------------------------------
+  # #147: Windows Rust CI leg. The `rust` job above only ever runs on
+  # ubuntu-latest, so a Windows-specific regression (path separators, symlink
+  # privilege, case-insensitive filesystem, CRLF line endings) was invisible
+  # until a user hit it. fmt and the intra-doc-link (rustdoc) gate stay
+  # ubuntu-only above — both are platform-independent checks, so running them
+  # here would be pure duplication, not new coverage.
+  #
+  # PF-036 local partial twin: there is no way to link or run the test suite
+  # for this target locally (macOS/Linux dev boxes can't execute a
+  # windows-msvc binary), so the closest local check is clippy-only, cross-
+  # compiled:
+  #   rustup target add x86_64-pc-windows-msvc
+  #   cargo clippy -p mds-core -p mds-cli --all-targets \
+  #     --target x86_64-pc-windows-msvc -- -D warnings
+  # That command cannot catch a test that merely fails to PASS at runtime (only
+  # this CI job can) — treat a local-clean cross-clippy as necessary, not
+  # sufficient.
+  # ---------------------------------------------------------------------------
+  rust-windows:
+    name: Rust — clippy, test (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # This repo has no .gitattributes, so git-for-windows' default
+      # core.autocrlf=true would rewrite checked-out LF line endings to CRLF —
+      # changing byte offsets/spans that the compiler and several tests assert
+      # on. Must run BEFORE checkout to take effect on this checkout.
+      - name: Disable line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
+        with:
+          components: clippy
+      # mds-python (pyo3, abi3-py311) links python3.lib at build time on
+      # Windows; a 3.11+ interpreter makes the pyo3 build deterministic (same
+      # rationale as the `rust` job above).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (includes doctests)
+        run: cargo test --workspace --no-fail-fast
+
   msrv:
     name: MSRV (Rust 1.88)
     runs-on: ubuntu-latest

@@ -36,9 +36,10 @@
  *   Tier C  (legacy statuses):   advisory unless the context is required
  *
  * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing even though
- * they are not (yet) in branch protection. Currently: all four non-required CI jobs —
+ * they are not (yet) in branch protection. Currently: all five non-required CI jobs —
  * 'Source hygiene' (control-byte gate, #288), 'Python — build & test',
- * 'examples/ gitignore coverage', and 'Python — wheel install smoke'. Tier B alone
+ * 'examples/ gitignore coverage', 'Python — wheel install smoke', and
+ * 'Rust — clippy, test (windows-latest)' (#147, the Windows Rust leg). Tier B alone
  * cannot make them binding because Tier B only iterates runs that ALREADY EXIST;
  * an absent job has nothing to iterate. Tier A+ fills this gap by asserting presence
  * (applies ADR-009, avoids PF-013: absence is never evidence of success).
@@ -159,6 +160,7 @@ export const EXPECTED_CONTEXTS = [
   'Python — build & test',       // matrix job; any run named 'Python — build & test (...)'
   'examples/ gitignore coverage',
   'Python — wheel install smoke',
+  'Rust — clippy, test (windows-latest)',
 ];
 
 // Tier B allowance (release pre-flight): release.yml's publish jobs are
