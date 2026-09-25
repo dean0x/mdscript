@@ -2220,16 +2220,57 @@ mod tests {
         assert_eq!(loaded.duplicate_keys_omitted, 3);
     }
 
+    /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
+    ///
+    /// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name and
+    /// contract (#147); duplicated rather than shared because that helper is
+    /// private to `fs.rs`'s own `mod tests` and this file's `mod tests` is a
+    /// separate module.
+    fn make_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+
+        match result {
+            Ok(()) => true,
+            Err(err) => {
+                #[cfg(windows)]
+                {
+                    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                    if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                        && std::env::var_os("CI").is_none()
+                    {
+                        eprintln!(
+                            "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
+                        );
+                        return false;
+                    }
+                }
+                panic!(
+                    "failed to create symlink {} -> {}: {err}",
+                    target.display(),
+                    link.display()
+                );
+            }
+        }
+    }
+
     /// Mirrors `security.rs:400-422` (mds-cli): the same symlink guard applies to
     /// the reporting variant, not just the pre-existing `load_vars_file`.
     #[test]
-    #[cfg(unix)]
     fn load_vars_file_reporting_duplicates_rejects_symlinked_path() {
         let dir = tempfile::tempdir().unwrap();
         let real_vars = dir.path().join("real_vars.json");
         std::fs::write(&real_vars, r#"{"name": "Alice"}"#).unwrap();
         let link_vars = dir.path().join("link_vars.json");
-        std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+        if !make_symlink(&real_vars, &link_vars) {
+            return;
+        }
 
         let result = load_vars_file_reporting_duplicates(&link_vars);
         assert!(

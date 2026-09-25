@@ -24,6 +24,56 @@ pub fn mds_bin() -> std::process::Command {
     cmd
 }
 
+/// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
+///
+/// Unix symlink creation needs no special privilege. On Windows it needs either
+/// Developer Mode or `SeCreateSymbolicLinkPrivilege` (an elevated process) —
+/// GitHub's `windows-latest` runners have Developer Mode enabled, so a failure
+/// there is a genuine regression and must panic. Locally, without that
+/// privilege, the OS reports `ERROR_PRIVILEGE_NOT_HELD` (raw error 1314); this
+/// helper treats exactly that failure as a skip (never a false pass) when the
+/// `CI` env var is unset, printing a one-line reason. Returns `false` when the
+/// caller should skip the rest of the test.
+///
+/// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name and
+/// contract (#147); duplicated rather than shared because `mds-core`'s helper
+/// is `cfg(test)`-private to that crate and each `mds-cli` integration test
+/// file compiles `tests/common/mod.rs` as its own module.
+#[allow(dead_code)]
+pub fn make_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            #[cfg(windows)]
+            {
+                const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                    && std::env::var_os("CI").is_none()
+                {
+                    eprintln!(
+                        "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
+                    );
+                    return false;
+                }
+            }
+            panic!(
+                "failed to create symlink {} -> {}: {err}",
+                target.display(),
+                link.display()
+            );
+        }
+    }
+}
+
 // ── Frontmatter YAML bounds builders (#162) ──────────────────────────────────
 
 /// Frontmatter size cap (1 MiB) — mirrors `mds-core`'s `MAX_FRONTMATTER_SIZE`.

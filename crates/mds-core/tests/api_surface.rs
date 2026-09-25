@@ -1326,6 +1326,10 @@ fn load_vars_str_feeds_compile_virtual() {
 }
 
 // ── Non-UTF-8 path rejection ──────────────────────────────────────────────────
+//
+// `#[cfg(unix)]` on all three: each constructs the hostile path via
+// `OsStrExt::from_bytes` (arbitrary bytes), a Unix-only API; Windows paths are
+// UTF-16 and have no equivalent construction from arbitrary bytes (#147).
 
 #[cfg(unix)]
 #[test]
@@ -1508,15 +1512,56 @@ fn compile_with_deps_messages_excludes_entry_from_dependencies() {
     );
 }
 
+/// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
+///
+/// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name and
+/// contract (#147); duplicated rather than shared because that helper is
+/// private to `fs.rs`'s own `mod tests` and this file is a separate
+/// integration-test binary.
+fn make_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            #[cfg(windows)]
+            {
+                const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                    && std::env::var_os("CI").is_none()
+                {
+                    eprintln!(
+                        "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
+                    );
+                    return false;
+                }
+            }
+            panic!(
+                "failed to create symlink {} -> {}: {err}",
+                target.display(),
+                link.display()
+            );
+        }
+    }
+}
+
 #[test]
-#[cfg(unix)]
 fn compile_rejects_symlinked_entry_for_messages_template() {
     // Symlinked entry rejection applies regardless of output shape.
     let dir = tempfile::tempdir().unwrap();
     let real_file = dir.path().join("real.mds");
     std::fs::write(&real_file, "@message system:\nYou are helpful.\n@end\n").unwrap();
     let link_file = dir.path().join("linked.mds");
-    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+    if !make_symlink(&real_file, &link_file) {
+        return;
+    }
 
     let result = mds::compile(&link_file, None);
     assert!(result.is_err(), "symlinked entry must be rejected");

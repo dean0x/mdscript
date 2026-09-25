@@ -1,7 +1,7 @@
 mod common;
 use common::{
-    count_occurrences, dup_vars_file_omitted, dup_vars_file_warning, fixture, mds_bin,
-    spawn_watch_ready, ChildGuard,
+    count_occurrences, dup_vars_file_omitted, dup_vars_file_warning, fixture, make_symlink,
+    mds_bin, spawn_watch_ready, ChildGuard,
 };
 
 #[test]
@@ -1832,6 +1832,8 @@ fn build_o_first_build_emits_only_compiled_to() {
 
 /// T-B2: a newly created output has the same mode `std::fs::write` would have produced
 /// (umask-dependent, so it is compared against a live control in the same directory).
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn build_o_new_output_mode_matches_std_fs_write() {
@@ -1873,6 +1875,8 @@ fn build_o_new_output_mode_matches_std_fs_write() {
 /// This is a pin: `std::fs::write` over an existing file also preserves the mode, so it
 /// was already true before the reroute. It exists so a future change to the primitive
 /// cannot quietly widen or narrow permissions on rebuild.
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn build_o_existing_output_mode_0640_preserved() {
@@ -1911,7 +1915,6 @@ fn build_o_existing_output_mode_0640_preserved() {
 
 /// T-B4: `-o` at a symlink is refused; the link and its target are left untouched.
 /// Positive control in the same test: the same build against the real file succeeds.
-#[cfg(unix)]
 #[test]
 fn build_o_symlinked_output_target_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -1920,7 +1923,9 @@ fn build_o_symlinked_output_target_rejected() {
     let real = dir.path().join("real.md");
     std::fs::write(&real, "REAL").unwrap();
     let link = dir.path().join("link.md");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
+    if !make_symlink(&real, &link) {
+        return;
+    }
 
     let refused = mds_bin()
         .arg("build")
@@ -1979,6 +1984,10 @@ fn build_o_symlinked_output_target_rejected() {
 }
 
 /// T-B5: a failed write leaves the previous artifact intact and no temp file behind.
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode parent
+/// directory; Windows' read-only attribute does not block creating files in a
+/// directory, so this setup would not provoke the failure there (#147).
 #[cfg(unix)]
 #[test]
 fn build_o_write_failure_preserves_existing_output_no_temp_residue() {

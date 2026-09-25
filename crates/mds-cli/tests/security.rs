@@ -1,7 +1,7 @@
 mod common;
 use common::{
-    alias_bomb, assert_no_control_chars, fixture, fm_of_size, mds_bin, nested_flow_seq, wrap,
-    MAX_FRONTMATTER_SIZE,
+    alias_bomb, assert_no_control_chars, fixture, fm_of_size, make_symlink, mds_bin,
+    nested_flow_seq, wrap, MAX_FRONTMATTER_SIZE,
 };
 use std::collections::HashMap;
 
@@ -143,7 +143,6 @@ fn for_loop_iteration_limit_rejects_huge_array() {
 }
 
 #[test]
-#[cfg(unix)]
 fn symlink_import_rejected() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -153,7 +152,9 @@ fn symlink_import_rejected() {
 
     // Create a symlink pointing to it
     let link_file = dir.path().join("linked.mds");
-    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+    if !make_symlink(&real_file, &link_file) {
+        return;
+    }
 
     // Create a consumer that imports via the symlink
     let consumer = dir.path().join("consumer.mds");
@@ -701,7 +702,6 @@ fn wrap_open(yaml: &str) -> String {
 // ── AC-2: load_vars_file rejects symlinked vars paths (PF-004 fix) ───────────
 
 #[test]
-#[cfg(unix)]
 fn load_vars_file_rejects_symlinked_path() {
     // Proves the PF-004 fix: load_vars_file now routes the path through
     // NativeFs::check_symlink before reading, the same guard applied to every
@@ -712,7 +712,9 @@ fn load_vars_file_rejects_symlinked_path() {
     std::fs::write(&real_vars, r#"{"name": "Alice"}"#).unwrap();
 
     let link_vars = dir.path().join("link_vars.json");
-    std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+    if !make_symlink(&real_vars, &link_vars) {
+        return;
+    }
 
     let result = mds::load_vars_file(&link_vars);
     assert!(

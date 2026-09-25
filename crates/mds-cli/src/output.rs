@@ -2671,6 +2671,49 @@ mod tests {
             .collect()
     }
 
+    /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
+    ///
+    /// Mirrors `crates/mds-core/src/fs.rs`'s unit-test helper of the same name
+    /// and contract (#147): Unix needs no privilege; Windows needs Developer
+    /// Mode or an elevated process (GitHub's `windows-latest` runners have
+    /// Developer Mode enabled, so a failure there is a genuine regression and
+    /// must panic), and only the unprivileged local case — `CI` unset plus raw
+    /// OS error 1314 (`ERROR_PRIVILEGE_NOT_HELD`) — is a skip. Duplicated rather
+    /// than shared because this crate has no unit-test-scope helper module.
+    fn make_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+
+        match result {
+            Ok(()) => true,
+            Err(err) => {
+                #[cfg(windows)]
+                {
+                    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                    if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                        && std::env::var_os("CI").is_none()
+                    {
+                        eprintln!(
+                            "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
+                        );
+                        return false;
+                    }
+                }
+                panic!(
+                    "failed to create symlink {} -> {}: {err}",
+                    target.display(),
+                    link.display()
+                );
+            }
+        }
+    }
+
     /// T-U1: `mds build` writes artifacts that do not exist yet (#227). The
     /// primitive must create the target instead of failing the existence probe.
     #[test]
@@ -2720,12 +2763,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&quick).unwrap(), "REBUILT");
 
         // Symlink target: still refused (the fsync is not what enforces this).
-        #[cfg(unix)]
         {
             let real = dir.path().join("real.md");
             std::fs::write(&real, "REAL").unwrap();
             let link = dir.path().join("link.md");
-            std::os::unix::fs::symlink(&real, &link).unwrap();
+            if !make_symlink(&real, &link) {
+                return;
+            }
             let err = atomic_write_file(&link, "NEW", Durability::RenameOnly)
                 .expect_err("RenameOnly must still refuse a symlink target");
             assert!(
@@ -2745,6 +2789,9 @@ mod tests {
     /// T-U2: a freshly created artifact must carry the same mode `std::fs::write`
     /// would have produced (`0666 & !umask`), not `tempfile`'s owner-only 0600.
     /// The sibling control makes the assertion umask-independent.
+    ///
+    /// `#[cfg(unix)]`: Unix permission mode bits (`PermissionsExt::mode`) have no
+    /// Windows equivalent — the permission model differs (#147).
     #[cfg(unix)]
     #[test]
     fn atomic_write_file_new_file_mode_matches_std_fs_write() {
@@ -2766,6 +2813,8 @@ mod tests {
     }
 
     /// T-U3: an existing file keeps its mode across the replace-by-rename cycle.
+    ///
+    /// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
     #[cfg(unix)]
     #[test]
     fn atomic_write_file_existing_mode_0640_preserved() {
@@ -2789,14 +2838,15 @@ mod tests {
     /// T-U4: a symlink at the target is refused, never written through. The
     /// control writes the symlink's own target directly and must succeed, so the
     /// refusal is not passing on an unrelated failure.
-    #[cfg(unix)]
     #[test]
     fn atomic_write_file_refuses_live_symlink_target() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real.md");
         let link = dir.path().join("link.md");
         std::fs::write(&real, "REAL").unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        if !make_symlink(&real, &link) {
+            return;
+        }
 
         let err = atomic_write_file(&link, "NEW", Durability::Fsync)
             .expect_err("writing through a symlink must be refused")
@@ -2826,13 +2876,14 @@ mod tests {
 
     /// T-U5: a dangling symlink is still a symlink — refuse it rather than
     /// materialising the missing file it points at.
-    #[cfg(unix)]
     #[test]
     fn atomic_write_file_refuses_dangling_symlink_target() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.md");
         let link = dir.path().join("link.md");
-        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        if !make_symlink(&missing, &link) {
+            return;
+        }
 
         let err = atomic_write_file(&link, "NEW", Durability::Fsync)
             .expect_err("writing through a dangling symlink must be refused")
@@ -2857,6 +2908,11 @@ mod tests {
     /// T-U6: a failed write leaves the original inode, bytes and mtime untouched
     /// and drops the temp file. The control proves the same call succeeds once
     /// the directory is writable again, and that success DOES replace the inode.
+    ///
+    /// `#[cfg(unix)]`: provokes the failure via chmod (Unix permission bits) and
+    /// asserts on `MetadataExt::ino()`, neither of which exists on Windows —
+    /// the read-only attribute there does not block creating files in a
+    /// directory, so the same setup would not provoke a write failure (#147).
     #[cfg(unix)]
     #[test]
     fn atomic_write_file_failure_preserves_original_and_leaves_no_temp() {
@@ -2939,6 +2995,10 @@ mod tests {
 
     /// T-U8: a stat failure that is NOT `NotFound` is a hard error — never a
     /// warning followed by a write with a guessed mode (#225).
+    ///
+    /// `#[cfg(unix)]`: provokes the stat failure with a `0o000`-mode parent
+    /// directory; Windows' permission model does not block traversal the same
+    /// way, so this setup would not provoke the failure there (#147).
     #[cfg(unix)]
     #[test]
     fn atomic_write_file_unreadable_parent_is_hard_error() {

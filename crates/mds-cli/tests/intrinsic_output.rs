@@ -19,7 +19,7 @@
 //! - Dynamic role with special chars round-trips through JSON correctly
 
 mod common;
-use common::{fixture, mds_bin};
+use common::{fixture, make_symlink, mds_bin};
 
 // ── AC-FUNC-09: messages.mds → stdout is a pretty JSON array ─────────────────
 
@@ -467,7 +467,6 @@ fn oversized_file_exits_nonzero_with_size_error() {
 // ── Symlinked entry → non-zero exit (security gate) ──────────────────────────
 
 #[test]
-#[cfg(unix)]
 fn symlinked_entry_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -475,7 +474,9 @@ fn symlinked_entry_exits_nonzero() {
     std::fs::write(&real_file, "@message system:\nYou are helpful.\n@end\n").unwrap();
 
     let link_file = dir.path().join("link.mds");
-    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+    if !make_symlink(&real_file, &link_file) {
+        return;
+    }
 
     let output = mds_bin()
         .args(["build", link_file.to_str().unwrap(), "-o", "-"])
@@ -499,7 +500,6 @@ fn symlinked_entry_exits_nonzero() {
 // ── Symlinked --vars file → non-zero exit (security gate) ────────────────────
 
 #[test]
-#[cfg(unix)]
 fn symlinked_vars_file_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -510,7 +510,9 @@ fn symlinked_vars_file_exits_nonzero() {
     std::fs::write(&real_vars, r#"{"greeting": "Hello!"}"#).unwrap();
 
     let link_vars = dir.path().join("link_vars.json");
-    std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+    if !make_symlink(&real_vars, &link_vars) {
+        return;
+    }
 
     let output = mds_bin()
         .args([
