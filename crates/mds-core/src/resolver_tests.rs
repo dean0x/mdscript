@@ -1975,7 +1975,7 @@ fn f9_messages_mode_default_block_in_message_body() {
 #[test]
 fn e13_extends_no_message_block_compiles_to_markdown() {
     // Base has @block placeholders but no @message. Output shape is intrinsic:
-    // with no @message anywhere in the spliced final_body, the child compiles to
+    // with no @message anywhere in the spliced regions, the child compiles to
     // Markdown (not an error). Extracting messages from it yields ExpectedMessages.
     let base = concat!(
         "You are an assistant.\n",
@@ -2281,7 +2281,7 @@ fn f9_messages_mode_multilevel_chain() {
     );
 }
 
-// ── PF-004 parity: messages-mode @extends path validates final_body ────────
+// ── PF-004 parity: messages-mode @extends path validates the spliced regions ─
 //
 // A check on the primary path (text-mode process_module_extends calls
 // validator::validate before evaluate) must not be absent on the parallel path
@@ -2290,7 +2290,7 @@ fn f9_messages_mode_multilevel_chain() {
 // produces the SAME error (mds::undefined_var) as text mode does.
 
 #[test]
-fn pf004_messages_mode_extends_validates_final_body_parity() {
+fn pf004_messages_mode_extends_validates_spliced_regions_parity() {
     // Base: @block with @message inside, and an undefined variable.
     // Child: @extends the base, provides no override (uses default).
     let base = concat!(
@@ -3765,4 +3765,323 @@ fn r3_map_mode_eval_diagnostic_display_is_root_relative() {
         !std::path::Path::new(name).is_absolute(),
         "map-mode diagnostic label must never be absolute; got: {name}"
     );
+}
+
+#[test]
+fn r3_extends_errors_name_the_base_root_relative() {
+    // #114 / AC-114-2: an error raised inside inherited base content names the base by
+    // its root-relative display, never its absolute canonical key — for validation
+    // (an undefined variable in a base-default block) and for evaluation (a cross-type
+    // comparison in the base skeleton), with source maps on and off.
+    let (_guard, root) = r3_project();
+    let cases = [
+        (
+            "validation",
+            "@block greeting:\nHello {{customer_name}}, welcome.\n@end\n",
+            "mds::undefined_var",
+        ),
+        (
+            "evaluation",
+            "---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n",
+            "mds::type_mismatch",
+        ),
+    ];
+    for (stage, base, code) in cases {
+        let dir = root.join(stage);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("base.mds"), base).unwrap();
+        let child = dir.join("child.mds");
+        std::fs::write(&child, "@extends \"./base.mds\"\n").unwrap();
+
+        // Positive control (PF-013): the base's canonical key IS absolute, so the
+        // equality below fails if it leaks into the name.
+        assert!(
+            dir.join("base.mds").canonicalize().unwrap().is_absolute(),
+            "positive control: canonical key must be absolute"
+        );
+        for source_map in [false, true] {
+            let opts = crate::CompileOptions::default().with_source_map(source_map);
+            let err = crate::compile_with_deps_opts(&child, None, opts).unwrap_err();
+            assert_eq!(
+                err.serialize().code,
+                code,
+                "{stage}, source_map={source_map}: {err}"
+            );
+            assert_eq!(
+                err.source_name(),
+                Some(format!("{stage}/base.mds").as_str()),
+                "{stage}, source_map={source_map}: the error must name the base by its \
+                 root-relative display"
+            );
+        }
+    }
+}
+
+// ── #371: filesystem-root base dir ────────────────────────────────────────
+//
+// A base directory that IS the filesystem root (`/` on Unix, a drive root
+// like `C:\` on Windows) must anchor resolution AT the root, never silently
+// fall back to the current working directory. The root is obtained portably
+// via a tempdir's topmost ancestor -- never a hardcoded "/" -- so these tests
+// run unchanged on the Windows CI leg (#147).
+//
+// Before the #371 fix, NativeFs's base-directory resolution routed every path (including
+// the root) through `check_symlink_named`, whose first step is
+// `path.file_name()` -- `None` for a root path -- so ANY string
+// compile/check/lint call whose base_dir resolved to the root failed with
+// "cannot resolve path /: file not found: /" before a single syscall ran.
+
+#[test]
+fn compile_str_with_root_base_dir_no_imports_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().ancestors().last().unwrap();
+    let result = crate::compile_str_with("Hello world\n", Some(root), None);
+    assert!(
+        result.is_ok(),
+        "compile_str_with with a root base_dir and no imports must succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn check_str_with_root_base_dir_no_imports_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().ancestors().last().unwrap();
+    let result = crate::check_str_with("Hello world\n", Some(root), None);
+    assert!(
+        result.is_ok(),
+        "check_str_with with a root base_dir and no imports must succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn lint_str_with_root_base_dir_no_imports_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().ancestors().last().unwrap();
+    let result = crate::lint_str_with(
+        "Hello world\n",
+        Some(root),
+        None,
+        &crate::LintConfig::default(),
+    );
+    assert!(
+        result.is_ok(),
+        "lint_str_with with a root base_dir and no imports must succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn import_through_root_base_dir_resolves() {
+    // A real @import, resolved through a base_dir that IS the filesystem
+    // root, using a canonicalized tempdir path stripped down to a
+    // root-relative import string -- the shape any real root-anchored
+    // compile hits (e.g. `docker run` with no WORKDIR set, cwd == "/").
+    //
+    // Both `root` and `canonical_lib` are derived from `canonicalize()`
+    // output (never a mix of canonical and non-canonical forms): on Windows,
+    // `canonicalize()` returns a verbatim (`\\?\`) path, and stripping a
+    // non-verbatim root from a verbatim file path would fail to find a
+    // common prefix.
+    let dir = tempfile::TempDir::new().unwrap();
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("tempdir must canonicalize");
+    let root = canonical_dir.ancestors().last().unwrap().to_path_buf();
+
+    let lib_path = dir.path().join("lib.mds");
+    std::fs::write(&lib_path, "@define greet(x):\nHello {{x}}!\n@end\n").unwrap();
+    let canonical_lib = lib_path
+        .canonicalize()
+        .expect("temp file must canonicalize");
+
+    let relative = canonical_lib
+        .strip_prefix(&root)
+        .expect("a filesystem root is a prefix of every absolute path under it")
+        .to_str()
+        .expect("temp path must be valid UTF-8")
+        .replace(std::path::MAIN_SEPARATOR, "/");
+
+    let source = format!("@import \"./{relative}\"\n{{{{greet(\"World\")}}}}\n");
+    let output = crate::compile_str_with(&source, Some(&root), None)
+        .expect("compile through a root base_dir with a real import must succeed")
+        .into_markdown()
+        .expect("markdown output expected");
+    assert_eq!(output, "Hello World!\n");
+}
+
+// ── validate_import_path ──────────────────────────────────────────────────
+
+/// The resolver's own import-string guard (it runs before any backend, so it covers
+/// custom `with_fs` backends): an import must be `./`/`../`-relative and NUL-free.
+#[test]
+fn validate_import_path_requires_relative_nul_free_form() {
+    for bad in ["lib.mds", "/abs/lib.mds", "", "sub/../lib.mds"] {
+        let err = validate_import_path(bad).unwrap_err();
+        assert!(
+            matches!(err, MdsError::ImportError { .. }),
+            "{bad:?}: expected ImportError, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("import path must be relative"),
+            "{bad:?}: got {err}"
+        );
+    }
+    let err = validate_import_path("./a\0b.mds").unwrap_err();
+    assert!(
+        err.to_string().contains("import path contains null byte"),
+        "got {err}"
+    );
+    // Controls: both relative forms pass.
+    for ok in ["./lib.mds", "../lib.mds"] {
+        assert!(validate_import_path(ok).is_ok(), "{ok:?} must be accepted");
+    }
+}
+
+/// #265: the resolver's guard refuses all 80 forbidden codepoints (it is what covers
+/// a custom `with_fs` backend), and `import_path_violation` names the rule each
+/// path breaks — the classification the frontmatter `imports:` parser reports.
+#[test]
+fn validate_import_path_refuses_every_forbidden_char() {
+    let chars: Vec<char> = (0..=0x10_FFFF_u32)
+        .filter_map(char::from_u32)
+        .filter(|&c| crate::lint::is_forbidden_path_char(c))
+        .collect();
+    assert_eq!(chars.len(), 80, "non-vacuity");
+    for ch in chars {
+        let path = format!("./a{ch}.mds");
+        let u = format!("U+{:04X}", u32::from(ch));
+        let err = validate_import_path(&path).unwrap_err();
+        assert!(matches!(err, MdsError::ImportError { .. }), "{u}: {err:?}");
+        let msg = err.to_string();
+        if ch == '\0' {
+            assert_eq!(
+                import_path_violation(&path),
+                Some(ImportPathViolation::NullByte)
+            );
+            assert!(msg.contains("import path contains null byte"), "{msg}");
+        } else {
+            assert_eq!(
+                import_path_violation(&path),
+                Some(ImportPathViolation::ForbiddenChar(ch))
+            );
+            let expected = format!(
+                "import path contains forbidden character {u}: \"./a\\u{:04X}.mds\"",
+                u32::from(ch)
+            );
+            assert!(msg.contains(&expected), "{u}: {msg}");
+        }
+        assert!(
+            !msg.chars().any(crate::lint::is_forbidden_path_char),
+            "{u}: raw char in {msg:?}"
+        );
+    }
+
+    // The relative-form rule is checked first; its message escapes the path too.
+    let hostile_bare = format!("lib{}.mds", '\x1b');
+    assert_eq!(
+        import_path_violation(&hostile_bare),
+        Some(ImportPathViolation::NotRelative)
+    );
+    let msg = validate_import_path(&hostile_bare).unwrap_err().to_string();
+    assert!(
+        msg.contains(&format!(
+            "must be relative (start with './' or '../'): \"lib\\u{:04X}.mds\"",
+            0x1B
+        )),
+        "{msg}"
+    );
+    // Reasons, as the frontmatter parser prints them.
+    assert_eq!(
+        ImportPathViolation::NotRelative.reason(),
+        "must start with './' or '../'"
+    );
+    assert_eq!(ImportPathViolation::NullByte.reason(), "contains null byte");
+    assert_eq!(
+        ImportPathViolation::ForbiddenChar('\u{202E}').reason(),
+        "contains forbidden character U+202E"
+    );
+    // Control: a clean relative path has no violation.
+    assert_eq!(import_path_violation("./a b-\u{00FC}.mds"), None);
+}
+
+/// A custom backend of the one kind that reaches the source-map root safety net:
+/// absolute keys, no root concept (`source_root` stays `None`), and an
+/// `anchor_base_dir` that refuses every directory and counts its calls.
+struct UnanchorableFs {
+    anchor_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FileSystem for UnanchorableFs {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        Ok(path.to_string())
+    }
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        Ok(format!("{dir}/{}", relative.trim_start_matches("./")))
+    }
+    fn parent_dir(&self, key: &str) -> String {
+        key.rsplit_once('/').map_or("", |(dir, _)| dir).to_string()
+    }
+    fn read(&self, key: &str) -> Result<String, MdsError> {
+        match key {
+            "/proj/main.mds" => Ok("Hello!\n".to_string()),
+            "/proj/child.mds" => Ok("@extends \"./base.mds\"\n".to_string()),
+            "/proj/base.mds" => Ok("Base\n@block body:\ndefault\n@end\n".to_string()),
+            _ => Err(MdsError::module_not_found(key)),
+        }
+    }
+    fn is_markdown(&self, _key: &str) -> bool {
+        false
+    }
+    fn anchor_base_dir(&self, dir: &str) -> Result<String, MdsError> {
+        self.anchor_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(MdsError::io(format!("refused: {dir}")))
+    }
+}
+
+/// #155: the source-map root safety net is best-effort. A backend that refuses to
+/// anchor the entry's directory there still compiles — it accepted the entry — and
+/// its absolute `sources[]` keys degrade to basenames, never to absolute paths.
+/// Standalone and `@extends` entries each reach their own call site.
+#[test]
+fn source_map_root_safety_net_never_fails_a_compile() {
+    for (entry, source, output) in [
+        ("/proj/main.mds", "main.mds", "Hello!\n"),
+        ("/proj/child.mds", "base.mds", "Base\ndefault\n"),
+    ] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = ModuleCache::with_fs(Box::new(UnanchorableFs {
+            anchor_calls: Arc::clone(&calls),
+        }));
+        let opts = crate::CompileOptions::default().with_source_map(true);
+        let (compiled, sm) = cache
+            .resolve_virtual_intrinsic_opts(entry, &HashMap::new(), &opts, &mut vec![])
+            .unwrap_or_else(|e| panic!("{entry}: a refused anchor must not fail the compile: {e}"));
+        // Reachability (PF-013): the refusal below was actually returned.
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "{entry}: the safety net must have called anchor_base_dir"
+        );
+        assert!(
+            matches!(&compiled, crate::CompiledOutput::Markdown(s) if s == output),
+            "{entry}: unexpected output {compiled:?}"
+        );
+        let sm = sm.expect("source map must be emitted");
+        // Positive control (PF-013): the raw key IS absolute.
+        assert!(
+            entry.starts_with('/'),
+            "positive control: raw key is absolute"
+        );
+        assert_eq!(
+            sm.sources.first().map(String::as_str),
+            Some(source),
+            "{entry}"
+        );
+        for s in &sm.sources {
+            assert!(
+                !s.starts_with('/'),
+                "{entry}: sources[] must never be absolute; got {s}"
+            );
+        }
+    }
 }

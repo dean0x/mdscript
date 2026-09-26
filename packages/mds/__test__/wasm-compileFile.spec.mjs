@@ -1,6 +1,6 @@
 /**
  * WASM backend compileFile/checkFile tests for @mdscript/mds universal package.
- * Tests: U-WCF1 through U-WCF11
+ * Tests: U-WCF1 through U-WCF12
  *
  * Uses subprocess isolation with MDS_BACKEND=wasm to force the WASM backend
  * for file operations. Each test spawns a separate subprocess to avoid
@@ -10,8 +10,10 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { SIMPLE_MDS, IMPORT_CONSUMER_MDS, ENTRY_MDS, __dirname } from './helpers.mjs';
+import { SIMPLE_MDS, IMPORT_CONSUMER_MDS, ENTRY_MDS, __dirname, caseInsensitive } from './helpers.mjs';
 import path from 'node:path';
+import os from 'node:os';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 
 const exec = promisify(execFile);
 const pkgRoot = path.join(__dirname, '..');
@@ -224,5 +226,59 @@ describe('WASM backend — compileFile/checkFile', () => {
     `, wasmEnv());
     assert.ok(result.threw, 'checkFile on nonexistent path must throw');
     assert.ok(result.message, 'error message must not be empty');
+  });
+
+  test('U-WCF12: case-mismatched entry and import spellings compile identically on both backends, never as a symlink (#408)', async () => {
+    // On a case-insensitive volume (the macOS and Windows default) the WASM
+    // backend's pre-scanner used to compare realpath with the path as written and
+    // report `MAIN.mds` for `main.mds` as a possible symlink. The same file is
+    // imported under three spellings, once through a second module.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-wcf-408-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      await writeFile(
+        path.join(dir, 'main.mds'),
+        '@import "./Header.mds" as a\n@import "./header.mds" as b\n@import "./footer.mds" as f\n' +
+          '{{a.hi()}}{{b.hi()}}{{f.bye()}}\n',
+      );
+      await writeFile(path.join(dir, 'header.mds'), '@define hi():\nHi\n@end\n');
+      await writeFile(
+        path.join(dir, 'footer.mds'),
+        '@import "./HEADER.mds" as h\n@define bye():\n{{h.hi()}} bye\n@end\n',
+      );
+      const insensitive = await caseInsensitive(dir);
+
+      const script = `
+        import { init, compileFile, getBackend } from './dist/node.js';
+        await init();
+        let outcome;
+        try {
+          outcome = { output: (await compileFile(${JSON.stringify(path.join(dir, 'MAIN.mds'))})).output };
+        } catch (e) {
+          outcome = { error: { code: e.code, message: e.message } };
+        }
+        process.stdout.write(JSON.stringify({ backend: getBackend(), ...outcome }));
+      `;
+      const [wasmResult, nativeResult] = await Promise.all([
+        runScript(script, wasmEnv()),
+        runScript(script, { ...process.env, MDS_BACKEND: 'native' }),
+      ]);
+      assert.equal(wasmResult.backend, 'wasm');
+      assert.equal(nativeResult.backend, 'native');
+
+      if (insensitive) {
+        assert.equal(nativeResult.error, undefined, JSON.stringify(nativeResult.error));
+        assert.match(nativeResult.output, /Hi.*bye/s);
+        assert.equal(wasmResult.output, nativeResult.output, JSON.stringify(wasmResult));
+      } else {
+        // Case-sensitive volume: the spelling names no file — not found, never a symlink.
+        for (const result of [wasmResult, nativeResult]) {
+          assert.ok(result.error, `${result.backend}: expected a not-found failure`);
+          assert.doesNotMatch(result.error.message, /symlink/, result.backend);
+        }
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

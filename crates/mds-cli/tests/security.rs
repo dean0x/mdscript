@@ -1,7 +1,7 @@
 mod common;
 use common::{
-    alias_bomb, assert_no_control_chars, fixture, fm_of_size, mds_bin, nested_flow_seq, wrap,
-    MAX_FRONTMATTER_SIZE,
+    alias_bomb, assert_no_control_chars, fixture, fm_of_size, make_symlink, mds_bin,
+    nested_flow_seq, wrap, MAX_FRONTMATTER_SIZE,
 };
 use std::collections::HashMap;
 
@@ -143,7 +143,6 @@ fn for_loop_iteration_limit_rejects_huge_array() {
 }
 
 #[test]
-#[cfg(unix)]
 fn symlink_import_rejected() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -153,7 +152,9 @@ fn symlink_import_rejected() {
 
     // Create a symlink pointing to it
     let link_file = dir.path().join("linked.mds");
-    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+    if !make_symlink(&real_file, &link_file) {
+        return;
+    }
 
     // Create a consumer that imports via the symlink
     let consumer = dir.path().join("consumer.mds");
@@ -170,6 +171,46 @@ fn symlink_import_rejected() {
         err.contains("symlink") || err.contains("not allowed"),
         "error should mention symlink restriction, got: {err}"
     );
+}
+
+/// #408: a mismatched spelling of an entry file or an import is resolved the way
+/// the OS resolves it — on a case-insensitive volume (default macOS APFS, NTFS on
+/// the Windows CI leg) it builds, on a case-sensitive one (Linux) it is a missing
+/// file (exit 2). It is never reported as a symlink. The volume is probed, not
+/// assumed.
+#[test]
+fn case_mismatched_entry_and_import_are_not_symlink_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("entry.mds"), "Hello!\n").unwrap();
+    std::fs::write(dir.path().join("header.mds"), "@define hi():\nHi\n@end\n").unwrap();
+    std::fs::write(
+        dir.path().join("main.mds"),
+        "@import \"./Header.mds\" as h\n{{h.hi()}}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("probe.txt"), "").unwrap();
+    let insensitive = dir.path().join("PROBE.TXT").exists();
+
+    // (argument, stdout on a case-insensitive volume)
+    for (arg, expected) in [("Entry.mds", "Hello!\n"), ("main.mds", "Hi\n")] {
+        let out = mds_bin()
+            .args(["build", arg, "-o", "-"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("symlink"),
+            "{arg}: a case mismatch must never be a symlink error: {stderr}"
+        );
+        if insensitive {
+            assert!(out.status.success(), "{arg}: {stderr}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{arg}");
+        } else {
+            assert_eq!(out.status.code(), Some(2), "{arg}: {stderr}");
+            assert!(stderr.contains("file not found"), "{arg}: {stderr}");
+        }
+    }
 }
 
 #[test]
@@ -310,15 +351,15 @@ fn build_mds_json_output_dir_path_traversal_rejected() {
         .output()
         .unwrap();
 
-    assert!(
-        !output.status.success(),
-        "build with output_dir containing '..' must fail"
-    );
+    // `mds::io`, exit 2 (#265 moved it from exit 1).
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "got: {stderr}");
+    assert!(stderr.contains("mds::io"), "got: {stderr}");
     assert!(
-        stderr.contains("..") || stderr.contains("output_dir"),
-        "error should mention the traversal or output_dir, got: {stderr}"
+        stderr.contains("mds.json output_dir '../escaped' must not contain '..' components"),
+        "got: {stderr}"
     );
+    assert!(!dir.path().parent().unwrap().join("escaped").exists());
 }
 
 #[test]
@@ -661,7 +702,6 @@ fn wrap_open(yaml: &str) -> String {
 // ── AC-2: load_vars_file rejects symlinked vars paths (PF-004 fix) ───────────
 
 #[test]
-#[cfg(unix)]
 fn load_vars_file_rejects_symlinked_path() {
     // Proves the PF-004 fix: load_vars_file now routes the path through
     // NativeFs::check_symlink before reading, the same guard applied to every
@@ -672,7 +712,9 @@ fn load_vars_file_rejects_symlinked_path() {
     std::fs::write(&real_vars, r#"{"name": "Alice"}"#).unwrap();
 
     let link_vars = dir.path().join("link_vars.json");
-    std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+    if !make_symlink(&real_vars, &link_vars) {
+        return;
+    }
 
     let result = mds::load_vars_file(&link_vars);
     assert!(
@@ -699,8 +741,9 @@ fn load_vars_file_rejects_symlinked_path() {
 //
 //   1. `MdsError` — `parser.rs` formats the raw alias into
 //      `invalid include alias: '{alias}'`.
-//   2. CLI-authored `miette::miette!()` — `output.rs` formats the raw `mds.json`
-//      value into `mds.json output_dir '{}' must not contain '..' components`.
+//   2. CLI-authored `miette::miette!()` — `build.rs`'s `load_config` formats the
+//      `serde_json` error into `invalid mds.json at {path}: {e}`, and serde's
+//      `unknown variant` message quotes the raw `mds.json` value.
 //
 // Both render through `eprint_error`, the single CLI stderr choke-point.
 
@@ -762,18 +805,22 @@ fn build_mds_error_message_escapes_control_bytes() {
 /// This is the PF-004 sibling path: `miette!()` reports do **not** downcast to
 /// `MdsError` (see `exit_code`'s rustdoc), so a fix that only handled `MdsError`
 /// would leave this vector open while claiming the boundary was closed.
+///
+/// The vector was once an `output_dir` holding `..` plus ESC, but since #265 that value
+/// is refused as an `MdsError` (`mds::io`) before any `miette!()` formats it — see
+/// `output_dir_in_mds_json_is_refused_at_load` in `forbidden_paths.rs`. An unknown lint
+/// severity still reaches a `miette!()` message with the raw value in it.
 #[test]
 fn build_cli_authored_error_message_escapes_control_bytes() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
-    // JSON `\u001b` decodes to a raw ESC byte in the parsed config value. The `..`
-    // component trips the traversal guard in `resolve_output_base`, which formats the
-    // raw value into its message.
-    std::fs::write(
-        dir.path().join("mds.json"),
-        r#"{"build": {"output_dir": "../\u001b[31mBAD"}}"#,
-    )
-    .unwrap();
+    // serde_json writes the ESC as a JSON escape, which decodes back to a raw ESC byte in
+    // the parsed config value; serde quotes it in its `unknown variant` error, which
+    // `load_config` formats into the message. Built at runtime (PF-018).
+    let config = serde_json::json!({
+        "lint": { "rules": { "unused-variable": format!("{}[31mBAD", '\x1b') } }
+    });
+    std::fs::write(dir.path().join("mds.json"), config.to_string()).unwrap();
 
     let out = mds_bin()
         .arg("build")
@@ -783,15 +830,17 @@ fn build_cli_authored_error_message_escapes_control_bytes() {
         .output()
         .unwrap();
 
-    // ── Non-vacuity ──────────────────────────────────────────────────────────
-    assert!(
-        !out.status.success(),
-        "build with output_dir containing '..' must fail"
-    );
+    // ── Non-vacuity: the CLI-authored error (exit 1, no `mds::` code) is the one
+    //    rendered, and it quotes the hostile value ────────────────────────────
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "got: {stderr}");
     assert!(
-        stderr.contains("output_dir"),
-        "non-vacuity: the output_dir traversal error must be the one rendered; got: {stderr}"
+        stderr.contains("invalid mds.json") && stderr.contains("unknown"),
+        "non-vacuity: the mds.json parse error must be the one rendered; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("mds::"),
+        "a miette!() error carries no code: {stderr}"
     );
 
     // ── Negative + positive ──────────────────────────────────────────────────
@@ -1071,29 +1120,33 @@ fn lint_plural_unknown_rule_names_escape_control_bytes() {
     }
 }
 
-/// T-ESC-FNAME-1 [S14 / CWE-117 / PF-013 / #176]: a filename containing newlines
-/// cannot forge CLI status lines.
+/// T-ESC-FNAME-1 [S14 / CWE-117 / PF-013 / #176 / #265]: a filename containing newlines
+/// is refused at the input boundary and cannot forge CLI status lines.
 ///
 /// Vector: POSIX permits a newline inside a filename and the user never types the name
-/// — `mds build <dir>` discovers it by directory walk. `safe_path` used HUMAN mode,
-/// which preserves newlines by design so that multi-line diagnostic *messages* keep
-/// rendering, so a file named `evil.mds<LF>Clean: real.mds<LF>OK: all-fine.mds` emitted
-/// two attacker-authored lines byte-identical in form to genuine status output,
-/// unframed and unindented.
+/// — `mds build <dir>` discovers it by directory walk. Before #265 the file was built and
+/// its name reached a status line, where only escaping stood between the two embedded
+/// newlines and two forged `Clean:`/`OK:` lines. Since #265 the name is refused before
+/// anything is read: the walker still collects it, and that one file fails with
+/// `mds::io` naming U+000A while its sibling builds.
+///
+/// Positive controls (PF-013): the refusal names the codepoint, the displayed name shows
+/// exactly the two escaped newlines, the genuine summary is pinned, and `ok.mds` really
+/// was built — so a run that silently skipped the hostile file, or built nothing, fails.
 ///
 /// Unix-only: Windows filesystems reject a newline in a filename outright.
 #[cfg(unix)]
 #[test]
-fn build_status_line_cannot_be_forged_by_a_newline_in_a_filename() {
+fn build_refuses_a_newline_in_a_filename_and_builds_its_sibling() {
     let dir = tempfile::tempdir().unwrap();
     let hostile = "evil.mds\nClean: real.mds\nOK: all-fine.mds";
     std::fs::write(dir.path().join(hostile), "Hello!\n").unwrap();
+    std::fs::write(dir.path().join("ok.mds"), "Sibling!\n").unwrap();
     let out_dir = dir.path().join("out");
 
     let out = mds_bin()
-        .arg("build")
-        .arg(dir.path())
-        .arg("--out-dir")
+        .current_dir(dir.path())
+        .args(["build", ".", "--out-dir"])
         .arg(&out_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1106,15 +1159,30 @@ fn build_status_line_cannot_be_forged_by_a_newline_in_a_filename() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // ── Non-vacuity: the build ran and printed a status line naming the file ─
+    // ── The hostile file is refused, per file: exit 1 is directory mode's
+    //    per-file-failure code (`N built, M failed`) ─────────────────────────────
+    assert_eq!(out.status.code(), Some(1), "got: {combined}");
     assert!(
-        out.status.success(),
-        "the build must succeed; stdout+stderr: {combined}"
+        combined.contains("mds::io"),
+        "refusal is mds::io; got: {combined}"
     );
     assert!(
-        combined.contains("evil.mds"),
-        "non-vacuity: the status line must name the built file; got: {combined}"
+        combined.contains("U+000A") && combined.contains("forbidden"),
+        "the refusal must name U+000A; got: {combined}"
     );
+    assert!(
+        combined.lines().any(|l| l.trim() == "1 built, 1 failed"),
+        "genuine summary; got: {combined}"
+    );
+
+    // ── Positive: the displayed name carries exactly its two newlines, escaped ──
+    let escaped_lf = format!("\\u{:04X}", 0x0A);
+    assert_eq!(
+        combined.matches(escaped_lf.as_str()).count(),
+        2,
+        "both embedded newlines must be shown escaped, once; got: {combined}"
+    );
+    assert_no_control_chars(&combined, "mds build refusal");
 
     // ── Negative: neither forged line appears on a line of its own ───────────
     for forged in ["Clean: real.mds", "OK: all-fine.mds"] {
@@ -1125,26 +1193,31 @@ fn build_status_line_cannot_be_forged_by_a_newline_in_a_filename() {
         );
     }
 
-    // ── Positive: both newlines escaped to their literal form ────────────────
+    // ── The sibling still builds ────────────────────────────────────────────
     assert_eq!(
-        combined.matches("\\u000A").count(),
-        2,
-        "both embedded newlines must be escaped; got: {combined}"
+        std::fs::read_to_string(out_dir.join("ok.md")).unwrap(),
+        "Sibling!\n",
+        "the sibling must be built; got: {combined}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&out_dir).unwrap().count(),
+        1,
+        "nothing is written for the refused file"
     );
 }
 
-/// T-ESC-FNAME-2 [S14 / PF-004 / #176]: the `Clean:` status line — which sanitized its
-/// filename inline rather than through `safe_path` — is covered by the same guarantee.
+/// T-ESC-FNAME-2 [S14 / PF-004 / #176 / #265]: the `Clean:` status line printer — which
+/// sanitized its filename inline rather than through `safe_path` — can no longer be
+/// reached by a hostile name at all: `mds lint <file>` refuses the path (`mds::io`,
+/// exit 2) before it reads the file, so no `Clean:` line is printed.
 ///
-/// This is the PF-004 sibling of T-ESC-FNAME-1: two status-line printers, one of which
-/// open-coded its own escape call and so would have kept HUMAN mode when `safe_path`
-/// moved to WIRE. The vector also carries U+061C, the bidi control the escape class
-/// originally missed, so this pins both fixes on one line of output.
+/// The vector also carries U+061C, the bidi control the escape class originally
+/// missed, and the refusal message must show both characters escaped.
 ///
 /// Unix-only: Windows filesystems reject a newline in a filename outright.
 #[cfg(unix)]
 #[test]
-fn lint_clean_status_line_cannot_be_forged_by_a_newline_in_a_filename() {
+fn lint_refuses_a_newline_in_a_filename_without_a_clean_line() {
     let dir = tempfile::tempdir().unwrap();
     let hostile = "ok.mds\nClean: real\u{061c}.mds";
     let path = dir.path().join(hostile);
@@ -1160,28 +1233,38 @@ fn lint_clean_status_line_cannot_be_forged_by_a_newline_in_a_filename() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // ── Non-vacuity: the Clean: line actually printed, naming the file ───────
+    // ── Refused: mds::io, exit 2, naming U+000A ─────────────────────────────
+    assert_eq!(out.status.code(), Some(2), "got: {stderr}");
+    assert!(stderr.contains("mds::io"), "got: {stderr}");
     assert!(
-        stderr.contains("Clean: ok.mds"),
-        "non-vacuity: the Clean: status line must name the linted file; got: {stderr}"
+        stderr.contains("U+000A") && stderr.contains("forbidden"),
+        "the refusal must name U+000A; got: {stderr}"
     );
 
-    // ── Negative: no forged standalone line, no raw hostile codepoint ────────
+    // ── Negative: no Clean: line at all, no raw hostile codepoint ───────────
     assert!(
-        !stderr.lines().any(|l| l.trim().starts_with("Clean: real")),
-        "a filename must not be able to forge a second Clean: line; got: {stderr}"
+        !stderr.lines().any(|l| l.trim().starts_with("Clean:")),
+        "a refused file must print no Clean: line; got: {stderr}"
     );
-    assert_no_control_chars(&stderr, "mds lint Clean: status line");
+    assert_no_control_chars(&stderr, "mds lint refusal");
 
-    // ── Positive: newline and U+061C both escaped ───────────────────────────
-    assert!(
-        stderr.contains("\\u000A"),
-        "the embedded newline must be escaped; got: {stderr}"
-    );
-    assert!(
-        stderr.contains("\\u061C"),
-        "U+061C must be escaped; got: {stderr}"
-    );
+    // ── Positive: the name is shown with the newline and U+061C escaped ─────
+    for cp in [0x0A_u32, 0x061C] {
+        let esc = format!("\\u{cp:04X}");
+        assert!(stderr.contains(&esc), "{esc} must be shown; got: {stderr}");
+    }
+
+    // Control: the same content under a clean name lints clean.
+    let clean = dir.path().join("clean.mds");
+    std::fs::write(&clean, "Hello!\n").unwrap();
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&clean)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "control lints clean");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Clean: "));
 }
 
 /// T-ESC-WALK-1 [security-11 / CWE-150 / CWE-117 / PF-004 / PF-013 / #176]: the shared

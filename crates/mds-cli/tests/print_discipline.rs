@@ -83,9 +83,12 @@
 //!   claimed here once when it was not true:
 //!   - `resolver.rs`'s imported-module filename (the source-map segment-cap warning) —
 //!     the only one whose input can actually carry a hostile character, since a module
-//!     key is a filesystem path. **Pinned by a test**:
-//!     `crates/mds-cli/tests/producer_discipline.rs`, which compiles a module named with
-//!     a real ESC byte and asserts the warning that reaches this crate is WIRE-escaped.
+//!     key is a filesystem path. Since #265 the built-in backends refuse a forbidden
+//!     path character in every key they resolve, so only a custom `FileSystem` backend
+//!     that rewrites keys can still deliver one. **Pinned by a test**:
+//!     `crates/mds-cli/tests/producer_discipline.rs`, which drives a module key carrying
+//!     a real ESC byte through such a backend and asserts the warning that reaches this
+//!     crate is WIRE-escaped, and pins the refusal on the built-in backend.
 //!   - `evaluator.rs`'s two `@include` alias warnings — **upheld by review only, and not
 //!     testable today.** The parser admits an `@include` alias only if it matches
 //!     `[A-Za-z_][A-Za-z0-9_]*` (`parser.rs`'s `is_valid_identifier` check), so no

@@ -1,5 +1,5 @@
 mod common;
-use common::{fixture, mds_bin};
+use common::{fixture, make_symlink, mds_bin};
 
 #[test]
 fn check_stdin_valid() {
@@ -23,6 +23,35 @@ fn check_stdin_valid() {
     assert!(
         output.status.success(),
         "check stdin should succeed for valid input"
+    );
+}
+
+#[test]
+fn check_stdin_with_root_cwd_succeeds() {
+    // #371: `mds check -` with no explicit base_dir resolves it from cwd. A
+    // process whose cwd IS the filesystem root must not fail to check.
+    let mut child = mds_bin()
+        .args(["check", "-"])
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "check stdin with cwd=/ should succeed for valid input; stderr: {stderr}"
     );
 }
 
@@ -134,14 +163,15 @@ fn init_does_not_overwrite_existing_file() {
 /// T-D1-1 (#386): `mds init --force` at a live symlink is refused; the link and its
 /// target survive untouched. Positive control in the same test: `mds init` on a plain
 /// (non-symlink) path still succeeds normally.
-#[cfg(unix)]
 #[test]
 fn init_force_symlink_target_refused_plain_path_created() {
     let dir = tempfile::tempdir().unwrap();
     let real = dir.path().join("real.txt");
     std::fs::write(&real, "REAL").unwrap();
     let link = dir.path().join("link.mds");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
+    if !make_symlink(&real, &link) {
+        return;
+    }
 
     let refused = mds_bin()
         .args(["init", link.to_str().unwrap(), "--force"])
@@ -194,13 +224,14 @@ fn init_force_symlink_target_refused_plain_path_created() {
 /// T-D1-2 (#386): `mds init` (no `--force`) at a dangling symlink is refused; the
 /// target is never created and the link survives. Positive control in the same test:
 /// `mds init` on a plain (non-symlink) path still succeeds normally.
-#[cfg(unix)]
 #[test]
 fn init_dangling_symlink_refused_without_force() {
     let dir = tempfile::tempdir().unwrap();
     let victim = dir.path().join("victim.txt");
     let link = dir.path().join("link.mds");
-    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    if !make_symlink(&victim, &link) {
+        return;
+    }
 
     let refused = mds_bin()
         .args(["init", link.to_str().unwrap()])
@@ -254,6 +285,8 @@ fn init_dangling_symlink_refused_without_force() {
 /// rename, preserving its permission bits, and leaves no `.mds-tmp-` temp file behind.
 /// Already green on `main` before this PR — this test pins the contract stated in the
 /// PR body so a future regression is caught.
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn init_force_regular_file_replaced_atomically_mode_preserved() {

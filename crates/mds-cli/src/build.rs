@@ -130,6 +130,12 @@ const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 ///
 /// The `config_dir` is the directory that *contains* `mds.json` — used to
 /// resolve relative `output_dir` values.
+///
+/// Every error names the file by the path `start` leads to it — `./mds.json`,
+/// `sub/../mds.json` — escaped by [`crate::output::safe_path`], never by the
+/// canonical path the walk uses: that one is absolute, which the caller did not
+/// type, and it can carry a forbidden character from a hostile-named directory above
+/// the project, since the config loads before the input is validated (#265).
 pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> {
     // Walk upward from `start` (which may be a file; begin at its parent).
     // avoids PF-006: a relative start_dir (e.g. "" or ".") causes current.parent()
@@ -142,6 +148,8 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
         effective_parent(start).to_path_buf()
     };
 
+    // The directory as `start` names it, one `..` per step up: what an error shows.
+    let mut shown_dir = raw_start_dir.clone();
     let mut current = match raw_start_dir.canonicalize() {
         Ok(p) => p,
         Err(_) => raw_start_dir,
@@ -150,27 +158,54 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
     for _ in 0..MAX_TRAVERSAL_DEPTH {
         let candidate = current.join("mds.json");
         if candidate.is_file() {
+            let shown = crate::output::safe_path(&shown_dir.join("mds.json"));
             // Read the file first, then check size — avoids a TOCTOU race between
             // a separate metadata() call and the actual read().
-            let bytes = std::fs::read(&candidate)
-                .map_err(|e| miette::miette!("cannot read {}: {e}", candidate.display()))?;
+            let bytes = std::fs::read(&candidate).map_err(|e| {
+                miette::miette!("cannot read {shown}: {}", crate::output::safe_inline(&e))
+            })?;
             if bytes.len() as u64 > MAX_CONFIG_SIZE {
                 return Err(miette::miette!(
-                    "mds.json at {} is too large ({} bytes; maximum is 1 MB)",
-                    candidate.display(),
+                    "mds.json at {shown} is too large ({} bytes; maximum is 1 MB)",
                     bytes.len()
                 ));
             }
-            let raw = String::from_utf8(bytes)
-                .map_err(|e| miette::miette!("invalid UTF-8 in {}: {e}", candidate.display()))?;
-            let config: MdsConfig = serde_json::from_str(&raw)
-                .map_err(|e| miette::miette!("invalid mds.json at {}: {e}", candidate.display()))?;
+            let raw = String::from_utf8(bytes).map_err(|e| {
+                miette::miette!(
+                    "invalid UTF-8 in {shown}: {}",
+                    crate::output::safe_inline(&e)
+                )
+            })?;
+            let config: MdsConfig = serde_json::from_str(&raw).map_err(|e| {
+                miette::miette!(
+                    "invalid mds.json at {shown}: {}",
+                    crate::output::safe_inline(&e)
+                )
+            })?;
+            // #265: a `build.output_dir` carrying a forbidden path character — as
+            // written, or in the form it resolves to under the config directory (a
+            // symlink into a hostile-named directory) — is refused
+            // here, at load — `mds::io`, exit 2 — so it never reaches output-path
+            // derivation. `load_config` is shared, so this fails every run that loads
+            // mds.json, not only the ones that write output: `build`, `watch`, `lint`
+            // (every input mode) and `fmt` directory mode. `check` does not load
+            // mds.json.
+            if let Some(output_dir) = &config.build.output_dir {
+                let shown = std::ffi::OsStr::new(output_dir);
+                crate::output::reject_forbidden_output_path("mds.json build.output_dir", shown)?;
+                crate::output::reject_forbidden_resolved_output_path(
+                    "mds.json build.output_dir",
+                    &current.join(output_dir),
+                    shown,
+                )?;
+            }
             return Ok(Some((config, current)));
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
             None => break,
         }
+        shown_dir.push("..");
     }
     Ok(None)
 }
@@ -354,18 +389,9 @@ pub(crate) fn resolve_output_path_for_kind(
     // 5. `mds.json` output_dir
     if let Some((cfg, config_dir)) = config {
         if let Some(ref output_dir) = cfg.build.output_dir {
-            // Reject path traversal: `output_dir` must not contain `..` components.
-            // We check raw path components rather than canonicalizing because the
-            // directory may not exist yet (it gets created by create_dir_all below).
-            let traversal = Path::new(output_dir)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir);
-            if traversal {
-                return Err(miette::miette!(
-                    "mds.json output_dir '{}' must not contain '..' components",
-                    output_dir
-                ));
-            }
+            // Reject path traversal: `output_dir` must not contain `..` components
+            // (exit 2). A forbidden character was already refused by `load_config`.
+            crate::output::reject_output_dir_traversal(output_dir)?;
             let dir = config_dir.join(output_dir);
             return Ok(Some(prepare_output_dir_for_kind(&dir, input_path, kind)?));
         }
@@ -476,14 +502,20 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
 
 // ── Input-validation helpers ──────────────────────────────────────────────────
 
-/// Validate `path` for single-file build/fmt/lint: existence is checked first
-/// (→ `mds::file_not_found`, exit 2) and then the `.mds` extension (→
+/// Validate `path` for single-file build/fmt/lint: a forbidden path character is
+/// refused first (→ `mds::io`, exit 2, #265), then existence is checked (→
+/// `mds::file_not_found`, exit 2) and then the `.mds` extension (→
 /// `mds::not_mds_file`, exit 2).
+///
+/// The refusal comes first because the two errors after it show the path as
+/// given, unescaped; it is worded like `NativeFs::check_symlink`'s, so a hostile
+/// file argument reports the same error whether or not the file exists.
 ///
 /// Existence-before-extension ordering is required so that a user pointing at a
 /// non-existent path without `.mds` receives a "file not found" error rather than
 /// the confusing "not an .mds file" error (C4/F6).
 pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
+    crate::output::reject_forbidden_output_path("path", path.as_os_str())?;
     let exists = path.try_exists().map_err(|e| MdsError::Io {
         message: format!("cannot check {}: {e}", path.display()),
     })?;
@@ -692,11 +724,17 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
     }
 }
 
-/// Read from stdin and return the source string along with the current working directory.
+/// Read the source from stdin.
 ///
 /// Reads at most `MAX_FILE_SIZE + 1` bytes so we can detect over-sized input without
 /// buffering the entire stream first.
-pub(crate) fn read_stdin() -> Result<(String, PathBuf)> {
+///
+/// A stdin source resolves its imports against the working directory. Callers pass
+/// `None` as the base directory for that, never the absolute `current_dir()`: core
+/// anchors `None` at the working directory itself, and a refusal of it (a forbidden
+/// path character, #265) then names it `"."` — the caller typed no path, so no
+/// message shows the absolute one.
+pub(crate) fn read_stdin() -> Result<String> {
     let mut source = String::new();
     std::io::stdin()
         .take(MAX_FILE_SIZE + 1)
@@ -705,9 +743,7 @@ pub(crate) fn read_stdin() -> Result<(String, PathBuf)> {
     if source.len() as u64 > MAX_FILE_SIZE {
         return Err(miette::miette!("stdin input exceeds maximum size of 10 MB"));
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
-    Ok((source, cwd))
+    Ok(source)
 }
 
 /// Write compiled output to a file or stdout.
@@ -740,7 +776,10 @@ pub(crate) fn write_output(
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        miette::miette!("cannot create output directory {}: {e}", parent.display())
+                        miette::miette!(
+                            "cannot create output directory {}: {e}",
+                            crate::output::safe_path(parent)
+                        )
                     })?;
                 }
             }
@@ -817,7 +856,10 @@ pub(crate) struct CompileOutput {
     pub(crate) content: String,
     /// The output kind (derived intrinsically from the compiled output).
     pub(crate) kind: OutputKind,
-    /// Transitive dependency paths (empty when no `@import`s).
+    /// Transitive dependency paths (empty when no `@import`s), as watch graph keys
+    /// ([`crate::watch::graph_key`]): the canonical form notify event paths are
+    /// compared in. `CompileResult.dependencies` is the conventional form, which on
+    /// Windows drops the `\\?\` prefix the watcher's own paths carry (#409).
     pub(crate) dependencies: Vec<String>,
     /// Source map if `opts.source_map` was `true` and the compilation produced one.
     pub(crate) source_map: Option<mds::SourceMap>,
@@ -867,13 +909,13 @@ pub(crate) fn compile_to_content(
     opts: mds::CompileOptions,
 ) -> Result<CompileOutput> {
     let result = if input == Path::new("-") {
-        // Stdin: compile from source string using cwd as base_dir.
-        // read_stdin enforces MAX_FILE_SIZE (PF-004).
-        let (source, cwd) = read_stdin()?;
+        // Stdin: compile from source string with the working directory as base_dir
+        // (`None` — see `read_stdin`). read_stdin enforces MAX_FILE_SIZE (PF-004).
+        let source = read_stdin()?;
         // AD-211-1 / AD-211-5: a string-source compile labels its errors `<source>`
         // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
         // boundary that knows the input was stdin.
-        mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
+        mds::compile_str_with_deps_opts(&source, None, runtime_vars, opts)
             .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?
     } else {
         // File path: compile_with_deps_opts routes through the resolver which enforces
@@ -892,10 +934,19 @@ pub(crate) fn compile_to_content(
     // Move result.output into serialize_output so the Markdown arm avoids a clone
     // (the kind was already derived from the borrow above — issue 2).
     let content = serialize_output(result.output)?;
+    let dependencies = result
+        .dependencies
+        .iter()
+        .map(|dep| {
+            crate::watch::graph_key(Path::new(dep))
+                .display()
+                .to_string()
+        })
+        .collect();
     Ok(CompileOutput {
         content,
         kind,
-        dependencies: result.dependencies,
+        dependencies,
         source_map,
     })
 }
@@ -1223,6 +1274,30 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
     }
 }
 
+/// Refuse `-o/--output` and `--out-dir` values carrying a forbidden path character
+/// (#265): `mds::io`, exit 2 — as typed, then in the form they resolve to (a symlink
+/// into a hostile-named directory). Shared by `build` and `watch`, which both call it
+/// before any other work, so a refused location is never created or written.
+pub(crate) fn reject_forbidden_output_flags(
+    output: Option<&str>,
+    out_dir: Option<&Path>,
+) -> Result<()> {
+    use crate::output::{reject_forbidden_output_path, reject_forbidden_resolved_output_path};
+    if let Some(o) = output {
+        let shown = std::ffi::OsStr::new(o);
+        reject_forbidden_output_path("-o/--output", shown)?;
+        // `-o -` is stdout, not a path.
+        if o != "-" {
+            reject_forbidden_resolved_output_path("-o/--output", Path::new(o), shown)?;
+        }
+    }
+    if let Some(d) = out_dir {
+        reject_forbidden_output_path("--out-dir", d.as_os_str())?;
+        reject_forbidden_resolved_output_path("--out-dir", d, d.as_os_str())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let BuildArgs {
         input,
@@ -1237,6 +1312,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         inline,
         embed_sources: flag_embed_sources,
     } = args;
+    // #265: refuse a hostile output location before anything is read or compiled.
+    reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
     let resolved = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
@@ -1335,9 +1412,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             .with_include_sources_content(use_embed_sources)
             .with_source_map_base(source_map_base);
 
-        let (source, cwd) = read_stdin()?;
-        // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`.
-        let result = mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
+        let source = read_stdin()?;
+        // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`; `None` is the
+        // working directory, shown as "." (see `read_stdin`).
+        let result = mds::compile_str_with_deps_opts(&source, None, runtime_vars, opts)
             .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
         if !quiet {
             for w in &result.warnings {
@@ -1873,6 +1951,39 @@ fn run_build_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #409: the watch loop compares dependency paths with canonical event paths
+    /// and graph keys, so `compile_to_content` hands it graph keys, not the
+    /// conventional form `CompileResult.dependencies` carries.
+    #[test]
+    fn compile_to_content_reports_dependencies_as_graph_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("main.mds"),
+            "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
+        let main = dir.path().join("main.mds");
+
+        let compiled =
+            compile_to_content(&main, None, true, mds::CompileOptions::default()).unwrap();
+        let expected = crate::watch::graph_key(&dir.path().join("lib.mds"));
+        assert_eq!(
+            compiled.dependencies,
+            [expected.display().to_string()],
+            "the dependency is the watch graph key of the imported file"
+        );
+
+        // On Windows the graph key is verbatim while the library result is not:
+        // this is the mismatch the mapping exists for.
+        #[cfg(windows)]
+        {
+            let library = mds::compile_with_deps(&main, None).unwrap().dependencies;
+            assert!(compiled.dependencies[0].starts_with(r"\\?\"));
+            assert!(!library[0].starts_with(r"\\?\"));
+        }
+    }
 
     // ── compute_source_map_base ───────────────────────────────────────────────
     //

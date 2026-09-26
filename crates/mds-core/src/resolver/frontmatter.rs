@@ -19,7 +19,7 @@ use crate::parser::is_valid_identifier;
 use crate::scope::Scope;
 use crate::value::Value;
 
-use super::validate_import_path;
+use super::import_path_violation;
 
 /// A single import declaration from YAML frontmatter.
 ///
@@ -515,12 +515,16 @@ fn parse_single_import_entry(
     };
     let path = path.clone();
 
-    // Validate path via the same rules as body @import
-    validate_import_path(&path).map_err(|_| {
-        err(&format!(
-            "invalid path \"{path}\": must start with './' or '../'"
-        ))
-    })?;
+    // Validate path via the same rules as body @import, reporting the rule it
+    // actually breaks (#265) — the path is escaped, since it may carry the very
+    // character being refused.
+    if let Some(violation) = import_path_violation(&path) {
+        return Err(err(&format!(
+            "invalid path \"{}\": {}",
+            crate::lint::escape_path_for_message(&path),
+            violation.reason()
+        )));
+    }
 
     match (map.get("as"), map.get("names")) {
         (Some(_), Some(_)) => Err(err("'as' and 'names' are mutually exclusive")),

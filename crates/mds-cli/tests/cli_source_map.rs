@@ -5,7 +5,7 @@
 //! (to verify mappings are parseable and encode known positions).
 
 mod common;
-use common::{fixture, mds_bin};
+use common::{fixture, make_symlink, mds_bin};
 use std::path::Path;
 
 // ── VLQ decode helper (inline; no extra dependency) ──────────────────────────
@@ -1551,7 +1551,6 @@ fn sm20b_embed_sources_with_source_map_no_warning() {
 // the CLI: they differ only in how the source reaches the compiler.
 
 /// T-S1: single-file `--source-map` refuses a symlinked sidecar path.
-#[cfg(unix)]
 #[test]
 fn build_source_map_sidecar_symlink_target_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -1560,7 +1559,9 @@ fn build_source_map_sidecar_symlink_target_rejected() {
     let out = dir.path().join("out.md");
     let real = dir.path().join("real.map");
     std::fs::write(&real, "OLD").unwrap();
-    std::os::unix::fs::symlink(&real, dir.path().join("out.md.map")).unwrap();
+    if !make_symlink(&real, &dir.path().join("out.md.map")) {
+        return;
+    }
 
     let result = mds_bin()
         .arg("build")
@@ -1596,14 +1597,15 @@ fn build_source_map_sidecar_symlink_target_rejected() {
 
 /// T-S2: the stdin `--source-map` sidecar writer is a second, distinct site — it must
 /// refuse a symlinked sidecar path too.
-#[cfg(unix)]
 #[test]
 fn build_stdin_source_map_sidecar_symlink_target_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.md");
     let real = dir.path().join("real.map");
     std::fs::write(&real, "OLD").unwrap();
-    std::os::unix::fs::symlink(&real, dir.path().join("out.md.map")).unwrap();
+    if !make_symlink(&real, &dir.path().join("out.md.map")) {
+        return;
+    }
 
     let mut child = mds_bin()
         .args(["build", "-", "--source-map", "-o", out.to_str().unwrap()])

@@ -361,6 +361,105 @@ fn stdin_mode_report_only_sends_diagnostics_to_stderr() {
     );
 }
 
+// ── #371: filesystem-root base dir ───────────────────────────────────────────
+
+#[test]
+fn stdin_lint_with_root_cwd_succeeds() {
+    // #371: `mds lint -` with no explicit base_dir resolves it from cwd. A
+    // process whose cwd IS the filesystem root must not fail to lint.
+    let out = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            let _ = child.stdin.take().unwrap().write_all(b"Hello World!\n");
+            child.wait_with_output()
+        })
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "lint stdin with cwd=/ should exit 0 for clean input; stderr: {stderr}"
+    );
+}
+
+/// #371 (Windows-only): `mds lint`/`mds fmt` on a file that lives at a REAL
+/// drive root (not just a subdirectory) must exercise the fixed root-anchor
+/// path in `NativeFs::anchor_base_dir`/`canonical_dir`, not the cwd-trap bug.
+/// A writable filesystem root isn't available on CI/macOS/Linux (`/` isn't
+/// writable there), so this test uses Windows' `subst` to mount a tempdir as
+/// a drive root -- the only way to get a real, writable root on this
+/// platform. It does not exist on unix (there is no portable, writable
+/// filesystem root to mount there) rather than being `#[ignore]`d, per the
+/// gating rule: gate only when the behavior genuinely doesn't exist on the
+/// platform, never to hide a product bug.
+#[cfg(windows)]
+#[test]
+fn windows_lint_and_fmt_at_real_drive_root() {
+    use std::process::Command;
+
+    /// Always `subst <letter>: /D` on drop, even if an assertion panics.
+    struct SubstGuard(char);
+    impl Drop for SubstGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("subst")
+                .args([&format!("{}:", self.0), "/D"])
+                .output();
+        }
+    }
+
+    // Pick the first free drive letter, scanning from Z downward.
+    let letter = ('A'..='Z')
+        .rev()
+        .find(|c| !std::path::Path::new(&format!("{c}:\\")).exists())
+        .expect("at least one free drive letter must exist");
+
+    let dir = tempfile::tempdir().unwrap();
+    let status = Command::new("subst")
+        .args([&format!("{letter}:"), dir.path().to_str().unwrap()])
+        .status()
+        .expect("subst must be available on Windows");
+    assert!(status.success(), "subst must succeed to map a drive root");
+    let _guard = SubstGuard(letter);
+
+    let file_path = format!("{letter}:\\root.mds");
+    std::fs::write(&file_path, "Hello   \r\n\r\n\r\nworld\r\n").unwrap();
+
+    // `mds lint` on a file at the drive root must succeed -- no crash from
+    // the cwd trap when anchoring the security root at the drive root.
+    let lint_output = mds_bin()
+        .args(["lint", &file_path])
+        .output()
+        .expect("run mds lint");
+    assert!(
+        lint_output.status.success(),
+        "lint at a real drive root should succeed; stderr: {}",
+        String::from_utf8_lossy(&lint_output.stderr)
+    );
+
+    // `mds fmt` on the same file must take the strong compile-equivalence
+    // path (not silently downgrade to the structural fallback) and succeed.
+    let fmt_output = mds_bin()
+        .args(["fmt", &file_path])
+        .output()
+        .expect("run mds fmt");
+    assert!(
+        fmt_output.status.success(),
+        "fmt at a real drive root should succeed; stderr: {}",
+        String::from_utf8_lossy(&fmt_output.stderr)
+    );
+    let formatted = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        formatted, "Hello   \n\n\nworld\n",
+        "fmt at a real drive root must apply R1/R2 exactly like anywhere else"
+    );
+}
+
 // ── L-CLI-STDIN2: --fix stdin ────────────────────────────────────────────────
 
 #[test]
@@ -2012,6 +2111,9 @@ fn json_files_array_is_path_sorted_in_directory_mode() {
 /// The byte is constructed at runtime from a numeric escape and never typed as a
 /// literal into this file (PF-018 — the editing tooling decodes such escapes into
 /// real bytes in tracked source, and the `Source hygiene` CI job rejects them).
+///
+/// `#[cfg(unix)]`: builds the control-byte name with `OsStringExt`, a Unix-only API, and
+/// a Windows file name cannot hold a C0 control anyway (#147).
 #[cfg(unix)]
 #[test]
 fn directory_json_file_key_escapes_control_bytes_in_paths() {
@@ -2100,6 +2202,9 @@ fn directory_json_file_key_escapes_control_bytes_in_paths() {
 ///
 /// The invalid bytes are built at RUNTIME from numeric values; no escape sequence
 /// or raw byte appears in this source file (Source hygiene gate).
+///
+/// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStringExt` (arbitrary bytes), a
+/// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
 #[cfg(unix)]
 #[test]
 fn lint_directory_non_utf8_entry_is_an_io_error_exit_2() {
@@ -2858,103 +2963,76 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
     );
 }
 
-/// T-9 [AC-C3]: `mds lint --format json` on a source whose `duplicate-import`
-/// diagnostic message embeds a raw C1 control character (U+0085 NEL) must emit
-/// valid JSON with no raw control bytes anywhere — in particular the embedded
-/// path must be escaped to its 6-character JSON escape (backslash, u, 0, 0, 8, 5).
-///
-/// ## Why this vector?
-///
-/// The original T-9 used a YAML frontmatter key containing a raw ESC byte
-/// (`"a\x1Bb": 1`).  `serde_yaml_ng` rejects raw ESC/DEL bytes inside
-/// double-quoted YAML keys, so the test never reached the lint code path at all
-/// — the YAML parser rejected the input before any sanitizer ran, making every
-/// assertion vacuous (PF-013 shape).
-///
-/// U+0085 (NEL, C1 NEL) is a C1 control character whose UTF-8 encoding
-/// (0xC2 0x85) **passes** `serde_yaml_ng` YAML parsing.  We exploit a
-/// different route: the `duplicate-import` rule fires when the same module is
-/// imported twice and embeds the raw import path in its message.  A module
-/// whose file *name* contains U+0085 therefore injects that byte into the
-/// diagnostic message.  When `to_canonical_json` serializes the result, it
-/// must sanitize U+0085 into its 6-character ASCII JSON escape; if that
-/// sanitization is removed the raw 0xC2 0x85 bytes appear in the JSON wire.
-///
-/// ## Failure mode (regression guard)
-///
-/// Removing the `sanitize_control_chars` call in `to_canonical_json` causes:
-///   - Gate 1 still passes (the JSON is syntactically valid)
-///   - Gate 2 FAILS: `assert_no_control_chars` finds U+0085 (a C1 char) in
-///     the JSON wire output
-///   - Gate 3 FAILS: the per-message check finds U+0085 in the diagnostic message
-///   - The positive assertion FAILS: the 6-character escape is not present when
-///     raw bytes leak
-#[test]
-fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // Helper module whose file name contains U+0085 (NEL, C1).  This character
-    // survives serde_yaml_ng YAML parsing (unlike ESC/DEL which are rejected).
-    let nel_name = "fo\u{0085}o.mds";
-    let nel_module = dir.path().join(nel_name);
-    fs::write(&nel_module, "hi\n").unwrap();
-
-    // main.mds imports the NEL-named module twice → duplicate-import fires.
-    // The diagnostic message embeds the raw import path (including U+0085).
-    let import_line = format!("@import \"./{nel_name}\"\n");
-    let main_content = format!("{import_line}{import_line}");
-    let main_file = dir.path().join("main.mds");
-    fs::write(&main_file, main_content.as_bytes()).unwrap();
-
-    let out = lint_path(&main_file, &["--format", "json"]);
-
-    let stdout_str = String::from_utf8_lossy(&out.stdout);
-
-    // Gate 1 (fail-closed): stdout must be valid JSON with version 1.
+/// Lint `file` with `--format json` and return `(parsed JSON, raw stdout)`, failing
+/// closed unless stdout is valid version-1 JSON.
+fn lint_json(file: &Path, label: &str) -> (serde_json::Value, String) {
+    let out = lint_path(file, &["--format", "json"]);
+    let stdout_str = String::from_utf8_lossy(&out.stdout).into_owned();
     let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
-        panic!(
-            "T-9: lint --format json must emit valid JSON; parse error: {e}; \
-             stdout: {stdout_str:?}"
-        )
+        panic!("{label}: lint --format json must emit valid JSON; parse error: {e}; stdout: {stdout_str:?}")
     });
-    assert_eq!(json["version"], 1, "T-9: JSON version must be 1");
+    assert_eq!(json["version"], 1, "{label}: JSON version must be 1");
+    (json, stdout_str)
+}
 
-    // Gate 2 (fail-closed, char-based): the entire JSON wire must contain no raw
-    // C0 (excl. \t \n), DEL, or C1 control codepoints.
-    // Uses `assert_no_control_chars` which iterates over Unicode codepoints, not
-    // raw bytes, to avoid false-positives on continuation bytes of non-C1 chars.
-    assert_no_control_chars(&stdout_str, "T-9 JSON wire output");
-
-    // Gate 3 (fail-closed): assert diagnostics ARE present and the rule fired.
+/// All diagnostics of a lint JSON document, failing closed on a missing array.
+fn json_diagnostics<'a>(json: &'a serde_json::Value, label: &str) -> Vec<&'a serde_json::Value> {
     let files = json["files"]
         .as_array()
-        .unwrap_or_else(|| panic!("T-9: JSON must have 'files' array; got: {json}"));
+        .unwrap_or_else(|| panic!("{label}: JSON must have 'files' array; got: {json}"));
     assert!(
         !files.is_empty(),
-        "T-9: files array must be non-empty (duplicate-import should fire); got: {json}"
+        "{label}: files array must be non-empty; got: {json}"
     );
-    let all_diags: Vec<&serde_json::Value> = files
+    files
         .iter()
         .flat_map(|f| {
             f["diagnostics"].as_array().unwrap_or_else(|| {
-                panic!(
-                    "T-9: every file entry must have a 'diagnostics' array; \
-                                           got: {f}"
-                )
+                panic!("{label}: every file entry needs 'diagnostics'; got: {f}")
             })
         })
-        .collect();
+        .collect()
+}
+
+/// T-9 [AC-C3]: `mds lint --format json` on a source whose diagnostic message embeds a
+/// raw C1 control character (U+0085 NEL) must emit valid JSON with no raw control bytes
+/// anywhere — the embedded character must arrive as its 6-character JSON escape
+/// (backslash, u, 0, 0, 8, 5).
+///
+/// ## Why this vector?
+///
+/// Route B: a YAML double-quoted frontmatter KEY written with the YAML escape `\x85`.
+/// `serde_yaml_ng` decodes it into a real U+0085 and `unused-variable` embeds the
+/// decoded key verbatim in its message; the .mds source itself carries no raw byte.
+///
+/// The earlier vector — a module whose file NAME carries U+0085, imported twice so
+/// `duplicate-import` embeds the path — is refused at the input boundary since #265
+/// (`lint_json_forbidden_char_in_import_path_is_refused_at_input` pins that), so it no
+/// longer reaches a lint rule at all; asserting on it would be vacuous (PF-013).
+///
+/// ## Failure mode (regression guard)
+///
+/// Removing the sanitization in `to_canonical_json` makes Gate 2 and Gate 3 find the
+/// raw U+0085 and the positive assertion miss the 6-character escape.
+#[test]
+fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("nel.mds");
+    // `\\x85` below is the YAML escape text (backslash, x, 8, 5) — no raw byte.
+    fs::write(&file, b"---\n\"fo\\x85o\": 1\n---\nHello\n").unwrap();
+
+    let (json, stdout_str) = lint_json(&file, "T-9");
+
+    // Gate 2 (fail-closed, char-based): no raw C0 (excl. \t \n), DEL, or C1 anywhere.
+    assert_no_control_chars(&stdout_str, "T-9 JSON wire output");
+
+    // Gate 3 (fail-closed): the rule fired, and no message carries a raw char.
+    let all_diags = json_diagnostics(&json, "T-9");
     assert!(
-        !all_diags.is_empty(),
-        "T-9: must have at least one diagnostic; got: {files:?}"
-    );
-    let has_dup_import = all_diags.iter().any(|d| d["rule"] == "duplicate-import");
-    assert!(
-        has_dup_import,
-        "T-9: duplicate-import must be among the diagnostics; got rules: {:?}",
+        all_diags.iter().any(|d| d["rule"] == "unused-variable"),
+        "T-9: unused-variable must fire; got rules: {:?}",
         all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
     );
-    // Per-message sanitization check (char-based).
     for diag in &all_diags {
         let msg = diag["message"]
             .as_str()
@@ -2962,23 +3040,13 @@ fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
         assert_no_control_chars(msg, "T-9 diagnostic message");
     }
 
-    // Positive assertion (non-vacuous, PF-013): the sanitized escape for U+0085
-    // must appear in at least one message.  If sanitization is removed the raw
-    // U+0085 character leaks and this assertion fails because the 6-char literal
-    // is absent while the raw codepoint (caught by Gate 2/3) is present.
-    //
-    // After JSON deserialisation by serde_json the string value is the
-    // 6-character sequence: backslash, u, 0, 0, 8, 5.
-    let has_sanitized_nel = all_diags.iter().any(|d| {
-        d["message"]
-            .as_str()
-            .map(|m| m.contains("\\u0085"))
-            .unwrap_or(false)
-    });
+    // Positive assertion (non-vacuous, PF-013): the 6-character escape is present.
+    let escaped_nel = format!("\\u{:04X}", 0x85);
     assert!(
-        has_sanitized_nel,
-        "T-9: sanitized \\u0085 literal must appear in at least one diagnostic message; \
-         got messages: {:?}",
+        all_diags.iter().any(|d| d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&escaped_nel))),
+        "T-9: {escaped_nel} must appear in at least one diagnostic message; got: {:?}",
         all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
     );
 }
@@ -2986,75 +3054,84 @@ fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
 /// T-9b [AC-C3]: the Trojan Source vector (CVE-2021-42574) end-to-end through
 /// `mds lint --format json`.
 ///
-/// U+202E RIGHT-TO-LEFT OVERRIDE is not a C0/DEL/C1 control character, so before
-/// the escape class was widened it passed through the wire untouched. A single RLO
-/// inside a filename makes every downstream renderer (terminal, IDE, code-review UI)
-/// display the remainder of the line in reverse — a benign-looking diagnostic can be
-/// made to read as something entirely different from its bytes.
+/// U+202E RIGHT-TO-LEFT OVERRIDE is not a C0/DEL/C1 control character, so before the
+/// escape class was widened it passed through the wire untouched. A single RLO makes
+/// every downstream renderer display the remainder of the line in reverse.
 ///
-/// Reachability: the same `duplicate-import` route T-9 uses. The rule embeds the raw
-/// import path in its message, and the path is a plain string (not YAML), so U+202E
-/// reaches the lint engine intact.
+/// Reachability: route B, as T-9 — a frontmatter key written with the YAML escape for
+/// U+202E (built at runtime, PF-018). The import-path route is refused at input since
+/// #265 (see `lint_json_forbidden_char_in_import_path_is_refused_at_input`).
 ///
-/// Non-vacuity (PF-013): asserts the `files` array is non-empty, that
-/// `duplicate-import` actually fired, AND the POSITIVE assertion that the escaped
-/// `\\u202E` literal is present — all three fail if the widened class is reverted.
+/// Non-vacuity (PF-013): the rule actually fired, AND the escaped literal is present.
 #[test]
-fn lint_json_bidi_override_in_import_path_is_escaped() {
+fn lint_json_bidi_override_in_frontmatter_key_is_escaped() {
     let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("rlo.mds");
+    let yaml_escape = format!("\\u{:04X}", 0x202E);
+    fs::write(
+        &file,
+        format!("---\n\"fo{yaml_escape}gnp\": 1\n---\nHello\n"),
+    )
+    .unwrap();
 
-    // "fo<RLO>gnp.mds" renders as "fopng.mds" in a bidi-aware terminal.
-    let rlo_name = "fo\u{202E}gnp.mds";
-    fs::write(dir.path().join(rlo_name), "hi\n").unwrap();
-
-    let import_line = format!("@import \"./{rlo_name}\"\n");
-    let main_file = dir.path().join("main.mds");
-    fs::write(&main_file, format!("{import_line}{import_line}").as_bytes()).unwrap();
-
-    let out = lint_path(&main_file, &["--format", "json"]);
-    let stdout_str = String::from_utf8_lossy(&out.stdout);
-
-    // Gate 1 (fail-closed): valid JSON, version 1.
-    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
-        panic!("T-9b: lint --format json must emit valid JSON; parse error: {e}; stdout: {stdout_str:?}")
-    });
-    assert_eq!(json["version"], 1, "T-9b: JSON version must be 1");
-
-    // Gate 2 (fail-closed): no raw hostile codepoint anywhere in the wire output.
+    let (json, stdout_str) = lint_json(&file, "T-9b");
     assert_no_control_chars(&stdout_str, "T-9b JSON wire output");
 
-    // Gate 3 (non-vacuity): the rule actually fired.
-    let files = json["files"]
-        .as_array()
-        .unwrap_or_else(|| panic!("T-9b: JSON must have 'files' array; got: {json}"));
+    let all_diags = json_diagnostics(&json, "T-9b");
     assert!(
-        !files.is_empty(),
-        "T-9b: files array must be non-empty (duplicate-import should fire); got: {json}"
-    );
-    let all_diags: Vec<&serde_json::Value> = files
-        .iter()
-        .flat_map(|f| {
-            f["diagnostics"]
-                .as_array()
-                .unwrap_or_else(|| panic!("T-9b: every file entry needs 'diagnostics'; got: {f}"))
-        })
-        .collect();
-    assert!(
-        all_diags.iter().any(|d| d["rule"] == "duplicate-import"),
-        "T-9b: duplicate-import must be among the diagnostics; got rules: {:?}",
+        all_diags.iter().any(|d| d["rule"] == "unused-variable"),
+        "T-9b: unused-variable must fire; got rules: {:?}",
         all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
     );
-
-    // Positive assertion (PF-013): the escaped form must be present.
-    let has_escaped_rlo = all_diags
-        .iter()
-        .any(|d| d["message"].as_str().is_some_and(|m| m.contains("\\u202E")));
+    // The escape text written into the YAML is the same six characters the wire
+    // escaper produces for U+202E.
     assert!(
-        has_escaped_rlo,
-        "T-9b: escaped \\u202E literal must appear in at least one diagnostic message; \
-         got messages: {:?}",
+        all_diags.iter().any(|d| d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&yaml_escape))),
+        "T-9b: {yaml_escape} must appear in at least one diagnostic message; got: {:?}",
         all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
     );
+}
+
+/// #265: the route T-9 and T-9b used to take — a module whose file name carries a
+/// forbidden character, imported twice so `duplicate-import` would embed the path — is
+/// refused at the input boundary before any lint rule runs. The JSON error names the
+/// codepoint and shows the path escaped; exit 2.
+///
+/// Unix-only: Windows file names cannot hold these characters, so the module on disk
+/// (which makes the refusal, not a missing file, the only possible error) cannot be
+/// created there.
+#[cfg(unix)]
+#[test]
+fn lint_json_forbidden_char_in_import_path_is_refused_at_input() {
+    for ch in ['\u{0085}', '\u{202E}'] {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("fo{ch}o.mds");
+        fs::write(dir.path().join(&name), "hi\n").unwrap();
+        let import_line = format!("@import \"./{name}\"\n");
+        let main_file = dir.path().join("main.mds");
+        fs::write(&main_file, format!("{import_line}{import_line}")).unwrap();
+
+        let out = lint_path(&main_file, &["--format", "json"]);
+        let stdout_str = String::from_utf8_lossy(&out.stdout);
+        let u = format!("U+{:04X}", u32::from(ch));
+        assert_eq!(out.status.code(), Some(2), "{u}: stdout {stdout_str:?}");
+        assert_no_control_chars(&stdout_str, "refused import JSON");
+
+        let json: serde_json::Value = serde_json::from_str(&stdout_str)
+            .unwrap_or_else(|e| panic!("{u}: invalid JSON ({e}): {stdout_str:?}"));
+        assert_eq!(json["error"]["code"], "mds::import", "{u}: {json}");
+        let expected = format!(
+            "import path contains forbidden character {u}: \"./fo\\u{:04X}o.mds\"",
+            u32::from(ch)
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&expected),
+            "{u}: {expected:?} in {message:?}"
+        );
+    }
 }
 
 /// T-9c [AC-C3]: wire-mode newline escaping end-to-end — the log/YAML-key forging
@@ -3162,6 +3239,8 @@ fn lint_json_newline_in_frontmatter_key_is_escaped_on_the_wire() {
 /// file-type bits (`mode & 0o7777`) ensures `Permissions::from_mode` receives
 /// only the permission bits.  This test locks in that guarantee for the lint path
 /// now that `atomic_write_file` lives in `output.rs` and is shared with `fmt`.
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_preserves_mode_0644() {
@@ -3202,6 +3281,9 @@ fn lint_fix_preserves_mode_0644() {
 /// Previously only the `persist()` error carried the path; all other paths
 /// (temp-file creation, permission set, write, fsync) emitted generic messages.
 /// Fixed by step 9.1 (all 5 non-persist errors now include `path.display()`).
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_write_failure_includes_filename_in_stderr() {
@@ -3249,6 +3331,9 @@ fn lint_write_failure_includes_filename_in_stderr() {
 /// immediately by "error writing …/e1.mds" — actively lying about the
 /// outcome.  `fmt.rs:284` already does this correctly (write first, label on
 /// `Ok(())`); this test locks in parity for both lint modes.
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
@@ -3291,6 +3376,9 @@ fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
 /// Regression gate (directory mode): when `atomic_write_file` fails,
 /// stderr must NOT contain "Fixed: <file>" — mirrors the single-file check
 /// above for the `lint_one_file_human` code path (lint.rs:1227).
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
@@ -3335,6 +3423,9 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
 ///
 /// Positive control (PF-013/ADR-009): a writable directory run confirms "Fixed:"
 /// DOES appear so the absence assertion below cannot be vacuous.
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
@@ -3399,6 +3490,8 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
 // Fix: attempt the write FIRST; on failure push a structured `{"file":…,"error":…}`
 // entry matching the read-failure shape, then return FileTally::Error.
 
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
 #[cfg(unix)]
 #[test]
 fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
@@ -5962,9 +6055,15 @@ fn lint_directory_all_excluded_quiet_no_summary() {
 // ── AC-Q25: hostile filename cannot forge a summary line ─────────────────────
 //
 // PF-018: construct the hostile byte at RUNTIME, never as a source literal.
-// PF-013/ADR-009: positive control — assert the escaped form IS in stderr,
-// proving the hostile filename was reached and neutralised.
+// PF-013/ADR-009: positive controls — the refusal names the codepoint, the escaped
+// form IS in stderr, and the genuine summary is pinned, proving the hostile filename
+// was reached and refused rather than silently skipped.
+//
+// Since #265 the file is refused at the input boundary (`mds::io`) and counted as an
+// error-severity file; its name still appears in the refusal, escaped.
 
+/// `#[cfg(unix)]`: a Windows file name cannot hold a C0 control, so the hostile file
+/// cannot be created there (#147).
 #[cfg(unix)]
 #[test]
 fn lint_directory_summary_is_not_forgeable() {
@@ -5984,8 +6083,6 @@ fn lint_directory_summary_is_not_forgeable() {
     let hostile_os = std::ffi::OsStr::from_bytes(&hostile_name_bytes);
     let hostile_path = dir.path().join(hostile_os);
 
-    // Use error-severity content so the file is lint-processed and its path
-    // appears in the output (duplicate-export from lint_error.mds content).
     let error_content = fs::read(fixture("lint_error.mds")).unwrap();
     fs::write(&hostile_path, &error_content).unwrap();
 
@@ -5993,30 +6090,31 @@ fn lint_directory_summary_is_not_forgeable() {
     let stderr_bytes = &out.stderr;
     let stderr = String::from_utf8_lossy(stderr_bytes);
 
+    // The file is refused: exit 2, mds::io, naming U+001B.
+    assert_eq!(out.status.code(), Some(2), "AC-Q25: got {stderr:?}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("U+001B"),
+        "AC-Q25: the refusal must be mds::io naming U+001B; got: {stderr:?}"
+    );
+
     // Primary assertion: no raw 0x1b (ESC) byte in stderr.
     assert!(
         !stderr_bytes.contains(&esc_byte),
         "AC-Q25: raw ESC byte must not appear in stderr; got: {stderr:?}"
     );
 
-    // Positive control: the escaped form of 0x1b MUST appear in stderr,
-    // proving the hostile filename was reached and processed, not silently skipped.
-    // The sanitizer emits control bytes as \uXXXX with UPPERCASE hex digits (e.g. \u001B).
-    // Check both cases defensively; the canonical form confirmed in error_tests.rs is \u001B.
+    // Positive control: the escaped form of 0x1b — the six-character, UPPERCASE-hex
+    // literal the escaper writes — MUST appear in stderr, proving the hostile filename
+    // was reached and neutralised, not silently skipped.
+    let escaped_esc = format!("\\u{:04X}", esc_byte);
     assert!(
-        stderr.contains("\\u001B")
-            || stderr.contains("\\u001b")
-            || stderr.contains("\\x1B")
-            || stderr.contains("\\x1b"),
-        "AC-Q25 positive control: escaped form of ESC must appear in stderr, \
-         confirming the hostile file was processed; got: {stderr:?}"
+        stderr.contains(&escaped_esc),
+        "AC-Q25 positive control: {escaped_esc} must appear in stderr; got: {stderr:?}"
     );
 
-    // The forged summary text must NOT appear as a standalone summary line.
-    // The genuine summary will have a different count (1 with errors, not 3 clean).
-    // Note: the hostile FILENAME embeds the forged text so it DOES appear inside the
-    // diagnostic frame line ("╭─[\u001B3 clean...mds:6:1]").  We must check for an
-    // exact line match, not a substring match, to distinguish the two cases.
+    // The forged summary text must NOT appear as a standalone summary line. It DOES
+    // appear inside the refusal message (the name is shown, escaped), so this is an
+    // exact line match, not a substring match.
     let forged_line = "3 clean, 0 with warnings, 0 with errors, 0 resource-limited";
     assert!(
         !stderr.lines().any(|l| l.trim() == forged_line),
@@ -6024,10 +6122,8 @@ fn lint_directory_summary_is_not_forgeable() {
          got: {stderr:?}"
     );
 
-    // AC-Q25 also requires the GENUINE summary appears exactly once, confirming the
-    // directory summary path was reached and a real count was emitted (not suppressed or
-    // omitted).  The directory contains exactly 1 error-severity file, so the genuine
-    // summary is the line below.
+    // The GENUINE summary appears exactly once: the directory holds exactly one file,
+    // and it was refused, which counts as an error-severity file.
     let genuine_summary = "0 clean, 0 with warnings, 1 with errors, 0 resource-limited";
     let genuine_count = stderr
         .lines()
@@ -6854,6 +6950,9 @@ fn d1_dir_fix_check_json_body_pre_fix_and_exit_2() {
 ///
 /// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or
 /// raw byte appears in this source file (source hygiene gate).
+///
+/// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStringExt` (arbitrary bytes), a
+/// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
 #[cfg(unix)]
 #[test]
 fn lint_single_file_non_utf8_path_exits_2() {

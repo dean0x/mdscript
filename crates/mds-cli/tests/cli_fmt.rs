@@ -16,7 +16,7 @@
 //! - AC-CF-8: -q/--quiet suppresses status but never errors
 
 mod common;
-use common::{fixture, mds_bin};
+use common::{fixture, make_symlink, mds_bin};
 
 use std::fs;
 use std::path::Path;
@@ -800,13 +800,14 @@ fn non_mds_extension_rejected_exits_two() {
 }
 
 #[test]
-#[cfg(unix)]
 fn symlinked_file_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let real = dir.path().join("real.mds");
     fs::write(&real, "Hello!\n").unwrap();
     let link = dir.path().join("link.mds");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
+    if !make_symlink(&real, &link) {
+        return;
+    }
 
     let output = fmt_path(&link, &[]);
     assert!(!output.status.success(), "symlinked file must be rejected");
@@ -818,13 +819,14 @@ fn symlinked_file_rejected() {
 }
 
 #[test]
-#[cfg(unix)]
 fn symlinked_directory_root_rejected() {
     let real_dir = tempfile::tempdir().unwrap();
     fs::write(real_dir.path().join("page.mds"), "Hello!\n").unwrap();
     let link_parent = tempfile::tempdir().unwrap();
     let link_path = link_parent.path().join("linked");
-    std::os::unix::fs::symlink(real_dir.path(), &link_path).unwrap();
+    if !make_symlink(real_dir.path(), &link_path) {
+        return;
+    }
 
     let output = fmt_path(&link_path, &[]);
     assert!(
@@ -848,8 +850,11 @@ fn oversized_file_exits_three() {
     );
 }
 
+/// #147: this file's name is plain ASCII — only its CONTENT is invalid UTF-8 —
+/// so there is nothing Unix-specific here (unlike `fmt_non_utf8_path_exits_two`
+/// below, which constructs a hostile FILENAME via a Unix-only API). Runs on
+/// every host; was gated `#[cfg(unix)]` for no discoverable reason.
 #[test]
-#[cfg(unix)]
 fn bad_utf8_exits_two() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("bad_utf8.mds");
@@ -1108,7 +1113,7 @@ fn dir_check_summary_includes_unchanged_count() {
 /// the syntax diagnostic.
 ///
 /// Regression for PF-006: `path.parent()` on a bare filename returns `Some("")`.
-/// `NativeFs::canonicalize("")` failed with `MdsError::Io`, which the
+/// Resolving the empty base directory `""` failed with `MdsError::Io`, which the
 /// `assert_equivalent` fallback path silently swallowed (fell through to
 /// `structural_equivalent`) instead of propagating the `MdsError::Syntax` error.
 /// After the `resolve_base_dir` + `effective_parent` fix the syntax error must
@@ -1198,6 +1203,8 @@ fn fmt_single_file_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
 ///
 /// `atomic_write_file` already handles this (commit c5aa086 hardened the lint
 /// path) — this test locks in the same guarantee for the fmt path.
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn fmt_single_file_preserves_mode_0644() {
@@ -1229,6 +1236,8 @@ fn fmt_single_file_preserves_mode_0644() {
 ///
 /// Directory mode routes through `format_one_file` → `atomic_write_file`.
 /// Same tempfile-0600 hazard as the single-file path above.
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn fmt_directory_mode_preserves_mode_0644() {
@@ -1384,6 +1393,10 @@ fn r3_fmt_read_error_names_root_relative_path() {
 ///
 /// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or raw
 /// byte appears in this source file (source hygiene gate).
+///
+/// `#[cfg(unix)]`: constructs the hostile filename via `OsStringExt::from_vec`
+/// (arbitrary bytes), a Unix-only API; Windows paths are UTF-16 and have no
+/// equivalent construction from arbitrary bytes (#147).
 #[cfg(unix)]
 #[test]
 fn fmt_non_utf8_path_exits_two() {

@@ -32,20 +32,46 @@ input. The compiler enforces several defense-in-depth controls:
 
 ### Filesystem boundary (`crates/mds-core/src/fs.rs`, `resolver.rs`)
 
-- **Path-traversal prevention**: import paths and the `output_dir` config value
-  are rejected if they escape the project root (`..` traversal). The project root
+- **Path-traversal prevention**: import paths are rejected if they resolve outside
+  the project root (`..` traversal, or a symlinked parent directory leading out),
+  and an `mds.json` `build.output_dir` containing any `..` component is refused
+  (`mds::io`, exit 2). The project root
   is the nearest ancestor directory containing a `.git` or `.mdsroot` marker,
   found by walking upward from the compiled file's directory. Placing a `.mdsroot`
   file is therefore a security-relevant decision: it sets the containment boundary
   for all imports, and placing it closer to the input narrows that boundary while
   placing it farther away widens it.
-- **Symlink rejection**: symlinked import paths are refused. Resolution is
-  written to be TOCTOU-safe (the resolved target is validated, not just the
-  pre-resolution path).
+- **Symlink rejection**: an entry file, import target or `--vars` file whose final
+  path component is a symbolic link (on Windows also a junction) is refused, and so
+  is a base directory passed to `ModuleCache::resolve_source*`. The check reads the
+  file type of the final component itself (not following it), then requires its
+  canonical path to lie in the canonical parent directory. Symbolic links in parent
+  directories are followed and the result is then subject to containment.
 - **Null-byte rejection**: paths containing NUL bytes are rejected at the API
   boundary rather than being passed to the OS.
+- **Forbidden path characters are refused at input, not only escaped on output**
+  (#265): a path carrying any of the 80 codepoints of `mds::is_forbidden_path_char`
+  — every C0 control including TAB and LF, DEL, every C1 control, and the bidi,
+  line/paragraph-separator and BOM hazards — is refused before the file it names is read:
+  import strings (`mds::import`); entry paths, virtual entry keys, base
+  directories and resolved canonical paths (`mds::io`); and on the CLI the
+  `-o`/`--out-dir`/`build.output_dir` output locations and the `mds init`
+  filename (`mds::io`, exit 2). `@mdscript/mds`'s WASM backend applies the same
+  class in its JS pre-scanner before it reads a file. The resolver runs these
+  checks before a `FileSystem` backend is called, so a custom backend passed to
+  `ModuleCache::with_fs` is covered for every path its caller supplies; a path the
+  backend produces itself (a key it rewrites, a link it follows) is its own
+  responsibility, and its contract requires it to apply `mds::is_forbidden_path_char`.
+  Output escaping stays in place as the second layer: diagnostics escape control,
+  bidi and separator characters (spec §7.5 "Sanitization invariant"), so a hostile
+  name that reaches one is displayed as `\uXXXX` text instead of being interpreted
+  by the terminal.
 - **Non-UTF-8 paths** are rejected at the public API boundary with an explicit
-  error instead of producing corrupted output.
+  error instead of producing corrupted output. A resolved path that is not valid
+  UTF-8 — reached through a symbolic link into such a directory — is refused too,
+  never turned into a lossy key, which would name a different, unchecked file.
+- **Path segment cap**: an entry path or import path of more than 256 segments is
+  refused (`mds::resource_limit`) on both built-in backends.
 - **Source-map anchors are byte-faithful**: the project root and `source_map_base`
   used to decide whether a `sources[]` entry is inside the project are never
   derived from a lossy string. A root that is empty or not valid UTF-8 is treated
@@ -59,9 +85,10 @@ input. The compiler enforces several defense-in-depth controls:
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 
-The symlink, containment, NUL-byte and path-encoding rules above are specified
-normatively — with their error codes and the tests that pin them — in `spec.md`
-§4.6 "Filesystem constraints"; this section is the overview.
+The symlink, containment, NUL-byte, forbidden-character, path-encoding and
+segment-count rules above are specified normatively — with their error codes, the
+place each check runs, and the tests that pin them — in `spec.md` §4.6
+"Filesystem constraints"; this section is the overview.
 
 ### Resource limits
 
@@ -79,6 +106,7 @@ normatively — with their error codes and the tests that pin them — in `spec.
 | Max output size | 50 MB | `evaluator.rs` (`MAX_OUTPUT_SIZE`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
+| Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
 | Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
 | Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |
 | Max value (YAML/JSON) nesting depth | 64 | `value.rs` (`MAX_VALUE_DEPTH`) |

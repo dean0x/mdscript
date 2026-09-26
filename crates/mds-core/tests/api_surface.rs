@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -34,6 +35,43 @@ fn public_functions_exist() {
     let _ = mds::load_vars_str("{}");
     let _ = mds::load_vars_file_reporting_duplicates(Path::new("nonexistent.json"));
     let _ = mds::load_vars_str_reporting_duplicates("{}");
+}
+
+/// #409: `display_native_path` is callable via the crate root with the expected
+/// `Path -> Cow<Path>` signature. It is the single public entry point CLI and
+/// binding display sinks use to strip a Windows verbatim prefix (`\\?\C:\…`)
+/// from a path before showing it to a user; off Windows (this host) a canonical
+/// path is never verbatim, so it is a documented no-op — pinned here rather than
+/// under `#[cfg(windows)]`, since every host must have this function.
+#[test]
+fn display_native_path_function_exists() {
+    let _: fn(&Path) -> Cow<'_, Path> = mds::display_native_path;
+    let unchanged = Path::new("relative/path.mds");
+    assert_eq!(&*mds::display_native_path(unchanged), unchanged);
+}
+
+/// #409 (Windows only): `display_native_path` actually strips a lossless
+/// verbatim prefix. The pin test above only exercises the no-op case, which
+/// passes trivially on every host, Windows included.
+#[cfg(windows)]
+#[test]
+fn display_native_path_strips_verbatim_prefix_on_windows() {
+    let verbatim = Path::new(r"\\?\C:\Users\example\file.mds");
+    let shown = mds::display_native_path(verbatim);
+    assert_eq!(shown.as_ref(), Path::new(r"C:\Users\example\file.mds"));
+}
+
+/// #265: `is_forbidden_path_char` and `escape_path_for_message` are callable via
+/// the crate root with the expected signatures, the predicate classifies TAB as
+/// forbidden and `a` as allowed, and the escaper renders TAB as its six-character
+/// escape.
+#[test]
+fn forbidden_path_char_functions_exist() {
+    let _: fn(char) -> bool = mds::is_forbidden_path_char;
+    let _: fn(&str) -> Cow<'_, str> = mds::escape_path_for_message;
+    assert!(mds::is_forbidden_path_char('\t'));
+    assert!(!mds::is_forbidden_path_char('a'));
+    assert_eq!(&*mds::escape_path_for_message("a\tb"), "a\\u0009b");
 }
 
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`
@@ -359,12 +397,358 @@ fn module_cache_with_fs_constructor() {
     let _cache = ModuleCache::with_fs(fs);
 }
 
+// ── FileSystem required-method set + resolver entry validation (#155) ─────────
+
+/// A custom backend implementing EXACTLY the required `FileSystem` methods.
+///
+/// This impl is the pin: a new required method fails to compile here (E0046), and
+/// so does removing one of these five (E0407). `resolve_entry` is an identity
+/// function that performs NO validation of its own and counts its calls, so the
+/// tests below can prove the resolver validates entry paths before a custom
+/// backend is ever reached.
+struct IdentityFs {
+    inner: VirtualFs,
+    resolve_entry_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl IdentityFs {
+    fn new(
+        modules: HashMap<String, String>,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fs = Self {
+            inner: VirtualFs::new(modules),
+            resolve_entry_calls: std::sync::Arc::clone(&calls),
+        };
+        (fs, calls)
+    }
+}
+
+impl FileSystem for IdentityFs {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        self.resolve_entry_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(path.to_string())
+    }
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        self.inner.normalize_in_dir(dir, relative)
+    }
+    fn parent_dir(&self, key: &str) -> String {
+        self.inner.parent_dir(key)
+    }
+    fn read(&self, key: &str) -> Result<String, MdsError> {
+        self.inner.read(key)
+    }
+    fn is_markdown(&self, key: &str) -> bool {
+        self.inner.is_markdown(key)
+    }
+}
+
+fn diagnostic_code(err: &MdsError) -> Option<String> {
+    miette::Diagnostic::code(err).map(|c| c.to_string())
+}
+
+#[test]
+fn filesystem_trait_required_methods_pin() {
+    let modules = HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
+    let (fs, calls) = IdentityFs::new(modules);
+    let fs: Box<dyn FileSystem> = Box::new(fs);
+    let mut cache = ModuleCache::with_fs(fs);
+    let output = cache
+        .resolve_path_intrinsic("main.mds", &HashMap::new(), &mut vec![])
+        .expect("a backend with only the required methods must resolve an entry");
+    assert!(
+        matches!(&output, CompiledOutput::Markdown(s) if s == "Hello!\n"),
+        "unexpected output: {output:?}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the entry must be resolved through FileSystem::resolve_entry"
+    );
+}
+
+/// AC-155-5: entry validation runs in the resolver, so a custom backend whose
+/// `resolve_entry` validates nothing still never sees an empty or NUL entry path.
+#[test]
+fn custom_backend_entry_validation_runs_before_backend() {
+    for bad in ["", "a\0b.mds"] {
+        let (fs, calls) = IdentityFs::new(HashMap::new());
+        let mut cache = ModuleCache::with_fs(Box::new(fs));
+        let err = cache
+            .resolve_path(bad, &HashMap::new(), &mut vec![])
+            .unwrap_err();
+        assert_eq!(
+            diagnostic_code(&err).as_deref(),
+            Some("mds::io"),
+            "entry {bad:?}: expected mds::io, got {err:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "entry {bad:?}: the backend must not be called"
+        );
+    }
+
+    // Control: a valid entry path does reach the backend.
+    let modules = HashMap::from([("main.mds".to_string(), "Hi\n".to_string())]);
+    let (fs, calls) = IdentityFs::new(modules);
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    cache
+        .resolve_path("main.mds", &HashMap::new(), &mut vec![])
+        .expect("control: a valid entry resolves");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// AC-155-1: `canonicalize`, `set_root` and `normalize` are not `FileSystem`
+/// methods — not even DEFAULTED ones, which `IdentityFs` cannot pin (it only stops
+/// compiling when the REQUIRED set changes).
+///
+/// Method lookup on a `dyn FileSystem` prefers the trait's own methods over any
+/// other trait's, so each probe answers `"probe"` only while `FileSystem` has no
+/// method of that name; if one came back, its call below would stop compiling or
+/// stop answering `"probe"`.
+trait TraitMethodProbe {
+    fn canonicalize(&self, _path: &str) -> &'static str {
+        "probe"
+    }
+    fn set_root(&self, _base: &str) -> &'static str {
+        "probe"
+    }
+    fn normalize(&self, _base: &str, _relative: &str) -> &'static str {
+        "probe"
+    }
+    // Never called while the trait has `anchor_base_dir` — its method shadows
+    // this one. If the trait lost it, this probe would be called and the
+    // `expect` would go unfulfilled: a warning, fatal under `-D warnings`.
+    #[expect(
+        dead_code,
+        reason = "shadowed by FileSystem::anchor_base_dir (positive control)"
+    )]
+    fn anchor_base_dir(&self, _dir: &str) -> &'static str {
+        "probe"
+    }
+}
+impl<T: FileSystem + ?Sized> TraitMethodProbe for T {}
+
+#[test]
+fn filesystem_trait_removed_methods_pin() {
+    let fs: &dyn FileSystem = &VirtualFs::new(HashMap::new());
+    assert_eq!(fs.canonicalize("x"), "probe");
+    assert_eq!(fs.set_root("x"), "probe");
+    assert_eq!(fs.normalize("", "x"), "probe");
+    // Positive control: a method the trait DOES have shadows its probe — this
+    // binding only compiles because the trait's `anchor_base_dir` was chosen.
+    let anchored: Result<String, MdsError> = fs.anchor_base_dir("x");
+    assert_eq!(anchored.unwrap(), "x");
+}
+
+/// A custom backend that does not override `anchor_base_dir` gets the identity:
+/// the base directory of a string compile is used unchanged as a key-space
+/// directory, and imports resolve from it.
+#[test]
+fn anchor_base_dir_default_is_identity_for_custom_backends() {
+    let modules = HashMap::from([(
+        "virtual/dir/lib.mds".to_string(),
+        "@define hi():\nHi from lib\n@end\n".to_string(),
+    )]);
+    let (fs, _calls) = IdentityFs::new(modules);
+    // Fully qualified: `TraitMethodProbe` above also names `anchor_base_dir`.
+    assert_eq!(
+        FileSystem::anchor_base_dir(&fs, "virtual/dir").unwrap(),
+        "virtual/dir"
+    );
+
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let output = cache
+        .resolve_source_intrinsic(
+            "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
+            "virtual/dir",
+            &HashMap::new(),
+            &mut vec![],
+        )
+        .expect("imports resolve from the unchanged base directory");
+    assert!(
+        matches!(&output, CompiledOutput::Markdown(s) if s.contains("Hi from lib")),
+        "unexpected output: {output:?}"
+    );
+}
+
+/// A NUL byte in an entry path is caller input, not an `@import` string: it
+/// reports `mds::io` through the public compile API and on the virtual backend.
+#[test]
+fn nul_in_entry_path_is_io_error() {
+    let err = mds::compile("./\0evil.mds", None).unwrap_err();
+    assert_eq!(
+        diagnostic_code(&err).as_deref(),
+        Some("mds::io"),
+        "compile: got {err:?}"
+    );
+
+    let mut cache = ModuleCache::virtual_fs(HashMap::new());
+    let err = cache
+        .resolve_path("a\0b.mds", &HashMap::new(), &mut vec![])
+        .unwrap_err();
+    assert_eq!(
+        diagnostic_code(&err).as_deref(),
+        Some("mds::io"),
+        "virtual: got {err:?}"
+    );
+
+    // Control: a NUL byte in an @import string stays mds::import.
+    let modules = HashMap::from([(
+        "main.mds".to_string(),
+        "@import \"./a\0b.mds\"\n".to_string(),
+    )]);
+    let err = mds::compile_virtual(modules, "main.mds", None).unwrap_err();
+    assert_eq!(
+        diagnostic_code(&err).as_deref(),
+        Some("mds::import"),
+        "import control: got {err:?}"
+    );
+}
+
+/// AC-155-3: every virtual entry API validates the entry key before resolving it.
+/// The module map DOES contain the bad key, so an unvalidated path would read and
+/// compile it; the refusal can only come from entry validation.
+#[test]
+fn virtual_entry_apis_validate_the_entry_key() {
+    type EntryApi = fn(HashMap<String, String>, &str) -> Result<(), MdsError>;
+    let apis: [(&str, EntryApi); 6] = [
+        ("ModuleCache::resolve_virtual_intrinsic", |m, e| {
+            ModuleCache::virtual_fs(m)
+                .resolve_virtual_intrinsic(e, &HashMap::new(), &mut vec![])
+                .map(drop)
+        }),
+        ("ModuleCache::resolve_virtual_intrinsic_opts", |m, e| {
+            ModuleCache::virtual_fs(m)
+                .resolve_virtual_intrinsic_opts(
+                    e,
+                    &HashMap::new(),
+                    &mds::CompileOptions::default(),
+                    &mut vec![],
+                )
+                .map(drop)
+        }),
+        ("ModuleCache::resolve_key", |m, e| {
+            ModuleCache::virtual_fs(m)
+                .resolve_key(e, &HashMap::new(), &mut vec![])
+                .map(drop)
+        }),
+        ("compile_virtual", |m, e| {
+            mds::compile_virtual(m, e, None).map(drop)
+        }),
+        ("check_virtual", |m, e| mds::check_virtual(m, e, None)),
+        ("lint_virtual", |m, e| {
+            mds::lint_virtual(m, e, None, &LintConfig::default()).map(drop)
+        }),
+    ];
+    for (name, api) in apis {
+        for bad in ["", "a\0b.mds"] {
+            let modules = HashMap::from([(bad.to_string(), "Hello!\n".to_string())]);
+            let err = api(modules, bad).unwrap_err();
+            assert_eq!(
+                diagnostic_code(&err).as_deref(),
+                Some("mds::io"),
+                "{name} with entry {bad:?}: expected mds::io, got {err:?}"
+            );
+        }
+        // Control: a valid key in the same position resolves.
+        let modules = HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
+        api(modules, "main.mds").unwrap_or_else(|e| panic!("{name} control: {e:?}"));
+    }
+}
+
 #[test]
 fn module_cache_new_still_works() {
     let _cache = ModuleCache::new();
 }
 
 // ── CompileResult / CompiledOutput / dependency graph API ─────────────────────
+
+/// A project whose `main.mds` imports `lib.mds`; returns the guard, the entry
+/// path and the canonical path of `lib.mds`.
+fn project_with_one_import() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+    std::fs::write(
+        dir.path().join("main.mds"),
+        "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
+    let lib = std::fs::canonicalize(dir.path().join("lib.mds")).unwrap();
+    let main = dir.path().join("main.mds");
+    (dir, main, lib)
+}
+
+/// The `dependencies` of every native compile entry point that reports them.
+fn native_dependency_lists(main: &Path) -> Vec<(&'static str, Vec<String>)> {
+    let source = std::fs::read_to_string(main).unwrap();
+    let base = main.parent();
+    vec![
+        (
+            "compile_with_deps",
+            mds::compile_with_deps(main, None).unwrap().dependencies,
+        ),
+        (
+            "compile_with_deps_opts",
+            mds::compile_with_deps_opts(main, None, mds::CompileOptions::default())
+                .unwrap()
+                .dependencies,
+        ),
+        (
+            "compile_str_with_deps",
+            mds::compile_str_with_deps(&source, base, None)
+                .unwrap()
+                .dependencies,
+        ),
+        (
+            "compile_str_with_deps_opts",
+            mds::compile_str_with_deps_opts(&source, base, None, mds::CompileOptions::default())
+                .unwrap()
+                .dependencies,
+        ),
+    ]
+}
+
+/// #409: on Windows, canonicalization yields verbatim `\\?\C:\…` module keys;
+/// a native compile reports each dependency in its conventional form instead,
+/// still naming the same file.
+#[cfg(windows)]
+#[test]
+fn windows_dependencies_carry_no_verbatim_prefix() {
+    let (_guard, main, lib) = project_with_one_import();
+    // Positive control (PF-013): the canonical key IS verbatim here, so the
+    // absence assertion below can fail.
+    assert!(lib.to_str().unwrap().starts_with(r"\\?\"), "{lib:?}");
+    for (api, deps) in native_dependency_lists(&main) {
+        let [dep] = deps.as_slice() else {
+            panic!("{api}: expected one dependency, got {deps:?}");
+        };
+        assert!(
+            !dep.starts_with(r"\\?\"),
+            "{api}: a dependency must not carry the verbatim prefix: {dep}"
+        );
+        assert!(Path::new(dep).is_absolute(), "{api}: {dep}");
+        assert_eq!(
+            std::fs::canonicalize(dep).unwrap(),
+            lib,
+            "{api}: the dependency must name the imported file"
+        );
+    }
+}
+
+/// #409 control: off Windows a canonical path has no verbatim form, and each
+/// dependency is exactly the canonical path of the imported file.
+#[cfg(not(windows))]
+#[test]
+fn dependencies_are_the_canonical_paths_off_windows() {
+    let (_guard, main, lib) = project_with_one_import();
+    for (api, deps) in native_dependency_lists(&main) {
+        assert_eq!(deps, [lib.to_str().unwrap()], "{api}");
+    }
+}
 
 #[test]
 fn compile_result_type_importable() {
@@ -943,6 +1327,10 @@ fn load_vars_str_feeds_compile_virtual() {
 }
 
 // ── Non-UTF-8 path rejection ──────────────────────────────────────────────────
+//
+// `#[cfg(unix)]` on all three: each constructs the hostile path via
+// `OsStrExt::from_bytes` (arbitrary bytes), a Unix-only API; Windows paths are
+// UTF-16 and have no equivalent construction from arbitrary bytes (#147).
 
 #[cfg(unix)]
 #[test]
@@ -1125,15 +1513,56 @@ fn compile_with_deps_messages_excludes_entry_from_dependencies() {
     );
 }
 
+/// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
+///
+/// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
+/// name and contract (#147); duplicated rather than shared because that
+/// helper is `pub(crate)` and this file is a separate integration-test
+/// binary that links against the non-test build.
+fn make_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            #[cfg(windows)]
+            {
+                const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                    && std::env::var_os("CI").is_none()
+                {
+                    eprintln!(
+                        "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
+                    );
+                    return false;
+                }
+            }
+            panic!(
+                "failed to create symlink {} -> {}: {err}",
+                target.display(),
+                link.display()
+            );
+        }
+    }
+}
+
 #[test]
-#[cfg(unix)]
 fn compile_rejects_symlinked_entry_for_messages_template() {
     // Symlinked entry rejection applies regardless of output shape.
     let dir = tempfile::tempdir().unwrap();
     let real_file = dir.path().join("real.mds");
     std::fs::write(&real_file, "@message system:\nYou are helpful.\n@end\n").unwrap();
     let link_file = dir.path().join("linked.mds");
-    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+    if !make_symlink(&real_file, &link_file) {
+        return;
+    }
 
     let result = mds::compile(&link_file, None);
     assert!(result.is_err(), "symlinked entry must be rejected");
@@ -1817,60 +2246,7 @@ fn fix_api_incremental_exists() {
     );
 }
 
-/// F-API-3: `apply_fixes` remains reachable on the public API surface while deprecated.
-/// This test pins the function signature and the empty-plan early-return path (the
-/// reverify closure is never invoked when `plan.edits.is_empty()`). Remove at v0.5.0
-/// with the function (AD-209-1).
-///
-/// AD-209-2: `#[expect(deprecated)]` was chosen over a `trybuild` compile-fail fixture
-/// because: (a) trybuild only asserts that the deprecation warning fires; it does not
-/// verify the function's signature or return value; (b) this test asserts the runtime
-/// behavior (NothingToFix for an empty plan -- the `plan.edits.is_empty()` early-return),
-/// giving a stronger pin than a compile-fail fixture alone; and
-/// (c) `#[expect(deprecated)]` fires `unfulfilled_lint_expectations` when the
-/// `#[deprecated]` attribute is removed from `apply_fixes`. The mutation control
-/// (applies ADR-009): removing the attribute leaves the lib rlib compiling clean, so
-/// both the lib-test (fix.rs `#[cfg(test)]`) and integration-test (api_surface) targets
-/// are affected. A single command is insufficient: `cargo clippy --workspace --all-targets
-/// -- -D warnings` emits 10 errors (all in fix.rs) and then cargo aborts compilation of
-/// the lib-test target; the integration-test (`api_surface`) target is never reached in
-/// that invocation. Run `cargo clippy --workspace --all-targets -- -D warnings` to verify.
-/// Total: exactly 10 unfulfilled_lint_expectations, all in fix.rs — one per deprecated
-/// `apply_fixes` call. All expectations are distinct; none is over-broad.
-///
-/// All values constructed via named constructors, never struct literals (applies ADR-010).
-#[expect(
-    deprecated,
-    reason = "AD-209-2: F-API-3 pins the deprecated apply_fixes public API surface; see fix.rs rustdoc"
-)]
-#[test]
-fn fix_api_apply_fixes_exists() {
-    use mds::fix::{apply_fixes, plan_fixes, FixOutcome};
-
-    // Construct via named constructors; never struct literals (applies ADR-010).
-    let source = "Hello!\n";
-    let original = LintResult::new(vec![]);
-    let plan = plan_fixes(&original, source);
-    // The closure moves out of a captured `String`, so it implements `FnOnce` but
-    // NOT `Fn`/`FnMut`. That makes this a real compile-time pin on the `F: FnOnce`
-    // bound: tightening `apply_fixes` to `F: Fn` (the `apply_fixes_incremental`
-    // bound) would break this test's compilation rather than pass silently.
-    let move_once = String::from("consumed-by-value");
-    let outcome = apply_fixes(
-        source,
-        plan,
-        &original,
-        move |_s| -> Result<LintResult, MdsError> {
-            drop(move_once);
-            Ok(LintResult::new(vec![]))
-        },
-    );
-    // Empty source with no diagnostics must return NothingToFix (no reverify called).
-    assert!(
-        matches!(outcome, FixOutcome::NothingToFix),
-        "trivial source with no diagnostics must return NothingToFix; got: {outcome:?}"
-    );
-}
+// F-API-3 (surface pin of the deprecated all-or-nothing fix entry point) retired in v0.5.0 (#304).
 
 /// Regression gate (issue #9): `STRING_SOURCE_MAP_LABEL` must be reachable from
 /// the public `mds` API so every surface can import it rather than redeclaring

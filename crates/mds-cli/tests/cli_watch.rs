@@ -32,8 +32,8 @@
 
 mod common;
 use common::{
-    dup_vars_file_warning, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, write_atomic,
-    ChildGuard, StderrTap, StdoutTap,
+    dup_vars_file_warning, make_symlink, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized,
+    write_atomic, ChildGuard, StderrTap, StdoutTap,
 };
 
 use std::path::Path;
@@ -824,6 +824,7 @@ fn watch_stdout_contains_content_when_o_stdout() {
 
 // ── T-I16: Ctrl+C clean exit (#[cfg(unix)]) ────────────────────────────────
 
+/// `#[cfg(unix)]`: sends SIGINT via `libc::kill`, which has no Windows analogue (#147).
 #[test]
 #[cfg(unix)]
 fn watch_ctrl_c_exits_cleanly() {
@@ -1147,6 +1148,8 @@ fn watch_quiet_keeps_errors_visible() {
 // ── AC-F9: "Stopped watching." message on clean Ctrl+C ────────────────────
 
 /// On SIGINT the watcher must print "Stopped watching." to stderr (non-quiet).
+///
+/// `#[cfg(unix)]`: sends SIGINT via `libc::kill`, which has no Windows analogue (#147).
 #[test]
 #[cfg(unix)]
 fn watch_ctrl_c_prints_stopped_watching() {
@@ -3334,7 +3337,6 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
 /// stderr names the symlink restriction).  Mirrors
 /// `symlinked_entry_exits_nonzero` in intrinsic_output.rs.
 #[test]
-#[cfg(unix)]
 fn watch_rejects_symlinked_entry() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -3344,7 +3346,9 @@ fn watch_rejects_symlinked_entry() {
 
     // Symlink → real file.
     let link_file = dir.path().join("link.mds");
-    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+    if !make_symlink(&real_file, &link_file) {
+        return;
+    }
 
     let out = dir.path().join("out.md");
 
@@ -3380,7 +3384,6 @@ fn watch_rejects_symlinked_entry() {
 /// startup (non-zero; stderr mentions symlink).  Mirrors
 /// `symlinked_vars_file_exits_nonzero` in intrinsic_output.rs.
 #[test]
-#[cfg(unix)]
 fn watch_rejects_symlinked_vars_file() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -3393,7 +3396,9 @@ fn watch_rejects_symlinked_vars_file() {
 
     // Symlink → real vars.
     let link_vars = dir.path().join("link_vars.json");
-    std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+    if !make_symlink(&real_vars, &link_vars) {
+        return;
+    }
 
     let out = dir.path().join("out.md");
 
@@ -3426,7 +3431,6 @@ fn watch_rejects_symlinked_vars_file() {
 /// AC-3: `mds watch <symlinked-dir>` must reject at startup (non-zero; stderr names
 /// the symlink restriction; the symlinked dir is never traversed).
 #[test]
-#[cfg(unix)]
 fn watch_rejects_symlinked_dir_target() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -3441,7 +3445,9 @@ fn watch_rejects_symlinked_dir_target() {
 
     // Symlink → the real source directory.
     let link_dir = dir.path().join("link_src");
-    std::os::unix::fs::symlink(&real_src, &link_dir).unwrap();
+    if !make_symlink(&real_src, &link_dir) {
+        return;
+    }
 
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
@@ -3479,7 +3485,6 @@ fn watch_rejects_symlinked_dir_target() {
 /// discovery-skip behavior in `collect_mds_files` (dir entries that are symlinks
 /// are already excluded by the follow-symlinks=false DirEntry filter).
 #[test]
-#[cfg(unix)]
 fn watch_dir_skips_symlinked_source_file() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -3501,7 +3506,9 @@ fn watch_dir_skips_symlinked_source_file() {
 
     // A symlinked .mds file inside the watched dir — must NOT compile.
     let link_mds = src.join("link.mds");
-    std::os::unix::fs::symlink(external_dir.join("external.mds"), &link_mds).unwrap();
+    if !make_symlink(&external_dir.join("external.mds"), &link_mds) {
+        return;
+    }
 
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
@@ -4007,6 +4014,9 @@ fn watch_dir_mode_idle_tick_fires_under_event_flood() {
 
 /// Directory mode: SIGINT delivered while the startup compile is still running must
 /// terminate the process, not be queued until the compile finishes.
+///
+/// `#[cfg(unix)]`: sends SIGINT via `libc::kill` and asserts termination-by-signal
+/// via `ExitStatusExt::signal()`; Windows has no signal-death `ExitStatus` (#147).
 #[test]
 #[cfg(unix)]
 fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
@@ -4121,6 +4131,9 @@ fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
 /// File mode: same property. The gate is the `Watching …` line, which `run_watch_file`
 /// prints before it creates the watcher and therefore before the startup compile; the
 /// entry imports enough partials that the compile is still running when SIGINT lands.
+///
+/// `#[cfg(unix)]`: sends SIGINT via `libc::kill` and asserts termination-by-signal
+/// via `ExitStatusExt::signal()`; Windows has no signal-death `ExitStatus` (#147).
 #[test]
 #[cfg(unix)]
 fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
@@ -4204,6 +4217,10 @@ fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
 /// A **bound, not a synchroniser**: a signalled child exits in milliseconds, and one
 /// that has not exited by the deadline is the defect the caller is asserting against.
 /// `what` names the arm so the panic is self-describing.
+///
+/// `#[cfg(unix)]`: a helper, not a test — its only caller,
+/// `watch_readiness_handshake_makes_ctrl_c_exit_deterministic`, is itself
+/// `#[cfg(unix)]` because it signals SIGINT, which has no Windows analogue (#147).
 #[cfg(unix)]
 fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;

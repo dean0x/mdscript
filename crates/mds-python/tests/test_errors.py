@@ -236,90 +236,123 @@ def test_e11_control_chars_in_message_are_escaped() -> None:
 
 
 @pytest.mark.parametrize(
-    "ctrl_char,expected_escape",
+    "codepoint",
+    # ESC (C0), DEL, NEL (C1), and the widened display-hazard class (#176): RLO
+    # (Trojan Source, CVE-2021-42574), LRI (bidi isolate), LINE SEPARATOR (ends a JS
+    # string literal), BOM (invisible). Numeric, never raw characters -- a literal
+    # RLO would reverse how this source file displays.
+    [0x1B, 0x7F, 0x85, 0x202E, 0x2066, 0x2028, 0xFEFF],
+    ids=["ESC", "DEL", "NEL", "RLO", "LRI", "LS", "BOM"],
+)
+def test_e12_lint_virtual_ctrl_in_import_path_is_refused(codepoint: int) -> None:
+    """T-14 / E12 [AC-F4]: a hostile import path is refused with an escaped error (#265).
+
+    lint_virtual with an import naming a module whose NAME contains a raw control or
+    format codepoint. Before #265 the name reached the duplicate-import rule, whose
+    message embedded it; the import string is now refused at the input boundary, so
+    the error itself must name the codepoint and show it escaped. The lint-message
+    coverage this vector used to give lives on in the route-B sibling below.
+
+    Verifies (``pytest.raises`` fails when nothing is raised, so every assertion
+    below is reached -- PF-013):
+    (a) the error code is ``mds::import``;
+    (b) the message is exactly the forbidden-character refusal, naming ``U+XXXX`` and
+        showing the codepoint as its six-character escape;
+    (c) the message carries no raw hostile codepoint, and ``str(e) == e.message``.
+    """
+    module_name = f"fo{chr(codepoint)}o.mds"
+    modules = {
+        module_name: "hi\n",
+        "main.mds": f'@import "./{module_name}"\n@import "./{module_name}"\n',
+    }
+    with pytest.raises(m.MdsError) as excinfo:
+        m.lint_virtual(modules, "main.mds")
+    e = excinfo.value
+
+    # (a)
+    assert e.code == "mds::import", e.message
+    # (b) The escape text is built, never written literally (PF-018).
+    escaped = "\\u" + f"{codepoint:04X}"
+    assert e.message == (
+        "import error: import path contains forbidden character "
+        f'U+{codepoint:04X}: "./fo{escaped}o.mds"'
+    )
+    # (c)
+    _assert_no_control_chars(e.message, "e.message")
+    assert str(e) == e.message
+
+
+@pytest.mark.parametrize(
+    "ctrl_char,expected_escape,yaml_escape",
     [
-        ("\x1b", "\\u001B"),  # ESC (U+001B) — C0 control char
-        ("\x7f", "\\u007F"),  # DEL (U+007F) — serde_json does not auto-escape 0x7F
-        # U+0085 NEL (C1) — passes serde_yaml_ng where ESC/DEL are rejected in YAML keys;
-        # the reachable YAML vector per KB Gotchas. Also exercised here via lint_virtual
-        # (module names are plain strings, not YAML, so all three chars reach the engine).
-        ("\x85", "\\u0085"),
-        # Widened escape class (#176): none of these are C0/DEL/C1, and all of them
-        # used to travel the wire untouched. Written as escapes, never as raw
-        # characters -- a literal RLO would reverse how this source file displays.
-        ("\u202e", "\\u202E"),  # RLO - Trojan Source display reversal (CVE-2021-42574)
-        ("\u2066", "\\u2066"),  # LRI - bidi isolate
-        ("\u2028", "\\u2028"),  # LINE SEPARATOR - terminates a JS string literal
-        ("\ufeff", "\\uFEFF"),  # BOM / ZWNBSP - invisible in every renderer
+        ("\x1b", "\\u001B", "\\x1B"),  # ESC (U+001B) — C0 control char
+        ("\x7f", "\\u007F", "\\x7F"),  # DEL (U+007F)
+        ("\x85", "\\u0085", "\\x85"),  # NEL (C1) — passes serde_yaml_ng
+        (chr(0x202E), "\\u202E", "\\u202E"),  # RLO - Trojan Source display reversal
+        (chr(0x2066), "\\u2066", "\\u2066"),  # LRI - bidi isolate
+        (chr(0x2028), "\\u2028", "\\u2028"),  # LINE SEPARATOR
+        (chr(0xFEFF), "\\uFEFF", "\\uFEFF"),  # BOM / ZWNBSP
     ],
     ids=["ESC", "DEL", "NEL", "RLO", "LRI", "LS", "BOM"],
 )
-def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
-    ctrl_char: str, expected_escape: str
+def test_e12_route_b_lint_virtual_ctrl_in_frontmatter_key_message_sanitized(
+    ctrl_char: str, expected_escape: str, yaml_escape: str
 ) -> None:
-    """T-14 / E12 [AC-F4]: Python typed LintDiagnostic.message and as_json() sanitization.
+    """Route B sibling of test_e12_lint_virtual_ctrl_in_import_path_is_refused.
 
-    Uses the lint_virtual API with a module whose NAME contains a raw control byte
-    to trigger a duplicate-import rule whose message embeds the raw path — a reachable
-    end-to-end vector that exercises the Python typed surface without touching YAML parsing.
+    Same control-char set, but carried by an UNUSED FRONTMATTER KEY (unused-variable)
+    rather than an import path / module name (duplicate-import). #265 rejects
+    hostile paths/module names at the input boundary, which retired route-A coverage
+    for these characters -- a frontmatter key is not a path, so this route stays
+    reachable and keeps message-escaping coverage alive.
 
-    Parametrized over ESC, DEL, and U+0085 NEL (PF-007 python-7).
-
-    Verifies:
-    (a) LintDiagnostic.message contains no raw C0/DEL/C1 bytes (typed attribute clean)
-    (b) LintDiagnostic.message contains the sanitized escape literal (explicit evidence)
-    (c) LintDiagnostic.to_dict()["message"] is identical to .message (parity guard, PF-007)
-    (d) LintFileReport.file contains no raw control bytes (python-3 regression anchor)
+    Written as a YAML double-quoted key with a YAML escape (e.g. ``\\x1B``) so the
+    .mds source text itself carries no raw control byte (PF-018); serde_yaml_ng
+    decodes the escape into the real control codepoint, which unused-variable embeds
+    verbatim in its message before WIRE-sanitization escapes it back out.
     """
-    # Module whose name contains the raw control byte — import path embeds it in the message.
-    module_name = f"fo{ctrl_char}o.mds"
-    modules = {
-        module_name: "hi\n",
-        # Import the same module twice to trigger duplicate-import; message will embed module_name.
-        "main.mds": f'@import "./{module_name}"\n@import "./{module_name}"\n',
-    }
-    result = m.lint_virtual(modules, "main.mds")
-
-    files = result.files
-    assert files, "expected at least one LintFileReport from lint_virtual"
-
-    # (d) Cheap invariant check only -- NOT coverage of the ``file``-key escape. The
-    # hostile codepoint is in the *imported* module's name, but this key is the *entry*
-    # filename, so no hostile byte reaches it and this cannot fail via this vector
-    # (PF-013). Real ``file``-key coverage: ``test_par7_...``, which constructs a
-    # LintResult with ``"file": "fo\u202egnp.mds"`` directly.
-    for fr in files:
-        _assert_no_control_chars(fr.file, "LintFileReport.file")
-
-    all_diags = [d for fr in files for d in fr.diagnostics]
-    assert all_diags, (
-        "expected at least one LintDiagnostic (duplicate-import should fire for "
-        "the twice-imported module)"
+    source = f'---\n"a{yaml_escape}payload{yaml_escape}b": 1\n---\nHello\n'
+    # Route-B contract check: the constructed .mds source carries no raw control
+    # byte -- only the YAML escape text.
+    assert ctrl_char not in source, (
+        f"route B: source must carry no raw {ctrl_char!r} byte, only the YAML escape; "
+        f"got: {source!r}"
     )
 
-    # (a) No raw C0/DEL/C1 bytes in typed .message attribute.
+    result = m.lint_virtual({"main.mds": source}, "main.mds")
+    all_diags = [d for fr in result.files for d in fr.diagnostics]
+    assert any(d.rule == "unused-variable" for d in all_diags), (
+        "route B: expected unused-variable to fire; got rules: "
+        + str([d.rule for d in all_diags])
+    )
+
+    # (a) No raw control bytes in typed .message attribute.
     for diag in all_diags:
         msg = diag.message
         assert isinstance(msg, str) and msg, "message must be a non-empty string"
-        _assert_no_control_chars(msg, "LintDiagnostic.message")
+        _assert_no_control_chars(msg, "LintDiagnostic.message (route B)")
 
-    # (b) At least one diagnostic must carry the sanitized escape literal —
-    #     confirming the control byte in the module name was sanitized, not dropped.
-    #     (Only the duplicate-import diagnostic embeds the path; check all.)
+    # (b) Positive control (PF-013): the sanitized literal IS present -- proof the
+    # raw control codepoint really reached the parsed frontmatter key before the
+    # WIRE sanitizer escaped it back out.
     found_escaped = [d for d in all_diags if expected_escape in d.message]
     assert found_escaped, (
-        f"expected at least one diagnostic whose message carries the sanitized "
-        f"{expected_escape!r} literal (module path); got: "
+        f"route B: expected at least one diagnostic whose message carries the "
+        f"sanitized {expected_escape!r} literal (frontmatter key); got: "
+        + str([d.message for d in all_diags])
+    )
+
+    # Escaped, not stripped -- the payload text around it survives verbatim.
+    assert any("payload" in d.message for d in all_diags), (
+        "route B: message body must be preserved verbatim; got: "
         + str([d.message for d in all_diags])
     )
 
     # (c) Parity guard: to_dict()["message"] must equal .message (PF-007).
-    # as_json() / to_dict() must not re-introduce raw control bytes from pyclass fields.
     for diag in all_diags:
         d_dict = diag.to_dict()
         assert isinstance(d_dict, dict), "to_dict() must return a dict"
         dict_msg = d_dict.get("message", "")
-        assert isinstance(dict_msg, str), "to_dict()[message] must be a string"
         assert dict_msg == diag.message, (
             f"to_dict()[message] must equal .message; "
             f"typed={diag.message!r}, dict={dict_msg!r}"
@@ -515,3 +548,39 @@ def test_d2_type_mismatch_span_is_not_none() -> None:
         assert e.span.column is not None, "span.column must be present for @if type_mismatch"
     else:
         pytest.fail("expected MdsError")
+
+
+# ── D3 (#114): inherited type_mismatch spans the file it is written in ──────────
+
+_BASE_WITH_IF = "---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n"
+_BASE_PLAIN = "---\nn: hi\n---\n@block body:\ndefault\n@end\n"
+
+
+@pytest.mark.parametrize(
+    "base,child,expected",
+    [
+        (
+            _BASE_WITH_IF,
+            '@extends "./base.mds"\n@block body:\noverride\n@end\n',
+            (14, 11, 4, 1),
+        ),
+        (
+            _BASE_PLAIN,
+            '@extends "./base.mds"\n@block body:\n@if n == 5:\nx\n@end\n@end\n',
+            (35, 11, 3, 1),
+        ),
+    ],
+    ids=["base-skeleton", "child-override"],
+)
+def test_d3_extends_type_mismatch_spans_its_own_file(
+    base: str, child: str, expected: tuple[int, int, int, int]
+) -> None:
+    """D3: a cross-type comparison fails at evaluation time; in the base skeleton it is
+    spanned on the base's @if line, in a child override on the child's (source maps off).
+    """
+    with pytest.raises(m.MdsError) as ei:
+        m.compile_virtual({"base.mds": base, "child.mds": child}, "child.mds")
+    err = ei.value
+    assert err.code == "mds::type_mismatch", f"expected type_mismatch, got: {err.code}"
+    assert err.span is not None, "an inherited type_mismatch must carry a span"
+    assert (err.span.offset, err.span.length, err.span.line, err.span.column) == expected

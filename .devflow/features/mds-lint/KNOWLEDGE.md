@@ -1,7 +1,7 @@
 ---
 feature: mds-lint
 name: mds lint — Static Analysis Engine and Tiered --fix
-description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, preview_text_for, print_discipline, reverify_failure_reason, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176, ADR-008, ResultSink, from_rules_checked, relative_display, write_bytes, PF-020, #309, emit-ordering."
+description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, escape_path_for_message, preview_text_for, print_discipline, reverify_failure_reason, precheck, RegressionGate, Verdict, splice_edit, apply_per_edit, summarize_rejections, fallback_cap_rejected, FALLBACK_MAX_EDITS, check_if_block, check_primary, check_elseifs, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176, ADR-008, ResultSink, from_rules_checked, relative_display, write_bytes, PF-020, #309, emit-ordering."
 category: domain-knowledge
 directories:
   - crates/mds-core/src/lint
@@ -11,7 +11,7 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-09-16
+updated: 2026-09-26
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
@@ -22,7 +22,7 @@ updated: 2026-09-16
 
 The feature has two key design invariants that touch every layer: (1) `LintResult::to_canonical_json()` is the ONE serializer for all surfaces — byte-parity across surfaces is enforced by goldens; (2) `tier.rs` is the single source of truth for which rules are auto-fixable — both `diagnostic.rs` and `fix.rs` import from it to break what would otherwise be a circular dependency.
 
-Fix edits take two forms: **line-removal** (`fix_removals: Option<Vec<FixLineSpan>>`) for rules that delete whole lines (e.g. `duplicate-import`), and **in-place replacement** (`fix_edits: Option<Vec<TextEdit>>`) for rules that need to replace text without changing line structure (e.g. `legacy-interpolation` rewrites `{x}` → `{{x}}`). Both paths converge in `diag_to_edits` and produce `ByteEdit`s that `apply_plan_unchecked` applies right-to-left via `replace_range`.
+Fix edits take two forms: **line-removal** (`fix_removals: Option<Vec<FixLineSpan>>`) for rules that delete whole lines (e.g. `duplicate-import`), and **in-place replacement** (`fix_edits: Option<Vec<TextEdit>>`) for rules that need to replace text without changing line structure (e.g. `legacy-interpolation` rewrites `{x}` → `{{x}}`). Both paths converge in `diag_to_edits` and produce `ByteEdit`s, which `apply_plan_unchecked` (the batch) and `apply_per_edit` (the per-edit fallback) apply right-to-left through one shared `splice_edit` (`replace_range`; an out-of-bounds edit is skipped in a RELEASE build but PANICS in a debug build — corrected 24f0d28, see Gotchas).
 
 ## Business Context
 
@@ -88,7 +88,7 @@ The `fixable` flag in the canonical JSON output is computed as `(fix_removals.is
 
 **Suppression configs**: `examples/edge-cases/mds.json`, `examples/stress-test/edge/mds.json`, and `crates/mds-cli/tests/fixtures/mds.json` all set `"legacy-interpolation": "off"` — these directories intentionally contain literal-brace teaching content.
 
-**unreachable-branch**: The rule only fires on literal↔literal comparisons (`@if "x" == "x":`). Always-true conditions only flag IF there are LATER branches to be unreachable. Each duplicate `@elseif` gets at most one finding — "duplicate" OR "always-true/false", never both. Diagnostic spans use `branch.offset`. All messages end with trailing periods. Per-case `fix_removals`: A/B/C/E/G have `Some(spans)`, D/F have `None` (when @elseif branches make safe removal ambiguous).
+**unreachable-branch**: The rule only fires on literal↔literal comparisons (`@if "x" == "x":`). Always-true conditions only flag IF there are LATER branches to be unreachable. Each duplicate `@elseif` gets at most one finding — "duplicate" OR "always-true/false", never both. Diagnostic spans use `branch.offset`. All messages end with trailing periods. Per-case `fix_removals`: A/B/C/E/G have `Some(spans)`, D/F have `None` (when @elseif branches make safe removal ambiguous). Structure (#235): `check_if_block` is `check_primary` (Pattern 1, the `@if` condition; cases A in `primary_true_fix`, B–D in `primary_false_fix`) then `check_elseifs` (Pattern 2; G in `elseif_diag`, E/F in `constant_elseif_finding`, boundaries from `next_boundary`, E/G spans from `exclusive_removal` — a struct literal, because `FixLineSpan::range_exclusive` asserts `from <= to` in every profile). Every branch condition joins `seen_conditions` after it is checked, duplicates included, so three identical conditions give two duplicate findings. Every push goes through `push_or_break`: a finding the diagnostic cap refuses stops the block, and a refused primary finding skips Pattern 2. Pinned by `ub_golden_exact_fields` (every message/help/offset/length/fix span for A–G), `ub_seen_conditions_*`, `ub_triple_identical_yields_two_duplicates` and `ub_respects_diagnostic_cap`; every function in the file is ≤40 lines.
 
 **empty-block**: "Empty" = `body.is_empty()` OR all nodes are whitespace-only `Text`. The `@block` directive is deliberately excluded (intentional "inherit parent default" pattern). All messages end with trailing periods. Per-case `fix_removals`: whole-block removal (`to_inclusive=true`) for ①@for ②@define ③bare-@if; `None` for ④@if-with-branches (unsafe partial removal); exclusive removal (`to_inclusive=false`) for ⑤@else ⑥terminal-@elseif; `None` for ⑦/⑧ non-terminal-@elseif or @else-follows; `@message` always `None`.
 
@@ -184,7 +184,7 @@ Fix edits are driven by two complementary fields on `LintDiagnostic`:
 - `fix_removals: Option<Vec<FixLineSpan>>` — line-range removals. `FixLineSpan` encodes `from`/`to`/`to_inclusive`. Used by all Tier A/B rules except `legacy-interpolation`.
 - `fix_edits: Option<Vec<TextEdit>>` — in-place replacements. `TextEdit { start: usize, end: usize, new_text: String }` where `start` is inclusive, `end` is exclusive, and empty `new_text` is a pure deletion. Used by `legacy-interpolation`.
 
-Both paths go through `diag_to_edits(diag, source) -> Vec<ByteEdit>`. The `fix_removals` path produces `ByteEdit { replacement: String::new() }` (pure deletion); the `fix_edits` path produces `ByteEdit { replacement: edit.new_text.clone() }` with a char-boundary guard (fail-closed, ADR-001). `apply_plan_unchecked` applies edits right-to-left via `replace_range`, handling both deletions and replacements uniformly.
+Both paths go through `diag_to_edits(diag, source) -> Vec<ByteEdit>`. The `fix_removals` path produces `ByteEdit { replacement: String::new() }` (pure deletion); the `fix_edits` path produces `ByteEdit { replacement: edit.new_text.clone() }` with a char-boundary guard (fail-closed, ADR-001). `apply_plan_unchecked` applies edits right-to-left through `splice_edit` (`replace_range`), handling both deletions and replacements uniformly; the per-edit fallback uses the same `splice_edit`, so both treat an out-of-bounds edit IDENTICALLY — but not, as an earlier doc claimed, uniformly "skipped": `splice_edit` calls `debug_assert!(false, …)` before returning, so a debug build PANICS (naming the offsets) rather than skipping, and only a release build (where `debug_assert!` compiles out) actually skips the edit and leaves the source unchanged there (24f0d28). A non-char-boundary `start`/`end` WITHIN bounds panics in every build regardless — `debug_assert!` catches it first in debug (naming the offset), but `String::replace_range` itself panics in release too.
 
 Planning steps in `plan_fixes_with_options`:
 1. Collect `ByteEdit`s from fixable diagnostics via `diag_to_edits`.
@@ -192,13 +192,13 @@ Planning steps in `plan_fixes_with_options`:
 3. **Containment coalescing** (`dedup_contained_or_identical`): drop any edit whose byte range is fully contained within (or identical to) an earlier retained edit.
 4. **Overlap detection**: after containment deduplication, any remaining partial overlap causes the whole batch to be cleared (`overlap_rejected = true`). Fail-closed.
 
-`FixOutcome` (returned by `apply_fixes` and `apply_fixes_incremental`) has four variants: `Fixed { source, residual }`, `PartiallyFixed { source, residual, rejected }`, `Rejected { source, reason }`, `NothingToFix`.
+`FixOutcome` (returned by `apply_fixes_incremental`, the only fix-application entry point since `apply_fixes` was removed in v0.5.0, #304) has four variants: `Fixed { source, residual }`, `PartiallyFixed { source, residual, rejected }`, `Rejected { source, reason }`, `NothingToFix`.
 
-**Reverify gate (AC-F-20)**: After applying edits, a reverify callback checks three conditions: (1) recompile-success; (2) no-new-untargeted-diagnostics; (3) output byte-equality for standalone files **when all edits in the plan are output-neutral**.
+**Reverify gate (AC-F-20, corrected a64dba0)**: After applying edits, a candidate is REFUSED through two INDEPENDENT paths, not one three-item checklist. (1) The CLI-supplied reverify CALLBACK returns `Err` — it does so when the candidate no longer compiles, and, when every edit in the plan is output-neutral (`is_output_neutral` — every fixable rule except `legacy-interpolation`) AND the original compiled, on any compiled-output delta too; a reverify `Err` becomes `Verdict::Reverify(err)`. (2) `RegressionGate::verify`, when the callback instead returns `Ok(residual)`, compares the residual `LintResult`'s untargeted findings against the pre-fix baseline it built in `RegressionGate::new` (per-rule counts of findings NOT targeted by any edit in the plan) and refuses — `Verdict::Regressed(rules)` — when a rule the plan does not target now has MORE findings than it did before any edit was applied. The baseline is symmetric with the retry loop on purpose: while one edit of a multi-rule plan is retried, the OTHER targeted rules' still-unfixed diagnostics must not themselves look like new findings (see `RegressionGate`'s own rustdoc for the worked example).
 
-The output-equality sub-check (3) is **skipped** when the plan contains any edit from `legacy-interpolation` (the only non-output-neutral rule). Both `plan_and_apply_fixes` and `preview_fixes` in `lint.rs` compute `all_output_neutral = plan.edits.iter().all(|e| mds::fix::is_output_neutral(&e.rule))` and gate the equality check on it. This bypass applies to the whole batch — a mixed plan containing `legacy-interpolation` alongside output-neutral rules skips the equality check for co-batched neutral edits too (assessed P2 risk).
+The output-equality sub-check (part of path (1) above, inside the reverify callback) is **skipped** when the plan contains any edit from `legacy-interpolation` (the only non-output-neutral rule). Both `plan_and_apply_fixes` and `preview_fixes` in `lint.rs` compute `all_output_neutral = plan.edits.iter().all(|e| mds::fix::is_output_neutral(&e.rule))` and gate the equality check on it. This bypass applies to the whole batch — a mixed plan containing `legacy-interpolation` alongside output-neutral rules skips the equality check for co-batched neutral edits too (assessed P2 risk).
 
-**`reverify_failure_reason(err)` in `fix.rs`** — the ONLY construction site for `FixOutcome::Rejected.reason`. It WIRE-escapes `err.to_string()` via `sanitize_control_chars_wire` so the CLI can print `fix rejected: {reason}` as a bare status line without further escaping. Construction-time sanitization, not print-time.
+**`reverify_failure_reason(err)` in `fix.rs`** — the only place a rejection reason embeds an `MdsError`, and its only call site is `Verdict::into_edit_result`. It WIRE-escapes `err.to_string()` via `sanitize_control_chars_wire` so the CLI can print `fix rejected: {reason}` as a bare status line without further escaping. Construction-time sanitization, not print-time. The other reasons carry no untrusted text: the fixed overlap and sortedness messages (`precheck`), the fallback-cap message with its edit count (`fallback_cap_rejected`), the regressed rule names (`Verdict::into_edit_result`), and `summarize_rejections`' `All {n} fix edits rejected: …` join of already-built per-edit reasons.
 
 **CLI's `plan_and_apply_fixes`** (in lint.rs): The short-circuit for `NothingToFix` guards on `plan.edits.is_empty() && !plan.overlap_rejected`. When overlap was detected, `plan.edits` is cleared but `plan.overlap_rejected = true` — so the function falls through to `apply_fixes_incremental`, which immediately returns `Rejected`.
 
@@ -373,10 +373,10 @@ The auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_sou
 | `eprint_warning` (output.rs) | prose HUMAN; interpolated identifiers/paths WIRE | HUMAN for the warning body prose; `safe_path` / `safe_inline` for any untrusted value the caller interpolates into it |
 | `emit_duplicate_vars_file_warnings` (build.rs) | prose HUMAN via `eprint_warning`; interpolated key/path/count WIRE | warns on `--vars`-file duplicate keys (#326) and on the count omitted past `mds::VarsLoad`'s cap; per AD-224-3 every interpolated value is wrapped in `safe_inline`/`safe_path` at the interpolation site, never hoisted into a `let` first; no-op when `quiet` (AD-224-5) |
 | `safe_inline(value)` (output.rs) | WIRE | any single-line untrusted value interpolated into a status, warning, or error line: rule names, config paths, `--format` args, `io::Error` causes |
-| `safe_path(p)` / `safe_file_display(name)` (output.rs) | WIRE | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) |
+| `safe_path(p)` / `safe_file_display(name)` (output.rs) | WIRE + `\t` (`escape_path_for_message`) | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) — every forbidden path character escaped, since a path may carry none (#265) |
 | `named_source_for_render(file, source)` (diagnostic.rs) | WIRE for filename; neutralize for source | the single `NamedSource` builder used by `MdsError::at()`, `check_equivalence`, `render_diag_human` |
 | `render_diag_human` (lint.rs) | HUMAN | message/help (filename and source go through `named_source_for_render`) |
-| `fix::FixOutcome::Rejected.reason` (fix.rs) | WIRE | construction-time via `reverify_failure_reason(err)` — the CLI prints `fix rejected: {reason}` as a bare status line |
+| `fix::FixOutcome::Rejected.reason` (fix.rs) | WIRE | construction-time: an embedded `MdsError` goes through `reverify_failure_reason(err)` (called only from `Verdict::into_edit_result`); every other reason is fixed text, a count or rule names — the CLI prints `fix rejected: {reason}` as a bare status line |
 | `MdsError::serialize()` (error.rs) | WIRE | message, help — covers all three bindings' error path |
 | `LintResult::to_canonical_json()` (diagnostic.rs) | WIRE | message, help, `files[].file` key; error-only entries bypass this — their `file` key is sanitized at the push site via `sanitize_control_chars_wire` |
 | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings (distinct method, not a duplicate) |
@@ -430,7 +430,7 @@ The test anchor inventory covers five surfaces across both error and lint paths.
 **T-AUX-1/2/3** `output.rs` — `SanitizedReport`: cause chain escaped+preserved, related diagnostics escaped+preserved, cyclic cause chain bounded at `MAX_AUX_DEPTH`  
 **T-ESC-5/6/7** `output.rs` — label text escaped/span preserved, PF-014 colour path, inert on clean input  
 **T-WARN-1/2/3** `output.rs` — `eprint_warning`: C0, clean passthrough, bidi  
-**T-REASON-1/2** `fix.rs` — `reverify_failure_reason` WIRE on both construction paths  
+**T-REASON-2/3** `fix.rs` — `incremental_rejection_reason_escapes_embedded_error_display` (one rejected edit) and `incremental_multi_rejection_reason_escapes_each_error` (the joined reason escapes every embedded error); T-REASON-1 retired with `apply_fixes` (#304)  
 **T-ESC-MSG-1/2** `security.rs` — `MdsError` and CLI-authored message escaping  
 **T-ESC-RULE-1** `security.rs` — unknown `mds.json` rule name with embedded control bytes  
 **T-ESC-FNAME-1/2** `security.rs` — `\n` in filename cannot forge standalone status line (build and lint)  
@@ -468,11 +468,22 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
       → dedup_contained_or_identical() — drop edits contained in wider edits
       → overlap detection — any partial overlap: FixPlan { overlap_rejected: true, edits: [] }
   → apply_fixes_incremental():
-      all_output_neutral? → skips equality gate if any edit is legacy-interpolation
-      batch attempt (1 reverify call) → passes? → FixOutcome::Fixed
-      batch fails → per-edit right-to-left retry → accept | RejectedEdit
-        all rejected → FixOutcome::Rejected { reason: reverify_failure_reason(&err) }
-        ≥1 accepted, ≥1 rejected → FixOutcome::PartiallyFixed
+      precheck(): overlap_rejected → Rejected (checked BEFORE emptiness — plan_fixes
+                  clears the edits of an overlapping plan) | empty → NothingToFix
+                  | unsorted → Rejected
+      RegressionGate::new(edits, original) — targeted rule set + untargeted baseline
+      batch: apply_plan_unchecked + gate.verify (1 reverify call)
+        (the CLI's reverify skips the output-equality check when any edit is
+         legacy-interpolation — all_output_neutral)
+        Verdict::Accepted → FixOutcome::Fixed
+      refused (verdict dropped unrendered) and edits > FALLBACK_MAX_EDITS (50)
+        → fallback_cap_rejected → Rejected
+      apply_per_edit(): right-to-left (.rev()), each edit via apply_one on the running
+        source, judged by the SAME gate; Verdict::into_edit_result renders a refusal
+        (reverify_failure_reason for an MdsError) → RejectedEdit
+        none accepted → Rejected { reason: summarize_rejections(..) }
+        all accepted → Fixed | some accepted → PartiallyFixed (residual from the LAST
+        accepted edit)
   → CLI: Fixed/PartiallyFixed → atomic_write_file()
        | Rejected → "fix rejected: ..." + original diagnostics
        | NothingToFix → pass through
@@ -518,6 +529,8 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 ## Gotchas
 
+**`apply_plan_unchecked`'s Panics section was wrong until 24f0d28**: an earlier rustdoc claimed it "does not panic — invalid spans produce no change (the edit is skipped with a `debug_assert` violation in debug builds)". That is backwards for the out-of-bounds case: `splice_edit`'s `debug_assert!(false, …)` PANICS in a debug build (naming `start`/`end`/`len`) and only a RELEASE build (where the assert compiles out) reaches the `return;` that skips the edit. A non-char-boundary `start`/`end` within bounds panics in every build regardless — `debug_assert!` fires first in debug, but `String::replace_range` itself panics in release too. `plan_fixes`/`plan_fixes_with_options` never hand back a plan that trips either case (edits are sorted, and an overlap-rejected plan has its edits cleared, though it still trips the debug-build `overlap_rejected` check) — only a direct external caller of `apply_plan_unchecked` with a hand-built `FixPlan` can hit this.
+
 **WASM budget raised three times**: 700K→750K (S2 lint rules), 750K→800K (S4 full surface), 800K→850K (v0.4.0 dogfood remediation). Current guard in `ci.yml`: **850,000 bytes**.
 
 **Two-pass artifact for `\{x\}` remnants**: Fixing a `\{x\}` remnant removes the backslash, leaving bare `{x}`. On the NEXT lint pass, that `{x}` is flagged as a `legacy-interpolation` single-brace expression. Two `--fix` runs are needed to fully migrate.
@@ -556,7 +569,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **Python `LintDiagnostic.to_dict()` always includes `fix_edits`, `help`, and `span` keys**: All three are emitted as Python `None` (JSON `null`) when not set — never absent. This matches `to_canonical_json()` exactly (PF-007 guard). `to_dict()` now conditionally emits `span.line` and `span.column` when present; `LintResult.files[]` parses them from canonical JSON. No built-in rule currently populates them — the only prior test was a negative one that passed identically under the old code. Verify with a positive control (PF-018).
 
-**Reverify rejection message**: Exact stable text: `"could not verify fix — the edited source did not re-parse cleanly ({err}); leaving the file unchanged"`. Test `A5` in `cli_lint.rs` pins this.
+**Reverify rejection message**: Exact stable text: `"could not verify fix — the edited source did not re-parse cleanly ({err}); leaving the file unchanged"`. Pinned only in `fix.rs`, by `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` and `l_fix_rev1_a5_two_edit_rejection_joins_with_count_prefix` (test-module consts `A5_PREFIX`/`A5_SUFFIX`); no CLI test contains it.
 
 **B1 attribution test pattern — use `MdsError::TypeMismatch { src, .. }`, not offsets**: `SerializedError` has no `file` field (PF-012). See `crates/mds-core/tests/virtual_fs.rs` B1 tests.
 
@@ -593,14 +606,14 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/src/lint/diagnostic.rs` — `LintDiagnostic`, `LintResult`, `to_canonical_json()` (WIRE: message/help/file key); `sanitize_control_chars` (HUMAN, `Cow`, `#[must_use]`, idempotent); `sanitize_control_chars_wire` (WIRE, new public API, shares one impl via `EscapeMode`); `neutralize_source_for_render` (byte-length-preserving: C0/DEL → `?`, C1+U+061C → NBSP, other 14 hazards → U+FFFD); `named_source_for_render` (new public API, the single `NamedSource` builder); `is_two_byte_format_hazard` / `is_three_byte_format_hazard`
 - `crates/mds-core/src/error.rs` — `MdsError`: `serialize()` (WIRE message/help); `display_sanitized()` (HUMAN Display for TTY); raw `Display` documented as unsanitized; `at()` (uses `named_source_for_render` — inherited by all `*_at` constructors)
 - `crates/mds-core/src/lib.rs` — `CompileResult::to_canonical_json()` (WIRE warnings, distinct from `LintResult::to_canonical_json`); `emit_warnings()` (HUMAN for prose; identifiers WIRE at construction)
-- `crates/mds-core/src/lint/fix.rs` — `plan_fixes_with_options`, `diag_to_edits`, `ByteEdit`, `apply_plan_unchecked`, `dedup_contained_or_identical`, `apply_fixes_incremental`, `FixOutcome`; `reverify_failure_reason()` (sole construction site for `Rejected.reason`, WIRE)
+- `crates/mds-core/src/lint/fix.rs` — `plan_fixes_with_options`, `diag_to_edits`, `ByteEdit`, `apply_plan_unchecked`, `splice_edit`, `dedup_contained_or_identical`, `apply_fixes_incremental` and its private helpers (`precheck`, `RegressionGate`, `Verdict`, `apply_one`, `apply_per_edit`, `summarize_rejections`, `fallback_cap_rejected`), `FALLBACK_MAX_EDITS`, `FixOutcome`; `reverify_failure_reason()` (WIRE; the only reason that embeds an `MdsError`)
 - `crates/mds-core/src/lint/rules/legacy_interpolation.rs` — Tier A token-based rule; atomic single TextEdit per finding; two-pass artifact for backslash-escape fixing
 - `crates/mds-core/src/lint/facts.rs` — `collect_facts()`, `AnalysisContext`, `DefineFact { name, offset, end_offset }`
 - `crates/mds-core/src/lint/config.rs` — `LintConfig` (lives in mds-core; CLI converts to it)
 - `crates/mds-core/src/ast.rs` — `ElseifBranch { offset }`, `IfBlock { else_offset, end_offset }`, `ForBlock/DefineBlock { end_offset }`
 - `crates/mds-core/src/lint/rules/` — 10 rule modules + `structural_eq.rs`
 - `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`; the rule-name list lives in `mds::KNOWN_LINT_RULES`, not in this crate (#224)
-- `crates/mds-cli/src/output.rs` — `atomic_write_file`; `eprint_error` (single CLI stderr choke-point, wraps in `SanitizedReport`); `SanitizedReport` / `SanitizedNode` / `MAX_AUX_DEPTH`; `render_error_sanitized` (private, plain `format!("{report:?}")` on sanitized wrapper); `eprint_warning` (HUMAN, new); `safe_path` / `safe_file_display` / `safe_inline` (all WIRE, new); `preview_text_for` (TTY-gated source neutralization for `--diff`); `render_unified_diff` / `colorize_unified_diff`
+- `crates/mds-cli/src/output.rs` — `atomic_write_file`; `eprint_error` (single CLI stderr choke-point, wraps in `SanitizedReport`); `SanitizedReport` / `SanitizedNode` / `MAX_AUX_DEPTH`; `render_error_sanitized` (private, plain `format!("{report:?}")` on sanitized wrapper); `eprint_warning` (HUMAN, new); `safe_path` / `safe_file_display` (WIRE + `\t`, via `mds::escape_path_for_message`) / `safe_inline` (WIRE only); `preview_text_for` (TTY-gated source neutralization for `--diff`); `render_unified_diff` / `colorize_unified_diff`
 - `crates/mds-cli/src/build.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field
 - `crates/mds-cli/src/watch.rs` — all 11 error prints route through `eprint_error`; lifecycle status lines route through `safe_path` / `safe_inline` / `eprint_warning`
 - `crates/mds-cli/tests/print_discipline.rs` — CI-enforced lexical guard; SANITIZERS allowlist; `ALLOWED_UNSANITIZED` allowlist; `every_allowlist_entry_is_live` rot check
@@ -610,7 +623,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-python/src/lib.rs` — `LintDiagnostic` frozen pyclass; `LintResult::new()` calls `sanitize_lint_value()` (WIRE, construction-time — closes PF-004 parallel-path gap)
 - `packages/mds/src/types.ts` — `LintDiagnostic.fix_edits`; `CheckOptions { vars? }`
 - `packages/mds/src/util/options.ts` — `assertKnownKeys` (strict unknown-option rejection)
-- `crates/mds-cli/tests/cli_lint.rs` — A5 (reverify rejection message prefix), L-CLI-RESOURCE (exit-3), L-CLI-DIR2 (file-order determinism); T-5..T-9 ESC-injection anchors
+- `crates/mds-cli/tests/cli_lint.rs` — L-CLI-RESOURCE (exit-3), L-CLI-DIR2 (file-order determinism); T-5..T-9 ESC-injection anchors
 
 ## Related
 
@@ -629,21 +642,8 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `.devflow/features/mds-fmt/KNOWLEDGE.md` — `mds fmt` knowledge base; `atomic_write_file` is shared between both subcommands via `output.rs`.
 - `.devflow/features/source-map-security/KNOWLEDGE.md` — source map path-containment choke-point.
 
-## v0.5.0 Removal Tracker: apply_fixes
+## `apply_fixes` removal (v0.5.0, #304)
 
-`mds::fix::apply_fixes` is deprecated as of v0.4.0. The six ADR-004 reverify-gate
-tests that must be ported or retired before removal are enumerated below by name —
-**test names are the durable key; line numbers drift as `fix.rs` evolves**. GitHub
-issue #304 carries behavioral context (which ADR-004 behavior each test pins); its
-line numbers predate the `#[expect(...)]` insertions made by PR #303 (issue #209) and
-have since drifted.
+`mds::fix::apply_fixes` (deprecated in v0.4.0, shipped v0.4.0–v0.4.4) is removed; `apply_fixes_incremental` is the only fix-application entry point (BREAKING, Rust API). Its six ADR-004 reverify-gate tests were ported to the incremental API by name, with their reverify call counts pinned: `a4_partial_overlap_still_rejected_after_dedup` (0), `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (2), `reverify_preexisting_untargeted_survives_and_fix_applies` (1), `reverify_new_untargeted_diagnostic_is_rejected` (2), `tier_b_unused_function_standalone_apply_succeeds` (1), `l_fix_rev1_output_delta_causes_rejection` (2). Four deprecated-only tests were retired because an incremental counterpart already existed: `l_fix_rev1_reverify_failure_rejects_fix`, `apply_fixes_rejection_reason_escapes_embedded_error_display` (T-REASON-1), `reverify_success_returns_fixed`, `pf005_unsorted_edits_rejected_in_apply_fixes`. `api_surface.rs` keeps a one-line retirement note where the F-API-3 pin was.
 
-Six tests to port or retire (use `grep -n 'fn <name>' crates/mds-core/src/lint/fix.rs`
-to locate current lines — test names are the durable key):
-
-- `a4_partial_overlap_still_rejected_after_dedup`
-- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix`
-- `reverify_preexisting_untargeted_survives_and_fix_applies`
-- `reverify_new_untargeted_diagnostic_is_rejected`
-- `tier_b_unused_function_standalone_apply_succeeds`
-- `l_fix_rev1_output_delta_causes_rejection`
+**Grepping for residue**: `git grep -nP '\bapply_fixes\b' -- crates` (the trailing `\b` already excludes `apply_fixes_incremental`); a lookahead form such as `apply_fixes\b(?!_incremental)` also matches `plan_and_apply_fixes` and can never come back empty. A single-line `#[(deprecated|expect(deprecated|…` regex cannot see rustfmt's multi-line `#[expect(` / `deprecated,` attribute — every historical site used that form — so scan attributes with a multi-line regex, and plant a positive control first.

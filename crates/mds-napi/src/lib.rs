@@ -1080,17 +1080,19 @@ pub fn lint_virtual(
     let mut mods: HashMap<String, String> = HashMap::with_capacity(mods_map.len());
     let mut aggregate: usize = 0;
     for (key, val) in mods_map {
+        // A key is caller input, escaped wherever a message names it (#265).
+        let shown = mds::escape_path_for_message(&key);
         let serde_json::Value::String(s) = val else {
             return Err(throw_options_error(
                 &env,
-                &format!("modules[\"{key}\"] must be a string source"),
+                &format!("modules[\"{shown}\"] must be a string source"),
             ));
         };
         if s.len() > MAX_SOURCE_SIZE {
             return Err(throw_resource_limit(
                 &env,
                 &format!(
-                    "modules[\"{key}\"] exceeds maximum size of {MAX_SOURCE_SIZE} bytes ({} bytes provided)",
+                    "modules[\"{shown}\"] exceeds maximum size of {MAX_SOURCE_SIZE} bytes ({} bytes provided)",
                     s.len()
                 ),
             ));

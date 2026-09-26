@@ -10,8 +10,11 @@ use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node}
 use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::evaluator::evaluate_messages_intrinsic;
+use crate::evaluator::evaluate_messages_seeded;
+use crate::evaluator::evaluate_seeded;
 use crate::evaluator::evaluate_with_map;
 use crate::evaluator::evaluate_with_map_seeded;
+use crate::evaluator::EvalBudget;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT};
@@ -28,8 +31,7 @@ pub(crate) use frontmatter::{
     FrontmatterImport,
 };
 use inheritance::{
-    apply_block_overrides, check_child_only_blocks, seed_effective_blocks, splice_skeleton,
-    spliced_regions,
+    apply_block_overrides, check_child_only_blocks, seed_effective_blocks, spliced_regions,
 };
 
 // `Origin` is defined in `sourcemap.rs` and re-exported above via `pub(crate) use`.
@@ -346,11 +348,53 @@ impl ModuleCache {
         Ok(())
     }
 
+    /// Validate an entry path and resolve it to its key through the backend.
+    ///
+    /// Entry validation runs here, before the backend is called, so a custom
+    /// [`FileSystem`] passed to [`ModuleCache::with_fs`] is covered as well as the
+    /// built-in backends (PF-004): an empty entry path, or one containing a null
+    /// byte or another forbidden path character (#265), is refused with `mds::io`
+    /// and never reaches [`FileSystem::resolve_entry`].
+    fn resolve_entry_key(&self, path: &str) -> Result<String, MdsError> {
+        crate::fs::validate_entry_path(path)?;
+        self.fs.resolve_entry(path)
+    }
+
+    /// Validate the base directory of a string compile and anchor it through the
+    /// backend.
+    ///
+    /// The forbidden-character check (#265) runs here, before the backend is
+    /// called, for the same reason entry validation does: a custom [`FileSystem`]
+    /// keeps the default identity `anchor_base_dir` and checks nothing (PF-004).
+    fn anchor_base(&self, base_dir: &str) -> Result<String, MdsError> {
+        crate::fs::reject_forbidden_path_chars("base directory", base_dir)?;
+        self.fs.anchor_base_dir(base_dir)
+    }
+
+    /// Anchor the project root at a module's `base_dir` when no entry call has
+    /// established one, before `sources[]` is relativized — the defense-in-depth
+    /// half of the source-map choke point, against a future entry path that skips
+    /// root establishment (PF-004 shape).
+    ///
+    /// Best-effort by design, never propagated. Every built-in entry API anchors
+    /// first, so [`NativeFs`] never reaches the call without a root, and the
+    /// default `anchor_base_dir` ([`VirtualFs`]) cannot fail — nor does it give
+    /// `source_root` a value. Only a custom backend without a `source_root` of its
+    /// own reaches it, for a directory it may never have been asked to anchor, and
+    /// that backend has already accepted the entry: a refusal must not fail the
+    /// compile. It leaves `source_root()` at `None`, and `relativize_source` then
+    /// degrades each absolute source to its basename — never an absolute path.
+    fn anchor_root_for_source_map(&self, base_dir: &str) {
+        if self.fs.source_root().is_none() && !base_dir.is_empty() {
+            let _ = self.fs.anchor_base_dir(base_dir);
+        }
+    }
+
     /// Resolve a module from a filesystem path string.
     ///
     /// `path` is a UTF-8 string representation of the OS path (callers convert
     /// `&Path` to `&str` at the public API boundary via `path_to_str`).
-    /// Normalizes `path` to a canonical key via the underlying [`FileSystem`],
+    /// Validates `path` and resolves it to a key via [`FileSystem::resolve_entry`],
     /// then resolves through the module cache with cycle detection and depth guarding.
     pub fn resolve_path(
         &mut self,
@@ -358,7 +402,7 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        let key = self.fs.normalize("", path)?;
+        let key = self.resolve_entry_key(path)?;
         self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
@@ -366,16 +410,16 @@ impl ModuleCache {
     ///
     /// Output shape is intrinsic to the template: a template containing any `@message`
     /// block resolves to [`crate::CompiledOutput::Messages`], otherwise to
-    /// [`crate::CompiledOutput::Markdown`]. Routes the entry through the filesystem
-    /// normalizer (so `check_symlink` and `MAX_FILE_SIZE` are enforced on the entry),
-    /// then resolves via `process_module_intrinsic`.
+    /// [`crate::CompiledOutput::Markdown`]. Routes the entry through entry validation
+    /// and [`FileSystem::resolve_entry`] (so `check_symlink` and `MAX_FILE_SIZE` are
+    /// enforced on the entry), then resolves via `process_module_intrinsic`.
     pub fn resolve_path_intrinsic(
         &mut self,
         path: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        let key = self.fs.normalize("", path)?;
+        let key = self.resolve_entry_key(path)?;
         self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
@@ -388,7 +432,7 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
-        let key = self.fs.normalize("", path)?;
+        let key = self.resolve_entry_key(path)?;
         self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
     }
 
@@ -495,26 +539,32 @@ impl ModuleCache {
         self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
-    /// Resolve a module by its normalized key.
+    /// Resolve an entry module by its key.
     ///
     /// This is the entry point for virtual filesystems where there is no OS path.
     /// Use this with [`ModuleCache::virtual_fs`] or a custom [`FileSystem`] backend.
+    /// The key is an entry path like any other: it is validated and resolved
+    /// through [`FileSystem::resolve_entry`] first, so on [`crate::NativeFs`] a
+    /// symlinked key is refused, the first key anchors the project root, and a
+    /// later key outside that root is refused.
     pub fn resolve_key(
         &mut self,
         key: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        self.resolve_by_key(key, runtime_vars, warnings)
+        let key = self.resolve_entry_key(key)?;
+        self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
     /// Resolve a module from an in-memory source string.
     ///
-    /// Imports within the source are resolved relative to `base_dir`.
-    ///
-    /// **NativeFs-only**: this method calls `canonicalize()` and `fs.set_root()`,
-    /// which only make sense for OS-backed filesystems. For virtual or
-    /// WASM environments use [`ModuleCache::resolve_key`] instead.
+    /// Imports within the source are resolved relative to `base_dir`, which goes
+    /// through [`FileSystem::anchor_base_dir`] first: [`crate::NativeFs`]
+    /// canonicalizes it, refuses a symlinked directory and anchors the project
+    /// root there; the default (in-memory backends) uses it unchanged as a
+    /// key-space directory (`""` is the root). A `base_dir` carrying a forbidden
+    /// path character is refused with `mds::io` before the backend sees it (#265).
     pub fn resolve_source(
         &mut self,
         source: &str,
@@ -524,10 +574,9 @@ impl ModuleCache {
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         // Entry-size backstop for the string funnel (PF-004) — before any IO or parse.
         Self::check_source_size(source)?;
-        // Canonicalize base_dir via the FileSystem abstraction so that custom
-        // or virtual backends can override this behaviour (fixes issue #21).
-        let canonical_str = self.fs.canonicalize(base_dir)?;
-        self.fs.set_root(&canonical_str)?;
+        // Anchor base_dir through the FileSystem abstraction so that custom or
+        // virtual backends can override this behaviour (fixes issue #21).
+        let canonical_str = self.anchor_base(base_dir)?;
 
         // Guard against re-entrant or cyclic calls that could form a cycle
         // back through this root module. Mirrors the resolving bookkeeping in
@@ -555,14 +604,16 @@ impl ModuleCache {
     /// block resolves to [`crate::CompiledOutput::Messages`], otherwise to
     /// [`crate::CompiledOutput::Markdown`]. This is the entry point for virtual
     /// filesystems (use with [`ModuleCache::virtual_fs`]); the entry source is read
-    /// from the cache's [`FileSystem`] backend.
+    /// from the cache's [`FileSystem`] backend. The entry key is validated and
+    /// resolved through [`FileSystem::resolve_entry`] first, like every entry path.
     pub fn resolve_virtual_intrinsic(
         &mut self,
         entry: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
+        let key = self.resolve_entry_key(entry)?;
+        self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
     /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -574,7 +625,8 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
-        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
+        let key = self.resolve_entry_key(entry)?;
+        self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
     }
 
     /// Resolve a module by its normalized key, dispatching on output shape.
@@ -645,8 +697,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         Self::check_source_size(source)?;
-        let canonical_str = self.fs.canonicalize(base_dir)?;
-        self.fs.set_root(&canonical_str)?;
+        let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
@@ -672,8 +723,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         Self::check_source_size(source)?;
-        let canonical_str = self.fs.canonicalize(base_dir)?;
-        self.fs.set_root(&canonical_str)?;
+        let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
@@ -688,16 +738,20 @@ impl ModuleCache {
         Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
 
-    /// Evaluate spliced `@extends` regions, accumulating output while recording
-    /// source-map segments.
+    /// Evaluate spliced `@extends` regions in order, accumulating their output and,
+    /// when a `MapBuilder` is supplied, recording source-map segments.
     ///
-    /// Each region carries its own [`Origin`] so the builder's `current_src` is
-    /// updated to the correct source index before evaluating that region.  Scope
-    /// is shared across all regions (functions defined in earlier regions are
-    /// visible to later ones).
+    /// Each region is evaluated against its own [`Origin`] — the file its node
+    /// offsets index into — so a span-bearing error names that file (#114). With a
+    /// builder, its `current_src` is switched to the region's source; without one,
+    /// the region's display path and source are passed directly. Never
+    /// `origin.file`: that is the canonical key (absolute for `NativeFs`) and must
+    /// not reach a diagnostic (R3 / CWE-209). Scope is shared across all regions
+    /// (functions defined in earlier regions are visible to later ones).
     ///
-    /// PF-004: cumulative output size is checked after each region rather than
-    /// only at the end so runaway base templates are caught early.
+    /// PF-004: one [`EvalBudget`] covers every region, and the cumulative output
+    /// size is checked after each region, so each cap applies to the whole module
+    /// evaluation rather than to each region.
     fn evaluate_regions_with_map(
         regions: &[(&[crate::ast::Node], &Origin)],
         scope: &mut crate::scope::Scope,
@@ -708,13 +762,9 @@ impl ModuleCache {
         let mut current_map = map;
 
         // REL-1 / applies PF-004: single cumulative iteration and message-byte budget
-        // across ALL regions.  Before this fix each call to evaluate_with_map seeded a
-        // fresh EvalContext (total_iterations = 0) so K regions each got an independent
-        // 1 M budget — CPU/DoS amplification ∝ region count.  Now we thread the running
-        // totals from region to region via evaluate_with_map_seeded so the same cap
-        // applies to the entire @extends compilation, matching the non-map (text) path.
-        let mut running_iterations: usize = 0;
-        let mut running_msg_bytes: usize = 0;
+        // across ALL regions.  A fresh budget per region would give K regions an
+        // independent 1 M budget each — CPU/DoS amplification ∝ region count.
+        let mut budget = EvalBudget::default();
 
         for (nodes, origin) in regions {
             // Switch the builder's current_src to the source that owns this region.
@@ -733,25 +783,18 @@ impl ModuleCache {
             let region_output = if let Some(builder) = current_map.take() {
                 // builder.current_src was set to origin's source index above;
                 // evaluate_with_map_seeded derives file/source from it (issue #58).
-                let (region_out, returned_builder, iters, bytes) = evaluate_with_map_seeded(
-                    nodes,
-                    scope,
-                    warnings,
-                    builder,
-                    running_iterations,
-                    running_msg_bytes,
-                )?;
-                running_iterations = iters;
-                running_msg_bytes = bytes;
+                let (region_out, returned_builder) =
+                    evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut budget)?;
                 current_map = Some(returned_builder);
                 region_out
             } else {
-                evaluate(
+                evaluate_seeded(
                     nodes,
                     scope,
                     warnings,
-                    origin.file.as_ref(),
-                    origin.source.as_ref(),
+                    &origin.display,
+                    &origin.source,
+                    &mut budget,
                 )?
             };
 
@@ -769,6 +812,36 @@ impl ModuleCache {
         Ok((output, current_map))
     }
 
+    /// Messages-mode twin of [`Self::evaluate_regions_with_map`]: collect the
+    /// `@message` blocks of spliced `@extends` regions in order.
+    ///
+    /// Each region is evaluated against its own [`Origin`]'s display path and source,
+    /// so a span-bearing error — orphan text outside a `@message`
+    /// (`mds::mixed_content`) or a cross-type comparison — names the file the region
+    /// came from (#115). PF-004: one message vector and one [`EvalBudget`] cover every
+    /// region, so the message-count, message-byte and iteration caps apply to the
+    /// whole module evaluation rather than to each region.
+    fn evaluate_message_regions(
+        regions: &[(&[crate::ast::Node], &Origin)],
+        scope: &mut crate::scope::Scope,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<crate::evaluator::EvalMessage>, MdsError> {
+        let mut budget = EvalBudget::default();
+        let mut messages = Vec::new();
+        for (nodes, origin) in regions {
+            evaluate_messages_seeded(
+                nodes,
+                scope,
+                warnings,
+                &origin.display,
+                &origin.source,
+                &mut budget,
+                &mut messages,
+            )?;
+        }
+        Ok(messages)
+    }
+
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
     /// output shape.
     ///
@@ -779,10 +852,10 @@ impl ModuleCache {
     /// `prepend_frontmatter`).
     ///
     /// When the parsed module has an `@extends` directive the shared extends pipeline
-    /// (`resolve_extends_components`) builds `final_body` and `scope` identically to
-    /// text mode — then the dispatch is performed on `final_body` (NOT `module.body`),
-    /// so @message blocks inside base @block defaults are correctly detected (avoids
-    /// PF-004 divergence, decision #8).
+    /// (`resolve_extends_components`) builds the effective blocks and `scope`
+    /// identically to text mode — then the dispatch is performed on the spliced
+    /// regions (NOT `module.body`), so @message blocks inside base @block defaults are
+    /// correctly detected (avoids PF-004 divergence, decision #8).
     fn process_module_intrinsic(
         &mut self,
         ctx: &ModuleCtx<'_>,
@@ -840,7 +913,6 @@ impl ModuleCache {
             }
 
             let ExtendsComponents {
-                final_body,
                 mut scope,
                 merged_frontmatter,
                 effective_skeleton,
@@ -849,20 +921,20 @@ impl ModuleCache {
                 ..
             } = components;
 
-            if has_message_block(&final_body) {
+            // Per-region evaluation in both modes, with or without a source map:
+            // base-skeleton nodes, base defaults and child overrides index into
+            // different files, so each region is evaluated against its own origin
+            // (#114, #115).
+            let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
+
+            if regions.iter().any(|(nodes, _)| has_message_block(nodes)) {
                 // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
                 // The evaluator only has text-stream semantics; messages boundaries don't
                 // have stable byte offsets relative to the source.  Degrade gracefully.
                 if opts.source_map {
                     warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
                 }
-                let messages = evaluate_messages_intrinsic(
-                    &final_body,
-                    &mut scope,
-                    warnings,
-                    ctx.file_str,
-                    ctx.source,
-                )?;
+                let messages = Self::evaluate_message_regions(&regions, &mut scope, warnings)?;
                 return Ok((
                     crate::CompiledOutput::Messages(
                         messages.into_iter().map(crate::Message::from).collect(),
@@ -871,34 +943,20 @@ impl ModuleCache {
                 ));
             }
 
-            let (body_raw, map_out) = if opts.source_map {
-                // Per-region evaluation so each block's segments carry the
-                // correct source origin (base template vs. child override).
-                let regions =
-                    spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
-                // Seed builder with the skeleton's root file.
-                let builder = crate::sourcemap::MapBuilder::new(
+            // Seed builder with the skeleton's root file (source maps only).
+            let builder = opts.source_map.then(|| {
+                crate::sourcemap::MapBuilder::new(
                     skeleton_origin.file.to_string(),
                     skeleton_origin.display.to_string(),
                     skeleton_origin.source.to_string(),
-                );
-                let (raw, maybe_builder) =
-                    Self::evaluate_regions_with_map(&regions, &mut scope, warnings, Some(builder))?;
-                // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-                match maybe_builder {
-                    Some(b) => apply_map_degradation(raw, b, opts, warnings),
-                    None => (raw, None),
-                }
-            } else {
-                // `final_body` is spliced from base-skeleton nodes (base-relative
-                // offsets) and child block overrides (child-relative offsets), so no
-                // single source can attribute every node's offset (#114). Pass empty
-                // file/source so `build_type_mismatch` degrades a `type_mismatch` to
-                // spanless rather than anchoring a base-relative offset against the
-                // child source (ADR-005 "degrade rather than mis-attribute"). The
-                // source-map branch above keeps spans correct by evaluating per-region
-                // with each region's own origin.
-                (evaluate(&final_body, &mut scope, warnings, "", "")?, None)
+                )
+            });
+            let (raw, maybe_builder) =
+                Self::evaluate_regions_with_map(&regions, &mut scope, warnings, builder)?;
+            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
+            let (body_raw, map_out) = match maybe_builder {
+                Some(b) => apply_map_degradation(raw, b, opts, warnings),
+                None => (raw, None),
             };
 
             let body_clean = crate::clean_output(&body_raw);
@@ -910,14 +968,7 @@ impl ModuleCache {
             // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
             // relativize ALL sources[] entries so no absolute path can leak into
             // the published map.  Unconditional — never opt-in, never debug_assert.
-            //
-            // Defense-in-depth: establish root from base_dir if it was not set by
-            // the entry-point normalize() / set_root() call (guards against a future
-            // alternate code path that bypasses root establishment — PF-004 shape).
-            // No-op for VirtualFs: its source_root() always returns None regardless.
-            if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-                let _ = self.fs.set_root(ctx.base_dir);
-            }
+            self.anchor_root_for_source_map(ctx.base_dir);
             let source_map = source_map.map(|mut sm| {
                 let root_str = self.fs.source_root();
                 let root = root_str.as_deref().map(std::path::Path::new);
@@ -992,14 +1043,7 @@ impl ModuleCache {
         // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
         // relativize ALL sources[] entries so no absolute path can leak into
         // the published map.  Unconditional — never opt-in, never debug_assert.
-        //
-        // Defense-in-depth: establish root from base_dir if it was not set by
-        // the entry-point normalize() / set_root() call (guards against a future
-        // alternate code path that bypasses root establishment — PF-004 shape).
-        // No-op for VirtualFs: its source_root() always returns None regardless.
-        if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-            let _ = self.fs.set_root(ctx.base_dir);
-        }
+        self.anchor_root_for_source_map(ctx.base_dir);
         let source_map = source_map.map(|mut sm| {
             let root_str = self.fs.source_root();
             let root = root_str.as_deref().map(std::path::Path::new);
@@ -1273,17 +1317,19 @@ impl ModuleCache {
         Ok((scope, merged_mapping))
     }
 
-    /// Shared extends-pipeline: steps 3a-3e are identical for the text-cached and
+    /// Shared extends-pipeline: steps 3a-3d are identical for the text-cached and
     /// intrinsic paths.
     ///
-    /// Builds the `final_body` (splice of base skeleton with effective block overrides)
-    /// and the `scope` (deep-merged frontmatter + FM imports + functions) needed by
-    /// both `process_module_extends` (cached text path) and `process_module_intrinsic`.
+    /// Builds the effective skeleton and blocks (base skeleton plus the winning block
+    /// overrides, each with its `Origin`) and the `scope` (deep-merged frontmatter + FM
+    /// imports + functions) needed by both `process_module_extends` (cached text path)
+    /// and `process_module_intrinsic`.
     ///
-    /// Callers differ only in the terminal step (step 3f):
-    /// - Cached text path: `validate` → `evaluate(&final_body, …)`
-    /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_messages_intrinsic`
-    ///   (Messages) or `evaluate` + clean/frontmatter (Markdown)
+    /// Callers differ only in the terminal step (step 3e), which walks the skeleton's
+    /// `spliced_regions` and evaluates each against its own origin:
+    /// - Cached text path: `validate` → `evaluate_regions_with_map`
+    /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
+    ///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
     ///
     /// Factoring here enforces that BOTH modes go through the same PF-004-safe
     /// `resolve_by_key_skeleton` path for the base, and share one copy of the
@@ -1355,14 +1401,7 @@ impl ModuleCache {
 
         validate_exports(&explicit_exports, &functions)?;
 
-        // ── Step 3e: splice final_body ────────────────────────────────────────
-        // Linear O(S+B) pass over the skeleton. Each Block in the skeleton is replaced
-        // by its effective body from effective_blocks (O(1) lookup). Non-Block nodes
-        // pass through verbatim. Between-block spacing (Text nodes) is preserved (decision #9, F11).
-        let final_body = splice_skeleton(&effective_skeleton, &effective_blocks, &skeleton_origin);
-
         Ok(ExtendsComponents {
-            final_body,
             scope,
             functions,
             effective_skeleton,
@@ -1378,14 +1417,16 @@ impl ModuleCache {
     ///
     /// Walks `spliced_regions` and calls `validator::validate` per region so each region's
     /// AST node offsets are paired with the correct source string (fixing the cross-source
-    /// OutOfBounds diagnostic bug). The scope is threaded through all regions so `@define`
-    /// / `@for` scope push/pop behaves identically to a whole-slice validate.
+    /// OutOfBounds diagnostic bug), under the region's display path — never the canonical
+    /// `origin.file`, which is absolute for `NativeFs` (R3 / CWE-209, #114). The scope is
+    /// threaded through all regions so `@define` / `@for` scope push/pop behaves
+    /// identically to a whole-slice validate.
     ///
     /// This single helper is called by BOTH `process_module_extends` (cached text path)
     /// and `process_module_intrinsic` (@extends branch) — enforcing PF-004 parity: the two
     /// parallel paths can never drift because they share one implementation.
     ///
-    /// Re-validate at the leaf (on `final_body` regions), not at intermediate bases.
+    /// Re-validate at the leaf (on the spliced regions), not at intermediate bases.
     fn validate_extends_components(
         components: &ExtendsComponents,
         scope: &mut Scope,
@@ -1395,15 +1436,15 @@ impl ModuleCache {
             &components.effective_blocks,
             &components.skeleton_origin,
         ) {
-            validator::validate(nodes, scope, &origin.file, &origin.source)?;
+            validator::validate(nodes, scope, &origin.display, &origin.source)?;
         }
         Ok(())
     }
 
     /// Evaluate an extending child template in text mode.
     ///
-    /// Delegates the shared pipeline (steps 3a-3e) to `resolve_extends_components`,
-    /// then runs `validate_extends_components` + `evaluate` on `final_body` (step 3f).
+    /// Delegates the shared pipeline (steps 3a-3d) to `resolve_extends_components`,
+    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3e).
     ///
     /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
     /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
@@ -1418,7 +1459,7 @@ impl ModuleCache {
         let components =
             self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
 
-        // ── Step 3f: validate + evaluate on final_body ────────────────────────
+        // ── Step 3e: validate + evaluate the spliced regions ──────────────────
         // Validate per-region so each region's offsets are checked against the correct
         // source (fixes the cross-source OutOfBounds diagnostic bug). This is what makes
         // E12 work: a base default block referencing an undefined var is caught HERE
@@ -1430,7 +1471,6 @@ impl ModuleCache {
         }
 
         let ExtendsComponents {
-            final_body,
             mut scope,
             functions,
             effective_skeleton,
@@ -1441,20 +1481,19 @@ impl ModuleCache {
             merged_frontmatter,
         } = components;
 
-        // `final_body` splices base-skeleton nodes (base-relative offsets) with child
-        // block overrides (child-relative offsets); a single `ctx.source` cannot attribute
-        // both. Pass empty file/source so a `type_mismatch` in an inherited condition
-        // degrades to spanless instead of mis-attributing a base-relative offset onto the
-        // child source (ADR-005 "degrade rather than mis-attribute"). Per-region source
-        // attribution for `@extends` is tracked as #114; spanless is the safe interim.
-        let prompt_body = evaluate(&final_body, &mut scope, warnings, "", "")?;
+        // Base-skeleton nodes, base defaults and child overrides index into different
+        // files, so each region is evaluated against its own origin (#114). No
+        // MapBuilder: an extending module carries no FragmentMap (below).
+        let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
+        let (prompt_body, _) =
+            Self::evaluate_regions_with_map(&regions, &mut scope, warnings, None)?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
         Ok(ResolvedModule {
             functions,
             prompt_body,
-            // @extends modules do not carry a FragmentMap in S6; multi-source
-            // region attribution for extending modules is tracked as #114.
+            // An extending module builds no FragmentMap, so the text an `@include` of
+            // it contributes to a source-mapped importer carries no segments.
             prompt_map: None,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.
@@ -2087,15 +2126,13 @@ struct CollectedDefs {
 
 /// Shared output of [`ModuleCache::resolve_extends_components`].
 ///
-/// Steps 3a-3e (base resolution, child-only-blocks check, effective-blocks construction,
-/// scope merge, and skeleton splice) are identical for text and messages modes. This struct
-/// carries those results so the two terminal steps differ only in the final evaluate call:
-/// - Cached text path: `validator::validate` → `evaluate(&final_body, …)`
-/// - Intrinsic path:   `has_message_block` dispatch → `evaluate_messages_intrinsic`
-///   (Messages) or `evaluate` + clean/frontmatter (Markdown)
+/// Steps 3a-3d (base resolution, child-only-blocks check, effective-blocks construction,
+/// and scope merge) are identical for text and messages modes. This struct carries those
+/// results so the two terminal steps differ only in how the spliced regions are evaluated:
+/// - Cached text path: `validator::validate` → `evaluate_regions_with_map`
+/// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
+///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
 struct ExtendsComponents {
-    /// Spliced final body: base skeleton with effective block bodies inlined.
-    final_body: Vec<Node>,
     /// Merged scope (base < child < runtime), with FM imports and functions loaded.
     scope: Scope,
     /// Merged function map (base functions + child overrides).
@@ -2123,9 +2160,10 @@ struct ModuleCtx<'a> {
     /// Canonical key of the source file.
     ///
     /// For `NativeFs` compiles this is the absolute canonical path returned by
-    /// `fs.normalize()`.  For string-source compiles this is `SOURCE_LABEL`.  Used
-    /// for source-map interning (`MapBuilder::new` / `Origin::file`) — must be the
-    /// stable, dedup-safe identity key, never the display-friendly path.
+    /// `fs.resolve_entry()` (the entry) or `fs.normalize_in_dir()` (an import).  For
+    /// string-source compiles this is `SOURCE_LABEL`.  Used for source-map interning
+    /// (`MapBuilder::new` / `Origin::file`) — must be the stable, dedup-safe identity
+    /// key, never the display-friendly path.
     key: &'a str,
     /// Display-safe (root-relative) path for user-visible strings — error messages,
     /// `NamedSource` names, validator diagnostics (R3 / CWE-209).
@@ -2407,21 +2445,68 @@ fn validate_exports(
     Ok(())
 }
 
+/// The first rule an `@import` / `@extends` / frontmatter `imports:` path breaks.
+///
+/// One classification shared by [`validate_import_path`] (body directives) and the
+/// frontmatter `imports:` parser, so both report the same, real reason (#265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ImportPathViolation {
+    /// The path does not start with `./` or `../`.
+    NotRelative,
+    /// The path contains a null byte, which could truncate it in some OS APIs.
+    NullByte,
+    /// The path carries a forbidden path character other than NUL (#265).
+    ForbiddenChar(char),
+}
+
+impl ImportPathViolation {
+    /// The violation as a message fragment: `must start with './' or '../'`,
+    /// `contains null byte`, `contains forbidden character U+XXXX`.
+    pub(super) fn reason(self) -> String {
+        match self {
+            Self::NotRelative => "must start with './' or '../'".to_string(),
+            Self::NullByte => "contains null byte".to_string(),
+            Self::ForbiddenChar(ch) => {
+                format!("contains forbidden character U+{:04X}", u32::from(ch))
+            }
+        }
+    }
+}
+
+/// Classify `path` as an import path: `None` when it is acceptable.
+///
+/// Checked in order — relative form, null byte, then the rest of the forbidden
+/// class — so a NUL keeps its own reason even though U+0000 is forbidden too.
+pub(super) fn import_path_violation(path: &str) -> Option<ImportPathViolation> {
+    if !path.starts_with("./") && !path.starts_with("../") {
+        return Some(ImportPathViolation::NotRelative);
+    }
+    if path.contains('\0') {
+        return Some(ImportPathViolation::NullByte);
+    }
+    crate::fs::first_forbidden_char(path).map(ImportPathViolation::ForbiddenChar)
+}
+
 /// Validate that an import path is safe and relative.
 ///
-/// Rejects absolute paths and paths containing components that could escape
-/// the project directory (e.g., null bytes).
+/// Rejects paths that are not `./`/`../`-relative, contain a null byte, or carry
+/// any other forbidden path character (#265). It runs before the backend is
+/// called, so a custom `with_fs` backend is covered too. The path is escaped in
+/// every message that shows it.
 fn validate_import_path(path: &str) -> Result<(), MdsError> {
-    if !path.starts_with("./") && !path.starts_with("../") {
-        return Err(MdsError::import_error(format!(
-            "import path must be relative (start with './' or '../'): \"{path}\""
-        )));
+    match import_path_violation(path) {
+        None => Ok(()),
+        Some(ImportPathViolation::NotRelative) => Err(MdsError::import_error(format!(
+            "import path must be relative (start with './' or '../'): \"{}\"",
+            crate::lint::escape_path_for_message(path)
+        ))),
+        Some(ImportPathViolation::NullByte) => {
+            Err(MdsError::import_error("import path contains null byte"))
+        }
+        Some(ImportPathViolation::ForbiddenChar(ch)) => Err(MdsError::import_error(
+            crate::fs::forbidden_char_message("import path", ch, path),
+        )),
     }
-    // Reject null bytes which could truncate paths in some OS APIs
-    if path.contains('\0') {
-        return Err(MdsError::import_error("import path contains null byte"));
-    }
-    Ok(())
 }
 
 /// Validate that a file is a valid MDS file.

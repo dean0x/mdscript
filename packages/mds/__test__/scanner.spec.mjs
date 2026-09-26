@@ -9,8 +9,22 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { mkdtemp, mkdir, symlink, writeFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
+import {
+  FORBIDDEN_PATH_CODEPOINTS,
+  assertNoForbiddenChars,
+  caseInsensitive,
+  compileFileOutcomes,
+  escapeText,
+  loadEngines,
+  pkgRoot,
+  rejectionOf,
+  requireEngines,
+  symlinkOrSkip,
+  thrownBy,
+  uPlus,
+} from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -38,6 +52,49 @@ function scanImports(source) {
     if (p && !paths.includes(p)) paths.push(p);
   }
   return paths;
+}
+
+/**
+ * A missing file — whether never found (nonexistent name, nonexistent parent or
+ * grandparent directory, ENOENT/ENOTDIR alike) or a mismatched spelling on a
+ * case-sensitive volume (#408) — is reported with the same `mds::file_not_found`
+ * shape the Rust engine reports for a missing file, keyed on `shown` (never a
+ * resolved absolute path, R3 / CWE-209) and never described as a symlink.
+ */
+function assertNotFoundNotSymlink(err, shown, label) {
+  assert.equal(err.code, 'mds::file_not_found', `${label}: ${err.message}`);
+  assert.equal(err.message, `file not found: ${shown}`, label);
+  assert.doesNotMatch(err.message, /symlink/, label);
+}
+
+/**
+ * A symlinked final component — entry or import alike — is refused with the error
+ * NativeFs reports for it (`mds::import`), keyed on `shown`, the path as written:
+ * never the resolved absolute path.
+ */
+function assertSymlinkRefusal(err, shown, label) {
+  assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+  assert.equal(err.message, `import error: symlinks are not allowed in imports: ${shown}`, label);
+}
+
+/**
+ * A module outside the project root is refused with the error NativeFs reports for
+ * it (`mds::import`), keyed on `shown`, the import as written.
+ */
+function assertEscapeRefusal(err, shown, label) {
+  assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+  assert.equal(err.message, `import error: import path escapes project directory: "${shown}"`, label);
+}
+
+/** Run `fn` with `dir` as the working directory, restoring it afterwards. */
+async function withCwd(dir, fn) {
+  const cwd = process.cwd();
+  process.chdir(dir);
+  try {
+    return await fn();
+  } finally {
+    process.chdir(cwd);
+  }
 }
 
 describe('normalizeVirtualKey', () => {
@@ -96,6 +153,78 @@ describe('normalizeVirtualKey', () => {
   });
 });
 
+// #265: the pre-scanner refuses the same 80 forbidden path codepoints as the Rust
+// resolver, with the same error codes and messages — an import string is
+// `mds::import`, an entry key is `mds::io`. The Rust↔JS differential over the whole
+// class lives in forbidden-path-chars.spec.mjs; these pin the scanner's own API.
+const NUL = 0x00;
+const HOSTILE_NAME_CODEPOINTS = FORBIDDEN_PATH_CODEPOINTS.filter((cp) => cp !== NUL);
+
+describe('normalizeVirtualKey — forbidden path characters (#265)', () => {
+  test('U-S11: an import carrying any forbidden codepoint is refused as mds::import', () => {
+    assert.equal(FORBIDDEN_PATH_CODEPOINTS.length, 80, 'the class has 80 codepoints');
+    for (const cp of HOSTILE_NAME_CODEPOINTS) {
+      const label = `U-S11 ${uPlus(cp)}`;
+      const relative = `./a${String.fromCodePoint(cp)}b.mds`;
+      const err = thrownBy(() => normalizeVirtualKey('dir/main.mds', relative), label);
+      assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+      assert.equal(
+        err.message,
+        `import error: import path contains forbidden character ${uPlus(cp)}: "./a${escapeText(cp)}b.mds"`,
+        label,
+      );
+      assertNoForbiddenChars(err.message, label);
+    }
+  });
+
+  test('U-S12: a NUL in an import keeps its own null-byte message, checked before the class', () => {
+    const err = thrownBy(
+      () => normalizeVirtualKey('main.mds', `./a${String.fromCodePoint(NUL)}b.mds`),
+      'U-S12',
+    );
+    assert.equal(err.code, 'mds::import');
+    assert.equal(err.message, 'import error: import path contains null byte');
+  });
+
+  test('U-S13: an entry key (empty base) carrying any forbidden codepoint is refused as mds::io', () => {
+    for (const cp of HOSTILE_NAME_CODEPOINTS) {
+      const label = `U-S13 ${uPlus(cp)}`;
+      const err = thrownBy(() => normalizeVirtualKey('', `a${String.fromCodePoint(cp)}b.mds`), label);
+      assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+      assert.equal(
+        err.message,
+        `entry path contains forbidden character ${uPlus(cp)}: "a${escapeText(cp)}b.mds"`,
+        label,
+      );
+      assertNoForbiddenChars(err.message, label);
+    }
+  });
+
+  test('U-S14: an empty or NUL entry key reports the entry-path messages as mds::io', () => {
+    const empty = thrownBy(() => normalizeVirtualKey('', ''), 'U-S14 empty');
+    assert.equal(empty.code, 'mds::io');
+    assert.equal(empty.message, 'entry path is empty');
+
+    const nul = thrownBy(
+      () => normalizeVirtualKey('', `a${String.fromCodePoint(NUL)}b.mds`),
+      'U-S14 NUL',
+    );
+    assert.equal(nul.code, 'mds::io');
+    assert.equal(nul.message, `entry path contains null byte: "a${escapeText(NUL)}b.mds"`);
+  });
+
+  test('U-S15: spaces, non-ASCII letters and the class neighbours are accepted (control)', () => {
+    assert.equal(normalizeVirtualKey('dir/main.mds', './a b-ünï.mds'), 'dir/a b-ünï.mds');
+    assert.equal(normalizeVirtualKey('', 'a b-ünï.mds'), 'a b-ünï.mds');
+    // Each sits next to a member of the class without being one.
+    for (const cp of [0x20, 0xa0, 0x061b, 0x061d, 0x200b, 0x200d, 0x2027, 0x202f, 0x2065, 0x206a, 0xfefe, 0x1f600]) {
+      const c = String.fromCodePoint(cp);
+      assert.equal(normalizeVirtualKey('main.mds', `./a${c}b.mds`), `a${c}b.mds`, uPlus(cp));
+      assert.equal(normalizeVirtualKey('', `a${c}b.mds`), `a${c}b.mds`, uPlus(cp));
+    }
+  });
+});
+
 describe('buildModulesMap', () => {
   test('U-SM1: builds modules map for entry with imports', async () => {
     const entryPath = path.join(FIXTURES, 'imports', 'entry.mds');
@@ -116,13 +245,29 @@ describe('buildModulesMap', () => {
     assert.equal(Object.keys(modules).length, 1);
   });
 
-  test('U-SM3: rejects nonexistent file', async () => {
-    await assert.rejects(
-      () => buildModulesMap('/nonexistent/file.mds', scanImports),
-      (err) => {
-        assert.ok(err instanceof Error);
-        return true;
-      },
+  test('U-SM3: rejects nonexistent file with the file-not-found shape, never a raw absolute-path error', async () => {
+    // The entry's parent directory does not exist, so `realpath(dirname(...))`
+    // — called before the filesystem is touched for the entry itself — is what
+    // rejects, not the later O_NOFOLLOW open (#408). Absolute `shown`: the
+    // caller's own path is already absolute, so it is expected back verbatim.
+    const absoluteEntry = '/nonexistent/file.mds';
+    assertNotFoundNotSymlink(
+      await rejectionOf(buildModulesMap(absoluteEntry, scanImports), 'U-SM3a'),
+      absoluteEntry,
+      'U-SM3a',
+    );
+
+    // Relative `shown`: this is the case that actually discriminates the fix from
+    // the raw Node error. A raw ENOENT from `realpath()` reports the *resolved*
+    // (cwd-joined) absolute path in its message, which would satisfy neither the
+    // exact-message assertion above nor the no-leak assertion below for a
+    // relative input — only the translated error reports `shown` unchanged.
+    const relativeEntry = `mds-scanner-u-sm3-${process.pid}-nonexistent/file.mds`;
+    const err = await rejectionOf(buildModulesMap(relativeEntry, scanImports), 'U-SM3b');
+    assertNotFoundNotSymlink(err, relativeEntry, 'U-SM3b');
+    assert.ok(
+      !err.message.includes(process.cwd()),
+      `U-SM3b: message must not leak the resolved absolute path: ${err.message}`,
     );
   });
 
@@ -158,20 +303,25 @@ describe('buildModulesMap', () => {
     );
   });
 
-  test('U-SM7: rejects symlink with security error', async () => {
-    // openNoFollow uses O_NOFOLLOW (Linux/macOS) or a post-open realpath check
+  test('U-SM7: rejects a symlinked entry with the symlink error native reports, naming the path as written', async () => {
+    // openNoFollow uses O_NOFOLLOW (Linux/macOS) or a post-open lstat check
     // (Windows) to detect symlinks. This test creates a real symlink in a temp
-    // directory and confirms the scanner surfaces a security error.
+    // directory and confirms the scanner reports NativeFs's symlink refusal.
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-test-'));
     try {
       const realFile = path.join(tmpDir, 'real.mds');
       const linkFile = path.join(tmpDir, 'link.mds');
       await writeFile(realFile, 'Hello world');
       await symlink(realFile, linkFile);
-      await assert.rejects(
-        () => buildModulesMap(linkFile, scanImports),
-        /security.*symlink/,
-      );
+      // The caller's path is absolute, so it is expected back verbatim.
+      assertSymlinkRefusal(await rejectionOf(buildModulesMap(linkFile, scanImports), 'U-SM7'), linkFile, 'U-SM7');
+
+      // Typed relative: only the path as written may appear, never the resolved
+      // absolute one (whose directory is canonical — /private/var on macOS).
+      const canonicalDir = await realpath(tmpDir);
+      const err = await withCwd(tmpDir, () => rejectionOf(buildModulesMap('link.mds', scanImports), 'U-SM7 relative'));
+      assertSymlinkRefusal(err, 'link.mds', 'U-SM7 relative');
+      assert.ok(!err.message.includes(canonicalDir), `U-SM7: no absolute path; got: ${err.message}`);
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
@@ -191,6 +341,669 @@ describe('buildModulesMap', () => {
     const helperKey = Object.keys(modules).find(k => k.endsWith('cross-dir/lib/helpers.mds'));
     assert.ok(helperKey, `sibling dir module should be included, got keys: ${Object.keys(modules)}`);
     assert.equal(Object.keys(modules).length, 2, 'should have exactly entry + helper');
+  });
+});
+
+describe('buildModulesMap — forbidden path characters (#265)', () => {
+  /** Run `fn` against a fresh project directory (marked by `.mdsroot`). */
+  async function withProject(fn) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-265-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      return await fn(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('U-SM9: an import carrying a forbidden codepoint is refused as mds::import before it is opened', async () => {
+    await withProject(async (dir) => {
+      const entry = path.join(dir, 'main.mds');
+      await writeFile(entry, 'hi\n');
+      for (const cp of HOSTILE_NAME_CODEPOINTS) {
+        const label = `U-SM9 ${uPlus(cp)}`;
+        // The injected scanner reports the hostile import for the entry. No file of
+        // that name exists, so a scan that reached the filesystem would reject with
+        // ENOENT rather than this error.
+        const importPath = `./a${String.fromCodePoint(cp)}b.mds`;
+        const err = await rejectionOf(buildModulesMap(entry, () => [importPath]), label);
+        assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+        assert.equal(
+          err.message,
+          `import error: import path contains forbidden character ${uPlus(cp)}: "./a${escapeText(cp)}b.mds"`,
+          label,
+        );
+        assertNoForbiddenChars(err.message, label);
+      }
+    });
+  });
+
+  test('U-SM10: import strings are classified in the resolver order — relative form, NUL, then the class', async () => {
+    await withProject(async (dir) => {
+      const entry = path.join(dir, 'main.mds');
+      await writeFile(entry, 'hi\n');
+      const esc = String.fromCodePoint(0x1b);
+      const cases = [
+        ['lib.mds', `import error: import path must be relative (start with './' or '../'): "lib.mds"`],
+        // Not relative AND hostile: the relative-form rule is reported, the name escaped.
+        [`fo${esc}o.mds`, `import error: import path must be relative (start with './' or '../'): "fo${escapeText(0x1b)}o.mds"`],
+        ['', `import error: import path must be relative (start with './' or '../'): ""`],
+        [`./a${String.fromCodePoint(NUL)}b${esc}.mds`, 'import error: import path contains null byte'],
+      ];
+      for (const [importPath, expected] of cases) {
+        const label = `U-SM10 ${JSON.stringify(importPath)}`;
+        const err = await rejectionOf(buildModulesMap(entry, () => [importPath]), label);
+        assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+        assert.equal(err.message, expected, label);
+      }
+    });
+  });
+
+  test('U-SM11: an entry path carrying a forbidden codepoint is refused as mds::io before the filesystem is touched', async () => {
+    await withProject(async (dir) => {
+      for (const cp of HOSTILE_NAME_CODEPOINTS) {
+        const label = `U-SM11 ${uPlus(cp)}`;
+        const typed = path.join(dir, `a${String.fromCodePoint(cp)}b.mds`);
+        const err = await rejectionOf(buildModulesMap(typed, scanImports), label);
+        assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+        assert.equal(
+          err.message,
+          `entry path contains forbidden character ${uPlus(cp)}: "${path.join(dir, `a${escapeText(cp)}b.mds`)}"`,
+          label,
+        );
+        assertNoForbiddenChars(err.message, label);
+      }
+
+      const nul = await rejectionOf(
+        buildModulesMap(path.join(dir, `a${String.fromCodePoint(NUL)}b.mds`), scanImports),
+        'U-SM11 NUL',
+      );
+      assert.equal(nul.code, 'mds::io');
+      assert.equal(nul.message, `entry path contains null byte: "${path.join(dir, `a${escapeText(NUL)}b.mds`)}"`);
+
+      const empty = await rejectionOf(buildModulesMap('', scanImports), 'U-SM11 empty');
+      assert.equal(empty.code, 'mds::io');
+      assert.equal(empty.message, 'entry path is empty');
+    });
+  });
+
+  test('U-SM12: a clean name with spaces and non-ASCII letters is imported (control)', async () => {
+    await withProject(async (dir) => {
+      const entry = path.join(dir, 'main.mds');
+      await writeFile(entry, 'hi\n');
+      await writeFile(path.join(dir, 'a b-ünï.mds'), 'there\n');
+      const { entryFilename, modules } = await buildModulesMap(entry, (src) =>
+        src === 'hi\n' ? ['./a b-ünï.mds'] : [],
+      );
+      assert.equal(entryFilename, 'main.mds');
+      assert.deepEqual(Object.keys(modules).sort(), ['a b-ünï.mds', 'main.mds']);
+    });
+  });
+
+  // Windows file names cannot carry C0 controls, so the hostile directory this
+  // needs cannot be created there.
+  test(
+    'U-SM13: an entry reached through a symlink into a hostile-named directory is refused as mds::io',
+    { skip: process.platform === 'win32' && 'C0 controls are not valid in Windows file names' },
+    async () => {
+      await withProject(async (dir) => {
+        for (const cp of [0x09, 0x0a, 0x1b, 0x7f, 0x85, 0x202e, 0xfeff]) {
+          const label = `U-SM13 ${uPlus(cp)}`;
+          const hostile = path.join(dir, `ho${String.fromCodePoint(cp)}stile-${cp}`);
+          await mkdir(hostile);
+          await writeFile(path.join(hostile, 'main.mds'), 'hi\n');
+          const alias = path.join(dir, `alias-${cp}`);
+          await symlink(hostile, alias, 'dir');
+
+          // The typed path is clean; only its canonical form carries the codepoint.
+          const typed = path.join(alias, 'main.mds');
+          const err = await rejectionOf(buildModulesMap(typed, scanImports), label);
+          assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+          // The message shows the path as typed, never the resolved one.
+          assert.equal(err.message, `resolved path contains forbidden character ${uPlus(cp)}: "${typed}"`, label);
+        }
+
+        // Control: the same layout with a clean target directory builds.
+        const clean = path.join(dir, 'clean');
+        await mkdir(clean);
+        await writeFile(path.join(clean, 'main.mds'), 'hi\n');
+        await symlink(clean, path.join(dir, 'alias-clean'), 'dir');
+        const { modules } = await buildModulesMap(path.join(dir, 'alias-clean', 'main.mds'), scanImports);
+        assert.deepEqual(Object.values(modules), ['hi\n']);
+      });
+    },
+  );
+});
+
+// #408: the scanner decides "symlink" from the final component's own file type
+// and checks the canonical parent — as NativeFs does — instead of comparing a
+// realpath with the path as written. On a case-insensitive volume (the macOS and
+// Windows default) realpath returns the on-disk spelling, so the comparison used to
+// report `Entry.mds` for `entry.mds` as a possible symlink.
+describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => {
+  async function withProject(fn) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-408-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      return await fn(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+
+  test('U-SM14: a case-mismatched entry path is never reported as a symlink', async () => {
+    await withProject(async (dir) => {
+      await writeFile(path.join(dir, 'main.mds'), 'Hello!\n');
+      // Resolve case-sensitivity BEFORE starting the build: the build's
+      // rejection on a case-sensitive volume can settle before an interleaved
+      // await elsewhere in this function attaches a handler, which Node's
+      // unhandled-rejection detector flags even though the rejection is
+      // handled moments later (a `PromiseRejectionHandledWarning`, not a
+      // silently dropped error). Starting `build` last means the very next
+      // expression always consumes it, on either branch.
+      const insensitive = await caseInsensitive(dir);
+      const entry = path.join(dir, 'MAIN.mds');
+      const build = buildModulesMap(entry, scanImports);
+      if (insensitive) {
+        // The entry is keyed as typed: that key is what the WASM engine is handed.
+        const { entryFilename, modules } = await build;
+        assert.equal(entryFilename, 'MAIN.mds');
+        assert.deepEqual(modules, { 'MAIN.mds': 'Hello!\n' });
+      } else {
+        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM14'), entry, 'U-SM14');
+      }
+    });
+  });
+
+  test('U-SM15: a case-mismatched import is never reported as a symlink', async () => {
+    await withProject(async (dir) => {
+      await writeFile(path.join(dir, 'main.mds'), '@import "./Header.mds" as h\n');
+      await writeFile(path.join(dir, 'header.mds'), 'hi\n');
+      // See U-SM14: resolve case-sensitivity before starting the build so
+      // nothing is left unhandled across an interleaved await.
+      const insensitive = await caseInsensitive(dir);
+      const build = buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      if (insensitive) {
+        // Keyed as written, since the engine's virtual filesystem looks the import
+        // up under exactly that key.
+        const { modules } = await build;
+        assert.equal(modules['Header.mds'], 'hi\n');
+      } else {
+        assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM15'), './Header.mds', 'U-SM15');
+      }
+    });
+  });
+
+  test('U-SM16: a symlink is still refused, under its exact and a mismatched spelling (control)', async () => {
+    await withProject(async (dir) => {
+      await writeFile(path.join(dir, 'target.mds'), 'hi\n');
+      await symlink(path.join(dir, 'target.mds'), path.join(dir, 'link.mds'));
+      const insensitive = await caseInsensitive(dir);
+
+      await writeFile(path.join(dir, 'main.mds'), '@import "./link.mds" as l\n');
+      assertSymlinkRefusal(
+        await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM16 import'),
+        './link.mds',
+        'U-SM16 import',
+      );
+      const entry = path.join(dir, 'link.mds');
+      assertSymlinkRefusal(await rejectionOf(buildModulesMap(entry, scanImports), 'U-SM16 entry'), entry, 'U-SM16 entry');
+
+      await writeFile(path.join(dir, 'main.mds'), '@import "./LINK.mds" as l\n');
+      const mismatched = buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      if (insensitive) {
+        assertSymlinkRefusal(await rejectionOf(mismatched, 'U-SM16 mismatched'), './LINK.mds', 'U-SM16 mismatched');
+      } else {
+        assertNotFoundNotSymlink(await rejectionOf(mismatched, 'U-SM16'), './LINK.mds', 'U-SM16');
+      }
+    });
+  });
+
+  test('U-SM17: a symlinked directory is followed inside the project and refused when it leads outside', async () => {
+    await withProject(async (dir) => {
+      // Inside: the parent directory is canonicalized (its link followed) and the
+      // final component checked, as NativeFs does.
+      await mkdir(path.join(dir, 'real'));
+      await writeFile(path.join(dir, 'real', 'lib.mds'), 'lib\n');
+      await symlink(path.join(dir, 'real'), path.join(dir, 'alias'), dirLinkType);
+      await writeFile(path.join(dir, 'main.mds'), '@import "./alias/lib.mds" as l\n');
+      const { modules } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      assert.equal(modules['alias/lib.mds'], 'lib\n');
+
+      // Outside: the canonical path is what containment is checked on.
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-408-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.mds'), 'secret\n');
+        await symlink(outside, path.join(dir, 'escape'), dirLinkType);
+        await writeFile(path.join(dir, 'main.mds'), '@import "./escape/secret.mds" as s\n');
+        const err = await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM17');
+        assertEscapeRefusal(err, './escape/secret.mds', 'U-SM17');
+        assert.ok(!err.message.includes(outside), `U-SM17: no resolved path; got: ${err.message}`);
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // Windows file names cannot carry C0 controls, so the hostile directory this
+  // needs cannot be created there.
+  test(
+    'U-SM18: an import through a symlink into a hostile-named directory is refused as mds::io (#265)',
+    { skip: process.platform === 'win32' && 'C0 controls are not valid in Windows file names' },
+    async () => {
+      await withProject(async (dir) => {
+        const hostile = path.join(dir, `ho${String.fromCodePoint(0x1b)}stile`);
+        await mkdir(hostile);
+        await writeFile(path.join(hostile, 'lib.mds'), 'lib\n');
+        await symlink(hostile, path.join(dir, 'alias'), 'dir');
+        await writeFile(path.join(dir, 'main.mds'), '@import "./alias/lib.mds" as l\n');
+        const err = await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM18');
+        assert.equal(err.code, 'mds::io', err.message);
+        // Names the import as written, never the resolved path.
+        assert.equal(err.message, 'resolved path contains forbidden character U+001B: "./alias/lib.mds"');
+      });
+    },
+  );
+
+  test('U-SM19: an entry path through a file where a directory is expected (ENOTDIR) is reported as file-not-found', async () => {
+    // Rust's check_symlink_named maps ANY canonicalize() failure on the parent —
+    // ENOENT or ENOTDIR alike — to file_not_found without distinguishing errno;
+    // this mirrors that. `blocker.mds` is a regular file, so the `nested` segment
+    // below it cannot be traversed.
+    await withProject(async (dir) => {
+      const blocker = path.join(dir, 'blocker.mds');
+      await writeFile(blocker, 'not a directory\n');
+      const entry = path.join(blocker, 'nested', 'file.mds');
+      assertNotFoundNotSymlink(await rejectionOf(buildModulesMap(entry, scanImports), 'U-SM19'), entry, 'U-SM19');
+
+      // One level down, the regular file IS the immediate parent: realpath() of it
+      // succeeds, and it is the open() of the file below it that fails with ENOTDIR
+      // — still a missing file, never a symlink.
+      const direct = path.join(blocker, 'file.mds');
+      assertNotFoundNotSymlink(await rejectionOf(buildModulesMap(direct, scanImports), 'U-SM19 direct'), direct, 'U-SM19 direct');
+      await writeFile(path.join(dir, 'main.mds'), '@import "./blocker.mds/file.mds" as f\n');
+      assertNotFoundNotSymlink(
+        await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM19 import'),
+        './blocker.mds/file.mds',
+        'U-SM19 import',
+      );
+    });
+  });
+
+  test('U-SM20: an import into a missing subdirectory is reported as file-not-found, not a raw ENOENT', async () => {
+    // Exercises openAndValidateModule's own realpath(dirname(...)) (the sibling
+    // of buildModulesMap's top-level one that U-SM3 exercises): the entry exists,
+    // but an imported module's directory does not.
+    await withProject(async (dir) => {
+      const importPath = './missing-subdir/lib.mds';
+      await writeFile(path.join(dir, 'main.mds'), `@import "${importPath}" as l\n`);
+      const err = await rejectionOf(buildModulesMap(path.join(dir, 'main.mds'), scanImports), 'U-SM20');
+      assertNotFoundNotSymlink(err, importPath, 'U-SM20');
+    });
+  });
+
+  test('U-SM21: compileFile on an entry with a missing parent directory — native and WASM backends agree on code and message', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM21')) return;
+    const missing = path.join(FIXTURES, `mds-scanner-u-sm21-${process.pid}-nonexistent`, 'file.mds');
+    const [native] = await compileFileOutcomes('native', [missing]);
+    const [wasm] = await compileFileOutcomes('wasm', [missing]);
+    assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+    assert.equal(native.message, `file not found: ${missing}`, JSON.stringify(native));
+    // code/message only, not the full errorShape: native reaches this error through
+    // Rust's own NativeFs (compileFile calls the napi addon directly, never
+    // buildModulesMap), whose FileNotFound carries a `help` diagnostic
+    // (crates/mds-core/src/error.rs); the WASM backend reaches it through this
+    // file's buildModulesMap, whose PathError type carries no `help` field at all
+    // (true of every mds::io/mds::import/mds::file_not_found refusal built by
+    // pathError() in this file, not something this fix introduces or narrows).
+    assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+    assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+  });
+
+  // The WASM engine resolves an import BY NAME, from the importing module's key;
+  // NativeFs resolves it ON DISK, from the importing module's canonical directory.
+  // Through a symlinked directory the two agree for every import except one that
+  // leaves the link through `..`: its key names the directory beside the link,
+  // the file NativeFs reads sits beside the link's target.
+
+  /** sub -> deep/other; sub/y.mds imports ../z.mds; both z.mds files exist. */
+  async function dotDotOutOfLink(dir, linked) {
+    await mkdir(path.join(dir, 'deep', 'other'), { recursive: true });
+    const yDir = linked ? path.join(dir, 'deep', 'other') : path.join(dir, 'sub');
+    if (linked) {
+      await symlink(path.join(dir, 'deep', 'other'), path.join(dir, 'sub'), dirLinkType);
+    } else {
+      await mkdir(yDir);
+    }
+    await writeFile(path.join(yDir, 'y.mds'), '@import "../z.mds" as dz\nY=\n@include dz\n');
+    await writeFile(path.join(dir, 'deep', 'z.mds'), 'DEEP-Z\n');
+    await writeFile(path.join(dir, 'z.mds'), 'ROOT-Z\n');
+    await writeFile(path.join(dir, 'main.mds'), '@import "./sub/y.mds" as y\n@import "./z.mds" as rz\n@include rz\n@include y\n');
+    return path.join(dir, 'main.mds');
+  }
+
+  test("U-SM22: an import that leaves a symlinked directory through '..' is refused, never read from the other side", async () => {
+    await withProject(async (dir) => {
+      const main = await dotDotOutOfLink(dir, true);
+      const err = await rejectionOf(buildModulesMap(main, scanImports), 'U-SM22');
+      assert.equal(err.code, 'mds::import', err.message);
+      assert.equal(
+        err.message,
+        `import error: import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "../z.mds"`,
+      );
+    });
+    // Control: the same tree with `sub` a real directory builds, and `../z.mds`
+    // from sub/y.mds is the root z.mds under both resolutions.
+    await withProject(async (dir) => {
+      const { modules } = await buildModulesMap(await dotDotOutOfLink(dir, false), scanImports);
+      assert.equal(modules['z.mds'], 'ROOT-Z\n');
+      assert.equal(modules['sub/y.mds'], '@import "../z.mds" as dz\nY=\n@include dz\n');
+    });
+  });
+
+  test('U-SM23: a file reached through a symlinked directory is stored under every key the engine looks up', async () => {
+    await withProject(async (dir) => {
+      await mkdir(path.join(dir, 'lib'));
+      await writeFile(path.join(dir, 'lib', 'x.mds'), 'X\n');
+      await writeFile(path.join(dir, 'lib', 'y.mds'), '@import "./x.mds" as x\n');
+      await symlink(path.join(dir, 'lib'), path.join(dir, 'alias'), dirLinkType);
+      await writeFile(path.join(dir, 'main.mds'), '@import "./lib/x.mds" as a\n@import "./alias/y.mds" as b\n');
+      const { modules } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      // lib/x.mds and alias/x.mds are one file on disk, but the engine resolves
+      // alias/y.mds's `./x.mds` to the key alias/x.mds: both keys must be present.
+      assert.equal(modules['lib/x.mds'], 'X\n');
+      assert.equal(modules['alias/x.mds'], 'X\n');
+    });
+  });
+
+  test('U-SM24: through a symlinked directory, the WASM backend compiles what the native backend compiles, or refuses', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM24')) return;
+    await withProject(async (dir) => {
+      // Both backends compile the alias layout identically.
+      await mkdir(path.join(dir, 'lib'));
+      await writeFile(path.join(dir, 'lib', 'x.mds'), 'X\n');
+      await writeFile(path.join(dir, 'lib', 'y.mds'), '@import "./x.mds" as x\nY\n@include x\n');
+      await symlink(path.join(dir, 'lib'), path.join(dir, 'alias'), dirLinkType);
+      const alias = path.join(dir, 'alias-main.mds');
+      await writeFile(alias, '@import "./lib/x.mds" as a\n@import "./alias/y.mds" as b\n@include a\n@include b\n');
+      // `..` out of the link: NativeFs reads deep/z.mds; the WASM backend refuses
+      // rather than compile the root z.mds its engine would look up by name.
+      const dotDot = await dotDotOutOfLink(dir, true);
+
+      const [nativeAlias, nativeDotDot] = await compileFileOutcomes('native', [alias, dotDot]);
+      const [wasmAlias, wasmDotDot] = await compileFileOutcomes('wasm', [alias, dotDot]);
+      assert.equal(nativeAlias.output, 'X\nY\nX\n', JSON.stringify(nativeAlias));
+      assert.deepEqual(wasmAlias, nativeAlias);
+      assert.equal(nativeDotDot.output, 'ROOT-Z\nY=\nDEEP-Z\n', JSON.stringify(nativeDotDot));
+      assert.equal(wasmDotDot.code, 'mds::import', JSON.stringify(wasmDotDot));
+      assert.equal(wasmDotDot.output, undefined, JSON.stringify(wasmDotDot));
+    });
+  });
+});
+
+describe('buildModulesMap — a filesystem error is coded, never a raw Node error (#408)', () => {
+  async function withProject(fn) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-errno-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      return await fn(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // Permission bits do not bind root, and Windows has no POSIX modes to strip.
+  const noModes =
+    (process.platform === 'win32' && 'POSIX permission bits are not enforced on Windows') ||
+    (typeof process.getuid === 'function' && process.getuid() === 0 && 'root bypasses permission bits');
+
+  /** Build `entry` and return its rejection — with every forbidden character absent. */
+  async function refusal(entry, label) {
+    const err = await rejectionOf(buildModulesMap(entry, scanImports), label);
+    assertNoForbiddenChars(err.message, label);
+    return err;
+  }
+
+  /**
+   * The scanner's refusal for `entry` and for the same file imported as
+   * `importPath` by a sibling `main.mds` — both `file not found`, keyed on the path
+   * as written, the shape NativeFs gives any failure to resolve a path (it maps
+   * every errno of that step to `mds::file_not_found`).
+   */
+  async function assertNotFoundAsEntryAndImport(dir, entry, importPath, label) {
+    assertNotFoundNotSymlink(await refusal(entry, `${label} entry`), entry, `${label} entry`);
+    await writeFile(path.join(dir, 'main.mds'), `@import "${importPath}" as x\n`);
+    const err = await refusal(path.join(dir, 'main.mds'), `${label} import`);
+    assertNotFoundNotSymlink(err, importPath, `${label} import`);
+  }
+
+  // Windows resolves a self-referencing directory link no more than POSIX does
+  // (its reparse-point limit), and both sides report ANY failure to resolve the
+  // directory as file-not-found, whatever its errno.
+  test('U-SM25: a symlink loop in a directory (ELOOP) is file-not-found, as native reports it', async (t) => {
+    await withProject(async (dir) => {
+      if (!(await symlinkOrSkip(t, path.join(dir, 'loop'), path.join(dir, 'loop'), 'dir'))) return;
+      const entry = path.join(dir, 'loop', 'x.mds');
+      await assertNotFoundAsEntryAndImport(dir, entry, './loop/x.mds', 'U-SM25');
+
+      const engines = await loadEngines();
+      if (!requireEngines(t, engines, 'U-SM25')) return;
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+      assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+      assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+    });
+  });
+
+  test('U-SM26: a name too long to resolve (ENAMETOOLONG) is file-not-found, as native reports it', async (t) => {
+    await withProject(async (dir) => {
+      const long = 'n'.repeat(300);
+      // The final component (the open fails) and a directory above it (realpath fails).
+      const file = path.join(dir, `${long}.mds`);
+      await assertNotFoundAsEntryAndImport(dir, file, `./${long}.mds`, 'U-SM26 file');
+      const nested = path.join(dir, long, 'x.mds');
+      await assertNotFoundAsEntryAndImport(dir, nested, `./${long}/x.mds`, 'U-SM26 dir');
+
+      const engines = await loadEngines();
+      if (!requireEngines(t, engines, 'U-SM26')) return;
+      const nativeOutcomes = await compileFileOutcomes('native', [file, nested]);
+      const wasmOutcomes = await compileFileOutcomes('wasm', [file, nested]);
+      for (const [i, native] of nativeOutcomes.entries()) {
+        const wasm = wasmOutcomes[i];
+        assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+      }
+    });
+  });
+
+  test('U-SM27: a directory that cannot be searched (EACCES) is file-not-found, as native reports it', { skip: noModes }, async (t) => {
+    await withProject(async (dir) => {
+      const locked = path.join(dir, 'locked');
+      await mkdir(path.join(locked, 'sub'), { recursive: true });
+      await writeFile(path.join(locked, 'sub', 'x.mds'), 'X\n');
+      await chmod(locked, 0o000);
+      try {
+        const entry = path.join(locked, 'sub', 'x.mds');
+        await assertNotFoundAsEntryAndImport(dir, entry, './locked/sub/x.mds', 'U-SM27');
+
+        const engines = await loadEngines();
+        if (!requireEngines(t, engines, 'U-SM27')) return;
+        const [native] = await compileFileOutcomes('native', [entry]);
+        const [wasm] = await compileFileOutcomes('wasm', [entry]);
+        assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
+        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+      } finally {
+        await chmod(locked, 0o755);
+      }
+    });
+  });
+
+  test('U-SM28: a file that exists but cannot be read (EACCES) is mds::io, as native reports it', { skip: noModes }, async (t) => {
+    await withProject(async (dir) => {
+      const secret = path.join(dir, 'secret.mds');
+      await writeFile(secret, 'S\n');
+      await chmod(secret, 0o000);
+      try {
+        const err = await refusal(secret, 'U-SM28 entry');
+        assert.equal(err.code, 'mds::io', err.message);
+        assert.equal(err.message, `cannot read ${secret}: EACCES`);
+
+        await writeFile(path.join(dir, 'main.mds'), '@import "./secret.mds" as s\n');
+        const imported = await refusal(path.join(dir, 'main.mds'), 'U-SM28 import');
+        assert.equal(imported.code, 'mds::io', imported.message);
+        assert.equal(imported.message, 'cannot read ./secret.mds: EACCES');
+
+        const engines = await loadEngines();
+        if (!requireEngines(t, engines, 'U-SM28')) return;
+        const [native] = await compileFileOutcomes('native', [secret]);
+        const [wasm] = await compileFileOutcomes('wasm', [secret]);
+        // The code agrees; the message names the path as written and the errno name,
+        // where native names its root-relative display path and the OS error text.
+        assert.equal(native.code, 'mds::io', JSON.stringify(native));
+        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+      } finally {
+        await chmod(secret, 0o644);
+      }
+    });
+  });
+
+  // Windows file names cannot carry C0 controls, so the hostile directory this
+  // needs cannot be created there.
+  test(
+    'U-SM29: under a hostile-named working directory, an unsearchable directory names only the path as written',
+    { skip: noModes || (process.platform === 'win32' && 'C0 controls are not valid in Windows file names') },
+    async () => {
+      await withProject(async (dir) => {
+        const hostile = path.join(dir, `ho${String.fromCodePoint(0x1b)}stile`);
+        const locked = path.join(hostile, 'locked');
+        await mkdir(path.join(locked, 'sub'), { recursive: true });
+        await writeFile(path.join(locked, 'sub', 'x.mds'), 'X\n');
+        await chmod(locked, 0o000);
+        const cwd = process.cwd();
+        process.chdir(hostile);
+        try {
+          // Node's own EACCES message names the absolute path, raw ESC included.
+          const err = await refusal('locked/sub/x.mds', 'U-SM29');
+          assertNotFoundNotSymlink(err, 'locked/sub/x.mds', 'U-SM29');
+        } finally {
+          process.chdir(cwd);
+          await chmod(locked, 0o755);
+        }
+      });
+    },
+  );
+});
+
+// The refusals NativeFs makes itself — a symlinked final component, a module
+// outside the project root, a module that is not a regular file — carry its code
+// and name the path as written, never the resolved one (#408).
+describe('buildModulesMap — symlink, root-escape and non-file refusals match native (#408)', () => {
+  /** A project directory `proj` (marked by `.mdsroot`) inside a scratch parent. */
+  async function withNestedProject(fn) {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-native-'));
+    try {
+      const proj = path.join(parent, 'proj');
+      await mkdir(proj);
+      await writeFile(path.join(proj, '.mdsroot'), '');
+      return await fn(proj, parent);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+
+  const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+
+  test('U-SM30: an import leaving the project root is refused as mds::import before it is opened', async () => {
+    await withNestedProject(async (proj, parent) => {
+      // The file exists, so only the containment check can refuse it.
+      await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
+      await writeFile(path.join(proj, 'main.mds'), '@import "../outside.mds" as o\n');
+      const err = await rejectionOf(buildModulesMap(path.join(proj, 'main.mds'), scanImports), 'U-SM30');
+      assertEscapeRefusal(err, '../outside.mds', 'U-SM30');
+      assert.ok(!err.message.includes(await realpath(parent)), `U-SM30: no absolute path; got: ${err.message}`);
+
+      // Control: the same import one level down stays inside the root and builds.
+      await mkdir(path.join(proj, 'sub'));
+      await writeFile(path.join(proj, 'in.mds'), 'IN\n');
+      await writeFile(path.join(proj, 'sub', 'main.mds'), '@import "../in.mds" as i\n');
+      const { modules } = await buildModulesMap(path.join(proj, 'sub', 'main.mds'), scanImports);
+      assert.equal(modules['in.mds'], 'IN\n');
+    });
+  });
+
+  test('U-SM31: a module that is not a regular file is mds::io, naming the path as written', async () => {
+    await withNestedProject(async (proj) => {
+      await mkdir(path.join(proj, 'dir.mds'));
+      await writeFile(path.join(proj, 'main.mds'), '@import "./dir.mds" as d\n');
+      const imported = await rejectionOf(buildModulesMap(path.join(proj, 'main.mds'), scanImports), 'U-SM31 import');
+      const entry = await withCwd(proj, () => rejectionOf(buildModulesMap('dir.mds', scanImports), 'U-SM31 entry'));
+      const canonicalProj = await realpath(proj);
+      for (const [err, shown, label] of [[imported, './dir.mds', 'U-SM31 import'], [entry, 'dir.mds', 'U-SM31 entry']]) {
+        assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+        // A directory fails with the errno a read of it reports; on Windows its
+        // open fails first, with whatever errno libuv maps that to.
+        const prefix = `cannot read ${shown}: `;
+        if (process.platform === 'win32') {
+          assert.ok(err.message.startsWith(prefix), `${label}: ${err.message}`);
+          assert.match(err.message.slice(prefix.length), /^E[A-Z]+$/, label);
+        } else {
+          assert.equal(err.message, `${prefix}EISDIR`, label);
+        }
+        assert.ok(!err.message.includes(canonicalProj), `${label}: no absolute path; got: ${err.message}`);
+      }
+    });
+  });
+
+  test('U-SM32: compileFile — native and WASM backends refuse a symlink and a root escape with one code and message', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM32')) return;
+    await withNestedProject(async (proj, parent) => {
+      await writeFile(path.join(proj, 'real.mds'), 'REAL\n');
+      await symlink(path.join(proj, 'real.mds'), path.join(proj, 'linked.mds'));
+      await writeFile(path.join(proj, 'imp-link.mds'), '@import "./linked.mds" as l\n');
+      await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
+      await writeFile(path.join(proj, 'imp-escape.mds'), '@import "../outside.mds" as o\n');
+      await mkdir(path.join(parent, 'outside-dir'));
+      await writeFile(path.join(parent, 'outside-dir', 'secret.mds'), 'SECRET\n');
+      await symlink(path.join(parent, 'outside-dir'), path.join(proj, 'escape'), dirLinkType);
+      await writeFile(path.join(proj, 'imp-escape-link.mds'), '@import "./escape/secret.mds" as s\n');
+      await writeFile(path.join(proj, 'control.mds'), '@import "./real.mds" as r\n@include r\n');
+
+      // The symlinked entry is typed relative to the subprocess's working directory,
+      // so a message naming anything but the path as written cannot match.
+      const linkedEntry = path.relative(pkgRoot, path.join(proj, 'linked.mds'));
+      const cases = [
+        [linkedEntry, 'mds::import', `import error: symlinks are not allowed in imports: ${linkedEntry}`],
+        [path.join(proj, 'imp-link.mds'), 'mds::import', 'import error: symlinks are not allowed in imports: ./linked.mds'],
+        [path.join(proj, 'imp-escape.mds'), 'mds::import', 'import error: import path escapes project directory: "../outside.mds"'],
+        [
+          path.join(proj, 'imp-escape-link.mds'),
+          'mds::import',
+          'import error: import path escapes project directory: "./escape/secret.mds"',
+        ],
+      ];
+      const files = [...cases.map(([file]) => file), path.join(proj, 'control.mds')];
+      const nativeOutcomes = await compileFileOutcomes('native', files);
+      const wasmOutcomes = await compileFileOutcomes('wasm', files);
+      for (const [i, [file, code, message]] of cases.entries()) {
+        const [native, wasm] = [nativeOutcomes[i], wasmOutcomes[i]];
+        const label = `U-SM32 ${file}`;
+        assert.equal(native.code, code, `${label}: ${JSON.stringify(native)}`);
+        assert.equal(native.message, message, `${label}: ${JSON.stringify(native)}`);
+        assert.equal(wasm.code, native.code, `${label}: ${JSON.stringify({ wasm, native })}`);
+        assert.equal(wasm.message, native.message, `${label}: ${JSON.stringify({ wasm, native })}`);
+      }
+      // Control: the same project compiles through the real file on both backends.
+      assert.deepEqual(nativeOutcomes[cases.length], { output: 'REAL\n' });
+      assert.deepEqual(wasmOutcomes[cases.length], nativeOutcomes[cases.length]);
+    });
   });
 });
 

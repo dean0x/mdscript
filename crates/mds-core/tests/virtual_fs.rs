@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use mds::{MdsError, ModuleCache, Value};
+use mds::{MdsError, ModuleCache, SerializedSpan, Value};
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -258,7 +258,7 @@ fn module_not_found() {
 #[test]
 fn cross_subdirectory_import() {
     // pages/main.mds imports ../shared/utils.mds using a relative path that
-    // crosses a subdirectory boundary. This exercises VirtualFs::normalize for
+    // crosses a subdirectory boundary. This exercises VirtualFs::normalize_in_dir for
     // the ".." traversal case across the full compile pipeline.
     let mut modules = HashMap::new();
     modules.insert(
@@ -1434,18 +1434,13 @@ fn d2_type_mismatch_at_elseif_span_points_to_elseif_not_if() {
 }
 
 #[test]
-fn extends_base_skeleton_type_mismatch_span_not_misattributed_to_child() {
-    // A type mismatch in a BASE skeleton `@if` condition (offset relative to the base
-    // template) must NOT be attributed to the CHILD source. The flat
-    // `evaluate(&final_body, …, ctx.source)` path in the `@extends` pipeline evaluates a
-    // body spliced from base-skeleton nodes (base-relative offsets) and child block
-    // overrides (child-relative offsets) against a single `ctx.source` (the child). A
-    // base-relative offset that happens to land within the child source at a char
-    // boundary would otherwise anchor the `type_mismatch` span onto the child's
-    // `@extends` line — mis-attribution to a foreign source. The contract
-    // (`build_type_mismatch` doc / ADR-005) is to degrade to spanless rather than
-    // mis-attribute, exactly as the flat non-`@extends` path never faces this because its
-    // offsets and `ctx.source` share one origin.
+fn extends_base_skeleton_type_mismatch_spans_the_base() {
+    // #114: a type mismatch in a BASE skeleton `@if` condition (offset relative to the
+    // base template) is spanned on the BASE source with source maps off. The `@extends`
+    // chain is evaluated one spliced region at a time, each against the source its node
+    // offsets index into. A single-source evaluation of the whole spliced body could
+    // only pair the base-relative offset with the child source (a mis-attribution) or
+    // drop the span.
     let mut modules = HashMap::new();
     modules.insert(
         "base.mds".to_string(),
@@ -1471,11 +1466,16 @@ fn extends_base_skeleton_type_mismatch_span_not_misattributed_to_child() {
         "must surface as mds::type_mismatch, got: {}",
         serialized.code
     );
-    assert!(
-        serialized.span.is_none(),
-        "cross-source @extends type_mismatch must degrade to spanless (never mis-attributed \
-         to the child source); got span: {:?}",
-        serialized.span
+    assert_eq!(
+        err.source_name(),
+        Some("base.mds"),
+        "an inherited @if must be reported against the base, never the child"
+    );
+    // `@if n == 5:` — 11 bytes at offset 14, the first line after the frontmatter.
+    assert_eq!(
+        serialized.span,
+        Some(SerializedSpan::new(14, 11).with_line(4).with_column(1)),
+        "the span must underline the base's @if line"
     );
 }
 

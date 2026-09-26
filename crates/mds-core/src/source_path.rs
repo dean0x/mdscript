@@ -322,6 +322,17 @@ fn apply_relative(mut anchor: Vec<String>, rel_parts: &[String]) -> Option<Vec<S
     Some(anchor)
 }
 
+/// True when two path components are equal, using platform case-sensitivity
+/// (ASCII case-insensitive on Windows, exact match elsewhere).
+#[cfg(windows)]
+fn comp_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+#[cfg(not(windows))]
+fn comp_eq(a: &str, b: &str) -> bool {
+    a == b
+}
+
 /// True when `path` component-wise starts with `prefix`.
 ///
 /// On Windows, component comparison is ASCII-case-insensitive.
@@ -329,16 +340,10 @@ fn starts_with_comps(path: &[String], prefix: &[String]) -> bool {
     if path.len() < prefix.len() {
         return false;
     }
-    #[cfg(windows)]
-    return path[..prefix.len()]
-        .iter()
-        .zip(prefix.iter())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b));
-    #[cfg(not(windows))]
     path[..prefix.len()]
         .iter()
         .zip(prefix.iter())
-        .all(|(a, b)| a == b)
+        .all(|(a, b)| comp_eq(a, b))
 }
 
 /// Compute the `/`-separated relative path from `from` to `to`.
@@ -350,17 +355,10 @@ fn starts_with_comps(path: &[String], prefix: &[String]) -> bool {
 /// absolute-path failure fallback is replaced with the basename fallback to
 /// close that leak path (build.rs:978 bug class).
 fn component_diff(from: &[String], to: &[String]) -> String {
-    #[cfg(windows)]
     let common = from
         .iter()
         .zip(to.iter())
-        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
-        .count();
-    #[cfg(not(windows))]
-    let common = from
-        .iter()
-        .zip(to.iter())
-        .take_while(|(a, b)| a == b)
+        .take_while(|(a, b)| comp_eq(a, b))
         .count();
 
     let ups = from.len() - common;
@@ -866,6 +864,9 @@ mod tests {
     ///
     /// Positive control: the same root spelled in valid UTF-8 must still emit the
     /// root-relative path.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStrExt` (arbitrary bytes), a
+    /// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
     #[cfg(unix)]
     #[test]
     fn non_utf8_root_degrades_to_basename() {
@@ -906,6 +907,9 @@ mod tests {
     /// Positive control: a usable base under the same root must still shift the
     /// emitted path by the map-directory offset (`../src/a.mds`), so this test
     /// cannot pass by ignoring `base` altogether.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStrExt` (arbitrary bytes), a
+    /// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
     #[cfg(unix)]
     #[test]
     fn non_utf8_base_falls_back_to_root_anchor() {
@@ -1142,7 +1146,7 @@ mod tests {
     struct FakeFs(Option<String>);
 
     impl crate::fs::FileSystem for FakeFs {
-        fn normalize(&self, _base: &str, _rel: &str) -> Result<String, crate::MdsError> {
+        fn resolve_entry(&self, _path: &str) -> Result<String, crate::MdsError> {
             unimplemented!()
         }
         fn normalize_in_dir(&self, _dir: &str, _rel: &str) -> Result<String, crate::MdsError> {

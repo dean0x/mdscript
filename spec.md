@@ -367,29 +367,78 @@ The resolver applies the rules below to the paths it opens — the entry file, e
 `@import` target (body directives and frontmatter `imports:` entries alike), and the
 base directory of a string compile — on the native filesystem backend (`NativeFs`:
 the CLI, the Rust API, and the file-path entry points of the napi and Python
-bindings). The in-memory backend (`VirtualFs`: `compile_virtual`, `lint_virtual`, and
-the WASM binding) has no symlinks and no host paths; the NUL-byte, empty-path and
-containment rules apply to it unchanged. Each rule is a compilation error, reported
-with the code shown.
+bindings). The in-memory backend (`VirtualFs`: `compile_virtual`, `check_virtual`,
+`lint_virtual`, and the WASM binding) has no symlinks and no host paths; the NUL-byte,
+forbidden-character, empty-path and segment-count rules apply to its entry keys and
+import paths alike, and the containment rule to its import paths. Each rule is a
+compilation error, reported with the code shown.
 
 | Constraint | Rule | Code and message |
 |---|---|---|
 | Relative form | An import path starts with `./` or `../`; bare module names and absolute paths are refused before any filesystem access. | `mds::import` — `import path must be relative (start with './' or '../'): "<path>"` |
-| Empty path | An empty import path is refused. | `mds::import` — `import path is empty` |
-| NUL bytes | A path containing U+0000 is refused before it reaches the operating system. | `mds::import` — `import path contains null byte` |
-| Symlink rejection | A path whose final component is a symbolic link is refused. The check canonicalizes the parent directory, joins the file name, canonicalizes the result and compares the two, so it is the resolved target that is validated, not the string the template wrote. Symbolic links in parent directories are followed, and the resolved path is then subject to the containment rule. Applies to the entry file, each import target and the base directory of a string compile; the CLI applies the same check to the `--vars` file. | `mds::import` — `symlinks are not allowed in imports: <path>` |
+| Empty path | An empty import path is refused. An empty entry path is refused by the resolver before the backend is called, on every entry API: the file-path APIs, `ModuleCache::resolve_path*`, `resolve_key` and `resolve_virtual_intrinsic*`, and the entry key of `compile_virtual`, `check_virtual` and `lint_virtual`. | Import: `mds::import` — `import path is empty`. Entry: `mds::io` — `entry path is empty` |
+| NUL bytes | A path containing U+0000 is refused before it reaches the operating system. An entry path containing it is refused by the resolver before the backend is called, on every entry API listed for an empty path, so a custom `FileSystem` backend is covered too. | Import: `mds::import` — `import path contains null byte`. Entry: `mds::io` — `entry path contains null byte: "<path>"` (the path escaped per §7.5) |
+| Forbidden characters | A path carrying any of the 80 codepoints of `mds::is_forbidden_path_char` is refused: every C0 control including TAB (U+0009) and LF (U+000A), DEL, every C1 control, U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069, U+2028, U+2029 and U+FEFF. An import path, an entry path or virtual entry key (every entry API listed for an empty path) and a base directory are each refused by the resolver before any backend is called, so a custom `FileSystem` backend is covered too; on the native filesystem a resolved canonical path carrying one anywhere — an entry, import or base directory reached through a symbolic link into a hostile-named directory, or a project located under one — is refused as well. U+0000 keeps its own message (row above). Each message names the codepoint and shows the path as the caller wrote it, escaped with `mds::escape_path_for_message`, so it carries no forbidden character itself and never the absolute resolved path. Where each check runs is listed under "Forbidden-character enforcement" below. | Import: `mds::import` — `import path contains forbidden character U+XXXX: "<path>"` (a frontmatter `imports:` entry: `imports[<n>]: invalid path "<path>": contains forbidden character U+XXXX`). Entry: `mds::io` — `entry path contains forbidden character U+XXXX: "<path>"`. Base directory: `mds::io` — `base directory contains forbidden character U+XXXX: "<path>"`. Resolved path: `mds::io` — `resolved path contains forbidden character U+XXXX: "<path as written>"` |
+| Symlink rejection | A path whose final component is a symbolic link is refused. The check canonicalizes the parent directory, joins the file name as written, and refuses the result when its own file type (not followed) is a symbolic link — on Windows also a junction or any other name-surrogate reparse point; it then canonicalizes it, and a result outside the canonical parent is refused too. A name that differs from the on-disk name only in case, on a case-insensitive volume, is not a link: it resolves as the operating system resolves it, and the module is keyed by its on-disk spelling, so every spelling of one file is one module. Symbolic links in parent directories are followed, and the resolved path is then subject to the containment rule. Applies to the entry file (a `ModuleCache::resolve_key` key included), each import target, and a base directory passed to `ModuleCache::resolve_source*` (through `FileSystem::anchor_base_dir`, before the project root is anchored there); the CLI applies the same check to the `--vars` file. The string-compile functions (`compile_str_with`, `check_str_with`, `lint_str_with` and the bindings' `basePath`/`base_path`) resolve their base directory to its canonical form first, so a symbolic link there is followed rather than refused, and the resolved directory anchors containment. | `mds::import` — `symlinks are not allowed in imports: <path>` |
 | Root containment | After resolution the canonical path must lie inside the project root (§5 Project Root). A `..` sequence or a symlinked parent that leads outside the root is refused; on the virtual backend, `..` above the virtual root is refused. | `mds::import` — `import path escapes project directory: "<path>"` |
-| Path encoding | An entry path or base directory that is not valid UTF-8 is refused at the public API boundary rather than converted lossily. On the CLI this is exit 2 (§7.9). | `mds::io` — `path is not valid UTF-8` (entry path) or `base_dir path is not valid UTF-8` (base directory) |
-| Segment count | On the virtual backend an import that resolves to more than 256 path segments is refused. | `mds::resource_limit` — `import path exceeds maximum segment count (256)` |
+| Path encoding | An entry path or base directory that is not valid UTF-8 is refused at the public API boundary rather than converted lossily. On the native filesystem a resolved canonical path that is not valid UTF-8 — an entry, import or base directory reached through a symbolic link into a directory whose name is not — is refused as well, never keyed by its lossy form (which would name a different file). On the CLI this is exit 2 (§7.9). | `mds::io` — `path is not valid UTF-8` (entry path), `base_dir path is not valid UTF-8` (base directory) or `resolved path is not valid UTF-8: "<path as written>"` (resolved path) |
+| Segment count | An import path of more than 256 segments is refused on both backends (on the virtual backend it is counted after it resolves against the importing directory), as is an entry file path resolved through `FileSystem::resolve_entry`. | `mds::resource_limit` — `import path exceeds maximum segment count (256)` |
 
-Enforced by `validate_relative_import`, `NativeFs::check_symlink` and
-`NativeFs::check_path_traversal` (`crates/mds-core/src/fs.rs`), `validate_import_path`
+Enforced by `validate_relative_import`, `validate_entry_path`, `check_segment_count`,
+`NativeFs::check_symlink`, `NativeFs::anchor_base_dir` and `NativeFs::check_path_traversal`
+(`crates/mds-core/src/fs.rs`), `validate_import_path` and `resolve_entry_key`
 (`crates/mds-core/src/resolver.rs`) and `path_to_str` / `resolve_base_dir`
-(`crates/mds-core/src/lib.rs`); pinned by the `native_normalize_*` and
-`vfs_normalize_*` tests in `fs.rs`, `symlink_import_rejected` and
+(`crates/mds-core/src/lib.rs`); pinned by the `native_resolve_entry_*`,
+`native_normalize_in_dir_*`, `native_anchor_base_dir_*`, `native_resolve_key_*`,
+`vfs_resolve_entry_*`, `vfs_normalize_in_dir_*` and `case_*` tests,
+`symlinked_base_dir_refused_by_resolve_source_followed_by_string_api` and (Windows)
+`junction_final_component_is_refused` in `fs.rs`,
+`case_mismatched_entry_and_import_are_not_symlink_errors` in
+`crates/mds-cli/tests/security.rs`,
+`custom_backend_entry_validation_runs_before_backend`,
+`virtual_entry_apis_validate_the_entry_key` and `nul_in_entry_path_is_io_error` in
+`crates/mds-core/tests/api_surface.rs`, `symlink_import_rejected` and
 `path_traversal_import_rejected` in `crates/mds-cli/tests/security.rs`, and the
 `*_rejects_non_utf8_*` tests in `crates/mds-core/tests/api_surface.rs`. Directory-mode
 commands additionally skip symlinked entries inside the tree (§7.2).
+
+##### Forbidden-character enforcement
+
+`mds::is_forbidden_path_char` (#265) is checked where each input enters, before any
+filesystem backend is called:
+
+| Input | Checked by | Code |
+|---|---|---|
+| An import path — a body directive (`@import`, `@extends`, …) or a frontmatter `imports:` entry | `validate_import_path` in the resolver, for every backend, and `validate_relative_import` again in both built-in backends' `normalize_in_dir`; the frontmatter parser classifies the path with the same `import_path_violation` | `mds::import` |
+| An entry path or virtual entry key (every entry API listed for an empty path, so the WASM `filename` too) | `validate_entry_path` in the resolver (`resolve_entry_key`), for every backend, and again in both built-in backends' `resolve_entry` | `mds::io` |
+| The base directory of a string compile (`compile_str_with`, `check_str_with`, `lint_str_with`, the bindings' `basePath`/`base_path`) and of the formatter's safety gate (`format_str_with`/`format_str_named`, so `mds fmt`) | `resolve_base_dir`, on the form as given and on its canonical form | `mds::io` |
+| The working directory — the base directory of `mds build`, `mds check`, `mds lint` and `mds fmt` reading `-` (stdin), and of a string compile given none | `resolve_base_dir`, on the working directory; the message names it `"."` (`resolved path contains forbidden character U+XXXX: "."`), never its absolute path | `mds::io` |
+| A base directory passed to `ModuleCache::resolve_source*` | the resolver, for every backend, and `NativeFs::anchor_base_dir` again | `mds::io` |
+| A resolved canonical path | `NativeFs`, on every path it canonicalizes — entry, import and base directory — scanned whole, not only its final component | `mds::io` |
+| A file the CLI opens itself — a `mds lint`/`mds fmt` file argument, the `--vars` file | `NativeFs::check_symlink`, on the path as given and on its canonical form (`path contains forbidden character U+XXXX: "<path>"`); a `mds lint`/`mds fmt` file argument is refused with the same message before its existence and `.mds`-extension checks, so a missing or non-`.mds` hostile path reports it too, and `mds watch` refuses a `--vars` path the same way before it probes it or watches its directory | `mds::io` |
+| `-o`/`--output` and `--out-dir` (`mds build`, `mds watch`); `mds.json` `build.output_dir`, checked when the config is loaded — by `build`, `watch`, `lint` and directory-mode `fmt`, not by `check`, which does not read `mds.json`; `mds init <filename>` | the CLI, before any input is read or any file is written — `-o`, `--out-dir` and `build.output_dir` both as written and in the form they resolve to (a symlink, or a working directory above a relative value, leading into a hostile-named directory: `<setting> resolved path contains forbidden character U+XXXX: "<value as written>"`; a location that does not exist yet is resolved through its deepest existing ancestor) | `mds::io`, exit 2 |
+| The entry path and imports of `@mdscript/mds`'s `compileFile`/`checkFile`/`lintFile` on the WASM backend | the package's JS pre-scanner (`packages/mds/src/util/path-chars.ts`, used by `module-scanner.ts`), before it opens any file: the entry path and each import string as written, then each resolved path — with the same codes and messages as the native backend | `mds::import` / `mds::io` |
+
+The one input outside that list is a path a custom `FileSystem` backend passed to
+`ModuleCache::with_fs` produces itself — a key it rewrites, a link it follows. The
+resolver still refuses every caller-supplied path above before calling such a backend,
+but it never sees the backend's own paths, so a custom backend MUST apply
+`mds::is_forbidden_path_char` to them itself (the `FileSystem` trait's "Security
+Contract" in `crates/mds-core/src/fs.rs`).
+
+Pinned by `forbidden_path_char_class_is_exactly_80` and
+`escape_path_for_message_leaves_no_forbidden_char` in
+`crates/mds-core/src/lint/diagnostic.rs`, `validate_import_path_refuses_every_forbidden_char`
+in `crates/mds-core/src/resolver_tests.rs`, `normalize_in_dir_refuses_every_forbidden_char`,
+`resolve_entry_refuses_every_forbidden_char`, `native_anchor_base_dir_refuses_forbidden_chars`
+and `native_canonical_path_through_a_hostile_directory_is_refused` in `fs.rs`, the tests
+in `crates/mds-core/tests/forbidden_path_chars.rs` (import, entry-key, base-directory,
+custom-backend and symlinked-hostile-directory cases) and
+`crates/mds-cli/tests/forbidden_paths.rs` (the directory-walker matrix over `build`,
+`check`, `fmt`, `lint` and `watch`, single-file arguments, the output locations and
+`mds init`), and U-FP1–U-FP5 in `packages/mds/__test__/forbidden-path-chars.spec.mjs`,
+which compare the JS pre-scanner with the native and WASM engines over all 80
+codepoints.
 
 ---
 
@@ -898,11 +947,11 @@ as 2 except for the two carve-outs shown.
 | `mds::type_error` | `@for` over a value that is not an array | evaluator | 1 / 2 | all |
 | `mds::type_mismatch` | Cross-type `==` / `!=` comparison | evaluator | 1 / 2 | all |
 | `mds::circular_import` | Import graph contains a cycle | resolver | 1 / 2 | all |
-| `mds::file_not_found` | Entry file or import target does not exist (native backend) | `NativeFs`, CLI input check | 2 / 2 | CLI, Rust, napi, Python |
-| `mds::import` | An `@import` the resolver refuses: not `./`/`../`-relative, empty, NUL byte, symlinked final component, escapes the project root, or another import-directive violation (§4.6 "Filesystem constraints") | resolver, `NativeFs`, `VirtualFs` | 1 / 2 | all |
+| `mds::file_not_found` | Entry file or import target does not exist, or a directory above it does not, or the path cannot otherwise be resolved — a symlink loop, a name too long, a directory that cannot be searched (native filesystem) | `NativeFs`, CLI input check; `@mdscript/mds`'s WASM-backend file pre-scanner, with the native message | 2 / 2 | CLI, Rust, napi, Python, `@mdscript/mds` |
+| `mds::import` | An `@import` the resolver refuses: not `./`/`../`-relative, empty, NUL byte, a forbidden path character, symlinked final component, escapes the project root, or another import-directive violation (§4.6 "Filesystem constraints"); on `@mdscript/mds`'s WASM backend also an import that leaves a symlinked directory through `..`, which its by-name virtual filesystem would resolve to a different file than the native backend reads | resolver, `NativeFs`, `VirtualFs`, `@mdscript/mds` WASM-backend pre-scanner | 1 / 2 | all |
 | `mds::name_collision` | A merge import or definition redefines a name already in scope | resolver | 1 / 2 | all |
 | `mds::not_mds` | Input is not an MDS file (no `.mds` extension and no `type: mds` frontmatter) | CLI input check, file API | 2 / 2 | CLI, Rust |
-| `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; on the CLI also a `--vars` file that is a symlink and a `lint --fix` rewrite refused by the compile-equivalence check | `mds-core` API boundary, CLI | 2 / 2 | CLI, Rust, napi, Python |
+| `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; an entry path or virtual entry key that is empty or contains a NUL byte; an entry path, entry key, base directory or resolved canonical path carrying a forbidden path character (§4.6); on the CLI also a `--vars` file that is a symlink, a `-o`/`--out-dir`/`build.output_dir`/`mds init` path carrying a forbidden path character (for `-o`/`--out-dir`/`build.output_dir`, as written or as resolved), a `build.output_dir` containing `..`, and a `lint --fix` rewrite refused by the compile-equivalence check | `mds-core` API boundary, resolver, `NativeFs`, `VirtualFs`, CLI, `@mdscript/mds` WASM-backend pre-scanner | 2 / 2 | all |
 | `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`); bindings also raise it before compilation for oversized sources, module maps and counts | evaluator, resolver, `VirtualFs`, bindings | 3 / 3 | all |
 | `mds::yaml` | Frontmatter YAML the parser itself refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1) | resolver | 1 / 2 | all |
 | `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites | `mds-core` vars API | 1 / 2 | Rust, CLI |
@@ -923,7 +972,10 @@ as 2 except for the two carve-outs shown.
 
 CLI-authored errors that are not `MdsError`s — an unreadable, oversized or malformed
 `mds.json`, `mds init` refusing a `..` path, a failed stdout write — carry no `mds::`
-code; they exit 1 under `build`/`check`/`fmt` and 2 under `lint`. A panic on the CLI is
+code; they exit 1 under `build`/`check`/`fmt` and 2 under `lint`. A `build.output_dir`
+containing a `..` component or a forbidden path character, and a `-o`/`--out-dir` value
+or `mds init` filename containing a forbidden path character, are `mds::io` (exit 2)
+instead. A panic on the CLI is
 not converted into an error object: it is a Rust panic with exit code 101. The
 `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
 `MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised
@@ -982,6 +1034,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source. A source that is not under the build root (not reachable for a walked tree; defence in depth) is written flat as `<out>/<stem>.<ext>` with a warning naming both paths; the warning is not suppressed by `--quiet`.
 - `-o` is rejected for a directory input.
 - Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
+- A file whose path carries a forbidden path character (§4.6) — in its own name or in a directory above it — is still collected, and fails on its own (`mds::io`, the name shown escaped) while its siblings are processed; `mds check`, `mds fmt`, `mds lint` and `mds watch` in directory mode do the same, each with its own per-file failure exit code, and `mds watch` keeps running.
 - When the directory contains no `.mds` files at all, exits 1 with `no .mds files found in <dir>; nothing was built` on stderr — emitted even under `--quiet`, like the all-excluded diagnostic — so an empty tree cannot pass a CI gate silently. (Changed in v0.4.3; previously exited 0.) `mds watch <dir>` is unaffected: it starts on an empty tree and compiles files created later.
 - When the directory contains `.mds` files but every one of them is a `_`-prefixed partial, exits 1 with `<n> .mds file(s) found in <dir> but all are _-prefixed partials; nothing was built` on stderr — emitted even under `--quiet`, the same bypass as the two diagnostics above. (Changed in v0.4.3; previously `0 built, 0 failed`, exit 0.) `mds fmt <dir>` and `mds lint <dir>` are unaffected: they format and lint partials, so a partials-only tree is real work for them. `mds watch <dir>` is unaffected: it still starts.
 - **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
@@ -991,8 +1044,8 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 
 | Option | Description |
 |--------|-------------|
-| `-o, --output <PATH>` | Output file path, or `-` for stdout. Mutually exclusive with `--out-dir`. Rejected for directory input. Warns if the extension contradicts the template kind. |
-| `--out-dir <DIR>` | Output directory. Mirrors subtree (dir mode) or writes `<stem>.<ext>` inside it (file mode). Created if absent. |
+| `-o, --output <PATH>` | Output file path, or `-` for stdout. Mutually exclusive with `--out-dir`. Rejected for directory input. Warns if the extension contradicts the template kind. A path carrying a forbidden path character (§4.6) is refused before any input is read (`mds::io`, exit 2). |
+| `--out-dir <DIR>` | Output directory. Mirrors subtree (dir mode) or writes `<stem>.<ext>` inside it (file mode). Created if absent. A path carrying a forbidden path character (§4.6) is refused before any input is read (`mds::io`, exit 2). |
 | `--vars <FILE>` | JSON file with runtime variable overrides. A key repeated at any depth warns with its dotted/bracketed path (e.g. `x.a`, `x[2].a`); the last value wins. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. Repeating a key emits a warning; the last value wins. |
 | `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). Repeating a key emits a warning; the last value wins. |
@@ -1039,7 +1092,7 @@ mds fmt template.mds --diff               # Print unified diff without writing
 
 Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside frontmatter and code fences), strips trailing whitespace on directive lines, and ensures exactly one trailing newline. An empty or whitespace-only source formats to 0 bytes (an empty output file). Interior blank lines and blank-line structure within frontmatter and code fences are left verbatim (blank-line collapsing was removed in v0.4.0 to preserve the interior-verbatim whitespace contract). Body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of `@message`/`@define` bodies are left untouched.
 
-Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template.
+Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template. The base directory the gate compiles against (the file's directory; the working directory for stdin) is resolved first, as `mds check` resolves it: one that is refused (§4.6) or cannot be resolved fails `mds fmt` with that error (`mds::io`, exit 2).
 
 | Option | Description |
 |--------|-------------|
@@ -1243,7 +1296,7 @@ Applied, that means:
 | Value | Mode | Because |
 |-------|------|---------|
 | `message`, `help`, warning bodies, `LabeledSpan` text | HUMAN on terminal surfaces, WIRE on the JSON wire | Prose; legitimately multi-line in a rendered frame |
-| A filename or path in a diagnostic `file` **field**: the JSON `file` key, a CLI status line, a `[file:line:col]` frame header | WIRE on every surface that renders one | Single-line by construction; POSIX permits `\n` in a filename and the user never types it |
+| A filename or path in a diagnostic `file` **field**: the JSON `file` key, a CLI status line, a `[file:line:col]` frame header | WIRE on every surface that renders one; a CLI status line also escapes `\t` (`mds::escape_path_for_message`, the whole forbidden-path class of §4.6) | Single-line by construction; POSIX permits `\n` in a filename and the user never types it |
 | `mds.json` rule names and config values, `--format` arguments | WIRE on every surface that renders one | Single-line identifiers. WIRE applies in all rendering contexts — including when a rule name appears inside a warning body (e.g., the unknown-rule-names warning), the name is WIRE-escaped, not HUMAN. This row takes precedence over the residual row below for `mds.json`-sourced values. |
 | `io::Error` / `MdsError` causes interpolated into a CLI status or warning line | WIRE on every surface that renders one | Single-line, and they embed paths of their own |
 | A path, identifier or cause interpolated into a diagnostic **message body** | HUMAN on terminal surfaces, WIRE on the JSON wire | Follows the message row above — it is part of prose. This is the **residual** below: it is not covered by the WIRE rows. Exception: `mds.json` rule names and config values that appear inside a warning body are governed by the WIRE row above, not this residual — the more specific row takes precedence. |
@@ -1302,6 +1355,23 @@ neutralization — in every one of these positions:
   the napi / WASM / Python compile results;
 - the `dependencies` array of `CompileResult::to_canonical_json()`.
 
+Emitted verbatim means not escaped. It does not mean byte-identical to the internal
+module key: on Windows a native `dependencies` entry is the conventional spelling of the
+canonical path (`C:\…`, not `\\?\C:\…`) wherever that names the same file — a lossless
+respelling, not an escape (pinned on the Windows CI leg by
+`windows_dependencies_carry_no_verbatim_prefix` in `crates/mds-core/tests/api_surface.rs`,
+and on every platform by the `verbatim` unit tests in `crates/mds-core/src/verbatim.rs`).
+
+The CLI's own **display text** — `file` per the per-field rule above — gets the same
+respelling through a separate mechanism, `mds::display_native_path` (a no-op off
+Windows): the diagnostic `file` field is WIRE-escaped for control/bidi/separator
+characters as the table above describes, and independently of that, any path a CLI
+status line or error message shows (a canonicalized `--out-dir`, an `atomic_write_file`
+I/O failure) is passed through `display_native_path` before display, at the CLI's
+`safe_path` choke-point. The two are orthogonal: escaping defends against a hostile
+filename, `display_native_path` respells a canonicalization artefact that is not
+hostile, just platform-specific.
+
 These are **functional references, not display text**. Source Map v3 `file` and
 `sources` are resolved against the filesystem by devtools, bundlers and IDEs;
 `dependencies` is a watch/rebuild input for the bundler plugins. Rewriting a path to a
@@ -1313,8 +1383,10 @@ unescaped: escaping the artefact corrupts the artefact.
 Consequently, and normatively:
 
 > **Consumers of a source map or of `dependencies` MUST treat every path they contain
-> as untrusted input.** A path may contain any byte a filesystem permits, including C0
-> control characters, `\n`, bidi controls and U+FEFF. A consumer that prints such a path
+> as untrusted input.** A path produced by a custom `FileSystem` backend may contain any
+> byte that backend's keys permit, including C0 control characters, `\n`, bidi controls
+> and U+FEFF; the built-in backends refuse those characters at input (#265, below), but a
+> consumer cannot tell which backend produced a map. A consumer that prints such a path
 > to a terminal, writes it into a log line, or interpolates it into HTML must escape it
 > for that destination itself. JSON string encoding is *not* that escaping: it makes the
 > document parseable, and a decoded `"\n"` is a real newline again.
@@ -1323,9 +1395,18 @@ The CLI does not rely on this contract for its own output: the `Compiled to …`
 `Source map written to …` status lines print the path through `safe_path`, so they carry
 the WIRE-escaped form even though the sidecar they name does not.
 
-Closing this differently — rejecting control characters in filenames at the input
-boundary rather than escaping them at output — is a plausible longer-term design and is
-deliberately not specified here.
+Since #265 the resolver, both built-in backends (`NativeFs`, `VirtualFs`), the CLI and
+`@mdscript/mds`'s WASM-backend file pre-scanner MUST refuse every forbidden path
+character (`mds::is_forbidden_path_char`: C0 including `\n` and `\t`, DEL, C1 and the
+bidi/format hazards) at input — import strings with `mds::import`; entry paths, entry
+keys, base directories, resolved canonical paths and the CLI's output locations with
+`mds::io` — at the points listed in §4.6 "Forbidden-character enforcement". A path one
+of the built-in backends resolves therefore carries none of them. The carve-out still
+stands as written — the paths are emitted verbatim — and the MUST above still binds
+consumers, because the one residual is a custom `FileSystem` backend passed to
+`ModuleCache::with_fs`: the resolver refuses every caller-supplied path before calling
+it, but a path the backend produces itself is checked only if that backend applies
+`mds::is_forbidden_path_char`, as its contract requires.
 
 ##### Escaping is one-way
 
@@ -1361,7 +1442,7 @@ mds init my-prompt.mds                     # Creates my-prompt.mds
 mds init my-prompt.mds --force             # Overwrite if file already exists
 ```
 
-Creates a compilable starter template. Path traversal (e.g. `../escaped.mds`) is rejected. The file is written through the replace-by-rename primitive of §7.2 "Output writing": a symlink at the target — live or dangling — is refused (exit 1, `cannot write <path>: refusing to replace a symlink`) rather than written through; `--force` replaces a regular file atomically, preserving its permission bits.
+Creates a compilable starter template. Path traversal (e.g. `../escaped.mds`) is rejected. A filename carrying a forbidden path character (§4.6) is refused before anything is written (`mds::io`, exit 2). The file is written through the replace-by-rename primitive of §7.2 "Output writing": a symlink at the target — live or dangling — is refused (exit 1, `cannot write <path>: refusing to replace a symlink`) rather than written through; `--force` replaces a regular file atomically, preserving its permission bits.
 
 ### 7.7 Auto-Detection
 
@@ -1391,10 +1472,10 @@ Place `mds.json` in the repository root or any ancestor directory of the input f
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `build.output_dir` | string | Relative path to output directory. Must not contain `..` components. |
+| `build.output_dir` | string | Relative path to output directory. Must not contain `..` components or a forbidden path character (#265); either is refused with `mds::io`, exit 2. |
 | `build.source_map` | bool | Enable source-map generation for all builds (equivalent to `--source-map`). Ignored for messages-mode templates. Default: `false`. |
 | `build.embed_sources` | bool | Embed source file contents in `sourcesContent[]` (equivalent to `--embed-sources`). Has no effect when `build.source_map` is `false`. Default: `false`. |
-| `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr and is suppressed by `--quiet`; `mds build`, `mds check`, `mds fmt`, and `mds watch` also read this file but do not emit the unknown-rule warning. On the `lint` API surfaces it is returned in `lint_warnings`. |
+| `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr and is suppressed by `--quiet`; `mds build`, `mds watch` and directory-mode `mds fmt` also read this file but do not emit the unknown-rule warning, and `mds check` does not read it. On the `lint` API surfaces it is returned in `lint_warnings`. |
 | `fmt.sort_frontmatter_keys` | bool | **Reserved — accepted, currently inert.** The key is parsed and type-checked (a non-boolean value is a hard config-load error, like any other field) so that `{"fmt": {"sort_frontmatter_keys": true}}` is valid today, but it drives no formatting behaviour in this version: `mds fmt` does not sort frontmatter keys and there is no matching CLI flag. Frontmatter key sorting is deferred to a future version; when it ships, this key will control it without a breaking `mds.json` schema change. Default: `true`. Pinned by `fmt_config_valid_section_loads_cleanly` and `fmt_config_malformed_bool_field_fails_loading` in `crates/mds-cli/src/build.rs`. |
 
 Maximum config file size: 1 MB.
@@ -1406,8 +1487,8 @@ Maximum config file size: 1 MB.
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials) |
-| `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8) |
+| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials), and a run in which any file failed, whatever that file's error (§7.2 continue-on-error) |
+| `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8, a path carrying a forbidden path character — §4.6); also an output location (`-o`, `--out-dir`, `build.output_dir`) or `mds init` filename carrying one, and a `build.output_dir` containing `..` |
 | `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, or frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels) |
 
 **`mds lint`** (see §7.5 for per-code meaning):

@@ -396,22 +396,29 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
 
 // ── Read source file ──────────────────────────────────────────────────────────
 
-/// Read raw source of `path`: symlink-checked and size-capped (mirrors fmt.rs).
+/// Read raw source of `path`: symlink-checked, size-capped and UTF-8-validated.
 ///
-/// Returns `MdsError` (not `miette::Error`) so callers can feed the error into
-/// `emit_analysis_failure_json_or_stderr` without downcasting (AC-F-14).
-fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
+/// Shared by `mds lint` and `mds fmt`, which both need the RAW source text rather
+/// than a compiled result. Returns `MdsError` (not `miette::Error`) so callers can
+/// feed the error into `emit_analysis_failure_json_or_stderr` without downcasting
+/// (AC-F-14).
+pub(crate) fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
     let canonical = NativeFs::check_symlink(path)?;
+    read_canonical_source(&canonical, path)
+}
+
+/// Read the already symlink-checked `canonical` path of `path` through `NativeFs`.
+///
+/// R3 / CWE-209: the display root (project-root walk-up from the file's
+/// directory) is anchored BEFORE `read()`, so read-error messages show a
+/// project-root-relative path instead of the bare basename. A failure to anchor
+/// it is reported, not swallowed (PF-004) — `mds::io`, exit 2.
+fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<String, MdsError> {
     let path_str = canonical.to_str().ok_or_else(|| MdsError::Io {
         message: format!("path is not valid UTF-8: {}", path.display()),
     })?;
     let fs = NativeFs::new();
-    // R3 / CWE-209: anchor the display root (project-root walk-up from the
-    // file's directory) BEFORE read(), so read-error messages show a
-    // project-root-relative path instead of falling back to the bare basename.
-    // Best-effort like the resolver's defense-in-depth guard: on failure the
-    // display degrades to the basename fallback, which is still never absolute.
-    let _ = fs.set_root(&effective_parent(&canonical).display().to_string());
+    fs.anchor_base_dir(&effective_parent(canonical).display().to_string())?;
     fs.read(path_str)
 }
 
@@ -847,9 +854,12 @@ fn run_lint_stdin(
         format,
     } = flags;
 
-    let (source, cwd) = read_stdin()?;
+    let source = read_stdin()?;
+    // The working directory, as the caller did not type it: `"."` anchors at it and is
+    // what a refusal of it shows (see `read_stdin`).
+    let cwd = Path::new(".");
     // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(&cwd, quiet) {
+    let config = match load_lint_config(cwd, quiet) {
         Ok(c) => c,
         Err(e) => {
             let mds_err = MdsError::Io {
@@ -864,7 +874,7 @@ fn run_lint_stdin(
         }
     };
 
-    let mut result = match mds::lint_str_with(&source, Some(&cwd), runtime_vars.clone(), &config) {
+    let mut result = match mds::lint_str_with(&source, Some(cwd), runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(e) => {
             // AD-211-5: relabel <source> → <stdin> in the rendered failure envelope.
@@ -901,7 +911,7 @@ fn run_lint_stdin(
             let preview = preview_fixes(
                 &result,
                 &source,
-                &cwd,
+                cwd,
                 runtime_vars.clone(),
                 &config,
                 STDIN_DISPLAY_LABEL,
@@ -951,7 +961,7 @@ fn run_lint_stdin(
         let fix_outcome = plan_and_apply_fixes(
             result,
             &source,
-            &cwd,
+            cwd,
             runtime_vars,
             &config,
             STDIN_DISPLAY_LABEL,
@@ -2293,6 +2303,9 @@ mod tests {
     /// sequence or raw byte appears in this source file (Source hygiene gate).
     ///
     /// Positive control: the valid-UTF-8 arm must still return `Ok`.
+    ///
+    /// `#[cfg(unix)]`: builds the non-UTF-8 name with `OsStrExt` (arbitrary bytes), a
+    /// Unix-only API; Windows paths are UTF-16 and have no such construction (#147).
     #[cfg(unix)]
     #[test]
     fn relative_display_rejects_non_utf8_component() {
@@ -2339,6 +2352,9 @@ mod tests {
     ///
     /// Path construction uses Rust string literals containing a backslash byte
     /// (0x5C) — not a control byte, so the Source hygiene gate does not flag it.
+    ///
+    /// `#[cfg(unix)]`: on Windows `\` is a path separator, so there is no literal
+    /// backslash name byte to preserve (#147).
     #[cfg(unix)]
     #[test]
     fn relative_display_preserves_literal_backslash_on_unix() {
@@ -2391,7 +2407,9 @@ mod tests {
     /// The control byte is constructed at runtime via char::from(1u8) so that no
     /// literal control byte or \uXXXX escape appears in the source file (PF-018 /
     /// Source hygiene gate).
-    #[cfg(unix)]
+    ///
+    /// Runs on every host: the paths are only built and compared in memory, never
+    /// created on disk, so a Windows file name's character rules do not apply (#147).
     #[test]
     fn sort_key_sanitizes_control_byte_filenames() {
         use super::relative_display;
@@ -2540,6 +2558,40 @@ mod tests {
             display, "sub/c.mds",
             "relative_display must emit forward-slash separator on Windows; \
              got {display:?} — native backslash must not appear in the wire key"
+        );
+    }
+
+    /// PF-004: a failure to anchor the display root is reported, not swallowed.
+    ///
+    /// `read_source_file` only reaches `read_canonical_source` after
+    /// `check_symlink` has canonicalized the path, so the anchor cannot fail
+    /// through it without a race; the split exists so this is testable. A
+    /// canonical path whose directory is missing makes the anchor fail. With the
+    /// failure swallowed the read would then fail instead, as `cannot read
+    /// x.mds` — the message this test tells apart.
+    #[test]
+    fn read_canonical_source_reports_an_anchor_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let missing = root.join("gone").join("x.mds");
+
+        let err = super::read_canonical_source(&missing, &missing).unwrap_err();
+        assert!(
+            matches!(err, mds::MdsError::Io { .. }),
+            "expected mds::io, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("cannot resolve path"),
+            "the anchor failure must surface, got: {err}"
+        );
+        assert_eq!(super::mds_error_exit_code(&err), 2);
+
+        // Control: an existing file under an anchorable directory reads.
+        let file = root.join("ok.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        assert_eq!(
+            super::read_canonical_source(&file, &file).unwrap(),
+            "Hello!\n"
         );
     }
 }

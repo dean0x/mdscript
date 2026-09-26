@@ -1,11 +1,11 @@
 ---
 feature: release-pipeline
 name: Release pipeline gates (release.yml, verify-pr-checks.mjs, gate specs)
-description: "Use when modifying release.yml, adding CI jobs, updating TIER_B_EXPECTED_SKIPPED, adjusting the pull_request surface trigger, debugging a publish failure, running the pre-merge verifier, or reasoning about the publish job ordering. Keywords: release, release.yml, verify-pr-checks, TIER_B_EXPECTED_SKIPPED, RELEASE_SURFACE, rehearse-publish-python, tag-push, TestPyPI, publish-crates, publish-npm, publish-python, github-release, version-gate, stage-and-verify-napi, ADR-013, PF-040."
+description: "Use when modifying release.yml, adding CI jobs, updating TIER_B_EXPECTED_SKIPPED, adjusting the pull_request surface trigger, debugging a publish failure, running the pre-merge verifier, reasoning about the publish job ordering, or adding a required CI context to branch protection. Keywords: release, release.yml, verify-pr-checks, TIER_B_EXPECTED_SKIPPED, RELEASE_SURFACE, rehearse-publish-python, tag-push, TestPyPI, publish-crates, publish-npm, publish-python, github-release, version-gate, stage-and-verify-napi, ADR-013, PF-040, EXPECTED_CONTEXTS, Tier A+, required_status_checks, branch protection PATCH, app_id 15368, rust-windows, Rust — clippy, test (windows-latest)."
 category: architecture
 directories: [.github/workflows, .github/actions, scripts, scripts/__test__]
 created: 2026-09-07
-updated: 2026-09-24
+updated: 2026-09-25
 ---
 
 # Release Pipeline Gates
@@ -116,13 +116,15 @@ sync whenever the `on.pull_request.paths:` list changes.
 **ADR-013 three-place rule**: Adding any job to `release.yml` is a three-place change:
 
 1. The workflow file itself.
-2. Branch protection required contexts (via the GitHub API, currently 15 contexts).
+2. Branch protection required contexts (via the scoped `required_status_checks` PATCH — procedure in RELEASING.md "Adding a required CI context"; 15 contexts, 16 once Wave 1's `Rust — clippy, test (windows-latest)` merges).
 3. `EXPECTED_CONTEXTS` in `scripts/verify-pr-checks.mjs` (for `ci.yml` jobs) **or**
    `TIER_B_EXPECTED_SKIPPED` (for `release.yml` tag/input-guarded jobs).
 
 A job added without all three places is silently decorative — it can never block a merge.
 The length assertion in `verify-pr-checks.spec.mjs` is the mechanical enforcer; do not
 relax it when adding a job.
+
+**ADR-013 in practice (v0.5.0 Wave 1, #147)**: the `rust-windows` job (`Rust — clippy, test (windows-latest)`) is the first `ci.yml` job added under the three-place rule with a written procedure: `EXPECTED_CONTEXTS` first (Tier A+ = 5, spec length assertion 4 → 5) in the PR that adds the job, so the job gates that PR before protection knows it; then — with the head fully green, immediately before merge — save protection JSON, PATCH only `required_status_checks` (`checks[]` with `app_id` 15368, `strict` unchanged, never the whole-protection PUT), GET-verify 16 contexts and `enforce_admins: false`; roll back from the saved JSON if the merge slips, because until the job is on `main` every open PR (Dependabot included) runs the old `ci.yml` and cannot report the new context. RELEASING.md "Adding a required CI context" is the runbook.
 
 **ADR-013 amendment (2026-09-06 — step-level guard rule)**: On a PR-triggered release run,
 disable PR-inapplicable behaviour at **step** level, never at **job** level. Any job present
@@ -140,8 +142,8 @@ bounded `GET /actions/runs?head_sha=` call maps each check-suite id to its workf
 
 | Tier | Membership | Passing condition |
 |---|---|---|
-| **Tier A** (required) | 15 contexts from live branch protection API | `completed+success` |
-| **Tier A+ (local)** | `EXPECTED_CONTEXTS` (4 entries: Source hygiene, Python — build & test, examples/ gitignore coverage, Python — wheel install smoke) | `completed+success`, presence required |
+| **Tier A** (required) | the contexts read from the live branch protection API (15; 16 after Wave 1 merges) | `completed+success` |
+| **Tier A+ (local)** | `EXPECTED_CONTEXTS` (5 entries: Source hygiene, Python — build & test, examples/ gitignore coverage, Python — wheel install smoke, Rust — clippy, test (windows-latest)) — enforced whether or not protection lists them, so a new job binds from the PR that adds it | `completed+success`, presence required |
 | **Tier B** | Everything else | `completed+success`; `skipped` tolerated ONLY for the five names in `TIER_B_EXPECTED_SKIPPED` AND only when the check-run belongs to a `release.yml` check suite |
 
 `TIER_B_EXPECTED_SKIPPED` (5 names):
@@ -363,11 +365,12 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   reads as non-failing under `--admin` merge (PF-017) while leaving registries in a partial state.
 - `publish-testpypi` is intentionally NOT in `publish-crates`'s `needs:` — a TestPyPI failure
   should not abort the live release.
-- The 2026-08 fixture `scripts/__test__/fixtures/protection-main.json` holds 6 contexts vs.
-  15 live — kept byte-identical as a historical baseline. The 2026-09 fixtures added:
+- The 2026-08 fixture `scripts/__test__/fixtures/protection-main.json` holds 6 contexts (15
+  live in 2026-09, 16 after Wave 1) — kept byte-identical as a historical baseline. The 2026-09 fixtures added:
   `checks-pr366-e02bcf2.json` (check-runs with suite ids), `runs-pr366-e02bcf2.json`
   (workflow runs mapping suite ids to workflow files), and
-  `protection-main-2026-09.json` (15 live contexts, the current shape).
+  `protection-main-2026-09.json` (15 contexts — the shape before Wave 1's 16th; also kept
+  as-is when protection changes, like the 2026-08 baseline).
 - The `startup-race-probe` Cargo feature (`mds-cli`) must never ship enabled.
 - `debug-panics` Cargo feature must never ship enabled (all three binding crates).
 
@@ -383,6 +386,14 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   every branch dry-run.
 - **Adding a `ci.yml` job without updating branch protection**: the new job is decorative —
   it can never block a merge (ADR-013).
+- **PATCHing a required context in before the job exists on `main`, then letting the merge
+  slip**: every open PR — Dependabot's included — runs the old `ci.yml`, never reports the
+  new context, and is blocked. Roll back from the saved JSON; after the merge, open PRs need
+  a rebase onto the new `main`.
+- **Using the whole-protection `PUT .../branches/main/protection`**: it resets every field
+  not sent (the pull-request review rules included). Use the scoped
+  `PATCH .../protection/required_status_checks`; it leaves `enforce_admins` (must stay
+  `false`) untouched.
 - **Using `section.includes('refs/tags/v')` in specs to detect a job's guard**: the `# ====`
   banner comment above `publish-crates` contains `startsWith(github.ref, 'refs/tags/v')` and
   lands inside the preceding job's section when `extractJobSection` runs. Use `extractJobIf`
@@ -504,13 +515,13 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   from Docker Hub's anonymous pull limit for public images (documented at
   docs.github.com/en/actions/reference/limits). A mirror (`public.ecr.aws`) would operate
   under a tighter tier. The gate uses Docker Hub directly and is blocking.
-- **Alpine container must run with `-w /w`**: `node:22-alpine` sets no `WORKDIR`; the default
-  container cwd is `/`; mds-core rejects a filesystem-root base directory with "cannot resolve
-  path /: file not found: /" (#371, surfaced by this gate's first run on PR #370). All four
-  `docker run` invocations in the Alpine load-test steps pass `-w /w` so the probe executes
-  from the fixture directory — the shape any real non-root cwd has. `musl-load-probe.cjs`
-  asserts `process.cwd() === '/w'` so a dropped flag fails loudly rather than silently
-  returning a spurious "file not found" error. S21 pins `-w /w` in the needle list.
+- **Alpine container runs with `-w /w`**: `node:22-alpine` sets no `WORKDIR`, so the default
+  container cwd is `/`. This gate's first run (PR #370) surfaced #371 — mds-core failed every
+  string compile whose base directory was a filesystem root with "cannot resolve path /: file
+  not found: /". #371 is fixed (`NativeFs::canonical_dir`); the flag stays as a regression
+  tripwire. All four `docker run` invocations in the Alpine load-test steps pass `-w /w`,
+  `musl-load-probe.cjs` asserts `process.cwd() === '/w'` so a dropped flag fails loudly, and
+  S21 pins `-w /w` in the needle list.
 - **`DEBUG` env on `Build addon` was deliberately NOT added**: there is no verified `@napi-rs/cli`
   debug namespace to enable, and the wrapper-cache presence check (wrappers found under
   `~/.cache/cargo-zigbuild/0.23.0/wrappers/` by the post-build step) is the run-proof that
@@ -557,7 +568,7 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
 - `scripts/__test__/fixtures/protection-main.json` — 6-context branch protection (historical,
   2026-08 baseline; kept byte-identical).
 - `scripts/__test__/fixtures/protection-main-2026-09.json` — 15-context branch protection
-  (current live shape, 2026-09).
+  (2026-09, before the 16th context; historical once Wave 1 merges).
 - `scripts/__test__/fixtures/checks-pr366-e02bcf2.json` — check-runs with suite ids (2026-09).
 - `scripts/__test__/fixtures/runs-pr366-e02bcf2.json` — workflow runs mapping suite ids to
   workflow files (2026-09).

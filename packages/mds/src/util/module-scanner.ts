@@ -1,6 +1,12 @@
-import { open, realpath } from 'node:fs/promises';
+import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
-import { resolve, dirname, relative, isAbsolute, sep } from 'node:path';
+import { resolve, dirname, basename, join, relative, isAbsolute, sep } from 'node:path';
+import {
+  escapePathForMessage,
+  firstForbiddenChar,
+  forbiddenCharMessage,
+  importPathViolation,
+} from './path-chars.js';
 
 // O_NOFOLLOW prevents the kernel from following a symlink at the final path
 // component. Using it closes the TOCTOU window between lstat and open.
@@ -102,23 +108,214 @@ function isWithinRoot(root: string, candidate: string): boolean {
 }
 
 /**
- * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP /
- * ENOTDIR errors that the kernel emits when the path is a symlink into a clear
- * security error. All other OS errors are re-thrown unchanged.
+ * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP error
+ * the kernel emits when the path is a symlink into NativeFs's symlink refusal
+ * (`symlinkError`), and every other failure into the error the Rust engine reports
+ * at the same step — each keyed on `shown` rather than the resolved `absolutePath`
+ * (R3 / CWE-209 — the raw Node error names the resolved filesystem path in its
+ * message).
+ *
+ * NativeFs stats the final component (`symlink_metadata`) before it reads it and
+ * maps any failure of that step to `mds::file_not_found`: so does this, when the
+ * failed path cannot be `lstat`ed either — no such file (ENOENT; e.g. a
+ * case-mismatched spelling on a case-sensitive volume, #408), a regular file where
+ * a directory is expected (ENOTDIR), a name too long (ENAMETOOLONG), a directory
+ * that cannot be searched (EACCES). A file that stats but cannot be opened (EACCES
+ * on the file itself) failed at NativeFs's read step instead: `mds::io`.
  *
  * Module-level helper (not a closure) so that openAndValidateModule's own
  * try/catch only handles post-open validation, keeping nesting shallow.
  */
-async function openNoFollow(absolutePath: string): Promise<Awaited<ReturnType<typeof open>>> {
+async function openNoFollow(
+  absolutePath: string,
+  shown: string,
+): Promise<Awaited<ReturnType<typeof open>>> {
   try {
     return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ELOOP' || code === 'ENOTDIR') {
-      throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
+    if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
+      throw symlinkError(shown);
     }
-    throw err;
+    throw await lstat(absolutePath).then(
+      () => readError(shown, err),
+      () => fileNotFoundError(shown),
+    );
   }
+}
+
+/**
+ * Close `handle`, reporting a failure as the read failure it is (`readError`), never
+ * as Node's raw error.
+ */
+async function closeModule(handle: Awaited<ReturnType<typeof open>>, shown: string): Promise<void> {
+  await handle.close().catch((err: unknown) => {
+    throw readError(shown, err);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Path refusals shared with the Rust engine (#265)
+// ---------------------------------------------------------------------------
+
+/**
+ * A path refusal carrying the code the Rust engine reports for the same input.
+ * Each message is byte-identical to that engine error's message as the native
+ * backend throws it, so the WASM backend's file operations fail exactly like
+ * the native ones.
+ */
+type PathError = Error & { code: 'mds::import' | 'mds::io' | 'mds::file_not_found' };
+
+function pathError(code: PathError['code'], message: string): PathError {
+  const err = new Error(message) as PathError;
+  err.code = code;
+  return err;
+}
+
+/** `mds::import`, with the `import error: ` prefix the Rust error's display adds. */
+function importError(detail: string): PathError {
+  return pathError('mds::import', `import error: ${detail}`);
+}
+
+/**
+ * `mds::file_not_found`, matching Rust `MdsError::file_not_found`'s message
+ * shape (`"file not found: {path}"`) exactly, keyed on `shown` — the path as
+ * written — never the resolved filesystem path.
+ *
+ * `shown` has passed `entryPathError`/`importPathError` by the time a file is
+ * looked for, so escaping it changes nothing; it is escaped anyway so no message
+ * this module builds can carry a forbidden character.
+ */
+function fileNotFoundError(shown: string): PathError {
+  return pathError('mds::file_not_found', `file not found: ${escapePathForMessage(shown)}`);
+}
+
+/**
+ * `mds::io` for a file that resolves but cannot be read — NativeFs's `cannot read
+ * …` I/O error — naming `shown`, the path as written, and `reason`: an errno name
+ * (`EACCES`), never Node's message, which names the resolved absolute path. Native
+ * names its root-relative display path and the OS error text instead, so the two
+ * agree on the code, not on the message.
+ */
+function cannotReadError(shown: string, reason: string): PathError {
+  return pathError(
+    'mds::io',
+    `cannot read ${escapePathForMessage(shown)}: ${escapePathForMessage(reason)}`,
+  );
+}
+
+/** `cannotReadError` for a failed Node call, with its errno name as the reason. */
+function readError(shown: string, err: unknown): PathError {
+  const errno = (err as NodeJS.ErrnoException | undefined)?.code;
+  return cannotReadError(shown, typeof errno === 'string' ? errno : 'I/O error');
+}
+
+/**
+ * `mds::import` for a module whose final path component is a symlink — the refusal
+ * NativeFs::check_symlink_named makes for an entry path and an import alike —
+ * keyed on `shown`, the path as written.
+ */
+function symlinkError(shown: string): PathError {
+  return importError(`symlinks are not allowed in imports: ${escapePathForMessage(shown)}`);
+}
+
+/**
+ * `mds::import` for a module outside the project root — NativeFs's
+ * `check_path_traversal` — keyed on `shown`, the import as written.
+ */
+function escapesProjectError(shown: string): PathError {
+  return importError(`import path escapes project directory: "${escapePathForMessage(shown)}"`);
+}
+
+/**
+ * Canonicalize `path`'s parent directory, translating every failure — the parent
+ * does not exist (ENOENT), a path component above it is a regular file (ENOTDIR),
+ * a symlink loop (ELOOP), a name too long (ENAMETOOLONG), a directory that cannot
+ * be searched (EACCES) — into the `mds::file_not_found` shape `fileNotFoundError`
+ * builds, keyed on `shown`, never Node's error, which names the raw absolute path
+ * (R3 / CWE-209, #408).
+ *
+ * Mirrors Rust `check_symlink_named`, whose `parent.canonicalize()` step maps
+ * every canonicalize failure on the parent — it does not distinguish errno —
+ * to `MdsError::file_not_found(shown)`.
+ *
+ * Shared by buildModulesMap's own entry-directory canonicalization and
+ * openAndValidateModule's per-module one, so the translation is written once.
+ */
+async function realpathParent(path: string, shown: string): Promise<string> {
+  try {
+    return await realpath(dirname(path));
+  } catch {
+    throw fileNotFoundError(shown);
+  }
+}
+
+/**
+ * The refusal for an entry path or virtual entry key, if any — mirrors Rust
+ * `validate_entry_path` (empty, then NUL, then the rest of the forbidden class;
+ * all `mds::io`).
+ */
+function entryPathError(path: string): PathError | undefined {
+  if (path.length === 0) {
+    return pathError('mds::io', 'entry path is empty');
+  }
+  if (path.includes('\0')) {
+    return pathError('mds::io', `entry path contains null byte: "${escapePathForMessage(path)}"`);
+  }
+  const cp = firstForbiddenChar(path);
+  return cp === undefined ? undefined : pathError('mds::io', forbiddenCharMessage('entry path', cp, path));
+}
+
+/**
+ * The refusal for an import resolved within a directory, if any — mirrors Rust
+ * `validate_relative_import`, which `VirtualFs::normalize_in_dir` runs (empty,
+ * then NUL, then the rest of the forbidden class; all `mds::import`).
+ */
+function relativeImportError(relative: string): PathError | undefined {
+  if (relative.length === 0) {
+    return importError('import path is empty');
+  }
+  if (relative.includes('\0')) {
+    return importError('import path contains null byte');
+  }
+  const cp = firstForbiddenChar(relative);
+  return cp === undefined ? undefined : importError(forbiddenCharMessage('import path', cp, relative));
+}
+
+/**
+ * The refusal for an import string as written in a module, if any — mirrors the
+ * Rust resolver's `validate_import_path`, which runs before any filesystem
+ * backend is called (relative form, then NUL, then the forbidden class).
+ */
+function importPathError(importPath: string): PathError | undefined {
+  const violation = importPathViolation(importPath);
+  if (violation === undefined) {
+    return undefined;
+  }
+  switch (violation.kind) {
+    case 'not-relative':
+      return importError(
+        `import path must be relative (start with './' or '../'): "${escapePathForMessage(importPath)}"`,
+      );
+    case 'null-byte':
+      return importError('import path contains null byte');
+    case 'forbidden-char':
+      return importError(forbiddenCharMessage('import path', violation.codePoint, importPath));
+    default: {
+      const exhaustive: never = violation;
+      throw new Error(`unknown import path violation: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * The refusal for a resolved path that carries a forbidden character anywhere,
+ * if any — mirrors Rust `reject_forbidden_in_path`. This is what catches a
+ * hostile directory name the caller never wrote, reached through a symlinked
+ * directory. `shown` is the path as written; the resolved one is never shown.
+ */
+function resolvedPathError(resolved: string, shown: string): PathError | undefined {
+  const cp = firstForbiddenChar(resolved);
+  return cp === undefined ? undefined : pathError('mds::io', forbiddenCharMessage('resolved path', cp, shown));
 }
 
 export interface ModuleScannerOptions {
@@ -141,28 +338,36 @@ export interface BuildModulesMapResult {
 }
 
 /**
- * Normalize a virtual module key the same way VirtualFs::normalize() does in Rust.
+ * Normalize a virtual module key the same way the Rust resolver does on VirtualFs:
+ * `VirtualFs::normalize_in_dir(parent_dir(base), relative)` for an import, and
+ * `VirtualFs::resolve_entry(relative)` (key unchanged) when `base` is empty.
  *
  * Given a base key (the key of the importing module) and a relative import path,
  * resolve the import path to a canonical slash-separated key.
  *
+ * An entry key that is empty, contains NUL or carries a forbidden path character
+ * (#265) is refused with `mds::io`; an import with the same defects with
+ * `mds::import` — each with the message the Rust backend reports.
+ *
  * MUST exactly mirror the Rust implementation to ensure import resolution matches.
  */
 export function normalizeVirtualKey(base: string, relative: string): string {
-  if (relative.length === 0) {
-    throw new Error('import path is empty');
-  }
-  if (relative.includes('\0')) {
-    throw new Error('import path contains null byte');
-  }
-
   if (base.length === 0) {
+    const entryErr = entryPathError(relative);
+    if (entryErr !== undefined) {
+      throw entryErr;
+    }
     // Root entry point — use key as-is, but still enforce the segment limit.
     const segmentCount = relative.split('/').filter((s) => s.length > 0 && s !== '.').length;
     if (segmentCount > MAX_PATH_SEGMENTS) {
       throw new Error(`import path exceeds maximum segment count of ${MAX_PATH_SEGMENTS}`);
     }
     return relative;
+  }
+
+  const importErr = relativeImportError(relative);
+  if (importErr !== undefined) {
+    throw importErr;
   }
 
   // Resolve relative to the directory portion of base (split on '/').
@@ -210,9 +415,31 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  * relative path.
  *
  * Security checks performed:
- * - Rejects symlinks (O_NOFOLLOW open; realpath check on Windows fallback)
- * - Rejects paths that escape the project root (discovered via .git/.mdsroot markers)
- * - Rejects paths with null bytes or empty segments
+ * - Rejects a module whose final path component is a symlink, judged by that
+ *   component's own file type (O_NOFOLLOW open; `lstat` where O_NOFOLLOW is
+ *   unavailable), with NativeFs's refusal (`mds::import`, `symlinks are not allowed
+ *   in imports: <path as written>`). Symlinked parent directories are followed, as
+ *   NativeFs does
+ * - Rejects an import that leaves a symlinked directory through `..`
+ *   (`mds::import`): the engine resolves it by name to another file than the
+ *   one NativeFs reads (#408)
+ * - Rejects paths that escape the project root (discovered via .git/.mdsroot
+ *   markers), checked on the canonical path, with NativeFs's refusal
+ *   (`mds::import`, `import path escapes project directory: "<import as written>"`)
+ * - Rejects a module that is not a regular file — a directory, device, FIFO or
+ *   socket — as unreadable (`mds::io`, `cannot read <path as written>: …`)
+ * - Rejects, before the filesystem is touched and with the Rust engine's code and
+ *   message: an entry path that is empty, contains NUL or carries a forbidden path
+ *   character (`mds::io`), and an import string that is not `./`/`../`-relative,
+ *   contains NUL or carries a forbidden path character (`mds::import`) (#265)
+ * - Rejects a module whose resolved path carries a forbidden path character — a
+ *   hostile-named directory reached through a symlink (`mds::io`, #265)
+ * - Reports a filesystem failure with the code the Rust engine gives the same
+ *   step, never Node's raw error, which names the resolved absolute path (#408):
+ *   a module or directory that cannot be resolved — missing, blocked by a
+ *   non-directory path component, a symlink loop, a name too long, a directory
+ *   that cannot be searched — is `mds::file_not_found`; a file that resolves but
+ *   cannot be read is `mds::io` (`cannot read <path as written>: <errno name>`)
  * - Enforces module count and aggregate size limits
  */
 export async function buildModulesMap(
@@ -223,19 +450,25 @@ export async function buildModulesMap(
   const maxModules = options?.maxModules ?? DEFAULT_MAX_MODULES;
   const maxAggregateSize = options?.maxAggregateSize ?? DEFAULT_MAX_AGGREGATE_SIZE;
 
+  const entryErr = entryPathError(entryPath);
+  if (entryErr !== undefined) {
+    throw entryErr;
+  }
+
   // Resolve the parent directory to its canonical form before computing the
-  // project root and security boundaries.  This eliminates false-positive
-  // "possible symlink" errors on platforms with OS-level directory symlinks
-  // (e.g. macOS /var → /private/var), where realpath(absolutePath) differs
-  // from absolutePath even for a regular non-symlink file.
+  // project root and security boundaries, so an OS-level directory symlink
+  // (e.g. macOS /var → /private/var) does not move the root.
   //
-  // Only the PARENT directory is canonicalized, NOT the final path component.
-  // A symlink at the file level is still caught by O_NOFOLLOW (openNoFollow)
-  // and the post-open realpath mismatch check inside openAndValidateModule.
-  // This mirrors the pattern in NativeFs::check_symlink (Rust): canonicalize
-  // the parent, join the filename, then check the file for symlinks.
+  // Only the PARENT directory is canonicalized, NOT the final path component,
+  // which openAndValidateModule judges by its own file type — the pattern of
+  // NativeFs::check_symlink_named (Rust).
+  //
+  // A parent directory that does not exist (ENOENT) or is not traversable
+  // (ENOTDIR — a path component above it is a regular file, #408) is reported
+  // as file-not-found, keyed on entryPath as written, rather than leaking this
+  // raw, resolved realpath() error.
   const rawAbsoluteEntry = resolve(entryPath);
-  const canonicalParentDir = await realpath(dirname(rawAbsoluteEntry));
+  const canonicalParentDir = await realpathParent(rawAbsoluteEntry, entryPath);
   const absoluteEntry = canonicalParentDir + sep + rawAbsoluteEntry.slice(rawAbsoluteEntry.lastIndexOf(sep) + 1);
   const projectRoot = findProjectRoot(dirname(absoluteEntry));
   // Virtual keys are always slash-separated to mirror Rust's VirtualFs; on
@@ -259,90 +492,165 @@ export async function buildModulesMap(
    * path within the project root. Returns the resolved absolute path.
    */
   function validateImportPath(importPath: string, absoluteDir: string): string {
-    // Security: reject null bytes and empty paths.
-    if (importPath.includes('\0')) {
-      throw new Error('security: import path contains null byte');
-    }
-    if (importPath.trim().length === 0) {
-      throw new Error('security: import path is empty');
+    // Security: classify the import string exactly as the Rust resolver will, so
+    // it is refused before the filesystem is touched and with the error the
+    // native backend throws for the same input.
+    const importErr = importPathError(importPath);
+    if (importErr !== undefined) {
+      throw importErr;
     }
 
     const childAbsolute = resolve(absoluteDir, importPath);
 
-    // Security: verify child is within project root.
+    // Security: verify child is within project root — lexically, before anything
+    // outside the root is touched. NativeFs resolves the file first, so for a
+    // MISSING file outside the root it reports `file not found` where this refuses.
     if (!isWithinRoot(projectRoot, childAbsolute)) {
-      throw new Error(
-        `security: import path escapes project root: ${childAbsolute} is outside ${projectRoot}`,
-      );
+      throw escapesProjectError(importPath);
     }
 
     return childAbsolute;
   }
 
   /**
+   * Refuse an import whose module key names another directory than the one the
+   * native backend reads it from.
+   *
+   * The WASM engine resolves an import by name, from the importing module's key.
+   * NativeFs resolves it on disk, from the importing module's canonical directory,
+   * where the OS applies each `..` after the symbolic links before it. The two
+   * agree for every import except one that leaves a symlinked directory through
+   * `..`: its key names the directory beside the link, while the file on disk sits
+   * beside the link's target. Whichever file were stored under that key, the
+   * engine would compile a module the native backend never reads (#408).
+   */
+  async function assertKeyMatchesDisk(
+    importerDir: string,
+    importPath: string,
+    childKey: string,
+  ): Promise<void> {
+    // realpath() resolves each `..` physically, after the links before it — the
+    // directory NativeFs reads from. A missing directory is file-not-found there.
+    const onDisk = await realpathParent(importerDir + sep + importPath, importPath);
+    // The directory the engine's key names. If it cannot be resolved at all, it
+    // is not the directory above, and the import is refused below.
+    let byName: string | undefined;
+    try {
+      byName = await realpath(dirname(join(projectRoot, ...childKey.split('/'))));
+    } catch {
+      byName = undefined;
+    }
+    if (byName !== onDisk) {
+      throw importError(
+        `import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "${escapePathForMessage(importPath)}"`,
+      );
+    }
+  }
+
+  /**
    * Open a file with O_NOFOLLOW and validate its security properties (symlink check,
-   * path confinement, regular-file check). Returns the open file handle and the
-   * file's byte size from fstat.
+   * path confinement, regular-file check). Returns the open file handle, the
+   * file's byte size from fstat, and its canonical path.
    *
    * The caller is responsible for closing the handle (use try/finally).
    * Separating open+validate from read allows the aggregate size check to happen
    * before file content is loaded into memory, bounding worst-case memory use.
    *
-   * Uses O_NOFOLLOW to eliminate the TOCTOU race window between validation and
-   * content access. If the path is a symlink, O_NOFOLLOW causes open() to fail
-   * with ELOOP, which we surface as a security error. On Windows (where O_NOFOLLOW=0),
-   * a post-open realpath check is performed instead.
+   * Mirrors NativeFs::check_symlink_named (Rust): the parent directory is
+   * canonicalized (its symlinks followed), the final component is joined as
+   * written, and that component is refused when its own file type is a symlink.
+   * The file type decides, never a comparison of the canonical path with the
+   * path as written: on a case-insensitive volume (the macOS and Windows
+   * default) realpath returns the on-disk spelling, so `Entry.mds` for
+   * `entry.mds` differs from its canonical form without being a symlink (#408).
+   *
+   * O_NOFOLLOW makes open() fail with ELOOP on a symlinked final component, so no
+   * link is followed between the check and the read. Where O_NOFOLLOW is
+   * unavailable (Windows) open() follows it, and `lstat` — which reports a
+   * junction as a symlink too — refuses it before a byte is read.
+   *
+   * `shown` is the path as written — the entry path the caller passed, or the
+   * import string — and is what a refusal of the resolved path names.
    */
   async function openAndValidateModule(
     absolutePath: string,
-  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number }> {
-    // Security: verify path is within project root before opening.
-    if (!isWithinRoot(projectRoot, absolutePath)) {
-      throw new Error(
-        `security: path escapes project root: ${absolutePath} is outside ${projectRoot}`,
-      );
+    shown: string,
+  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number; resolved: string }> {
+    // See realpathParent: an import whose directory does not exist (or is not
+    // traversable) is reported as file-not-found, keyed on `shown`.
+    const canonicalParent = await realpathParent(absolutePath, shown);
+    const joined = join(canonicalParent, basename(absolutePath));
+
+    // Security (#265): no forbidden path character anywhere in the canonical
+    // path — a directory the caller never named, reached through a symlink, can
+    // carry one. Checked before anything under it is opened.
+    const hostileErr = resolvedPathError(joined, shown);
+    if (hostileErr !== undefined) {
+      throw hostileErr;
     }
 
-    // O_NOFOLLOW | O_RDONLY: if absolutePath is a symlink the kernel rejects it
-    // with ELOOP before our code reads a single byte — no TOCTOU window.
-    const handle = await openNoFollow(absolutePath);
+    // Security: containment is decided on the canonical path, so a symlinked
+    // directory cannot lead outside the project root.
+    if (!isWithinRoot(projectRoot, joined)) {
+      throw escapesProjectError(shown);
+    }
+
+    // O_NOFOLLOW | O_RDONLY: if the final component is a symlink the kernel
+    // rejects it with ELOOP before our code reads a single byte.
+    const handle = await openNoFollow(joined, shown);
 
     try {
-      const [stats, resolved] = await Promise.all([
-        handle.stat(),
-        realpath(absolutePath),
+      // `openNoFollow` above already succeeded, so `joined` names a file that
+      // existed a moment ago; a failure here can only come from a concurrent
+      // change (TOCTOU). It is still reported as the engine would report it:
+      // `lstat`/`realpath` are NativeFs's stat and canonicalize steps
+      // (file-not-found), the fd-based `stat` is part of reading the file.
+      const [stats, linkStats, resolved] = await Promise.all([
+        handle.stat().catch((err: unknown) => {
+          throw readError(shown, err);
+        }),
+        lstat(joined).catch(() => {
+          throw fileNotFoundError(shown);
+        }),
+        realpath(joined).catch(() => {
+          throw fileNotFoundError(shown);
+        }),
       ]);
 
+      // The final component's own file type — the check that stands in for
+      // O_NOFOLLOW where the platform lacks it.
+      if (linkStats.isSymbolicLink()) {
+        throw symlinkError(shown);
+      }
+
       // fstat on the opened fd: verify it is a regular file (not a device,
-      // directory, socket, etc.). Note: fstat never reports isSymbolicLink()
-      // because it operates on the resolved fd, not the path — symlink
-      // detection is handled by O_NOFOLLOW (ELOOP) and the realpath check below.
+      // directory, socket, etc.). NativeFs fails such a module at its read step
+      // (`mds::io`); a directory is named by the errno reading it reports.
       if (!stats.isFile()) {
-        throw new Error(`security: ${absolutePath} is not a regular file`);
+        throw cannotReadError(shown, stats.isDirectory() ? 'EISDIR' : 'not a regular file');
       }
 
-      // On platforms where O_NOFOLLOW=0 (e.g. Windows), the open() above did
-      // not prevent symlink traversal. A post-open realpath comparison catches
-      // a symlink that was in place at open time. Windows' filesystem is
-      // case-insensitive and `realpath` may return a different drive-letter
-      // case than `resolve` produced, so compare case-insensitively there.
-      const realpathMismatch = process.platform === 'win32'
-        ? resolved.toLowerCase() !== absolutePath.toLowerCase()
-        : resolved !== absolutePath;
-      if (realpathMismatch) {
-        throw new Error(
-          `security: path ${absolutePath} resolved to unexpected location ${resolved} — possible symlink`,
-        );
+      // Canonicalizing a non-symlink final component only respells its name;
+      // it never changes the directory. A canonical path in another directory
+      // means the component was replaced by a link after the checks above —
+      // refused as NativeFs refuses it, as a symlink.
+      if (dirname(resolved) !== canonicalParent) {
+        throw symlinkError(shown);
       }
 
-      return { handle, size: stats.size };
+      return { handle, size: stats.size, resolved };
     } catch (err) {
-      await handle.close();
+      await closeModule(handle, shown);
       throw err;
     }
   }
 
-  async function scan(absolutePath: string, virtualKey: string, depth: number = 0): Promise<void> {
+  async function scan(
+    absolutePath: string,
+    virtualKey: string,
+    shown: string,
+    depth: number = 0,
+  ): Promise<void> {
     // Reliability: bound recursion depth explicitly — maxModules limits total
     // nodes but not stack frames; a linear chain of 256 imports would create
     // 256 frames without this guard.
@@ -352,10 +660,12 @@ export async function buildModulesMap(
       );
     }
 
-    if (visited.has(absolutePath)) {
+    // Keyed by virtual key, not by path: through a symlinked directory one file
+    // can sit under two keys, and the engine looks up each of them (#408).
+    if (visited.has(virtualKey)) {
       return;
     }
-    visited.add(absolutePath);
+    visited.add(virtualKey);
 
     // Resource limit: check module count immediately after marking visited so
     // the count is O(1) and there is no off-by-one from checking after the write.
@@ -365,7 +675,7 @@ export async function buildModulesMap(
       );
     }
 
-    const { handle, size: fileSize } = await openAndValidateModule(absolutePath);
+    const { handle, size: fileSize, resolved } = await openAndValidateModule(absolutePath, shown);
 
     let content: string;
     try {
@@ -381,15 +691,19 @@ export async function buildModulesMap(
         );
       }
 
-      content = await handle.readFile({ encoding: 'utf-8' });
+      content = await handle.readFile({ encoding: 'utf-8' }).catch((err: unknown) => {
+        throw readError(shown, err);
+      });
     } finally {
-      await handle.close();
+      await closeModule(handle, shown);
     }
 
     modules[virtualKey] = content;
 
     const importPaths = scanImports(content);
-    const absoluteDir = dirname(absolutePath);
+    // Imports resolve from the module's canonical directory, as NativeFs resolves
+    // them from its canonical key.
+    const absoluteDir = dirname(resolved);
 
     // Bounded-concurrency fan-out: limit simultaneous child opens to
     // MAX_CONCURRENT_OPENS to avoid exhausting file descriptors on modules
@@ -400,16 +714,17 @@ export async function buildModulesMap(
       let importPath: string | undefined;
       while ((importPath = queue.shift()) !== undefined) {
         const childAbsolute = validateImportPath(importPath, absoluteDir);
-        // Compute virtual key using normalizeVirtualKey to mirror Rust's VirtualFs::normalize().
+        // Compute virtual key using normalizeVirtualKey to mirror Rust's VirtualFs::normalize_in_dir().
         const childVirtualKey = normalizeVirtualKey(virtualKey, importPath);
-        await scan(childAbsolute, childVirtualKey, depth + 1);
+        await assertKeyMatchesDisk(absoluteDir, importPath, childVirtualKey);
+        await scan(childAbsolute, childVirtualKey, importPath, depth + 1);
       }
     }
     const slots = Math.min(MAX_CONCURRENT_OPENS, importPaths.length);
     await Promise.all(Array.from({ length: slots }, worker));
   }
 
-  await scan(absoluteEntry, entryFilename);
+  await scan(absoluteEntry, entryFilename, entryPath);
 
   return { entryFilename, modules };
 }

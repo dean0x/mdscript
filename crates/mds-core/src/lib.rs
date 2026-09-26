@@ -58,13 +58,16 @@ pub(crate) mod sourcemap;
 pub(crate) mod validator;
 pub(crate) mod value;
 pub(crate) mod vars_json;
+#[cfg(any(windows, test))]
+pub(crate) mod verbatim;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{
-    find_unknown_rule_names, fix, format_unknown_rule_names_warning, named_source_for_render,
-    neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire, FixLineSpan,
-    LintConfig, LintDiagnostic, LintResult, Severity, TextEdit, UnknownRuleNames, KNOWN_LINT_RULES,
+    escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
+    is_forbidden_path_char, named_source_for_render, neutralize_source_for_render,
+    sanitize_control_chars, sanitize_control_chars_wire, FixLineSpan, LintConfig, LintDiagnostic,
+    LintResult, Severity, TextEdit, UnknownRuleNames, KNOWN_LINT_RULES,
 };
 pub use options::{
     attach_lint_warnings, format_unknown_keys_error, json_type_name, parse_json_vars,
@@ -142,8 +145,15 @@ pub struct CompileResult {
     pub output: CompiledOutput,
     /// Warnings emitted during compilation (e.g. empty `@include`).
     pub warnings: Vec<String>,
-    /// Normalized keys of all modules imported during compilation, in
-    /// first-resolution (depth-first) order. Excludes the entry module.
+    /// The modules imported during compilation, in first-resolution (depth-first)
+    /// order. Excludes the entry module.
+    ///
+    /// A virtual compile reports module keys. A native compile reports the
+    /// absolute path of each file, spelled as it is on disk; on Windows the
+    /// verbatim `\\?\` prefix that canonicalization adds is dropped (`C:\…`,
+    /// `\\server\share\…`) wherever the conventional form names the same file,
+    /// and kept on a path it cannot name exactly — one longer than `MAX_PATH`, or
+    /// with a component such as a reserved device name or a trailing dot.
     ///
     /// These are **functional path references**, not display text: bundler plugins feed
     /// them straight back into a watcher. They are a named carve-out from the
@@ -293,6 +303,58 @@ pub(crate) fn compile_virtual_md(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<String, MdsError> {
     compile_virtual(modules, entry, runtime_vars).and_then(CompileResult::into_markdown)
+}
+
+// ── Test-only filesystem helpers ───────────────────────────────────────────────
+//
+// Shared by `fs.rs`'s and this file's own unit tests (both compiled into this
+// crate's `#[cfg(test)]` build); integration-test binaries under `tests/` link
+// against the non-test build and cannot see `pub(crate)` items, so they keep
+// their own copy (#147).
+
+/// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
+///
+/// Unix symlink creation needs no special privilege. On Windows it needs
+/// either Developer Mode or `SeCreateSymbolicLinkPrivilege` (an elevated
+/// process) — GitHub's `windows-latest` runners have Developer Mode enabled,
+/// so a failure there is a genuine regression and must panic. Locally,
+/// without that privilege, the OS reports `ERROR_PRIVILEGE_NOT_HELD` (raw
+/// error 1314); this helper treats exactly that failure as a skip (never a
+/// false pass) when the `CI` env var is unset, printing a one-line reason.
+/// Returns `false` when the caller should skip the rest of the test.
+#[cfg(test)]
+pub(crate) fn make_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            #[cfg(windows)]
+            {
+                const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                    && std::env::var_os("CI").is_none()
+                {
+                    eprintln!(
+                        "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
+                    );
+                    return false;
+                }
+            }
+            panic!(
+                "failed to create symlink {} -> {}: {err}",
+                target.display(),
+                link.display()
+            );
+        }
+    }
 }
 
 /// Maximum file size accepted for compilation (10 MB).
@@ -463,55 +525,63 @@ pub fn check_str(source: &str) -> Result<(), MdsError> {
 ///
 /// This is one of two UTF-8 boundary enforcement points; the other is
 /// [`path_to_str`], which handles the entry-point `path` argument.
-fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
-    // Canonicalize to an absolute path so NativeFs::canonicalize() always
+///
+/// Also called by the formatter's safety gate, before either compile, so a base
+/// directory refused here fails `format_str_with` with this error exactly as it
+/// fails `check_str_with`.
+pub(crate) fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
+    // Canonicalize to an absolute path so NativeFs::anchor_base_dir() always
     // receives a path whose file_name() is non-None.
     //
     // Path::parent() on a bare filename (e.g. "hello.mds") returns Some(""),
     // and effective_parent normalises that to Some("."). Neither "" nor "."
-    // survive NativeFs::canonicalize() because check_symlink() calls
-    // file_name() on them, which returns None, causing a FileNotFound error
-    // that assert_equivalent's Err(_) arm then silently swallows via
-    // structural_equivalent. avoids PF-006.
+    // survive NativeFs::anchor_base_dir() because check_symlink() calls
+    // file_name() on them, which returns None, causing a FileNotFound error.
+    // avoids PF-006.
+    //
+    // #265: a base directory carrying a forbidden path character is refused here,
+    // where the form the caller typed is still known — the typed form first, then
+    // the canonical one (a symlink can lead into a hostile-named directory), both
+    // named by the typed form so no message shows the absolute resolved path.
     match base_dir {
         // None and the empty-string sentinel both mean "current working directory".
-        None => std::env::current_dir()
-            .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
-            .and_then(|cwd| {
-                cwd.to_str()
-                    .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
-                    .map(str::to_owned)
-            }),
-        Some(d) if d.as_os_str().is_empty() => std::env::current_dir()
-            .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
-            .and_then(|cwd| {
-                cwd.to_str()
-                    .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
-                    .map(str::to_owned)
-            }),
+        None => current_dir_base(),
+        Some(d) if d.as_os_str().is_empty() => current_dir_base(),
         // Canonicalize resolves "." → absolute cwd, relative → absolute, and
         // strips trailing separators so the last component is a real directory name.
         // UTF-8 boundary check runs first so that invalid bytes produce a clear
         // error rather than a confusing "No such file" from canonicalize.
         Some(d) => {
-            if d.to_str().is_none() {
-                return Err(MdsError::io("base_dir path is not valid UTF-8"));
-            }
-            d.canonicalize()
-                .map_err(|e| {
-                    MdsError::io(format!(
-                        "cannot resolve base directory {}: {e}",
-                        d.display()
-                    ))
-                })
-                .and_then(|canonical| {
-                    canonical
-                        .to_str()
-                        .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
-                        .map(str::to_owned)
-                })
+            let typed = d
+                .to_str()
+                .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))?;
+            fs::reject_forbidden_path_chars("base directory", typed)?;
+            let canonical = d.canonicalize().map_err(|e| {
+                MdsError::io(format!(
+                    "cannot resolve base directory {}: {e}",
+                    d.display()
+                ))
+            })?;
+            fs::reject_forbidden_in_path(&canonical, typed)?;
+            canonical
+                .to_str()
+                .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
+                .map(str::to_owned)
         }
     }
+}
+
+/// The current working directory as the base directory of a string compile.
+///
+/// The caller typed no path, so a forbidden character in the working directory
+/// (#265) is reported against `"."` rather than the absolute directory.
+fn current_dir_base() -> Result<String, MdsError> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))?;
+    fs::reject_forbidden_in_path(&cwd, ".")?;
+    cwd.to_str()
+        .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
+        .map(str::to_owned)
 }
 
 /// Check (validate) MDS source from a string with options.
@@ -550,6 +620,62 @@ pub fn check_str_with(
 fn path_to_str(path: &Path) -> Result<&str, MdsError> {
     path.to_str()
         .ok_or_else(|| MdsError::io("path is not valid UTF-8"))
+}
+
+/// The user-visible form of a native compile's module keys (#409).
+///
+/// A native key is a canonical path, which on Windows is a verbatim `\\?\` path;
+/// each is rewritten to its conventional form where that is lossless. Keys stay
+/// verbatim inside the resolver, where containment compares canonical paths.
+/// Virtual keys never come through here: they are the caller's own module names.
+#[cfg(windows)]
+fn native_dependencies(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    keys.into_iter()
+        .map(|key| verbatim::simplify_verbatim(&key).unwrap_or(key))
+        .collect()
+}
+
+/// The user-visible form of a native compile's module keys: off Windows a
+/// canonical path is never verbatim, so the keys are the dependencies as they are.
+#[cfg(not(windows))]
+fn native_dependencies(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    keys.into_iter().collect()
+}
+
+/// The user-visible form of a filesystem path (#409).
+///
+/// A path that reached the caller through [`FileSystem`] canonicalization — or
+/// through any other `Path::canonicalize()` call, such as a CLI `--out-dir`
+/// resolution — may be a Windows verbatim path (`\\?\C:\…`,
+/// `\\?\UNC\server\share\…`). This rewrites it to the conventional form wherever
+/// [`verbatim::simplify_verbatim`] can do that losslessly, and returns the path
+/// unchanged otherwise (non-verbatim already, another verbatim form such as
+/// `\\?\Volume{…}`, or not representable conventionally — see that function's
+/// doc for the exact rules). Off Windows a canonical path is never verbatim, so
+/// this is a no-op there and callers can invoke it unconditionally regardless of
+/// host platform.
+///
+/// This is the single, documented entry point for a caller — a CLI status line,
+/// an error message, a binding's own diagnostics — that wants to *display* a
+/// path to a user. It is deliberately separate from [`native_dependencies`]
+/// (used only at the `CompileResult.dependencies` boundary): internal
+/// comparisons (containment, module-cache keys, cycle detection) keep comparing
+/// the canonical/verbatim form as-is, never this simplified one.
+#[must_use]
+#[cfg(windows)]
+pub fn display_native_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    match path.to_str().and_then(verbatim::simplify_verbatim) {
+        Some(simplified) => std::borrow::Cow::Owned(std::path::PathBuf::from(simplified)),
+        None => std::borrow::Cow::Borrowed(path),
+    }
+}
+
+/// See the `#[cfg(windows)]` variant above: off Windows a canonical path is
+/// never verbatim, so this returns `path` unchanged.
+#[must_use]
+#[cfg(not(windows))]
+pub fn display_native_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(path)
 }
 
 /// Print warnings to stderr. Each warning is printed on its own line.
@@ -592,15 +718,16 @@ pub fn compile_collecting_warnings(
     // imported sub-modules are inserted), so `dependencies()` normally already
     // excludes the entry. Filter the canonical entry key anyway to also drop it in
     // the edge case where a transitive import re-imports the entry. check_symlink
-    // mirrors the normalize("", path) the resolver already performed — no extra I/O.
+    // mirrors the NativeFs::resolve_entry the resolver already performed — no extra I/O.
     let canonical_entry = NativeFs::check_symlink(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path_str.to_owned());
-    let dependencies = cache
-        .dependencies()
-        .into_iter()
-        .filter(|k| k != &canonical_entry)
-        .collect();
+    let dependencies = native_dependencies(
+        cache
+            .dependencies()
+            .into_iter()
+            .filter(|k| k != &canonical_entry),
+    );
     Ok(CompileResult {
         output,
         warnings,
@@ -619,14 +746,28 @@ pub fn compile_str_collecting_warnings(
     base_dir: Option<&Path>,
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<CompileResult, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
     let dir = resolve_base_dir(base_dir)?;
+    compile_source_in_dir(source, &dir, runtime_vars)
+}
+
+/// [`compile_str_collecting_warnings`] against a base directory that
+/// [`resolve_base_dir`] has already resolved.
+///
+/// The formatter's safety gate resolves the base directory once, up front, so a
+/// refused or unresolvable one is reported as the error it is rather than taken
+/// for a template that does not compile standalone.
+pub(crate) fn compile_source_in_dir(
+    source: &str,
+    dir: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileResult, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    let output = cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
+    let output = cache.resolve_source_intrinsic(source, dir, &vars, &mut warnings)?;
     // resolve_source_intrinsic does not insert the inline source into the modules cache,
     // so cache.dependencies() contains only imported files — no entry-key filtering needed.
-    let dependencies = cache.dependencies();
+    let dependencies = native_dependencies(cache.dependencies());
     Ok(CompileResult {
         output,
         warnings,
@@ -1015,11 +1156,12 @@ pub fn compile_with_deps_opts(
     let canonical_entry = NativeFs::check_symlink(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path_str.to_owned());
-    let dependencies = cache
-        .dependencies()
-        .into_iter()
-        .filter(|k| k != &canonical_entry)
-        .collect();
+    let dependencies = native_dependencies(
+        cache
+            .dependencies()
+            .into_iter()
+            .filter(|k| k != &canonical_entry),
+    );
     Ok(CompileResult {
         output,
         warnings,
@@ -1057,7 +1199,7 @@ pub fn compile_str_with_deps_opts(
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_source_intrinsic_opts(source, &dir, &vars, &opts, &mut warnings)?;
-    let dependencies = cache.dependencies();
+    let dependencies = native_dependencies(cache.dependencies());
     Ok(CompileResult {
         output,
         warnings,
@@ -1310,18 +1452,18 @@ pub fn lint_virtual(
     config: &LintConfig,
 ) -> Result<LintResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    // Get the entry source before moving `modules` into the check gate.
-    // R6: VirtualFs missing keys are ModuleNotFound, not FileNotFound.
-    let source = modules
-        .get(entry)
-        .ok_or_else(|| MdsError::module_not_found(entry))?
-        .clone();
+    // Take the entry source before moving `modules` into the check gate, but
+    // report nothing about it until the gate has run: the gate validates the
+    // entry key first (an empty or NUL key is `mds::io` on every virtual entry
+    // API) and reports a missing key as ModuleNotFound (R6), like compile_virtual.
+    let source = modules.get(entry).cloned();
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
     {
         let mut cache = ModuleCache::virtual_fs(modules);
         let mut warnings = vec![];
         cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
     }
+    let source = source.ok_or_else(|| MdsError::module_not_found(entry))?;
     // Step 2: lint the entry source.
     lint::lint_source(&source, entry, config)
 }
@@ -1356,6 +1498,13 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 /// Frontmatter paths are inserted before body paths, matching resolution order.
 /// Duplicate paths are deduplicated while preserving insertion order.
 /// Returns an error if the source has a syntax error.
+///
+/// The returned paths are exactly as written in the source and are not
+/// validated — including against the forbidden-path-character class (#265).
+/// A caller that opens, resolves or watches one of them must validate it
+/// first (e.g. with [`is_forbidden_path_char`]), the way the resolver and
+/// `@mdscript/mds`'s WASM pre-scanner already do before touching the
+/// filesystem.
 ///
 /// # Examples
 ///
@@ -2155,13 +2304,14 @@ mod tests {
     /// Mirrors `security.rs:400-422` (mds-cli): the same symlink guard applies to
     /// the reporting variant, not just the pre-existing `load_vars_file`.
     #[test]
-    #[cfg(unix)]
     fn load_vars_file_reporting_duplicates_rejects_symlinked_path() {
         let dir = tempfile::tempdir().unwrap();
         let real_vars = dir.path().join("real_vars.json");
         std::fs::write(&real_vars, r#"{"name": "Alice"}"#).unwrap();
         let link_vars = dir.path().join("link_vars.json");
-        std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+        if !make_symlink(&real_vars, &link_vars) {
+            return;
+        }
 
         let result = load_vars_file_reporting_duplicates(&link_vars);
         assert!(

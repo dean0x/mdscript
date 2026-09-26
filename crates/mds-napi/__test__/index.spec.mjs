@@ -724,6 +724,42 @@ describe('template inheritance', () => {
       );
     });
   });
+
+  // INH-4 (#114): a cross-type comparison fails at evaluation time. In the base skeleton
+  // it is spanned on the base's `@if` line; in a child override, on the child's.
+  // `@if n == 5:` is 11 bytes. Source maps off (the default).
+  test('INH-4: an inherited type_mismatch is spanned on the file the comparison is written in', () => {
+    const cases = [
+      {
+        region: 'base skeleton',
+        base: '---\nn: hi\n---\n@if n == 5:\nx\n@end\n@block body:\ndefault\n@end\n',
+        child: '@extends "./base.mds"\n@block body:\noverride\n@end\n',
+        span: { offset: 14, length: 11, line: 4, column: 1 },
+      },
+      {
+        region: 'child override',
+        base: '---\nn: hi\n---\n@block body:\ndefault\n@end\n',
+        child: '@extends "./base.mds"\n@block body:\n@if n == 5:\nx\n@end\n@end\n',
+        span: { offset: 35, length: 11, line: 3, column: 1 },
+      },
+    ];
+    for (const { region, base, child, span } of cases) {
+      withInheritanceFixtures(base, child, (childPath) => {
+        assert.throws(
+          () => compileFile(childPath),
+          (err) => {
+            assert.equal(err.code, 'mds::type_mismatch', `INH-4 ${region}: code`);
+            assert.deepEqual(
+              err.span,
+              span,
+              `INH-4 ${region}: span must underline the @if line in its own file`,
+            );
+            return true;
+          },
+        );
+      });
+    }
+  });
 });
 
 // ── Intrinsic output shape tests (AC-API-04, AC-API-05, AC-API-13) ────────────
@@ -1039,6 +1075,29 @@ describe('lintVirtual', () => {
     );
   });
 
+  // #265: a module key a message names is escaped — every forbidden path character,
+  // TAB included — so a hostile key reaches the error as its six-character escape.
+  test('L-NV-5: lintVirtual escapes a hostile module key in its error', () => {
+    for (const cp of [0x09, 0x1b, 0x0a, 0x202e]) {
+      const key = `x${String.fromCodePoint(cp)}.mds`;
+      const escapedKey = `x\\u${cp.toString(16).toUpperCase().padStart(4, '0')}.mds`;
+      assert.throws(
+        () => lintVirtual({ [key]: 5 }, 'main.mds'),
+        (err) => {
+          assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+          assert.equal(err.message, `modules["${escapedKey}"] must be a string source`);
+          assert.ok(!err.message.includes(String.fromCodePoint(cp)), `raw char: ${err.message}`);
+          return true;
+        },
+      );
+    }
+    // Control: a clean key is shown as written.
+    assert.throws(
+      () => lintVirtual({ 'ok.mds': 5 }, 'main.mds'),
+      (err) => err.message === 'modules["ok.mds"] must be a string source',
+    );
+  });
+
   // R6: missing virtual module emits mds::module_not_found, not mds::file_not_found.
   test('R6-NV: lintVirtual on missing entry emits mds::module_not_found', () => {
     assert.throws(
@@ -1237,6 +1296,58 @@ describe('lint parity (AC-API-06 guard)', () => {
   });
 });
 
+// ── #371: filesystem-root base dir ────────────────────────────────────────────
+
+describe('#371: filesystem-root base dir', () => {
+  // A base directory that IS the filesystem root must resolve successfully,
+  // not fail with "cannot resolve path /: file not found: /" (the cwd trap
+  // in NativeFs's base-directory resolution, fixed core-side by NativeFs::canonical_dir).
+  // On Windows, "/" resolves to the root of the current drive -- this stays
+  // portable without hardcoding a drive letter.
+  test('#371: compile/check/lint with basePath "/" succeed', () => {
+    const result = compile('Hello World!\n', { basePath: '/' });
+    assert.equal(result.kind, 'markdown');
+    assert.equal(result.output, 'Hello World!\n');
+
+    assert.doesNotThrow(
+      () => check('Hello World!\n', { basePath: '/' }),
+      'check with basePath "/" should not throw',
+    );
+
+    const lintResult = lint('Hello World!\n', { basePath: '/' });
+    assert.deepEqual(lintResult.files, [], `expected no diagnostics, got: ${JSON.stringify(lintResult)}`);
+  });
+
+  // Proves the addon itself (not just an explicit basePath option) works
+  // when the HOST PROCESS's cwd is the filesystem root -- the exact shape
+  // that surfaced #371 in production: `docker run` on `node:22-alpine` sets
+  // no WORKDIR, so the process cwd is "/" and the implicit (no basePath)
+  // compile path resolves base_dir from cwd.
+  test('#371: addon compiles successfully when the process cwd is the filesystem root', () => {
+    const script =
+      `const addon = require(${JSON.stringify(ADDON_PATH)});` +
+      `const result = addon.compile('Hello World!\\n');` +
+      `if (result.output !== 'Hello World!\\n') { ` +
+      `throw new Error('unexpected output: ' + JSON.stringify(result.output)); }` +
+      `process.stdout.write('OK');`;
+
+    const proc = spawnSync(process.execPath, ['-e', script], {
+      cwd: '/',
+      encoding: 'utf-8',
+    });
+    assert.equal(
+      proc.status,
+      0,
+      `child process at cwd=/ should exit 0; stderr: ${proc.stderr}`,
+    );
+    assert.equal(
+      proc.stdout,
+      'OK',
+      `expected 'OK' from child process at cwd=/, got stdout: ${proc.stdout}`,
+    );
+  });
+});
+
 // ── Source map tests ──────────────────────────────────────────────────────────
 
 describe('source maps (F-SM)', () => {
@@ -1372,15 +1483,24 @@ describe('source maps (F-SM)', () => {
   });
 });
 
+// Hex digits of a codepoint (`U+XXXX`'s tail) and the six-character escape text
+// (backslash, `u`, four uppercase hex digits) a message shows in its place. Built,
+// never written literally (PF-018). Shared by the ESC-injection and #265
+// forbidden-path-character suites below.
+const hex4 = (cp) => cp.toString(16).toUpperCase().padStart(4, '0');
+const escapeText = (cp) => '\\u' + hex4(cp);
+
 // ── T-12/T-13 (E-10/E-11): ESC-injection hardening — napi direct (issue #176 / CWE-150) ────────
 //
 // Four vectors (E-10..E-13):
 //  (E-10) error path: `@include fo<ESC>o` — parser rejects invalid alias, message
 //      embeds the raw alias. After fix: err.message has no raw C0/DEL/C1 chars.
-//  (E-11) lint path: lintVirtual with module name containing U+001B, imported twice —
-//      duplicate-import fires; diagnostic message has no raw ESC char.
+//  (E-11) import path: lintVirtual with an import naming a module that contains
+//      U+001B — refused at the input boundary (#265) with an mds::import error whose
+//      message names the codepoint and shows it escaped. The lint-message coverage the
+//      vector used to give lives on in the route-B siblings (frontmatter keys).
 //  (E-12) error path with DEL (U+007F) — same as E-10 with a different control char.
-//  (E-13) lint path with U+0085 (NEL/C1) — passes serde_yaml_ng, provides C1 coverage.
+//  (E-13) import path with U+0085 (NEL/C1) — same as E-11, C1 coverage.
 
 describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
   // Helper: assert no raw C0 (excl. \t \n), DEL, or C1 chars in a string.
@@ -1410,6 +1530,30 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     }
   }
 
+  // #265 route A: a lintVirtual import naming a module whose name carries `cp` is
+  // refused at the input boundary. assert.throws fails when nothing is thrown, so the
+  // exact-message assertion below is always reached (PF-013).
+  function assertImportRefused(cp, label) {
+    const moduleName = `fo${String.fromCodePoint(cp)}o.mds`;
+    const modules = {
+      [moduleName]: 'hi\n',
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+    };
+    assert.throws(
+      () => lintVirtual(modules, 'main.mds'),
+      (err) => {
+        assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
+        assert.equal(
+          err.message,
+          `import error: import path contains forbidden character U+${hex4(cp)}: "./fo${escapeText(cp)}o.mds"`,
+          label,
+        );
+        assertNoControlChars(err.message, `${label}: err.message`);
+        return true;
+      },
+    );
+  }
+
   test('T-12 / E-10: error path — compile error message sanitized for ESC-in-alias', () => {
     const esc = String.fromCharCode(0x1b);
     const source = `@include fo${esc}o\n`;
@@ -1427,58 +1571,57 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     }
   });
 
-  test('T-13 / E-11: lint path — lintVirtual with ESC in module name sanitizes duplicate-import message', () => {
-    // Use lintVirtual with a module whose NAME contains a raw ESC byte (U+001B),
-    // imported twice so duplicate-import fires and embeds the raw path in its message.
-    // Mirrors Python E12 (test_e12_lint_virtual_esc_in_import_path_message_sanitized).
-    // Verifies:
-    //   (1) No raw C0/DEL/C1 bytes in any diagnostic message.
-    //   (2) Sanitized \u001B literal IS present (positive evidence, non-vacuous).
-    //   (3) Result shape: version 1, duplicate-import rule present.
-    const esc = String.fromCharCode(0x1b);
-    const moduleName = `fo${esc}o.mds`;
-    const modules = {
-      [moduleName]: 'hi\n',
-      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
-    };
-    const result = lintVirtual(modules, 'main.mds');
+  test('T-13 / E-11: import path — ESC in an imported module name is refused with an escaped mds::import error', () => {
+    // Mirrors Python E12 (test_e12_lint_virtual_ctrl_in_import_path_is_refused).
+    assertImportRefused(0x1b, 'T-13/E-11');
+  });
 
-    // (3) Result shape: version 1.
-    assert.equal(result.version, 1, 'T-13/E-11: version must be 1');
-    assert.ok(Array.isArray(result.files), 'T-13/E-11: files must be an array');
+  test('T-13/E-11 (route B): ESC in a frontmatter key sanitizes unused-variable message', () => {
+    // Route B sibling of T-13/E-11: same ESC (U+001B) control character, but carried
+    // by an UNUSED FRONTMATTER KEY (unused-variable) rather than an import path /
+    // module name (duplicate-import). #265 rejects hostile paths/module names at the
+    // input boundary, which retired route-A coverage for ESC — a frontmatter key is
+    // not a path, so this route stays reachable and keeps message-escaping coverage
+    // alive.
+    //
+    // Written as a YAML double-quoted key with a YAML `\x1B` escape so the .mds
+    // source text itself carries no raw control byte (PF-018); serde_yaml_ng decodes
+    // the escape into a real ESC codepoint, which unused-variable embeds verbatim in
+    // its message before WIRE-sanitization escapes it back out.
+    const source = '---\n"a\\x1Bpayload\\x1Bb": 1\n---\nHello\n';
+    // Route-B contract check: the constructed .mds source carries no raw ESC byte —
+    // only the two-character YAML escape text.
+    assert.ok(
+      !source.includes(String.fromCharCode(0x1b)),
+      'T-13/E-11 (route B): source must carry no raw ESC byte, only the YAML escape',
+    );
 
+    const result = lint(source);
+    assert.equal(result.version, 1, 'T-13/E-11 (route B): version must be 1');
     const allDiags = result.files.flatMap((f) => f.diagnostics);
     assert.ok(
-      allDiags.length > 0,
-      'T-13/E-11: expected at least one diagnostic (duplicate-import should fire); got: ' +
-        JSON.stringify(allDiags),
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'T-13/E-11 (route B): expected unused-variable; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
     );
-
-    // (1) No raw control bytes in any diagnostic message.
     for (const diag of allDiags) {
       if (typeof diag.message === 'string') {
-        assertNoControlChars(diag.message, `T-13/E-11: diag[${diag.rule}].message`);
+        assertNoControlChars(diag.message, 'T-13/E-11 (route B): diag.message');
       }
     }
-
-    // (2) At least one message carries the sanitized \u001B literal (positive evidence).
-    const hasSanitizedEsc = allDiags.some(
-      (d) =>
-        typeof d.message === 'string' &&
-        d.message.includes('\\u001B'),
-    );
+    // (2) Positive control (PF-013): the sanitized \u001B literal IS present — proof
+    // the raw ESC codepoint really reached the parsed frontmatter key before the
+    // WIRE sanitizer escaped it back out.
     assert.ok(
-      hasSanitizedEsc,
-      'T-13/E-11: expected \\u001B in at least one diagnostic message; got: ' +
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u001B')),
+      'T-13/E-11 (route B): expected \\u001B in at least one diagnostic message; got: ' +
         JSON.stringify(allDiags.map((d) => d.message)),
     );
-
-    // (3) Expected rule: duplicate-import must be among the diagnostics.
-    const hasDupImport = allDiags.some((d) => d.rule === 'duplicate-import');
+    // Escaped, not stripped — the payload text around it survives verbatim.
     assert.ok(
-      hasDupImport,
-      'T-13/E-11: expected duplicate-import diagnostic; got rules: ' +
-        JSON.stringify(allDiags.map((d) => d.rule)),
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('payload')),
+      'T-13/E-11 (route B): message body must be preserved verbatim; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
     );
   });
 
@@ -1501,81 +1644,49 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     }
   });
 
-  test('E-13: lint path — lintVirtual with U+0085 (NEL/C1) in module name sanitizes message', () => {
-    // U+0085 (NEL) is a C1 control char that passes serde_yaml_ng YAML parsing
-    // (unlike ESC/DEL), making it a reachable C1 ESC-injection vector for lintVirtual.
-    // The duplicate-import rule fires and embeds the raw module name in its message;
-    // after sanitization the message must carry the 6-character escape for
-    // U+0085 (backslash, u, 0, 0, 8, 5) and no raw C1 chars.
-    const nel = String.fromCharCode(0x85);
-    const moduleName = `fo${nel}o.mds`;
-    const modules = {
-      [moduleName]: 'hi\n',
-      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
-    };
-    const result = lintVirtual(modules, 'main.mds');
-    assert.equal(result.version, 1, 'E-13: version must be 1');
-    const allDiags = result.files.flatMap((f) => f.diagnostics);
+  test('E-12 (route B): DEL in a frontmatter key sanitizes unused-variable message', () => {
+    // Route B sibling of E-12: same DEL (U+007F) control character, but carried by an
+    // UNUSED FRONTMATTER KEY (unused-variable) rather than an @include alias (compile
+    // error). See T-13/E-11 (route B) above for the full rationale.
+    const source = '---\n"a\\x7Fpayload\\x7Fb": 1\n---\nHello\n';
     assert.ok(
-      allDiags.length > 0,
-      'E-13: expected at least one diagnostic; got: ' + JSON.stringify(allDiags),
+      !source.includes(String.fromCharCode(0x7f)),
+      'E-12 (route B): source must carry no raw DEL byte, only the YAML escape',
     );
-    for (const diag of allDiags) {
-      if (typeof diag.message === 'string') {
-        assertNoControlChars(diag.message, `E-13: diag[${diag.rule}].message`);
-      }
-    }
-    const hasSanitizedNel = allDiags.some(
-      (d) => typeof d.message === 'string' && d.message.includes('\\u0085'),
-    );
-    assert.ok(
-      hasSanitizedNel,
-      'E-13: expected \\u0085 in at least one diagnostic message; got: ' +
-        JSON.stringify(allDiags.map((d) => d.message)),
-    );
-  });
 
-  test('E-14: lint path — U+202E (RLO) in module name is escaped on the wire', () => {
-    // Trojan Source (CVE-2021-42574): U+202E is not a C0/DEL/C1 control char, so it
-    // used to travel the wire untouched and reverse the display order of everything
-    // after it in any bidi-aware renderer (terminal, IDE, code-review UI).
-    // "fo<RLO>gnp.mds" renders as "fopng.mds".
-    const rlo = String.fromCharCode(0x202e);
-    const moduleName = `fo${rlo}gnp.mds`;
-    const modules = {
-      [moduleName]: 'hi\n',
-      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
-    };
-    const result = lintVirtual(modules, 'main.mds');
-    assert.equal(result.version, 1, 'E-14: version must be 1');
+    const result = lint(source);
+    assert.equal(result.version, 1, 'E-12 (route B): version must be 1');
     const allDiags = result.files.flatMap((f) => f.diagnostics);
     assert.ok(
-      allDiags.length > 0,
-      'E-14: expected at least one diagnostic; got: ' + JSON.stringify(allDiags),
-    );
-    assert.ok(
-      allDiags.some((d) => d.rule === 'duplicate-import'),
-      'E-14: expected duplicate-import; got rules: ' +
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'E-12 (route B): expected unused-variable; got rules: ' +
         JSON.stringify(allDiags.map((d) => d.rule)),
     );
     for (const diag of allDiags) {
       if (typeof diag.message === 'string') {
-        assertNoControlChars(diag.message, `E-14: diag[${diag.rule}].message`);
+        assertNoControlChars(diag.message, 'E-12 (route B): diag.message');
       }
     }
-    // Cheap invariant check only — NOT coverage of the `file`-key escape. The
-    // hostile RLO is in the *imported* module's name, but this key is the *entry*
-    // filename ("main.mds"), so no hostile byte reaches it and this cannot fail via
-    // this vector (PF-013). Real `file`-key coverage: mds-core
-    // `to_canonical_json_escapes_bidi_override`.
-    for (const f of result.files) {
-      assertNoControlChars(f.file, 'E-14: files[].file');
-    }
     assert.ok(
-      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u202E')),
-      'E-14: expected \\u202E in at least one diagnostic message; got: ' +
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u007F')),
+      'E-12 (route B): expected \\u007F in at least one diagnostic message; got: ' +
         JSON.stringify(allDiags.map((d) => d.message)),
     );
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('payload')),
+      'E-12 (route B): message body must be preserved verbatim; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
+  test('E-13: import path — U+0085 (NEL/C1) in an imported module name is refused with an escaped mds::import error', () => {
+    assertImportRefused(0x85, 'E-13');
+  });
+
+  test('E-14: import path — U+202E (RLO) in an imported module name is refused with an escaped mds::import error', () => {
+    // Trojan Source (CVE-2021-42574): "fo<RLO>o.mds" would reverse how the rest of
+    // the message displays if the codepoint reached it raw.
+    assertImportRefused(0x202e, 'E-14');
   });
 
   test('E-15: lint path — newline in a frontmatter key is escaped to \\u000A on the wire', () => {
@@ -1622,6 +1733,83 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
 // An unknown rule name in the `rules` option produces a `lint_warnings` array
 // in the result rather than hard-failing (D8 / AC-224-1). Known rule names
 // produce no `lint_warnings` field (common-case cleanliness).
+
+// ── #265: forbidden path characters in entry paths and base directories ───────
+//
+// The ESC-injection block above covers import strings (mds::import). An entry path
+// — a lintVirtual key, a compileFile/checkFile/lintFile path — and a basePath are
+// caller input, not import strings, so a forbidden codepoint there is mds::io.
+
+describe('forbidden path characters in entry paths and base directories (#265)', () => {
+  // TAB and LF (the two members outside the display-escape class), C0, DEL, C1,
+  // a bidi override and the BOM.
+  const HOSTILE = [0x09, 0x0a, 0x1b, 0x7f, 0x85, 0x202e, 0xfeff];
+
+  test('FP-1: a lintVirtual entry key carrying a forbidden codepoint is refused as mds::io', () => {
+    for (const cp of HOSTILE) {
+      const key = `fo${String.fromCodePoint(cp)}o.mds`;
+      assert.throws(
+        () => lintVirtual({ [key]: 'hi\n' }, key),
+        (err) => {
+          assert.equal(err.code, 'mds::io', err.message);
+          assert.equal(
+            err.message,
+            `entry path contains forbidden character U+${hex4(cp)}: "fo${escapeText(cp)}o.mds"`,
+          );
+          return true;
+        },
+      );
+    }
+    // Control: a key with a space and non-ASCII letters lints.
+    assert.equal(lintVirtual({ 'a b-ünï.mds': 'hi\n' }, 'a b-ünï.mds').version, 1);
+  });
+
+  test('FP-2: compileFile, checkFile and lintFile refuse a forbidden codepoint in the entry path as mds::io', () => {
+    for (const cp of HOSTILE) {
+      // Never created: the refusal comes before any filesystem lookup, so a
+      // missing-file error here would mean the check did not run.
+      const typed = path.join(os.tmpdir(), `fo${String.fromCodePoint(cp)}o.mds`);
+      const shown = path.join(os.tmpdir(), `fo${escapeText(cp)}o.mds`);
+      for (const [name, fn] of [['compileFile', compileFile], ['checkFile', checkFile], ['lintFile', lintFile]]) {
+        assert.throws(
+          () => fn(typed),
+          (err) => {
+            assert.equal(err.code, 'mds::io', `${name}: ${err.message}`);
+            assert.equal(
+              err.message,
+              `entry path contains forbidden character U+${hex4(cp)}: "${shown}"`,
+              name,
+            );
+            return true;
+          },
+        );
+      }
+    }
+  });
+
+  test('FP-3: a basePath carrying a forbidden codepoint is refused as mds::io', () => {
+    for (const cp of HOSTILE) {
+      const basePath = path.join(os.tmpdir(), `fo${String.fromCodePoint(cp)}o`);
+      const shown = path.join(os.tmpdir(), `fo${escapeText(cp)}o`);
+      for (const [name, fn] of [['compile', compile], ['check', check], ['lint', lint]]) {
+        assert.throws(
+          () => fn('Hello\n', { basePath }),
+          (err) => {
+            assert.equal(err.code, 'mds::io', `${name}: ${err.message}`);
+            assert.equal(
+              err.message,
+              `base directory contains forbidden character U+${hex4(cp)}: "${shown}"`,
+              name,
+            );
+            return true;
+          },
+        );
+      }
+    }
+    // Control: a clean basePath compiles.
+    assert.equal(compile('Hello\n', { basePath: os.tmpdir() }).kind, 'markdown');
+  });
+});
 
 describe('unknown rule name warning (AC-224 D8)', () => {
   // L-N-WARN-1: lint() with unknown rule name returns lint_warnings array

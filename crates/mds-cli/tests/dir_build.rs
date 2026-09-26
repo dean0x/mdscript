@@ -15,7 +15,7 @@
 //! - AC-Q30 (#216): `--quiet` before subcommand and after produce identical results
 
 mod common;
-use common::mds_bin;
+use common::{make_symlink, mds_bin};
 
 use std::fs;
 use std::path::Path;
@@ -53,6 +53,10 @@ fn build_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {
 
 /// Run `mds build <file>` on a single file. Same shape as [`build_dir`]; a separate
 /// helper so call sites stay honest about which input form is under test.
+///
+/// `#[cfg(unix)]`: its only caller, `build_non_utf8_path_exits_2_and_writes_no_map`,
+/// is itself Unix-only (constructs a non-UTF-8 filename via `OsStringExt`).
+#[cfg(unix)]
 fn build_file(path: &Path, extra_args: &[&str]) -> std::process::Output {
     mds_bin()
         .arg("build")
@@ -243,7 +247,6 @@ fn dir_build_bare_writes_next_to_source() {
 
 // ── T-CLI-16 (FUNC-20): in-tree symlinks skipped; symlinked entry root rejected
 
-#[cfg(unix)]
 #[test]
 fn dir_build_symlinked_file_skipped() {
     let src = tempfile::tempdir().unwrap();
@@ -253,7 +256,9 @@ fn dir_build_symlinked_file_skipped() {
     let real_file = src.path().join("real.mds");
     fs::write(&real_file, "Real content.\n").unwrap();
     let link_file = src.path().join("link.mds");
-    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+    if !make_symlink(&real_file, &link_file) {
+        return;
+    }
 
     let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
 
@@ -275,7 +280,6 @@ fn dir_build_symlinked_file_skipped() {
     assert!(real_out.exists(), "real.md should be created from real.mds");
 }
 
-#[cfg(unix)]
 #[test]
 fn dir_build_symlinked_subdir_skipped() {
     let real_dir = tempfile::tempdir().unwrap();
@@ -285,7 +289,9 @@ fn dir_build_symlinked_subdir_skipped() {
     // Place a .mds file in real_dir and make a symlink into src pointing at it.
     fs::write(real_dir.path().join("child.mds"), "Child.\n").unwrap();
     let link_dir = src.path().join("linked_sub");
-    std::os::unix::fs::symlink(real_dir.path(), &link_dir).unwrap();
+    if !make_symlink(real_dir.path(), &link_dir) {
+        return;
+    }
 
     // Also create a real file at the root so the build isn't empty.
     create_plain_mds(src.path(), "root.mds");
@@ -306,7 +312,6 @@ fn dir_build_symlinked_subdir_skipped() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn dir_build_symlinked_entry_root_rejected() {
     let real_dir = tempfile::tempdir().unwrap();
@@ -315,7 +320,9 @@ fn dir_build_symlinked_entry_root_rejected() {
     // Create a symlink pointing at the real dir.
     let link_dir = tempfile::tempdir().unwrap();
     let link_path = link_dir.path().join("linked");
-    std::os::unix::fs::symlink(real_dir.path(), &link_path).unwrap();
+    if !make_symlink(real_dir.path(), &link_path) {
+        return;
+    }
 
     let output = build_dir(&link_path, &[]);
 
@@ -1475,6 +1482,10 @@ fn dir_build_out_dir_source_map_no_temp_residue() {
 
 /// T-D2: when the output directory is not writable, every pre-existing artifact survives
 /// intact, the run reports the failures, and nothing is left behind.
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode output
+/// directory; Windows' read-only attribute does not block creating files in a
+/// directory, so this setup would not provoke the failure there (#147).
 #[cfg(unix)]
 #[test]
 fn dir_build_write_failure_preserves_existing_outputs() {
@@ -1538,7 +1549,6 @@ fn dir_build_write_failure_preserves_existing_outputs() {
 /// T-D3: the directory-mode `.map` sidecar writer is its own site — a symlinked sidecar
 /// path is refused, the artifact beside it is still written, and the run reports one
 /// failure.
-#[cfg(unix)]
 #[test]
 fn dir_build_source_map_sidecar_symlink_target_rejected() {
     let src = tempfile::tempdir().unwrap();
@@ -1549,7 +1559,9 @@ fn dir_build_source_map_sidecar_symlink_target_rejected() {
     create_plain_mds(src.path(), "page.mds");
     let real = root.path().join("real.map");
     fs::write(&real, "OLD").unwrap();
-    std::os::unix::fs::symlink(&real, out.join("page.md.map")).unwrap();
+    if !make_symlink(&real, &out.join("page.md.map")) {
+        return;
+    }
 
     let output = build_dir(
         src.path(),
@@ -1593,6 +1605,10 @@ fn dir_build_source_map_sidecar_symlink_target_rejected() {
 ///
 /// The invalid bytes are built at RUNTIME from numeric values; no escape sequence or
 /// raw byte appears in this source file (source hygiene gate).
+///
+/// `#[cfg(unix)]`: constructs the hostile filename via `OsStringExt::from_vec`
+/// (arbitrary bytes), a Unix-only API; Windows paths are UTF-16 and have no
+/// equivalent construction from arbitrary bytes (#147).
 #[cfg(unix)]
 #[test]
 fn build_non_utf8_path_exits_2_and_writes_no_map() {
@@ -1683,7 +1699,6 @@ fn build_non_utf8_path_exits_2_and_writes_no_map() {
 /// same raw `dir` value to the walker and to `output_path_for`, so `strip_prefix`
 /// succeeds and the mirror survives. This test is what fails if a future change
 /// canonicalizes one of the two and not the other.
-#[cfg(unix)]
 #[test]
 fn dir_build_symlinked_ancestor_root_mirrors_without_warning() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1691,7 +1706,9 @@ fn dir_build_symlinked_ancestor_root_mirrors_without_warning() {
     fs::create_dir_all(real_src.join("sub")).unwrap();
     create_plain_mds(&real_src, "a.mds");
     create_plain_mds(&real_src.join("sub"), "b.mds");
-    std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+    if !make_symlink(&tmp.path().join("real"), &tmp.path().join("link")) {
+        return;
+    }
 
     let out = tempfile::tempdir().unwrap();
     let output = build_dir(
@@ -1764,5 +1781,89 @@ fn dir_build_dotdot_root_mirrors_without_warning() {
     assert!(
         !stderr.contains("is outside the build root"),
         "a mirrored build must not report the out-of-root flatten; got: {stderr}"
+    );
+}
+
+// ── #409: no Windows verbatim prefix in directory-mode `--out-dir` status lines ─
+
+/// #409 (Windows only): directory-mode `build` canonicalizes `--out-dir`
+/// (`canonicalize_out_dir`, used only by `run_build_directory` and directory
+/// `watch` — single-file `-o`/`--out-dir` never canonicalizes). On Windows,
+/// `Path::canonicalize` always returns the verbatim form (`\\?\C:\…`) once the
+/// directory exists, so `--out-dir` must already exist for this test to exercise
+/// the bug. The `Compiled to …` status line — and every other path `--out-dir`
+/// feeds — must show the conventional form instead.
+#[cfg(windows)]
+#[test]
+fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "plain.mds");
+
+    let out = tempfile::tempdir().unwrap();
+    // Positive control (PF-013): canonicalizing the pre-existing --out-dir IS
+    // verbatim on this host, so the absence assertions below can fail.
+    assert!(
+        out.path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(r"\\?\"),
+        "test assumption: canonicalize must yield a verbatim path on Windows"
+    );
+
+    let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "dir build should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Compiled to"),
+        "expected a Compiled to status line; got: {stderr}"
+    );
+    assert!(
+        !stdout.contains(r"\\?\"),
+        "stdout must not contain the Windows verbatim prefix; got: {stdout}"
+    );
+    assert!(
+        !stderr.contains(r"\\?\"),
+        "stderr must not contain the Windows verbatim prefix; got: {stderr}"
+    );
+}
+
+/// Unix control for the Windows test above: off Windows, canonicalizing
+/// `--out-dir` never produces a verbatim path, so `display_native_path` is a
+/// no-op and the `Compiled to …` line names the canonical output path unchanged.
+///
+/// `#[cfg(unix)]`: this is the off-Windows control arm for the preceding
+/// Windows-only test; the property it asserts (no verbatim prefix, because
+/// there is none to strip) does not apply on Windows (#147/#409).
+#[cfg(unix)]
+#[test]
+fn dir_build_out_dir_status_line_unchanged_off_windows() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "plain.mds");
+
+    let out = tempfile::tempdir().unwrap();
+    let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "dir build should succeed; stderr: {stderr}"
+    );
+    let expected_line = format!(
+        "Compiled to {}",
+        out.path()
+            .canonicalize()
+            .unwrap()
+            .join("plain.md")
+            .display()
+    );
+    assert!(
+        stderr.contains(&expected_line),
+        "expected the unchanged canonical status line {expected_line:?}; got: {stderr}"
     );
 }

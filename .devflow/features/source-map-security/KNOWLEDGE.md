@@ -1,14 +1,14 @@
 ---
 feature: source-map-security
 name: Source Map Security and Path Containment
-description: "Use when working with Source Map v3 generation, sources[] path relativization, the relativize_source choke-point, FileSystem::source_root(), CompileOptions.source_map_base, cross-surface source-map parity tests, or the Windows verbatim UNC path fix. Keywords: source map, sources[], relativize_source, source_map_base, source_root, path containment, basename fallback, PF-005, ADR-005, SEC-3, Windows verbatim UNC, path_to_unified, compute_source_map_base, apply_source_map_file_label, CF-SM2, V-SM1, differential test, two-level anchoring, map-relative, root-relative."
+description: "Use when working with Source Map v3 generation, sources[] path relativization, the relativize_source choke-point, FileSystem::source_root(), CompileOptions.source_map_base, cross-surface source-map parity tests, the Windows verbatim UNC path fix, or the verbatim-prefix respelling of native dependencies and CLI display paths (#409). Keywords: source map, sources[], relativize_source, source_map_base, source_root, path containment, basename fallback, PF-005, ADR-005, SEC-3, Windows verbatim UNC, path_to_unified, compute_source_map_base, apply_source_map_file_label, CF-SM2, V-SM1, differential test, two-level anchoring, map-relative, root-relative, anchor_base_dir, resolve_entry, display_native_path, native_dependencies, simplify_verbatim, verbatim.rs, safe_path, #409."
 category: domain-knowledge
 directories:
   - crates/mds-core/src
   - crates/mds-cli/src
   - packages/mds/src
 created: 2026-07-19
-updated: 2026-09-15
+updated: 2026-09-26
 ---
 
 # Source Map Security and Path Containment
@@ -69,18 +69,21 @@ fn source_root(&self) -> Option<String> {
 }
 ```
 
-`VirtualFs` inherits the default (`None`). `NativeFs` overrides it to return the project root established by the walk-up from the entry-point directory's `normalize()` call.
+`VirtualFs` inherits the default (`None`). `NativeFs` overrides it to return the project root established by the walk-up from the entry-point directory — anchored by the first `resolve_entry` or `anchor_base_dir` call (first writer wins; a later call never moves it).
 
 **Critical gotcha**: because `source_root()` is a *defaulted* method returning `None`, any external `FileSystem` implementor that forgets to override it silently lands on the `root = None` branch (step 6 above). That branch still enforces "never absolute, never drive-qualified" but skips the containment check. `resolver.rs` has a defense-in-depth guard for this:
 
 ```rust
 // resolver.rs — at both finalize sites, before calling relativize_source:
-// Defense-in-depth: if root was not established yet, establish it now.
-// No-op for VirtualFs (source_root() always None, ctx.base_dir empty).
-if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
-    let _ = self.fs.set_root(ctx.base_dir);
+self.anchor_root_for_source_map(ctx.base_dir);
+
+// ModuleCache::anchor_root_for_source_map — best-effort by design:
+if self.fs.source_root().is_none() && !base_dir.is_empty() {
+    let _ = self.fs.anchor_base_dir(base_dir);
 }
 ```
+
+The anchor is never propagated (c615ace): only a custom backend without a `source_root` of its own reaches it, after it accepted the entry, so a refusal must not fail the compile — it leaves `source_root()` at `None` and absolute sources degrade to basenames. `source_map_root_safety_net_never_fails_a_compile` pins it.
 
 ## Technical Implementation Patterns
 
@@ -170,7 +173,16 @@ Both `MapBuilder::new(source_name, display_name, source_content)` and `MapBuilde
 
 The `sources[]` bytes emitted into produced source maps are **byte-identical** to what they were before R3 — only the diagnostic display path changes. ADR-005 is preserved.
 
-**CLI `read_source_file` anchors display roots**: In `crates/mds-cli/src/lint.rs`, `read_source_file` calls `fs.set_root(effective_parent(&canonical))` before `fs.read()`. This anchors the project-root walk-up for the `NativeFs` instance used in single-file lint mode, so even error messages from the raw read path show root-relative display paths instead of the basename fallback.
+**CLI `read_source_file` anchors display roots**: In `crates/mds-cli/src/lint.rs`, `read_source_file` → `read_canonical_source` calls `fs.anchor_base_dir(effective_parent(&canonical))?` before `fs.read()` (shared by `mds lint` and `mds fmt`). This anchors the project-root walk-up for the `NativeFs` instance used for the raw read, so even error messages from that path show root-relative display paths instead of the basename fallback. An anchor failure is propagated (`mds::io`, exit 2) since #155 — it used to be discarded.
+
+### Verbatim respelling at display and dependency sinks (#409)
+
+On Windows `std::fs::canonicalize` returns verbatim paths (`\\?\C:\…`, `\\?\UNC\server\share\…`). Native module keys stay verbatim inside the resolver (containment compares canonical paths), but two sinks now respell them with `verbatim::simplify_verbatim`, which rewrites only when the conventional form names exactly the same file (≤ MAX_PATH; no reserved device name such as `CON`; no trailing dot or space; no `.`/`..` component) and otherwise keeps the prefix:
+
+- **`CompileResult.dependencies`** of a native compile (`native_dependencies` in `lib.rs`) — Rust, napi, `@mdscript/mds` native backend, Python. Still emitted verbatim in the §7.5 sense (not escaped): a lossless respelling is not an escape. Pinned on the Windows CI leg by `windows_dependencies_carry_no_verbatim_prefix` (`tests/api_surface.rs`) and on every host by the `verbatim.rs` unit tests. `mds watch` keeps comparing dependencies in canonical form.
+- **Display text**: the public `mds::display_native_path` (a no-op off Windows) is the entry point for showing a path to a user; the CLI's `safe_path` choke-point routes every status-line and error-message path through it (a canonicalized `--out-dir` in `Compiled to …`/`Removed stale …`, an `atomic_write_file` I/O error). It is orthogonal to escaping: `safe_path` still WIRE-escapes the result.
+
+Source-map `sources[]` are unaffected — `relativize_source`'s `path_to_unified` already strips the prefix before building component lists.
 
 ### TS Mirror: `packages/bundler-utils/src/project-root.ts`
 
@@ -188,7 +200,7 @@ The bundler-utils package mirrors the Rust display-path logic in TypeScript for 
 1. `TransformResult.dependencies` — ABSOLUTE paths (watch input). Bundlers call `addWatchFile`/`addDependency` with these.
 2. Emitted `metadata` literal — ROOT-RELATIVE POSIX paths. Never absolute, never `../`, never drive-qualified.
 
-The Windows verbatim lesson is the same on both sides: native backend emits `\\?\D:\...` on Windows; the TS must strip verbatim prefixes BEFORE unifying separators, mirroring what `path_to_unified` does in core. The UNC rewrite divergence (functional `\\server\share` vs. dropped prefix in core) is intentional and documented at the call site.
+The Windows verbatim lesson is the same on both sides: the TS must strip verbatim prefixes BEFORE unifying separators, mirroring what `path_to_unified` does in core. The UNC rewrite divergence (functional `\\server\share` vs. dropped prefix in core) is intentional and documented at the call site. Since #409 the native backend's `dependencies` already arrive in conventional form wherever that is lossless (see "Verbatim respelling" below), so the TS strip is a no-op for them and still covers the keys that keep their prefix.
 
 ## Anti-Patterns
 
@@ -210,7 +222,7 @@ The Windows verbatim lesson is the same on both sides: native backend emits `\\?
 
 **Empty/non-UTF-8 anchor hazard**: `path_to_unified` is `Option`; `None` root → basename, `None` base → root anchor; `starts_with_comps(x, [])` is vacuously true; root `/` is deliberately still a real root. The `Option` return exists so an unusable anchor can never reach `starts_with_comps` as an empty component list that every path matches — the degradation is chosen at the choke-point (step 6b), not inferred later.
 
-**`source_root()` returns `None` before any `normalize()` call**: `NativeFs::source_root()` returns `None` until at least one `normalize()` or explicit `set_root()` call establishes the project root. The defense-in-depth guard in `resolver.rs` catches this, but external callers that skip `normalize()` and jump straight to `compile_with_deps_opts` will land on the `root = None` branch — and returns `None` for a non-UTF-8 root (lossy strings are not anchors).
+**`source_root()` returns `None` before the root is anchored**: `NativeFs::source_root()` returns `None` until a `resolve_entry` or `anchor_base_dir` call establishes the project root. The defense-in-depth guard in `resolver.rs` catches this at both finalize sites; it also returns `None` for a non-UTF-8 root (lossy strings are not anchors).
 
 **Directory-mode `opts` must be per-file**: In directory mode (`run_build_directory`), each file has a different output directory, so `source_map_base` differs per file. Constructing `opts` as loop-invariant (outside the per-file loop) would give every file the same anchor, producing incorrect relative paths for all but one file.
 
@@ -226,10 +238,11 @@ The Windows verbatim lesson is the same on both sides: native backend emits `\\?
 
 - `crates/mds-core/src/source_path.rs` — `relativize_source` (the single choke-point; 10-step guard algorithm; `path_to_unified` with verbatim-prefix strip; `basename_fallback` using normalized components; `core_rule_map_relative` and `core_rule_source_outside_root` discriminating test pair); `display_path_for` (R3 display-path wrapper, root-relative for NativeFs, verbatim for VirtualFs)
 - `crates/mds-core/src/fs.rs:111-132` — `FileSystem::source_root()` (defaulted `None`; NativeFs override at line 522)
-- `crates/mds-core/src/resolver.rs:865-884, 943-963` — two finalize sites; both call `relativize_source` unconditionally; both include the defense-in-depth `set_root` guard
+- `crates/mds-core/src/resolver.rs` — two finalize sites in `process_module_intrinsic_opts` (grep `Step 5 — single choke-point`); both call `relativize_source` unconditionally; both call the best-effort defense-in-depth `anchor_root_for_source_map` first
 - `crates/mds-core/src/sourcemap.rs` — `Origin` struct (`file: Arc<str>` canonical key; `display: Arc<str>` root-relative display path, populated via `display_path_for`); `MapBuilder` (`sources[]` + parallel `display_names[]`; 3-arg `new` and `source_index`); `CompileOptions` struct (`source_map_base: Option<PathBuf>`); `SourceMap` struct carries `#[non_exhaustive]`, `CompileOptions` does not
 - `crates/mds-cli/src/build.rs` — `compute_source_map_base` (pure oracle; uses `compute_output_dir_path_for_kind`); `apply_source_map_file_label` (two-job post-processor: `sm.file` + `<stdin>` relabel)
-- `crates/mds-cli/src/lint.rs:380-393` — `read_source_file`: calls `fs.set_root(effective_parent(&canonical))` before `fs.read()` to anchor display roots for single-file lint mode
+- `crates/mds-cli/src/lint.rs` — `read_source_file` / `read_canonical_source`: `fs.anchor_base_dir(effective_parent(&canonical))?` before `fs.read()` to anchor display roots (lint and fmt)
+- `crates/mds-core/src/verbatim.rs` — `simplify_verbatim` (lossless verbatim → conventional respelling; Windows builds only, unit-tested on every host); users: `native_dependencies` and `display_native_path` in `lib.rs`
 - `packages/bundler-utils/src/project-root.ts` — TS mirror of R3 display-path logic: `findProjectRoot` (`.git`/`.mdsroot` walk, cached), `stripWindowsVerbatimPrefix` (mirrors `path_to_unified`; UNC divergence documented), `toAbsoluteDependency` (watch-input absolutisation), `toRootRelativePosix` (metadata literal, mirrors `relativize_source`)
 - `packages/mds/__test__/source-map.spec.mjs` — V-SM1 (WASM↔native virtual parity), CF-SM2 (four-surface differential test; hard-fails in CI if any surface missing)
 

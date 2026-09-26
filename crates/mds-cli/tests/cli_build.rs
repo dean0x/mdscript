@@ -1,7 +1,7 @@
 mod common;
 use common::{
-    count_occurrences, dup_vars_file_omitted, dup_vars_file_warning, fixture, mds_bin,
-    spawn_watch_ready, ChildGuard,
+    count_occurrences, dup_vars_file_omitted, dup_vars_file_warning, fixture, make_symlink,
+    mds_bin, spawn_watch_ready, ChildGuard,
 };
 
 #[test]
@@ -51,6 +51,42 @@ fn build_from_stdin() {
     assert!(
         stdout.contains("Hello World!"),
         "stdin build should produce 'Hello World!', got: {stdout}"
+    );
+}
+
+#[test]
+fn build_from_stdin_with_root_cwd_succeeds() {
+    // #371: `mds build -` with no explicit base_dir resolves it from cwd. A
+    // process whose cwd IS the filesystem root (e.g. `docker run` with no
+    // WORKDIR set, as the Alpine load test discovered this bug) must not
+    // fail to compile.
+    let mut child = mds_bin()
+        .args(["build", "-"])
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Hello World!\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "build from stdin with cwd=/ should succeed; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Hello World!"),
+        "stdin build with cwd=/ should produce 'Hello World!', got: {stdout}"
     );
 }
 
@@ -1796,6 +1832,8 @@ fn build_o_first_build_emits_only_compiled_to() {
 
 /// T-B2: a newly created output has the same mode `std::fs::write` would have produced
 /// (umask-dependent, so it is compared against a live control in the same directory).
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn build_o_new_output_mode_matches_std_fs_write() {
@@ -1837,6 +1875,8 @@ fn build_o_new_output_mode_matches_std_fs_write() {
 /// This is a pin: `std::fs::write` over an existing file also preserves the mode, so it
 /// was already true before the reroute. It exists so a future change to the primitive
 /// cannot quietly widen or narrow permissions on rebuild.
+///
+/// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
 #[cfg(unix)]
 #[test]
 fn build_o_existing_output_mode_0640_preserved() {
@@ -1875,7 +1915,6 @@ fn build_o_existing_output_mode_0640_preserved() {
 
 /// T-B4: `-o` at a symlink is refused; the link and its target are left untouched.
 /// Positive control in the same test: the same build against the real file succeeds.
-#[cfg(unix)]
 #[test]
 fn build_o_symlinked_output_target_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -1884,7 +1923,9 @@ fn build_o_symlinked_output_target_rejected() {
     let real = dir.path().join("real.md");
     std::fs::write(&real, "REAL").unwrap();
     let link = dir.path().join("link.md");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
+    if !make_symlink(&real, &link) {
+        return;
+    }
 
     let refused = mds_bin()
         .arg("build")
@@ -1943,6 +1984,10 @@ fn build_o_symlinked_output_target_rejected() {
 }
 
 /// T-B5: a failed write leaves the previous artifact intact and no temp file behind.
+///
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode parent
+/// directory; Windows' read-only attribute does not block creating files in a
+/// directory, so this setup would not provoke the failure there (#147).
 #[cfg(unix)]
 #[test]
 fn build_o_write_failure_preserves_existing_output_no_temp_residue() {

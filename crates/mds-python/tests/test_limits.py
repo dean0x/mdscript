@@ -116,6 +116,24 @@ def test_l2_non_mapping_and_bad_value_modules() -> None:
     assert ei.value.code == "mds::invalid_options"
 
 
+def test_l2_bad_value_module_key_is_escaped_in_message() -> None:
+    # #265: the module key a message names is escaped — every forbidden path
+    # character, TAB included — as the same six-character text the other bindings use.
+    for cp in (0x09, 0x1B, 0x0A, 0x202E):
+        key = "x" + chr(cp) + ".mds"
+        shown = "x" + "\\u" + format(cp, "04X") + ".mds"
+        for call in (m.compile_virtual, m.lint_virtual):
+            with pytest.raises(m.MdsError) as ei:
+                call({key: 5}, "main.mds")  # type: ignore[dict-item]
+            assert ei.value.code == "mds::invalid_options"
+            assert ei.value.message == f'modules["{shown}"] must be a string, got number'
+            assert chr(cp) not in ei.value.message
+    # Control: a clean key is shown as written.
+    with pytest.raises(m.MdsError) as ei:
+        m.compile_virtual({"ok.mds": 5}, "main.mds")  # type: ignore[dict-item]
+    assert ei.value.message == 'modules["ok.mds"] must be a string, got number'
+
+
 # ── L3: core structural limits surface as MdsError, not a panic ──────────────────
 
 

@@ -424,8 +424,15 @@ fn rewrite_body(
 ///
 /// When `source` compiles standalone, this is an exact check: both are
 /// compiled with the same `base_dir` and their [`crate::CompiledOutput`]s must
-/// match. `compile_str_collecting_warnings` (not `compile_str_with`) is used
-/// so the gate never duplicates warnings to stderr on every format call.
+/// match. The warning-collecting compile (the body of
+/// `compile_str_collecting_warnings`, not `compile_str_with`) is used so the gate
+/// never duplicates warnings to stderr on every format call.
+///
+/// The base directory is resolved first, once, exactly as `check_str_with`
+/// resolves it, and a failure there is returned as it is: a base directory that
+/// is refused (a forbidden path character, #265) or cannot be resolved is caller
+/// input, not a template that fails to compile standalone, so it never reaches
+/// the fallback below.
 ///
 /// When `source` does NOT compile standalone the reason matters:
 ///
@@ -451,8 +458,9 @@ fn assert_equivalent(
     raw_content: &[Range<usize>],
     file_name: &str,
 ) -> Result<(), MdsError> {
-    match crate::compile_str_collecting_warnings(source, base_dir, None) {
-        Ok(orig) => match crate::compile_str_collecting_warnings(formatted, base_dir, None) {
+    let dir = crate::resolve_base_dir(base_dir)?;
+    match crate::compile_source_in_dir(source, &dir, None) {
+        Ok(orig) => match crate::compile_source_in_dir(formatted, &dir, None) {
             Ok(after) if after.output == orig.output => Ok(()),
             Ok(_) => Err(MdsError::formatter_invariant(
                 "formatted source compiles to different output than the original",
@@ -988,5 +996,98 @@ mod tests {
             "different blank-line counts must NOT be structural_equivalent \
              (clean_output is interior-verbatim; a 3-newline run != 2-newline run)"
         );
+    }
+
+    // ── #371: filesystem-root base dir must not downgrade the safety gate ──
+
+    #[test]
+    fn fmt_root_base_dir_takes_compile_path() {
+        // A root base dir must let `assert_equivalent`'s strong compile-and-
+        // diff path run (the `Ok(orig) => ...` arm, which recompiles both the
+        // original and formatted strings and diffs their real output), not
+        // silently downgrade to the weaker `structural_equivalent` fallback
+        // reserved for sources that genuinely fail to compile standalone
+        // (the `Err(_) => ...` arm).
+        //
+        // Which arm runs is gated entirely by whether
+        // `compile_str_collecting_warnings(source, base_dir, None)` succeeds.
+        // Before the #371 fix, resolving the base directory `/` always errored
+        // (`check_symlink_named` calls `path.file_name()`, which is `None`
+        // for a filesystem root) -- so EVERY format call whose base_dir
+        // resolved to a root, even for a perfectly valid template, took the
+        // structural fallback instead of the real compile-equivalence check.
+        //
+        // Root obtained portably (a tempdir's topmost ancestor), matching
+        // every other root-base-dir test in this crate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().ancestors().last().unwrap();
+        let source = "Hello world\n";
+
+        // This is exactly the base-dir resolution and compile assert_equivalent
+        // performs to decide which branch to take (formatter.rs's
+        // `assert_equivalent`, `Ok(orig) =>` vs `Err(_) =>`). If the compile
+        // errs, formatting downgrades to the structural check.
+        let compiled = crate::compile_str_collecting_warnings(source, Some(root), None);
+        assert!(
+            compiled.is_ok(),
+            "compile with a root base_dir should succeed so the formatter's \
+             safety gate takes the strong compile-equivalence path, not the \
+             structural fallback: {compiled:?}"
+        );
+
+        // And the public API surface reflects the same: formatting must
+        // succeed and be a no-op on already-clean source.
+        let formatted = format_str_with(source, Some(root))
+            .expect("format_str_with with a root base_dir must succeed");
+        assert_eq!(formatted, source);
+    }
+
+    // ── #265: a base-directory refusal is not a compile error to fall back on ──
+
+    /// A base directory the compile refuses — a forbidden path character, or a
+    /// directory that does not exist — is caller input, not a template that fails to
+    /// compile standalone, so the formatter reports it with the code `check_str_with`
+    /// reports, instead of passing it to the structural fallback and succeeding.
+    /// Both a source that compiles standalone and one that does not (an undefined
+    /// variable, the fallback's own case) are refused.
+    #[test]
+    fn fmt_base_dir_refusal_propagates_like_check() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("missing");
+        for source in ["Hello world\n", "Hello {{name}}!\n"] {
+            for ch in ['\t', '\x1B', '\u{202E}'] {
+                let dir = format!("d{ch}e");
+                let checked = crate::check_str_with(source, Some(Path::new(&dir)), None)
+                    .expect_err("check refuses the base directory");
+                let err = format_str_with(source, Some(Path::new(&dir)))
+                    .expect_err("fmt must refuse the base directory like check");
+                let (got, want) = (err.serialize(), checked.serialize());
+                assert_eq!(got.code, "mds::io", "{source:?} U+{:04X}", u32::from(ch));
+                assert_eq!(got.message, want.message);
+                assert!(
+                    got.message.contains(&format!(
+                        "base directory contains forbidden character U+{:04X}",
+                        u32::from(ch)
+                    )),
+                    "got: {}",
+                    got.message
+                );
+                assert!(!got.message.contains(ch), "raw char: {:?}", got.message);
+            }
+
+            let checked = crate::check_str_with(source, Some(&missing), None)
+                .expect_err("check refuses a base directory that does not exist");
+            let err = format_str_with(source, Some(&missing))
+                .expect_err("fmt must refuse a base directory that does not exist");
+            assert_eq!(err.serialize().code, "mds::io", "{source:?}: {err:?}");
+            assert_eq!(err.serialize().message, checked.serialize().message);
+
+            // Control: the same source with a real base directory formats — the
+            // undefined-variable source through the structural fallback.
+            assert_eq!(
+                format_str_with(source, Some(tmp.path())).expect("real base dir formats"),
+                source
+            );
+        }
     }
 }

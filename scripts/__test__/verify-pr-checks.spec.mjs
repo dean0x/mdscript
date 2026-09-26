@@ -99,18 +99,27 @@ const RUNS_RELEASE = {
 // source-hygiene job (#288); tests that verify a PASSING run today must inject one.
 const SOURCE_HYGIENE_PASS = { name: 'Source hygiene', status: 'completed', conclusion: 'success' };
 
+// A synthetic 'Rust — clippy, test (windows-latest)' run (#147, D-PR3b). Every
+// fixture in this file predates the Windows Rust CI job; tests that verify a
+// PASSING run today must inject this alongside SOURCE_HYGIENE_PASS.
+const RUST_WINDOWS_PASS = {
+  name: 'Rust — clippy, test (windows-latest)',
+  status: 'completed',
+  conclusion: 'success',
+};
+
 // ---------------------------------------------------------------------------
 // AC-22: Historical fixtures reproduce correctly
 // ---------------------------------------------------------------------------
 describe('AC-21 AC-22: historical fixture evaluation', () => {
 
-  test('113f472 (main baseline + Source hygiene) → PASS (exit 0)', () => {
-    // The 113f472 fixture predates the source-hygiene job (added in #288).
-    // A passing run today requires Source hygiene to be present and successful
-    // (D-PR3b, EXPECTED_CONTEXTS). We inject a synthetic run to represent the
-    // current expected state.
-    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
-    assert.equal(checkRuns.length, 19, 'fixture must have 18+1 check-runs');
+  test('113f472 (main baseline + Source hygiene + Windows Rust) → PASS (exit 0)', () => {
+    // The 113f472 fixture predates both the source-hygiene job (#288) and the
+    // Windows Rust CI job (#147). A passing run today requires both to be
+    // present and successful (D-PR3b, EXPECTED_CONTEXTS). We inject synthetic
+    // runs to represent the current expected state.
+    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
+    assert.equal(checkRuns.length, 20, 'fixture must have 18+2 check-runs');
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0, `expected PASS; lines: ${result.lines.join('\n')}`);
     assert.ok(result.pass, 'evaluateChecks must return pass=true');
@@ -161,8 +170,8 @@ describe('AC-23: partial case (5 of 6 required present)', () => {
     // but the tool catches: a required context is absent.
     const allRuns = loadCheckRuns('checks-main-113f472.json');
     const msrvName = 'MSRV (Rust 1.88)';
-    const withoutMsrv = [...allRuns.filter(cr => cr.name !== msrvName), SOURCE_HYGIENE_PASS];
-    assert.equal(withoutMsrv.length, 18, 'should have 17+1 runs after removing MSRV');
+    const withoutMsrv = [...allRuns.filter(cr => cr.name !== msrvName), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
+    assert.equal(withoutMsrv.length, 19, 'should have 17+2 runs after removing MSRV');
 
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
@@ -187,7 +196,7 @@ describe('AC-24: non-success states → FAIL, quoting the observed state', () =>
 
   // Build a passing baseline from the 113f472 fixture + Source hygiene.
   function buildPassingRuns() {
-    return [...loadCheckRuns('checks-main-113f472.json').map(cr => ({ ...cr })), { ...SOURCE_HYGIENE_PASS }];
+    return [...loadCheckRuns('checks-main-113f472.json').map(cr => ({ ...cr })), { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS }];
   }
 
   const NON_SUCCESS_CASES = [
@@ -247,7 +256,7 @@ describe('AC-24: non-success states → FAIL, quoting the observed state', () =>
     const runs = [
       ...loadCheckRuns('checks-main-113f472.json'),
       { name: 'Some other job', status: 'in_progress', conclusion: null },
-      { ...SOURCE_HYGIENE_PASS },
+      { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
     ];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1, 'a non-required in_progress run must prevent PASS');
@@ -341,7 +350,7 @@ describe('D-PR3b: Source hygiene absence detection (EXPECTED_CONTEXTS)', () => {
   test('Source hygiene present+success → does not fail (Tier A+ does not false-fail)', () => {
     const checkRuns = [
       ...loadCheckRuns('checks-main-113f472.json'),
-      SOURCE_HYGIENE_PASS,
+      SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS,
     ];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0, 'present-and-successful Source hygiene must not fail');
@@ -352,7 +361,7 @@ describe('D-PR3b: Source hygiene absence detection (EXPECTED_CONTEXTS)', () => {
     // it appears in both requiredContexts and EXPECTED_CONTEXTS. The Tier A+
     // loop must skip it (already handled in Tier A), not double-fail it.
     const requiredWithHygiene = [...REQUIRED, 'Source hygiene'];
-    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const result = evaluateChecks({ requiredContexts: requiredWithHygiene, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0, 'Source hygiene in required set must not be double-reported');
     const allLines = result.lines.join('\n');
@@ -373,7 +382,7 @@ describe('D-PR2a: Tier A checks both check-runs AND statuses independently', () 
     // no check-run existed. A failing status was silently ignored when a
     // check-run of the same name was green (narrow divergence from GitHub's
     // enforcement model per D-PR2a).
-    const allRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const allRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const msrvName = 'MSRV (Rust 1.88)';
     // MSRV exists in check-runs (success), also in statuses (failure)
     const statuses = [{ context: msrvName, state: 'failure' }];
@@ -391,7 +400,7 @@ describe('D-PR2a: Tier A checks both check-runs AND statuses independently', () 
   });
 
   test('required context in check-runs (success) AND statuses (success) → PASS', () => {
-    const allRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const allRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const msrvName = 'MSRV (Rust 1.88)';
     const statuses = [{ context: msrvName, state: 'success' }];
     const result = evaluateChecks({
@@ -425,7 +434,7 @@ describe('AC-25: zero check-runs never passes', () => {
   });
 
   test('output always includes counts (applies ADR-009)', () => {
-    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     const allLines = result.lines.join('\n');
     // Counts must appear whether pass or fail
@@ -441,7 +450,7 @@ describe('AC-25: zero check-runs never passes', () => {
 describe('AC-26 AC-27: exit codes and merge command', () => {
 
   test('PASS → exit 0 with --admin --match-head-commit <sha> in output', () => {
-    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0);
     assert.ok(result.mergeCommand, 'PASS must produce a mergeCommand');
@@ -468,7 +477,7 @@ describe('AC-26 AC-27: exit codes and merge command', () => {
 
     const passResult = evaluateChecks({
       requiredContexts: REQUIRED,
-      checkRuns: [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS],
+      checkRuns: [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS],
       statuses: [],
       headSha: HEAD_113F472,
     });
@@ -516,13 +525,14 @@ const PR_OK = { head: { sha: HEAD_113F472 }, base: { ref: 'main' } };
 const PROTECTION_OK = JSON.parse(readFileSync(join(FIXTURES, 'protection-main.json'), 'utf8'));
 const CHECKS_OK = JSON.parse(readFileSync(join(FIXTURES, 'checks-main-113f472.json'), 'utf8'));
 
-// CHECKS_OK_WITH_HYGIENE: the 113f472 fixture + Source hygiene run, for happy-path
-// tests that drive main() and expect exit 0. The 113f472 fixture predates #288;
-// a PASS today requires Source hygiene to be present (D-PR3b, EXPECTED_CONTEXTS).
+// CHECKS_OK_WITH_HYGIENE: the 113f472 fixture + Source hygiene run + the
+// Windows Rust CI run, for happy-path tests that drive main() and expect exit
+// 0. The 113f472 fixture predates both #288 and #147; a PASS today requires
+// both to be present (D-PR3b, EXPECTED_CONTEXTS).
 const CHECKS_OK_WITH_HYGIENE = {
   ...CHECKS_OK,
-  check_runs: [...CHECKS_OK.check_runs, SOURCE_HYGIENE_PASS],
-  total_count: CHECKS_OK.total_count + 1,
+  check_runs: [...CHECKS_OK.check_runs, SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS],
+  total_count: CHECKS_OK.total_count + 2,
 };
 
 describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
@@ -914,7 +924,7 @@ describe('Tier B: non-required non-expected check-run states', () => {
   function baseRunsWith(extra) {
     return [
       ...loadCheckRuns('checks-main-113f472.json'),
-      { ...SOURCE_HYGIENE_PASS },
+      { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
       extra,
     ];
   }
@@ -1028,7 +1038,7 @@ describe('duplicate check-run names are all evaluated', () => {
       ...loadCheckRuns('checks-main-113f472.json').filter(cr => cr.name !== ctx),
       { name: ctx, status: 'completed', conclusion: 'failure' },
       { name: ctx, status: 'completed', conclusion: 'success' },
-      SOURCE_HYGIENE_PASS,
+      SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS,
     ];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1,
@@ -1045,7 +1055,7 @@ describe('duplicate check-run names are all evaluated', () => {
       { name: ctx, status: 'completed', conclusion: 'failure' },
       { name: ctx, status: 'completed', conclusion: 'failure' },
       { name: ctx, status: 'completed', conclusion: 'failure' },
-      SOURCE_HYGIENE_PASS,
+      SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS,
     ];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1);
@@ -1086,7 +1096,7 @@ describe('D-PR2a: required context satisfied by commit status', () => {
     // but that context is present in commit statuses as success.
     const allRuns = loadCheckRuns('checks-main-113f472.json');
     const msrvName = 'MSRV (Rust 1.88)';
-    const withoutMsrv = [...allRuns.filter(cr => cr.name !== msrvName), SOURCE_HYGIENE_PASS];
+    const withoutMsrv = [...allRuns.filter(cr => cr.name !== msrvName), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
 
     // Simulate MSRV being satisfied via commit status instead
     const statuses = [{ context: msrvName, state: 'success' }];
@@ -1112,7 +1122,7 @@ describe('Tier C: pending non-required status is reported as advisory', () => {
     // non-completed Tier B run — both are "not yet resolved". Tier B now FAILs
     // on queued/in_progress (same delta). Tier C is advisory-only, but the
     // operator must still be able to see it, not have it vanish silently.
-    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const statuses = [{ context: 'security/snyk (dean0x)', state: 'pending' }];
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
@@ -1132,7 +1142,7 @@ describe('Tier C: pending non-required status is reported as advisory', () => {
 
   test('state=error non-required status still emits advisory (regression guard)', () => {
     // Guard against the Tier C rewrite accidentally dropping non-pending errors.
-    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const statuses = [{ context: 'security/snyk (dean0x)', state: 'error' }];
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
@@ -1151,22 +1161,23 @@ describe('Tier C: pending non-required status is reported as advisory', () => {
 });
 
 // ---------------------------------------------------------------------------
-// reliability-02: EXPECTED_CONTEXTS absence detection for all 4 non-required jobs
+// reliability-02: EXPECTED_CONTEXTS absence detection for all 5 non-required jobs
 //
 // The 113f472 fixture includes all 6 Python matrix runs, examples/ gitignore
-// coverage, and Python — wheel install smoke. These tests verify that removing
-// any of the three newly-added expected contexts causes FAIL. Each test runs
-// with the 6 required contexts passing and Source hygiene passing, but the
-// target context absent.
+// coverage, and Python — wheel install smoke; it predates both Source hygiene
+// (#288) and the Windows Rust CI job (#147). These tests verify that removing
+// (or failing) any of the five expected contexts causes FAIL. Each test runs
+// with the 6 required contexts passing and Source hygiene + Windows Rust
+// passing, but the target context absent or failing.
 // ---------------------------------------------------------------------------
-describe('reliability-02: EXPECTED_CONTEXTS covers all 4 non-required CI jobs', () => {
+describe('reliability-02: EXPECTED_CONTEXTS covers all 5 non-required CI jobs', () => {
 
-  // Base: only required runs + Source hygiene.
+  // Base: only required runs + Source hygiene + Windows Rust.
   function requiredPlusHygiene() {
     const allRuns = loadCheckRuns('checks-main-113f472.json');
     // Keep only runs that are required (in REQUIRED set) or Source hygiene.
     return allRuns.filter(cr => REQUIRED.includes(cr.name) || cr.name === 'Source hygiene')
-      .concat([{ ...SOURCE_HYGIENE_PASS }]);
+      .concat([{ ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS }]);
   }
 
   test('Python — build & test: all matrix runs absent → FAIL (reliability-02)', () => {
@@ -1186,7 +1197,7 @@ describe('reliability-02: EXPECTED_CONTEXTS covers all 4 non-required CI jobs', 
   test('examples/ gitignore coverage: absent → FAIL (reliability-02)', () => {
     const checkRuns = loadCheckRuns('checks-main-113f472.json')
       .filter(cr => cr.name !== 'examples/ gitignore coverage')
-      .concat([{ ...SOURCE_HYGIENE_PASS }]);
+      .concat([{ ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS }]);
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1, 'examples/ gitignore coverage absent must FAIL (reliability-02)');
     const allLines = result.lines.join('\n');
@@ -1199,7 +1210,7 @@ describe('reliability-02: EXPECTED_CONTEXTS covers all 4 non-required CI jobs', 
   test('Python — wheel install smoke: absent → FAIL (reliability-02)', () => {
     const checkRuns = loadCheckRuns('checks-main-113f472.json')
       .filter(cr => cr.name !== 'Python — wheel install smoke')
-      .concat([{ ...SOURCE_HYGIENE_PASS }]);
+      .concat([{ ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS }]);
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1, 'Python — wheel install smoke absent must FAIL (reliability-02)');
     const allLines = result.lines.join('\n');
@@ -1218,7 +1229,7 @@ describe('reliability-02: EXPECTED_CONTEXTS covers all 4 non-required CI jobs', 
         }
         return cr;
       }),
-      { ...SOURCE_HYGIENE_PASS },
+      { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
     ];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1, 'a failing Python matrix run must FAIL (Tier A+)');
@@ -1226,23 +1237,59 @@ describe('reliability-02: EXPECTED_CONTEXTS covers all 4 non-required CI jobs', 
     assert.ok(allLines.includes('failure'), `must quote the conclusion; got:\n${allLines}`);
   });
 
-  test('all 4 expected contexts present+success → PASS (full fixture, no double-count)', () => {
-    // The full 113f472 fixture includes all 6 Python matrix runs, examples/ gitignore,
-    // and Python — wheel install smoke. With Source hygiene injected, all 4 EXPECTED_CONTEXTS
-    // are present and passing → exit 0.
+  test('Rust — clippy, test (windows-latest): absent → FAIL (reliability-02 / #147)', () => {
+    // 113f472 predates #147 entirely, so the fixture already has no Windows-leg
+    // run — no filter needed to remove it, unlike the other reliability-02
+    // absence tests above.
     const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), { ...SOURCE_HYGIENE_PASS }];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
-    assert.equal(result.exitCode, 0, 'all 4 expected contexts present and passing must PASS');
+    assert.equal(result.exitCode, 1, 'Rust — clippy, test (windows-latest) absent must FAIL (reliability-02)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes(
+        'Tier A+ (expected): "Rust — clippy, test (windows-latest)" — not found in check-runs or ' +
+        'statuses (never ran). This job must exist and pass; its absence is not evidence of success ' +
+        '(D-PR3b, avoids PF-013)',
+      ),
+      `failure must name the absent job with the exact Tier A+ message; got:\n${allLines}`,
+    );
+  });
+
+  test('Rust — clippy, test (windows-latest): failure → FAIL (reliability-02 / #147)', () => {
+    const checkRuns = [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { ...SOURCE_HYGIENE_PASS },
+      { name: 'Rust — clippy, test (windows-latest)', status: 'completed', conclusion: 'failure' },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Rust — clippy, test (windows-latest) failing must FAIL (reliability-02)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes(
+        'Tier A+ (expected): "Rust — clippy, test (windows-latest)" — status=completed, ' +
+        'conclusion=failure (locally-expected job must be completed+success, D-PR3b)',
+      ),
+      `failure must quote the exact Tier A+ message; got:\n${allLines}`,
+    );
+  });
+
+  test('all 5 expected contexts present+success → PASS (full fixture, no double-count)', () => {
+    // The full 113f472 fixture includes all 6 Python matrix runs, examples/ gitignore,
+    // and Python — wheel install smoke. With Source hygiene and Windows Rust injected,
+    // all 5 EXPECTED_CONTEXTS are present and passing → exit 0.
+    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS }];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 0, 'all 5 expected contexts present and passing must PASS');
   });
 
   test('EXPECTED_CONTEXTS entries each match a job name: in .github/workflows/ci.yml (full set)', () => {
-    // Existing coverage: 'Source hygiene'. This test verifies all 4 EXPECTED_CONTEXTS entries.
+    // Existing coverage: 'Source hygiene'. This test verifies all 5 EXPECTED_CONTEXTS entries.
     const ciYml = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
     const jobNames = ciYml
       .split('\n')
       .filter(line => /^    name: /.test(line))
       .map(line => line.replace(/^    name:\s+/, '').trim());
-    assert.equal(EXPECTED_CONTEXTS.length, 4, 'EXPECTED_CONTEXTS must have 4 entries (reliability-02)');
+    assert.equal(EXPECTED_CONTEXTS.length, 5, 'EXPECTED_CONTEXTS must have 5 entries (reliability-02)');
     for (const ctx of EXPECTED_CONTEXTS) {
       assert.ok(
         jobNames.includes(ctx),
@@ -1297,7 +1344,7 @@ describe('complexity-08: argument parsing and merge command', () => {
     // Before fix: emitted 'gh pr merge --squash --admin --match-head-commit <sha>'
     // with no PR number — relying on gh resolving from current branch. Ambiguous.
     // After fix: PR number is included so the command is unambiguous.
-    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS, RUST_WINDOWS_PASS];
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
       checkRuns: runs,
@@ -1481,7 +1528,7 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
   function basePassingRunsWith(extras) {
     return [
       ...loadCheckRuns('checks-main-113f472.json'),
-      { ...SOURCE_HYGIENE_PASS },
+      { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
       ...extras,
     ];
   }
@@ -1646,7 +1693,7 @@ describe('D-PR7: release-surface presence check', () => {
   function passingRunsWith(extras) {
     return [
       ...loadCheckRuns('checks-main-113f472.json'),
-      { ...SOURCE_HYGIENE_PASS },
+      { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
       ...extras,
     ];
   }
@@ -1944,7 +1991,7 @@ describe('D-PR8: suite-keyed TIER_B_EXPECTED_SKIPPED allowance', () => {
   function basePassingRunsWith(extras) {
     return [
       ...loadCheckRuns('checks-main-113f472.json'),
-      { ...SOURCE_HYGIENE_PASS },
+      { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
       ...extras,
     ];
   }
@@ -2268,7 +2315,7 @@ describe('D-PR5k: multiple release suites on one head (dispatch + pull_request)'
     function basePassingRunsWith(extras) {
       return [
         ...loadCheckRuns('checks-main-113f472.json'),
-        { ...SOURCE_HYGIENE_PASS },
+        { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
         ...extras,
       ];
     }
@@ -2320,7 +2367,7 @@ describe('D-PR7k, D-PR7l: D-PR7 attribution keyed on release suite identity', ()
   function passingRunsWith(extras) {
     return [
       ...loadCheckRuns('checks-main-113f472.json'),
-      { ...SOURCE_HYGIENE_PASS },
+      { ...SOURCE_HYGIENE_PASS }, { ...RUST_WINDOWS_PASS },
       ...extras,
     ];
   }
@@ -2458,6 +2505,17 @@ describe('current fixtures (2026-09): live-shaped evaluation', () => {
 
   const REQUIRED_2026_09 = PROTECTION_2026_09.required_status_checks.contexts;
   const CHECK_RUNS_PR366 = CHECKS_PR366.check_runs;
+
+  // PR #366 predates #147 (the Windows Rust CI job entered EXPECTED_CONTEXTS
+  // after this fixture was captured), so a scenario that must PASS today needs
+  // a synthetic passing run injected, same as CHECKS_OK_WITH_HYGIENE above.
+  const CHECK_RUNS_PR366_WITH_WINDOWS = [...CHECK_RUNS_PR366, { ...RUST_WINDOWS_PASS }];
+  const CHECKS_PR366_WITH_WINDOWS = {
+    ...CHECKS_PR366,
+    check_runs: CHECK_RUNS_PR366_WITH_WINDOWS,
+    total_count: CHECKS_PR366.total_count + 1,
+  };
+
   const PR366_HEAD = 'e02bcf280dc50bb8df032744aa2a2520c02865ee';
   // B1 files changed in PR #366:
   const PR366_FILES = [
@@ -2505,7 +2563,7 @@ describe('current fixtures (2026-09): live-shaped evaluation', () => {
 
     const result = evaluateChecks({
       requiredContexts: REQUIRED_2026_09,
-      checkRuns: CHECK_RUNS_PR366,
+      checkRuns: CHECK_RUNS_PR366_WITH_WINDOWS,
       statuses: [],
       headSha: PR366_HEAD,
       changedFiles: ['.github/workflows/release.yml'],
@@ -2577,7 +2635,7 @@ describe('current fixtures (2026-09): live-shaped evaluation', () => {
       ['/files', PR366_FILES],
       ['/pulls/', PR366_DATA],
       ['/protection', PROTECTION_2026_09],
-      ['/check-runs', CHECKS_PR366],
+      ['/check-runs', CHECKS_PR366_WITH_WINDOWS],
       ['/status', { statuses: [], total_count: 0 }],
       ['/actions/runs', RUNS_PR366],
     ], calls);
@@ -2647,7 +2705,7 @@ describe('current fixtures (2026-09): live-shaped evaluation', () => {
     // PASS: all 15 required contexts + surface contexts → no double-report
     const result = evaluateChecks({
       requiredContexts: REQUIRED_2026_09,
-      checkRuns: CHECK_RUNS_PR366,
+      checkRuns: CHECK_RUNS_PR366_WITH_WINDOWS,
       statuses: [],
       headSha: PR366_HEAD,
       changedFiles: ['.github/workflows/release.yml'],

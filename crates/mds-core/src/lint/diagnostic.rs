@@ -68,7 +68,7 @@
 //! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr on the non-collecting paths. The identifiers its producers interpolate — `resolver.rs`'s imported-module filename, `evaluator.rs`'s `@include` alias — are WIRE-escaped at construction, per the per-field rule |
 //! | `named_source_for_render()` (this module) | **per field** | the single `NamedSource` builder used by `MdsError::at()` (error.rs), `check_equivalence` (formatter.rs) and `render_diag_human` (mds-cli/src/lint.rs): filename WIRE, source via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
 //! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help` (its filename and source go through `named_source_for_render`) |
-//! | `safe_path()` / `safe_file_display()` (mds-cli/src/output.rs) | WIRE | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) |
+//! | `safe_path()` / `safe_file_display()` (mds-cli/src/output.rs) | WIRE + `\t` ([`escape_path_for_message`]) | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) — every forbidden path character escaped, since a path may carry none (#265) |
 //! | `fix::FixOutcome::Rejected.reason` (fix.rs) | WIRE | construction-time: the `MdsError` `Display` embedded in a reverify-failure reason, so the value is display-safe for every consumer of the published `mds::fix` API (PF-004) |
 //! | `MdsError::serialize()` (error.rs) | WIRE | `message`, `help` — covers all three bindings' error path |
 //! | `LintResult::to_canonical_json()` (this module) | WIRE | `message`, `help`, `files[].file` key, `fix_edits[].new_text` |
@@ -1160,6 +1160,67 @@ fn is_control_char(ch: char) -> bool {
         || ch == '\u{007F}'
         || ('\u{0080}'..='\u{009F}').contains(&ch)
         || is_format_hazard_char(ch)
+}
+
+// ── #265: forbidden path characters ─────────────────────────────────────────
+
+/// Returns `true` when `ch` must be refused in a **path** accepted from
+/// untrusted input (#265).
+///
+/// The forbidden-path-character class is `is_control_char`'s 78-codepoint
+/// escape class plus `\n` (U+000A) and `\t` (U+0009) — **80 codepoints** in
+/// total. Both are carved out of `is_control_char` because a diagnostic
+/// *message* legitimately preserves them at some boundary (HUMAN mode keeps
+/// `\n` so multi-line frames render; both modes keep `\t` because a tab cannot
+/// forge a line or reposition a cursor destructively) — but neither belongs in
+/// a *path*. A filename is never legitimately multi-line or tab-containing, and
+/// a hostile one is exactly the payload #253 could only neutralize by escaping
+/// it at every output site, never by refusing it before it reaches the
+/// filesystem.
+///
+/// This predicate is the input-boundary half of the #265 defense. The resolver
+/// applies it to every import string (`mds::import`), entry path and base
+/// directory (`mds::io`) before any `FileSystem` backend is called, and
+/// `NativeFs` applies it to every canonical path it resolves. It is also the
+/// **public contract** for a custom `FileSystem` backend passed to
+/// `ModuleCache::with_fs` that rewrites paths (see the trait's Security
+/// Contract doc).
+#[must_use]
+pub fn is_forbidden_path_char(ch: char) -> bool {
+    is_control_char(ch) || ch == '\n' || ch == '\t'
+}
+
+/// Escape every [`is_forbidden_path_char`] character in `path` so it can be
+/// shown in a diagnostic message.
+///
+/// Built on [`sanitize_control_chars_wire`] (WIRE mode escapes
+/// `is_control_char`'s class plus `\n` — 79 of the 80 forbidden codepoints),
+/// with one addition: WIRE mode deliberately leaves `\t` raw, because no
+/// diagnostic *message* boundary needs to escape a character that cannot forge
+/// a line. `\t` **is** in the forbidden-path class, though, so a path
+/// containing one would otherwise still show a raw tab in the message. This
+/// function escapes it too, to the same uppercase `\uXXXX` literal WIRE uses
+/// for every other member, so the postcondition holds for the full 80-codepoint
+/// class: the returned string contains none of them.
+///
+/// Returns a borrowed view of the input when no escaping is needed (zero
+/// allocation for the overwhelmingly-common clean case).
+#[must_use]
+pub fn escape_path_for_message(path: &str) -> Cow<'_, str> {
+    let wired = sanitize_control_chars_wire(path);
+    if !wired.contains('\t') {
+        return wired;
+    }
+    let n_tabs = wired.chars().filter(|&ch| ch == '\t').count();
+    let mut out = String::with_capacity(wired.len() + 5 * n_tabs);
+    for ch in wired.chars() {
+        if ch == '\t' {
+            write!(out, "\\u{:04X}", ch as u32).expect("writing to a String is infallible");
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Returns `true` for the non-C0/C1 codepoints that are still display-hazardous.
@@ -2624,6 +2685,127 @@ mod tests {
             "non-vacuity: expected is_control_char to claim exactly 78 codepoints; a \
              different count means the class changed and this pin must be updated \
              together with the width helpers"
+        );
+    }
+
+    // ── #265: forbidden path characters ────────────────────────────────────
+
+    /// The forbidden-path-character class is exactly 80 codepoints:
+    /// `is_control_char`'s 78 plus `\n` and `\t`. Walks every Unicode scalar
+    /// value (the `char` range iterator admits no surrogates, so none need
+    /// skipping) so the count is a claim about the real class, not a handful
+    /// of hand-picked probes.
+    #[test]
+    fn forbidden_path_char_class_is_exactly_80() {
+        assert!(
+            !is_control_char('\n') && !is_control_char('\t'),
+            "is_control_char must NOT already claim \\n or \\t — otherwise the \
+             78+2=80 arithmetic in is_forbidden_path_char's doc comment is wrong"
+        );
+
+        let mut hits = 0usize;
+        for ch in '\0'..=char::MAX {
+            let forbidden = is_forbidden_path_char(ch);
+            let expected = is_control_char(ch) || ch == '\n' || ch == '\t';
+            assert_eq!(
+                forbidden, expected,
+                "U+{:04X}: is_forbidden_path_char disagrees with is_control_char \
+                 ∪ {{LF, TAB}}",
+                ch as u32
+            );
+            if forbidden {
+                hits += 1;
+            }
+        }
+        assert_eq!(
+            hits, 80,
+            "non-vacuity: expected is_forbidden_path_char to claim exactly 80 \
+             codepoints (78 from is_control_char + LF + TAB); a different count \
+             means the class changed and this pin must be updated"
+        );
+    }
+
+    /// Every codepoint WIRE-mode sanitization actually escapes is a member of
+    /// the forbidden-path class — the class is a superset of what WIRE
+    /// escapes. WIRE escapes `is_control_char`'s 78 plus `\n` (79 total); `\t`
+    /// is the one member WIRE leaves raw, which is exactly why
+    /// `escape_path_for_message` exists on top of it.
+    #[test]
+    fn every_wire_escaped_char_is_forbidden() {
+        let mut escaped_by_wire = 0usize;
+        for ch in '\0'..=char::MAX {
+            let raw = ch.to_string();
+            let wired = sanitize_control_chars_wire(&raw);
+            if *wired != raw {
+                escaped_by_wire += 1;
+                assert!(
+                    is_forbidden_path_char(ch),
+                    "U+{:04X} is escaped by WIRE-mode sanitization but is not in \
+                     the forbidden-path-character class",
+                    ch as u32
+                );
+            }
+        }
+        // Non-vacuity: WIRE escapes is_control_char's 78 plus LF = 79; TAB is
+        // the one forbidden codepoint WIRE leaves alone (see
+        // escape_path_for_message_leaves_no_forbidden_char below).
+        assert_eq!(
+            escaped_by_wire, 79,
+            "non-vacuity: expected WIRE mode to escape exactly 79 codepoints \
+             (78 from is_control_char + LF); a different count means this test \
+             stopped exercising the real class"
+        );
+    }
+
+    /// `escape_path_for_message`'s postcondition: for every one of the 80
+    /// forbidden codepoints, the escaped output contains none of the 80 —
+    /// including `\t`, which WIRE mode alone leaves raw.
+    #[test]
+    fn escape_path_for_message_leaves_no_forbidden_char() {
+        let mut checked = 0usize;
+        for ch in '\0'..=char::MAX {
+            if !is_forbidden_path_char(ch) {
+                continue;
+            }
+            checked += 1;
+            let input = format!("a{ch}b");
+            let escaped = escape_path_for_message(&input);
+            assert!(
+                !escaped.chars().any(is_forbidden_path_char),
+                "U+{:04X}: escape_path_for_message left a forbidden character in \
+                 the output: {escaped:?}",
+                ch as u32
+            );
+            let expected_literal = format!("\\u{:04X}", ch as u32);
+            assert!(
+                escaped.contains(&expected_literal),
+                "U+{:04X}: expected the escaped output to contain the literal \
+                 {expected_literal:?}, got {escaped:?}",
+                ch as u32
+            );
+        }
+        assert_eq!(
+            checked, 80,
+            "non-vacuity: expected to have exercised all 80 forbidden codepoints"
+        );
+    }
+
+    /// A path containing more than one forbidden character (TAB and ESC
+    /// together — TAB proves the WIRE-alone gap is closed, ESC proves the
+    /// WIRE-inherited escaping still works) is escaped in full, and a clean
+    /// path with no forbidden character is returned borrowed.
+    #[test]
+    fn escape_path_for_message_mixed_and_clean_input() {
+        let mixed = escape_path_for_message("a\tb\x1Bc");
+        assert_eq!(mixed, "a\\u0009b\\u001Bc");
+        assert!(!mixed.chars().any(is_forbidden_path_char));
+
+        let clean = "normal/relative/path.mds";
+        let escaped = escape_path_for_message(clean);
+        assert_eq!(escaped, clean);
+        assert!(
+            matches!(escaped, Cow::Borrowed(_)),
+            "clean input must not allocate"
         );
     }
 

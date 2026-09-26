@@ -26,12 +26,16 @@ if (process.argv.length !== 3 || !VALID_PLATFORMS.includes(platform)) {
 }
 
 // Step 2: Assert cwd is /w — node:22-alpine sets no WORKDIR so the default cwd is /;
-// mds-core rejects a filesystem-root base directory (#371, found by this gate's first
-// run); the docker run must pass -w /w so this probe runs from the fixture dir.
+// this gate's first run surfaced mds-core rejecting a filesystem-root base directory
+// (#371, since fixed: NativeFs::canonical_dir anchors a root base dir at the root
+// instead of erroring). The docker run still passes -w /w so this probe runs from
+// the fixture dir, and the assertion below stays as a regression tripwire — a
+// dropped -w flag now exercises the (fixed) root-base-dir path instead of silently
+// reintroducing the old failure mode.
 if (process.cwd() !== '/w') {
   process.stderr.write(
     '::error::probe must run with cwd /w (docker run -w /w); got ' +
-    process.cwd() + ' — a root cwd trips the mds-core base-directory defect (#371)\n',
+    process.cwd() + ' — dropped -w /w (#371 regression tripwire)\n',
   );
   process.exit(1);
 }
