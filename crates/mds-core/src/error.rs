@@ -374,6 +374,13 @@ pub enum MdsError {
         src: Option<Arc<miette::NamedSource<String>>>,
     },
 
+    /// An entry file, or the target of an `@import`, `@export … from`, frontmatter
+    /// import or `@extends`, is not an MDS file: neither a `.mds` file nor a `.md` file
+    /// whose frontmatter declares `type: mds`.
+    ///
+    /// `path` is display text: the path as the caller typed it — the entry path passed
+    /// to the API, or the string as written in the template — escaped with
+    /// [`crate::escape_path_for_message`]; never the resolved key (#417).
     #[error("not an MDS file: {path}")]
     #[diagnostic(
         code(mds::not_mds),

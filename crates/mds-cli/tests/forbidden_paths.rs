@@ -87,11 +87,36 @@ fn assert_refusal(text: &str, ch: char, shown_escaped: &str, label: &str) {
 
 /// `s` without whitespace or miette's `│` frame marker, so a message miette wrapped
 /// (at a space or after a `/`) compares equal to the unwrapped one.
-#[cfg(unix)]
 fn squash(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
         .collect()
+}
+
+/// How a message frames the path it names: the text right before it and right after
+/// it.
+type Frame<'a> = (&'a str, &'a str);
+
+/// A path in double quotes, as every refusal (#265) shows it. Unix-only: its callers
+/// are the hostile-name walker tests, which Windows cannot run.
+#[cfg(unix)]
+const QUOTED: Frame<'static> = ("\"", "\"");
+
+/// `text` names the path exactly as `shown`, framed by `frame`, and never frames the
+/// canonical absolute form of `resolved` — status lines may name that, an error may
+/// not.
+fn assert_names_as_typed(text: &str, frame: Frame<'_>, shown: &str, resolved: &Path, label: &str) {
+    let (open, close) = frame;
+    let text = squash(text);
+    let canonical = resolved.canonicalize().unwrap();
+    assert!(
+        !text.contains(&squash(&format!("{open}{}", canonical.display()))),
+        "{label}: must not name the absolute path; got: {text}"
+    );
+    assert!(
+        text.contains(&squash(&format!("{open}{shown}{close}"))),
+        "{label}: must name {shown:?} as typed; got: {text}"
+    );
 }
 
 // ── Walker matrix ───────────────────────────────────────────────────────────
@@ -252,7 +277,13 @@ mod walker {
 
         let stderr = tap.finish_text(&mut child);
         assert_refusal(&stderr, ESC, &shown, "watch");
-        assert_names_as_typed(&stderr, &format!("src/{shown}"), dir.path(), "watch");
+        assert_names_as_typed(
+            &stderr,
+            QUOTED,
+            &format!("src/{shown}"),
+            dir.path(),
+            "watch",
+        );
         assert!(
             !out.join(format!("evil{ESC}[31m.md")).exists(),
             "nothing is written for the refused file"
@@ -267,23 +298,7 @@ mod walker {
         let (code, text) = run(dir.path(), &["watch", hostile.as_str()]);
         assert_eq!(code, Some(2), "refused at startup; got: {text}");
         assert_refusal(&text, ESC, &shown, "watch file");
-        assert_names_as_typed(&text, &shown, dir.path(), "watch file");
-    }
-
-    /// `text` quotes the refused path exactly as `shown` and never quotes the
-    /// canonical absolute path of `root` — status lines may name that, a refusal may
-    /// not.
-    fn assert_names_as_typed(text: &str, shown: &str, root: &Path, label: &str) {
-        let text = squash(text);
-        let canonical = root.canonicalize().unwrap();
-        assert!(
-            !text.contains(&squash(&format!("\"{}", canonical.display()))),
-            "{label}: must not quote the absolute path; got: {text}"
-        );
-        assert!(
-            text.contains(&squash(&format!("\"{shown}\""))),
-            "{label}: must quote {shown:?} as typed; got: {text}"
-        );
+        assert_names_as_typed(&text, QUOTED, &shown, dir.path(), "watch file");
     }
 
     /// `--vars` naming a hostile file reports the refusal, not the symlink message it
@@ -464,6 +479,68 @@ fn single_file_argument_is_refused_before_the_existence_check() {
             "{sub} control: got: {text}"
         );
     }
+}
+
+// ── #417: `not_mds` names the file argument as typed ────────────────────────
+
+/// A file argument that is not an MDS file is named as the user typed it —
+/// `doc.txt`, `./sub/../doc.txt`, or the uncanonicalized absolute path — never by its
+/// canonical absolute path, under every single-file subcommand: `build` and `check`
+/// (the resolver raises it), `watch` file mode (its startup compile), and `lint` and
+/// `fmt` (their own input check). `watch` reports it and keeps watching (#417).
+///
+/// Portable: no hostile names are involved.
+#[test]
+fn not_mds_cli_names_typed_path() {
+    use common::{spawn_watch_ready, ChildGuard};
+
+    /// The miette frame around the path: `× not an MDS file: <path>` and the help
+    /// line right after it.
+    const NOT_MDS: Frame<'static> = ("not an MDS file: ", "help:");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let doc = dir.path().join("doc.txt");
+    std::fs::write(&doc, "Hello!\n").unwrap();
+    let absolute = dir
+        .path()
+        .join("sub")
+        .join("..")
+        .join("doc.txt")
+        .display()
+        .to_string();
+    for typed in ["doc.txt", "./sub/../doc.txt", absolute.as_str()] {
+        for sub in ["build", "check", "lint", "fmt"] {
+            let label = format!("{sub} {typed}");
+            let (code, text) = run(dir.path(), &[sub, typed]);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert!(text.contains("mds::not_mds"), "{label}: got: {text}");
+            assert_names_as_typed(&text, NOT_MDS, typed, &doc, &label);
+        }
+
+        let label = format!("watch {typed}");
+        let (child, tap, _) = spawn_watch_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", typed, "--out-dir", "out", "--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        let mut child = ChildGuard(child);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{label}: watch keeps running after the startup error"
+        );
+        let text = tap.finish_text(&mut child);
+        assert!(text.contains("mds::not_mds"), "{label}: got: {text}");
+        assert_names_as_typed(&text, NOT_MDS, typed, &doc, &label);
+    }
+
+    // Control: the same typed form naming an MDS file builds, so only the file's type
+    // is refused above.
+    std::fs::write(dir.path().join("doc.mds"), "Hello!\n").unwrap();
+    let (code, text) = run(dir.path(), &["build", "./sub/../doc.mds", "-o", "-"]);
+    assert_eq!(code, Some(0), "control: got: {text}");
+    assert!(!text.contains("not an MDS file"), "control: got: {text}");
 }
 
 /// `mds watch --vars` with a path carrying a forbidden character is refused up front

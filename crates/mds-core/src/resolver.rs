@@ -406,7 +406,11 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         let key = self.resolve_entry_key(path)?;
-        self.resolve_by_key(&key, runtime_vars, warnings)
+        let entry = KeyRef {
+            key: &key,
+            shown: path,
+        };
+        self.resolve_by_key(entry, runtime_vars, warnings)
     }
 
     /// Resolve a module from a filesystem path string, dispatching on output shape.
@@ -423,7 +427,11 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         let key = self.resolve_entry_key(path)?;
-        self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
+        let entry = KeyRef {
+            key: &key,
+            shown: path,
+        };
+        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
     }
 
     /// Like [`Self::resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -436,19 +444,25 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         let key = self.resolve_entry_key(path)?;
-        self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
+        let entry = KeyRef {
+            key: &key,
+            shown: path,
+        };
+        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
     }
 
     /// Resolve a module by its normalized key.
     ///
     /// This is the core resolution loop: cache check → depth check →
     /// cycle detection → read → validate type → process → cache insert.
+    /// `module.shown` only names the module when it is not an MDS file (#417).
     fn resolve_by_key(
         &mut self,
-        key: &str,
+        module: KeyRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
+        let key = module.key;
         // Step 1: cache hit — return immediately without reading, UNLESS the cached
         // entry is a skeleton (resolved as an @extends base: collect-only, never
         // validated/evaluated standalone, prompt_body = None). A skeleton entry must
@@ -480,7 +494,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
 
         // Step 6: validate file type.
-        validate_file_type(key, &source)?;
+        validate_file_type(module, &source)?;
 
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
@@ -529,7 +543,7 @@ impl ModuleCache {
     ///
     /// Validates the import path, resolves it via `FileSystem::normalize_in_dir`
     /// (directory-anchored — no sentinel-path coupling), then delegates to
-    /// [`ModuleCache::resolve_by_key`].
+    /// [`ModuleCache::resolve_by_key`], which names the module by `relative` as written.
     fn resolve_import_from(
         &mut self,
         base_dir: &str,
@@ -539,7 +553,11 @@ impl ModuleCache {
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         validate_import_path(relative)?;
         let key = self.fs.normalize_in_dir(base_dir, relative)?;
-        self.resolve_by_key(&key, runtime_vars, warnings)
+        let module = KeyRef {
+            key: &key,
+            shown: relative,
+        };
+        self.resolve_by_key(module, runtime_vars, warnings)
     }
 
     /// Resolve an entry module by its key.
@@ -556,8 +574,12 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        let key = self.resolve_entry_key(key)?;
-        self.resolve_by_key(&key, runtime_vars, warnings)
+        let resolved = self.resolve_entry_key(key)?;
+        let entry = KeyRef {
+            key: &resolved,
+            shown: key,
+        };
+        self.resolve_by_key(entry, runtime_vars, warnings)
     }
 
     /// Resolve a module from an in-memory source string.
@@ -616,7 +638,11 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         let key = self.resolve_entry_key(entry)?;
-        self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
+        let entry = KeyRef {
+            key: &key,
+            shown: entry,
+        };
+        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
     }
 
     /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -629,7 +655,11 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         let key = self.resolve_entry_key(entry)?;
-        self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
+        let entry = KeyRef {
+            key: &key,
+            shown: entry,
+        };
+        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
     }
 
     /// Resolve a module by its normalized key, dispatching on output shape.
@@ -641,11 +671,11 @@ impl ModuleCache {
     /// are evaluated only once.
     fn resolve_intrinsic_by_key(
         &mut self,
-        key: &str,
+        entry: KeyRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        self.resolve_intrinsic_by_key_opts(key, runtime_vars, &Default::default(), warnings)
+        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, &Default::default(), warnings)
             .map(|(output, _)| output)
     }
 
@@ -653,11 +683,12 @@ impl ModuleCache {
     /// `(CompiledOutput, Option<SourceMap>)`.
     fn resolve_intrinsic_by_key_opts(
         &mut self,
-        key: &str,
+        entry: KeyRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        let key = entry.key;
         // Cycle detection: if this key is already on the resolving stack it forms
         // a circular import that must be rejected.
         if self.resolving.contains(key) {
@@ -669,7 +700,7 @@ impl ModuleCache {
 
         let source = self.fs.read(key)?;
         let is_md = self.fs.is_markdown(key);
-        validate_file_type(key, &source)?;
+        validate_file_type(entry, &source)?;
 
         self.resolving.insert(key.to_string());
 
@@ -1333,8 +1364,12 @@ impl ModuleCache {
         // PF-004 (avoids PF-004): resolve through resolve_by_key_skeleton so cycle
         // detection, MAX_IMPORT_DEPTH, dependency tracking, and MAX_FILE_SIZE all apply.
         // This guard holds for BOTH text and messages modes — they share this path.
+        let base_ref = KeyRef {
+            key: &base_key,
+            shown: &ext.path,
+        };
         let base = self
-            .resolve_by_key_skeleton(&base_key, ctx.runtime_vars, warnings)
+            .resolve_by_key_skeleton(base_ref, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // ── Step 3b: child-only-blocks check ─────────────────────────────────
@@ -1501,10 +1536,11 @@ impl ModuleCache {
     /// same normalized key. The first resolution wins. See ResolvedModule doc comment for details.
     fn resolve_by_key_skeleton(
         &mut self,
-        key: &str,
+        module: KeyRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
+        let key = module.key;
         // Cache hit — return immediately (full or skeleton entry, both are valid bases).
         if let Some(cached) = self.modules.get(key) {
             return Ok(Arc::clone(cached));
@@ -1525,7 +1561,7 @@ impl ModuleCache {
         // PF-004: read via FileSystem trait — NEVER std::fs.
         let source = self.fs.read(key)?;
         let is_md = self.fs.is_markdown(key);
-        validate_file_type(key, &source)?;
+        validate_file_type(module, &source)?;
 
         self.resolving.insert(key.to_string());
 
@@ -1587,8 +1623,12 @@ impl ModuleCache {
             .fs
             .normalize_in_dir(ctx.base_dir, &ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+        let grandparent_ref = KeyRef {
+            key: &grandparent_key,
+            shown: &ext.path,
+        };
         let grandparent = self
-            .resolve_by_key_skeleton(&grandparent_key, ctx.runtime_vars, warnings)
+            .resolve_by_key_skeleton(grandparent_ref, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // Child-only-blocks check for this intermediate base (3b).
@@ -2167,6 +2207,20 @@ struct ModuleCtx<'a> {
     runtime_vars: &'a HashMap<String, Value>,
 }
 
+/// A module's key together with the path the caller typed to reach it (#417).
+///
+/// `key` is what the backend resolved the path to — the identity every check, cache
+/// lookup and read uses (on [`crate::NativeFs`] the canonical absolute path, in its
+/// on-disk spelling). `shown` is the text that named the module: the entry path passed
+/// to the API, or the `@import`, `@export … from`, frontmatter `imports:` or `@extends`
+/// string as written in the template. `shown` only ever names the module in an error
+/// message; nothing compares it with `key` (canonicalization re-spells a path, #408).
+#[derive(Clone, Copy)]
+struct KeyRef<'a> {
+    key: &'a str,
+    shown: &'a str,
+}
+
 /// Whether `name` is an available export of a module: every name when the module
 /// declares no `@export` list, only the listed names when it does.
 ///
@@ -2557,8 +2611,13 @@ fn validate_import_path(path: &str) -> Result<(), MdsError> {
 /// Validate that a file is a valid MDS file.
 ///
 /// Accepts the already-read source content to avoid double-reading for `.md` files.
-/// Uses the normalized key (string) rather than a Path.
-fn validate_file_type(key: &str, source: &str) -> Result<(), MdsError> {
+/// The extension is judged on `module.key`, the resolved key — on [`crate::NativeFs`]
+/// the on-disk spelling, so `Doc.MDS` typed for `doc.mds` is an MDS file (#408). The
+/// error names `module.shown`, the path as the caller typed it, escaped with
+/// [`crate::escape_path_for_message`] — never the resolved key, which on
+/// [`crate::NativeFs`] is an absolute path (#417).
+fn validate_file_type(module: KeyRef<'_>, source: &str) -> Result<(), MdsError> {
+    let key = module.key;
     // Extract extension from the key string (split on '/' and '\\' for portability).
     let filename = key.rsplit(['/', '\\']).next().unwrap_or(key);
     // Guard against dotfiles: a filename that starts with '.' and contains no
@@ -2579,7 +2638,9 @@ fn validate_file_type(key: &str, source: &str) -> Result<(), MdsError> {
         return Ok(());
     }
 
-    Err(MdsError::not_mds_file(key.to_string()))
+    Err(MdsError::not_mds_file(
+        crate::lint::escape_path_for_message(module.shown).into_owned(),
+    ))
 }
 
 /// Return `true` if a frontmatter line declares `type: mds` at the top level.

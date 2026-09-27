@@ -230,6 +230,40 @@ describe('compileFile', () => {
       process.chdir(originalCwd);
     }
   });
+
+  test('CF-NOTMDS: a non-MDS entry is named as typed, never by its resolved absolute path (#417)', () => {
+    // Every form differs from the canonical path: `sub/..` is built by hand, since
+    // path.join would normalize it away, and the temporary directory itself is not
+    // canonical on macOS (`/var/…` for `/private/var/…`).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-napi-notmds-'));
+    const originalCwd = process.cwd();
+    try {
+      fs.mkdirSync(path.join(dir, 'sub'));
+      fs.writeFileSync(path.join(dir, 'doc.txt'), 'Hello!\n');
+      fs.writeFileSync(path.join(dir, 'page.md'), '---\ntype: mds\n---\nHello!\n');
+      const dotted = (name) => [dir, 'sub', '..', name].join(path.sep);
+      const canonical = fs.realpathSync(path.join(dir, 'doc.txt'));
+      process.chdir(dir);
+      for (const typed of ['doc.txt', './sub/../doc.txt', dotted('doc.txt')]) {
+        assert.throws(
+          () => compileFile(typed),
+          (err) => {
+            assert.equal(err.code, 'mds::not_mds', `${typed}: ${err.message}`);
+            assert.equal(err.message, `not an MDS file: ${typed}`, typed);
+            assert.equal(err.help, "use .mds extension or add 'type: mds' to frontmatter", typed);
+            assert.ok(!err.message.includes(canonical), `${typed}: resolved path shown: ${err.message}`);
+            return true;
+          },
+        );
+        // Control: the same form naming a `type: mds` file compiles.
+        const control = typed.replace('doc.txt', 'page.md');
+        assert.equal(compileFile(control).output, 'Hello!\n', control);
+      }
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── Check tests ───────────────────────────────────────────────────────────────

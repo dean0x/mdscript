@@ -635,11 +635,12 @@ fn json_format_nonexistent_path_emits_error_envelope() {
 // ── C4/F6: existence-before-extension ordering for lint ──────────────────────
 
 /// A non-existent path that also lacks the `.mds` extension must report
-/// `mds::file_not_found`, NOT `mds::not_mds_file` (C4/F6).
+/// `mds::file_not_found`, NOT `mds::not_mds` (C4/F6): `ensure_existing_mds_file`
+/// checks existence before the extension.
 ///
-/// Before this fix, `ensure_mds_extension` ran before the file was opened, so
-/// `/nonexistent.txt` produced a confusing "not an .mds file" diagnostic.
-/// Now `ensure_existing_mds_file` checks existence first.
+/// Positive control (PF-013): once the same path exists it IS refused as
+/// `mds::not_mds`, `not an MDS file`, so the absence check looks for the code and text
+/// that error really carries.
 #[test]
 fn lint_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -655,39 +656,63 @@ fn lint_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("mds::file_not_found") || stderr.contains("file not found"),
+        stderr.contains("mds::file_not_found") && stderr.contains("file not found"),
         "error must be file-not-found (not extension error); got: {stderr:?}"
     );
     assert!(
-        !stderr.contains("mds::not_mds_file") && !stderr.contains("not an .mds"),
-        "must NOT report 'not an .mds file' for a non-existent path; got: {stderr:?}"
+        !stderr.contains("mds::not_mds") && !stderr.contains("not an MDS file"),
+        "must NOT report 'not an MDS file' for a non-existent path; got: {stderr:?}"
+    );
+
+    std::fs::write(&missing, "Hello!\n").unwrap();
+    let out = lint_path(&missing, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "control: an existing .txt exits 2"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mds::not_mds") && stderr.contains("not an MDS file"),
+        "control: an existing .txt is mds::not_mds; got: {stderr:?}"
     );
 }
 
 /// Same as above but in `--format json` mode: the error envelope must have
-/// code `mds::file_not_found`, not `mds::not_mds_file`.
+/// code `mds::file_not_found`, not `mds::not_mds` — and, as the control, `mds::not_mds`
+/// once the path exists.
 #[test]
 fn lint_nonexistent_non_mds_json_mode_reports_file_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing_12345.txt");
-
-    let out = lint_path(&missing, &["--format", "json"]);
+    let envelope_code = |label: &str| {
+        let out = lint_path(&missing, &["--format", "json"]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{label}: --format json must exit 2"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("{label}: stdout must be valid JSON (error envelope); parse error: {e}; stdout: {stdout}")
+        });
+        parsed["error"]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: error.code must be a string; got: {parsed}"))
+            .to_string()
+    };
 
     assert_eq!(
-        out.status.code(),
-        Some(2),
-        "--format json + nonexistent .txt must exit 2"
+        envelope_code("missing"),
+        "mds::file_not_found",
+        "JSON envelope code must be mds::file_not_found (not mds::not_mds)"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("stdout must be valid JSON (error envelope); parse error: {e}; stdout: {stdout}")
-    });
-    let code = parsed["error"]["code"]
-        .as_str()
-        .unwrap_or_else(|| panic!("error.code must be a string; got: {parsed}"));
+
+    std::fs::write(&missing, "Hello!\n").unwrap();
     assert_eq!(
-        code, "mds::file_not_found",
-        "JSON envelope code must be mds::file_not_found (not mds::not_mds_file); got: {code}"
+        envelope_code("control"),
+        "mds::not_mds",
+        "control: an existing .txt is mds::not_mds"
     );
 }
 

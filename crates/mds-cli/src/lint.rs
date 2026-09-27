@@ -225,7 +225,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
 
     // Single-file mode.
     // Check existence first, then extension (C4/F6): a non-existent path must report
-    // mds::file_not_found, not mds::not_mds_file, regardless of the extension.
+    // mds::file_not_found, not mds::not_mds, regardless of the extension.
     // Route through emit_analysis_failure_json_or_stderr so --format json produces the
     // correct error envelope (L-CLI-JSON4 / AC-F-14). Do NOT use `?` here.
     if let Err(mds_err) = ensure_existing_mds_file(&input) {

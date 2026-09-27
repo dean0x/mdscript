@@ -4302,3 +4302,44 @@ fn source_map_root_safety_net_never_fails_a_compile() {
         }
     }
 }
+
+// ── #417: validate_file_type ──────────────────────────────────────────────
+
+/// `validate_file_type` judges the extension on the resolved key and names the path
+/// as typed, escaped (#417). The escape is defence in depth — every built-in route
+/// refuses a forbidden character in the typed path first — so only this unit test
+/// can reach it.
+#[test]
+fn validate_file_type_judges_the_key_and_names_the_shown_path_escaped() {
+    let check = |key: &str, shown: &str, source: &str| {
+        validate_file_type(KeyRef { key, shown }, source).map_err(|e| e.to_string())
+    };
+    let bs = '\\';
+    let hostile = format!("./a{}b\tc\u{202E}d.txt", '\x1b');
+    assert_eq!(
+        check("/abs/proj/doc.txt", &hostile, "Hi\n"),
+        Err(format!(
+            "not an MDS file: ./a{bs}u001Bb{bs}u0009c{bs}u202Ed.txt"
+        )),
+        "the path as typed, escaped — never the key"
+    );
+    // The extension is the key's, whatever the typed spelling says.
+    assert_eq!(
+        check("/abs/proj/doc.txt", "./doc.mds", ""),
+        Err("not an MDS file: ./doc.mds".to_string())
+    );
+    assert_eq!(check("/abs/proj/doc.mds", "./Doc.MDS", ""), Ok(()));
+    // Controls: an `.md` key passes only with `type: mds` in its frontmatter.
+    assert_eq!(
+        check(
+            "/abs/proj/page.md",
+            "./page.md",
+            "---\ntype: mds\n---\nHi\n"
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check("/abs/proj/page.md", "./page.md", "Hi\n"),
+        Err("not an MDS file: ./page.md".to_string())
+    );
+}

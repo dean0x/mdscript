@@ -121,6 +121,14 @@ fn wait_for_file_contains_tight(path: &Path, needle: &str, timeout: Duration) ->
     false
 }
 
+/// `s` without whitespace or miette's `│` frame marker, so a message miette wrapped
+/// (at a space or after a `/`) compares equal to the unwrapped one.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+        .collect()
+}
+
 /// Poll `path` until it no longer exists, or `timeout` elapses.
 fn wait_for_file_gone(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
@@ -238,6 +246,142 @@ fn watch_initial_compile_writes_output() {
 
     let found = wait_for_file_contains(&out, "Hello World!", TIMEOUT);
     assert!(found, "initial compile should write output to hello.md");
+    drop(child);
+}
+
+/// A `.md` entry that declares `type: mds` is an MDS file: file mode compiles it and
+/// rebuilds it on an edit. The resolver judges the file type, so watch must not run
+/// the CLI's `.mds`-extension check on its entry (#417 compiles the entry by the path
+/// as typed, and nothing else changes). Written to `-o`, since the default output
+/// path of `page.md` is the entry itself.
+#[test]
+fn watch_type_mds_markdown_entry_compiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, "---\ntype: mds\nname: World\n---\nHello {{name}}!\n").unwrap();
+    let out = dir.path().join("out.md");
+
+    let (child, _stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md", "-o", "out.md", "--debounce", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello World!", TIMEOUT),
+        "a type: mds .md entry compiles at startup"
+    );
+
+    write_atomic(&src, "---\ntype: mds\nname: Again\n---\nHello {{name}}!\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello Again!", TIMEOUT),
+        "and is rebuilt on an edit"
+    );
+    drop(child);
+}
+
+/// A rebuild compiles the entry by the path as typed as well, so an error about the
+/// entry raised on a rebuild names it that way (#417): once `page.md` drops its
+/// `type: mds`, the rebuild reports `not an MDS file: ./sub/../page.md`, never the
+/// canonical absolute path. Control: the same typed path compiled at startup.
+#[test]
+fn watch_rebuild_names_the_entry_as_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, "---\ntype: mds\n---\nHello!\n").unwrap();
+    let out = dir.path().join("out.md");
+    let typed = "./sub/../page.md";
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", typed, "-o", "out.md", "--debounce", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello!", TIMEOUT),
+        "control: the typed path compiles at startup"
+    );
+
+    write_atomic(&src, "Hello again!\n");
+    let needle = format!("not an MDS file: {typed}");
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, &needle, TIMEOUT);
+    assert!(
+        stderr.contains(&needle),
+        "the rebuild names the entry as typed; stderr: {stderr}"
+    );
+    // Squashed: miette wraps a long absolute path across lines.
+    let canonical = src.canonicalize().unwrap();
+    assert!(
+        !squash(&stderr).contains(&squash(&format!(
+            "not an MDS file: {}",
+            canonical.display()
+        ))),
+        "never by its canonical absolute path; stderr: {stderr}"
+    );
+    drop(child);
+}
+
+/// File mode compiles the entry by the path as typed but watches its canonical file
+/// (#417). Once a symlinked directory on the typed path is retargeted, the typed path
+/// leads to another file: the rebuild is refused (`mds::io`), naming the entry as typed,
+/// and nothing is written — rather than compiling the new target while watching the
+/// old one. Control: through the link as it was, an edit rebuilds.
+///
+/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_entry_through_a_retargeted_directory_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in [("a", "Hello A\n"), ("b", "Hello B\n")] {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+        std::fs::write(dir.path().join(name).join("page.mds"), text).unwrap();
+    }
+    let link = dir.path().join("link");
+    symlink("a", &link).unwrap();
+    let watched = dir.path().join("a").join("page.mds");
+    let out = dir.path().join("out.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "link/page.mds",
+                "-o",
+                "out.md",
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(wait_for_file_contains(&out, "Hello A", TIMEOUT), "startup");
+    write_atomic(&watched, "Hello A1\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello A1", TIMEOUT),
+        "control: an edit rebuilds through the link"
+    );
+
+    std::fs::remove_file(&link).unwrap();
+    symlink("b", &link).unwrap();
+    write_atomic(&watched, "Hello A2\n");
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, "watched entry now resolves", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(
+            "mds::io×watchedentrynowresolvestoadifferentfile:\"link/page.mds\";\
+             restartmdswatchtofollowit"
+        ),
+        "the rebuild is refused, naming the entry as typed; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "Hello A1\n",
+        "nothing is written from the retargeted file"
+    );
     drop(child);
 }
 

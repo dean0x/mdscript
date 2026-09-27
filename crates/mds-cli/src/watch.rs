@@ -69,9 +69,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use mds::MdsError;
 
 use crate::build::{
-    auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content,
+    auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_entry, compile_to_content,
     emit_duplicate_var_warnings, load_config, resolve_output_path_for_kind, write_output,
-    OutputKind, RuntimeVarArgs,
+    EntryPaths, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
@@ -904,6 +904,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         )
     } else {
         run_watch_file(
+            resolved_input,
             canonical_input,
             output,
             out_dir,
@@ -933,7 +934,14 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 /// For the watch single-file case the path is stable across recompiles (the template
 /// kind cannot change without the template itself changing, which triggers a rebuild).
 struct FileCompileCtx {
+    /// Canonical entry path — matches notify's canonicalized event paths; used for
+    /// `dirs_to_watch`/`files_of_interest`, the output path and baselines.
     entry: PathBuf,
+    /// The entry exactly as the user typed it. The entry is compiled by it, so a compile
+    /// error names the file as typed, never by its canonical absolute path (#417). No
+    /// identity check uses it and its text is never compared with `entry` (#408);
+    /// [`compile_entry`] refuses a compile once it leads to a different file than `entry`.
+    entry_typed: PathBuf,
     /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
     /// used for `dirs_to_watch`/`files_of_interest` (never for display, #326).
     vars_path: Option<PathBuf>,
@@ -1158,8 +1166,12 @@ fn rebuild_file(
     let runtime_vars = resolved.vars.take();
 
     let t0 = Instant::now();
-    match compile_to_content(
-        &ctx.entry,
+    let entry = EntryPaths {
+        typed: &ctx.entry_typed,
+        canonical: &ctx.entry,
+    };
+    match compile_entry(
+        entry,
         runtime_vars,
         ctx.quiet,
         mds::CompileOptions::default(),
@@ -1255,8 +1267,11 @@ fn rebuild_file(
     }
 }
 
+/// Single-file watch: `entry_typed` is the path as typed (the entry is compiled by it,
+/// #417); `entry` is its canonical form, which everything else uses.
 #[allow(clippy::too_many_arguments)]
 fn run_watch_file(
+    entry_typed: PathBuf,
     entry: PathBuf,
     output: Option<String>,
     out_dir: Option<PathBuf>,
@@ -1384,8 +1399,12 @@ fn run_watch_file(
     // Initial compile: returns (output_path, deps, content).
     // content is captured here so the baseline block below can reuse it without
     // recompiling (issue 3 — avoids a redundant second compile at startup).
+    let startup_entry = EntryPaths {
+        typed: &entry_typed,
+        canonical: &entry,
+    };
     let (output_path, initial_deps, initial_content) = match compile_and_write(
-        &entry,
+        startup_entry,
         &output,
         &out_dir,
         &config,
@@ -1527,6 +1546,7 @@ fn run_watch_file(
     // #[allow(clippy::too_many_arguments)] suppressions).
     let ctx = FileCompileCtx {
         entry,
+        entry_typed,
         vars_path,
         vars_path_raw,
         static_set_vars,
@@ -4363,8 +4383,15 @@ mod tests {
         // Use -o <out> style to direct output to a specific path.
         let out = dir.path().join("entry.md");
         let out_str = out.display().to_string();
+        // The canonical form `run_watch` derives, which `compile_entry` checks the typed
+        // path against (on macOS the temporary directory is not canonical).
+        let canonical = mds::NativeFs::check_symlink(&entry).unwrap();
+        let entry_paths = EntryPaths {
+            typed: &entry,
+            canonical: &canonical,
+        };
         let (_written_path, deps, _content) = compile_and_write(
-            &entry,
+            entry_paths,
             &Some(out_str),
             &None,
             &None,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 from collections.abc import Callable
 
@@ -69,6 +70,32 @@ def test_e3_file_not_found() -> None:
     with pytest.raises(m.MdsError) as ei:
         m.compile_file("/no/such/mds/file.mds")
     assert ei.value.code == "mds::file_not_found"
+
+
+@pytest.mark.parametrize("form", ["name", "dotted", "absolute-dotted"])
+def test_e3_not_mds_names_typed_path(
+    form: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-MDS entry is named as typed, never by its resolved absolute path (#417)."""
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "doc.txt").write_text("Hello!\n")
+    (tmp_path / "page.md").write_text("---\ntype: mds\n---\nHello!\n")
+    monkeypatch.chdir(tmp_path)
+    # A str, not a pathlib.Path, which would drop the leading "./".
+    typed = {
+        "name": "{}",
+        "dotted": f".{os.sep}sub{os.sep}..{os.sep}{{}}",
+        "absolute-dotted": f"{tmp_path}{os.sep}sub{os.sep}..{os.sep}{{}}",
+    }[form]
+    entry = typed.format("doc.txt")
+    with pytest.raises(m.MdsError) as ei:
+        m.compile_file(entry)
+    assert ei.value.code == "mds::not_mds"
+    assert ei.value.message == f"not an MDS file: {entry}"
+    assert ei.value.help == "use .mds extension or add 'type: mds' to frontmatter"
+    assert str((tmp_path / "doc.txt").resolve()) not in ei.value.message
+    # Control: the same form naming a `type: mds` file compiles.
+    assert m.compile_file(typed.format("page.md")).output == "Hello!\n"
 
 
 def test_e3_circular_import_virtual() -> None:

@@ -502,33 +502,36 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
 
 // ── Input-validation helpers ──────────────────────────────────────────────────
 
-/// Validate `path` for single-file build/fmt/lint: a forbidden path character is
+/// Validate `path` for single-file fmt/lint: a forbidden path character is
 /// refused first (→ `mds::io`, exit 2, #265), then existence is checked (→
 /// `mds::file_not_found`, exit 2) and then the `.mds` extension (→
-/// `mds::not_mds_file`, exit 2).
+/// `mds::not_mds`, exit 2).
 ///
-/// The refusal comes first because the two errors after it show the path as
-/// given, unescaped; it is worded like `NativeFs::check_symlink`'s, so a hostile
-/// file argument reports the same error whether or not the file exists.
+/// Every error names the path as the user typed it, escaped with
+/// [`mds::escape_path_for_message`] (#417). The refusal comes first and is worded
+/// like `NativeFs::check_symlink`'s, so a hostile file argument reports the same
+/// error whether or not the file exists.
 ///
 /// Existence-before-extension ordering is required so that a user pointing at a
 /// non-existent path without `.mds` receives a "file not found" error rather than
-/// the confusing "not an .mds file" error (C4/F6).
+/// the confusing "not an MDS file" error (C4/F6).
 pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
     crate::output::reject_forbidden_output_path("path", path.as_os_str())?;
+    let lossy = path.to_string_lossy();
+    let shown = mds::escape_path_for_message(&lossy);
     let exists = path.try_exists().map_err(|e| MdsError::Io {
-        message: format!("cannot check {}: {e}", path.display()),
+        message: format!("cannot check {shown}: {e}"),
     })?;
     if !exists {
         return Err(MdsError::FileNotFound {
-            path: path.display().to_string(),
+            path: shown.into_owned(),
             span: None,
             src: None,
         });
     }
     if path.extension().and_then(|e| e.to_str()) != Some("mds") {
         return Err(MdsError::NotMdsFile {
-            path: path.display().to_string(),
+            path: shown.into_owned(),
         });
     }
     Ok(())
@@ -891,8 +894,9 @@ fn serialize_output(output: CompiledOutput) -> Result<String> {
 /// result — the caller does not specify it. This is the pure "compile" step used by the
 /// watch loop for content-based dedup.
 ///
-/// `build` and the initial watch compile use [`compile_and_write`], which calls
-/// this internally and then always writes.
+/// `build` calls this directly; `mds watch` file mode compiles its entry through
+/// [`compile_entry`], and its startup compile through [`compile_and_write`], which
+/// then always writes.
 ///
 /// Pass `opts = mds::CompileOptions::default()` from watch callers that do not want
 /// source maps; the watch paths never emit maps so they always use the default.
@@ -951,7 +955,60 @@ pub(crate) fn compile_to_content(
     })
 }
 
-/// Compile `input`, derive the output path from the compiled kind, and write.
+/// A single-file entry in the two forms `mds watch` holds it in (#417).
+///
+/// `typed` is the path as the user typed it: the entry is compiled by it, so an error
+/// names the file that way, as `mds build` does — never by its canonical absolute path.
+/// `canonical` is the form notify reports event paths under: the output path is derived
+/// from it, and every identity check — watched directories, files of interest,
+/// baselines — uses it. `typed` is never compared with it as text (#408); [`compile_entry`]
+/// canonicalizes `typed` again and compares the two canonical directories.
+#[derive(Clone, Copy)]
+pub(crate) struct EntryPaths<'a> {
+    pub(crate) typed: &'a Path,
+    pub(crate) canonical: &'a Path,
+}
+
+/// Refuse to compile a watched entry once `entry.typed` leads into a different directory
+/// than `entry.canonical` (#417).
+///
+/// The resolver resolves `typed` afresh on every compile, while `mds watch` keeps
+/// watching `canonical`. Once a symlinked directory on the typed path is retargeted, or
+/// a directory on it replaced, the two name different files: the compile would read one
+/// while the watched directories, baselines and output path follow the other. The
+/// directories are compared canonical with canonical, so a file name the volume
+/// respells (its case, on a case-insensitive volume) is not a move (#408). A path that
+/// no longer resolves at all is left to the compile, which reports it by the path as
+/// typed. A retarget racing the compile itself is the check-then-open window every
+/// path-based read has.
+fn ensure_entry_unmoved(entry: EntryPaths<'_>) -> Result<(), MdsError> {
+    match mds::NativeFs::check_symlink(entry.typed) {
+        Ok(now) if now.parent() != entry.canonical.parent() => Err(MdsError::Io {
+            message: format!(
+                "watched entry now resolves to a different file: \"{}\"; \
+                 restart mds watch to follow it",
+                mds::escape_path_for_message(&entry.typed.to_string_lossy())
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Compile a watched entry by `entry.typed`, so an error names it as the user typed it
+/// (#417), after [`ensure_entry_unmoved`] has confirmed that the typed path still leads
+/// to `entry.canonical`, the file `mds watch` watches.
+pub(crate) fn compile_entry(
+    entry: EntryPaths<'_>,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    quiet: bool,
+    opts: mds::CompileOptions,
+) -> Result<CompileOutput> {
+    ensure_entry_unmoved(entry).map_err(miette::Error::from)?;
+    compile_to_content(entry.typed, runtime_vars, quiet, opts)
+}
+
+/// Compile `entry` with [`compile_entry`], derive the output path from the compiled
+/// kind and `entry.canonical`, and write.
 ///
 /// Returns `(output_path, deps, content)`:
 /// - `output_path`: the resolved output path (None for stdout).
@@ -976,7 +1033,7 @@ pub(crate) fn compile_to_content(
 /// `mds::compile_str_with_deps_opts` (which use the resolver that enforces MAX_FILE_SIZE).
 /// There is no bare `std::fs::read_to_string` path here.
 pub(crate) fn compile_and_write(
-    input: &Path,
+    entry: EntryPaths<'_>,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<(MdsConfig, PathBuf)>,
@@ -984,9 +1041,9 @@ pub(crate) fn compile_and_write(
     quiet: bool,
     opts: mds::CompileOptions,
 ) -> Result<(Option<PathBuf>, Vec<String>, String)> {
-    let compiled = compile_to_content(input, runtime_vars, quiet, opts)?;
+    let compiled = compile_entry(entry, runtime_vars, quiet, opts)?;
     let output_path = resolve_output_path_for_kind(
-        &Some(input.to_path_buf()),
+        &Some(entry.canonical.to_path_buf()),
         output,
         out_dir,
         config,
@@ -1983,6 +2040,59 @@ mod tests {
             assert!(compiled.dependencies[0].starts_with(r"\\?\"));
             assert!(!library[0].starts_with(r"\\?\"));
         }
+    }
+
+    /// #417: `compile_entry` compiles a watched entry by the typed path while that path
+    /// leads to the canonical entry's directory, and refuses it — naming the path as
+    /// typed, never the canonical one — once it leads into another directory. A typed
+    /// path that no longer resolves is left to the compile's own error.
+    #[test]
+    fn compile_entry_refuses_a_typed_path_that_leads_elsewhere() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["a", "b"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(
+                dir.path().join(name).join("page.mds"),
+                format!("Hi {name}\n"),
+            )
+            .unwrap();
+        }
+        let typed = dir.path().join("a").join("page.mds");
+        let compile = |canonical: &Path| {
+            let entry = EntryPaths {
+                typed: &typed,
+                canonical,
+            };
+            compile_entry(entry, None, true, mds::CompileOptions::default())
+                .map(|compiled| compiled.content)
+                .map_err(|e| e.to_string())
+        };
+
+        let here = mds::NativeFs::check_symlink(&typed).unwrap();
+        assert_eq!(compile(&here), Ok("Hi a\n".to_string()), "control");
+
+        let elsewhere =
+            mds::NativeFs::check_symlink(&dir.path().join("b").join("page.mds")).unwrap();
+        let refused = compile(&elsewhere).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "watched entry now resolves to a different file: \"{}\"; \
+                 restart mds watch to follow it",
+                typed.display()
+            )
+        );
+        assert!(
+            !refused.contains(&*elsewhere.to_string_lossy()),
+            "{refused}"
+        );
+
+        std::fs::remove_file(&typed).unwrap();
+        let missing = compile(&here).unwrap_err();
+        assert!(
+            !missing.contains("different file"),
+            "a missing entry is the compile's error: {missing}"
+        );
     }
 
     // ── compute_source_map_base ───────────────────────────────────────────────
