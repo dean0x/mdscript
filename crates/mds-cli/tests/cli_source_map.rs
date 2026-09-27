@@ -1100,6 +1100,112 @@ fn sm16_stale_map_not_smv3_preserved_with_warning() {
     );
 }
 
+// ── SM-16c: the stale-map check deletes only a sidecar mds wrote (#428) ───────
+
+/// Run `mds <args>` in `dir` and return `(exit code, stderr)`. Bounded: a run still going
+/// after 20 s — blocked opening a FIFO, say — is killed, and reported with no exit code.
+fn run_bounded(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    use std::io::Read as _;
+    let mut child = mds_bin()
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mds binary should spawn");
+    let mut pipe = child.stderr.take().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = pipe.read_to_string(&mut text);
+        text
+    });
+    // Bounded: at most 20 s / 10 ms iterations.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = drain.join().unwrap();
+            return (None, format!("killed: still running after 20 s; {stderr}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    (status.code(), drain.join().unwrap())
+}
+
+/// #428: a build without `--source-map` deletes the sidecar an earlier `--source-map`
+/// build wrote (the control), and leaves anything else at `<output>.map` in place with
+/// the warning: a hand-formatted map with the same fields, a 64 MiB file of anything
+/// else (only a sidecar's first bytes are read), and on Unix a FIFO, which is never
+/// opened — opening one with no writer blocks.
+#[test]
+fn sm16c_stale_map_check_leaves_anything_but_a_sidecar_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("page.mds"), "Hi\n").unwrap();
+    let map = dir.path().join("out.md.map");
+    let rebuild = ["build", "page.mds", "-o", "out.md"];
+    let warning =
+        "warning: leaving out.md.map in place — not a tool-generated SMv3 map (version/file mismatch)";
+
+    let (code, stderr) = run_bounded(
+        dir.path(),
+        &["build", "page.mds", "--source-map", "-o", "out.md"],
+    );
+    assert_eq!(code, Some(0), "source-map build: {stderr}");
+    assert!(map.is_file(), "the sidecar is written");
+    let (code, stderr) = run_bounded(dir.path(), &rebuild);
+    assert_eq!(code, Some(0), "control rebuild: {stderr}");
+    assert!(
+        !map.exists(),
+        "control: the sidecar is deleted; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Removed stale map out.md.map"),
+        "control: {stderr}"
+    );
+
+    let mut mismatches = Vec::new();
+    let hand_formatted =
+        b"{ \"version\": 3, \"file\": \"out.md\", \"sources\": [], \"names\": [], \"mappings\": \"\" }"
+            .to_vec();
+    for (label, bytes) in [
+        ("hand-formatted, same fields", hand_formatted),
+        ("64 MiB of x", vec![b'x'; 64 * 1024 * 1024]),
+    ] {
+        std::fs::write(&map, &bytes).unwrap();
+        let (code, stderr) = run_bounded(dir.path(), &rebuild);
+        let kept = std::fs::read(&map).is_ok_and(|now| now == bytes);
+        if code != Some(0) || !kept || !stderr.lines().any(|l| l == warning) {
+            mismatches.push(format!(
+                "{label}: exit {code:?}, left in place: {kept}; stderr: {stderr}"
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        std::fs::remove_file(&map).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&map)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo out.md.map");
+        let (code, stderr) = run_bounded(dir.path(), &rebuild);
+        let fifo = std::fs::symlink_metadata(&map).is_ok_and(|m| m.file_type().is_fifo());
+        if code != Some(0) || !fifo || !stderr.lines().any(|l| l == warning) {
+            mismatches.push(format!(
+                "FIFO: exit {code:?}, left in place: {fifo}; stderr: {stderr}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
 // ── SM-14b: stdin --source-map sidecar relabels source to <stdin> ────────────
 //
 // After the STRING_SOURCE_MAP_LABEL fix, stdin builds emit "input.mds" in

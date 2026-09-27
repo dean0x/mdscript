@@ -160,23 +160,22 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
         if candidate.is_file() {
             let shown = crate::output::safe_path(&shown_dir.join("mds.json"));
             // The size is taken from the opened file, and the read stops one byte past
-            // the cap, so an oversized mds.json — or one that grows while it is read —
-            // is never held in memory whole (#428).
+            // the cap into a buffer that never grows past it, so an oversized mds.json
+            // — or one that grows while it is read — is never held in memory whole
+            // (#428).
             let cannot_read = |e: std::io::Error| {
                 miette::miette!("cannot read {shown}: {}", crate::output::safe_inline(&e))
             };
             let too_large = |size: u64| {
                 miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MB)")
             };
-            let file = std::fs::File::open(&candidate).map_err(cannot_read)?;
+            let mut file = std::fs::File::open(&candidate).map_err(cannot_read)?;
             let size = file.metadata().map_err(cannot_read)?.len();
             if size > MAX_CONFIG_SIZE {
                 return Err(too_large(size));
             }
-            let mut bytes = Vec::with_capacity(size as usize + 1);
-            file.take(MAX_CONFIG_SIZE + 1)
-                .read_to_end(&mut bytes)
-                .map_err(cannot_read)?;
+            let bytes =
+                mds::read_at_most(&mut file, MAX_CONFIG_SIZE + 1, size).map_err(cannot_read)?;
             if bytes.len() as u64 > MAX_CONFIG_SIZE {
                 return Err(too_large(bytes.len() as u64));
             }
@@ -733,10 +732,7 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
     }
 }
 
-/// Read the source from stdin.
-///
-/// Reads at most `MAX_FILE_SIZE + 1` bytes so we can detect over-sized input without
-/// buffering the entire stream first.
+/// Read the source from stdin (see [`read_stdin_from`]).
 ///
 /// A stdin source resolves its imports against the working directory. Callers pass
 /// `None` as the base directory for that, never the absolute `current_dir()`: core
@@ -744,15 +740,22 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
 /// path character, #265) then names it `"."` — the caller typed no path, so no
 /// message shows the absolute one.
 pub(crate) fn read_stdin() -> Result<String> {
-    let mut source = String::new();
-    std::io::stdin()
-        .take(MAX_FILE_SIZE + 1)
-        .read_to_string(&mut source)
+    read_stdin_from(&mut std::io::stdin().lock())
+}
+
+/// Read a stdin source from `reader`, holding no more than one byte over
+/// `MAX_FILE_SIZE` of it and reading no further (#428): [`mds::read_at_most`], as
+/// mds-core reads a module file. More than the cap is refused before the bytes are
+/// checked as UTF-8; bytes that are not UTF-8 keep the message `read_to_string` gave
+/// them.
+fn read_stdin_from(reader: &mut impl Read) -> Result<String> {
+    let bytes = mds::read_at_most(reader, MAX_FILE_SIZE + 1, 0)
         .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
-    if source.len() as u64 > MAX_FILE_SIZE {
+    if bytes.len() as u64 > MAX_FILE_SIZE {
         return Err(miette::miette!("stdin input exceeds maximum size of 10 MB"));
     }
-    Ok(source)
+    String::from_utf8(bytes)
+        .map_err(|_| miette::miette!("cannot read stdin: stream did not contain valid UTF-8"))
 }
 
 /// Write compiled output to a file or stdout.
@@ -1326,37 +1329,23 @@ pub(crate) fn apply_source_map_file_label(
     }
 }
 
-/// Verify a `.map` file is a valid source-map v3 for `expected_basename`,
-/// then delete it (AC-FUNC-10: stale-map reconciliation).
+/// Delete the `.map` file at `map_path` when it is the sidecar an earlier
+/// `--source-map` build wrote for the output named `expected_basename` (stale-map
+/// reconciliation), and leave anything else in place, never clobbering a hand-authored
+/// file that happens to share its name.
 ///
-/// Silently skips deletion if:
-/// - The file does not exist.
-/// - The file is not valid UTF-8 JSON.
-/// - `version != 3`.
-/// - `file` does not match `expected_basename`.
-///
-/// This avoids clobbering a hand-authored file that happens to share a name with
-/// a tool-generated map.
+/// A missing file is skipped silently. Anything else that is not such a sidecar is left
+/// in place with a warning (unless `quiet`): one that is not a regular file is never
+/// opened — opening a FIFO with no writer blocks — and a regular file is recognised by
+/// its first bytes alone ([`has_sidecar_head`]), so none is read whole (#428).
 pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, quiet: bool) {
-    let Ok(bytes) = std::fs::read(map_path) else {
+    let Ok(metadata) = std::fs::metadata(map_path) else {
         return;
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return;
-    };
-    if v.get("version").and_then(|x| x.as_u64()) != Some(3) {
-        if !quiet {
-            eprintln!(
-                "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
-                crate::output::safe_path(map_path)
-            );
-        }
-        return;
-    }
-    if v.get("file").and_then(|x| x.as_str()) != Some(expected_basename) {
+    let sidecar = metadata.is_file()
+        && std::fs::File::open(map_path)
+            .is_ok_and(|mut file| has_sidecar_head(&mut file, expected_basename));
+    if !sidecar {
         if !quiet {
             eprintln!(
                 "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
@@ -1376,6 +1365,21 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
     } else if !quiet {
         eprintln!("Removed stale map {}", crate::output::safe_path(map_path));
     }
+}
+
+/// Whether `reader` starts with the bytes every sidecar mds writes for the output named
+/// `expected_basename` starts with: `{"version":3,"file":<the name as a JSON string>,`.
+/// `SourceMap::to_json` writes `version`, `file` and then `sources` in that order, with
+/// no whitespace, and a sidecar always carries the output's name as `file`, so a map it
+/// wrote always starts so; a map formatted by hand does not, even with the same fields.
+/// Only those bytes are read (#428).
+fn has_sidecar_head(reader: &mut impl Read, expected_basename: &str) -> bool {
+    let Ok(name) = serde_json::to_string(expected_basename) else {
+        return false;
+    };
+    let head = format!("{{\"version\":3,\"file\":{name},");
+    let len = head.len() as u64;
+    mds::read_at_most(reader, len, len).is_ok_and(|bytes| bytes == head.as_bytes())
 }
 
 /// Refuse `-o/--output` and `--out-dir` values carrying a forbidden path character
@@ -2787,5 +2791,137 @@ mod tests {
             msg.contains("variable 'x' is set by both --set and --set-string"),
             "error must be the cross-flag collision, not a file-read error; got: {msg}"
         );
+    }
+
+    // ── Bounded reads (#428) ────────────────────────────────────────────────────
+
+    /// A stream of `x` bytes — `len` of them, or without end — handed out at most 64 KiB
+    /// per read, as a pipe does, counting how many it served.
+    struct Stream {
+        left: Option<u64>,
+        served: u64,
+    }
+
+    impl Stream {
+        fn sized(len: u64) -> Self {
+            Self {
+                left: Some(len),
+                served: 0,
+            }
+        }
+
+        fn endless() -> Self {
+            Self {
+                left: None,
+                served: 0,
+            }
+        }
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(64 * 1024);
+            let n = self
+                .left
+                .map_or(n, |left| n.min(usize::try_from(left).unwrap_or(n)));
+            buf[..n].fill(b'x');
+            if let Some(left) = self.left.as_mut() {
+                *left -= n as u64;
+            }
+            self.served += n as u64;
+            Ok(n)
+        }
+    }
+
+    /// #428: stdin is read into a buffer that never holds more than the per-file cap
+    /// plus one byte — a buffer only grows, so its final capacity is the most it ever
+    /// held — and never past that byte: exactly the cap is accepted, one byte more is
+    /// refused, and an endless stream is read to one byte past the cap. Bytes that are
+    /// not UTF-8 keep their message.
+    #[test]
+    fn read_stdin_holds_at_most_the_cap_plus_one_byte() {
+        let at_cap = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE)).unwrap();
+        assert_eq!(
+            at_cap.len() as u64,
+            MAX_FILE_SIZE,
+            "exactly the cap is read"
+        );
+        assert!(
+            at_cap.capacity() as u64 <= MAX_FILE_SIZE + 1,
+            "capacity {} for {MAX_FILE_SIZE} bytes, over the cap plus one byte",
+            at_cap.capacity()
+        );
+
+        let over = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE + 1)).unwrap_err();
+        assert_eq!(
+            over.to_string(),
+            "stdin input exceeds maximum size of 10 MB"
+        );
+
+        let mut endless = Stream::endless();
+        let err = read_stdin_from(&mut endless).unwrap_err();
+        assert_eq!(err.to_string(), "stdin input exceeds maximum size of 10 MB");
+        assert_eq!(endless.served, MAX_FILE_SIZE + 1, "read no further");
+
+        let err = read_stdin_from(&mut &b"ok \xff"[..]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot read stdin: stream did not contain valid UTF-8"
+        );
+        assert_eq!(read_stdin_from(&mut &b"Hello!\n"[..]).unwrap(), "Hello!\n");
+    }
+
+    /// #428: the stale-map check reads only the bytes a sidecar mds wrote starts with —
+    /// `SourceMap::to_json` writes `version`, then `file`, then `sources` — and deletes
+    /// nothing else: a map written for the output (its name escaped as JSON, or not) is
+    /// recognised, while one for another output, a hand-formatted one with the same
+    /// fields, one that ends after `file`, and a large file of anything else are not,
+    /// and the large one is never read whole.
+    #[test]
+    fn stale_map_check_reads_only_the_sidecar_head() {
+        let sidecar = |name: &str| {
+            let mut sm = mds::compile_str_with_deps_opts(
+                "Hi\n",
+                None,
+                None,
+                mds::CompileOptions::default().with_source_map(true),
+            )
+            .unwrap()
+            .source_map
+            .expect("a map was built");
+            apply_source_map_file_label(&mut sm, Some(Path::new(name)), false);
+            sm.to_json()
+        };
+        let verdict = |bytes: &str, name: &str| has_sidecar_head(&mut bytes.as_bytes(), name);
+
+        let mut mismatches = Vec::new();
+        for name in ["out.md", "a \"quoted\" name.md", "caf\u{e9}.md"] {
+            if !verdict(&sidecar(name), name) {
+                mismatches.push(format!("{name}: its own sidecar is not recognised"));
+            }
+        }
+        let rows = [
+            ("another output's sidecar", sidecar("other.md")),
+            (
+                "hand-formatted, same fields",
+                "{ \"version\": 3, \"file\": \"out.md\", \"sources\": [], \"names\": [], \"mappings\": \"\" }".to_owned(),
+            ),
+            ("ends after file", "{\"version\":3,\"file\":\"out.md\"}".to_owned()),
+            ("version 2", "{\"version\":2,\"file\":\"out.md\",\"sources\":[]}".to_owned()),
+        ];
+        for (label, bytes) in rows {
+            if verdict(&bytes, "out.md") {
+                mismatches.push(format!("{label}: recognised as out.md's sidecar"));
+            }
+        }
+        let head = "{\"version\":3,\"file\":\"out.md\",".len() as u64;
+        let mut large = Stream::sized(64 * 1024 * 1024);
+        if has_sidecar_head(&mut large, "out.md") || large.served > head {
+            mismatches.push(format!(
+                "64 MiB of x: read {} bytes; the head is {head}",
+                large.served
+            ));
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 }

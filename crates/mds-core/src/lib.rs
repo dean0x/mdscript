@@ -63,7 +63,8 @@ pub(crate) mod verbatim;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{
-    check_module_bytes, effective_parent, reject_forbidden_path, FileSystem, NativeFs, VirtualFs,
+    check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, FileSystem,
+    NativeFs, VirtualFs,
 };
 pub use lint::{
     escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,

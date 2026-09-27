@@ -462,13 +462,32 @@ pub(crate) fn read_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
 const MAX_INTERRUPTED_READS: u32 = 64;
 
 /// Read `reader` to its end or to `limit` bytes, whichever comes first, into a buffer
-/// whose capacity never exceeds `limit`: it starts at `size_hint` plus one byte (room
-/// to see the end of a file whose size is known without growing) and grows by at most
-/// doubling, capped at `limit`.
+/// whose capacity never exceeds `limit` (#428): it starts at `size_hint` plus one byte
+/// (room to see the end of a source whose size is known without growing) and grows by
+/// at most doubling, capped at `limit`.
 ///
-/// Every read that returns bytes brings the buffer closer to `limit`, and at most
-/// [`MAX_INTERRUPTED_READS`] reads in a row may be interrupted, so the loop is bounded.
-fn read_at_most(
+/// Pass one byte more than a size cap as `limit` to tell a source of exactly the cap
+/// from a larger one while holding no more than that one byte over it; mds-core reads
+/// every module file this way, and the CLI its stdin, its `mds.json` and the head of a
+/// stale source map.
+///
+/// Every read that returns bytes brings the buffer closer to `limit`, and at most 64
+/// reads in a row may be interrupted, so the loop is bounded.
+///
+/// # Errors
+///
+/// The first error `reader` returns other than [`std::io::ErrorKind::Interrupted`], and
+/// that one when more than 64 reads in a row are interrupted.
+///
+/// # Examples
+///
+/// ```
+/// let bytes = mds::read_at_most(&mut &b"Hello!\n"[..], 4, 0)?;
+/// assert_eq!(bytes, b"Hell");
+/// assert!(bytes.capacity() <= 4);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn read_at_most(
     reader: &mut impl std::io::Read,
     limit: u64,
     size_hint: u64,

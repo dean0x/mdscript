@@ -89,6 +89,17 @@ fn reject_forbidden_path_function_exists() {
     );
 }
 
+/// #428: `read_at_most` — the bounded read behind every capped read, the CLI's stdin
+/// and stale-map check included — is callable via the crate root: it stops at `limit`
+/// bytes and never holds more.
+#[test]
+fn read_at_most_function_exists() {
+    let _: fn(&mut &'static [u8], u64, u64) -> std::io::Result<Vec<u8>> = mds::read_at_most;
+    let bytes = mds::read_at_most(&mut &b"Hello!\n"[..], 4, 0).unwrap();
+    assert_eq!(bytes, b"Hell");
+    assert!(bytes.capacity() <= 4, "capacity {}", bytes.capacity());
+}
+
 /// #414: `check_module_bytes` — NativeFs's post-read checks, shared with the WASM
 /// backend's `preflightModule` — is callable via the crate root with the expected
 /// signature: text in, the size and UTF-8 refusals out.
