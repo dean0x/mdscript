@@ -70,8 +70,9 @@ use mds::MdsError;
 
 use crate::build::{
     auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_entry, compile_to_content,
-    emit_duplicate_var_warnings, load_config, resolve_output_path_for_kind, write_output,
-    EntryPaths, OutputKind, RuntimeVarArgs,
+    emit_duplicate_var_warnings, load_config, refuse_output_over_entry,
+    resolve_output_path_for_kind, warn_output_extension_mismatch, write_output,
+    CompileWriteOutcome, EntryPaths, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
@@ -1193,6 +1194,8 @@ fn rebuild_file(
                 // By the canonical entry, the file being watched: an error here is
                 // swallowed, so no message ever names the path, and the canonical path
                 // holds no symlink a retarget could move elsewhere (#417).
+                // No `-o` extension warning here: an `-o <file>` always resolves at
+                // startup, so `ctx.output_path` is `None` only for stdout or no `-o`.
                 let config = load_config(&ctx.entry).unwrap_or(None);
                 resolve_output_path_for_kind(
                     &Some(ctx.entry.clone()),
@@ -1200,10 +1203,19 @@ fn rebuild_file(
                     &ctx.out_dir,
                     &config,
                     compiled.kind,
-                    ctx.quiet,
                 )
                 .unwrap_or(None)
             };
+            // #425: a rebuild never writes over the entry — reachable when a failed
+            // startup compile left the Markdown default in place as the output path.
+            // Refused like a compile error: reported, settled, still watching.
+            if let Err(e) =
+                refuse_output_over_entry(output_path.as_deref(), &ctx.entry, &ctx.entry_typed)
+            {
+                eprint_error(miette::Error::from(e));
+                state.last_mtimes = snapshot_state(&state.foi);
+                return;
+            }
 
             // Build the output_key for content-dedup.
             let output_key: String = output_path
@@ -1409,6 +1421,9 @@ fn run_watch_file(
     // Initial compile: returns (output_path, deps, content).
     // content is captured here so the baseline block below can reuse it without
     // recompiling (issue 3 — avoids a redundant second compile at startup).
+    // The outer `?` is an output path that is the entry file itself (#425): refused at
+    // startup, exit 2, before anything is written. Any other error is reported, and
+    // watching continues.
     let startup_entry = EntryPaths {
         typed: &entry_typed,
         canonical: &entry,
@@ -1421,23 +1436,29 @@ fn run_watch_file(
         runtime_vars,
         quiet,
         mds::CompileOptions::default(),
-    ) {
-        Ok(result) => result,
-        Err(e) => {
+    )? {
+        CompileWriteOutcome::Written(result) => result,
+        CompileWriteOutcome::Failed(e) => {
             // Initial compile error: print and continue watching (entry dir still watched).
             eprint_error(e);
             // Fall back: resolve output path with Markdown kind as a placeholder so we
             // know where to watch. This path may not match a later successful compile if
-            // the template has @message blocks, but it will correct on first successful rebuild.
+            // the template has @message blocks, and every rebuild reuses it
+            // (`FileCompileCtx.output_path`) — so it can be the entry itself, which
+            // `rebuild_file` refuses to write over (#425).
             let fallback_path = resolve_output_path_for_kind(
                 &Some(entry.clone()),
                 &output,
                 &out_dir,
                 &config,
                 OutputKind::Markdown,
-                quiet,
             )
             .unwrap_or(None);
+            // The `-o` extension warning announces a write; a fallback that is the entry
+            // is never written, so it gets none.
+            if refuse_output_over_entry(fallback_path.as_deref(), &entry, &entry_typed).is_ok() {
+                warn_output_extension_mismatch(&output, OutputKind::Markdown, quiet);
+            }
             (fallback_path, vec![], String::new())
         }
     };
@@ -4431,7 +4452,7 @@ mod tests {
             typed: &entry,
             canonical: &canonical,
         };
-        let (_written_path, deps, _content) = compile_and_write(
+        let (_written_path, deps, _content) = match compile_and_write(
             entry_paths,
             &Some(out_str),
             &None,
@@ -4440,7 +4461,11 @@ mod tests {
             true,
             mds::CompileOptions::default(),
         )
-        .unwrap();
+        .unwrap()
+        {
+            CompileWriteOutcome::Written(result) => result,
+            CompileWriteOutcome::Failed(e) => panic!("compile_and_write failed: {e}"),
+        };
         // The entry's compile output should list helper as a dependency.
         assert!(out.exists(), "output file should be created");
         assert!(

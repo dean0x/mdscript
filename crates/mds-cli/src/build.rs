@@ -328,45 +328,19 @@ pub(crate) fn prepare_output_dir_for_kind(
 /// 6. Default                        → source dir + `<name>.<ext>` (ext from kind)
 ///
 /// For rules 4–6 the extension is derived from `kind` (markdown → `.md`, messages → `.json`).
-/// For rule 2 (`-o <path>`), the path is used verbatim; if its extension conflicts with `kind`
-/// a warning is emitted to stderr (AC-FUNC-11: write still proceeds to the requested path).
+/// For rule 2 (`-o <path>`), the path is used verbatim, whatever its extension; once the
+/// write is certain, [`warn_output_extension_mismatch`] warns when it conflicts with `kind`.
 pub(crate) fn resolve_output_path_for_kind(
     input: &Option<PathBuf>,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<(MdsConfig, PathBuf)>,
     kind: OutputKind,
-    quiet: bool,
 ) -> Result<Option<PathBuf>> {
     // 1 & 2. Explicit `-o` flag: `-` means stdout, anything else is a literal path.
     match output.as_deref() {
         Some("-") => return Ok(None),
-        Some(o) => {
-            let path = PathBuf::from(o);
-            // AC-FUNC-11: warn when the extension contradicts the kind.
-            if !quiet {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    let expected = kind.extension();
-                    if ext != expected {
-                        // The `-o` value and the extension derived from it occupy a
-                        // diagnostic `file` field on a status line: WIRE (spec §7.5
-                        // per-field rule).
-                        // The escape call is repeated rather than bound to a local so it
-                        // is visible at each interpolation — the print-discipline guard
-                        // reads call sites, not bindings.
-                        eprintln!(
-                            "warning: output path '{}' has extension '.{}' but compiled \
-                             output is {}; writing to '{}' anyway",
-                            crate::output::safe_inline(o),
-                            crate::output::safe_inline(ext),
-                            kind_label(kind),
-                            crate::output::safe_inline(o)
-                        );
-                    }
-                }
-            }
-            return Ok(Some(path));
-        }
+        Some(o) => return Ok(Some(PathBuf::from(o))),
         None => {}
     }
 
@@ -407,6 +381,40 @@ pub(crate) fn resolve_output_path_for_kind(
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
         None => Ok(None),
+    }
+}
+
+/// Warn when an explicit `-o <path>`'s extension contradicts the compiled `kind`
+/// (AC-FUNC-11): the output is still written to the path as given. The warning
+/// announces that write, so callers emit it only once the write is certain — after
+/// [`refuse_output_over_entry`] has passed (#425) — never for an output that is refused.
+pub(crate) fn warn_output_extension_mismatch(
+    output: &Option<String>,
+    kind: OutputKind,
+    quiet: bool,
+) {
+    let Some(o) = output.as_deref().filter(|o| *o != "-") else {
+        return;
+    };
+    if quiet {
+        return;
+    }
+    if let Some(ext) = Path::new(o).extension().and_then(|e| e.to_str()) {
+        if ext != kind.extension() {
+            // The `-o` value and the extension derived from it occupy a diagnostic
+            // `file` field on a status line: WIRE (spec §7.5 per-field rule).
+            // The escape call is repeated rather than bound to a local so it is visible
+            // at each interpolation — the print-discipline guard reads call sites, not
+            // bindings.
+            eprintln!(
+                "warning: output path '{}' has extension '.{}' but compiled \
+                 output is {}; writing to '{}' anyway",
+                crate::output::safe_inline(o),
+                crate::output::safe_inline(ext),
+                kind_label(kind),
+                crate::output::safe_inline(o)
+            );
+        }
     }
 }
 
@@ -1007,22 +1015,97 @@ pub(crate) fn compile_entry(
     compile_to_content(entry.typed, runtime_vars, quiet, opts)
 }
 
-/// Compile `entry` with [`compile_entry`], derive the output path from the compiled
-/// kind and `entry.canonical`, and write.
+/// The canonical path of the file `path` names, for comparing two paths as files, or
+/// `None` when not even its directory resolves.
 ///
-/// Returns `(output_path, deps, content)`:
+/// An existing file is canonicalized, which respells its name the way the volume stores
+/// it — so `PAGE.md` and `page.md` are one file on a case-insensitive volume (#408). A
+/// path that does not exist yet, or whose final component is a symlink, is its
+/// canonical directory joined with its name: the symlink itself is the directory entry
+/// a write would replace, not the file it points to.
+fn file_identity(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        if let Ok(canonical) = path.canonicalize() {
+            return Some(canonical);
+        }
+    }
+    effective_parent(path)
+        .canonicalize()
+        .ok()
+        .map(|dir| dir.join(name))
+}
+
+/// Refuse to write the compiled entry over the entry file itself (#425): `mds::io`,
+/// exit 2, naming the entry as `typed`, escaped.
+///
+/// A `.md` entry that declares `type: mds` compiles to Markdown, whose default output
+/// name — the entry's stem plus `.md` — is the entry's own name; `--out-dir` or
+/// `mds.json` `build.output_dir` naming the entry's directory, and `-o` naming the
+/// entry itself (any extension), land on it too. Writing would replace the source with
+/// its compiled form, which no longer declares `type: mds`, so the next build fails.
+///
+/// `output` and `entry` are compared as the files they name ([`file_identity`]),
+/// canonical with canonical, never a path with a spelling of it (#408). `entry` may be
+/// any spelling that reaches the entry — `build` passes it as typed, `watch` its
+/// canonical form. `None` (stdout) is never the entry. `mds build` and `mds watch` file
+/// mode run it after the output path is resolved and before anything is written —
+/// `watch` at startup and on every rebuild.
+pub(crate) fn refuse_output_over_entry(
+    output: Option<&Path>,
+    entry: &Path,
+    typed: &Path,
+) -> Result<(), MdsError> {
+    let Some(output) = output else {
+        return Ok(());
+    };
+    match (file_identity(output), file_identity(entry)) {
+        (Some(output), Some(entry)) if output == entry => Err(MdsError::Io {
+            message: format!(
+                "output would overwrite the entry file: \"{}\"; \
+                 write it elsewhere with -o <file> or --out-dir <dir>",
+                mds::escape_path_for_message(&typed.to_string_lossy())
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// What [`compile_and_write`] returns on success, `(output_path, deps, content)`:
 /// - `output_path`: the resolved output path (None for stdout).
 /// - `deps`: transitive dependency paths.
 /// - `content`: the compiled string (issue 3 — reused by the watch baseline block
 ///   so startup does not compile twice).
+pub(crate) type WrittenEntry = (Option<PathBuf>, Vec<String>, String);
+
+/// Outcome of [`compile_and_write`]'s compile-route-write attempt, once its own
+/// startup refusal ([`refuse_output_over_entry`], #425) has already passed.
+pub(crate) enum CompileWriteOutcome {
+    /// Compiled, routed and written.
+    Written(WrittenEntry),
+    /// A failure — compile, route, or write — that `mds watch` reports and keeps
+    /// watching through.
+    Failed(miette::Report),
+}
+
+/// Compile `entry` with [`compile_entry`], derive the output path from the compiled
+/// kind and `entry.canonical`, and write — `mds watch` file mode's startup compile.
+///
+/// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
+/// reports and keeps watching through: the compile, the output path, the write. The
+/// `Err` this function itself returns is reserved for an output path that is the entry
+/// file itself ([`refuse_output_over_entry`], #425), which ends `mds watch` at startup
+/// (exit 2): every rebuild would reuse that path.
 ///
 /// The output path is derived AFTER compiling (compile-then-route) so the kind
 /// (and thus extension: `.json` for messages, `.md` for markdown) is known before
 /// the path is constructed. This is the single-file intrinsic extension path.
 ///
-/// If `-o <path>` is given explicitly, that path is used verbatim and an ext-mismatch
-/// warning is emitted when the extension contradicts the kind (AC-FUNC-11).
-/// If `-o -` or stdin-with-no-flags, content is written to stdout.
+/// If `-o <path>` is given explicitly, that path is used verbatim, and once it has
+/// passed the #425 refusal an ext-mismatch warning is emitted when the extension
+/// contradicts the kind (AC-FUNC-11). If `-o -` or stdin-with-no-flags, content is
+/// written to stdout.
 ///
 /// Source-map writing is NOT performed here — callers that need maps handle them
 /// after this call returns (so map writing logic stays in `run_build`, not here).
@@ -1040,18 +1123,32 @@ pub(crate) fn compile_and_write(
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
     opts: mds::CompileOptions,
-) -> Result<(Option<PathBuf>, Vec<String>, String)> {
-    let compiled = compile_entry(entry, runtime_vars, quiet, opts)?;
-    let output_path = resolve_output_path_for_kind(
-        &Some(entry.canonical.to_path_buf()),
-        output,
-        out_dir,
-        config,
-        compiled.kind,
-        quiet,
-    )?;
-    write_output(output_path.clone(), &compiled.content, quiet, true)?;
-    Ok((output_path, compiled.dependencies, compiled.content))
+) -> Result<CompileWriteOutcome> {
+    let routed = compile_entry(entry, runtime_vars, quiet, opts).and_then(|compiled| {
+        resolve_output_path_for_kind(
+            &Some(entry.canonical.to_path_buf()),
+            output,
+            out_dir,
+            config,
+            compiled.kind,
+        )
+        .map(|output_path| (compiled, output_path))
+    });
+    let (compiled, output_path) = match routed {
+        Ok(routed) => routed,
+        Err(e) => return Ok(CompileWriteOutcome::Failed(e)),
+    };
+    refuse_output_over_entry(output_path.as_deref(), entry.canonical, entry.typed)
+        .map_err(miette::Error::from)?;
+    warn_output_extension_mismatch(output, compiled.kind, quiet);
+    Ok(
+        match write_output(output_path.clone(), &compiled.content, quiet, true) {
+            Ok(()) => {
+                CompileWriteOutcome::Written((output_path, compiled.dependencies, compiled.content))
+            }
+            Err(e) => CompileWriteOutcome::Failed(e),
+        },
+    )
 }
 
 // ── Build args struct ─────────────────────────────────────────────────────────
@@ -1479,7 +1576,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
         // Stdin: no project config; output path follows -o flag or defaults to stdout.
         let output_path =
-            resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind, quiet)?;
+            resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind)?;
+        warn_output_extension_mismatch(&output, kind, quiet);
 
         if let Some(ref mut sm) = source_map {
             // Set `file` field and relabel source entry for stdin builds (AC-FUNC-12).
@@ -1591,8 +1689,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         &out_dir,
         &config,
         compiled.kind,
-        quiet,
     )?;
+    // #425: nothing — output or sidecar map — is written once the output is the entry,
+    // and no warning announces that write.
+    refuse_output_over_entry(output_path.as_deref(), &input, &input)
+        .map_err(miette::Error::from)?;
+    warn_output_extension_mismatch(&output, compiled.kind, quiet);
 
     let mut source_map = compiled.source_map;
     if let Some(ref mut sm) = source_map {
@@ -2236,7 +2338,6 @@ mod tests {
             &None,
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(result, None, "-o - should resolve to stdout (None)");
@@ -2250,7 +2351,6 @@ mod tests {
             &None,
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(
@@ -2267,7 +2367,6 @@ mod tests {
             &None,
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(
@@ -2287,7 +2386,6 @@ mod tests {
             &Some(out_dir.clone()),
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(
@@ -2315,7 +2413,6 @@ mod tests {
             &None,
             &config,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(

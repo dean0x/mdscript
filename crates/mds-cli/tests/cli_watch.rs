@@ -5726,3 +5726,210 @@ fn watch_help_example_src_poll_interval_0_rebuilds_on_native_events() {
     );
     drop(child);
 }
+
+// ── #425: output over the entry file is refused ──────────────────────────────
+
+/// A `.md` entry that declares `type: mds`: its default output name is its own name.
+const TYPE_MDS_PAGE: &str = "---\ntype: mds\nname: X\n---\nHello {{name}}!\n";
+
+/// The #425 refusal naming the entry as `typed`, squashed (miette wraps long lines).
+fn entry_overwrite_refusal(typed: &str) -> String {
+    squash(&format!(
+        "mds::io × output would overwrite the entry file: \"{typed}\"; \
+         write it elsewhere with -o <file> or --out-dir <dir>"
+    ))
+}
+
+/// Wait for a watcher expected to refuse at startup to exit, and return its exit
+/// status and stderr. Bounded: 10 s at a 10 ms poll — a watcher that did not refuse
+/// keeps running, and fails here.
+fn startup_refusal_exit(
+    child: &mut ChildGuard,
+    tap: StderrTap,
+    label: &str,
+) -> (Option<i32>, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: still running, so it did not refuse; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    (status.code(), tap.finish_text(child))
+}
+
+/// `mds watch` in file mode refuses at startup, exit 2, when the output it resolves is
+/// the entry file itself — the default route of a `type: mds` `.md` entry, `--out-dir`
+/// naming its directory, `-o` naming it — and writes nothing: the source stays
+/// byte-identical. It used to write the compiled output over the source and keep
+/// watching a file that no longer declared `type: mds`.
+#[test]
+fn watch_refuses_at_startup_to_write_over_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, TYPE_MDS_PAGE).unwrap();
+
+    for extra in [&[][..], &["--out-dir", "."], &["-o", "page.md"]] {
+        let label = format!("mds watch page.md {}", extra.join(" "));
+        let (mut child, tap) = spawn_unsynchronized(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "page.md", "--debounce", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        let (code, stderr) = startup_refusal_exit(&mut child, tap, &label);
+        assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+        assert!(
+            squash(&stderr).contains(&entry_overwrite_refusal("page.md")),
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src).unwrap(),
+            TYPE_MDS_PAGE,
+            "{label}: the source is untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "{label}: nothing is written"
+        );
+    }
+}
+
+/// A rebuild never writes over the entry either. When the startup compile fails, the
+/// output path is resolved without knowing the kind and falls back to the Markdown
+/// default — the entry itself here; once the source is fixed, the rebuild refuses
+/// (`mds::io`, the entry named as typed), keeps watching, and the fixed source stays
+/// byte-identical. It used to overwrite it with the compiled output.
+#[test]
+fn watch_rebuild_never_writes_over_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+    assert!(
+        stderr.contains("mds::syntax"),
+        "control: the startup compile fails; stderr: {stderr}"
+    );
+
+    write_atomic(&src, TYPE_MDS_PAGE);
+    let needle = "output would overwrite the entry file";
+    let stderr = wait_for_stderr_contains_str(&tap, needle, TIMEOUT);
+    assert!(
+        squash(&stderr).contains(&entry_overwrite_refusal("page.md")),
+        "the rebuild is refused; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&src).unwrap(),
+        TYPE_MDS_PAGE,
+        "the fixed source is untouched"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "nothing is written"
+    );
+    let mut child = child;
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "watch keeps running after a refused rebuild"
+    );
+    drop(child);
+}
+
+/// The #425 refusal is all `mds watch` says about an output that is the entry: the `-o`
+/// extension-mismatch warning, which announces a write (`… writing to '<path>'
+/// anyway`), is not printed for it — neither at startup, where the refusal ends the
+/// run, nor for the fallback output of a failed startup compile, which every rebuild
+/// refuses. Control: an `-o` with the same mismatched extension that is not the entry
+/// still gets the warning, and is written.
+#[test]
+fn watch_refusal_is_not_preceded_by_the_extension_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("e.mds");
+    let no_warning = |stderr: &str, label: &str| {
+        assert!(
+            !stderr.contains("warning:"),
+            "{label}: no warning announces a write that is refused; stderr: {stderr}"
+        );
+    };
+
+    // Startup: the compile succeeds, and its output is the entry.
+    std::fs::write(&src, "E\n").unwrap();
+    let label = "startup: mds watch e.mds -o e.mds";
+    let (mut child, tap) = spawn_unsynchronized(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "e.mds", "-o", "e.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let (code, stderr) = startup_refusal_exit(&mut child, tap, label);
+    assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+    assert!(
+        squash(&stderr).contains(&entry_overwrite_refusal("e.mds")),
+        "{label}: stderr: {stderr}"
+    );
+    no_warning(&stderr, label);
+    drop(child);
+
+    // A failed startup compile: its fallback output is the entry, so the rebuild after
+    // the fix is refused, and nothing ever announced a write to it.
+    std::fs::write(&src, "Hello {{name\n").unwrap();
+    let label = "fallback: mds watch e.mds -o e.mds";
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "e.mds", "-o", "e.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+    assert!(
+        stderr.contains("mds::syntax"),
+        "{label}: control: the startup compile fails; stderr: {stderr}"
+    );
+    write_atomic(&src, "E\n");
+    let stderr =
+        wait_for_stderr_contains_str(&tap, "output would overwrite the entry file", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(&entry_overwrite_refusal("e.mds")),
+        "{label}: the rebuild is refused; stderr: {stderr}"
+    );
+    no_warning(&stderr, label);
+    assert_eq!(std::fs::read_to_string(&src).unwrap(), "E\n", "{label}");
+    drop(child);
+
+    // Control: the same mismatched extension on an output that is not the entry.
+    let other = dir.path().join("other.mds");
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "e.mds", "-o", "other.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&other, "E", TIMEOUT),
+        "control: other.mds is written; stderr: {}",
+        tap.text()
+    );
+    let warning = "warning: output path 'other.mds' has extension '.mds' but compiled output \
+                   is markdown (.md); writing to 'other.mds' anyway";
+    let stderr = wait_for_stderr_contains_str(&tap, warning, TIMEOUT);
+    assert!(
+        stderr.contains(warning),
+        "control: the warning still announces a write that happens; stderr: {stderr}"
+    );
+    drop(child);
+}

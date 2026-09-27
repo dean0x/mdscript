@@ -2105,3 +2105,309 @@ fn build_o_bare_filename_writes_in_cwd() {
         temp_residue(dir.path())
     );
 }
+
+// ── #425: output over the entry file is refused ──────────────────────────────
+
+mod entry_overwrite {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// A `.md` entry that declares `type: mds`: it compiles to Markdown, so its default
+    /// output name is its own name.
+    pub(super) const PAGE: &str = "---\ntype: mds\nname: X\n---\nHello {{name}}!\n";
+    /// What `PAGE` compiles to.
+    pub(super) const COMPILED: &str = "---\nname: X\n---\nHello X!\n";
+
+    /// Run `mds` in `dir`: `(exit code, stdout, stderr)`.
+    fn run_in(dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+        let output = mds_bin()
+            .current_dir(dir)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// Every entry under `dir` — path, and its bytes (a symlink or directory by kind) —
+    /// sorted: equal snapshots mean a run created, removed and rewrote nothing.
+    pub(super) fn snapshot(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            assert!(depth < 8, "fixture trees are shallow");
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+                if kind.is_file() {
+                    out.push((rel, Some(std::fs::read(&path).unwrap())));
+                } else {
+                    out.push((rel, None));
+                    if kind.is_dir() {
+                        walk(root, &path, depth + 1, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, 0, &mut out);
+        out.sort();
+        out
+    }
+
+    /// `stderr` is the #425 refusal naming the entry exactly as `typed`.
+    pub(super) fn assert_refused(stderr: &str, typed: &str, label: &str) {
+        let squash = |s: &str| {
+            s.chars()
+                .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+                .collect::<String>()
+        };
+        assert!(
+            stderr.contains("mds::io"),
+            "{label}: mds::io; got: {stderr}"
+        );
+        let expected = format!(
+            "output would overwrite the entry file: \"{typed}\"; \
+             write it elsewhere with -o <file> or --out-dir <dir>"
+        );
+        assert!(
+            squash(stderr).contains(&squash(&expected)),
+            "{label}: expected {expected:?}; got: {stderr}"
+        );
+    }
+
+    /// `mds build page.md` for a `.md` entry that declares `type: mds`, with no output
+    /// flag, resolves its output to `page.md` — the entry itself. It is refused
+    /// (`mds::io`, exit 2) before anything is written: the source stays byte-identical,
+    /// where it used to be replaced by its compiled form (exit 0), which no longer
+    /// declares `type: mds`, so the next build failed. Control: `-o out.md` builds.
+    #[test]
+    fn build_refuses_to_write_over_a_markdown_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("page.md"), PAGE).unwrap();
+        let before = snapshot(dir.path());
+
+        let (code, stdout, stderr) = run_in(dir.path(), &["build", "page.md"]);
+        assert_eq!(code, Some(2), "stderr: {stderr}");
+        assert_refused(&stderr, "page.md", "build page.md");
+        assert!(stdout.is_empty(), "nothing on stdout; got: {stdout}");
+        assert_eq!(snapshot(dir.path()), before, "nothing is written");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("page.md")).unwrap(),
+            PAGE
+        );
+
+        let (code, _, stderr) = run_in(dir.path(), &["build", "page.md", "-o", "out.md"]);
+        assert_eq!(code, Some(0), "control: stderr: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.md")).unwrap(),
+            COMPILED
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("page.md")).unwrap(),
+            PAGE
+        );
+    }
+
+    /// Every output-path route that lands on the entry file is refused, whichever way
+    /// either side is spelled — the two are compared as the files they name, canonical
+    /// with canonical: the default route, `--out-dir` naming the entry's directory,
+    /// `mds.json` `build.output_dir`, `-o` naming the entry (a `.mds` entry too, and a
+    /// case variant on a case-insensitive volume), and a symlinked directory leading
+    /// back to it. The message names the entry as typed. Every other output writes.
+    #[test]
+    fn build_refuses_every_output_route_that_lands_on_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::fs::write(root.join("page.md"), PAGE).unwrap();
+        std::fs::write(root.join("e.mds"), "E\n").unwrap();
+        std::fs::write(root.join("cfg").join("page.md"), PAGE).unwrap();
+        std::fs::write(
+            root.join("cfg").join("mds.json"),
+            r#"{"build":{"output_dir":"."}}"#,
+        )
+        .unwrap();
+        let linked = make_symlink(root, &root.join("lnk"));
+        let abs_dir = root.display().to_string();
+        let abs_page = root.join("page.md").display().to_string();
+        let case_insensitive = root.join("PAGE.md").exists();
+
+        let mut rows: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["build", "page.md"], "page.md"),
+            (vec!["build", "./page.md"], "./page.md"),
+            (vec!["build", "sub/../page.md"], "sub/../page.md"),
+            (vec!["build", abs_page.as_str()], abs_page.as_str()),
+            (vec!["build", "page.md", "--out-dir", "."], "page.md"),
+            (
+                vec!["build", "page.md", "--out-dir", abs_dir.as_str()],
+                "page.md",
+            ),
+            (vec!["build", "page.md", "--out-dir", "sub/.."], "page.md"),
+            (vec!["build", "cfg/page.md"], "cfg/page.md"),
+            (vec!["build", "page.md", "-o", "page.md"], "page.md"),
+            (
+                vec!["build", "page.md", "-o", "./sub/../page.md"],
+                "page.md",
+            ),
+            (vec!["build", "page.md", "-o", abs_page.as_str()], "page.md"),
+            (vec!["build", "e.mds", "-o", "e.mds"], "e.mds"),
+            (vec!["build", "e.mds", "-o", "sub/../e.mds"], "e.mds"),
+        ];
+        if case_insensitive {
+            rows.push((vec!["build", "page.md", "-o", "PAGE.md"], "page.md"));
+        }
+        if linked {
+            rows.push((vec!["build", "page.md", "-o", "lnk/page.md"], "page.md"));
+            rows.push((
+                vec!["build", "lnk/page.md", "--out-dir", "."],
+                "lnk/page.md",
+            ));
+        }
+
+        let before = snapshot(root);
+        for (args, typed) in &rows {
+            let label = args.join(" ");
+            let (code, stdout, stderr) = run_in(root, args);
+            assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+            assert_refused(&stderr, typed, &label);
+            assert!(stdout.is_empty(), "{label}: stdout: {stdout}");
+            assert_eq!(snapshot(root), before, "{label}: nothing is written");
+        }
+
+        // A symlink AT the output path is the directory entry a write would replace, not
+        // the entry it points to: the write's own symlink refusal answers it (exit 1),
+        // and the entry is untouched either way.
+        if make_symlink(&root.join("page.md"), &root.join("page_link.md")) {
+            let before = snapshot(root);
+            let (code, _, stderr) = run_in(root, &["build", "page.md", "-o", "page_link.md"]);
+            assert_eq!(code, Some(1), "-o page_link.md: stderr: {stderr}");
+            assert!(
+                stderr.contains("refusing to replace a symlink")
+                    && !stderr.contains("overwrite the entry"),
+                "-o page_link.md: stderr: {stderr}"
+            );
+            assert_eq!(
+                snapshot(root),
+                before,
+                "-o page_link.md: nothing is written"
+            );
+            std::fs::remove_file(root.join("page_link.md")).unwrap();
+        }
+
+        // A hard link to the entry is another name for the same file, not the entry's
+        // path: the write replaces that name by rename (§7.2 "Output writing"), so it is
+        // not refused and the entry keeps its content.
+        if std::fs::hard_link(root.join("page.md"), root.join("page_hl.md")).is_ok() {
+            let (code, _, stderr) = run_in(root, &["build", "page.md", "-o", "page_hl.md"]);
+            assert_eq!(code, Some(0), "-o page_hl.md: stderr: {stderr}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("page_hl.md")).unwrap(),
+                COMPILED
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("page.md")).unwrap(),
+                PAGE,
+                "-o page_hl.md: the entry keeps its content"
+            );
+            std::fs::remove_file(root.join("page_hl.md")).unwrap();
+        }
+
+        // Controls: every other output writes, and so does `-o -`.
+        let (code, stdout, stderr) = run_in(root, &["build", "page.md", "-o", "-"]);
+        assert_eq!(code, Some(0), "-o -: stderr: {stderr}");
+        assert_eq!(stdout, COMPILED);
+        assert_eq!(snapshot(root), before, "-o - writes no file");
+        for (args, written, content) in [
+            (
+                &["build", "page.md", "-o", "out.md"][..],
+                "out.md",
+                COMPILED,
+            ),
+            (
+                &["build", "page.md", "--out-dir", "out"],
+                "out/page.md",
+                COMPILED,
+            ),
+            (&["build", "e.mds"], "e.md", "E\n"),
+            (
+                &["build", "cfg/page.md", "-o", "cfg/out.md"],
+                "cfg/out.md",
+                COMPILED,
+            ),
+        ] {
+            let (code, _, stderr) = run_in(root, args);
+            assert_eq!(code, Some(0), "{args:?}: stderr: {stderr}");
+            assert_eq!(
+                std::fs::read_to_string(root.join(written)).unwrap(),
+                content,
+                "{args:?}"
+            );
+        }
+        if !case_insensitive {
+            // A case-sensitive volume: `PAGE.md` is another file, and it is written.
+            let (code, _, stderr) = run_in(root, &["build", "page.md", "-o", "PAGE.md"]);
+            assert_eq!(code, Some(0), "-o PAGE.md: stderr: {stderr}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("PAGE.md")).unwrap(),
+                COMPILED
+            );
+        }
+        assert_eq!(std::fs::read_to_string(root.join("page.md")).unwrap(), PAGE);
+        assert_eq!(std::fs::read_to_string(root.join("e.mds")).unwrap(), "E\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("cfg").join("page.md")).unwrap(),
+            PAGE
+        );
+    }
+
+    /// The `-o` extension-mismatch warning for `path` — it announces the write.
+    pub(super) fn extension_warning(path: &str) -> String {
+        format!(
+            "warning: output path '{path}' has extension '.mds' but compiled output is \
+             markdown (.md); writing to '{path}' anyway"
+        )
+    }
+
+    /// The #425 refusal is all `mds build` says about an output that is the entry: the
+    /// `-o` extension-mismatch warning, which announces the write (`… writing to
+    /// '<path>' anyway`), is not printed for a write that is refused. Control: an `-o`
+    /// with the same mismatched extension that is not the entry still gets the warning,
+    /// and is written.
+    #[test]
+    fn build_refusal_is_not_preceded_by_the_extension_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("e.mds"), "E\n").unwrap();
+        let before = snapshot(root);
+
+        for target in ["e.mds", "sub/../e.mds"] {
+            let label = format!("build e.mds -o {target}");
+            let (code, _, stderr) = run_in(root, &["build", "e.mds", "-o", target]);
+            assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+            assert_refused(&stderr, "e.mds", &label);
+            assert!(
+                !stderr.contains("warning:"),
+                "{label}: no warning announces a write that is refused; stderr: {stderr}"
+            );
+        }
+        assert_eq!(snapshot(root), before, "nothing is written");
+
+        let (code, _, stderr) = run_in(root, &["build", "e.mds", "-o", "other.mds"]);
+        assert_eq!(code, Some(0), "control: stderr: {stderr}");
+        assert!(
+            stderr.contains(&extension_warning("other.mds")),
+            "control: the warning still announces a write that happens; stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("other.mds")).unwrap(),
+            "E\n"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("e.mds")).unwrap(), "E\n");
+    }
+}
