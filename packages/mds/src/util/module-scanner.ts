@@ -1,6 +1,7 @@
 import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, sep } from 'node:path';
+import type { MdsError } from '../types.js';
 import {
   escapePathForMessage,
   firstForbiddenChar,
@@ -157,17 +158,34 @@ async function closeModule(handle: Awaited<ReturnType<typeof open>>, shown: stri
 // Path refusals shared with the Rust engine (#265)
 // ---------------------------------------------------------------------------
 
+/** The codes a scanner refusal carries — each the one the Rust engine reports for the same step. */
+type PathErrorCode = 'mds::import' | 'mds::io' | 'mds::file_not_found' | 'mds::resource_limit';
+
 /**
  * A path refusal carrying the code the Rust engine reports for the same input.
  * Each message is byte-identical to that engine error's message as the native
  * backend throws it, so the WASM backend's file operations fail exactly like
  * the native ones.
  */
-type PathError = Error & { code: 'mds::import' | 'mds::io' | 'mds::file_not_found' };
+type PathError = MdsError & { code: PathErrorCode };
 
-function pathError(code: PathError['code'], message: string): PathError {
+/**
+ * The `help` the Rust engine attaches to an error of each code
+ * (crates/mds-core/src/error.rs). Only `mds::file_not_found` carries one; a code
+ * absent here carries none on either backend (#414).
+ */
+const PATH_ERROR_HELP: Readonly<Partial<Record<PathErrorCode, string>>> = {
+  'mds::file_not_found': 'check the file path and ensure the file exists',
+};
+
+/** Build a refusal with `code`, `message` and — only where the engine has one — its `help`. */
+function pathError(code: PathErrorCode, message: string): PathError {
   const err = new Error(message) as PathError;
   err.code = code;
+  const help = PATH_ERROR_HELP[code];
+  if (help !== undefined) {
+    err.help = help;
+  }
   return err;
 }
 

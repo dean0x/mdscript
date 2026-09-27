@@ -55,16 +55,33 @@ function scanImports(source) {
 }
 
 /**
+ * The `help` the Rust engine attaches to `mds::file_not_found`
+ * (crates/mds-core/src/error.rs). U-SM21 checks it against the native engine
+ * itself, so a change on the Rust side alone fails there.
+ */
+const FILE_NOT_FOUND_HELP = 'check the file path and ensure the file exists';
+
+/**
  * A missing file — whether never found (nonexistent name, nonexistent parent or
  * grandparent directory, ENOENT/ENOTDIR alike) or a mismatched spelling on a
  * case-sensitive volume (#408) — is reported with the same `mds::file_not_found`
  * shape the Rust engine reports for a missing file, keyed on `shown` (never a
- * resolved absolute path, R3 / CWE-209) and never described as a symlink.
+ * resolved absolute path, R3 / CWE-209) and never described as a symlink — with
+ * the engine's `help` (#414).
  */
 function assertNotFoundNotSymlink(err, shown, label) {
   assert.equal(err.code, 'mds::file_not_found', `${label}: ${err.message}`);
   assert.equal(err.message, `file not found: ${shown}`, label);
+  assert.equal(err.help, FILE_NOT_FOUND_HELP, label);
   assert.doesNotMatch(err.message, /symlink/, label);
+}
+
+/**
+ * The engine attaches no `help` to `mds::import` or `mds::io`, so neither does the
+ * scanner — not even an own `help: undefined` property (#414).
+ */
+function assertNoHelp(err, label) {
+  assert.equal(Object.hasOwn(err, 'help'), false, `${label}: no help property; got ${JSON.stringify(err.help)}`);
 }
 
 /**
@@ -75,6 +92,7 @@ function assertNotFoundNotSymlink(err, shown, label) {
 function assertSymlinkRefusal(err, shown, label) {
   assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
   assert.equal(err.message, `import error: symlinks are not allowed in imports: ${shown}`, label);
+  assertNoHelp(err, label);
 }
 
 /**
@@ -84,6 +102,12 @@ function assertSymlinkRefusal(err, shown, label) {
 function assertEscapeRefusal(err, shown, label) {
   assert.equal(err.code, 'mds::import', `${label}: ${err.message}`);
   assert.equal(err.message, `import error: import path escapes project directory: "${shown}"`, label);
+  assertNoHelp(err, label);
+}
+
+/** An outcome of `compileFileOutcomes` without its `span` — see U-SM21 for why. */
+function withoutSpan({ span: _span, ...rest }) {
+  return rest;
 }
 
 /** Run `fn` with `dir` as the working directory, restoring it afterwards. */
@@ -644,23 +668,34 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     });
   });
 
-  test('U-SM21: compileFile on an entry with a missing parent directory — native and WASM backends agree on code and message', async (t) => {
+  test('U-SM21: compileFile on a missing entry or import — native and WASM backends throw the same error, help included', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM21')) return;
-    const missing = path.join(FIXTURES, `mds-scanner-u-sm21-${process.pid}-nonexistent`, 'file.mds');
-    const [native] = await compileFileOutcomes('native', [missing]);
-    const [wasm] = await compileFileOutcomes('wasm', [missing]);
-    assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
-    assert.equal(native.message, `file not found: ${missing}`, JSON.stringify(native));
-    // code/message only, not the full errorShape: native reaches this error through
-    // Rust's own NativeFs (compileFile calls the napi addon directly, never
-    // buildModulesMap), whose FileNotFound carries a `help` diagnostic
-    // (crates/mds-core/src/error.rs); the WASM backend reaches it through this
-    // file's buildModulesMap, whose PathError type carries no `help` field at all
-    // (true of every mds::io/mds::import/mds::file_not_found refusal built by
-    // pathError() in this file, not something this fix introduces or narrows).
-    assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
-    assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+    await withProject(async (dir) => {
+      const missing = path.join(dir, `mds-scanner-u-sm21-${process.pid}-nonexistent`, 'file.mds');
+      const importer = path.join(dir, 'main.mds');
+      await writeFile(importer, '@import "./missing.mds" as m\nhi\n');
+      const files = [missing, importer];
+      const [nativeEntry, nativeImport] = await compileFileOutcomes('native', files);
+      const [wasmEntry, wasmImport] = await compileFileOutcomes('wasm', files);
+      // Non-vacuity (PF-013): native's own errors, its help included.
+      assert.deepEqual(nativeEntry, {
+        code: 'mds::file_not_found',
+        message: `file not found: ${missing}`,
+        help: FILE_NOT_FOUND_HELP,
+        span: null,
+      });
+      assert.deepEqual(withoutSpan(nativeImport), {
+        code: 'mds::file_not_found',
+        message: 'file not found: ./missing.mds',
+        help: FILE_NOT_FOUND_HELP,
+      });
+      // An entry error points into no source: the whole shape agrees.
+      assert.deepEqual(wasmEntry, nativeEntry);
+      // An import agrees on code, message and help. Native also points at the
+      // import directive (its span), which the pre-scanner does not yet (#414).
+      assert.deepEqual(withoutSpan(wasmImport), withoutSpan(nativeImport));
+    });
   });
 
   // The WASM engine resolves an import BY NAME, from the importing module's key;
@@ -795,8 +830,9 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
       const [native] = await compileFileOutcomes('native', [entry]);
       const [wasm] = await compileFileOutcomes('wasm', [entry]);
       assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
-      assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
-      assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+      assert.equal(native.help, FILE_NOT_FOUND_HELP, JSON.stringify(native));
+      // An entry error: the whole shape agrees, help included (#414).
+      assert.deepEqual(wasm, native);
     });
   });
 
@@ -814,10 +850,10 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
       const nativeOutcomes = await compileFileOutcomes('native', [file, nested]);
       const wasmOutcomes = await compileFileOutcomes('wasm', [file, nested]);
       for (const [i, native] of nativeOutcomes.entries()) {
-        const wasm = wasmOutcomes[i];
         assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
-        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
-        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+        assert.equal(native.help, FILE_NOT_FOUND_HELP, JSON.stringify(native));
+        // An entry error: the whole shape agrees, help included (#414).
+        assert.deepEqual(wasmOutcomes[i], native);
       }
     });
   });
@@ -837,8 +873,9 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
         const [native] = await compileFileOutcomes('native', [entry]);
         const [wasm] = await compileFileOutcomes('wasm', [entry]);
         assert.equal(native.code, 'mds::file_not_found', JSON.stringify(native));
-        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
-        assert.equal(wasm.message, native.message, JSON.stringify({ wasm, native }));
+        assert.equal(native.help, FILE_NOT_FOUND_HELP, JSON.stringify(native));
+        // An entry error: the whole shape agrees, help included (#414).
+        assert.deepEqual(wasm, native);
       } finally {
         await chmod(locked, 0o755);
       }
@@ -854,11 +891,13 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
         const err = await refusal(secret, 'U-SM28 entry');
         assert.equal(err.code, 'mds::io', err.message);
         assert.equal(err.message, `cannot read ${secret}: EACCES`);
+        assertNoHelp(err, 'U-SM28 entry');
 
         await writeFile(path.join(dir, 'main.mds'), '@import "./secret.mds" as s\n');
         const imported = await refusal(path.join(dir, 'main.mds'), 'U-SM28 import');
         assert.equal(imported.code, 'mds::io', imported.message);
         assert.equal(imported.message, 'cannot read ./secret.mds: EACCES');
+        assertNoHelp(imported, 'U-SM28 import');
 
         const engines = await loadEngines();
         if (!requireEngines(t, engines, 'U-SM28')) return;
@@ -947,6 +986,7 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
       const canonicalProj = await realpath(proj);
       for (const [err, shown, label] of [[imported, './dir.mds', 'U-SM31 import'], [entry, 'dir.mds', 'U-SM31 entry']]) {
         assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
+        assertNoHelp(err, label);
         // A directory fails with the errno a read of it reports; on Windows its
         // open fails first, with whatever errno libuv maps that to.
         const prefix = `cannot read ${shown}: `;

@@ -255,7 +255,7 @@ describe('WASM backend — compileFile/checkFile', () => {
         try {
           outcome = { output: (await compileFile(${JSON.stringify(path.join(dir, 'MAIN.mds'))})).output };
         } catch (e) {
-          outcome = { error: { code: e.code, message: e.message } };
+          outcome = { error: { code: e.code, message: e.message, help: e.help ?? null, span: e.span ?? null } };
         }
         process.stdout.write(JSON.stringify({ backend: getBackend(), ...outcome }));
       `;
@@ -276,6 +276,11 @@ describe('WASM backend — compileFile/checkFile', () => {
           assert.ok(result.error, `${result.backend}: expected a not-found failure`);
           assert.doesNotMatch(result.error.message, /symlink/, result.backend);
         }
+        // The same error on both, help included: the entry is what is missing, and an
+        // entry error points into no source (#414).
+        assert.equal(nativeResult.error.code, 'mds::file_not_found', JSON.stringify(nativeResult.error));
+        assert.equal(typeof nativeResult.error.help, 'string', JSON.stringify(nativeResult.error));
+        assert.deepEqual(wasmResult.error, nativeResult.error);
       }
     } finally {
       await rm(dir, { recursive: true, force: true });
