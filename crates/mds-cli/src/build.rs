@@ -1395,20 +1395,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                  use --out-dir to specify an output directory"
             ));
         }
-        // Reject a symlinked directory root for build parity (commit aa0c538).
-        if input
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(miette::miette!(
-                "directory argument must not be a symlink: {}",
-                input.display()
-            ));
-        }
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
+        let (dir, _) =
+            crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
 
         // Load project config to determine effective flags for directory mode.
-        let dir_config = load_config(&input)?;
+        let dir_config = load_config(&dir)?;
         let cfg_source_map = dir_config
             .as_ref()
             .map(|(c, _)| c.build.source_map)
@@ -1429,7 +1422,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         }
 
         return run_build_directory(
-            &input,
+            &dir,
             out_dir,
             runtime_vars,
             quiet,

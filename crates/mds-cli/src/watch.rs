@@ -878,21 +878,18 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         ));
     }
 
-    // Reject a symlinked entry/target (build parity — PF-004); plain canonicalize
-    // would silently follow it. check_symlink returns the canonical path for
-    // non-symlinks, preserving FSEvents path-matching.
-    let canonical_input =
-        mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
-
     // Clamp poll_interval: 0 = disable; nonzero ≥ 50ms floor (reconcile rule).
     let tick_opt: Option<Duration> = clamp_poll_interval(poll_interval);
 
     if is_dir {
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`). It
+        // takes `.`, `..` and `sub/..`, which `check_symlink` cannot, and returns the
+        // canonical form notify reports event paths under.
+        let (typed, canonical) = crate::input::resolve_directory_argument(&resolved_input)
+            .map_err(miette::Error::from)?;
         run_watch_dir(
-            WatchRoot {
-                canonical: canonical_input,
-                typed: resolved_input,
-            },
+            WatchRoot { canonical, typed },
             out_dir,
             vars,
             set_vars,
@@ -903,6 +900,11 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
             tick_opt,
         )
     } else {
+        // Reject a symlinked entry (build parity — PF-004); plain canonicalize would
+        // silently follow it. check_symlink returns the canonical path for
+        // non-symlinks, preserving FSEvents path-matching.
+        let canonical_input =
+            mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
         run_watch_file(
             resolved_input,
             canonical_input,
@@ -1633,6 +1635,51 @@ impl WatchRoot {
             Err(_) => src.to_path_buf(),
         }
     }
+
+    /// Refuse to compile under the root once `typed` leads to a different directory
+    /// than `canonical` (#413) — the directory-mode twin of file mode's entry check.
+    ///
+    /// Every walked path resolves `typed` afresh, while notify keeps watching
+    /// `canonical`. Once a symlink on the typed path is retargeted — `link/..` is the
+    /// directory above the link's target — or a directory on it is replaced, a walked
+    /// path names a file in another directory: the compile would read it while the
+    /// output mapping, graph keys and change detection follow the watched one. The two
+    /// are compared canonical with canonical (#408). A typed path that no longer
+    /// resolves (the root deleted, before it is recreated) is left to the compile's own
+    /// error. A retarget racing the compile itself is the check-then-open window every
+    /// path-based read has.
+    fn ensure_unmoved(&self) -> Result<(), MdsError> {
+        match self.typed.canonicalize() {
+            Ok(now) if now != self.canonical => Err(MdsError::Io {
+                message: format!(
+                    "watched directory now resolves to a different directory: \"{}\"; \
+                     restart mds watch to follow it",
+                    mds::escape_path_for_message(&self.typed.to_string_lossy())
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Compile `src` by its [walked](Self::walked) path — every directory-mode compile
+    /// goes through here — after [`ensure_unmoved`](Self::ensure_unmoved) has confirmed,
+    /// for a source under the root, that the walked path still leads into it.
+    fn compile(
+        &self,
+        src: &Path,
+        runtime_vars: Option<HashMap<String, mds::Value>>,
+        quiet: bool,
+    ) -> Result<crate::build::CompileOutput> {
+        if src.starts_with(&self.canonical) {
+            self.ensure_unmoved().map_err(miette::Error::from)?;
+        }
+        compile_to_content(
+            &self.walked(src),
+            runtime_vars,
+            quiet,
+            mds::CompileOptions::default(),
+        )
+    }
 }
 
 /// Mutable state for the directory-mode watch loop.
@@ -1814,12 +1861,7 @@ fn compile_one_source(
 ) -> bool {
     let root = watch_root.canonical.as_path();
     let t0 = Instant::now();
-    match compile_to_content(
-        &watch_root.walked(src),
-        runtime_vars.clone(),
-        quiet,
-        mds::CompileOptions::default(),
-    ) {
+    match watch_root.compile(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths: Vec<PathBuf> = compiled.dependencies.iter().map(PathBuf::from).collect();
 
@@ -2449,12 +2491,7 @@ fn dir_watch_startup(
 
     for source in &all_files {
         let key = graph_key(source);
-        match compile_to_content(
-            &watch_root.walked(source),
-            runtime_vars.clone(),
-            quiet,
-            mds::CompileOptions::default(),
-        ) {
+        match watch_root.compile(source, runtime_vars.clone(), quiet) {
             Ok(compiled) => {
                 // Collect dep paths (graph keys from compile_to_content).
                 let dep_paths: Vec<PathBuf> =
@@ -2553,11 +2590,10 @@ fn dir_watch_startup(
             if is_partial(source) {
                 continue; // Partials have no output path in last_written.
             }
-            match compile_to_content(
-                &watch_root.walked(source),
+            match watch_root.compile(
+                source,
                 baseline_vars.clone(),
                 true, /* quiet for baseline */
-                mds::CompileOptions::default(),
             ) {
                 Ok(compiled) => {
                     // Derive output path from the compiled kind (intrinsic extension).
@@ -2948,12 +2984,7 @@ fn process_dir_batch_incremental(
         // hidden dirs) are graph nodes but never emit their own output (DD3 pattern).
         if !is_in_root || is_excluded_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
-            match compile_to_content(
-                &watch_root.walked(src),
-                runtime_vars.clone(),
-                true,
-                mds::CompileOptions::default(),
-            ) {
+            match watch_root.compile(src, runtime_vars.clone(), true) {
                 Ok(compiled) => {
                     let dep_paths: Vec<PathBuf> =
                         compiled.dependencies.iter().map(PathBuf::from).collect();

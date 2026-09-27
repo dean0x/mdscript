@@ -7,6 +7,9 @@
 //! - `-o`/`--output`, `--out-dir` and `mds.json` `build.output_dir` are refused UP FRONT
 //!   (`mds::io`, exit 2), before any input is read.
 //! - A `..` component in `build.output_dir` is `mds::io`, exit 2.
+//! - A directory ARGUMENT carrying one — as typed, or in the canonical form it resolves
+//!   to — is refused up front (`mds::io`, exit 2) by all five, like a symlinked one or
+//!   the filesystem root (#413); only files found inside the walked tree fail one by one.
 //!
 //! PF-018: every hostile character is built at runtime and every six-character escape
 //! text with `format!`, so this file holds no live control byte.
@@ -902,7 +905,6 @@ mod config_errors {
                 (&["build", "in.mds"][..], "./mds.json", 1),
                 (&["build", "sub/in.mds"], "sub/../mds.json", 1),
                 (&["lint", "in.mds"], "./mds.json", 2),
-                (&["fmt", "."], "./mds.json", 1),
             ] {
                 let label = format!("{} [{before}]", args.join(" "));
                 let (code, text) = run(&cwd, args);
@@ -921,6 +923,24 @@ mod config_errors {
             }
         }
         set_mode(&config, 0o644);
+
+        // `fmt .` never reaches the config: the directory argument `.` resolves into
+        // the hostile-named working directory and is refused up front (#413), naming
+        // it `"."` — the same refusal `fmt -` gets there.
+        let (code, text) = run(&cwd, &["fmt", "."]);
+        assert_eq!(code, Some(2), "fmt .: got: {text:?}");
+        assert!(
+            squash(&text).contains(&squash(
+                "resolved path contains forbidden character U+0009: \".\""
+            )),
+            "fmt .: got: {text:?}"
+        );
+        assert!(!text.contains("mds.json"), "fmt .: got: {text:?}");
+        assert_no_control_chars(&text, "fmt .");
+        assert!(
+            !text.contains(&tmp_name),
+            "fmt .: absolute path; got: {text:?}"
+        );
     }
 }
 
@@ -960,4 +980,255 @@ fn init_clean_filename_is_accepted() {
     let (code, text) = run(dir.path(), &["init", "hello.mds"]);
     assert_eq!(code, Some(0), "got: {text}");
     assert!(dir.path().join("hello.mds").is_file());
+}
+
+// ── #413: one directory-argument resolver for every directory-mode subcommand ──
+
+/// The five directory-mode subcommands, each walking `target` without writing into the
+/// tree it walks: `build` and `watch` write to `out`, `fmt` only checks, `lint` does not
+/// fix. Where `target` is refused, `watch` exits at startup, so [`run`] returns; its
+/// 20 s kill bounds a regression that started walking instead.
+fn walk_commands<'a>(target: &'a str, out: &'a str) -> [Vec<&'a str>; 5] {
+    [
+        vec!["build", target, "--out-dir", out],
+        vec!["check", target],
+        vec!["lint", target],
+        vec!["fmt", "--check", target],
+        vec!["watch", target, "--out-dir", out],
+    ]
+}
+
+/// `text` carries the `mds::io` refusal `message`, however miette wrapped it.
+fn assert_io_refusal(text: &str, message: &str, label: &str) {
+    assert!(text.contains("mds::io"), "{label}: mds::io; got: {text}");
+    assert!(
+        squash(text).contains(&squash(message)),
+        "{label}: expected {message:?}; got: {text}"
+    );
+    assert_no_control_chars(text, label);
+}
+
+/// `mds lint --format json <target>` carries the same refusal in its JSON envelope.
+fn assert_lint_json_refusal(dir: &Path, target: &str, message: &str) {
+    let label = format!("lint --format json {target}");
+    let (code, text) = run(dir, &["lint", "--format", "json", target]);
+    assert_eq!(code, Some(2), "{label}: got: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{label}: stdout must be JSON ({e}); got: {text}"));
+    assert_eq!(json["error"]["code"], "mds::io", "{label}: got: {text}");
+    assert_eq!(json["error"]["message"], message, "{label}: got: {text}");
+}
+
+/// The filesystem root as the directory to walk is refused up front by every
+/// directory-mode subcommand — `mds::io`, exit 2, naming the directory as typed —
+/// whether it is typed `/`, reached through `/..`, or typed `.` in a working directory
+/// of `/`. A root stays usable as the working directory (#371): `-` (stdin) and a file
+/// argument still work from `/`.
+///
+/// ROOT SAFETY: only commands that write nothing into the walked tree run here (see
+/// [`walk_commands`]), each under [`run`]'s 20 s kill, so a regression that walks `/`
+/// is bounded and harmless.
+#[cfg(unix)]
+#[test]
+fn directory_argument_filesystem_root_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    let out_str = out.to_str().unwrap();
+    for (cwd, typed) in [
+        (tmp.path(), "/"),
+        (tmp.path(), "/.."),
+        (Path::new("/"), "."),
+    ] {
+        let message = format!("directory argument must not be the filesystem root: \"{typed}\"");
+        for args in walk_commands(typed, out_str) {
+            let label = format!("(in {}) {}", cwd.display(), args.join(" "));
+            let (code, text) = run(cwd, &args);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert_io_refusal(&text, &message, &label);
+        }
+        assert_lint_json_refusal(cwd, typed, &message);
+    }
+    assert!(!out.exists(), "nothing is written");
+
+    // Controls: from a working directory of `/`, stdin (an empty source here) and a
+    // file argument still work — only walking the root is refused.
+    let file = tmp.path().join("in.mds");
+    std::fs::write(&file, "Hi\n").unwrap();
+    for args in [&["check", "-"][..], &["check", file.to_str().unwrap()]] {
+        let (code, text) = run(Path::new("/"), args);
+        assert_eq!(code, Some(0), "control (in /) {args:?}: got: {text}");
+    }
+    let (code, text) = run(
+        Path::new("/"),
+        &["build", file.to_str().unwrap(), "-o", "-"],
+    );
+    assert_eq!(code, Some(0), "control (in /) build: got: {text}");
+    assert!(text.contains("Hi"), "control (in /) build: got: {text}");
+}
+
+/// The Windows twin of [`directory_argument_filesystem_root_is_refused`]: the drive
+/// root the temp directory lives on, typed plainly (`C:\`) and in its verbatim form
+/// (`\\?\C:\`), and `.` in a working directory of that root. The same root-safety
+/// rules apply.
+#[cfg(windows)]
+#[test]
+fn directory_argument_drive_root_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let drive = tmp.path().ancestors().last().unwrap().to_path_buf();
+    let plain = drive.display().to_string();
+    let verbatim = format!(r"\\?\{plain}");
+    let out = tmp.path().join("out");
+    let out_str = out.to_str().unwrap();
+    for (cwd, typed) in [
+        (tmp.path(), plain.as_str()),
+        (tmp.path(), verbatim.as_str()),
+        (drive.as_path(), "."),
+    ] {
+        let message = format!("directory argument must not be the filesystem root: \"{typed}\"");
+        for args in walk_commands(typed, out_str) {
+            let label = format!("(in {}) {}", cwd.display(), args.join(" "));
+            let (code, text) = run(cwd, &args);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert_io_refusal(&text, &message, &label);
+        }
+    }
+    assert!(!out.exists(), "nothing is written");
+}
+
+/// A directory argument whose final component is a symlink is refused identically by
+/// all five directory-mode subcommands — `mds::io`, exit 2, `directory argument must
+/// not be a symlink: "<typed>"` — with or without a trailing `/` or `/.`, through which
+/// the operating system follows the link (a check on the path as typed walked past it:
+/// `build`, `check`, `lint` and `fmt` exited 0 on `link/`). Nothing is walked or
+/// written. `link/..` names no link — it is the directory above the link's target — and
+/// all five accept it.
+#[test]
+fn directory_argument_symlink_is_refused_everywhere() {
+    use common::{make_symlink, spawn_watch_ready, ChildGuard};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("real")).unwrap();
+    std::fs::write(dir.path().join("real").join("a.mds"), "Hello!\n").unwrap();
+    if !make_symlink(&dir.path().join("real"), &dir.path().join("link")) {
+        return;
+    }
+    for typed in ["link", "link/", "link/."] {
+        let message = format!("directory argument must not be a symlink: \"{typed}\"");
+        for args in walk_commands(typed, "out") {
+            let label = args.join(" ");
+            let (code, text) = run(dir.path(), &args);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert_io_refusal(&text, &message, &label);
+        }
+        assert_lint_json_refusal(dir.path(), typed, &message);
+    }
+    assert!(!dir.path().join("out").exists(), "nothing is written");
+
+    // `link/..` is the temp directory itself: the walk finds `real/a.mds` and skips the
+    // link, as it skips every symlink inside a tree.
+    for args in [
+        &["build", "link/..", "--out-dir", "out"][..],
+        &["check", "link/.."],
+        &["lint", "link/.."],
+        &["fmt", "--check", "link/.."],
+    ] {
+        let (code, text) = run(dir.path(), args);
+        assert_eq!(code, Some(0), "{args:?}: link/.. is accepted; got: {text}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out").join("real").join("a.md")).unwrap(),
+        "Hello!\n"
+    );
+    let (child, tap, _) = spawn_watch_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "link/..", "--out-dir", "wout", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let mut child = ChildGuard(child);
+    let written = dir.path().join("wout").join("real").join("a.md");
+    // Bounded: 2 s at a 20 ms poll.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !written.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        written.is_file(),
+        "watch link/.. walks the directory above the link's target; stderr: {}",
+        tap.finish_text(&mut child)
+    );
+}
+
+/// A forbidden path character in a directory argument is refused up front, naming the
+/// directory as typed: in the path as typed (`path contains forbidden character`), and
+/// in the canonical form a symlinked directory leads it to (`resolved path contains
+/// forbidden character`), for a named directory and one reached through `..` alike. The
+/// directory is never walked, so no file in it is compiled and no summary line follows
+/// — before #413 each subcommand walked it and failed file by file.
+///
+/// Unix-only: a Windows file name cannot hold ESC or TAB.
+#[cfg(unix)]
+#[test]
+fn directory_argument_forbidden_characters_are_refused_naming_the_typed_form() {
+    use common::make_symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmp_name = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+    let hostile = format!("d{ESC}e");
+    std::fs::create_dir(dir.path().join(&hostile)).unwrap();
+    std::fs::write(dir.path().join(&hostile).join("a.mds"), "A\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("x\ty").join("sub")).unwrap();
+    std::fs::write(dir.path().join("x\ty").join("sub").join("b.mds"), "B\n").unwrap();
+    assert!(make_symlink(
+        &dir.path().join("x\ty"),
+        &dir.path().join("clink")
+    ));
+
+    let hostile_slash = format!("{hostile}/");
+    for (typed, what, ch, shown) in [
+        (hostile.as_str(), "path", ESC, format!("d{}e", escaped(ESC))),
+        (
+            hostile_slash.as_str(),
+            "path",
+            ESC,
+            format!("d{}e/", escaped(ESC)),
+        ),
+        ("clink/sub", "resolved path", '\t', "clink/sub".to_owned()),
+        (
+            "clink/sub/..",
+            "resolved path",
+            '\t',
+            "clink/sub/..".to_owned(),
+        ),
+    ] {
+        let message = format!(
+            "{what} contains forbidden character U+{:04X}: \"{shown}\"",
+            u32::from(ch)
+        );
+        for args in walk_commands(typed, "out") {
+            let label = format!("{} [{shown}]", args[0]);
+            let (code, text) = run(dir.path(), &args);
+            assert_eq!(code, Some(2), "{label}: got: {text:?}");
+            assert_refusal(&text, ch, &shown, &label);
+            assert!(
+                squash(&text).contains(&squash(&message)),
+                "{label}: expected {message:?}; got: {text:?}"
+            );
+            assert_eq!(
+                text.contains("resolved path"),
+                what == "resolved path",
+                "{label}: the typed form is refused before it is resolved; got: {text:?}"
+            );
+            assert!(!text.contains(ch), "{label}: raw char; got: {text:?}");
+            assert!(
+                !text.contains(&tmp_name),
+                "{label}: absolute path; got: {text:?}"
+            );
+            assert!(
+                !text.contains("built") && !text.contains("passed") && !text.contains("clean"),
+                "{label}: refused before the walk, so no summary; got: {text:?}"
+            );
+        }
+    }
+    assert!(!dir.path().join("out").exists(), "nothing is written");
 }

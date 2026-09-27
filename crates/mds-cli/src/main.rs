@@ -6,6 +6,7 @@ use miette::Result;
 
 mod build;
 mod fmt;
+mod input;
 mod lint;
 mod output;
 mod watch;
@@ -274,18 +275,10 @@ fn run_check(
 
     // Directory mode: validate every non-partial .mds file in the tree.
     if input != std::path::Path::new("-") && input.is_dir() {
-        // Reject a symlinked directory root for build parity (commit aa0c538).
-        if input
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(miette::miette!(
-                "directory argument must not be a symlink: {}",
-                input.display()
-            ));
-        }
-        return run_check_directory(&input, runtime_vars, quiet);
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
+        let (dir, _) = input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
+        return run_check_directory(&dir, runtime_vars, quiet);
     }
 
     // Single-file / stdin path.

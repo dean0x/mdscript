@@ -897,17 +897,11 @@ fn watch_messages_template_produces_json_intrinsically() {
     std::fs::write(&src, "@message user:\nWhat is 2+2?\n@end\n").unwrap();
     let out = dir.path().join("chat.json");
 
+    // No `-o`: the `mds watch chat.mds` example of `--help` — the `.json` extension is
+    // the default output path's, derived from the compiled kind.
     let (child, _stderr_tap) = spawn_ready(
         mds_bin()
-            .args([
-                "watch",
-                src.to_str().unwrap(),
-                "-o",
-                out.to_str().unwrap(),
-                "--debounce",
-                "0",
-                "-q",
-            ])
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
             .stdout(Stdio::null()),
     );
 
@@ -5370,4 +5364,365 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
         stdout.len(),
         body.len()
     );
+}
+
+// ── #413: directory arguments, and every `--help` example has a test ────────
+
+/// `mds watch .`, `./`, `..` and `sub/..` watch the directory they resolve to (#413).
+/// Directory mode takes its argument through the resolver every directory-mode
+/// subcommand shares, where it used to run `NativeFs::check_symlink`, which cannot take
+/// a path with no final name and failed with `file not found: .`. Each form compiles
+/// every file at startup, announces the canonical directory and rebuilds on an edit.
+/// The banner prints the canonical path in its on-disk spelling, so it is compared
+/// canonical to canonical, never with a typed spelling (#408).
+#[test]
+fn watch_dot_forms_watch_the_canonical_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("proj");
+    std::fs::create_dir_all(proj.join("sub")).unwrap();
+    std::fs::write(proj.join("p.mds"), "P\n").unwrap();
+    std::fs::write(proj.join("sub").join("s.mds"), "S\n").unwrap();
+    let canonical = proj.canonicalize().unwrap();
+
+    for (i, (cwd, typed)) in [
+        (proj.clone(), "."),
+        (proj.clone(), "./"),
+        (proj.join("sub"), ".."),
+        (proj.clone(), "sub/.."),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = format!("(in {}) mds watch {typed}", cwd.display());
+        let out = dir.path().join(format!("out{i}"));
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(&cwd)
+                .args(["watch", typed, "--out-dir", out.to_str().unwrap()])
+                .args(["--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("p.md"), "P", TIMEOUT),
+            "{label}: p.mds compiles at startup; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            wait_for_file_contains(&out.join("sub").join("s.md"), "S", TIMEOUT),
+            "{label}: sub/s.mds compiles at startup; stderr: {}",
+            tap.text()
+        );
+
+        let stderr = wait_for_stderr_contains_str(&tap, "Watching directory ", TIMEOUT);
+        let banner = stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("Watching directory "))
+            .unwrap_or_else(|| panic!("{label}: no banner; stderr: {stderr}"));
+        assert_eq!(
+            Path::new(banner.trim()).canonicalize().unwrap(),
+            canonical,
+            "{label}: the banner names the directory `{typed}` resolves to"
+        );
+
+        let edited = format!("P{i}");
+        write_atomic(&proj.join("p.mds"), format!("{edited}\n"));
+        assert!(
+            wait_for_file_contains(&out.join("p.md"), &edited, TIMEOUT),
+            "{label}: an edit rebuilds; stderr: {}",
+            tap.text()
+        );
+        drop(child);
+    }
+}
+
+/// Directory mode compiles each source by its walked path — the directory argument as
+/// typed, joined with the source's path below it — but watches the canonical directory
+/// (#413). `link/..` is accepted as the directory above the link's target; once the
+/// link is retargeted, the walked path leads into another directory: the rebuild is
+/// refused (`mds::io`), naming the directory as typed, and nothing is written from the
+/// other directory — rather than compiling its file into the watched one's output.
+/// Control: before the retarget, an edit rebuilds.
+///
+/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_dir_through_a_retargeted_link_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, below, text) in [("a", "x", "Hello A\n"), ("b", "y", "Hello B\n")] {
+        std::fs::create_dir_all(dir.path().join(name).join(below)).unwrap();
+        std::fs::write(dir.path().join(name).join("p.mds"), text).unwrap();
+    }
+    let link = dir.path().join("link");
+    symlink("a/x", &link).unwrap();
+    let watched = dir.path().join("a").join("p.mds");
+    let out = dir.path().join("out").join("p.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "link/..",
+                "--out-dir",
+                "out",
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(wait_for_file_contains(&out, "Hello A", TIMEOUT), "startup");
+    write_atomic(&watched, "Hello A1\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello A1", TIMEOUT),
+        "control: an edit rebuilds through the link"
+    );
+
+    std::fs::remove_file(&link).unwrap();
+    symlink("b/y", &link).unwrap();
+    write_atomic(&watched, "Hello A2\n");
+    let stderr =
+        wait_for_stderr_contains_str(&stderr_tap, "watched directory now resolves", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(
+            "mds::io×watcheddirectorynowresolvestoadifferentdirectory:\"link/..\";\
+             restartmdswatchtofollowit"
+        ),
+        "the rebuild is refused, naming the directory as typed; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "Hello A1\n",
+        "nothing is written from the retargeted directory"
+    );
+    drop(child);
+}
+
+/// `mds watch --help`'s examples, each with the test that runs it (#413).
+const WATCH_HELP_EXAMPLES: [(&str, &str); 10] = [
+    (
+        "mds watch template.mds",
+        "watch_initial_compile_writes_output",
+    ),
+    (
+        "mds watch chat.mds",
+        "watch_messages_template_produces_json_intrinsically",
+    ),
+    (
+        "mds watch template.mds -o out.md",
+        "watch_output_flag_writes_to_specified_file",
+    ),
+    (
+        "mds watch template.mds -o -",
+        "watch_stdout_contains_content_when_o_stdout",
+    ),
+    (
+        "mds watch .",
+        "watch_help_example_dot_watches_the_working_directory",
+    ),
+    (
+        "mds watch src/ --out-dir dist",
+        "watch_help_example_src_out_dir_dist_mirrors_the_subtree",
+    ),
+    (
+        "mds watch template.mds --vars v.json",
+        "watch_vars_file_change_triggers_recompile",
+    ),
+    (
+        "mds watch template.mds --clear",
+        "watch_clear_non_tty_no_ansi_escape",
+    ),
+    (
+        "mds watch src/ --poll-interval 500",
+        "watch_help_example_src_poll_interval_500_self_heals",
+    ),
+    (
+        "mds watch src/ --poll-interval 0",
+        "watch_help_example_src_poll_interval_0_rebuilds_on_native_events",
+    ),
+];
+
+/// Whether this file defines `name` as a `#[test]` function.
+fn is_test_in_this_file(name: &str) -> bool {
+    const SOURCE: &str = include_str!("cli_watch.rs");
+    let Some(at) = SOURCE.find(&format!("\nfn {name}() {{")) else {
+        return false;
+    };
+    // The attributes and doc comment above the fn, back to the previous item's end.
+    let before = &SOURCE[..at];
+    let preamble = &before[before.rfind("\n}\n").map_or(0, |i| i + 3)..];
+    preamble.lines().any(|l| l.trim() == "#[test]")
+}
+
+/// Every example `mds watch --help` prints has a named test that runs it, and every
+/// test the table names exists (#413): an example added without a test, edited so it
+/// no longer matches, or whose test was renamed away fails here.
+#[test]
+fn watch_help_examples_each_have_a_named_test() {
+    let output = mds_bin().args(["watch", "--help"]).output().unwrap();
+    assert!(output.status.success(), "mds watch --help exits 0");
+    let help = String::from_utf8(output.stdout).unwrap();
+    let (_, examples) = help
+        .split_once("Examples:")
+        .unwrap_or_else(|| panic!("--help has an Examples section; got: {help}"));
+    // An example line is the command, two or more spaces, then its description.
+    let shown: std::collections::BTreeSet<&str> = examples
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("mds watch"))
+        .map(|l| l.split("  ").next().unwrap_or(l).trim_end())
+        .collect();
+    let mapped: std::collections::BTreeSet<&str> =
+        WATCH_HELP_EXAMPLES.iter().map(|(ex, _)| *ex).collect();
+    assert_eq!(
+        shown, mapped,
+        "every --help example, and only those, is mapped"
+    );
+
+    for (example, test) in WATCH_HELP_EXAMPLES {
+        assert!(
+            is_test_in_this_file(test),
+            "{example:?} maps to `{test}`, which is not a #[test] in this file"
+        );
+    }
+    // Control: the lookup rejects a name that is not a test here, and a helper that is
+    // not a test.
+    assert!(!is_test_in_this_file(
+        "watch_help_example_that_does_not_exist"
+    ));
+    assert!(!is_test_in_this_file("spawn_ready"));
+    assert!(is_test_in_this_file(
+        "watch_help_examples_each_have_a_named_test"
+    ));
+}
+
+/// `mds watch .` — watch every `.mds` file in the working directory, writing each
+/// output next to its source (#413: `.` used to fail with `file not found: .`).
+#[test]
+fn watch_help_example_dot_watches_the_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("template.mds"), "Hello!\n").unwrap();
+    let out = dir.path().join("template.md");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", ".", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello!", TIMEOUT),
+        "the startup compile writes template.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&dir.path().join("template.mds"), "Hello again!\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello again!", TIMEOUT),
+        "an edit rebuilds; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch src/ --out-dir dist` — the trailing slash is accepted, and the output
+/// mirrors the source subtree under `dist/`.
+#[test]
+fn watch_help_example_src_out_dir_dist_mirrors_the_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+    std::fs::write(src.join("sub").join("b.mds"), "B\n").unwrap();
+    let dist = dir.path().join("dist");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "src/", "--out-dir", "dist", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&dist.join("a.md"), "A", TIMEOUT),
+        "src/a.mds → dist/a.md; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        wait_for_file_contains(&dist.join("sub").join("b.md"), "B", TIMEOUT),
+        "src/sub/b.mds → dist/sub/b.md; stderr: {}",
+        tap.text()
+    );
+    assert!(!dist.join("b.md").exists(), "mirrored, not flattened");
+    write_atomic(&src.join("sub").join("b.mds"), "B2\n");
+    assert!(
+        wait_for_file_contains(&dist.join("sub").join("b.md"), "B2", TIMEOUT),
+        "an edit rebuilds the mirrored output; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch src/ --poll-interval 500` — the self-heal check runs every 500 ms: once
+/// the watched root is deleted and recreated, which no OS event announces (the watch
+/// died with the old directory), the idle tick re-arms it and compiles the new file.
+#[test]
+fn watch_help_example_src_poll_interval_500_self_heals() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "Old A\n").unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "src/", "--poll-interval", "500", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&src.join("a.md"), "Old A", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&src).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir(&src).unwrap();
+    write_atomic(&src.join("new.mds"), "New file\n");
+    // TICK-DEPENDENT (see TICK_TIMEOUT): only the 500 ms self-heal tick can recover.
+    assert!(
+        wait_for_file_contains(&src.join("new.md"), "New file", TICK_TIMEOUT),
+        "the self-heal tick recovers the recreated root; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch src/ --poll-interval 0` — the self-heal check is off; native events alone
+/// compile at startup and rebuild on an edit.
+#[test]
+fn watch_help_example_src_poll_interval_0_rebuilds_on_native_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "src/", "--poll-interval", "0", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&src.join("a.md"), "A", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src.join("a.mds"), "A2\n");
+    assert!(
+        wait_for_file_contains(&src.join("a.md"), "A2", TIMEOUT),
+        "a native event rebuilds with the self-heal tick off; stderr: {}",
+        tap.text()
+    );
+    drop(child);
 }

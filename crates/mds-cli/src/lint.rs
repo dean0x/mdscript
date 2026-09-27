@@ -204,23 +204,17 @@ fn do_lint(args: LintArgs) -> Result<()> {
 
     // Directory mode.
     if input.is_dir() {
-        // Reject a symlinked directory root (build/check/fmt parity).
-        if input
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            // Directory-root symlink → JSON envelope in --format json mode (AC-F-14).
-            let mds_err = MdsError::Io {
-                message: format!(
-                    "directory argument must not be a symlink: {}",
-                    input.display()
-                ),
-            };
-            emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-            std::process::exit(2);
-        }
-        return run_lint_directory(&input, flags, runtime_vars);
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`). A
+        // refusal is an analysis failure: the JSON envelope in --format json mode
+        // (AC-F-14), exit 2.
+        return match crate::input::resolve_directory_argument(&input) {
+            Ok((dir, _)) => run_lint_directory(&dir, flags, runtime_vars),
+            Err(mds_err) => {
+                emit_analysis_failure_json_or_stderr(&mds_err, format, None);
+                std::process::exit(2);
+            }
+        };
     }
 
     // Single-file mode.
