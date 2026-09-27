@@ -14,7 +14,9 @@ import {
   errorShape,
   escapeText,
   findPythonForMarkdownScript,
+  loadEngines,
   rejectionOf,
+  requireEngines,
   thrownBy,
 } from './helpers.mjs';
 
@@ -619,5 +621,30 @@ describe('error shape', () => {
         );
       }
     }
+  });
+
+  test('U-E-CAP: native and WASM report a loop crossing the output cap with the same coded error', async (t) => {
+    // #415, a guard with no RED claim: 100 passes of 1 MiB + 1 bytes cross the 50 MiB
+    // output cap on the 50th. The error is the same whether the cap is checked before
+    // each append or after the loop, so this pins cross-surface parity of the error,
+    // not where the loop stopped (mds-core pins that). Both engines are required in CI.
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-E-CAP')) return;
+    const source = '@for i in items:\n{{x}}\n@end\n';
+    const vars = { x: 'a'.repeat(1024 * 1024), items: Array.from({ length: 100 }, (_, i) => i) };
+
+    const native = errorShape(
+      thrownBy(() => engines.native.compile(source, { vars }), 'U-E-CAP native'),
+    );
+    const wasm = errorShape(thrownBy(() => engines.wasm.compile(source, { vars }), 'U-E-CAP wasm'));
+
+    // Non-vacuity (PF-013): the shared error is the output cap, not some other failure.
+    assert.deepEqual(native, {
+      code: 'mds::resource_limit',
+      message: 'resource limit exceeded: output exceeds maximum size of 52428800 bytes',
+      help: null,
+      span: null,
+    });
+    assert.deepEqual(wasm, native, 'U-E-CAP: native and WASM must throw identical errors');
   });
 });

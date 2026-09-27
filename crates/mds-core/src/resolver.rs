@@ -14,6 +14,7 @@ use crate::evaluator::evaluate_messages_seeded;
 use crate::evaluator::evaluate_seeded;
 use crate::evaluator::evaluate_with_map;
 use crate::evaluator::evaluate_with_map_seeded;
+use crate::evaluator::push_capped;
 use crate::evaluator::EvalBudget;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
@@ -749,8 +750,8 @@ impl ModuleCache {
     /// not reach a diagnostic (R3 / CWE-209). Scope is shared across all regions
     /// (functions defined in earlier regions are visible to later ones).
     ///
-    /// PF-004: one [`EvalBudget`] covers every region, and the cumulative output
-    /// size is checked after each region, so each cap applies to the whole module
+    /// PF-004: one [`EvalBudget`] covers every region, and each region's output is
+    /// appended through the capped append, so each cap applies to the whole module
     /// evaluation rather than to each region.
     fn evaluate_regions_with_map(
         regions: &[(&[crate::ast::Node], &Origin)],
@@ -798,15 +799,9 @@ impl ModuleCache {
                 )?
             };
 
-            // PF-004: cumulative size guard — same limit as the per-node check.
-            let new_len = output.len() + region_output.len();
-            if new_len > crate::limits::MAX_OUTPUT_SIZE {
-                return Err(MdsError::resource_limit(format!(
-                    "output exceeds maximum size of {} bytes",
-                    crate::limits::MAX_OUTPUT_SIZE
-                )));
-            }
-            output.push_str(&region_output);
+            // PF-004: cumulative size guard — the same capped append as every other
+            // output buffer (#415).
+            push_capped(&mut output, &region_output)?;
         }
 
         Ok((output, current_map))

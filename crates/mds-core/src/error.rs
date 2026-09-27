@@ -3,6 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
+use crate::limits::MAX_OUTPUT_SIZE;
 use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
 
 // ── Serializable error types ──────────────────────────────────────────────────
@@ -887,6 +888,16 @@ impl MdsError {
         MdsError::ResourceLimit {
             message: message.into(),
         }
+    }
+
+    /// The output-cap error: an output buffer would grow past `MAX_OUTPUT_SIZE`.
+    ///
+    /// The only place this message is built (#415); every output append reports it
+    /// through the evaluator's `push_capped`.
+    pub(crate) fn output_size_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"
+        ))
     }
 
     /// Upgrade a spanless `Syntax` error with a span; no-op for other variants or if

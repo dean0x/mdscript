@@ -437,6 +437,59 @@ fn exit_code_resource_limit() {
     );
 }
 
+/// #415 (AC-14, a guard — no RED claim): a `@for` whose output crosses the 50 MiB
+/// output cap exits 3 with the exact `mds::resource_limit` message and writes nothing.
+/// The code and message are the same whether the cap is checked before each append or
+/// after the loop, so this pins the CLI's reporting; where the loop stops is pinned in
+/// mds-core (`for_loop_output_cap_stops_iterating`).
+#[test]
+fn for_loop_output_cap_exits_3() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("cap.mds");
+    // 100 passes of 1 MiB + 1 bytes (the body line and its newline): the 50th pass
+    // crosses 52,428,800 bytes. The source itself is ~1 MiB, under the 10 MiB file cap.
+    let items = (0..100)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = "a".repeat(1024 * 1024);
+    std::fs::write(
+        &src,
+        format!("---\nitems: [{items}]\n---\n@for i in items:\n{body}\n@end\n"),
+    )
+    .unwrap();
+
+    let output = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .args(["-o", "-"])
+        .output()
+        .expect("failed to run mds");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains("mds::resource_limit"),
+        "stderr must name the resource limit: {stderr}"
+    );
+    // miette word-wraps the diagnostic and prefixes continuation lines with `│`; flatten
+    // that back to a single line before matching the full message.
+    let flat: String = stderr
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("output exceeds maximum size of 52428800 bytes"),
+        "stderr must name the output cap: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "nothing may be written when the cap fires; got {} bytes",
+        output.stdout.len()
+    );
+}
+
 // ── Frontmatter YAML DoS bounds across the CLI (#162) ────────────────────────
 //
 // The alias bomb is the sub-1 MiB memory-amplification repro (n = m = 100 000,

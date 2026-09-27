@@ -239,7 +239,7 @@ fn builtin_replace(args: &[Value]) -> Result<Value, MdsError> {
     let result = s.replace(from, to);
     // Guard against amplification: a single-char search replaced by a long
     // string on large input can produce a result far exceeding MAX_OUTPUT_SIZE
-    // before the evaluator's per-node output check fires.
+    // before the evaluator's capped append ever sees it.
     if result.len() > MAX_OUTPUT_SIZE {
         return Err(MdsError::builtin_error(format!(
             "replace() output exceeds maximum size of {} bytes",
@@ -398,8 +398,8 @@ fn builtin_join(args: &[Value]) -> Result<Value, MdsError> {
                 }
                 out.push_str(s);
                 // Guard against amplification: large arrays with long elements
-                // can produce output far exceeding MAX_OUTPUT_SIZE before the
-                // evaluator's per-node check fires.
+                // can produce a value far exceeding MAX_OUTPUT_SIZE before the
+                // evaluator's capped append ever sees it.
                 if out.len() > MAX_OUTPUT_SIZE {
                     return Err(MdsError::builtin_error(format!(
                         "join() output exceeds maximum size of {} bytes",

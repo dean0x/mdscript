@@ -38,6 +38,10 @@
 //! - REL-1: one loop-iteration budget per extends chain, not per spliced region
 //! - AC-114-3: one message-byte budget per extends chain, not per spliced region
 //! - PF-004: one output-size budget per extends chain, not per spliced region
+//!
+//! #415 tests pin that the output cap is checked before each append: a `@for` of
+//! exactly the cap compiles, one byte more fails, and a crossing loop stops on the
+//! pass that crosses the cap in an `@extends` region and in an included module.
 
 use std::collections::HashMap;
 
@@ -1619,6 +1623,222 @@ fn output_size_cumulative_across_regions() {
             &format!("output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"),
         );
     }
+}
+
+// ── #415: the output cap is checked before each append ─────────────────────────
+//
+// The error is the same whether the cap is checked before each append or after a
+// whole node has finished, so the crossing-loop tests assert WHERE the loop stopped
+// (applies PF-013). The public API does not expose the iteration count, so the
+// iteration budget is the probe: a warm-up spends all but `CAP_CROSSING_PASS`
+// iterations, so an evaluator that ran even one pass past the crossing one would
+// report the iteration cap instead of the output cap.
+
+/// The exact output-cap error, as `Display` renders it.
+fn output_cap_error() -> String {
+    format!("resource limit exceeded: output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes")
+}
+
+/// The exact iteration-cap error, as `Display` renders it.
+fn iteration_cap_error() -> String {
+    format!(
+        "resource limit exceeded: total loop iterations exceeded maximum of \
+         {MAX_TOTAL_ITERATIONS} across all loops in this compilation"
+    )
+}
+
+/// The error of `result`, reported by kind only on success (the output runs to tens
+/// of megabytes).
+fn err_of<T>(result: Result<T, MdsError>, context: &str) -> MdsError {
+    match result {
+        Ok(_) => panic!("{context}: compiled successfully, expected an error"),
+        Err(err) => err,
+    }
+}
+
+/// One crossing-loop pass renders `{{x}}\n`: `x` is 1 MiB, plus the newline.
+const CAP_PASS: usize = 1024 * 1024 + 1;
+
+/// The pass whose append would take the loop's buffer past `MAX_OUTPUT_SIZE`: 49
+/// passes fit (51,380,273 bytes), the 50th does not (52,428,850).
+const CAP_CROSSING_PASS: usize = MAX_OUTPUT_SIZE / CAP_PASS + 1;
+
+/// Warm-up outer-loop length; with `WARMUP_INNER` it spends every iteration but
+/// the last `CAP_CROSSING_PASS`.
+const WARMUP_OUTER: usize = 50;
+const WARMUP_INNER: usize = (MAX_TOTAL_ITERATIONS - CAP_CROSSING_PASS) / WARMUP_OUTER - 1;
+
+const _: () = assert!((CAP_CROSSING_PASS - 1) * CAP_PASS <= MAX_OUTPUT_SIZE);
+const _: () = assert!(CAP_CROSSING_PASS * CAP_PASS > MAX_OUTPUT_SIZE);
+const _: () =
+    assert!(WARMUP_OUTER * (WARMUP_INNER + 1) + CAP_CROSSING_PASS == MAX_TOTAL_ITERATIONS);
+const _: () = assert!(WARMUP_INNER + 1 < 100_000);
+
+/// Crossing-loop base: the warm-up runs in the skeleton, before the `work` block.
+const CROSSING_BASE: &str = "BASE-SKELETON-HEAD\n\
+     @for o in warmup_outer:\n@for i in warmup_inner:\n@end\n@end\n\
+     @for i in warmup_extra:\n@end\n\
+     @block work:\nBASE-DEFAULT-WORK\n@end\n\
+     BASE-SKELETON-TAIL\n";
+/// The child's `work` override holds the crossing loop.
+const CROSSING_CHILD: &str = "@extends \"./base.mds\"\n\
+     @block work:\nCHILD-OVERRIDE-WORK\n@for i in items:\n{{x}}\n@end\n@end\n";
+/// A standalone module with the same warm-up and crossing loop, for `@include`. It
+/// carries the chain's markers (and no `BASE-DEFAULT`), so the control's
+/// `honors_extends` check proves its text reached the importer's output.
+const CROSSING_MODULE: &str = "BASE-SKELETON-HEAD\n\
+     @for o in warmup_outer:\n@for i in warmup_inner:\n@end\n@end\n\
+     @for i in warmup_extra:\n@end\n\
+     CHILD-OVERRIDE-WORK\n@for i in items:\n{{x}}\n@end\n\
+     BASE-SKELETON-TAIL\n";
+
+/// Runtime vars for the crossing-loop fixtures: `x` is the pass body, `items` the
+/// crossing loop's array, and `extra` extra warm-up passes (0 or 1).
+fn crossing_vars(x: &str, items: usize, extra: usize) -> HashMap<String, Value> {
+    let numbers = |n: usize| Value::Array((0..n).map(|i| Value::Number(i as f64)).collect());
+    HashMap::from([
+        ("x".to_string(), Value::String(x.to_string())),
+        ("items".to_string(), numbers(items)),
+        ("warmup_outer".to_string(), numbers(WARMUP_OUTER)),
+        ("warmup_inner".to_string(), numbers(WARMUP_INNER)),
+        ("warmup_extra".to_string(), numbers(extra)),
+    ])
+}
+
+/// Pin, on one path, that a loop crossing the output cap stops on the crossing pass.
+///
+/// `compile` compiles the path's fixture with the given runtime vars.
+fn assert_loop_stops_at_the_crossing_pass(
+    path: &str,
+    compile: impl Fn(HashMap<String, Value>) -> Result<String, MdsError>,
+) {
+    // Control: warm-up plus `CAP_CROSSING_PASS` small passes spend the iteration
+    // budget exactly, and the output comes from the fixture's container.
+    let text = compile(crossing_vars("tick", CAP_CROSSING_PASS, 0))
+        .unwrap_or_else(|err| panic!("{path}: the at-budget control must compile: {err}"));
+    assert!(
+        honors_extends(&text),
+        "{path}: output must come from the crossing fixture; markers: {}",
+        marker_report(&text)
+    );
+    assert_eq!(
+        text.matches("tick\n").count(),
+        CAP_CROSSING_PASS,
+        "{path}: the control's loop must run every pass"
+    );
+
+    // The crossing pass is the last one the budget allows: only the output cap can
+    // stop the loop there. One pass more would trip the iteration cap.
+    let x = "a".repeat(CAP_PASS - 1);
+    let err = err_of(
+        compile(crossing_vars(&x, 2 * CAP_CROSSING_PASS, 0)),
+        &format!("{path}: crossing loop"),
+    );
+    assert_eq!(
+        err.to_string(),
+        output_cap_error(),
+        "{path}: the loop must stop on the pass that crosses the output cap"
+    );
+
+    // One warm-up pass more: the crossing pass is now one past the iteration budget,
+    // and the iteration cap fires first, before that pass's body runs.
+    let err = err_of(
+        compile(crossing_vars(&x, 2 * CAP_CROSSING_PASS, 1)),
+        &format!("{path}: crossing loop past the iteration budget"),
+    );
+    assert_eq!(
+        err.to_string(),
+        iteration_cap_error(),
+        "{path}: the iteration cap must still win on the crossing pass"
+    );
+}
+
+/// TP-12 (AC-11): a `@for` whose output is exactly `MAX_OUTPUT_SIZE` compiles; one
+/// byte more fails with the exact output-cap error, with source maps on and off.
+#[test]
+fn for_loop_output_of_exactly_the_cap_compiles_one_byte_more_fails() {
+    let modules = HashMap::from([(
+        "main.mds".to_string(),
+        "@for s in seps:\n{{x}}{{s}}\n@end\n".to_string(),
+    )]);
+    // Each pass renders `x`, then `s`, then a newline: 1 MiB when `s` is empty.
+    let passes = MAX_OUTPUT_SIZE / (1024 * 1024);
+    let x = "a".repeat(1024 * 1024 - 1);
+    let vars = |last: &str| {
+        let mut seps = vec![Value::String(String::new()); passes - 1];
+        seps.push(Value::String(last.to_string()));
+        HashMap::from([
+            ("x".to_string(), Value::String(x.clone())),
+            ("seps".to_string(), Value::Array(seps)),
+        ])
+    };
+    for source_map in [false, true] {
+        let opts = CompileOptions::default().with_source_map(source_map);
+        let text =
+            compile_chain(&modules, "main.mds", vars(""), opts.clone()).unwrap_or_else(|err| {
+                panic!("source_map={source_map}: output of exactly the cap must compile: {err}")
+            });
+        assert_eq!(text.len(), MAX_OUTPUT_SIZE, "source_map={source_map}");
+        assert!(
+            text.bytes().filter(|&b| b == b'\n').count() == passes && !text.contains('b'),
+            "source_map={source_map}: every pass must render `x` and a newline"
+        );
+
+        let err = err_of(
+            compile_chain(&modules, "main.mds", vars("b"), opts),
+            &format!("source_map={source_map}: one byte over the cap"),
+        );
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "source_map={source_map}: expected mds::resource_limit, got: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            output_cap_error(),
+            "source_map={source_map}"
+        );
+    }
+}
+
+/// TP-15 (AC-13): a crossing loop in a child's `@extends` override stops on the
+/// crossing pass, source maps off; the warm-up in the base skeleton shares its budget.
+#[test]
+fn for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_maps_off() {
+    let modules = extends_chain(CROSSING_BASE, CROSSING_CHILD);
+    assert_loop_stops_at_the_crossing_pass("extends region, maps off", |vars| {
+        compile_chain(&modules, "child.mds", vars, CompileOptions::default())
+    });
+}
+
+/// TP-15 twin of `for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_maps_off`
+/// with source maps on.
+#[test]
+fn for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_source_map() {
+    let modules = extends_chain(CROSSING_BASE, CROSSING_CHILD);
+    assert_loop_stops_at_the_crossing_pass("extends region, maps on", |vars| {
+        compile_chain(
+            &modules,
+            "child.mds",
+            vars,
+            CompileOptions::default().with_source_map(true),
+        )
+    });
+}
+
+/// TP-15 (AC-13): a crossing loop in an `@include`d module stops on the crossing pass;
+/// the module is evaluated with its own budget, which its warm-up spends.
+#[test]
+fn for_loop_output_cap_stops_at_the_crossing_pass_in_included_module() {
+    let modules = HashMap::from([
+        ("lib.mds".to_string(), CROSSING_MODULE.to_string()),
+        (
+            "main.mds".to_string(),
+            "@import \"./lib.mds\" as lib\n@include lib\n".to_string(),
+        ),
+    ]);
+    assert_loop_stops_at_the_crossing_pass("included module", |vars| {
+        compile_chain(&modules, "main.mds", vars, CompileOptions::default())
+    });
 }
 
 /// Evaluation-error fixtures, one per kind of spliced region: `n` is a string, so the

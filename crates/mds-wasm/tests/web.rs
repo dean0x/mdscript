@@ -271,6 +271,23 @@ fn check_source_too_large_returns_resource_limit() {
     assert_eq!(code, "mds::resource_limit", "got: {code}");
 }
 
+/// #415 (a guard — no RED claim): a `@for` whose output crosses the 50 MiB output
+/// cap is a coded `mds::resource_limit` error with native's exact message. Its 100
+/// passes of 1 MiB fit in linear memory whether the cap is checked before each append
+/// or after the loop, so this pins the error's shape, not where the loop stopped.
+#[wasm_bindgen_test]
+fn for_loop_output_cap_is_resource_limit() {
+    let source = "@for i in items:\n{{x}}\n@end\n";
+    let items: Vec<u32> = (0..100).collect();
+    let opts = vars_opts(&serde_json::json!({ "x": "a".repeat(1024 * 1024), "items": items }));
+    let err = mds_wasm::compile(source, opts).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_eq!(
+        get_str(&err, "message"),
+        "resource limit exceeded: output exceeds maximum size of 52428800 bytes"
+    );
+}
+
 // ── check tests ───────────────────────────────────────────────────────────────
 
 #[wasm_bindgen_test]

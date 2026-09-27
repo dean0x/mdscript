@@ -37,11 +37,13 @@ pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// can import it for the `find_project_root` upward directory walk.
 pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
 
-/// Maximum size of the compiled output string in bytes (50 MB).
+/// Maximum size of an output buffer in bytes (50 MiB).
 ///
-/// Checked by the evaluator after each node and by built-ins that can amplify
-/// output (e.g. `replace()`) to prevent runaway memory use from adversarial
-/// inputs. Shared with `builtins.rs` to ensure a single authoritative limit.
+/// Checked by the evaluator before every append to an output buffer
+/// (`push_capped`, #415) and by built-ins that can amplify output (e.g.
+/// `replace()`) to prevent runaway memory use from adversarial inputs. Shared
+/// with `builtins.rs` to ensure a single authoritative limit. It bounds each
+/// buffer, not a compile's total memory (#420).
 pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 
 /// Maximum number of elements that `split()` may produce in a single call.

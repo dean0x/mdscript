@@ -103,7 +103,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max call depth | 128 | `evaluator.rs` (`MAX_CALL_DEPTH`) |
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
 | Max total iterations | 1,000,000 | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
-| Max output size | 50 MB | `evaluator.rs` (`MAX_OUTPUT_SIZE`) |
+| Max output size | 50 MiB (52,428,800 bytes) per output buffer, checked before every append; it does not bound a compile's total memory, since nested blocks, function results and imported modules each hold a buffer of their own ([#420](https://github.com/dean0x/mdscript/issues/420)) | `limits.rs` (`MAX_OUTPUT_SIZE`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
 | Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
