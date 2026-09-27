@@ -5780,6 +5780,7 @@ fn watch_refuses_at_startup_to_write_over_the_entry() {
         &["--out-dir", "."],
         &["-o", "page.md"],
         &["-o", "newdir/../page.md"],
+        &["--out-dir", "newdir/.."],
     ] {
         let label = format!("mds watch page.md {}", extra.join(" "));
         let (mut child, tap) = spawn_unsynchronized(
@@ -5806,6 +5807,24 @@ fn watch_refuses_at_startup_to_write_over_the_entry() {
             "{label}: nothing is written"
         );
     }
+
+    // Control: an `--out-dir` that does not exist yet is created by the write.
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md", "--out-dir", "fresh", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(
+            &dir.path().join("fresh").join("page.md"),
+            "Hello X!",
+            TIMEOUT
+        ),
+        "control: --out-dir fresh is created and written; stderr: {}",
+        tap.text()
+    );
+    drop(child);
 }
 
 /// A rebuild never writes over the entry either. When the startup compile fails, the
@@ -5860,6 +5879,38 @@ fn watch_rebuild_never_writes_over_the_entry() {
         );
         drop(child);
     }
+
+    // Control: a fallback that is not the entry is written by the first rebuild that
+    // compiles, which creates its directory; the failed startup compile created nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md", "--out-dir", "fresh", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+    assert!(
+        stderr.contains("mds::syntax"),
+        "control: the startup compile fails; stderr: {stderr}"
+    );
+    assert!(
+        !dir.path().join("fresh").exists(),
+        "control: a failed startup compile creates no directory"
+    );
+    write_atomic(&src, TYPE_MDS_PAGE);
+    assert!(
+        wait_for_file_contains(
+            &dir.path().join("fresh").join("page.md"),
+            "Hello X!",
+            TIMEOUT
+        ),
+        "control: the rebuild creates fresh/ and writes it; stderr: {}",
+        tap.text()
+    );
+    drop(child);
 }
 
 /// The #425 refusal is all `mds watch` says about an output that is the entry: the `-o`

@@ -2269,6 +2269,10 @@ mod entry_overwrite {
                 "page.md",
             ),
             (vec!["build", "e.mds", "-o", "new/../e.mds"], "e.mds"),
+            (
+                vec!["build", "page.md", "--out-dir", "newdir/.."],
+                "page.md",
+            ),
         ];
         if case_insensitive {
             rows.push((vec!["build", "page.md", "-o", "PAGE.md"], "page.md"));

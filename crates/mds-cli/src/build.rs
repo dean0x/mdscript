@@ -293,7 +293,7 @@ pub(crate) fn derive_output_filename_for_kind(input: &Path, kind: OutputKind) ->
 /// `input_path` drives the filename: if `Some`, the stem is reused (e.g. `foo.mds` → `foo.md`);
 /// if `None` (stdin), the fallback name is `output.md` for markdown, `output.json` for messages.
 ///
-/// Use [`prepare_output_dir_for_kind`] when the directory also needs to be created.
+/// [`write_output`] creates the directory, just before the write.
 pub(crate) fn compute_output_dir_path_for_kind(
     dir: &Path,
     input_path: Option<&Path>,
@@ -310,24 +310,11 @@ pub(crate) fn compute_output_dir_path_for_kind(
     dir.join(filename)
 }
 
-/// Create `dir` (if absent) and return `dir/<derived-name>.<ext>`.
-///
-/// Extension is determined by `kind` (markdown → `.md`, messages → `.json`).
-/// `input_path` drives the filename stem: if `Some`, the stem is reused;
-/// if `None` (stdin), the fallback is `output.md` / `output.json`.
-pub(crate) fn prepare_output_dir_for_kind(
-    dir: &Path,
-    input_path: Option<&Path>,
-    kind: OutputKind,
-) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| miette::miette!("cannot create output directory {}: {e}", dir.display()))?;
-    Ok(compute_output_dir_path_for_kind(dir, input_path, kind))
-}
-
 /// Resolve the output path according to the precedence chain (kind-aware variant).
 ///
-/// Any required output directory is created via `create_dir_all`.
+/// Nothing is created: [`write_output`] creates the output's directory just before the
+/// write, so an output refused as the entry file itself ([`refuse_output_over_entry`],
+/// #425) leaves no directory behind — `--out-dir newdir/..` included.
 ///
 /// Precedence:
 /// 1. `-o -`                         → stdout (returns `None`)
@@ -367,7 +354,9 @@ pub(crate) fn resolve_output_path_for_kind(
 
     // 4. `--out-dir <dir>`
     if let Some(dir) = out_dir {
-        return Ok(Some(prepare_output_dir_for_kind(dir, input_path, kind)?));
+        return Ok(Some(compute_output_dir_path_for_kind(
+            dir, input_path, kind,
+        )));
     }
 
     // 5. `mds.json` output_dir
@@ -377,7 +366,9 @@ pub(crate) fn resolve_output_path_for_kind(
             // (exit 2). A forbidden character was already refused by `load_config`.
             crate::output::reject_output_dir_traversal(output_dir)?;
             let dir = config_dir.join(output_dir);
-            return Ok(Some(prepare_output_dir_for_kind(&dir, input_path, kind)?));
+            return Ok(Some(compute_output_dir_path_for_kind(
+                &dir, input_path, kind,
+            )));
         }
     }
 
@@ -772,7 +763,9 @@ pub(crate) fn read_stdin() -> Result<String> {
 /// When `output_path` is `Some(path)`, creates any missing parent directories,
 /// writes the compiled string, and prints `"Compiled to {path}"` to stderr
 /// unless `quiet` or `announce` is false.  When `output_path` is `None`,
-/// prints the compiled string to stdout with no trailing newline.
+/// prints the compiled string to stdout with no trailing newline. This is where a
+/// single-file output's directory is created — [`resolve_output_path_for_kind`] creates
+/// nothing — so an output refused before the write leaves no directory behind (#425).
 ///
 /// Set `announce = false` in watch-loop rebuilds so only the `"Recompiled …"`
 /// summary line is emitted (not a redundant `"Compiled to …"` line).
@@ -2001,9 +1994,9 @@ fn run_build_directory(
         }
 
         // Per-file source_map_base: the output directory for this file, computed
-        // from the kind-independent directory oracle (avoids calling
-        // prepare_output_dir_for_kind here — an early create_dir_all would leave
-        // an empty directory on compile failure; Step 6 Caveat 1 / PF-004).
+        // from the kind-independent directory oracle, without creating it — an early
+        // create_dir_all would leave an empty directory on compile failure (Step 6
+        // Caveat 1 / PF-004).
         let base_no_ext = output_base_no_ext(file, dir, &output_base);
         let source_map_base = base_no_ext
             .parent()
@@ -2504,6 +2497,9 @@ mod tests {
             Some(out_dir.join("output.md")),
             "stdin with --out-dir should produce output.md inside the out dir"
         );
+        // #425: resolving creates nothing — `write_output` creates the directory, once
+        // the output has been admitted — so a refused output leaves no directory behind.
+        assert!(!out_dir.exists(), "resolving creates no directory");
     }
 
     #[test]
