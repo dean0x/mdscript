@@ -375,8 +375,9 @@ function segmentCapError(path: string): PathError {
 /**
  * `path`'s parent directory and final name as Rust's `Path::parent` and
  * `Path::file_name` see them: repeated and trailing separators and `.` components do
- * not count, and `..` is kept as written — the OS applies it, after any symlink
- * before it, when the parent is canonicalized. `name` is `undefined` when the path
+ * not count, and `..` is kept as written — the OS applies it when the parent is
+ * canonicalized: on POSIX after any symlink before it, on Windows lexically, before
+ * any link is followed, as it does for NativeFs. `name` is `undefined` when the path
  * has no final name (`.`, `./`, a root); an empty parent is `.`, as Rust
  * `effective_parent` makes it.
  */
@@ -398,8 +399,9 @@ function nativeParentAndName(path: string): { parent: string; name: string | und
  *
  * Mirrors Rust `check_symlink_named`, whose `parent.canonicalize()` step maps
  * every canonicalize failure on the parent — it does not distinguish errno —
- * to `MdsError::file_not_found(shown)`. `realpath` resolves each `..` physically,
- * after the symlinks before it, as the OS does for NativeFs.
+ * to `MdsError::file_not_found(shown)`. `realpath` resolves each `..` as the OS does
+ * for NativeFs: physically, after the symlinks before it, on POSIX; lexically, before
+ * any link is followed, on Windows.
  */
 async function canonicalDirectory(dir: string, shown: string): Promise<string> {
   try {
@@ -747,7 +749,8 @@ const WALK_FINISHED: Settled<never> = { ok: false, error: undefined };
  * is read: the entry path is validated as written (`mds::io`), its segments counted
  * (`mds::resource_limit`), and a path with no final name — `.`, a root, one ending in
  * `..` — is not found. Its parent directory is canonicalized as typed, so the OS
- * applies each `..` after the symlinks before it (never lexically), and the final
+ * applies each `..` as it does for NativeFs (after the symlinks before it on POSIX,
+ * lexically on Windows), never the scanner itself, and the final
  * component is refused when missing or a symlink, then canonicalized, and refused when
  * its canonical path carries a forbidden path character.
  */
@@ -855,10 +858,11 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  * 4. Module count: native refuses a module once 256 others are fully resolved, so a
  *    graph whose modules are still being resolved can hold more; the engine takes
  *    the entry plus 256, and a larger graph is refused here (#427).
- * 5. An import that names a symlinked directory and leaves it again through `..`
- *    (`./link/../x.mds`) is refused (`mds::import`): the engine resolves the name,
+ * 5. On POSIX, an import that names a symlinked directory and leaves it again through
+ *    `..` (`./link/../x.mds`) is refused (`mds::import`): the engine resolves the name,
  *    NativeFs the disk, so the key it resolves to names another file than the one
- *    native reads (#408, U-SM22).
+ *    native reads (#408, U-SM22). Windows collapses `link\..` lexically before it
+ *    follows the link, on both backends, so there such an import compiles as on native.
  * 6. A module more than 256 directories below the project root is refused: the
  *    engine's key of it is capped at 256 segments, where native caps only the path
  *    as written.
@@ -905,20 +909,22 @@ export async function buildModulesMap(
    *
    * The WASM engine resolves an import by name, from the importing module's key.
    * NativeFs resolves it on disk, from the importing module's canonical directory,
-   * where the OS applies each `..` after the symbolic links before it. A module's key
-   * is its canonical path, so the two agree for every import except one that names a
-   * symlinked directory and leaves it through `..` (`./link/../x.mds`): its key names
-   * the directory beside the link, while the file on disk sits beside the link's
-   * target. Whichever file were stored under that key, the engine would compile a
-   * module the native backend never reads (#408).
+   * where on POSIX the OS applies each `..` after the symbolic links before it. A
+   * module's key is its canonical path, so the two agree for every import except one
+   * that names a symlinked directory and leaves it through `..` (`./link/../x.mds`):
+   * its key names the directory beside the link, while the file on disk sits beside
+   * the link's target. Whichever file were stored under that key, the engine would
+   * compile a module the native backend never reads (#408). On Windows the OS applies
+   * each `..` lexically, before any link is followed, so the two always agree there.
    */
   async function assertKeyMatchesDisk(
     importerDir: string,
     importPath: string,
     childKey: string,
   ): Promise<void> {
-    // realpath() resolves each `..` physically, after the links before it — the
-    // directory NativeFs reads from. A missing directory is file-not-found there.
+    // realpath() resolves each `..` as the OS does for NativeFs — after the links
+    // before it on POSIX, lexically on Windows — so this is the directory NativeFs
+    // reads from. A missing directory is file-not-found there.
     const onDisk = await realpathParent(importerDir + sep + importPath, importPath);
     // The directory the engine's key names. If it cannot be resolved at all, it
     // is not the directory above, and the import is refused below.

@@ -812,7 +812,11 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
   // A module's key is its canonical path (#414), so through a symlinked directory the
   // two agree for every import except one whose own path names the link and leaves
   // it through `..`: its key names the directory beside the link, the file NativeFs
-  // reads sits beside the link's target.
+  // reads sits beside the link's target. That is POSIX, where the OS applies each
+  // `..` after the link before it. Windows collapses `sub\..` lexically before it
+  // follows the link (a junction here), on both backends, so there the two agree for
+  // that import too, and an entry typed that way names the file beside the link.
+  const lexicalDotDot = process.platform === 'win32';
 
   /** sub -> deep/other; sub/y.mds imports ../z.mds; both z.mds files exist. */
   async function dotDotOutOfLink(dir, linked) {
@@ -830,7 +834,7 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     return path.join(dir, 'main.mds');
   }
 
-  test("U-SM22: an import naming a symlinked directory and leaving it through '..' is refused, never read from the other side", async () => {
+  test("U-SM22: an import naming a symlinked directory and leaving it through '..' is never read from the other side — refused on POSIX, lexical on Windows", async () => {
     await withProject(async (dir) => {
       // A module reached through the link is keyed by its canonical path, so its own
       // `../z.mds` names, by key and on disk alike, the z.mds beside the link's target.
@@ -839,16 +843,26 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       assert.equal(modules['deep/z.mds'], 'DEEP-Z\n');
       assert.equal(modules['deep/other/y.mds'], '@import "../z.mds" as dz\nY=\n@include dz\n');
       assert.deepEqual(aliases, { 'sub/y.mds': 'deep/other/y.mds' });
-      // An import whose own path runs through the link and back out: its key names the
-      // root's z.mds, the file on disk is deep/z.mds.
+      // An import whose own path runs through the link and back out.
       const through = path.join(dir, 'through.mds');
-      await writeFile(through, '@import "./sub/../z.mds" as z\n@include z\n');
-      const err = await rejectionOf(buildModulesMap(through, scanImports), 'U-SM22');
-      assert.equal(err.code, 'mds::import', err.message);
-      assert.equal(
-        err.message,
-        `import error: import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "./sub/../z.mds"`,
-      );
+      const throughSource = '@import "./sub/../z.mds" as z\n@include z\n';
+      await writeFile(through, throughSource);
+      const build = buildModulesMap(through, scanImports);
+      if (lexicalDotDot) {
+        // Windows: its key and the disk both name the root's z.mds, the file native
+        // reads, so nothing is refused.
+        const built = await build;
+        assert.deepEqual(built.modules, { 'through.mds': throughSource, 'z.mds': 'ROOT-Z\n' });
+        assert.deepEqual(built.aliases, {});
+      } else {
+        // POSIX: its key names the root's z.mds, the file on disk is deep/z.mds.
+        const err = await rejectionOf(build, 'U-SM22');
+        assert.equal(err.code, 'mds::import', err.message);
+        assert.equal(
+          err.message,
+          `import error: import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "./sub/../z.mds"`,
+        );
+      }
     });
     // Control: the same tree with `sub` a real directory builds, and `../z.mds`
     // from sub/y.mds is the root z.mds under both resolutions.
@@ -890,16 +904,20 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       // A module reached through the link imports `../z.mds`: both backends read
       // deep/z.mds, the module's key being its canonical path (#414).
       const dotDot = await dotDotOutOfLink(dir, true);
-      // An import whose own path runs through the link and back out: NativeFs reads
-      // deep/z.mds; the WASM backend refuses rather than compile the root z.mds its
-      // engine would look up by name (difference 5).
+      // An import whose own path runs through the link and back out. On POSIX NativeFs
+      // reads deep/z.mds; the WASM backend refuses rather than compile the root z.mds
+      // its engine would look up by name (difference 5). On Windows both collapse
+      // `sub\..` lexically and compile the root z.mds.
       const through = path.join(dir, 'through.mds');
       await writeFile(through, '@import "./sub/../z.mds" as z\n@include z\n');
       // An ENTRY typed through the link and back out with `..`: the OS applies the
-      // `..` after the link, so both backends compile deep/z.mds — the scanner
-      // resolves the entry's directory as NativeFs does, never lexically (#414).
+      // `..` — after the link on POSIX, so both backends compile deep/z.mds; lexically
+      // on Windows, so both compile the root z.mds. The scanner resolves the entry's
+      // directory as NativeFs does, never lexically itself (#414).
       // Joined by hand: path.join would drop the `..` before the OS saw it.
       const entryOutOfLink = [dir, 'sub', '..', 'z.mds'].join(path.sep);
+      /** What native compiles for `sub/../z.mds`. */
+      const outOfLink = { output: lexicalDotDot ? 'ROOT-Z\n' : 'DEEP-Z\n' };
 
       const files = [alias, dotDot, entryOutOfLink, through];
       const [nativeAlias, nativeDotDot, nativeEntry, nativeThrough] = await compileFileOutcomes('native', files);
@@ -908,11 +926,15 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       assert.deepEqual(wasmAlias, nativeAlias);
       assert.equal(nativeDotDot.output, 'ROOT-Z\nY=\nDEEP-Z\n', JSON.stringify(nativeDotDot));
       assert.deepEqual(wasmDotDot, nativeDotDot);
-      assert.deepEqual(nativeEntry, { output: 'DEEP-Z\n' });
+      assert.deepEqual(nativeEntry, outOfLink);
       assert.deepEqual(wasmEntry, nativeEntry);
-      assert.deepEqual(nativeThrough, { output: 'DEEP-Z\n' });
-      assert.equal(wasmThrough.code, 'mds::import', JSON.stringify(wasmThrough));
-      assert.equal(wasmThrough.output, undefined, JSON.stringify(wasmThrough));
+      assert.deepEqual(nativeThrough, outOfLink);
+      if (lexicalDotDot) {
+        assert.deepEqual(wasmThrough, nativeThrough);
+      } else {
+        assert.equal(wasmThrough.code, 'mds::import', JSON.stringify(wasmThrough));
+        assert.equal(wasmThrough.output, undefined, JSON.stringify(wasmThrough));
+      }
     });
   });
 });
