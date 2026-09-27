@@ -10,13 +10,14 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { chmod, mkdtemp, mkdir, realpath, symlink, writeFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, open, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
   FORBIDDEN_PATH_CODEPOINTS,
   assertNoForbiddenChars,
   caseInsensitive,
   compileFileOutcomes,
+  errorShape,
   escapeText,
   loadEngines,
   pkgRoot,
@@ -1312,10 +1313,12 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
           span: null,
         }],
       ];
-      // Controls: exactly the cap resolves on both, with the same output.
+      // Controls: exactly the cap resolves on both, with the same output — a file of
+      // exactly the per-file cap too (#428).
       const atTheCap = [
         await write('count-257.mds', `${importsOf(256)}\nhi\n`),
         path.join(proj, 'chain', 'c1.mds'),
+        await write('exact.mds', 'x'.repeat(MAX_FILE_SIZE)),
       ];
       // `./` names the importing module's own directory: NativeFs reads it and fails
       // with `mds::io`. The message names the path differently on the two backends —
@@ -1745,6 +1748,60 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       for (const [i, [name, expected]] of rows.entries()) {
         assert.deepEqual(native[i], expected, `${name} (native)`);
         assert.deepEqual(wasm[i], native[i], name);
+      }
+    });
+  });
+
+  test('U-SM43: a file larger than its size check is read to one byte past the cap and no further (#428)', async () => {
+    await withNestedProject(async (proj) => {
+      const grown = path.join(proj, 'grown.mds');
+      const size = MAX_FILE_SIZE + 3 * 1024 * 1024;
+      await writeFile(grown, 'x'.repeat(size));
+      const main = path.join(proj, 'main.mds');
+      await writeFile(main, '@import "./grown.mds" as g\nhi\n');
+      // What reaches the engine: the length of every buffer handed to preflightModule.
+      const seen = [];
+      const engine = {
+        scanImportRecords: importRecordsOf(scanImports),
+        preflightModule(bytes, display, shown) {
+          seen.push(bytes.length);
+          return preflightModule(bytes, display, shown);
+        },
+      };
+      const tooLarge = (n) => ({
+        code: 'mds::resource_limit',
+        message: `resource limit exceeded: file too large (${n} bytes, max ${MAX_FILE_SIZE} bytes): grown.mds`,
+        help: null,
+        span: null,
+      });
+      // Control: its size when it is opened refuses it with its size, before a byte of
+      // it is read — as native refuses it.
+      for (const entry of [grown, main]) {
+        assert.deepEqual(errorShape(await rejectionOf(buildModulesMapWith(entry, engine), entry)), tooLarge(size));
+      }
+      assert.ok(!seen.includes(size), `nothing of it reached the engine: ${seen}`);
+
+      // A file that grows after its size check: every fstat reports it under the cap.
+      const probe = await open(grown);
+      const FileHandle = Object.getPrototypeOf(probe);
+      await probe.close();
+      const realStat = FileHandle.stat;
+      FileHandle.stat = async function stat(...args) {
+        const stats = await realStat.apply(this, args);
+        stats.size = Math.min(stats.size, 100);
+        return stats;
+      };
+      try {
+        for (const entry of [grown, main]) {
+          seen.length = 0;
+          const err = await rejectionOf(buildModulesMapWith(entry, engine), `${entry} grown`);
+          assert.deepEqual(errorShape(err), tooLarge(MAX_FILE_SIZE + 1), entry);
+          // At most one byte past the cap reached the engine — and that much did
+          // (non-vacuity): the read went on past the size it was told.
+          assert.equal(Math.max(...seen), MAX_FILE_SIZE + 1, `${entry}: ${seen}`);
+        }
+      } finally {
+        FileHandle.stat = realStat;
       }
     });
   });

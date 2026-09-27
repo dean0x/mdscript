@@ -153,6 +153,43 @@ async function openNoFollow(
   }
 }
 
+/** The smallest a read buffer grows by (Node's own `readFile` chunk). */
+const MIN_READ_GROWTH = 64 * 1024;
+
+/**
+ * Read `handle` from its start to its end or to `limit` bytes, whichever comes first,
+ * into a buffer of at most `limit` bytes: it starts at `sizeHint` plus one byte (room to
+ * see the end of a file whose size is known without growing) and grows by at most
+ * doubling, capped at `limit` — so a file that grows while it is read is never held
+ * whole, and no more than `limit` bytes of it reach the engine (#428), as native's
+ * `NativeFs::read` holds no more.
+ *
+ * Every pass either grows the buffer, which it does at most once per doubling up to
+ * `limit`, or reads, and every read that returns a byte brings `length` closer to
+ * `limit`; a read that returns none ends it. So the loop is bounded.
+ */
+async function readAtMost(
+  handle: Awaited<ReturnType<typeof open>>,
+  limit: number,
+  sizeHint: number,
+): Promise<Uint8Array> {
+  let buffer = Buffer.alloc(Math.min(sizeHint + 1, limit));
+  let length = 0;
+  while (length < limit) {
+    if (length === buffer.length) {
+      const grown = Buffer.alloc(Math.min(Math.max(buffer.length * 2, MIN_READ_GROWTH), limit));
+      buffer.copy(grown, 0, 0, length);
+      buffer = grown;
+    }
+    const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+    if (bytesRead === 0) {
+      break;
+    }
+    length += bytesRead;
+  }
+  return buffer.subarray(0, length);
+}
+
 /**
  * Close `handle`, reporting a failure as the read failure it is (`readError`), never
  * as Node's raw error.
@@ -1010,14 +1047,15 @@ export async function buildModulesMap(
       const display = keyOf(projectRoot, resolved);
       // Checked on the fstat size too, before a byte is read, so a file over the cap
       // when it is opened is never read into memory; one that grows past it while it
-      // is read is refused by the engine's own check below.
+      // is read is read to one byte past the cap and no further (#428), and refused by
+      // the engine's own check below.
       if (stats.size > MAX_FILE_SIZE) {
         throw fileTooLargeError(stats.size, display);
       }
       if (admit !== undefined && !admit(stats.size)) {
         return undefined;
       }
-      const bytes = await handle.readFile().catch((err: unknown) => {
+      const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, stats.size).catch((err: unknown) => {
         throw readError(shown, err);
       });
       // The engine's own checks, in the native order — the per-file cap and UTF-8

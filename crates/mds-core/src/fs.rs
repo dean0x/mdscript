@@ -371,15 +371,108 @@ fn check_segment_count(path: &str) -> Result<(), MdsError> {
 /// # Ok::<(), mds::MdsError>(())
 /// ```
 pub fn check_module_bytes(bytes: Vec<u8>, display: &str) -> Result<String, MdsError> {
-    let shown = crate::lint::escape_path_for_message(display);
     if bytes.len() as u64 > MAX_FILE_SIZE {
-        return Err(MdsError::resource_limit(format!(
-            "file too large ({} bytes, max {} bytes): {shown}",
-            bytes.len(),
-            MAX_FILE_SIZE,
-        )));
+        return Err(file_too_large(bytes.len() as u64, display));
     }
-    String::from_utf8(bytes).map_err(|e| MdsError::io(format!("invalid UTF-8 in {shown}: {e}")))
+    String::from_utf8(bytes).map_err(|e| {
+        MdsError::io(format!(
+            "invalid UTF-8 in {}: {e}",
+            crate::lint::escape_path_for_message(display)
+        ))
+    })
+}
+
+/// The refusal of a module file of `size` bytes, over [`crate::MAX_FILE_SIZE`], named
+/// by `display`, escaped.
+fn file_too_large(size: u64, display: &str) -> MdsError {
+    MdsError::resource_limit(format!(
+        "file too large ({size} bytes, max {MAX_FILE_SIZE} bytes): {}",
+        crate::lint::escape_path_for_message(display)
+    ))
+}
+
+/// Read the module file at `path` and check it as [`check_module_bytes`] does, naming
+/// it by `display`, without ever holding more than one byte over
+/// [`crate::MAX_FILE_SIZE`] of it (#428): a file over the cap when it is opened is
+/// refused before a byte is read, with its size; one that grows past the cap while it
+/// is read — or that reports no size, like a FIFO — is read to one byte past the cap
+/// and refused. [`NativeFs::read`] and `mds::lint`'s re-read of its entry read a module
+/// through it.
+pub(crate) fn read_module_file(path: &Path, display: &str) -> Result<String, MdsError> {
+    let bytes = match read_capped(path, MAX_FILE_SIZE) {
+        Ok(Capped::Bytes(bytes)) => bytes,
+        Ok(Capped::TooLarge(size)) => return Err(file_too_large(size, display)),
+        Err(e) => return Err(MdsError::io(format!("cannot read {display}: {e}"))),
+    };
+    check_module_bytes(bytes, display)
+}
+
+/// A file read under a size cap (see [`read_capped`]).
+pub(crate) enum Capped {
+    /// Its bytes: at most one more than the cap, and one more means it is over it.
+    Bytes(Vec<u8>),
+    /// Its size when it was opened, over the cap: nothing was read.
+    TooLarge(u64),
+}
+
+/// Open `path` and read it, holding no more than one byte over `cap` of it: a file
+/// over `cap` when it is opened is reported by its size, unread; any other is read to
+/// its end or to one byte past `cap`, whichever comes first. The size is taken from
+/// the opened file, so no other file can take its place between the two.
+pub(crate) fn read_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > cap {
+        return Ok(Capped::TooLarge(size));
+    }
+    read_at_most(&mut file, cap.saturating_add(1), size).map(Capped::Bytes)
+}
+
+/// How many reads in a row may be interrupted before `read_at_most` gives up.
+const MAX_INTERRUPTED_READS: u32 = 64;
+
+/// Read `reader` to its end or to `limit` bytes, whichever comes first, into a buffer
+/// whose capacity never exceeds `limit`: it starts at `size_hint` plus one byte (room
+/// to see the end of a file whose size is known without growing) and grows by at most
+/// doubling, capped at `limit`.
+///
+/// Every read that returns bytes brings the buffer closer to `limit`, and at most
+/// [`MAX_INTERRUPTED_READS`] reads in a row may be interrupted, so the loop is bounded.
+fn read_at_most(
+    reader: &mut impl std::io::Read,
+    limit: u64,
+    size_hint: u64,
+) -> std::io::Result<Vec<u8>> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let first = usize::try_from(size_hint)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1)
+        .min(limit);
+    let mut buf: Vec<u8> = Vec::with_capacity(first);
+    let mut chunk = [0u8; 8 * 1024];
+    let mut interrupted = 0;
+    while buf.len() < limit {
+        let want = chunk.len().min(limit - buf.len());
+        let n = match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                interrupted += 1;
+                if interrupted > MAX_INTERRUPTED_READS {
+                    return Err(e);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        interrupted = 0;
+        if buf.capacity() - buf.len() < n {
+            // Double, but never past `limit`: `n` fits, as `want` did.
+            buf.reserve_exact(buf.capacity().max(n).min(limit - buf.len()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
 }
 
 // ── VirtualFs segment logic ──────────────────────────────────────────────────
@@ -923,12 +1016,10 @@ impl FileSystem for NativeFs {
         // Compute a display-safe (root-relative) path before any IO so errors
         // always show a relative path rather than the canonical absolute key (R3 / CWE-209).
         let display = self.display_of(path);
-        // Read bytes first, then check size — this is the TOCTOU-safe pattern.
-        // A metadata() pre-check would introduce a race window between the size
-        // check and the actual read. Read first, reject after.
-        let bytes =
-            std::fs::read(path).map_err(|e| MdsError::io(format!("cannot read {display}: {e}")))?;
-        check_module_bytes(bytes, &display)
+        // The size is taken from the opened file, and the read itself stops one byte
+        // past the cap, so neither a file swapped nor one grown after the check is
+        // held in memory whole (#428).
+        read_module_file(path, &display)
     }
 
     fn is_markdown(&self, normalized: &str) -> bool {

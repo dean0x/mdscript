@@ -159,16 +159,26 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
         let candidate = current.join("mds.json");
         if candidate.is_file() {
             let shown = crate::output::safe_path(&shown_dir.join("mds.json"));
-            // Read the file first, then check size — avoids a TOCTOU race between
-            // a separate metadata() call and the actual read().
-            let bytes = std::fs::read(&candidate).map_err(|e| {
+            // The size is taken from the opened file, and the read stops one byte past
+            // the cap, so an oversized mds.json — or one that grows while it is read —
+            // is never held in memory whole (#428).
+            let cannot_read = |e: std::io::Error| {
                 miette::miette!("cannot read {shown}: {}", crate::output::safe_inline(&e))
-            })?;
+            };
+            let too_large = |size: u64| {
+                miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MB)")
+            };
+            let file = std::fs::File::open(&candidate).map_err(cannot_read)?;
+            let size = file.metadata().map_err(cannot_read)?.len();
+            if size > MAX_CONFIG_SIZE {
+                return Err(too_large(size));
+            }
+            let mut bytes = Vec::with_capacity(size as usize + 1);
+            file.take(MAX_CONFIG_SIZE + 1)
+                .read_to_end(&mut bytes)
+                .map_err(cannot_read)?;
             if bytes.len() as u64 > MAX_CONFIG_SIZE {
-                return Err(miette::miette!(
-                    "mds.json at {shown} is too large ({} bytes; maximum is 1 MB)",
-                    bytes.len()
-                ));
+                return Err(too_large(bytes.len() as u64));
             }
             let raw = String::from_utf8(bytes).map_err(|e| {
                 miette::miette!(

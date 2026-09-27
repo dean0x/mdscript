@@ -1463,10 +1463,9 @@ pub fn lint(
         let mut warnings = vec![];
         cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
     }
-    // Read source for lint re-parse, with NativeFs::read's own post-read checks.
-    let bytes =
-        std::fs::read(path).map_err(|e| MdsError::io(format!("cannot read {path_str}: {e}")))?;
-    let source = check_module_bytes(bytes, path_str)?;
+    // Read source for lint re-parse as NativeFs::read reads a module: at most one byte
+    // past the cap (#428), then its own post-read checks.
+    let source = fs::read_module_file(path, path_str)?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1871,15 +1870,19 @@ pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsE
         )),
         other => other,
     })?;
-    // Read bytes first, then check size (same TOCTOU-safe pattern as resolver.rs).
-    let bytes = std::fs::read(path)
-        .map_err(|e| MdsError::io(format!("cannot read vars file {path_str}: {e}")))?;
-    if bytes.len() as u64 > MAX_FILE_SIZE {
-        return Err(MdsError::resource_limit(format!(
-            "vars file exceeds maximum size of {} bytes: {path_str}",
-            MAX_FILE_SIZE,
-        )));
-    }
+    // Read at most one byte past the cap (#428): a file over it when it is opened is
+    // never read, and one that grows past it while it is read is read no further.
+    let bytes = match fs::read_capped(path, MAX_FILE_SIZE)
+        .map_err(|e| MdsError::io(format!("cannot read vars file {path_str}: {e}")))?
+    {
+        fs::Capped::Bytes(bytes) if bytes.len() as u64 <= MAX_FILE_SIZE => bytes,
+        fs::Capped::Bytes(_) | fs::Capped::TooLarge(_) => {
+            return Err(MdsError::resource_limit(format!(
+                "vars file exceeds maximum size of {} bytes: {path_str}",
+                MAX_FILE_SIZE,
+            )));
+        }
+    };
     let content = String::from_utf8(bytes)
         .map_err(|e| MdsError::io(format!("invalid UTF-8 in vars file {path_str}: {e}")))?;
     let json: serde_json::Value = serde_json::from_str(&content)
