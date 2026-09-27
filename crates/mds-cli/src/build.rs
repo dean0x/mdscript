@@ -313,8 +313,8 @@ pub(crate) fn compute_output_dir_path_for_kind(
 /// Resolve the output path according to the precedence chain (kind-aware variant).
 ///
 /// Nothing is created: [`write_output`] creates the output's directory just before the
-/// write, so an output refused as the entry file itself ([`refuse_output_over_entry`],
-/// #425) leaves no directory behind — `--out-dir newdir/..` included.
+/// write, so an output [`admit_output`] refuses as the entry file itself (#425) leaves
+/// no directory behind — `--out-dir newdir/..` included.
 ///
 /// Precedence:
 /// 1. `-o -`                         → stdout (returns `None`)
@@ -387,13 +387,10 @@ pub(crate) fn resolve_output_path_for_kind(
 
 /// Warn when an explicit `-o <path>`'s extension contradicts the compiled `kind`
 /// (AC-FUNC-11): the output is still written to the path as given. The warning
-/// announces that write, so callers emit it only once the write is certain — after
-/// [`refuse_output_over_entry`] has passed (#425) — never for an output that is refused.
-pub(crate) fn warn_output_extension_mismatch(
-    output: &Option<String>,
-    kind: OutputKind,
-    quiet: bool,
-) {
+/// announces that write, so it is emitted only once the write is certain — by
+/// [`admit_output`], after the #425 refusal has passed, never for an output that is
+/// refused; `mds build -` (stdin), which has no entry file to refuse, emits it directly.
+fn warn_output_extension_mismatch(output: &Option<String>, kind: OutputKind, quiet: bool) {
     let Some(o) = output.as_deref().filter(|o| *o != "-") else {
         return;
     };
@@ -966,14 +963,20 @@ pub(crate) fn compile_to_content(
     })
 }
 
-/// A single-file entry in the two forms `mds watch` holds it in (#417).
+/// A single-file entry in the two forms `mds watch` holds it in (#417), always in
+/// `(typed, canonical)` order, so the two cannot be passed swapped.
 ///
-/// `typed` is the path as the user typed it: the entry is compiled by it, so an error
+/// `typed` is the path as the user typed it: the entry is compiled by it, and a message
 /// names the file that way, as `mds build` does — never by its canonical absolute path.
 /// `canonical` is the form notify reports event paths under: the output path is derived
 /// from it, and every identity check — watched directories, files of interest,
 /// baselines — uses it. `typed` is never compared with it as text (#408); [`compile_entry`]
 /// canonicalizes `typed` again and compares the two canonical directories.
+///
+/// [`admit_output`] takes the entry's identity through [`file_identity`], which
+/// canonicalizes, so `mds build` — which compiles its entry once, by the path as typed,
+/// and never holds a canonical form — passes the typed path as both. It never passes one
+/// to [`compile_entry`].
 #[derive(Clone, Copy)]
 pub(crate) struct EntryPaths<'a> {
     pub(crate) typed: &'a Path,
@@ -1098,32 +1101,47 @@ fn resolve_dir_as_created(dir: &Path) -> Option<PathBuf> {
 /// entry itself (any extension), land on it too. Writing would replace the source with
 /// its compiled form, which no longer declares `type: mds`, so the next build fails.
 ///
-/// `output` and `entry` are compared as the files they name ([`file_identity`]),
-/// canonical with canonical, never a path with a spelling of it (#408) — an output
-/// whose directory does not exist yet as the write will create it, so
-/// `newdir/../page.md` is `page.md`. `entry` may be
-/// any spelling that reaches the entry — `build` passes it as typed, `watch` its
-/// canonical form. `None` (stdout) is never the entry. `mds build` and `mds watch` file
-/// mode run it after the output path is resolved and before anything is written —
-/// `watch` at startup and on every rebuild.
-pub(crate) fn refuse_output_over_entry(
-    output: Option<&Path>,
-    entry: &Path,
-    typed: &Path,
-) -> Result<(), MdsError> {
+/// `output` and `entry.canonical` are compared as the files they name
+/// ([`file_identity`]), canonical with canonical, never a path with a spelling of it
+/// (#408) — an output whose directory does not exist yet as the write will create it, so
+/// `newdir/../page.md` is `page.md`. `None` (stdout) is never the entry. It runs only
+/// inside [`admit_output`], after the output path is resolved and before anything is
+/// written.
+fn refuse_output_over_entry(output: Option<&Path>, entry: EntryPaths<'_>) -> Result<(), MdsError> {
     let Some(output) = output else {
         return Ok(());
     };
-    match (file_identity(output), file_identity(entry)) {
-        (Some(output), Some(entry)) if output == entry => Err(MdsError::Io {
+    match (file_identity(output), file_identity(entry.canonical)) {
+        (Some(output), Some(canonical)) if output == canonical => Err(MdsError::Io {
             message: format!(
                 "output would overwrite the entry file: \"{}\"; \
                  write it elsewhere with -o <file> or --out-dir <dir>",
-                mds::escape_path_for_message(&typed.to_string_lossy())
+                mds::escape_path_for_message(&entry.typed.to_string_lossy())
             ),
         }),
         _ => Ok(()),
     }
+}
+
+/// Admit `output_path` as the destination of the compiled `entry`: refuse it when it is
+/// the entry file itself ([`refuse_output_over_entry`], #425), and only then warn when
+/// an explicit `-o` (`output_arg`) contradicts `kind` ([`warn_output_extension_mismatch`])
+/// — the warning announces the write, so a refused output never gets one.
+///
+/// Every route to a compiled entry's output goes through it: `mds build` file mode,
+/// `mds watch`'s startup compile, its startup fallback and every rebuild. A rebuild
+/// passes no `output_arg`: the warning is a startup message, printed once for the path
+/// every rebuild reuses.
+pub(crate) fn admit_output(
+    output_path: Option<&Path>,
+    entry: EntryPaths<'_>,
+    output_arg: &Option<String>,
+    kind: OutputKind,
+    quiet: bool,
+) -> Result<(), MdsError> {
+    refuse_output_over_entry(output_path, entry)?;
+    warn_output_extension_mismatch(output_arg, kind, quiet);
+    Ok(())
 }
 
 /// What [`compile_and_write`] returns on success, `(output_path, deps, content)`:
@@ -1133,8 +1151,8 @@ pub(crate) fn refuse_output_over_entry(
 ///   so startup does not compile twice).
 pub(crate) type WrittenEntry = (Option<PathBuf>, Vec<String>, String);
 
-/// Outcome of [`compile_and_write`]'s compile-route-write attempt, once its own
-/// startup refusal ([`refuse_output_over_entry`], #425) has already passed.
+/// Outcome of [`compile_and_write`]'s compile-route-write attempt, once its output has
+/// been admitted ([`admit_output`], #425).
 pub(crate) enum CompileWriteOutcome {
     /// Compiled, routed and written.
     Written(WrittenEntry),
@@ -1149,17 +1167,17 @@ pub(crate) enum CompileWriteOutcome {
 /// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
 /// reports and keeps watching through: the compile, the output path, the write. The
 /// `Err` this function itself returns is reserved for an output path that is the entry
-/// file itself ([`refuse_output_over_entry`], #425), which ends `mds watch` at startup
-/// (exit 2): every rebuild would reuse that path.
+/// file itself ([`admit_output`], #425), which ends `mds watch` at startup (exit 2):
+/// every rebuild would reuse that path.
 ///
 /// The output path is derived AFTER compiling (compile-then-route) so the kind
 /// (and thus extension: `.json` for messages, `.md` for markdown) is known before
 /// the path is constructed. This is the single-file intrinsic extension path.
 ///
-/// If `-o <path>` is given explicitly, that path is used verbatim, and once it has
-/// passed the #425 refusal an ext-mismatch warning is emitted when the extension
-/// contradicts the kind (AC-FUNC-11). If `-o -` or stdin-with-no-flags, content is
-/// written to stdout.
+/// If `-o <path>` is given explicitly, that path is used verbatim, and once
+/// [`admit_output`] has admitted it an ext-mismatch warning is emitted when the
+/// extension contradicts the kind (AC-FUNC-11). If `-o -` or stdin-with-no-flags,
+/// content is written to stdout.
 ///
 /// Source-map writing is NOT performed here — callers that need maps handle them
 /// after this call returns (so map writing logic stays in `run_build`, not here).
@@ -1192,9 +1210,8 @@ pub(crate) fn compile_and_write(
         Ok(routed) => routed,
         Err(e) => return Ok(CompileWriteOutcome::Failed(e)),
     };
-    refuse_output_over_entry(output_path.as_deref(), entry.canonical, entry.typed)
+    admit_output(output_path.as_deref(), entry, output, compiled.kind, quiet)
         .map_err(miette::Error::from)?;
-    warn_output_extension_mismatch(output, compiled.kind, quiet);
     Ok(
         match write_output(output_path.clone(), &compiled.content, quiet, true) {
             Ok(()) => {
@@ -1629,6 +1646,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         let content = serialize_output(result.output)?;
 
         // Stdin: no project config; output path follows -o flag or defaults to stdout.
+        // There is no entry file to refuse (#425), so the `-o` warning is printed now.
         let output_path =
             resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind)?;
         warn_output_extension_mismatch(&output, kind, quiet);
@@ -1745,10 +1763,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         compiled.kind,
     )?;
     // #425: nothing — output or sidecar map — is written once the output is the entry,
-    // and no warning announces that write.
-    refuse_output_over_entry(output_path.as_deref(), &input, &input)
+    // and no warning announces that write. `mds build` holds only the typed path;
+    // `admit_output` canonicalizes both sides itself.
+    let entry = EntryPaths {
+        typed: &input,
+        canonical: &input,
+    };
+    admit_output(output_path.as_deref(), entry, &output, compiled.kind, quiet)
         .map_err(miette::Error::from)?;
-    warn_output_extension_mismatch(&output, compiled.kind, quiet);
 
     let mut source_map = compiled.source_map;
     if let Some(ref mut sm) = source_map {
@@ -2242,6 +2264,50 @@ mod tests {
             !missing.contains("different file"),
             "a missing entry is the compile's error: {missing}"
         );
+    }
+
+    /// #425: `admit_output` refuses an output that is the entry file and names the entry
+    /// by `typed`, never by `canonical`; any other output is admitted, stdout included.
+    /// Every write site — `mds build`, `mds watch`'s startup compile, its startup
+    /// fallback and every rebuild — passes the entry as one `EntryPaths`, so none of them
+    /// can hand the two forms over swapped.
+    #[test]
+    fn admit_output_refuses_naming_the_entry_as_typed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("page.md"), "x").unwrap();
+        let typed = dir.path().join("sub").join("..").join("page.md");
+        let canonical = dir.path().join("page.md").canonicalize().unwrap();
+        let entry = EntryPaths {
+            typed: &typed,
+            canonical: &canonical,
+        };
+        let admit = |output: Option<&Path>| {
+            admit_output(output, entry, &None, OutputKind::Markdown, true)
+                .map_err(|e| e.to_string())
+        };
+
+        let refused = admit(Some(&canonical)).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "output would overwrite the entry file: \"{}\"; \
+                 write it elsewhere with -o <file> or --out-dir <dir>",
+                typed.display()
+            )
+        );
+        assert!(
+            !refused.contains(&*canonical.to_string_lossy()),
+            "{refused}"
+        );
+        assert_eq!(
+            admit(Some(&dir.path().join("sub").join("..").join("page.md"))),
+            Err(refused),
+            "another spelling of the entry is the entry"
+        );
+
+        assert_eq!(admit(Some(&dir.path().join("out.md"))), Ok(()), "control");
+        assert_eq!(admit(None), Ok(()), "stdout is never the entry");
     }
 
     /// #425: an output whose directory does not exist yet is the file the write will

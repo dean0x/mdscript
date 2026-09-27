@@ -69,10 +69,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use mds::MdsError;
 
 use crate::build::{
-    auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_entry, compile_to_content,
-    emit_duplicate_var_warnings, load_config, refuse_output_over_entry,
-    resolve_output_path_for_kind, warn_output_extension_mismatch, write_output,
-    CompileWriteOutcome, EntryPaths, OutputKind, RuntimeVarArgs,
+    admit_output, auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_entry,
+    compile_to_content, emit_duplicate_var_warnings, load_config, resolve_output_path_for_kind,
+    write_output, CompileWriteOutcome, EntryPaths, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
@@ -904,11 +903,13 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         // Reject a symlinked entry (build parity — PF-004); plain canonicalize would
         // silently follow it. check_symlink returns the canonical path for
         // non-symlinks, preserving FSEvents path-matching.
-        let canonical_input =
+        let canonical =
             mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
         run_watch_file(
-            resolved_input,
-            canonical_input,
+            WatchEntry {
+                typed: resolved_input,
+                canonical,
+            },
             output,
             out_dir,
             vars,
@@ -924,6 +925,31 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 
 // ── Single-file watch ─────────────────────────────────────────────────────────
 
+/// The watched entry in the two forms file mode holds it in for the whole session — the
+/// file-mode twin of [`WatchRoot`]. [`WatchEntry::paths`] lends both as one
+/// [`EntryPaths`], the form [`compile_entry`] and [`admit_output`] take, so they always
+/// travel together, typed first, and cannot be handed over swapped (#417).
+struct WatchEntry {
+    /// The entry exactly as the user typed it. The entry is compiled by it, so a compile
+    /// error names the file as typed, never by its canonical absolute path (#417), and
+    /// `mds.json` is looked up from it at startup (#413). No identity check uses it and
+    /// its text is never compared with `canonical` (#408); [`compile_entry`] refuses a
+    /// compile once it leads to a different file than `canonical`.
+    typed: PathBuf,
+    /// The canonical entry path — matches notify's canonicalized event paths; used for
+    /// `dirs_to_watch`/`files_of_interest`, the output path and baselines.
+    canonical: PathBuf,
+}
+
+impl WatchEntry {
+    fn paths(&self) -> EntryPaths<'_> {
+        EntryPaths {
+            typed: &self.typed,
+            canonical: &self.canonical,
+        }
+    }
+}
+
 /// Compile-time context for single-file watch mode.
 ///
 /// Holds the parameters that are resolved once at startup and passed to every
@@ -937,14 +963,8 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 /// For the watch single-file case the path is stable across recompiles (the template
 /// kind cannot change without the template itself changing, which triggers a rebuild).
 struct FileCompileCtx {
-    /// Canonical entry path — matches notify's canonicalized event paths; used for
-    /// `dirs_to_watch`/`files_of_interest`, the output path and baselines.
-    entry: PathBuf,
-    /// The entry exactly as the user typed it. The entry is compiled by it, so a compile
-    /// error names the file as typed, never by its canonical absolute path (#417). No
-    /// identity check uses it and its text is never compared with `entry` (#408);
-    /// [`compile_entry`] refuses a compile once it leads to a different file than `entry`.
-    entry_typed: PathBuf,
+    /// The watched entry, as typed and canonical.
+    entry: WatchEntry,
     /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
     /// used for `dirs_to_watch`/`files_of_interest` (never for display, #326).
     vars_path: Option<PathBuf>,
@@ -961,6 +981,32 @@ struct FileCompileCtx {
     out_dir: Option<PathBuf>,
     output_path: Option<PathBuf>,
     quiet: bool,
+}
+
+impl FileCompileCtx {
+    /// The output path a rebuild that compiled to `kind` writes to.
+    ///
+    /// When startup resolved one (`output_path` is `Some`: a successful startup compile,
+    /// or the Markdown fallback of a failed one), it is reused. `None` means stdout
+    /// (`-o -`) or a startup that resolved no path at all, and the path is re-derived
+    /// from the kind and the flags. Project config is loaded lazily, only on that path.
+    /// It is looked up by the canonical entry, the file being watched: an error here is
+    /// swallowed, so no message ever names the path, and the canonical path holds no
+    /// symlink a retarget could move elsewhere (#417).
+    fn rebuild_output_path(&self, kind: OutputKind) -> Option<PathBuf> {
+        if self.output_path.is_some() {
+            return self.output_path.clone();
+        }
+        let config = load_config(&self.entry.canonical).unwrap_or(None);
+        resolve_output_path_for_kind(
+            &Some(self.entry.canonical.clone()),
+            &self.output_arg,
+            &self.out_dir,
+            &config,
+            kind,
+        )
+        .unwrap_or(None)
+    }
 }
 
 /// Mutable loop state for single-file watch mode.
@@ -1017,10 +1063,11 @@ fn liveness_probe_file(
     //    A dir "needs attention" if it was previously missing OR not yet armed.
     //    Already-armed, currently-present dirs are not touched — steady-state idle
     //    cost becomes O(missing_dirs) ≈ O(0), not O(watched_dirs).
-    let desired_dirs: BTreeSet<PathBuf> = dirs_to_watch(&ctx.entry, &[], ctx.vars_path.as_deref())
-        .union(&state.watched_dirs)
-        .cloned()
-        .collect();
+    let desired_dirs: BTreeSet<PathBuf> =
+        dirs_to_watch(&ctx.entry.canonical, &[], ctx.vars_path.as_deref())
+            .union(&state.watched_dirs)
+            .cloned()
+            .collect();
     let dir_statuses: Vec<(PathBuf, bool, bool)> = desired_dirs
         .iter()
         .map(|d| {
@@ -1059,7 +1106,7 @@ fn liveness_probe_file(
     // 2. Determine if we need a full reconcile:
     //    (a) first tick, (b) edge-triggered dir recovery,
     //    (c) entry was missing and now exists (vanish→reappear edge).
-    let entry_now_exists = ctx.entry.exists();
+    let entry_now_exists = ctx.entry.canonical.exists();
     let recovery =
         state.first_tick || dirs_recovery || (state.entry_was_missing && entry_now_exists);
     state.first_tick = false;
@@ -1131,7 +1178,8 @@ fn handle_fs_event_file(
 /// # Invariants preserved
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output.
 /// - PF-004: all reads go through `compile_to_content`.
-/// - Error-settle: `last_mtimes` updated on vars error, compile error, and write error.
+/// - Error-settle: every failure — the vars file, the compile, the output route or its
+///   #425 refusal, the write — goes through [`settle_after_error`].
 fn rebuild_file(
     ctx: &FileCompileCtx,
     watcher: &mut RecommendedWatcher,
@@ -1156,11 +1204,7 @@ fn rebuild_file(
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
         Ok(v) => v,
-        Err(e) => {
-            eprint_error(e);
-            state.last_mtimes = snapshot_state(&state.foi);
-            return;
-        }
+        Err(e) => return settle_after_error(state, e),
     };
     // Move the map out instead of cloning it: `compile_to_content` takes
     // `runtime_vars` by value, and the emitter below only ever reads
@@ -1169,129 +1213,110 @@ fn rebuild_file(
     let runtime_vars = resolved.vars.take();
 
     let t0 = Instant::now();
-    let entry = EntryPaths {
-        typed: &ctx.entry_typed,
-        canonical: &ctx.entry,
-    };
-    match compile_entry(
+    let entry = ctx.entry.paths();
+    // Compile, route and admit as one step, so a failure of any of the three is reported
+    // and settled the same way, and watching continues.
+    let routed = compile_entry(
         entry,
         runtime_vars,
         ctx.quiet,
         mds::CompileOptions::default(),
-    ) {
-        Ok(compiled) => {
-            // Derive the output path from the compiled kind (intrinsic extension).
-            // If ctx.output_path is already set (startup succeeded), reuse it.
-            // If ctx.output_path is None: either output is stdout (output_arg == Some("-")
-            // or no flags) OR startup failed. In either case, re-derive from kind + args.
-            // We load project config lazily here only if output_path is None and we need
-            // to derive from mds.json — for the common "startup succeeded" path this is free.
-            let output_path = if ctx.output_path.is_some() {
-                ctx.output_path.clone()
-            } else {
-                // output_path is None: this means either stdout or startup failed.
-                // Re-derive using kind. If -o - or stdin fallback, this returns None (stdout).
-                // By the canonical entry, the file being watched: an error here is
-                // swallowed, so no message ever names the path, and the canonical path
-                // holds no symlink a retarget could move elsewhere (#417).
-                // No `-o` extension warning here: an `-o <file>` always resolves at
-                // startup, so `ctx.output_path` is `None` only for stdout or no `-o`.
-                let config = load_config(&ctx.entry).unwrap_or(None);
-                resolve_output_path_for_kind(
-                    &Some(ctx.entry.clone()),
-                    &ctx.output_arg,
-                    &ctx.out_dir,
-                    &config,
-                    compiled.kind,
-                )
-                .unwrap_or(None)
-            };
-            // #425: a rebuild never writes over the entry — reachable when a failed
-            // startup compile left the Markdown default in place as the output path.
-            // Refused like a compile error: reported, settled, still watching.
-            if let Err(e) =
-                refuse_output_over_entry(output_path.as_deref(), &ctx.entry, &ctx.entry_typed)
-            {
-                eprint_error(miette::Error::from(e));
-                state.last_mtimes = snapshot_state(&state.foi);
-                return;
+    )
+    .and_then(|compiled| {
+        // The output path from the compiled kind (intrinsic extension).
+        let output_path = ctx.rebuild_output_path(compiled.kind);
+        // #425: a rebuild never writes over the entry — reachable when a failed startup
+        // compile left the Markdown default in place as the output path. No `-o`
+        // extension warning (no `output_arg`): startup printed it for the path every
+        // rebuild reuses, and an `-o <file>` always resolves at startup.
+        admit_output(
+            output_path.as_deref(),
+            entry,
+            &None,
+            compiled.kind,
+            ctx.quiet,
+        )
+        .map_err(miette::Error::from)?;
+        Ok((compiled, output_path))
+    });
+    let (compiled, output_path) = match routed {
+        Ok(routed) => routed,
+        Err(e) => return settle_after_error(state, e),
+    };
+
+    // The content-dedup key, and the name the "Recompiled" line shows.
+    let output_key: String = output_path
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<stdout>".to_string());
+
+    // Content-based dedup: skip write + summary line when unchanged.
+    let content_changed = state
+        .last_written
+        .get(&output_key)
+        .is_none_or(|prev| *prev != compiled.content);
+
+    // #326: re-report the vars-file duplicate-key warnings exactly when an
+    // observable rebuild happens (same gate as the "Recompiled" line below),
+    // not on the liveness probe's redundant no-op recompile.
+    if content_changed {
+        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+    }
+
+    // Freshness rule: always recompute dep set from fresh output.
+    let new_dirs = dirs_to_watch(
+        &ctx.entry.canonical,
+        &compiled.dependencies,
+        ctx.vars_path.as_deref(),
+    );
+    state.watched_dirs = resync_watches(watcher, &state.watched_dirs, &new_dirs);
+    // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
+    // dirs removed by resync_watches are no longer in watched_dirs.
+    state.armed_dirs = state.watched_dirs.clone();
+    state.foi = files_of_interest(
+        &ctx.entry.canonical,
+        &compiled.dependencies,
+        ctx.vars_path.as_deref(),
+    );
+    // Update mtime snapshot after a compile (even if content unchanged).
+    state.last_mtimes = snapshot_state(&state.foi);
+
+    if !content_changed {
+        return;
+    }
+    match write_output(output_path, &compiled.content, ctx.quiet, false) {
+        Ok(()) => {
+            let elapsed = t0.elapsed().as_millis();
+            let dep_count = compiled.dependencies.len();
+            if !ctx.quiet {
+                eprintln!(
+                    "Recompiled {} ({} deps) in {}ms",
+                    safe_inline(&output_key),
+                    dep_count,
+                    elapsed
+                );
             }
-
-            // Build the output_key for content-dedup.
-            let output_key: String = output_path
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<stdout>".to_string());
-
-            // Content-based dedup: skip write + summary line when unchanged.
-            let content_changed = state
-                .last_written
-                .get(&output_key)
-                .is_none_or(|prev| *prev != compiled.content);
-
-            // #326: re-report the vars-file duplicate-key warnings exactly when an
-            // observable rebuild happens (same gate as the "Recompiled" line below),
-            // not on the liveness probe's redundant no-op recompile.
-            if content_changed {
-                crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
-            }
-
-            // Freshness rule: always recompute dep set from fresh output.
-            let new_dirs =
-                dirs_to_watch(&ctx.entry, &compiled.dependencies, ctx.vars_path.as_deref());
-            state.watched_dirs = resync_watches(watcher, &state.watched_dirs, &new_dirs);
-            // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
-            // dirs removed by resync_watches are no longer in watched_dirs.
-            state.armed_dirs = state.watched_dirs.clone();
-            state.foi =
-                files_of_interest(&ctx.entry, &compiled.dependencies, ctx.vars_path.as_deref());
-            // Update mtime snapshot after a compile (even if content unchanged).
-            state.last_mtimes = snapshot_state(&state.foi);
-
-            if content_changed {
-                match write_output(output_path.clone(), &compiled.content, ctx.quiet, false) {
-                    Ok(()) => {
-                        let elapsed = t0.elapsed().as_millis();
-                        let dep_count = compiled.dependencies.len();
-                        let out_display = output_path
-                            .as_deref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<stdout>".to_string());
-                        state.last_written.insert(output_key, compiled.content);
-                        if !ctx.quiet {
-                            eprintln!(
-                                "Recompiled {} ({} deps) in {}ms",
-                                safe_inline(&out_display),
-                                dep_count,
-                                elapsed
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprint_error(e);
-                        // Error-settle: update snapshot so we don't re-fire.
-                        state.last_mtimes = snapshot_state(&state.foi);
-                    }
-                }
-            }
+            state.last_written.insert(output_key, compiled.content);
         }
-        Err(e) => {
-            eprint_error(e);
-            // Error-settle: snapshot current state so the tick gate
-            // won't re-fire on the same unchanged files (AC-R7/W6).
-            state.last_mtimes = snapshot_state(&state.foi);
-        }
+        Err(e) => settle_after_error(state, e),
     }
 }
 
-/// Single-file watch: `entry_typed` is the path as typed — the entry is compiled by it
+/// Report a failed file-mode rebuild and settle: snapshot the files of interest, so the
+/// tick gate does not re-fire on the same unchanged files (AC-R7/W6). Watching
+/// continues. Every failure [`rebuild_file`] meets ends here.
+fn settle_after_error(state: &mut FileWatchState, e: miette::Report) {
+    eprint_error(e);
+    state.last_mtimes = snapshot_state(&state.foi);
+}
+
+/// Single-file watch: `entry.typed` is the path as typed — the entry is compiled by it
 /// (#417) and `mds.json` is looked up from it at startup (#413), so their errors name
-/// the files as the user reaches them; `entry` is its canonical form, which everything
-/// else uses.
+/// the files as the user reaches them; `entry.canonical` is its canonical form, which
+/// everything else uses.
 #[allow(clippy::too_many_arguments)]
 fn run_watch_file(
-    entry_typed: PathBuf,
-    entry: PathBuf,
+    entry: WatchEntry,
     output: Option<String>,
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
@@ -1319,7 +1344,7 @@ fn run_watch_file(
     let static_set_string_vars = set_string_vars;
 
     if !quiet {
-        eprintln!("Watching {}", safe_path(&entry));
+        eprintln!("Watching {}", safe_path(&entry.canonical));
     }
 
     // ── Arm before publish (startup race) ─────────────────────────────────────
@@ -1387,7 +1412,7 @@ fn run_watch_file(
     // full dir set. Splitting it this way keeps startup failure messages identical
     // to the pre-reorder behaviour.
     let mut watched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    for dir in dirs_to_watch(&entry, &[], vars_path.as_deref()) {
+    for dir in dirs_to_watch(&entry.canonical, &[], vars_path.as_deref()) {
         if dir.exists() && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
             watched_dirs.insert(dir);
         }
@@ -1397,8 +1422,12 @@ fn run_watch_file(
     // `build_runtime_vars` (reads the vars file) and `compile_and_write` (reads
     // the entry) come after this point, so an edit landing during startup leaves
     // this snapshot strictly older than the file — and the liveness probe sees it.
-    let mut pre_mtimes = snapshot_state(&files_of_interest(&entry, &[], vars_path.as_deref()));
-    let entry_was_missing = !entry.exists();
+    let mut pre_mtimes = snapshot_state(&files_of_interest(
+        &entry.canonical,
+        &[],
+        vars_path.as_deref(),
+    ));
+    let entry_was_missing = !entry.canonical.exists();
 
     // Initial compile: compile first, derive output path from kind (compile-then-route).
     // For explicit -o / --out-dir the path is determined by the flag.
@@ -1416,7 +1445,7 @@ fn run_watch_file(
     // typed path, so a config error names `mds.json` as the input reaches it
     // (`./mds.json`), never by its canonical absolute path (#413); the config
     // directory it returns is canonical either way.
-    let config = load_config(&entry_typed)?;
+    let config = load_config(&entry.typed)?;
 
     // Initial compile: returns (output_path, deps, content).
     // content is captured here so the baseline block below can reuse it without
@@ -1424,12 +1453,8 @@ fn run_watch_file(
     // The outer `?` is an output path that is the entry file itself (#425): refused at
     // startup, exit 2, before anything is written. Any other error is reported, and
     // watching continues.
-    let startup_entry = EntryPaths {
-        typed: &entry_typed,
-        canonical: &entry,
-    };
     let (output_path, initial_deps, initial_content) = match compile_and_write(
-        startup_entry,
+        entry.paths(),
         &output,
         &out_dir,
         &config,
@@ -1447,18 +1472,24 @@ fn run_watch_file(
             // (`FileCompileCtx.output_path`) — so it can be the entry itself, which
             // `rebuild_file` refuses to write over (#425).
             let fallback_path = resolve_output_path_for_kind(
-                &Some(entry.clone()),
+                &Some(entry.canonical.clone()),
                 &output,
                 &out_dir,
                 &config,
                 OutputKind::Markdown,
             )
             .unwrap_or(None);
-            // The `-o` extension warning announces a write; a fallback that is the entry
-            // is never written, so it gets none.
-            if refuse_output_over_entry(fallback_path.as_deref(), &entry, &entry_typed).is_ok() {
-                warn_output_extension_mismatch(&output, OutputKind::Markdown, quiet);
-            }
+            // Nothing is written now. Every rebuild reuses this path, and refuses and
+            // reports one that is the entry (#425), so the refusal is dropped here:
+            // admitting the fallback only decides whether the `-o` extension warning,
+            // which announces a write, is printed — never for a fallback that is the entry.
+            let _ = admit_output(
+                fallback_path.as_deref(),
+                entry.paths(),
+                &output,
+                OutputKind::Markdown,
+                quiet,
+            );
             (fallback_path, vec![], String::new())
         }
     };
@@ -1496,7 +1527,7 @@ fn run_watch_file(
     // Arm the dependency directories the compile just reported. Dirs already armed
     // above are skipped; anything still unarmed — including a pre-arm attempt that
     // failed — is a hard startup error, as it was before the reorder.
-    let init_dirs = dirs_to_watch(&entry, &initial_deps, vars_path.as_deref());
+    let init_dirs = dirs_to_watch(&entry.canonical, &initial_deps, vars_path.as_deref());
     let unarmed: Vec<PathBuf> = init_dirs.difference(&watched_dirs).cloned().collect();
     for dir in unarmed {
         match watcher.watch(&dir, RecursiveMode::NonRecursive) {
@@ -1523,11 +1554,11 @@ fn run_watch_file(
         last_written.insert(output_key.clone(), initial_content);
     }
 
-    let foi = files_of_interest(&entry, &initial_deps, vars_path.as_deref());
+    let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
 
     // Build pre-loop FileWatchState (mtime snapshot + edge-trigger seeds).
     let missing_watched_dirs: BTreeSet<PathBuf> = {
-        let desired = dirs_to_watch(&entry, &[], vars_path.as_deref())
+        let desired = dirs_to_watch(&entry.canonical, &[], vars_path.as_deref())
             .union(&watched_dirs)
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -1544,15 +1575,15 @@ fn run_watch_file(
     // only the pre-compile pair predates an edit that landed during startup, so
     // inverting the merge (or switching to an `or_insert`-style one that keeps the
     // value already present) silently restores the lost-save bug while every test
-    // still passes. `entry` is inserted verbatim by `files_of_interest`, so this
+    // still passes. `entry.canonical` is inserted verbatim by `files_of_interest`, so this
     // lookup hits. The previous assertion here compared the key sets of
     // `files_of_interest(entry, &[], vars)` and `files_of_interest(entry, &deps, vars)`
     // — a subset relation those two calls guarantee by construction, so it could
     // never fail and guarded nothing.
-    let entry_pre = pre_mtimes.get(&entry).copied();
+    let entry_pre = pre_mtimes.get(&entry.canonical).copied();
     last_mtimes.extend(pre_mtimes);
     debug_assert_eq!(
-        last_mtimes.get(&entry).copied(),
+        last_mtimes.get(&entry.canonical).copied(),
         entry_pre,
         "baseline merge inverted: the entry's pre-compile (mtime, size) must survive \
          the merge with the post-compile snapshot, or an edit made during startup can \
@@ -1577,7 +1608,6 @@ fn run_watch_file(
     // #[allow(clippy::too_many_arguments)] suppressions).
     let ctx = FileCompileCtx {
         entry,
-        entry_typed,
         vars_path,
         vars_path_raw,
         static_set_vars,
