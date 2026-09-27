@@ -1031,8 +1031,10 @@ pub(crate) fn compile_entry(
 /// An existing file is canonicalized, which respells its name the way the volume stores
 /// it — so `PAGE.md` and `page.md` are one file on a case-insensitive volume (#408). A
 /// path that does not exist yet, or whose final component is a symlink, is its
-/// canonical directory joined with its name: the symlink itself is the directory entry
-/// a write would replace, not the file it points to.
+/// directory joined with its name: the symlink itself is the directory entry a write
+/// would replace, not the file it points to. That directory is resolved as
+/// [`write_output`] will leave it, created if it does not exist yet
+/// ([`resolve_dir_as_created`]).
 fn file_identity(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?;
     let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
@@ -1041,10 +1043,57 @@ fn file_identity(path: &Path) -> Option<PathBuf> {
             return Some(canonical);
         }
     }
-    effective_parent(path)
-        .canonicalize()
-        .ok()
-        .map(|dir| dir.join(name))
+    resolve_dir_as_created(effective_parent(path)).map(|dir| dir.join(name))
+}
+
+/// The canonical path `dir` has once [`write_output`]'s `create_dir_all(dir)` has run,
+/// found without creating anything; `None` when not even the working directory
+/// resolves, which a write of `dir` could not get past either.
+///
+/// An existing `dir` is canonicalized. Otherwise it is walked component by component, as
+/// the system resolves it while creating it: an existing component is canonicalized —
+/// a symlink is followed — and the first missing one is created as a plain directory,
+/// so below it nothing exists yet: a name is appended as it stands, and a `..` leads back
+/// to the parent, where the next name is looked up on disk again. So `newdir/..` is the
+/// directory `newdir` would be created in, and `newdir/../lnk` follows `lnk`. The walk
+/// visits each component of `dir` once, and a `..` never climbs above the root.
+///
+/// A relative `dir` is anchored at the working directory with [`std::path::absolute`].
+/// On Windows that also collapses `..` lexically, which is how every Win32 file call
+/// reads a path, so the walk and the write agree there too.
+fn resolve_dir_as_created(dir: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if let Ok(canonical) = dir.canonicalize() {
+        return Some(canonical);
+    }
+    let absolute = std::path::absolute(dir).ok()?;
+    let mut resolved = PathBuf::new();
+    // How many trailing components of `resolved` the write creates.
+    let mut created: usize = 0;
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                created = created.saturating_sub(1);
+            }
+            Component::Normal(name) => {
+                let next = resolved.join(name);
+                if created > 0 {
+                    resolved = next;
+                    created += 1;
+                } else if let Ok(existing) = next.canonicalize() {
+                    resolved = existing;
+                } else {
+                    resolved = next;
+                    created = 1;
+                }
+            }
+        }
+    }
+    Some(resolved)
 }
 
 /// Refuse to write the compiled entry over the entry file itself (#425): `mds::io`,
@@ -1057,7 +1106,9 @@ fn file_identity(path: &Path) -> Option<PathBuf> {
 /// its compiled form, which no longer declares `type: mds`, so the next build fails.
 ///
 /// `output` and `entry` are compared as the files they name ([`file_identity`]),
-/// canonical with canonical, never a path with a spelling of it (#408). `entry` may be
+/// canonical with canonical, never a path with a spelling of it (#408) — an output
+/// whose directory does not exist yet as the write will create it, so
+/// `newdir/../page.md` is `page.md`. `entry` may be
 /// any spelling that reaches the entry — `build` passes it as typed, `watch` its
 /// canonical form. `None` (stdout) is never the entry. `mds build` and `mds watch` file
 /// mode run it after the output path is resolved and before anything is written —
@@ -2198,6 +2249,56 @@ mod tests {
             !missing.contains("different file"),
             "a missing entry is the compile's error: {missing}"
         );
+    }
+
+    /// #425: an output whose directory does not exist yet is the file the write will
+    /// reach once `write_output` has created that directory. A created directory is a
+    /// plain one, so a `..` after it leads back to its parent — the entry's directory
+    /// here — while an existing component is followed as the write follows it, a
+    /// symlink included. Nothing is created by asking.
+    #[test]
+    fn file_identity_resolves_a_directory_the_write_creates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("page.md"), "x").unwrap();
+        let page = root.join("page.md");
+
+        let rows = [
+            ("page.md", page.clone()),
+            ("sub/../page.md", page.clone()),
+            ("newdir/../page.md", page.clone()),
+            ("a/b/../../page.md", page.clone()),
+            ("sub/new/../../page.md", page.clone()),
+            ("new/./x/../../page.md", page.clone()),
+            ("newdir/page.md", root.join("newdir").join("page.md")),
+            (
+                "sub/new/page.md",
+                root.join("sub").join("new").join("page.md"),
+            ),
+        ];
+        // `dir.path()` is not canonical on macOS (`/var` → `/private/var`), so the
+        // existing part of each path is canonicalized, not merely joined.
+        let mismatches: Vec<String> = rows
+            .iter()
+            .filter_map(|(rel, expected)| {
+                let got = file_identity(&dir.path().join(rel));
+                (got.as_ref() != Some(expected)).then(|| format!("{rel}: {got:?}"))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+        #[cfg(unix)]
+        {
+            // Out of a directory the write creates, then through an existing link that
+            // leads back to the entry's directory: the link is followed.
+            std::os::unix::fs::symlink(&root, root.join("lnk")).unwrap();
+            assert_eq!(
+                file_identity(&dir.path().join("newdir/../lnk/page.md")),
+                Some(page.clone())
+            );
+        }
+        assert!(!root.join("newdir").exists() && !root.join("a").exists());
     }
 
     // ── compute_source_map_base ───────────────────────────────────────────────

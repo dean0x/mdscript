@@ -2216,8 +2216,10 @@ mod entry_overwrite {
     /// either side is spelled — the two are compared as the files they name, canonical
     /// with canonical: the default route, `--out-dir` naming the entry's directory,
     /// `mds.json` `build.output_dir`, `-o` naming the entry (a `.mds` entry too, and a
-    /// case variant on a case-insensitive volume), and a symlinked directory leading
-    /// back to it. The message names the entry as typed. Every other output writes.
+    /// case variant on a case-insensitive volume), a symlinked directory leading back
+    /// to it, and a `..` after a directory that does not exist yet — the write would
+    /// create it, and come back out of it onto the entry. The message names the entry
+    /// as typed. Every other output writes, through a directory it creates too.
     #[test]
     fn build_refuses_every_output_route_that_lands_on_the_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -2257,6 +2259,16 @@ mod entry_overwrite {
             (vec!["build", "page.md", "-o", abs_page.as_str()], "page.md"),
             (vec!["build", "e.mds", "-o", "e.mds"], "e.mds"),
             (vec!["build", "e.mds", "-o", "sub/../e.mds"], "e.mds"),
+            // A directory that does not exist yet: nothing is created either.
+            (
+                vec!["build", "page.md", "-o", "newdir/../page.md"],
+                "page.md",
+            ),
+            (
+                vec!["build", "page.md", "-o", "a/b/../../page.md"],
+                "page.md",
+            ),
+            (vec!["build", "e.mds", "-o", "new/../e.mds"], "e.mds"),
         ];
         if case_insensitive {
             rows.push((vec!["build", "page.md", "-o", "PAGE.md"], "page.md"));
@@ -2266,6 +2278,11 @@ mod entry_overwrite {
             rows.push((
                 vec!["build", "lnk/page.md", "--out-dir", "."],
                 "lnk/page.md",
+            ));
+            // Out of a directory the write would create, then through an existing link.
+            rows.push((
+                vec!["build", "page.md", "-o", "newdir/../lnk/page.md"],
+                "page.md",
             ));
         }
 
@@ -2337,6 +2354,12 @@ mod entry_overwrite {
             (
                 &["build", "cfg/page.md", "-o", "cfg/out.md"],
                 "cfg/out.md",
+                COMPILED,
+            ),
+            // The entry's own name inside a directory the write creates is another file.
+            (
+                &["build", "page.md", "-o", "fresh/page.md"],
+                "fresh/page.md",
                 COMPILED,
             ),
         ] {

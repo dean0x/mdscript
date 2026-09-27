@@ -5765,8 +5765,9 @@ fn startup_refusal_exit(
 
 /// `mds watch` in file mode refuses at startup, exit 2, when the output it resolves is
 /// the entry file itself — the default route of a `type: mds` `.md` entry, `--out-dir`
-/// naming its directory, `-o` naming it — and writes nothing: the source stays
-/// byte-identical. It used to write the compiled output over the source and keep
+/// naming its directory, `-o` naming it, also through a `..` after a directory that
+/// does not exist yet — and writes nothing: the source stays byte-identical, and no
+/// directory is created. It used to write the compiled output over the source and keep
 /// watching a file that no longer declared `type: mds`.
 #[test]
 fn watch_refuses_at_startup_to_write_over_the_entry() {
@@ -5774,7 +5775,12 @@ fn watch_refuses_at_startup_to_write_over_the_entry() {
     let src = dir.path().join("page.md");
     std::fs::write(&src, TYPE_MDS_PAGE).unwrap();
 
-    for extra in [&[][..], &["--out-dir", "."], &["-o", "page.md"]] {
+    for extra in [
+        &[][..],
+        &["--out-dir", "."],
+        &["-o", "page.md"],
+        &["-o", "newdir/../page.md"],
+    ] {
         let label = format!("mds watch page.md {}", extra.join(" "));
         let (mut child, tap) = spawn_unsynchronized(
             mds_bin()
@@ -5804,50 +5810,56 @@ fn watch_refuses_at_startup_to_write_over_the_entry() {
 
 /// A rebuild never writes over the entry either. When the startup compile fails, the
 /// output path is resolved without knowing the kind and falls back to the Markdown
-/// default — the entry itself here; once the source is fixed, the rebuild refuses
-/// (`mds::io`, the entry named as typed), keeps watching, and the fixed source stays
-/// byte-identical. It used to overwrite it with the compiled output.
+/// default — the entry itself here, or the `-o` path as given, which leads back to the
+/// entry out of a directory that does not exist yet; once the source is fixed, the
+/// rebuild refuses (`mds::io`, the entry named as typed), keeps watching, and the fixed
+/// source stays byte-identical, with no directory created. It used to overwrite it
+/// with the compiled output.
 #[test]
 fn watch_rebuild_never_writes_over_the_entry() {
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("page.md");
-    std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
+    for extra in [&[][..], &["-o", "newdir/../page.md"]] {
+        let label = format!("mds watch page.md {}", extra.join(" "));
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("page.md");
+        std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
 
-    let (child, tap) = spawn_ready(
-        mds_bin()
-            .current_dir(dir.path())
-            .args(["watch", "page.md", "--debounce", "0"])
-            .stdout(Stdio::null()),
-    );
-    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
-    assert!(
-        stderr.contains("mds::syntax"),
-        "control: the startup compile fails; stderr: {stderr}"
-    );
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "page.md", "--debounce", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+        assert!(
+            stderr.contains("mds::syntax"),
+            "{label}: control: the startup compile fails; stderr: {stderr}"
+        );
 
-    write_atomic(&src, TYPE_MDS_PAGE);
-    let needle = "output would overwrite the entry file";
-    let stderr = wait_for_stderr_contains_str(&tap, needle, TIMEOUT);
-    assert!(
-        squash(&stderr).contains(&entry_overwrite_refusal("page.md")),
-        "the rebuild is refused; stderr: {stderr}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&src).unwrap(),
-        TYPE_MDS_PAGE,
-        "the fixed source is untouched"
-    );
-    assert_eq!(
-        std::fs::read_dir(dir.path()).unwrap().count(),
-        1,
-        "nothing is written"
-    );
-    let mut child = child;
-    assert!(
-        child.0.try_wait().unwrap().is_none(),
-        "watch keeps running after a refused rebuild"
-    );
-    drop(child);
+        write_atomic(&src, TYPE_MDS_PAGE);
+        let needle = "output would overwrite the entry file";
+        let stderr = wait_for_stderr_contains_str(&tap, needle, TIMEOUT);
+        assert!(
+            squash(&stderr).contains(&entry_overwrite_refusal("page.md")),
+            "{label}: the rebuild is refused; stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src).unwrap(),
+            TYPE_MDS_PAGE,
+            "{label}: the fixed source is untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "{label}: nothing is written"
+        );
+        let mut child = child;
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{label}: watch keeps running after a refused rebuild"
+        );
+        drop(child);
+    }
 }
 
 /// The #425 refusal is all `mds watch` says about an output that is the entry: the `-o`
