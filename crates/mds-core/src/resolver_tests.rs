@@ -3882,6 +3882,103 @@ fn map_builder_shares_origin_arc_across_regions() {
     );
 }
 
+/// #416 / AC-1, the imported extending-module arm (#412): the map of an extending
+/// module reached through `@import` records its chain's own origins, so after an
+/// importer splices it every builder entry is pointer-identical to the source its
+/// module was loaded with — the root base, the intermediate and the leaf.
+#[test]
+fn map_builder_shares_origin_arc_across_an_imported_extending_splice() {
+    let mut cache = virtual_cache(&[
+        (
+            "a.mds",
+            "A-HEAD\n@block b1:\nA-ONE\n@end\n@block b2:\nA-TWO\n@end\n",
+        ),
+        ("b.mds", "@extends \"./a.mds\"\n@block b1:\nB-ONE\n@end\n"),
+        ("c.mds", "@extends \"./b.mds\"\n@block b2:\nC-TWO\n@end\n"),
+    ]);
+    cache.source_map_mode = true;
+    let leaf = cache
+        .resolve_key("c.mds", &HashMap::new(), &mut vec![])
+        .expect("the chain must resolve");
+    let fragment = leaf
+        .prompt_map
+        .clone()
+        .expect("an extending module with a non-empty prompt must carry a map");
+    let root = &cache
+        .modules
+        .get("a.mds")
+        .expect("root cached")
+        .skeleton_origin;
+    let chain = [
+        &leaf.skeleton_origin,
+        &leaf.effective_blocks["b1"].origin,
+        &leaf.effective_blocks["b2"].origin,
+    ];
+    assert!(
+        Arc::ptr_eq(&chain[0].source, &root.source),
+        "the chain's root origin is the one the cache loaded"
+    );
+
+    let main = arc_origin("main.mds", "main.mds", "@include c\n");
+    let mut importer = crate::sourcemap::MapBuilder::new(main.clone());
+    importer.splice_fragment(&fragment, 0);
+    let expected = [&main, chain[0], chain[1], chain[2]];
+    assert_eq!(importer.sources.len(), expected.len(), "one entry per file");
+    for (idx, (entry, want)) in importer.sources.iter().zip(expected).enumerate() {
+        assert!(
+            Arc::ptr_eq(&entry.source, &want.source),
+            "entry {idx}: source must be the module's own Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&entry.display, &want.display),
+            "entry {idx}: display must be the module's own Arc"
+        );
+    }
+    let displays: Vec<&str> = importer.sources.iter().map(|o| &*o.display).collect();
+    assert_eq!(displays, ["main.mds", "a.mds", "b.mds", "c.mds"]);
+    // Control: an equal-content source in its own allocation is not pointer-equal.
+    assert!(!Arc::ptr_eq(&Arc::<str>::from(&*root.source), &root.source));
+}
+
+/// #412 / AC-6: an imported module keeps a map only when its `prompt` is exported and
+/// renders text — standalone and extending alike — while its body is evaluated either
+/// way (WARN-B reads a not-exported module's text). Observed on the module itself: an
+/// importer cannot tell, because it drops a not-exported map and splices nothing for an
+/// empty body. Each gate has a control that keeps its map.
+#[test]
+fn prompt_map_is_kept_only_for_an_exported_prompt_that_renders_text() {
+    let mut cache = virtual_cache(&[
+        ("lib.mds", "LIB\n"),
+        ("hidden.mds", "@define f():\nF\n@end\n@export f\nHIDDEN\n"),
+        ("defs.mds", "@define f():\nF\n@end\n"),
+        ("base.mds", "@block body:\nBASE\n@end\n"),
+        (
+            "child.mds",
+            "@extends \"./base.mds\"\n@block body:\nCHILD\n@end\n",
+        ),
+        (
+            "blank.mds",
+            "@extends \"./base.mds\"\n@block body:\n\n@end\n",
+        ),
+    ]);
+    cache.source_map_mode = true;
+    // (module, its prompt body, whether a map is kept)
+    let rows = [
+        ("lib.mds", Some("LIB\n"), true),
+        ("hidden.mds", Some("HIDDEN\n"), false),
+        ("defs.mds", None, false),
+        ("child.mds", Some("CHILD\n"), true),
+        ("blank.mds", None, false),
+    ];
+    for (key, body, mapped) in rows {
+        let module = cache
+            .resolve_key(key, &HashMap::new(), &mut vec![])
+            .unwrap_or_else(|err| panic!("{key} must resolve: {err}"));
+        assert_eq!(module.prompt_body.as_deref(), body, "{key}: evaluated body");
+        assert_eq!(module.prompt_map.is_some(), mapped, "{key}: map kept");
+    }
+}
+
 /// #416 / AC-9 (G5): a region whose module was first registered in the builder by an
 /// `@include` splice — a source of the included module's fragment — names that
 /// module's root-relative display path in a runtime diagnostic, never its canonical

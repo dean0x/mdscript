@@ -67,8 +67,10 @@ keyword-only; `scan_imports` takes its argument positionally.
 - `compile_virtual` / `check_virtual` / `lint_virtual` resolve imports against an in-memory
   map; `entry` must be a key in `modules`.
 - `source_map=True` generates a Source Map v3 document; `result.source_map` is a `dict`.
-  For string-source compiles `sources[0]` is `"input.mds"`. `sources_content=True` embeds
-  the original source text in `sourcesContent[]` (requires `source_map=True`).
+  For string-source compiles the source string is named `"input.mds"` — `sources[0]`,
+  unless the string `@extends` a base: then the chain's root base comes first.
+  `sources_content=True` embeds the original source text in `sourcesContent[]`
+  (requires `source_map=True`).
   ⚠ Privacy: `sources_content=True` embeds the full template source in the map.
 - `rules` is a mapping of rule name → severity string (`"off"`, `"info"`, `"warn"`, `"error"`).
   Unknown severity values raise `MdsError(code="mds::invalid_options")`; unknown rule names

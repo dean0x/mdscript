@@ -1050,9 +1050,10 @@ fn push_capped_segment(segments: &mut Vec<RawSegment>, dropped: &mut bool, segme
 /// A pre-computed source-map fragment for an imported module's `prompt` body.
 ///
 /// Computed once when a module is resolved in source-map mode (see
-/// `process_module` in `resolver.rs`, via [`MapBuilder::into_fragment`]) and cached
-/// inside `ResolvedModule` / [`crate::scope::NamespaceScope`] behind an `Arc` so
-/// every `@include` call-site can share the same allocation.
+/// `process_module` and, for an extending module, `process_module_extends` in
+/// `resolver.rs`, via [`MapBuilder::into_fragment`]) and cached inside
+/// `ResolvedModule` / [`crate::scope::NamespaceScope`] behind an `Arc` so every
+/// `@include` call-site can share the same allocation.
 ///
 /// # Local coordinate space
 ///
@@ -1062,11 +1063,13 @@ fn push_capped_segment(segments: &mut Vec<RawSegment>, dropped: &mut bool, segme
 /// [`MapBuilder::splice_fragment`]).
 ///
 /// Each entry is the whole [`Origin`] the module's builder registered — canonical
-/// key, root-relative display path and source — in registration order: index 0 is
-/// the first-evaluated origin (the module itself), later entries the files it pulled
-/// in (an S8 function body's defining file, a nested `@include`'s sources). A splice
-/// registers them by key with their own display path, so a file first registered by
-/// a splice still names its root-relative path in a later diagnostic (R3 / CWE-209).
+/// key, root-relative display path and source — in registration order. Index 0 is
+/// the builder's seed: the module itself, or for an extending module its chain's
+/// root base, as in a direct compile of that module. Later entries are the files it
+/// pulled in (the chain's other files, an S8 function body's defining file, a nested
+/// `@include`'s sources). A splice registers them by key with their own display
+/// path, so a file first registered by a splice still names its root-relative path
+/// in a later diagnostic (R3 / CWE-209).
 ///
 /// Segment `out` offsets are **0-based byte offsets within the module's
 /// own raw evaluator output** (the `prompt_body` string before

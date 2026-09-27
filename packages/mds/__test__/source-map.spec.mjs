@@ -815,6 +815,144 @@ describe('source maps — compileFile differential (CF-SM)', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // CF-SM3 (#412): one full source map on all four surfaces for an @include of
+  // an extending chain, sourcesContent on everywhere.
+  //
+  // CF-SM2 compares sources[] only; this compares the whole map — sources,
+  // sourcesContent, names and mappings — in one deepEqual per surface pair
+  // (PF-007), and anchors it: the shared map names every file of the chain and
+  // maps included bytes to each of them.
+  //
+  // Fixture layout:
+  //   <dir>/.mdsroot
+  //   <dir>/main.mds    ← @import "./lib/c.mds" as c · MAIN-HEAD · @include c
+  //   <dir>/lib/a.mds   ← root: skeleton text around two blocks
+  //   <dir>/lib/b.mds   ← @extends "./a.mds", overrides b1
+  //   <dir>/lib/c.mds   ← @extends "./b.mds", overrides b2
+  //
+  // The entry and the CLI sidecar sit at the project root, so every surface
+  // anchors sources[] there. Only the CLI map carries `file` (the output's
+  // basename); it is checked, then set aside for the comparison.
+  // -------------------------------------------------------------------------
+  test('CF-SM3: napi, WASM, CLI and Python produce one full source map for an @include of an extending chain', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cf-sm3-'));
+    try {
+      const files = {
+        'main.mds': '@import "./lib/c.mds" as c\nMAIN-HEAD\n@include c\n',
+        'lib/a.mds': 'A-HEAD\n@block b1:\nA-ONE\n@end\n@block b2:\nA-TWO\n@end\nA-TAIL\n',
+        'lib/b.mds': '@extends "./a.mds"\n@block b1:\nB-ONE\n@end\n',
+        'lib/c.mds': '@extends "./b.mds"\n@block b2:\nC-TWO\n@end\n',
+      };
+      await writeFile(join(dir, '.mdsroot'), '');
+      await mkdir(join(dir, 'lib'), { recursive: true });
+      for (const [name, text] of Object.entries(files)) {
+        await writeFile(join(dir, name), text);
+      }
+      const entryPath = join(dir, 'main.mds');
+
+      // -- Surface 1: napi compileFile -----------------------------------------
+      const napiResult = await compileFile(entryPath, { sourceMap: true, sourcesContent: true });
+      assert.equal(napiResult.output, 'MAIN-HEAD\nA-HEAD\nB-ONE\nC-TWO\nA-TAIL\n');
+      const napiMap = napiResult.sourceMap;
+      assert.ok(napiMap != null, 'napi compileFile must produce sourceMap');
+
+      // -- Surface 2: WASM via buildModulesMap + wasmMod.compile ---------------
+      const { entryFilename, modules } = await buildModulesMap(
+        entryPath,
+        (src) => wasmMod.scanImports(src),
+      );
+      const entrySource = modules[entryFilename];
+      const wasmModules = { ...modules };
+      delete wasmModules[entryFilename];
+      const wasmMap = createWasmBackend(wasmMod).compile(entrySource, {
+        filename: entryFilename,
+        modules: wasmModules,
+        sourceMap: true,
+        sourcesContent: true,
+      }).sourceMap;
+      assert.ok(wasmMap != null, 'WASM path must produce sourceMap');
+
+      // -- Surface 3: CLI sidecar at the project root --------------------------
+      const mdsCli = findMdsCli();
+      assert.ok(
+        mdsCli != null,
+        'mds CLI binary not found — set MDS_CLI_BIN or run `cargo build -p mds-cli`',
+      );
+      const outFile = join(dir, 'out.md');
+      const cliProc = spawnSync(
+        mdsCli,
+        ['build', '--source-map', '--embed-sources', '-o', outFile, entryPath],
+        { encoding: 'utf-8' },
+      );
+      assert.equal(
+        cliProc.status,
+        0,
+        `CLI build --source-map failed (rc=${cliProc.status}): ${cliProc.stderr}`,
+      );
+      const { file: cliFile, ...cliMap } = JSON.parse(readFileSync(`${outFile}.map`, 'utf-8'));
+      assert.equal(cliFile, 'out.md', 'the CLI map names its output file');
+
+      // -- Surface 4: Python binding compile_file -------------------------------
+      // Required in CI (a missing surface must not read as green, PF-007); locally a
+      // missing interpreter warns and skips this leg only, as in CF-SM2.
+      const python = findPythonForMarkdownScript();
+      let pyMap = null;
+      if (python == null) {
+        if (process.env.CI) {
+          throw new Error(
+            'CF-SM3: Python surface is required in CI but no interpreter was found. ' +
+            'Set MDS_PYTHON_BIN to an interpreter that can import markdown_script.',
+          );
+        }
+        console.warn('CF-SM3: skipping Python surface — no Python interpreter found');
+      } else {
+        const pyScript = [
+          'import json, sys',
+          'import markdown_script as m',
+          'result = m.compile_file(sys.argv[1], source_map=True, sources_content=True)',
+          'print(json.dumps(result.source_map))',
+        ].join('\n');
+        const pyProc = spawnSync(python, ['-c', pyScript, entryPath], { encoding: 'utf-8' });
+        assert.equal(
+          pyProc.status,
+          0,
+          `Python compile_file failed (rc=${pyProc.status}): ${pyProc.stderr}`,
+        );
+        pyMap = JSON.parse(pyProc.stdout.trim());
+      }
+
+      // -- Differential: the whole map, surface against surface ---------------
+      assert.deepEqual(wasmMap, napiMap, 'napi vs WASM source map mismatch (PF-007)');
+      assert.deepEqual(cliMap, napiMap, 'napi vs CLI source map mismatch (PF-007)');
+      if (pyMap != null) {
+        assert.deepEqual(pyMap, napiMap, 'napi vs Python source map mismatch (PF-007)');
+      }
+
+      // -- Anchor: the shared map covers every file of the chain ---------------
+      assert.deepEqual(napiMap.sources, ['main.mds', 'lib/a.mds', 'lib/b.mds', 'lib/c.mds']);
+      assert.deepEqual(
+        napiMap.sourcesContent,
+        napiMap.sources.map((name) => files[name]),
+        'sourcesContent must hold each file, aligned with sources',
+      );
+      let src = 0;
+      const referenced = new Set();
+      for (const seg of decodeMappings(napiMap.mappings)) {
+        if (seg.length < 4) continue;
+        src += seg[1];
+        referenced.add(src);
+      }
+      assert.deepEqual(
+        [...referenced].sort(),
+        [0, 1, 2, 3],
+        `every chain file must own mapped output; mappings=${napiMap.mappings}`,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

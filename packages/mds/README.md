@@ -198,8 +198,10 @@ Promise-returning file-path methods (`compileFile`, `checkFile`, `lintFile`), `.
 on the returned promise does **not** capture option-validation errors — use `try/catch`
 around the call.
 
-**Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
-map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
+**Source maps:** for string-source compiles (`compile`) the source string is named
+`"input.mds"` in the generated map's `sources` (`"<stdin>"` for stdin builds via the
+CLI). It is `sources[0]` unless the string `@extends` a base: the map of an `@extends`
+chain lists the chain's root base first, as a compile of the same file does.
 
 **Lint `rules` map:** unknown rule names emit a warning and lint continues — the unknown
 name has no effect but `result.lint_warnings` (a `string[]` field, absent when empty)

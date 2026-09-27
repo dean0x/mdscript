@@ -45,6 +45,12 @@
 //!
 //! #416 pins that a source-mapped `@extends` compile stays linear in its region count:
 //! the builder shares each module's source instead of copying it per region.
+//!
+//! #412 pins that an `@include` of an extending module is source-mapped: each included
+//! byte maps to the chain file that wrote it, exactly as a direct compile of the chain
+//! maps it; output is unchanged; no map is kept for an empty body; the segment-cap
+//! warning is truthful; the sourcesContent ceiling covers the chain's files; and a
+//! diagnostic in a file first registered by the splice names it root-relative.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -266,8 +272,8 @@ fn to_canonical_json_includes_source_map_key_when_present() {
     );
 }
 
-/// @extends path: source map for a template using @extends must be present
-/// and non-empty, and must list the skeleton template as a source.
+/// @extends path: the source map of a template using @extends lists the base (the
+/// skeleton template) first, then the child, and maps output to both.
 #[test]
 fn source_map_extends_multi_source() {
     let mut modules = HashMap::new();
@@ -286,14 +292,17 @@ fn source_map_extends_multi_source() {
         .expect("source_map should be present for @extends");
 
     assert_eq!(sm.version, 3);
-    assert!(
-        !sm.mappings.is_empty(),
-        "mappings must be non-empty for @extends templates"
+    // The base owns the skeleton text and seeds the map; the child owns its override.
+    assert_eq!(
+        sm.sources,
+        vec!["base.mds", "child.mds"],
+        "both base and child must appear as sources, base first"
     );
-    // Both base and child must appear as sources
-    assert!(
-        !sm.sources.is_empty(),
-        "sources must be non-empty for @extends"
+    assert_eq!(
+        referenced_src_indices(&sm.mappings),
+        std::collections::HashSet::from([0, 1]),
+        "both base and child must own mapped output; mappings={:?}",
+        sm.mappings
     );
 }
 
@@ -2253,4 +2262,600 @@ fn extends_many_regions_source_map_is_not_quadratic() {
             "source_map={source_map}: only the base owns a region"
         );
     }
+}
+
+// ── #412: an @include of an extending module is source-mapped ─────────────────
+
+/// Root of the #412 three-level chain: skeleton text around three blocks.
+const CHAIN_A: &str = "A-HEAD\n@block b1:\nA-ONE {{v}}\n@end\n\
+     @block b2:\nA-TWO\n@end\n@block b3:\nA-THREE\n@end\nA-TAIL\n";
+/// The intermediate file overrides `b2`.
+const CHAIN_B: &str = "@extends \"./a.mds\"\n@block b2:\nB-OVERRIDE {{v}}\n@end\n";
+/// The leaf overrides `b3`. Its override text starts at the same byte offset as the
+/// intermediate's, so a segment attributed to the wrong one of the two still lands
+/// on text: attribution must be checked by file, not by bounds.
+const CHAIN_C: &str = "@extends \"./b.mds\"\n@block b3:\nC-OVERRIDE {{v}}\n@end\n";
+/// The importer: one line of its own on each side of the included chain.
+const CHAIN_MAIN: &str = "@import \"./c.mds\" as c\nMAIN-HEAD\n@include c\nMAIN-TAIL\n";
+
+/// Mirrors the private `limits::MAX_SOURCEMAP_SEGMENTS`. Pinned by the segment-cap
+/// warning, which prints the real value.
+const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
+
+/// Mirrors the private `limits::MAX_SOURCES_CONTENT_BYTES` (= `MAX_OUTPUT_SIZE`).
+/// Pinned by the ceiling warning, which prints the real value.
+const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
+
+/// The #412 chain and its importer as a module set.
+fn chain_modules() -> HashMap<String, String> {
+    HashMap::from([
+        ("a.mds".to_string(), CHAIN_A.to_string()),
+        ("b.mds".to_string(), CHAIN_B.to_string()),
+        ("c.mds".to_string(), CHAIN_C.to_string()),
+        ("main.mds".to_string(), CHAIN_MAIN.to_string()),
+    ])
+}
+
+/// Compile `entry` of the #412 chain, with `v` = `V`.
+fn compile_chain_entry(entry: &str, opts: CompileOptions) -> CompileResult {
+    mds::compile_virtual_with_deps_opts(
+        chain_modules(),
+        entry,
+        Some(HashMap::from([(
+            "v".to_string(),
+            Value::String("V".to_string()),
+        )])),
+        opts,
+    )
+    .unwrap_or_else(|err| panic!("{entry} must compile: {err}"))
+}
+
+/// One mapped point: generated line and column, source file, source line and column.
+type MappedPoint = (usize, i64, String, i64, i64);
+
+/// Every mapped point of `sm`, in mappings order. Source indices are resolved to
+/// names, so two maps that list their sources in different orders compare equal.
+fn mapped_points(sm: &mds::SourceMap) -> Vec<MappedPoint> {
+    let mut points = Vec::new();
+    let (mut src, mut src_line, mut src_col) = (0i64, 0i64, 0i64);
+    for (line, line_str) in sm.mappings.split(';').enumerate() {
+        let mut col = 0i64;
+        for seg_str in line_str.split(',').filter(|s| !s.is_empty()) {
+            let (d_col, rest) = vlq_decode_one(seg_str.as_bytes());
+            col += d_col;
+            if rest.is_empty() {
+                continue; // 1-field (unmapped) segment
+            }
+            let (d_src, rest) = vlq_decode_one(rest);
+            let (d_line, rest) = vlq_decode_one(rest);
+            let (d_src_col, _) = vlq_decode_one(rest);
+            src += d_src;
+            src_line += d_line;
+            src_col += d_src_col;
+            points.push((
+                line,
+                col,
+                sm.sources[src as usize].clone(),
+                src_line,
+                src_col,
+            ));
+        }
+    }
+    points
+}
+
+/// The names of the sources `sm`'s mappings reference.
+fn referenced_sources(sm: &mds::SourceMap) -> std::collections::BTreeSet<String> {
+    referenced_src_indices(&sm.mappings)
+        .into_iter()
+        .map(|idx| sm.sources[idx as usize].clone())
+        .collect()
+}
+
+/// A set of owned names.
+fn name_set<const N: usize>(names: [&str; N]) -> std::collections::BTreeSet<String> {
+    names.into_iter().map(String::from).collect()
+}
+
+/// #412 / AC-4 (TP-5): an `@include` of a three-level extending chain maps every
+/// included byte to the chain file that wrote it — root, intermediate or leaf — and
+/// the included lines map exactly as a direct compile of the leaf maps them, one line
+/// down.
+#[test]
+fn include_of_extending_chain_attributes_each_byte() {
+    // Colliding offsets: only a per-file comparison tells the two overrides apart.
+    assert_eq!(CHAIN_B.find("B-OVERRIDE"), CHAIN_C.find("C-OVERRIDE"));
+    let opts = CompileOptions::default().with_source_map(true);
+    let direct = compile_chain_entry("c.mds", opts.clone());
+    let imported = compile_chain_entry("main.mds", opts);
+    let direct_text = output_text(direct.output);
+    let imported_text = output_text(imported.output);
+    // Non-vacuity: the direct compile honors the whole chain, and the importer renders
+    // it whole between its own two lines.
+    for marker in [
+        "A-HEAD",
+        "A-ONE V",
+        "B-OVERRIDE V",
+        "C-OVERRIDE V",
+        "A-TAIL",
+    ] {
+        assert!(
+            direct_text.contains(marker),
+            "{marker} missing: {direct_text:?}"
+        );
+    }
+    assert!(
+        !direct_text.contains("A-TWO") && !direct_text.contains("A-THREE"),
+        "overridden defaults must not render: {direct_text:?}"
+    );
+    assert_eq!(
+        imported_text,
+        format!("MAIN-HEAD\n{direct_text}MAIN-TAIL\n")
+    );
+
+    let direct_sm = direct
+        .source_map
+        .expect("the direct compile must produce a map");
+    let imported_sm = imported
+        .source_map
+        .expect("the importer must produce a map");
+    assert_eq!(
+        referenced_sources(&imported_sm),
+        name_set(["a.mds", "b.mds", "c.mds", "main.mds"]),
+        "every file of the included chain must own mapped output; mappings={:?}",
+        imported_sm.mappings
+    );
+
+    let chain_lines = direct_text.lines().count();
+    let direct_points = mapped_points(&direct_sm);
+    let (spliced, own): (Vec<_>, Vec<_>) = mapped_points(&imported_sm)
+        .into_iter()
+        .partition(|point| (1..=chain_lines).contains(&point.0));
+    let spliced: Vec<MappedPoint> = spliced
+        .into_iter()
+        .map(|(line, col, src, src_line, src_col)| (line - 1, col, src, src_line, src_col))
+        .collect();
+    assert!(
+        !direct_points.is_empty(),
+        "non-vacuity: the chain is mapped"
+    );
+    assert_eq!(
+        spliced, direct_points,
+        "the included lines must map as a direct compile of the chain maps them"
+    );
+    assert!(
+        !own.is_empty() && own.iter().all(|point| point.2 == "main.mds"),
+        "the importer's own lines map to the importer: {own:?}"
+    );
+}
+
+/// #412 / AC-5 (TP-6) — a guard, no RED claim: output never depended on the map. An
+/// importer's output is byte-identical with source maps on and off when it includes an
+/// extending chain, and holds the text of all three chain files.
+#[test]
+fn include_of_extending_chain_output_is_identical_with_and_without_source_map() {
+    let [off, on] = [false, true].map(|source_map| {
+        output_text(
+            compile_chain_entry(
+                "main.mds",
+                CompileOptions::default().with_source_map(source_map),
+            )
+            .output,
+        )
+    });
+    for marker in ["A-HEAD", "B-OVERRIDE V", "C-OVERRIDE V", "MAIN-TAIL"] {
+        assert!(on.contains(marker), "{marker} missing: {on:?}");
+    }
+    assert!(
+        !on.contains("A-TWO") && !on.contains("A-THREE"),
+        "overridden defaults must not render: {on:?}"
+    );
+    assert_eq!(
+        on, off,
+        "output must be byte-identical with and without source maps"
+    );
+}
+
+/// The WARN-A text an `@include` of `alias` gives when the module has no body text.
+fn empty_include_warning(alias: &str) -> String {
+    format!(
+        "warning: @include of '{alias}' produced empty output — module has no body text; \
+         to use the module's functions, call them directly: {{{{{alias}.fn()}}}}"
+    )
+}
+
+/// #412 / AC-6 (TP-7) — a guard, no RED claim: 633e518 kept no map for any extending
+/// module. An included module whose `prompt` adds no text contributes nothing to the
+/// importer's map, is still evaluated, and warns exactly as with source maps off. That
+/// the module keeps no map at all is not visible here — an importer drops a
+/// not-exported map and splices nothing for an empty body — and is pinned on the module
+/// by `resolver::tests::prompt_map_is_kept_only_for_an_exported_prompt_that_renders_text`.
+///
+/// Rows: an extending module whose body is empty — its override `@include`s an empty
+/// module, a warning only evaluation can raise — and a standalone module that does not
+/// export `prompt` (WARN-B needs its body evaluated). The not-exported form of the
+/// extending row is unreachable: an extending template may contain only `@block`
+/// overrides, so it cannot `@export` and always exports `prompt`. Each row's control
+/// makes the module's `prompt` add text, and its map is then spliced.
+#[test]
+fn include_that_adds_no_text_keeps_no_map_and_warns_the_same() {
+    let rows = [
+        (
+            "extending module, empty body",
+            vec![
+                ("empty.mds", ""),
+                ("base.mds", "@block body:\nBASE-DEFAULT\n@end\n"),
+                (
+                    "child.mds",
+                    "---\nimports:\n  - path: ./empty.mds\n    as: e\n---\n\
+                     @extends \"./base.mds\"\n@block body:\n@include e\n@end\n",
+                ),
+            ],
+            vec![empty_include_warning("e"), empty_include_warning("m")],
+            ("empty.mds", "E-TEXT\n"),
+        ),
+        (
+            "standalone module, prompt not exported",
+            vec![("child.mds", "@define f():\nF\n@end\n@export f\nLIB-BODY\n")],
+            vec![
+                "warning: @include of 'm' produced empty output — module has body text, but \
+                 its explicit @export list does not export 'prompt'; add `@export prompt` to \
+                 the module, or call its functions directly: {{m.fn()}}"
+                    .to_string(),
+            ],
+            (
+                "child.mds",
+                "@define f():\nF\n@end\n@export f\n@export prompt\nLIB-BODY\n",
+            ),
+        ),
+    ];
+    let compile = |modules: &HashMap<String, String>, source_map: bool, row: &str| {
+        mds::compile_virtual_with_deps_opts(
+            modules.clone(),
+            "main.mds",
+            None,
+            CompileOptions::default().with_source_map(source_map),
+        )
+        .unwrap_or_else(|err| panic!("{row}, source_map={source_map}: {err}"))
+    };
+    for (row, files, expected_warnings, (control_key, control_text)) in rows {
+        let mut modules: HashMap<String, String> = files
+            .into_iter()
+            .map(|(key, text)| (key.to_string(), text.to_string()))
+            .collect();
+        modules.insert(
+            "main.mds".to_string(),
+            "@import \"./child.mds\" as m\nMAIN\n@include m\n".to_string(),
+        );
+        let [off, on] = [false, true].map(|source_map| compile(&modules, source_map, row));
+        assert_eq!(on.warnings, expected_warnings, "{row}: maps on");
+        assert_eq!(
+            off.warnings, on.warnings,
+            "{row}: warnings must not depend on maps"
+        );
+        assert_eq!(output_text(on.output.clone()), "MAIN\n", "{row}");
+        assert_eq!(on.output, off.output, "{row}");
+        let sm = on.source_map.expect("the importer's own map is produced");
+        assert_eq!(sm.sources, vec!["main.mds"], "{row}: nothing is spliced");
+        assert_eq!(
+            referenced_src_indices(&sm.mappings),
+            std::collections::HashSet::from([0]),
+            "{row}: the importer's own text stays mapped"
+        );
+
+        // Control (PF-013): once the module's `prompt` adds text, its map is spliced, so
+        // the importer's map lists it and the check above can fail.
+        modules.insert(control_key.to_string(), control_text.to_string());
+        let control = compile(&modules, true, row);
+        assert!(control.warnings.is_empty(), "{row}: {:?}", control.warnings);
+        let sm = control.source_map.expect("maps on");
+        assert!(
+            sm.sources.iter().any(|source| source == "child.mds"),
+            "{row}: control: the module's map is spliced; sources={:?}",
+            sm.sources
+        );
+    }
+}
+
+/// Segment-cap module body: 6 text and 5 interpolation segments per pass, so
+/// `SEGMENT_CAP_PASSES` passes record 1,100,000 segments, past the cap.
+const SEGMENT_CAP_LOOP: &str =
+    "@for item in items:\nA{{item}}B{{item}}C{{item}}D{{item}}E{{item}}F\n@end\n";
+const SEGMENT_CAP_PASSES: usize = 100_000;
+const _: () = assert!(11 * SEGMENT_CAP_PASSES > MAX_SOURCEMAP_SEGMENTS);
+
+/// One segment-cap case: its label, the included module's key, and the module set
+/// (without the importer) that defines it.
+type SegmentCapRow = (&'static str, &'static str, Vec<(&'static str, String)>);
+
+/// #412 / AC-7 (TP-8): an included module whose own map passes the segment cap —
+/// standalone or extending — gives a warning saying exactly what happens: the text it
+/// contributes is left unmapped and the importer's map is still produced. The same
+/// modules under the cap are mapped (control).
+#[test]
+fn segment_cap_in_an_included_module_leaves_its_text_unmapped() {
+    let rows: [SegmentCapRow; 2] = [
+        (
+            "standalone",
+            "lib.mds",
+            vec![("lib.mds", SEGMENT_CAP_LOOP.to_string())],
+        ),
+        (
+            "extending",
+            "child.mds",
+            vec![
+                ("base.mds", "@block body:\nBASE-DEFAULT\n@end\n".to_string()),
+                (
+                    "child.mds",
+                    format!("@extends \"./base.mds\"\n@block body:\n{SEGMENT_CAP_LOOP}@end\n"),
+                ),
+            ],
+        ),
+    ];
+    let compile = |module: &str, files: &[(&str, String)], passes: usize| {
+        let mut modules: HashMap<String, String> = files
+            .iter()
+            .map(|(key, text)| (key.to_string(), text.clone()))
+            .collect();
+        modules.insert(
+            "main.mds".to_string(),
+            format!("@import \"./{module}\" as m\nMAIN\n@include m\n"),
+        );
+        let items = Value::Array(vec![Value::String("x".to_string()); passes]);
+        mds::compile_virtual_with_deps_opts(
+            modules,
+            "main.mds",
+            Some(HashMap::from([("items".to_string(), items)])),
+            CompileOptions::default().with_source_map(true),
+        )
+        .unwrap_or_else(|err| panic!("{module}, {passes} passes: {err}"))
+    };
+
+    let mut observed = Vec::new();
+    let mut expected = Vec::new();
+    let mut maps = Vec::new();
+    for (row, module, files) in &rows {
+        let result = compile(module, files, SEGMENT_CAP_PASSES);
+        // Non-vacuity: every pass of the included loop reached the importer's output.
+        let text = output_text(result.output);
+        assert_eq!(
+            text.matches("AxBxCxDxExF\n").count(),
+            SEGMENT_CAP_PASSES,
+            "{row}"
+        );
+        observed.push((*row, result.warnings));
+        expected.push((
+            *row,
+            vec![format!(
+                "source map segment cap ({MAX_SOURCEMAP_SEGMENTS} segments) exceeded in \
+                 imported module '{module}'; text included from it is left unmapped in the \
+                 source map"
+            )],
+        ));
+        maps.push((*row, result.source_map));
+    }
+    assert_eq!(observed, expected, "the warning must say what happens");
+    for (row, map) in maps {
+        let sm = map.unwrap_or_else(|| panic!("{row}: the importer's map is still produced"));
+        assert_eq!(
+            sm.sources,
+            vec!["main.mds"],
+            "{row}: the module's files are not listed"
+        );
+        // Line 0 is the importer's own `MAIN`; every later line is included text.
+        let mapped_lines: std::collections::BTreeSet<usize> = mapped_points(&sm)
+            .into_iter()
+            .map(|point| point.0)
+            .collect();
+        assert_eq!(
+            mapped_lines,
+            std::collections::BTreeSet::from([0]),
+            "{row}: the importer's own text stays mapped and the included text is unmapped"
+        );
+    }
+
+    // Control (PF-013): under the cap the same modules are mapped and nothing warns.
+    for (row, module, files) in &rows {
+        let result = compile(module, files, 10);
+        assert!(result.warnings.is_empty(), "{row}: {:?}", result.warnings);
+        let sm = result.source_map.expect("maps on");
+        assert!(
+            referenced_sources(&sm).contains(*module),
+            "{row}: under the cap the module is mapped; sources={:?}",
+            sm.sources
+        );
+    }
+}
+
+/// Levels of the sourcesContent-ceiling chain, and the unrendered padding each level
+/// carries: six levels pass the ceiling, five would not.
+const CEILING_LEVELS: usize = 6;
+const CEILING_PADDING: usize = 9 * 1024 * 1024;
+const _: () = assert!(CEILING_LEVELS * CEILING_PADDING > MAX_SOURCES_CONTENT_BYTES);
+const _: () = assert!((CEILING_LEVELS - 1) * CEILING_PADDING < MAX_SOURCES_CONTENT_BYTES);
+
+/// A `CEILING_LEVELS`-level chain `l1.mds` ← … ← `l6.mds` and an importer that
+/// includes its leaf. Level `k` renders one block (`bk`) and carries `padding` bytes it
+/// never renders: the root in an unused `@define`, each extending level as blank space
+/// between its directives (an extending template may hold only `@block` overrides and
+/// whitespace).
+fn ceiling_chain(padding: usize) -> HashMap<String, String> {
+    let pad = " ".repeat(padding);
+    let blocks: String = (1..=CEILING_LEVELS)
+        .map(|k| format!("@block b{k}:\nL1-B{k}\n@end\n"))
+        .collect();
+    let mut modules = HashMap::from([
+        (
+            "l1.mds".to_string(),
+            format!("@define unused():\n{pad}\n@end\n{blocks}"),
+        ),
+        (
+            "main.mds".to_string(),
+            format!("@import \"./l{CEILING_LEVELS}.mds\" as m\nMAIN\n@include m\n"),
+        ),
+    ]);
+    for k in 2..=CEILING_LEVELS {
+        modules.insert(
+            format!("l{k}.mds"),
+            format!(
+                "@extends \"./l{}.mds\"\n{pad}\n@block b{k}:\nL{k}-B{k}\n@end\n",
+                k - 1
+            ),
+        );
+    }
+    modules
+}
+
+/// #412 / AC-8 (TP-9): the importer's map now carries the included chain's files, so
+/// the sourcesContent ceiling covers them — the first test of that ceiling. A chain
+/// whose files pass it drops `sourcesContent` from the importer's map with the ceiling
+/// warning and keeps every source and mapping; a small copy of the chain keeps
+/// `sourcesContent` (control).
+#[test]
+fn include_of_extending_chain_over_the_sources_content_ceiling_drops_sources_content() {
+    let all_files: std::collections::BTreeSet<String> = (1..=CEILING_LEVELS)
+        .map(|k| format!("l{k}.mds"))
+        .chain(["main.mds".to_string()])
+        .collect();
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    for (padding, over) in [(CEILING_PADDING, true), (16, false)] {
+        let modules = ceiling_chain(padding);
+        let total: usize = modules.values().map(String::len).sum();
+        let result = mds::compile_virtual_with_deps_opts(modules, "main.mds", None, opts.clone())
+            .unwrap_or_else(|err| panic!("padding={padding}: {err}"));
+        let expected_warnings = if over {
+            vec![format!(
+                "sourcesContent total size ({total} bytes) exceeds the \
+                 {MAX_SOURCES_CONTENT_BYTES} byte ceiling; sourcesContent will be omitted \
+                 from the source map"
+            )]
+        } else {
+            vec![]
+        };
+        assert_eq!(result.warnings, expected_warnings, "padding={padding}");
+        let text = output_text(result.output);
+        let sm = result.source_map.expect("the importer's map is produced");
+        assert_eq!(
+            sm.sources_content.as_ref().map(Vec::len),
+            (!over).then_some(all_files.len()),
+            "padding={padding}: sourcesContent is kept only under the ceiling"
+        );
+        assert_eq!(
+            referenced_sources(&sm),
+            all_files,
+            "padding={padding}: every chain file must own mapped output"
+        );
+        let rendered: Vec<String> = (1..=CEILING_LEVELS).map(|k| format!("L{k}-B{k}")).collect();
+        assert_eq!(
+            text,
+            format!("MAIN\n{}\n", rendered.join("\n")),
+            "padding={padding}: each level renders its block and none of its padding"
+        );
+    }
+}
+
+/// #412 / AC-9 (TP-10, on disk): a runtime error in an `@extends` region whose file the
+/// importer's map first registered through an `@include` splice names that file by its
+/// root-relative path, never its absolute one, identically with source maps on and off.
+///
+/// `c.mds` extends `b.mds` and overrides `first` with `@include m`, where `m` is `e.mds`
+/// — which extends `b.mds` too, with `n` = 5. The splice of `m`'s map registers
+/// `b.mds` in `c.mds`'s builder, before `c.mds`'s `second` region — `b.mds`'s override,
+/// where `n` is `hi` — raises the cross-type comparison.
+#[test]
+fn diagnostic_in_a_file_first_registered_by_a_splice_names_it_root_relative() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+    let g5 = dir.path().join("g5");
+    std::fs::create_dir(&g5).unwrap();
+    let write = |name: &str, text: &str| std::fs::write(g5.join(name), text).unwrap();
+    write(
+        "a.mds",
+        "@define helper():\nfrom a\n@end\n@block first:\nA-FIRST\n@end\n\
+         @block second:\nA-SECOND\n@end\n",
+    );
+    write(
+        "b.mds",
+        "---\nn: 5\n---\n@extends \"./a.mds\"\n@block second:\n@if n == 5:\nfive\n@end\n@end\n",
+    );
+    write("e.mds", "@extends \"./b.mds\"\n");
+    let leaf = |n: &str| {
+        format!(
+            "---\nn: {n}\nimports:\n  - path: ./e.mds\n    as: m\n---\n\
+             @extends \"./b.mds\"\n@block first:\n@include m\n@end\n"
+        )
+    };
+    write("c.mds", &leaf("hi"));
+    // Positive control (PF-013): the file's canonical path is absolute, so the equality
+    // below fails if it reaches the diagnostic.
+    assert!(g5.join("b.mds").canonicalize().unwrap().is_absolute());
+
+    let [off, on] = [false, true].map(|source_map| {
+        let err = mds::compile_with_deps_opts(
+            g5.join("c.mds"),
+            None,
+            CompileOptions::default().with_source_map(source_map),
+        )
+        .expect_err("a cross-type comparison must fail");
+        assert_eq!(
+            err.serialize().code,
+            "mds::type_mismatch",
+            "source_map={source_map}: {err}"
+        );
+        assert_eq!(
+            err.source_name(),
+            Some("g5/b.mds"),
+            "source_map={source_map}: the error must name the file root-relative"
+        );
+        err.serialize()
+    });
+    assert_eq!(off, on, "the error must not depend on source maps");
+
+    // Non-vacuity: the splice carries `b.mds`. With `n` = 6 in `c.mds` its own `second`
+    // region renders nothing, so the one `five` line comes from the included module,
+    // and the map attributes it to `b.mds`.
+    write("c.mds", &leaf("6"));
+    let result = mds::compile_with_deps_opts(
+        g5.join("c.mds"),
+        None,
+        CompileOptions::default().with_source_map(true),
+    )
+    .expect("the control must compile");
+    let text = output_text(result.output);
+    assert_eq!(text.matches("five").count(), 1, "{text:?}");
+    let five_line = text.lines().position(|line| line == "five").expect("five");
+    let sm = result.source_map.expect("maps on");
+    assert!(
+        mapped_points(&sm)
+            .iter()
+            .any(|point| point.0 == five_line && point.2 == "g5/b.mds"),
+        "the included `five` line must map to g5/b.mds; sources={:?}",
+        sm.sources
+    );
+}
+
+/// #412 behaviour decision: a string compile of an extending child seeds its map with
+/// the root base, as a direct compile of the same file does, so `sources[0]` is the
+/// base and the string's own `input.mds` label follows it (a guard for the READMEs).
+#[test]
+fn extends_string_compile_names_the_base_first() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+    std::fs::write(
+        dir.path().join("base.mds"),
+        "BASE-HEAD\n@block body:\nBASE-DEFAULT\n@end\n",
+    )
+    .unwrap();
+    let result = mds::compile_str_with_deps_opts(
+        "@extends \"./base.mds\"\n@block body:\nCHILD\n@end\n",
+        Some(dir.path()),
+        None,
+        CompileOptions::default().with_source_map(true),
+    )
+    .expect("should compile");
+    assert_eq!(output_text(result.output), "BASE-HEAD\nCHILD\n");
+    let sm = result.source_map.expect("source_map must be present");
+    assert_eq!(sm.sources, vec!["base.mds", "input.mds"]);
 }

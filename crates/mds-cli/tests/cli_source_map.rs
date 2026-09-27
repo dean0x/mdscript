@@ -928,6 +928,101 @@ fn sm17_include_multi_file_attribution() {
     );
 }
 
+// ── SM-18: an @include of an extending chain names relative sources (#412) ──
+
+/// #412 / AC-8 (TP-9, on disk): an importer in `src/` that `@include`s a three-level
+/// extending chain in `lib/`, built into `build/`, lists every chain file in its
+/// sidecar map with its text, each relative to the map and contained in the project —
+/// never an absolute path.
+#[test]
+fn sm18_include_of_extending_chain_sources_are_relative() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join(".mdsroot"), "").unwrap();
+    for sub in ["src", "lib", "build"] {
+        std::fs::create_dir(root.join(sub)).unwrap();
+    }
+    let files = [
+        (
+            "lib/a.mds",
+            "A-HEAD\n@block b1:\nA-ONE\n@end\n@block b2:\nA-TWO\n@end\nA-TAIL\n",
+        ),
+        (
+            "lib/b.mds",
+            "@extends \"./a.mds\"\n@block b1:\nB-ONE\n@end\n",
+        ),
+        (
+            "lib/c.mds",
+            "@extends \"./b.mds\"\n@block b2:\nC-TWO\n@end\n",
+        ),
+        (
+            "src/main.mds",
+            "@import \"../lib/c.mds\" as c\nMAIN-HEAD\n@include c\n",
+        ),
+    ];
+    for (name, text) in files {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    // Positive control (PF-013): the chain's canonical paths are absolute, so the
+    // containment checks below fail if one reaches the map.
+    assert!(root.join("lib/a.mds").canonicalize().unwrap().is_absolute());
+
+    // Relative arguments from the project root: the map's directory then resolves
+    // the way the root does, so the sources anchor at the map (`../…`).
+    let result = mds_bin()
+        .current_dir(root)
+        .args(["build", "src/main.mds", "--source-map", "--embed-sources"])
+        .args(["-o", "build/out.md"])
+        .output()
+        .expect("mds binary should run");
+    assert!(
+        result.status.success(),
+        "build should succeed, stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("build").join("out.md")).unwrap(),
+        "MAIN-HEAD\nA-HEAD\nB-ONE\nC-TWO\nA-TAIL\n"
+    );
+
+    let v = read_map_json(&root.join("build").join("out.md.map"));
+    let sources: Vec<&str> = v["sources"]
+        .as_array()
+        .expect("sources must be an array")
+        .iter()
+        .map(|s| s.as_str().expect("each source is a string"))
+        .collect();
+    // Map-relative (`../…`) when `build/` resolves inside the project root as the
+    // root itself does; root-relative when it does not (a working directory reached
+    // through a Windows 8.3 short name). Both are correct anchors (ADR-005); either
+    // way every file of the chain is listed after the importer.
+    let anchor = if sources.first() == Some(&"../src/main.mds") {
+        "../"
+    } else {
+        ""
+    };
+    let files_in_order = ["src/main.mds", "lib/a.mds", "lib/b.mds", "lib/c.mds"];
+    assert_eq!(
+        sources,
+        files_in_order.map(|file| format!("{anchor}{file}")),
+        "the importer, then every file of the included chain"
+    );
+    for source in &sources {
+        assert_source_is_contained(source, root, &root.join("build"), &[]);
+    }
+    let contents: Vec<&str> = v["sourcesContent"]
+        .as_array()
+        .expect("--embed-sources keeps sourcesContent")
+        .iter()
+        .map(|s| s.as_str().expect("each entry is a string"))
+        .collect();
+    let expected: Vec<&str> = files_in_order
+        .iter()
+        .map(|name| files.iter().find(|(file, _)| file == name).unwrap().1)
+        .collect();
+    assert_eq!(contents, expected, "sourcesContent must align with sources");
+}
+
 // ── SM-VLQ-INT: VLQ integration test with actual map output ──────────────────
 
 #[test]

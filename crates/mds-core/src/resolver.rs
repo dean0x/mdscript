@@ -122,10 +122,11 @@ pub struct ResolvedModule {
     pub(crate) prompt_body: Option<String>,
     /// Pre-computed source-map fragment for this module's `prompt` output.
     ///
-    /// Populated by `process_module` when `ModuleCache::source_map_mode` is
+    /// Populated by `process_module` — and, for an extending module, by
+    /// `process_module_extends` (#412) — when `ModuleCache::source_map_mode` is
     /// true and the module exports a non-empty `prompt` (S6).  `None` for
-    /// skeleton entries, `@extends` modules (tracked as #114), and all
-    /// non-source-map compilations (zero-cost AC-PERF-01).
+    /// skeleton entries, for a module whose map passed the segment cap, and for
+    /// all non-source-map compilations (zero-cost AC-PERF-01).
     pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
     pub(crate) raw_frontmatter: Option<String>,
     pub(crate) has_explicit_exports: bool,
@@ -234,9 +235,10 @@ pub struct ModuleCache {
     /// so a separate `resolving_stack` is no longer needed.
     resolving: IndexSet<String>,
     /// Set to `true` by `process_module_intrinsic_opts` when `opts.source_map`
-    /// is enabled.  When true, `process_module` builds a
-    /// [`crate::sourcemap::FragmentMap`] alongside the prompt body for every
-    /// standalone module that exports a non-empty `prompt`.
+    /// is enabled.  When true, `process_module` and `process_module_extends`
+    /// build a [`crate::sourcemap::FragmentMap`] alongside the prompt body for
+    /// every imported module — standalone or extending — that exports a
+    /// non-empty `prompt`.
     ///
     /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
     /// for sub-modules (AC-PERF-01).
@@ -812,6 +814,25 @@ impl ModuleCache {
         Ok((output, current_map))
     }
 
+    /// Evaluate an `@extends` chain's spliced regions: the terminal step the entry's
+    /// extends path (`process_module_intrinsic_opts`) and an imported extending module
+    /// (`process_module_extends`) share.
+    ///
+    /// With a `seed` — the chain's `skeleton_origin`, so a map lists the root base
+    /// first however the chain is reached — every region is recorded into a
+    /// [`crate::sourcemap::MapBuilder`] seeded with it; without one nothing is
+    /// recorded. The body is evaluated either way, all regions under one
+    /// [`EvalBudget`] ([`Self::evaluate_regions_with_map`]).
+    fn evaluate_extends_regions(
+        regions: &[(&[crate::ast::Node], &Origin)],
+        seed: Option<&Origin>,
+        scope: &mut crate::scope::Scope,
+        warnings: &mut Vec<String>,
+    ) -> Result<(String, Option<crate::sourcemap::MapBuilder>), MdsError> {
+        let builder = seed.map(|origin| crate::sourcemap::MapBuilder::new(origin.clone()));
+        Self::evaluate_regions_with_map(regions, scope, warnings, builder)
+    }
+
     /// Messages-mode twin of [`Self::evaluate_regions_with_map`]: collect the
     /// `@message` blocks of spliced `@extends` regions in order.
     ///
@@ -875,7 +896,7 @@ impl ModuleCache {
     /// [`crate::sourcemap::MapBuilder`] through the evaluator:
     ///
     /// - Standalone path: [`evaluate_with_map`] on `module.body`.
-    /// - `@extends` path: [`evaluate_regions_with_map`] over
+    /// - `@extends` path: [`Self::evaluate_extends_regions`] over
     ///   `spliced_regions(skeleton, effective_blocks, skeleton_origin)` so each
     ///   region's segments are attributed to the correct source file.
     ///
@@ -943,17 +964,12 @@ impl ModuleCache {
                 ));
             }
 
-            // Seed builder with the skeleton's root file (source maps only).
-            let builder = opts
-                .source_map
-                .then(|| crate::sourcemap::MapBuilder::new(skeleton_origin.clone()));
-            let (raw, maybe_builder) =
-                Self::evaluate_regions_with_map(&regions, &mut scope, warnings, builder)?;
+            // Seed the builder with the skeleton's root file (source maps only).
+            let seed = opts.source_map.then_some(&skeleton_origin);
+            let (body_raw, builder) =
+                Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            let (body_raw, map_out) = match maybe_builder {
-                Some(b) => apply_map_degradation(raw, b, opts, warnings),
-                None => (raw, None),
-            };
+            let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
 
             let body_clean = crate::clean_output(&body_raw);
             let body_clean_len = body_clean.len();
@@ -1023,7 +1039,7 @@ impl ModuleCache {
             });
             let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            apply_map_degradation(raw, returned, opts, warnings)
+            (raw, apply_map_degradation(returned, opts, warnings))
         } else {
             (
                 evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?,
@@ -1128,9 +1144,9 @@ impl ModuleCache {
         // Validate semantic correctness before evaluation
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
-        // Determine whether "prompt" is an available export for this module.
-        // Mirrors the `is_exported("prompt")` logic on `ResolvedModule`.
-        let prompt_exported = !has_explicit_exports || explicit_exports.contains("prompt");
+        // Whether "prompt" is an available export of this module (the rule
+        // `ResolvedModule::is_exported` applies).
+        let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
 
         // Build Origin once for this module — Arc::clone'd into the source-map builder
         // below and into each EffectiveBlock (P3), so every copy shares one source text.
@@ -1146,41 +1162,20 @@ impl ModuleCache {
         // single evaluate_with_map pass to collect both the body string and the
         // segment records in one traversal (no double-evaluation).  The resulting
         // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
-        // that imports this module, enabling @include splice attribution (S6).
-        let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
+        // that imports this module, enabling @include splice attribution (S6). The body
+        // is evaluated either way: WARN-B needs it when `prompt` is not exported.
+        let (body_raw, builder) = if self.source_map_mode && prompt_exported {
             let builder = crate::sourcemap::MapBuilder::new(origin.clone());
             // evaluate_with_map derives file/source from builder.current_src (issue #58).
             let (body_raw, returned) =
                 evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
-            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
-
-            // RUST-3 / PF-004 observability: propagate the segment-cap drop flag from
-            // sub-module evaluation.  Without this check a >1M-segment imported module
-            // silently yields a partial FragmentMap (incorrect splice attributions) with
-            // no AC-PERF-03 warning.  Mirror the top-level degradation logic exactly.
-            let fmap = if returned.segments_dropped {
-                // The module filename is an untrusted identifier — WIRE, per the
-                // spec 7.5 per-field rule: a filename is never legitimately multi-line,
-                // and `emit_warnings` prints this string to stderr in HUMAN mode, where a
-                // raw `\n` would forge a standalone status line (CWE-117).
-                warnings.push(format!(
-                    "source map segment cap ({} segments) exceeded in imported module '{}'; \
-                     no source map will be generated",
-                    crate::limits::MAX_SOURCEMAP_SEGMENTS,
-                    crate::lint::sanitize_control_chars_wire(ctx.file_str),
-                ));
-                None
-            } else {
-                // Only keep the FragmentMap when the body is non-empty — an empty prompt
-                // has no segments worth recording.
-                body.as_ref().map(|_| Arc::new(returned.into_fragment()))
-            };
-            (body, fmap)
+            (body_raw, Some(returned))
         } else {
             let body_raw = evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?;
-            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
-            (body, None)
+            (body_raw, None)
         };
+        let (prompt_body, prompt_map) =
+            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         // Build effective_blocks first so module.body can be moved into the Arc below.
         let effective_blocks = seed_effective_blocks(&module.body, &block_names, &origin);
@@ -1310,9 +1305,9 @@ impl ModuleCache {
     ///
     /// Callers differ only in the terminal step (step 3e), which walks the skeleton's
     /// `spliced_regions` and evaluates each against its own origin:
-    /// - Cached text path: `validate` → `evaluate_regions_with_map`
+    /// - Cached text path: `validate` → `evaluate_extends_regions` (+ a FragmentMap)
     /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
-    ///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
+    ///   (Messages) or `evaluate_extends_regions` + clean/frontmatter (Markdown)
     ///
     /// Factoring here enforces that BOTH modes go through the same PF-004-safe
     /// `resolve_by_key_skeleton` path for the base, and share one copy of the
@@ -1427,7 +1422,8 @@ impl ModuleCache {
     /// Evaluate an extending child template in text mode.
     ///
     /// Delegates the shared pipeline (steps 3a-3d) to `resolve_extends_components`,
-    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3e).
+    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3e),
+    /// which in source-map mode also yields the module's FragmentMap (#412).
     ///
     /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
     /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
@@ -1465,19 +1461,23 @@ impl ModuleCache {
         } = components;
 
         // Base-skeleton nodes, base defaults and child overrides index into different
-        // files, so each region is evaluated against its own origin (#114). No
-        // MapBuilder: an extending module carries no FragmentMap (below).
+        // files, so each region is evaluated against its own origin (#114). In
+        // source-map mode the regions are recorded into a builder seeded with the
+        // chain's root, as for a direct compile of this file, and kept as the
+        // FragmentMap an importer's `@include` splices (#412) — under the same gate as
+        // a standalone module. The body is evaluated either way.
+        let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
         let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
-        let (prompt_body, _) =
-            Self::evaluate_regions_with_map(&regions, &mut scope, warnings, None)?;
-        let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
+        let seed = (self.source_map_mode && prompt_exported).then_some(&skeleton_origin);
+        let (body_raw, builder) =
+            Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
+        let (prompt_body, prompt_map) =
+            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         Ok(ResolvedModule {
             functions,
             prompt_body,
-            // An extending module builds no FragmentMap, so the text an `@include` of
-            // it contributes to a source-mapped importer carries no segments.
-            prompt_map: None,
+            prompt_map,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.
             raw_frontmatter: merged_frontmatter,
@@ -2030,7 +2030,7 @@ impl ResolvedModule {
     /// When no explicit `@export` list is present every name is visible.
     /// When an explicit list exists only the listed names are visible.
     fn is_exported(&self, name: &str) -> bool {
-        !self.has_explicit_exports || self.explicit_exports.contains(name)
+        is_visible_export(self.has_explicit_exports, &self.explicit_exports, name)
     }
 
     /// Get a single export by name.
@@ -2112,9 +2112,9 @@ struct CollectedDefs {
 /// Steps 3a-3d (base resolution, child-only-blocks check, effective-blocks construction,
 /// and scope merge) are identical for text and messages modes. This struct carries those
 /// results so the two terminal steps differ only in how the spliced regions are evaluated:
-/// - Cached text path: `validator::validate` → `evaluate_regions_with_map`
+/// - Cached text path: `validator::validate` → `evaluate_extends_regions`
 /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
-///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
+///   (Messages) or `evaluate_extends_regions` + clean/frontmatter (Markdown)
 struct ExtendsComponents {
     /// Merged scope (base < child < runtime), with FM imports and functions loaded.
     scope: Scope,
@@ -2167,6 +2167,71 @@ struct ModuleCtx<'a> {
     runtime_vars: &'a HashMap<String, Value>,
 }
 
+/// Whether `name` is an available export of a module: every name when the module
+/// declares no `@export` list, only the listed names when it does.
+///
+/// The one export rule — [`ResolvedModule::is_exported`] applies it, and so does the
+/// `prompt` gate of both module paths (`process_module`, `process_module_extends`).
+fn is_visible_export(
+    has_explicit_exports: bool,
+    explicit_exports: &HashSet<String>,
+    name: &str,
+) -> bool {
+    !has_explicit_exports || explicit_exports.contains(name)
+}
+
+/// The [`crate::sourcemap::FragmentMap`] an imported module's importers splice, from
+/// the builder that recorded its `prompt` body — or `None`, when there is nothing
+/// correct to splice:
+///
+/// - The builder dropped a segment at the cap (AC-PERF-03): a partial map would
+///   misattribute, so none is kept and a warning says what that means for the
+///   importer — the text included from the module is left unmapped, while the rest of
+///   the importer's map is still produced.
+/// - The body is empty (`None`): an `@include` of the module adds no text (PF-034; the
+///   evaluator warns at the `@include`).
+///
+/// `display` names the module in the warning.
+fn fragment_map_from(
+    builder: crate::sourcemap::MapBuilder,
+    body: Option<&str>,
+    display: &str,
+    warnings: &mut Vec<String>,
+) -> Option<Arc<crate::sourcemap::FragmentMap>> {
+    if builder.segments_dropped {
+        // The module filename is an untrusted identifier — WIRE, per the spec 7.5
+        // per-field rule: a filename is never legitimately multi-line, and
+        // `emit_warnings` prints this string to stderr in HUMAN mode, where a raw `\n`
+        // would forge a standalone status line (CWE-117).
+        warnings.push(format!(
+            "source map segment cap ({} segments) exceeded in imported module '{}'; \
+             text included from it is left unmapped in the source map",
+            crate::limits::MAX_SOURCEMAP_SEGMENTS,
+            crate::lint::sanitize_control_chars_wire(display),
+        ));
+        return None;
+    }
+    body.map(|_| Arc::new(builder.into_fragment()))
+}
+
+/// The `(prompt_body, prompt_map)` `ResolvedModule` fields, from a module's evaluated
+/// body and — when source maps are on for it — the builder that recorded it.
+///
+/// Shared by both module paths (`process_module`, `process_module_extends`): an empty
+/// body clears to `None` either way, and the map is kept only when [`fragment_map_from`]
+/// finds one worth splicing.
+fn prompt_body_and_map(
+    body_raw: String,
+    builder: Option<crate::sourcemap::MapBuilder>,
+    display: &str,
+    warnings: &mut Vec<String>,
+) -> (Option<String>, Option<Arc<crate::sourcemap::FragmentMap>>) {
+    let prompt_body = (!body_raw.trim().is_empty()).then_some(body_raw);
+    let prompt_map =
+        builder.and_then(|b| fragment_map_from(b, prompt_body.as_deref(), display, warnings));
+    (prompt_body, prompt_map)
+}
+
 /// Apply AC-PERF-03 and AC-SEC-04 degradation checks to a completed builder.
 ///
 /// - AC-PERF-03: if the segment cap was hit, degrade to `None` (a partial map
@@ -2174,21 +2239,18 @@ struct ModuleCtx<'a> {
 /// - AC-SEC-04: if `sourcesContent` total bytes exceed the ceiling, set
 ///   `no_sources_content` so [`MapBuilder::finalize`] omits the array.
 /// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
-///
-/// Returns `(raw_body, Option<MapBuilder>)`.
 fn apply_map_degradation(
-    raw: String,
     mut builder: crate::sourcemap::MapBuilder,
     opts: &crate::sourcemap::CompileOptions,
     warnings: &mut Vec<String>,
-) -> (String, Option<crate::sourcemap::MapBuilder>) {
+) -> Option<crate::sourcemap::MapBuilder> {
     if builder.segments_dropped {
         warnings.push(format!(
             "source map segment cap ({} segments) exceeded; \
              no source map will be generated",
             crate::limits::MAX_SOURCEMAP_SEGMENTS,
         ));
-        return (raw, None);
+        return None;
     }
     let total_src_bytes = builder.sources_content_bytes();
     if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
@@ -2203,7 +2265,7 @@ fn apply_map_degradation(
     if !opts.include_sources_content {
         builder.no_sources_content = true;
     }
-    (raw, Some(builder))
+    Some(builder)
 }
 
 /// Return `true` when the AST body contains at least one `@message` block

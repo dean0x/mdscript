@@ -26,13 +26,14 @@ Each build exposes `compile(source, options)`, `check(source, options)`,
 ```js
 // compile(source, options)
 // options.filename — string (default "input.mds"): key used for this source in the
-//   virtual FS and as sources[0] in the generated source map. Override when you want
-//   a meaningful name to appear in source maps or import paths.
+//   virtual FS and as its name in the generated source map's sources[]. Override when
+//   you want a meaningful name to appear in source maps or import paths.
 // options.modules — { [key: string]: string }: additional virtual modules for
 //   @import resolution. The entry source is inserted under options.filename.
 // options.vars — { [key: string]: any }: runtime variable overrides.
 // options.sourceMap — boolean: generate a Source Map v3 document; result gains .sourceMap.
-//   sources[0] is options.filename (default "input.mds").
+//   sources[0] is options.filename (default "input.mds"), unless the source @extends
+//   a base: then the chain's root base comes first.
 // options.sourcesContent — boolean: embed original source text in sourcesContent[]
 //   (requires sourceMap: true). ⚠ Privacy: embeds the full template source.
 const result = compile(source, { sourceMap: true, vars: { name: 'World' } });
