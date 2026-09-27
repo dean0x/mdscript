@@ -1778,24 +1778,52 @@ impl WatchRoot {
         }
     }
 
+    /// Refuse to compile `src`, a source under the root, once its walked path `walked`
+    /// leads into a different directory than `src`'s own (#413) — the rule file mode
+    /// applies to its entry, applied to each source.
+    ///
+    /// [`ensure_unmoved`](Self::ensure_unmoved) confirms the root only. A directory
+    /// below it replaced by a symbolic link after startup leaves the root where it was,
+    /// while `walked` — and `src`, the canonical key the watch holds for it — now reach
+    /// a file through the link: the startup walk skips symlinked directories, but a
+    /// rebuild compiles the sources it already knows, and the idle tick's content check
+    /// follows the link. `src` is canonical — a key the walk of the canonical root
+    /// produced, or a graph key — so the directories are compared canonical with
+    /// canonical (#408). A walked path that no longer resolves, or whose final
+    /// component is a symlink, is left to the compile, which reports the first by the
+    /// path as walked and refuses the second.
+    fn ensure_source_unmoved(walked: &Path, src: &Path) -> Result<(), MdsError> {
+        match mds::NativeFs::check_symlink(walked) {
+            Ok(now) if now.parent() != src.parent() => Err(MdsError::Io {
+                message: format!(
+                    "watched file now resolves to a different file: \"{}\"; \
+                     restart mds watch to follow it",
+                    mds::escape_path_for_message(&walked.to_string_lossy())
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Compile `src` by its [walked](Self::walked) path — every directory-mode compile
-    /// goes through here — after [`ensure_unmoved`](Self::ensure_unmoved) has confirmed,
-    /// for a source under the root, that the walked path still leads into it.
+    /// goes through here. For a source under the root, two checks come first: that the
+    /// root as typed still resolves to the watched directory
+    /// ([`ensure_unmoved`](Self::ensure_unmoved)), and that the walked path itself still
+    /// leads into the directory `src` names
+    /// ([`ensure_source_unmoved`](Self::ensure_source_unmoved)). An out-of-root
+    /// dependency is compiled by its canonical path, with no walked form to check.
     fn compile(
         &self,
         src: &Path,
         runtime_vars: Option<HashMap<String, mds::Value>>,
         quiet: bool,
     ) -> Result<crate::build::CompileOutput> {
+        let walked = self.walked(src);
         if src.starts_with(&self.canonical) {
             self.ensure_unmoved().map_err(miette::Error::from)?;
+            Self::ensure_source_unmoved(&walked, src).map_err(miette::Error::from)?;
         }
-        compile_to_content(
-            &self.walked(src),
-            runtime_vars,
-            quiet,
-            mds::CompileOptions::default(),
-        )
+        compile_to_content(&walked, runtime_vars, quiet, mds::CompileOptions::default())
     }
 }
 

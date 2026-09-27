@@ -5665,6 +5665,79 @@ fn watch_dir_through_a_retargeted_link_is_refused() {
     drop(child);
 }
 
+/// Directory mode checks before every compile that the source's own walked path still
+/// leads to the file it watches, not only that the root does (#413). Once a subdirectory
+/// below the root is replaced by a symbolic link to a directory outside the tree,
+/// `root/sub/x.mds` still names a file — through the link — while the root itself is
+/// unmoved; the startup walk skips symlinked directories, but a rebuild compiles the
+/// sources it already knows. The rebuild of `sub/x.mds` is refused (`mds::io`, naming
+/// its walked path as typed) and nothing is written from outside the tree, rather than
+/// compiling the outside file into the watched one's output. The vars-file edit rebuilds
+/// every known source; `top.mds` rebuilding is its positive control, and before the swap
+/// an edit under the unchanged subdirectory rebuilds.
+///
+/// Unix-only: it replaces a directory with a symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_dir_source_under_a_subdirectory_swapped_for_a_link_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("top.mds"), "Top {{v}}\n").unwrap();
+    std::fs::write(root.join("sub").join("x.mds"), "Inside {{v}}\n").unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("x.mds"), "Outside {{v}}\n").unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "1"}"#).unwrap();
+    let out = dir.path().join("out");
+    let x_out = out.join("sub").join("x.md");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "root", "--out-dir", "out", "--vars", "vars.json"])
+            .args(["--debounce", "0", "--poll-interval", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&x_out, "Inside 1", TIMEOUT),
+        "startup; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&root.join("sub").join("x.mds"), "Inside {{v}} again\n");
+    assert!(
+        wait_for_file_contains(&x_out, "Inside 1 again", TIMEOUT),
+        "control: an edit under the unchanged subdirectory rebuilds; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::rename(root.join("sub"), dir.path().join("sub.old")).unwrap();
+    symlink(&outside, root.join("sub")).unwrap();
+    write_atomic(&vars, r#"{"v": "2"}"#);
+    assert!(
+        wait_for_file_contains(&out.join("top.md"), "Top 2", TIMEOUT),
+        "control: the vars edit rebuilds every known source; stderr: {}",
+        tap.text()
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "watched file now resolves", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(
+            "mds::io×watchedfilenowresolvestoadifferentfile:\"root/sub/x.mds\";\
+             restartmdswatchtofollowit"
+        ),
+        "the rebuild is refused, naming the source as walked; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&x_out).unwrap(),
+        "Inside 1 again\n",
+        "nothing is written from outside the tree; stderr: {stderr}"
+    );
+    drop(child);
+}
+
 /// `mds watch --help`'s examples, each with the test that runs it (#413).
 const WATCH_HELP_EXAMPLES: [(&str, &str); 10] = [
     (
