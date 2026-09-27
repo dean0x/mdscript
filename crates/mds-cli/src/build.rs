@@ -902,9 +902,8 @@ fn serialize_output(output: CompiledOutput) -> Result<String> {
 /// result — the caller does not specify it. This is the pure "compile" step used by the
 /// watch loop for content-based dedup.
 ///
-/// `build` calls this directly; `mds watch` file mode compiles its entry through
-/// [`compile_entry`], and its startup compile through [`compile_and_write`], which
-/// then always writes.
+/// `build` calls this directly; `mds watch` calls it for its entry and every source
+/// once it has checked that the path it compiles still leads to the file it watches.
 ///
 /// Pass `opts = mds::CompileOptions::default()` from watch callers that do not want
 /// source maps; the watch paths never emit maps so they always use the default.
@@ -963,62 +962,20 @@ pub(crate) fn compile_to_content(
     })
 }
 
-/// A single-file entry in the two forms `mds watch` holds it in (#417), always in
+/// A single-file entry in the two forms [`admit_output`] takes, always in
 /// `(typed, canonical)` order, so the two cannot be passed swapped.
 ///
-/// `typed` is the path as the user typed it: the entry is compiled by it, and a message
-/// names the file that way, as `mds build` does — never by its canonical absolute path.
-/// `canonical` is the form notify reports event paths under: the output path is derived
-/// from it, and every identity check — watched directories, files of interest,
-/// baselines — uses it. `typed` is never compared with it as text (#408); [`compile_entry`]
-/// canonicalizes `typed` again and compares the two canonical directories.
-///
-/// [`admit_output`] takes the entry's identity through [`file_identity`], which
-/// canonicalizes, so `mds build` — which compiles its entry once, by the path as typed,
-/// and never holds a canonical form — passes the typed path as both. It never passes one
-/// to [`compile_entry`].
+/// `typed` is the path as the user typed it: a refusal names the entry that way, never
+/// by its canonical absolute path. `canonical` is the entry's identity, which
+/// [`admit_output`] compares with the output's through [`file_identity`], canonical with
+/// canonical — `typed` is never compared with it as text (#408). `mds watch` lends the
+/// entry it watches in its two forms. `mds build` compiles its entry once, by the path as
+/// typed, and never holds a canonical form, so it passes the typed path as both:
+/// [`file_identity`] canonicalizes it.
 #[derive(Clone, Copy)]
 pub(crate) struct EntryPaths<'a> {
     pub(crate) typed: &'a Path,
     pub(crate) canonical: &'a Path,
-}
-
-/// Refuse to compile a watched entry once `entry.typed` leads into a different directory
-/// than `entry.canonical` (#417).
-///
-/// The resolver resolves `typed` afresh on every compile, while `mds watch` keeps
-/// watching `canonical`. Once a symlinked directory on the typed path is retargeted, or
-/// a directory on it replaced, the two name different files: the compile would read one
-/// while the watched directories, baselines and output path follow the other. The
-/// directories are compared canonical with canonical, so a file name the volume
-/// respells (its case, on a case-insensitive volume) is not a move (#408). A path that
-/// no longer resolves at all is left to the compile, which reports it by the path as
-/// typed. A retarget racing the compile itself is the check-then-open window every
-/// path-based read has.
-fn ensure_entry_unmoved(entry: EntryPaths<'_>) -> Result<(), MdsError> {
-    match mds::NativeFs::check_symlink(entry.typed) {
-        Ok(now) if now.parent() != entry.canonical.parent() => Err(MdsError::Io {
-            message: format!(
-                "watched entry now resolves to a different file: \"{}\"; \
-                 restart mds watch to follow it",
-                mds::escape_path_for_message(&entry.typed.to_string_lossy())
-            ),
-        }),
-        _ => Ok(()),
-    }
-}
-
-/// Compile a watched entry by `entry.typed`, so an error names it as the user typed it
-/// (#417), after [`ensure_entry_unmoved`] has confirmed that the typed path still leads
-/// to `entry.canonical`, the file `mds watch` watches.
-pub(crate) fn compile_entry(
-    entry: EntryPaths<'_>,
-    runtime_vars: Option<HashMap<String, mds::Value>>,
-    quiet: bool,
-    opts: mds::CompileOptions,
-) -> Result<CompileOutput> {
-    ensure_entry_unmoved(entry).map_err(miette::Error::from)?;
-    compile_to_content(entry.typed, runtime_vars, quiet, opts)
 }
 
 /// The canonical path of the file `path` names, for comparing two paths as files, or
@@ -1142,84 +1099,6 @@ pub(crate) fn admit_output(
     refuse_output_over_entry(output_path, entry)?;
     warn_output_extension_mismatch(output_arg, kind, quiet);
     Ok(())
-}
-
-/// What [`compile_and_write`] returns on success, `(output_path, deps, content)`:
-/// - `output_path`: the resolved output path (None for stdout).
-/// - `deps`: transitive dependency paths.
-/// - `content`: the compiled string (issue 3 — reused by the watch baseline block
-///   so startup does not compile twice).
-pub(crate) type WrittenEntry = (Option<PathBuf>, Vec<String>, String);
-
-/// Outcome of [`compile_and_write`]'s compile-route-write attempt, once its output has
-/// been admitted ([`admit_output`], #425).
-pub(crate) enum CompileWriteOutcome {
-    /// Compiled, routed and written.
-    Written(WrittenEntry),
-    /// A failure — compile, route, or write — that `mds watch` reports and keeps
-    /// watching through.
-    Failed(miette::Report),
-}
-
-/// Compile `entry` with [`compile_entry`], derive the output path from the compiled
-/// kind and `entry.canonical`, and write — `mds watch` file mode's startup compile.
-///
-/// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
-/// reports and keeps watching through: the compile, the output path, the write. The
-/// `Err` this function itself returns is reserved for an output path that is the entry
-/// file itself ([`admit_output`], #425), which ends `mds watch` at startup (exit 2):
-/// every rebuild would reuse that path.
-///
-/// The output path is derived AFTER compiling (compile-then-route) so the kind
-/// (and thus extension: `.json` for messages, `.md` for markdown) is known before
-/// the path is constructed. This is the single-file intrinsic extension path.
-///
-/// If `-o <path>` is given explicitly, that path is used verbatim, and once
-/// [`admit_output`] has admitted it an ext-mismatch warning is emitted when the
-/// extension contradicts the kind (AC-FUNC-11). If `-o -` or stdin-with-no-flags,
-/// content is written to stdout.
-///
-/// Source-map writing is NOT performed here — callers that need maps handle them
-/// after this call returns (so map writing logic stays in `run_build`, not here).
-/// Watch callers pass `opts = mds::CompileOptions::default()` to opt out of maps.
-///
-/// # PF-004 compliance
-/// All file reads go through `compile_to_content` → `mds::compile_with_deps_opts` or
-/// `mds::compile_str_with_deps_opts` (which use the resolver that enforces MAX_FILE_SIZE).
-/// There is no bare `std::fs::read_to_string` path here.
-pub(crate) fn compile_and_write(
-    entry: EntryPaths<'_>,
-    output: &Option<String>,
-    out_dir: &Option<PathBuf>,
-    config: &Option<(MdsConfig, PathBuf)>,
-    runtime_vars: Option<HashMap<String, mds::Value>>,
-    quiet: bool,
-    opts: mds::CompileOptions,
-) -> Result<CompileWriteOutcome> {
-    let routed = compile_entry(entry, runtime_vars, quiet, opts).and_then(|compiled| {
-        resolve_output_path_for_kind(
-            &Some(entry.canonical.to_path_buf()),
-            output,
-            out_dir,
-            config,
-            compiled.kind,
-        )
-        .map(|output_path| (compiled, output_path))
-    });
-    let (compiled, output_path) = match routed {
-        Ok(routed) => routed,
-        Err(e) => return Ok(CompileWriteOutcome::Failed(e)),
-    };
-    admit_output(output_path.as_deref(), entry, output, compiled.kind, quiet)
-        .map_err(miette::Error::from)?;
-    Ok(
-        match write_output(output_path.clone(), &compiled.content, quiet, true) {
-            Ok(()) => {
-                CompileWriteOutcome::Written((output_path, compiled.dependencies, compiled.content))
-            }
-            Err(e) => CompileWriteOutcome::Failed(e),
-        },
-    )
 }
 
 // ── Build args struct ─────────────────────────────────────────────────────────
@@ -2211,59 +2090,6 @@ mod tests {
             assert!(compiled.dependencies[0].starts_with(r"\\?\"));
             assert!(!library[0].starts_with(r"\\?\"));
         }
-    }
-
-    /// #417: `compile_entry` compiles a watched entry by the typed path while that path
-    /// leads to the canonical entry's directory, and refuses it — naming the path as
-    /// typed, never the canonical one — once it leads into another directory. A typed
-    /// path that no longer resolves is left to the compile's own error.
-    #[test]
-    fn compile_entry_refuses_a_typed_path_that_leads_elsewhere() {
-        let dir = tempfile::TempDir::new().unwrap();
-        for name in ["a", "b"] {
-            std::fs::create_dir(dir.path().join(name)).unwrap();
-            std::fs::write(
-                dir.path().join(name).join("page.mds"),
-                format!("Hi {name}\n"),
-            )
-            .unwrap();
-        }
-        let typed = dir.path().join("a").join("page.mds");
-        let compile = |canonical: &Path| {
-            let entry = EntryPaths {
-                typed: &typed,
-                canonical,
-            };
-            compile_entry(entry, None, true, mds::CompileOptions::default())
-                .map(|compiled| compiled.content)
-                .map_err(|e| e.to_string())
-        };
-
-        let here = mds::NativeFs::check_symlink(&typed).unwrap();
-        assert_eq!(compile(&here), Ok("Hi a\n".to_string()), "control");
-
-        let elsewhere =
-            mds::NativeFs::check_symlink(&dir.path().join("b").join("page.mds")).unwrap();
-        let refused = compile(&elsewhere).unwrap_err();
-        assert_eq!(
-            refused,
-            format!(
-                "watched entry now resolves to a different file: \"{}\"; \
-                 restart mds watch to follow it",
-                typed.display()
-            )
-        );
-        assert!(
-            !refused.contains(&*elsewhere.to_string_lossy()),
-            "{refused}"
-        );
-
-        std::fs::remove_file(&typed).unwrap();
-        let missing = compile(&here).unwrap_err();
-        assert!(
-            !missing.contains("different file"),
-            "a missing entry is the compile's error: {missing}"
-        );
     }
 
     /// #425: `admit_output` refuses an output that is the entry file and names the entry

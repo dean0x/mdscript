@@ -15,7 +15,7 @@
 //! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
 //!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
-//! Single-file path helpers (`OutputKind`, `compile_to_content`, `compile_and_write`,
+//! Single-file path helpers (`OutputKind`, `compile_to_content`,
 //! `resolve_output_path_for_kind`) remain in `build.rs`; they are imported here when
 //! callers need both single-file and directory logic.
 
