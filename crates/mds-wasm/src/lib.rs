@@ -986,3 +986,40 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
             .map_err(|e| js_error(&format!("failed to serialize result: {e}"), "mds::internal"))
     }))
 }
+
+/// Check a module file's bytes as the native filesystem backend checks every file
+/// it reads, and return its text.
+///
+/// `@mdscript/mds`'s WASM backend reads the modules of a `compileFile` itself, in
+/// JS, and hands each file's bytes here, so it refuses exactly the bytes the native
+/// backend refuses, with the same error ([`mds::check_module_bytes`], #414): more
+/// than 10 MiB is `mds::resource_limit` (`file too large (<n> bytes, max 10485760
+/// bytes): <display>`), bytes that are not valid UTF-8 are `mds::io` (`invalid UTF-8
+/// in <display>: <reason>`). A leading byte-order mark is kept.
+///
+/// ## Arguments
+///
+/// - `bytes`: the file's content.
+/// - `display`: the file's name in an error message — the pre-scanner passes its
+///   path below the project root. It is escaped as it enters the message.
+///
+/// ## Returns
+///
+/// The file's text. On failure, throws a JS `Error` with the same structure as
+/// [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const text = preflightModule(new TextEncoder().encode('Hello!\n'), 'hello.mds');
+/// console.log(text); // "Hello!\n"
+/// ```
+#[wasm_bindgen(js_name = "preflightModule")]
+pub fn preflight_module(bytes: Vec<u8>, display: &str) -> Result<String, JsValue> {
+    // Owned String required so the closure satisfies UnwindSafe.
+    let display = display.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        mds::check_module_bytes(bytes, &display).map_err(mds_error_to_js)
+    }))
+}

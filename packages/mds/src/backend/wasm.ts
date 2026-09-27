@@ -16,8 +16,8 @@ import { forwardOpts } from '../util/options.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
- * The WASM module exports compile, check, lint, lintVirtual, and scanImports.
- * options shapes mirror the Rust wasm-bindgen signatures.
+ * The WASM module exports compile, check, lint, lintVirtual, scanImports and
+ * preflightModule. options shapes mirror the Rust wasm-bindgen signatures.
  *
  * Exported so callers can type-annotate pre-loaded modules passed to
  * createWasmBackend().
@@ -44,6 +44,12 @@ export interface WasmModule {
     rules?: Record<string, string>;
   }): unknown;
   scanImports(source: string): string[];
+  /**
+   * A module file's text, checked as the native filesystem backend checks every file
+   * it reads (`mds::check_module_bytes`): throws `mds::resource_limit` over 10 MiB and
+   * `mds::io` for invalid UTF-8, naming the file by `display`.
+   */
+  preflightModule(bytes: Uint8Array, display: string): string;
   default?: (input?: unknown) => Promise<void>;
 }
 

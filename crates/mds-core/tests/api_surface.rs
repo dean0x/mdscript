@@ -74,6 +74,22 @@ fn forbidden_path_char_functions_exist() {
     assert_eq!(&*mds::escape_path_for_message("a\tb"), "a\\u0009b");
 }
 
+/// #414: `check_module_bytes` — NativeFs's post-read checks, shared with the WASM
+/// backend's `preflightModule` — is callable via the crate root with the expected
+/// signature: text in, the size and UTF-8 refusals out.
+#[test]
+fn check_module_bytes_function_exists() {
+    let _: fn(Vec<u8>, &str) -> Result<String, MdsError> = mds::check_module_bytes;
+    assert_eq!(
+        mds::check_module_bytes(b"hi\n".to_vec(), "a.mds").unwrap(),
+        "hi\n"
+    );
+    let err = mds::check_module_bytes(vec![0xff], "a.mds").unwrap_err();
+    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+    let err = mds::check_module_bytes(vec![b'x'; MAX_FILE_SIZE as usize + 1], "a.mds").unwrap_err();
+    assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err:?}");
+}
+
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`
 /// forbids a struct literal, so the type is only obtainable through the load API.
 #[test]

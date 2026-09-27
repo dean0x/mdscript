@@ -608,10 +608,7 @@ describe('source maps — compileFile differential (CF-SM)', () => {
       // WASM compileFile simulation: the exact code path wrapWithFileOps uses.
       // buildModulesMap returns entryFilename as a root-relative slash path
       // (e.g. "hello.mds") and populates modules with the file source.
-      const { entryFilename, modules } = await buildModulesMap(
-        filePath,
-        (src) => wasmMod.scanImports(src),
-      );
+      const { entryFilename, modules } = await buildModulesMap(filePath, wasmMod);
       const entrySource = modules[entryFilename];
       // Remove entry from modules — WASM inserts it separately under filename.
       delete modules[entryFilename];
@@ -696,10 +693,7 @@ describe('source maps — compileFile differential (CF-SM)', () => {
       const napiSources = napiResult.sourceMap.sources;
 
       // -- Surface 2: WASM via buildModulesMap + wasmMod.compile ---------------
-      const { entryFilename, modules } = await buildModulesMap(
-        entryPath,
-        (src) => wasmMod.scanImports(src),
-      );
+      const { entryFilename, modules } = await buildModulesMap(entryPath, wasmMod);
       const entrySource = modules[entryFilename];
       const wasmModules = { ...modules };
       delete wasmModules[entryFilename];
@@ -859,10 +853,7 @@ describe('source maps — compileFile differential (CF-SM)', () => {
       assert.ok(napiMap != null, 'napi compileFile must produce sourceMap');
 
       // -- Surface 2: WASM via buildModulesMap + wasmMod.compile ---------------
-      const { entryFilename, modules } = await buildModulesMap(
-        entryPath,
-        (src) => wasmMod.scanImports(src),
-      );
+      const { entryFilename, modules } = await buildModulesMap(entryPath, wasmMod);
       const entrySource = modules[entryFilename];
       const wasmModules = { ...modules };
       delete wasmModules[entryFilename];

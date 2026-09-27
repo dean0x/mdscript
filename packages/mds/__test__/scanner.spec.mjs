@@ -9,6 +9,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
@@ -30,9 +31,29 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Import from the compiled dist.
 // Note: module-scanner is a Node-only utility (uses fs/promises).
-const { normalizeVirtualKey, buildModulesMap, findProjectRoot } = await import('../dist/util/module-scanner.js');
+const {
+  normalizeVirtualKey,
+  buildModulesMap: buildModulesMapWith,
+  findProjectRoot,
+} = await import('../dist/util/module-scanner.js');
 
 const FIXTURES = path.join(__dirname, 'fixtures');
+
+// The scanner checks every file's bytes through the WASM engine's own
+// `preflightModule` (#414); these tests pair it with the import scanner passed in.
+const { wasm: wasmEngine } = await loadEngines();
+
+function preflightModule(bytes, display) {
+  if (wasmEngine === null) {
+    throw new Error('buildModulesMap needs the WASM engine: build crates/mds-wasm/pkg first');
+  }
+  return wasmEngine.preflightModule(bytes, display);
+}
+
+/** buildModulesMap with `scan` as the engine's import scanner. */
+function buildModulesMap(entryPath, scan, options) {
+  return buildModulesMapWith(entryPath, { scanImports: scan, preflightModule }, options);
+}
 
 // A minimal scanImports implementation using the napi addon.
 function scanImports(source) {
@@ -1295,6 +1316,149 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         help: null,
         span: null,
       });
+    });
+  });
+
+  // Writing at the filesystem root needs root: TP-39 runs this in a throwaway container
+  // (`docker run --rm -v "$PWD":/repo -w /repo/packages/mds node:22 node --test
+  // --test-name-pattern U-SM34 __test__/scanner.spec.mjs`).
+  const notRoot =
+    !(typeof process.getuid === 'function' && process.getuid() === 0) &&
+    'needs root, to write at the filesystem root: run it in a throwaway container (TP-39)';
+
+  test('U-SM34: a project rooted at the filesystem root compiles through the WASM backend as on native', { skip: notRoot }, async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM34')) return;
+    const root = path.parse(process.cwd()).root;
+    const name = `mds-u-sm34-${process.pid}`;
+    const lib = path.join(root, `${name}-lib.mds`);
+    const entry = path.join(root, `${name}.mds`);
+    const up = path.join(root, `${name}-up.mds`);
+    try {
+      await writeFile(lib, 'LIB\n');
+      await writeFile(entry, `@import "./${name}-lib.mds" as l\n@include l\n`);
+      // `/..` is `/` on native; the engine's key space has nothing above its root (#424).
+      await writeFile(up, `@import "../${name}-lib.mds" as l\n@include l\n`);
+      const native = await compileFileOutcomes('native', [entry, up]);
+      const wasm = await compileFileOutcomes('wasm', [entry, up]);
+      assert.deepEqual(native, [{ output: 'LIB\n' }, { output: 'LIB\n' }]);
+      assert.deepEqual(wasm[0], native[0]);
+      assert.deepEqual(wasm[1], {
+        code: 'mds::import',
+        message: `import error: import path escapes project directory: "../${name}-lib.mds"`,
+        help: null,
+        span: null,
+      });
+    } finally {
+      await rm(lib, { force: true });
+      await rm(entry, { force: true });
+      await rm(up, { force: true });
+    }
+  });
+
+  test("U-SM35: bytes that are not valid UTF-8 are refused with native's mds::io error; a BOM file compiles identically", async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM35')) return;
+    await withNestedProject(async (proj) => {
+      await mkdir(path.join(proj, 'sub'));
+      // An invalid byte, and an incomplete sequence at the very end (the first two
+      // bytes of U+20AC).
+      await writeFile(path.join(proj, 'bad.mds'), Buffer.from([0x68, 0x69, 0xff, 0x0a]));
+      await writeFile(path.join(proj, 'sub', 'tail.mds'), Buffer.from([0x68, 0x69, 0x0a, 0xe2, 0x82]));
+      await writeFile(path.join(proj, 'imp-bad.mds'), '@import "./bad.mds" as b\nhi\n');
+      await writeFile(path.join(proj, 'imp-tail.mds'), '@import "./sub/tail.mds" as b\nhi\n');
+      // Control: a byte-order mark is valid UTF-8, kept as the template's first character.
+      await writeFile(path.join(proj, 'bom.mds'), Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('Hello\n')]));
+      await writeFile(path.join(proj, 'imp-bom.mds'), '@import "./bom.mds" as b\n@include b\n');
+
+      const badByte = 'invalid utf-8 sequence of 1 bytes from index 2';
+      const incomplete = 'incomplete utf-8 byte sequence from index 3';
+      const refused = [
+        ['bad.mds', `invalid UTF-8 in bad.mds: ${badByte}`],
+        [path.join('sub', 'tail.mds'), `invalid UTF-8 in sub/tail.mds: ${incomplete}`],
+        ['imp-bad.mds', `invalid UTF-8 in bad.mds: ${badByte}`],
+        ['imp-tail.mds', `invalid UTF-8 in sub/tail.mds: ${incomplete}`],
+      ];
+      const files = [...refused.map(([rel]) => path.join(proj, rel)), path.join(proj, 'bom.mds'), path.join(proj, 'imp-bom.mds')];
+      const native = await compileFileOutcomes('native', files);
+      const wasm = await compileFileOutcomes('wasm', files);
+      for (const [i, [rel, message]] of refused.entries()) {
+        assert.deepEqual(native[i], { code: 'mds::io', message, help: null, span: null }, `${rel} (native)`);
+        assert.deepEqual(wasm[i], native[i], rel);
+      }
+      assert.deepEqual(native[refused.length], { output: `${String.fromCodePoint(0xfeff)}Hello\n` });
+      assert.equal(typeof native[refused.length + 1].output, 'string', JSON.stringify(native[refused.length + 1]));
+      assert.deepEqual(wasm.slice(refused.length), native.slice(refused.length));
+    });
+  });
+
+  test('U-SM36: a missing entry directly under the filesystem root is not found on both backends, help included', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM36')) return;
+    const missing = path.join(path.parse(process.cwd()).root, `mds-u-sm-${process.pid}-missing.mds`);
+    assert.equal(existsSync(missing), false, `${missing} must not exist`);
+    const [native] = await compileFileOutcomes('native', [missing]);
+    const [wasm] = await compileFileOutcomes('wasm', [missing]);
+    assert.deepEqual(native, {
+      code: 'mds::file_not_found',
+      message: `file not found: ${missing}`,
+      help: FILE_NOT_FOUND_HELP,
+      span: null,
+    });
+    assert.deepEqual(wasm, native);
+    assert.equal(existsSync(missing), false, 'nothing is written');
+  });
+
+  test('U-SM39: the aggregate-size guard never pre-empts a refusal native makes of the module that crosses it', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM39')) return;
+    await withNestedProject(async (proj) => {
+      const MiB = 1024 * 1024;
+      const text = (bytes) => 'x'.repeat(bytes);
+      const invalidUtf8 = (bytes) => Buffer.concat([Buffer.from(text(bytes - 1)), Buffer.from([0xff])]);
+      // Each project crosses the 10 MiB aggregate at its last module, `c`, which native
+      // refuses on its own. In `walk-*` the read-ahead budget is spent on `a`, so the
+      // walk reads `c` itself; in `race-*` `a` and `c` are read ahead side by side, and
+      // which of them the budget admits depends on which read gets there first.
+      const rows = [
+        // [label, name of c, content of c, native's refusal of c]
+        ['invalid UTF-8', 'c.mds', invalidUtf8, 'mds::io'],
+        // Control (PF-013): a valid `c` compiles on native, and crosses the guard here.
+        ['valid', 'c.mds', text, null],
+      ];
+      const entries = [];
+      for (const [label, name, content] of rows) {
+        const slug = label.replace(/\W+/g, '-');
+        const walkDir = path.join(proj, `walk-${slug}`);
+        await mkdir(walkDir);
+        await writeFile(path.join(walkDir, 'e.mds'), `@import "./a.mds" as a\nhi\n${text(MiB)}`);
+        await writeFile(path.join(walkDir, 'a.mds'), `@import "./${name}" as c\nA\n${text(8.5 * MiB)}`);
+        await writeFile(path.join(walkDir, name), content(Math.floor(1.6 * MiB)));
+        const raceDir = path.join(proj, `race-${slug}`);
+        await mkdir(raceDir);
+        await writeFile(path.join(raceDir, 'e.mds'), `@import "./a.mds" as a\n@import "./${name}" as c\nhi\n`);
+        await writeFile(path.join(raceDir, 'a.mds'), text(6 * MiB));
+        await writeFile(path.join(raceDir, name), content(6 * MiB));
+        entries.push(path.join(walkDir, 'e.mds'), path.join(raceDir, 'e.mds'));
+      }
+      const native = await compileFileOutcomes('native', entries);
+      const wasm = await compileFileOutcomes('wasm', entries);
+      for (const [r, [label, , , code]] of rows.entries()) {
+        for (const i of [2 * r, 2 * r + 1]) {
+          if (code === null) {
+            assert.equal(typeof native[i].output, 'string', `${label}: ${JSON.stringify(native[i]).slice(0, 200)}`);
+            assert.deepEqual(wasm[i], {
+              code: 'mds::resource_limit',
+              message: `resource limit exceeded: aggregate module size exceeds maximum of ${10 * MiB} bytes`,
+              help: null,
+              span: null,
+            }, `${label} ${entries[i]}`);
+          } else {
+            assert.equal(native[i].code, code, `${label}: ${JSON.stringify(native[i])}`);
+            assert.deepEqual(wasm[i], native[i], `${label} ${entries[i]}`);
+          }
+        }
+      }
     });
   });
 

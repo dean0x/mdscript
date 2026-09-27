@@ -19,7 +19,10 @@ Two builds, selected by package `exports` conditions:
 | `browser` / `default` | `dist/web/mds_wasm.js` | ESM (`wasm-pack --target web`) | call `default()` with the `.wasm` URL |
 
 Each build exposes `compile(source, options)`, `check(source, options)`,
-`lint(source, options)`, `lintVirtual(modules, entry, options)`, and `scanImports(source)`.
+`lint(source, options)`, `lintVirtual(modules, entry, options)`, `scanImports(source)`, and
+`preflightModule(bytes, display)` — a module file's text from its bytes (a `Uint8Array`), checked as
+the native filesystem backend checks every file it reads: over 10 MiB is `mds::resource_limit`,
+bytes that are not valid UTF-8 are `mds::io`, each naming the file by `display`.
 
 ### Options
 

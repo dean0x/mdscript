@@ -449,6 +449,21 @@ function resolvedPathError(resolved: string, shown: string): PathError | undefin
   return cp === undefined ? undefined : pathError('mds::io', forbiddenCharMessage('resolved path', cp, shown));
 }
 
+/**
+ * The WASM engine calls the scanner makes — the WASM module's own exports, so every
+ * check they make is the Rust engine's, never a TypeScript copy of it (#414).
+ */
+export interface ScannerEngine {
+  /** The import paths a module's source names, in the order the resolver resolves them. */
+  scanImports(source: string): string[];
+  /**
+   * A module file's text, checked as NativeFs checks every file it reads
+   * (`mds::check_module_bytes`: the per-file cap, then UTF-8), or a throw of the
+   * native error. `display` names the file: its path below the project root.
+   */
+  preflightModule(bytes: Uint8Array, display: string): string;
+}
+
 export interface ModuleScannerOptions {
   /**
    * How many modules besides the entry a scan may resolve — the WASM engine takes
@@ -570,14 +585,14 @@ interface Located {
   readonly dir: string;
 }
 
-/** A module file opened and checked, and read unless its reader declined. */
+/** A module file opened, checked and read. */
 interface ReadModule {
   /** Its canonical path. */
   readonly resolved: string;
   /** Its size in bytes. */
   readonly size: number;
-  /** Its text, or `undefined` when the reader's `admit` declined to read it. */
-  readonly content: string | undefined;
+  /** Its text. */
+  readonly content: string;
 }
 
 /** An import of a walked module: located, and read too when read ahead of the walk. */
@@ -652,10 +667,15 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  * - a module whose resolved path carries a forbidden path character — a hostile-named
  *   directory reached through a symlink (`mds::io`);
  * - an import chain deeper than 64 modules (`mds::import`); more modules than the
- *   engine takes, the entry plus `maxModules` (`mds::resource_limit`); a file over the
- *   engine's 10 MiB per-file cap (`mds::resource_limit`);
+ *   engine takes, the entry plus `maxModules` (`mds::resource_limit`);
  * - a module that is not a regular file or cannot be read (`mds::io`, `cannot read
- *   <path as written>: <errno name>`).
+ *   <path as written>: <errno name>`);
+ * - a file over the engine's 10 MiB per-file cap (`mds::resource_limit`) or whose
+ *   bytes are not valid UTF-8 (`mds::io`) — refused by the engine's own
+ *   `preflightModule`, the checks NativeFs makes on every file it reads, which also
+ *   decodes the file (a leading byte-order mark kept).
+ *
+ * A project may be rooted at the filesystem root, as on native.
  *
  * Modules are read concurrently — at most MAX_CONCURRENT_OPENS files open at once,
  * at most MAX_IMPORTS_READ_AHEAD of a module's imports and no more than
@@ -670,7 +690,8 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  *    found. Deliberate: containment is decided before the file is looked at, so the
  *    scanner is no existence oracle for files outside the project (U-SM30, U-SM32).
  * 2. The aggregate-size guard (`maxAggregateSize`) is the WASM backend's own; native
- *    has none.
+ *    has none. It judges a module only once native's own checks on it pass, so it
+ *    never pre-empts a refusal native makes of that module (U-SM39).
  * 3. A `../` import from a project rooted at the filesystem root is refused as
  *    escaping it, where native resolves `/..` to `/` (#424).
  * 4. Module count: native refuses a module once 256 others are fully resolved, so a
@@ -690,24 +711,18 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  */
 export async function buildModulesMap(
   entryPath: string,
-  scanImports: (source: string) => string[],
+  engine: ScannerEngine,
   options?: ModuleScannerOptions,
 ): Promise<BuildModulesMapResult> {
   const maxModules = options?.maxModules ?? DEFAULT_MAX_MODULES;
   const maxAggregateSize = options?.maxAggregateSize ?? DEFAULT_MAX_AGGREGATE_SIZE;
 
   const entry = await locateEntry(entryPath);
+  // A project may be rooted at the filesystem root, as on native: containment in it
+  // then admits every path, exactly as NativeFs's does.
   const projectRoot = findProjectRoot(entry.dir);
   // Virtual keys are always slash-separated to mirror Rust's VirtualFs.
   const entryFilename = keyOf(projectRoot, entry.path);
-
-  // Security: entry file must not be at filesystem root — that would disable the
-  // path traversal guard (a root project dir makes containment checks meaningless).
-  // `dirname(root) === root` is true exactly at a filesystem root on every
-  // platform ('/', 'C:\\', '\\\\server\\share\\').
-  if (projectRoot === '' || dirname(projectRoot) === projectRoot) {
-    throw new Error('security: project root cannot be filesystem root');
-  }
 
   const modules: Record<string, string> = {};
   /** Keys of modules walked to the end: the native resolver's module cache. */
@@ -807,8 +822,8 @@ export async function buildModulesMap(
 
   /**
    * Open a located module with O_NOFOLLOW and read it, as NativeFs's `read` does:
-   * `mds::io` when it cannot be read, `file too large` over the per-file cap. Its
-   * content is read only when `admit` accepts its size.
+   * `mds::io` when it cannot be read, `file too large` over the per-file cap. Given
+   * `admit`, it is read only when `admit` accepts its size, and `undefined` otherwise.
    *
    * O_NOFOLLOW makes open() fail with ELOOP when the final component was swapped for
    * a symlink after it was located, so no link is followed between the check and the
@@ -821,11 +836,17 @@ export async function buildModulesMap(
    * on-disk spelling, so `Entry.mds` for `entry.mds` differs from its canonical form
    * without being a symlink (#408).
    */
+  async function readModule(located: Located, shown: string): Promise<ReadModule>;
   async function readModule(
     located: Located,
     shown: string,
     admit: (size: number) => boolean,
-  ): Promise<ReadModule> {
+  ): Promise<ReadModule | undefined>;
+  async function readModule(
+    located: Located,
+    shown: string,
+    admit?: (size: number) => boolean,
+  ): Promise<ReadModule | undefined> {
     const handle = await openNoFollow(located.path, shown);
     try {
       // `openNoFollow` above already succeeded, so the file existed a moment ago; a
@@ -853,18 +874,22 @@ export async function buildModulesMap(
       if (!stats.isFile()) {
         throw cannotReadError(shown, stats.isDirectory() ? 'EISDIR' : 'not a regular file');
       }
-      // Checked on the fstat size, before a byte is read, so a file over the cap is
-      // never loaded into memory.
+      const display = keyOf(projectRoot, resolved);
+      // Checked on the fstat size too, before a byte is read, so a file over the cap
+      // when it is opened is never read into memory; one that grows past it while it
+      // is read is refused by the engine's own check below.
       if (stats.size > MAX_FILE_SIZE) {
-        throw fileTooLargeError(stats.size, keyOf(projectRoot, resolved));
+        throw fileTooLargeError(stats.size, display);
       }
-      if (!admit(stats.size)) {
-        return { resolved, size: stats.size, content: undefined };
+      if (admit !== undefined && !admit(stats.size)) {
+        return undefined;
       }
-      const content = await handle.readFile({ encoding: 'utf-8' }).catch((err: unknown) => {
+      const bytes = await handle.readFile().catch((err: unknown) => {
         throw readError(shown, err);
       });
-      return { resolved, size: stats.size, content };
+      // The engine's own post-read checks — the per-file cap, then UTF-8 — decode it,
+      // so it refuses exactly the bytes NativeFs refuses (#414).
+      return { resolved, size: bytes.length, content: engine.preflightModule(bytes, display) };
     } finally {
       await closeModule(handle, shown);
     }
@@ -897,8 +922,11 @@ export async function buildModulesMap(
         return true;
       }),
     );
+    if (!read.ok) {
+      return { located, read };
+    }
     // A module the read-ahead budget left unread is read by the walk itself.
-    return { located, read: read.ok && read.value.content === undefined ? undefined : read };
+    return { located, read: read.value === undefined ? undefined : { ok: true, value: read.value } };
   }
 
   /**
@@ -931,20 +959,24 @@ export async function buildModulesMap(
     }
     admitted += 1;
 
+    // A module no read-ahead read is read here, whatever its size: the per-file cap
+    // bounds it.
     const read = readAheadOutcome === undefined
-      ? await readModule(located, shown, (size) => aggregateSize + size <= maxAggregateSize)
+      ? await readModule(located, shown)
       : unwrap(readAheadOutcome);
-    // The WASM backend's own guard, checked in walk order after the per-file cap. A
-    // module the walk read itself is left unread when it would cross it.
+    // The WASM backend's own guard, checked in walk order once the module has passed
+    // every check native makes on it — the per-file cap and UTF-8 — so it never
+    // reports a module native refuses, whichever reads the read-ahead budget let run
+    // ahead of the walk (difference 2 above).
     aggregateSize += read.size;
-    if (read.content === undefined || aggregateSize > maxAggregateSize) {
+    if (aggregateSize > maxAggregateSize) {
       throw resourceLimitError(`aggregate module size exceeds maximum of ${maxAggregateSize} bytes`);
     }
     modules[key] = read.content;
 
     // The next MAX_IMPORTS_READ_AHEAD imports are read ahead of the walk; each one
     // walked starts the next.
-    const upcoming = scanImports(read.content).values();
+    const upcoming = engine.scanImports(read.content).values();
     const queued: Array<{ readonly importPath: string; readonly ahead: Promise<ReadAhead> }> = [];
     const refill = (): void => {
       while (queued.length < MAX_IMPORTS_READ_AHEAD) {

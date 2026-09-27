@@ -337,6 +337,51 @@ fn check_segment_count(path: &str) -> Result<(), MdsError> {
     Ok(())
 }
 
+// ── Module bytes ─────────────────────────────────────────────────────────────
+
+/// Check a module file's bytes as [`NativeFs`] checks every file it reads, and
+/// return its text: more than [`crate::MAX_FILE_SIZE`] bytes is refused with
+/// [`MdsError::ResourceLimit`] (`file too large (<n> bytes, max <max> bytes):
+/// <display>`), and bytes that are not valid UTF-8 with [`MdsError::Io`] (`invalid
+/// UTF-8 in <display>: <reason>`). A leading byte-order mark is kept, as the
+/// template's first character.
+///
+/// `display` names the file in both messages — [`NativeFs`] passes its path relative
+/// to the project root — escaped with [`crate::escape_path_for_message`]. This is the
+/// one implementation of these checks: [`NativeFs`] reads a module and calls it,
+/// `mds::lint` calls it when it re-reads its entry, and so does `@mdscript/mds`'s WASM
+/// backend, whose JS pre-scanner reads each file itself (`preflightModule`), so both
+/// backends refuse the same bytes with the same error (#414).
+///
+/// # Errors
+///
+/// [`MdsError::ResourceLimit`] over the size cap; [`MdsError::Io`] for invalid UTF-8,
+/// including an incomplete sequence at the end.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(mds::check_module_bytes(b"Hello!\n".to_vec(), "hi.mds")?, "Hello!\n");
+///
+/// let err = mds::check_module_bytes(vec![b'h', 0xff], "bad.mds").unwrap_err();
+/// assert_eq!(
+///     err.to_string(),
+///     "invalid UTF-8 in bad.mds: invalid utf-8 sequence of 1 bytes from index 1"
+/// );
+/// # Ok::<(), mds::MdsError>(())
+/// ```
+pub fn check_module_bytes(bytes: Vec<u8>, display: &str) -> Result<String, MdsError> {
+    let shown = crate::lint::escape_path_for_message(display);
+    if bytes.len() as u64 > MAX_FILE_SIZE {
+        return Err(MdsError::resource_limit(format!(
+            "file too large ({} bytes, max {} bytes): {shown}",
+            bytes.len(),
+            MAX_FILE_SIZE,
+        )));
+    }
+    String::from_utf8(bytes).map_err(|e| MdsError::io(format!("invalid UTF-8 in {shown}: {e}")))
+}
+
 // ── VirtualFs segment logic ──────────────────────────────────────────────────
 
 /// Resolve a relative path string against a pre-split directory segment stack.
@@ -768,15 +813,7 @@ impl FileSystem for NativeFs {
         // check and the actual read. Read first, reject after.
         let bytes =
             std::fs::read(path).map_err(|e| MdsError::io(format!("cannot read {display}: {e}")))?;
-        if bytes.len() as u64 > MAX_FILE_SIZE {
-            return Err(MdsError::resource_limit(format!(
-                "file too large ({} bytes, max {} bytes): {display}",
-                bytes.len(),
-                MAX_FILE_SIZE,
-            )));
-        }
-        String::from_utf8(bytes)
-            .map_err(|e| MdsError::io(format!("invalid UTF-8 in {display}: {e}")))
+        check_module_bytes(bytes, &display)
     }
 
     fn is_markdown(&self, normalized: &str) -> bool {
@@ -1633,6 +1670,100 @@ mod tests {
         assert!(
             matches!(err, MdsError::ResourceLimit { .. }),
             "expected ResourceLimit for oversized file, got {err:?}"
+        );
+    }
+
+    // ── check_module_bytes: the one post-read check (#414) ───────────────────
+
+    #[test]
+    fn check_module_bytes_returns_the_text_keeping_a_bom() {
+        assert_eq!(
+            check_module_bytes(b"Hello!\n".to_vec(), "a.mds").unwrap(),
+            "Hello!\n"
+        );
+        let bom = [&[0xef, 0xbb, 0xbf][..], b"Hi\n"].concat();
+        assert_eq!(
+            check_module_bytes(bom, "a.mds").unwrap(),
+            format!("{}Hi\n", char::from_u32(0xfeff).unwrap())
+        );
+        assert_eq!(check_module_bytes(Vec::new(), "a.mds").unwrap(), "");
+    }
+
+    #[test]
+    fn check_module_bytes_refuses_one_byte_over_the_cap() {
+        let at_cap = vec![b'x'; MAX_FILE_SIZE as usize];
+        assert_eq!(
+            check_module_bytes(at_cap, "big.mds").unwrap().len(),
+            MAX_FILE_SIZE as usize
+        );
+        let err =
+            check_module_bytes(vec![b'x'; MAX_FILE_SIZE as usize + 1], "big.mds").unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::resource_limit"));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "resource limit exceeded: file too large ({} bytes, max {MAX_FILE_SIZE} bytes): big.mds",
+                MAX_FILE_SIZE + 1
+            )
+        );
+    }
+
+    #[test]
+    fn check_module_bytes_refuses_invalid_utf8_with_the_std_reason() {
+        for (bytes, reason) in [
+            (
+                vec![b'h', b'i', 0xff, b'\n'],
+                "invalid utf-8 sequence of 1 bytes from index 2",
+            ),
+            // An incomplete sequence at the very end (the first two bytes of U+20AC).
+            (
+                vec![b'h', b'i', b'\n', 0xe2, 0x82],
+                "incomplete utf-8 byte sequence from index 3",
+            ),
+        ] {
+            let err = check_module_bytes(bytes, "sub/bad.mds").unwrap_err();
+            assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+            assert_eq!(
+                err.to_string(),
+                format!("invalid UTF-8 in sub/bad.mds: {reason}")
+            );
+        }
+    }
+
+    /// The display is escaped as it enters a message; a clean one is unchanged (the
+    /// cases above).
+    #[test]
+    fn check_module_bytes_escapes_the_display() {
+        let esc = char::from_u32(0x1b).unwrap();
+        let hostile = format!("a{esc}b.mds");
+        let err = check_module_bytes(vec![0xff], &hostile).unwrap_err();
+        let message = err.to_string();
+        assert!(!message.contains(esc), "raw ESC in {message:?}");
+        assert!(
+            message.starts_with(&format!("invalid UTF-8 in a{}u001Bb.mds: ", '\\')),
+            "{message:?}"
+        );
+    }
+
+    /// NativeFs::read refuses exactly what check_module_bytes refuses, naming the file
+    /// by its path below the project root.
+    #[test]
+    fn native_read_refuses_invalid_utf8_as_check_module_bytes_does() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+        let bytes = vec![b'h', b'i', 0xff, b'\n'];
+        let path = dir.path().join("bad.mds");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let fs = NativeFs::new();
+        let key = fs.resolve_entry(&path.display().to_string()).unwrap();
+        let err = fs.read(&key).unwrap_err();
+        let expected = check_module_bytes(bytes, "bad.mds").unwrap_err();
+        assert_eq!(code_of(&err), code_of(&expected));
+        assert_eq!(err.to_string(), expected.to_string());
+        assert_eq!(
+            err.to_string(),
+            "invalid UTF-8 in bad.mds: invalid utf-8 sequence of 1 bytes from index 2"
         );
     }
 

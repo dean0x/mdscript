@@ -62,7 +62,7 @@ pub(crate) mod vars_json;
 pub(crate) mod verbatim;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
-pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
+pub use fs::{check_module_bytes, effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{
     escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
     is_forbidden_path_char, named_source_for_render, neutralize_source_for_render,
@@ -1410,18 +1410,10 @@ pub fn lint(
         let mut warnings = vec![];
         cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
     }
-    // Read source for lint re-parse (mirrors NativeFs::read size guard).
+    // Read source for lint re-parse, with NativeFs::read's own post-read checks.
     let bytes =
         std::fs::read(path).map_err(|e| MdsError::io(format!("cannot read {path_str}: {e}")))?;
-    if bytes.len() as u64 > limits::MAX_FILE_SIZE {
-        return Err(MdsError::resource_limit(format!(
-            "file too large ({} bytes, max {} bytes): {path_str}",
-            bytes.len(),
-            limits::MAX_FILE_SIZE,
-        )));
-    }
-    let source = String::from_utf8(bytes)
-        .map_err(|e| MdsError::io(format!("invalid UTF-8 in {path_str}: {e}")))?;
+    let source = check_module_bytes(bytes, path_str)?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())

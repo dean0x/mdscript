@@ -572,9 +572,7 @@ describe('error shape', () => {
           await rejectionOf(native.compileFile(childPath, { sourceMap }), 'U-E-EXT napi'),
         );
         // The WASM compileFile path: pre-scan the modules, then compile the entry.
-        const { entryFilename, modules } = await buildModulesMap(childPath, (src) =>
-          wasmModule.scanImports(src),
-        );
+        const { entryFilename, modules } = await buildModulesMap(childPath, wasmModule);
         const entrySource = modules[entryFilename];
         delete modules[entryFilename];
         shapes[`wasm sourceMap=${sourceMap}`] = errorShape(

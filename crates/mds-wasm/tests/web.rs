@@ -620,6 +620,65 @@ fn scan_imports_returns_empty_array_for_importless_source() {
     assert_eq!(js_array_len(&result), 0);
 }
 
+// ── preflightModule (#414) ───────────────────────────────────────────────────
+
+/// `preflightModule` returns a module's text, a leading byte-order mark kept, and
+/// throws the native backend's error — `mds::check_module_bytes`'s — for bytes it
+/// refuses.
+#[wasm_bindgen_test]
+fn preflight_module_returns_the_text_or_the_native_error() {
+    assert_eq!(
+        mds_wasm::preflight_module(b"Hello!\n".to_vec(), "a.mds").unwrap(),
+        "Hello!\n"
+    );
+    let bom = [&[0xef, 0xbb, 0xbf][..], b"Hi\n"].concat();
+    let expected_bom = format!("{}Hi\n", char::from_u32(0xfeff).unwrap());
+    assert_eq!(
+        mds_wasm::preflight_module(bom, "a.mds").unwrap(),
+        expected_bom
+    );
+
+    let cases = [
+        (
+            vec![b'h', b'i', 0xff, b'\n'],
+            "mds::io",
+            "invalid UTF-8 in sub/bad.mds: invalid utf-8 sequence of 1 bytes from index 2",
+        ),
+        (
+            vec![b'h', b'i', b'\n', 0xe2, 0x82],
+            "mds::io",
+            "invalid UTF-8 in sub/bad.mds: incomplete utf-8 byte sequence from index 3",
+        ),
+    ];
+    for (bytes, code, message) in cases {
+        let err = mds_wasm::preflight_module(bytes, "sub/bad.mds").unwrap_err();
+        assert_eq!(get_str(&err, "code"), code);
+        assert_eq!(get_str(&err, "message"), message);
+        assert!(
+            get_prop(&err, "help").is_undefined(),
+            "no help on {message}"
+        );
+    }
+
+    // The per-file cap: exactly 10 MiB passes, one byte more is refused.
+    let cap = 10 * 1024 * 1024;
+    assert_eq!(
+        mds_wasm::preflight_module(vec![b'x'; cap], "big.mds")
+            .unwrap()
+            .len(),
+        cap
+    );
+    let err = mds_wasm::preflight_module(vec![b'x'; cap + 1], "big.mds").unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_eq!(
+        get_str(&err, "message"),
+        format!(
+            "resource limit exceeded: file too large ({} bytes, max {cap} bytes): big.mds",
+            cap + 1
+        )
+    );
+}
+
 #[wasm_bindgen_test]
 fn scan_imports_returns_error_for_malformed_source() {
     // Unclosed double-brace interpolation — should produce a syntax error.
