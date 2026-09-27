@@ -1087,8 +1087,9 @@ fn directory_argument_filesystem_root_is_refused() {
 
 /// The Windows twin of [`directory_argument_filesystem_root_is_refused`]: the drive
 /// root the temp directory lives on, typed plainly (`C:\`) and in its verbatim form
-/// (`\\?\C:\`), and `.` in a working directory of that root. The same root-safety
-/// rules apply.
+/// (`\\?\C:\`), and `.` in a working directory of that root, each refused by the five
+/// subcommands and in `mds lint --format json`'s envelope. From a working directory of
+/// that root, stdin and a file argument still work. The same root-safety rules apply.
 #[cfg(windows)]
 #[test]
 fn directory_argument_drive_root_is_refused() {
@@ -1110,8 +1111,24 @@ fn directory_argument_drive_root_is_refused() {
             assert_eq!(code, Some(2), "{label}: got: {text}");
             assert_io_refusal(&text, &message, &label);
         }
+        assert_lint_json_refusal(cwd, typed, &message);
     }
     assert!(!out.exists(), "nothing is written");
+
+    // Controls: from a working directory of the drive root, stdin (an empty source here)
+    // and a file argument still work — only walking the root is refused.
+    let file = tmp.path().join("in.mds");
+    std::fs::write(&file, "Hi\n").unwrap();
+    for args in [&["check", "-"][..], &["check", file.to_str().unwrap()]] {
+        let (code, text) = run(&drive, args);
+        assert_eq!(code, Some(0), "control (in {plain}) {args:?}: got: {text}");
+    }
+    let (code, text) = run(&drive, &["build", file.to_str().unwrap(), "-o", "-"]);
+    assert_eq!(code, Some(0), "control (in {plain}) build: got: {text}");
+    assert!(
+        text.contains("Hi"),
+        "control (in {plain}) build: got: {text}"
+    );
 }
 
 /// A directory argument whose final component is a symlink is refused identically by

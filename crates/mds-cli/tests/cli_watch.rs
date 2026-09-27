@@ -166,9 +166,11 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// can ever announce the recovery: `rmdir` of a watched directory removes the kernel's
 /// watch, and the directory recreated in its place is a different inode that nothing is
 /// watching. Recovery there is the `liveness_probe_*` re-arm, which runs once per
-/// `--poll-interval`. Such a wait is denominated in **ticks**, and pricing it with
-/// [`TIMEOUT`] — a latency bound — conflates two unrelated quantities and leaves the
-/// headroom silently dependent on whatever `--poll-interval` the test happens to pass.
+/// `--poll-interval`. An edit that lands before the watch is armed (the startup-window
+/// tests) is announced by no event either, and is recovered by the tick's content
+/// backstop. Such a wait is denominated in **ticks**, and pricing it with [`TIMEOUT`] —
+/// a latency bound — conflates two unrelated quantities and leaves the headroom
+/// silently dependent on whatever `--poll-interval` the test happens to pass.
 ///
 /// The tick-dependent waits, all of which use this bound:
 /// - `watch_file_mode_parent_dir_delete_recreate_recovers`
@@ -177,6 +179,11 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// - `watch_file_mode_relative_paths_recover_after_the_working_directory_is_recreated`
 /// - `watch_dot_recovers_after_the_working_directory_is_recreated`
 /// - `watch_vars_dir_delete_recreate_rearms`
+/// - `watch_dir_mode_cross_root_edit_during_startup_window_is_not_lost`
+/// - `watch_file_mode_dep_edit_during_startup_window_is_not_lost`
+/// - `watch_dir_mode_idle_tick_fires_under_event_flood`
+/// - `i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate`
+/// - `watch_help_example_src_poll_interval_500_self_heals`
 ///
 /// Every other wait in this file is satisfied by an inotify event on a watch that was
 /// never lost, and keeps [`TIMEOUT`].
@@ -5782,17 +5789,20 @@ const WATCH_HELP_EXAMPLES: [(&str, &str); 10] = [
     ),
 ];
 
-/// Whether this file defines `name` as a `#[test]` function.
-fn is_test_in_this_file(name: &str) -> bool {
+/// How this file defines `name`: `None` when it has no `fn <name>() {` — the shape of
+/// a test fn — and otherwise whether that fn is a `#[test]`.
+fn test_attribute(name: &str) -> Option<bool> {
     const SOURCE: &str = include_str!("cli_watch.rs");
-    let Some(at) = SOURCE.find(&format!("\nfn {name}() {{")) else {
-        return false;
-    };
+    let at = SOURCE.find(&format!("\nfn {name}() {{"))?;
     // The attributes and doc comment above the fn, back to the previous item's end.
     let before = &SOURCE[..at];
     let preamble = &before[before.rfind("\n}\n").map_or(0, |i| i + 3)..];
-    preamble.lines().any(|l| l.trim() == "#[test]")
+    Some(preamble.lines().any(|l| l.trim() == "#[test]"))
 }
+
+/// A zero-argument fn that is not a test: [`test_attribute`] must find it, as it finds
+/// a test, and still tell that it is not one.
+fn not_a_test() {}
 
 /// Every example `mds watch --help` prints has a named test that runs it, and every
 /// test the table names exists (#413): an example added without a test, edited so it
@@ -5820,20 +5830,25 @@ fn watch_help_examples_each_have_a_named_test() {
     );
 
     for (example, test) in WATCH_HELP_EXAMPLES {
-        assert!(
-            is_test_in_this_file(test),
+        assert_eq!(
+            test_attribute(test),
+            Some(true),
             "{example:?} maps to `{test}`, which is not a #[test] in this file"
         );
     }
-    // Control: the lookup rejects a name that is not a test here, and a helper that is
-    // not a test.
-    assert!(!is_test_in_this_file(
-        "watch_help_example_that_does_not_exist"
-    ));
-    assert!(!is_test_in_this_file("spawn_ready"));
-    assert!(is_test_in_this_file(
-        "watch_help_examples_each_have_a_named_test"
-    ));
+    // Controls, one for each answer: a name this file does not define; a fn it defines
+    // in a test's shape (`fn()`, which the coercion below pins) that is not a test; and
+    // this test.
+    let _: fn() = not_a_test;
+    assert_eq!(
+        test_attribute("watch_help_example_that_does_not_exist"),
+        None
+    );
+    assert_eq!(test_attribute("not_a_test"), Some(false));
+    assert_eq!(
+        test_attribute("watch_help_examples_each_have_a_named_test"),
+        Some(true)
+    );
 }
 
 /// `mds watch .` — watch every `.mds` file in the working directory, writing each
@@ -5901,9 +5916,16 @@ fn watch_help_example_src_out_dir_dist_mirrors_the_subtree() {
     drop(child);
 }
 
-/// `mds watch src/ --poll-interval 500` — the self-heal check runs every 500 ms: once
-/// the watched root is deleted and recreated, which no OS event announces (the watch
-/// died with the old directory), the idle tick re-arms it and compiles the new file.
+/// `mds watch src/ --poll-interval 500` — the help example runs, and it self-heals once
+/// the watched root is deleted and recreated: the file written into the new root is
+/// compiled. On Linux no event announces it (the watch died with the old directory), so
+/// the idle tick re-arms the watch; on macOS FSEvents reports it without a tick.
+///
+/// This does not measure the 500 ms interval: the default 1000 ms tick recovers within
+/// [`TICK_TIMEOUT`] too, and a wall-clock assertion on the interval would only make the
+/// test a timing flake. `watch_poll_interval_zero_works`,
+/// `watch_poll_interval_invalid_exits_2` and `watch_poll_interval_tiny_clamped` pin how
+/// the flag is parsed and clamped.
 #[test]
 fn watch_help_example_src_poll_interval_500_self_heals() {
     let dir = tempfile::tempdir().unwrap();
@@ -5927,7 +5949,7 @@ fn watch_help_example_src_poll_interval_500_self_heals() {
     std::thread::sleep(Duration::from_millis(200));
     std::fs::create_dir(&src).unwrap();
     write_atomic(&src.join("new.mds"), "New file\n");
-    // TICK-DEPENDENT (see TICK_TIMEOUT): only the 500 ms self-heal tick can recover.
+    // TICK-DEPENDENT (see TICK_TIMEOUT): on Linux only the self-heal tick can recover.
     assert!(
         wait_for_file_contains(&src.join("new.md"), "New file", TICK_TIMEOUT),
         "the self-heal tick recovers the recreated root; stderr: {}",
