@@ -992,10 +992,14 @@ fn sm18_include_of_extending_chain_sources_are_relative() {
         .iter()
         .map(|s| s.as_str().expect("each source is a string"))
         .collect();
-    // Map-relative (`../…`) when `build/` resolves inside the project root as the
-    // root itself does; root-relative when it does not (a working directory reached
-    // through a Windows 8.3 short name). Both are correct anchors (ADR-005); either
-    // way every file of the chain is listed after the importer.
+    // Map-relative (`../…`): `build/` resolves inside the project root as the root
+    // itself does. On Windows a working directory reached through an 8.3 short name can
+    // resolve `build/` outside the root's spelling, and the sources are then
+    // root-relative, also a correct anchor (ADR-005), so there the anchor is read off
+    // the first source. Either way every file of the chain is listed after the importer.
+    #[cfg(not(windows))]
+    let anchor = "../";
+    #[cfg(windows)]
     let anchor = if sources.first() == Some(&"../src/main.mds") {
         "../"
     } else {
