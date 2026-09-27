@@ -624,17 +624,17 @@ fn scan_imports_returns_empty_array_for_importless_source() {
 
 /// `preflightModule` returns a module's text, a leading byte-order mark kept, and
 /// throws the native backend's error — `mds::check_module_bytes`'s — for bytes it
-/// refuses.
+/// refuses (#414).
 #[wasm_bindgen_test]
 fn preflight_module_returns_the_text_or_the_native_error() {
     assert_eq!(
-        mds_wasm::preflight_module(b"Hello!\n".to_vec(), "a.mds").unwrap(),
+        mds_wasm::preflight_module(b"Hello!\n".to_vec(), "a.mds", "./a.mds").unwrap(),
         "Hello!\n"
     );
     let bom = [&[0xef, 0xbb, 0xbf][..], b"Hi\n"].concat();
     let expected_bom = format!("{}Hi\n", char::from_u32(0xfeff).unwrap());
     assert_eq!(
-        mds_wasm::preflight_module(bom, "a.mds").unwrap(),
+        mds_wasm::preflight_module(bom, "a.mds", "./a.mds").unwrap(),
         expected_bom
     );
 
@@ -651,7 +651,7 @@ fn preflight_module_returns_the_text_or_the_native_error() {
         ),
     ];
     for (bytes, code, message) in cases {
-        let err = mds_wasm::preflight_module(bytes, "sub/bad.mds").unwrap_err();
+        let err = mds_wasm::preflight_module(bytes, "sub/bad.mds", "./sub/bad.mds").unwrap_err();
         assert_eq!(get_str(&err, "code"), code);
         assert_eq!(get_str(&err, "message"), message);
         assert!(
@@ -663,12 +663,12 @@ fn preflight_module_returns_the_text_or_the_native_error() {
     // The per-file cap: exactly 10 MiB passes, one byte more is refused.
     let cap = 10 * 1024 * 1024;
     assert_eq!(
-        mds_wasm::preflight_module(vec![b'x'; cap], "big.mds")
+        mds_wasm::preflight_module(vec![b'x'; cap], "big.mds", "./big.mds")
             .unwrap()
             .len(),
         cap
     );
-    let err = mds_wasm::preflight_module(vec![b'x'; cap + 1], "big.mds").unwrap_err();
+    let err = mds_wasm::preflight_module(vec![b'x'; cap + 1], "big.mds", "./big.mds").unwrap_err();
     assert_eq!(get_str(&err, "code"), "mds::resource_limit");
     assert_eq!(
         get_str(&err, "message"),
@@ -677,6 +677,46 @@ fn preflight_module_returns_the_text_or_the_native_error() {
             cap + 1
         )
     );
+}
+
+/// `preflightModule` refuses a file that is not an MDS file after its bytes pass, as the
+/// resolver does before it parses a module (#417): the extension of `display` (the
+/// on-disk spelling) is judged, and the error names `shown`, the path as typed.
+#[wasm_bindgen_test]
+fn preflight_module_refuses_a_non_mds_file_naming_it_as_typed() {
+    let help = "use .mds extension or add 'type: mds' to frontmatter";
+    for (display, shown, source) in [
+        ("doc.txt", "./sub/../doc.txt", "Hello!\n"),
+        ("plain.md", "/abs/plain.md", "Hello!\n"),
+        // Its import-like line is never the pre-scanner's to follow.
+        ("lure.txt", "lure.txt", "@import \"./missing.mds\" as m\n"),
+        // The path as typed only names the file: a `.mds` spelling of it admits nothing.
+        ("doc.txt", "./doc.mds", "Hello!\n"),
+    ] {
+        let err =
+            mds_wasm::preflight_module(source.as_bytes().to_vec(), display, shown).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::not_mds", "{shown}");
+        assert_eq!(
+            get_str(&err, "message"),
+            format!("not an MDS file: {shown}")
+        );
+        assert_eq!(get_str(&err, "help"), help);
+    }
+    // The shown path is escaped as it enters the message.
+    let hostile = format!("./a{}b.txt", char::from_u32(0x1b).unwrap());
+    let err = mds_wasm::preflight_module(b"hi\n".to_vec(), "ab.txt", &hostile).unwrap_err();
+    assert_eq!(
+        get_str(&err, "message"),
+        format!("not an MDS file: ./a{}u001Bb.txt", '\\')
+    );
+    // Bytes are checked first: invalid UTF-8 in a .txt file is the bytes error.
+    let err = mds_wasm::preflight_module(vec![0xff], "doc.txt", "doc.txt").unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::io");
+    // Controls: .mds, and .md declaring type: mds, pass — the extension judged on
+    // display, never on shown.
+    mds_wasm::preflight_module(b"hi\n".to_vec(), "Doc.mds", "./doc.txt").unwrap();
+    mds_wasm::preflight_module(b"---\ntype: mds\n---\nhi\n".to_vec(), "page.md", "page.md")
+        .unwrap();
 }
 
 #[wasm_bindgen_test]

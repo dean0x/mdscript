@@ -90,6 +90,18 @@ fn check_module_bytes_function_exists() {
     assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err:?}");
 }
 
+/// #417: `check_module_type` — the resolver's not-an-MDS-file check, shared with the
+/// WASM backend's `preflightModule` — is callable via the crate root: it judges the
+/// key's extension and names the path as typed.
+#[test]
+fn check_module_type_function_exists() {
+    let _: fn(&str, &str, &str) -> Result<(), MdsError> = mds::check_module_type;
+    mds::check_module_type("/p/Doc.mds", "./doc.mds", "hi\n").unwrap();
+    let err = mds::check_module_type("/p/doc.txt", "./sub/../doc.txt", "hi\n").unwrap_err();
+    assert!(matches!(err, MdsError::NotMdsFile { .. }), "{err:?}");
+    assert_eq!(err.to_string(), "not an MDS file: ./sub/../doc.txt");
+}
+
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`
 /// forbids a struct literal, so the type is only obtainable through the load API.
 #[test]

@@ -108,8 +108,8 @@ describe('compileFile', () => {
     assert.ok(Array.isArray(result.dependencies));
   });
 
-  // The native backend only: the WASM backend's pre-scanner names a not-MDS entry by
-  // its own route (#417 WASM parity is a separate change).
+  // The native backend only: U-WCF13 (wasm-compileFile.spec.mjs) holds the WASM
+  // backend to the same error, named as typed.
   test('CF-NOTMDS: a non-MDS entry is named as typed on the native backend (#417)', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, { native: engines.native }, 'CF-NOTMDS')) return;

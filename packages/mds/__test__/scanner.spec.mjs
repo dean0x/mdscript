@@ -43,11 +43,11 @@ const FIXTURES = path.join(__dirname, 'fixtures');
 // `preflightModule` (#414); these tests pair it with the import scanner passed in.
 const { wasm: wasmEngine } = await loadEngines();
 
-function preflightModule(bytes, display) {
+function preflightModule(bytes, display, shown) {
   if (wasmEngine === null) {
     throw new Error('buildModulesMap needs the WASM engine: build crates/mds-wasm/pkg first');
   }
-  return wasmEngine.preflightModule(bytes, display);
+  return wasmEngine.preflightModule(bytes, display, shown);
 }
 
 /** buildModulesMap with `scan` as the engine's import scanner. */
@@ -1423,6 +1423,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const rows = [
         // [label, name of c, content of c, native's refusal of c]
         ['invalid UTF-8', 'c.mds', invalidUtf8, 'mds::io'],
+        ['not an MDS file', 'c.txt', text, 'mds::not_mds'],
         // Control (PF-013): a valid `c` compiles on native, and crosses the guard here.
         ['valid', 'c.mds', text, null],
       ];

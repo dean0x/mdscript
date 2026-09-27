@@ -2643,6 +2643,39 @@ fn validate_file_type(module: KeyRef<'_>, source: &str) -> Result<(), MdsError> 
     ))
 }
 
+/// Refuse a module that is not an MDS file, as the resolver refuses every module it
+/// reads: neither a `.mds` file nor a `.md` file whose frontmatter declares `type: mds`
+/// is [`MdsError::NotMdsFile`] (`mds::not_mds`).
+///
+/// `key` is the module's resolved key, whose extension is judged — on [`crate::NativeFs`]
+/// its on-disk spelling (#408); `source` is its text; `shown` is the path the caller
+/// typed to reach it — the entry path as passed, or the import string as written —
+/// which the error names, escaped with [`crate::escape_path_for_message`] (#417).
+///
+/// This is the resolver's own check, run after a module is read and before it is
+/// parsed. `@mdscript/mds`'s WASM backend, whose JS pre-scanner reads each file itself,
+/// runs it through the `preflightModule` export in the same place, so a file that is
+/// not an MDS file is refused identically on both backends — and its import-like
+/// lines are never followed (#417).
+///
+/// # Errors
+///
+/// [`MdsError::NotMdsFile`] naming `shown`.
+///
+/// # Examples
+///
+/// ```
+/// mds::check_module_type("/proj/doc.mds", "./doc.mds", "Hello!\n")?;
+/// mds::check_module_type("/proj/page.md", "page.md", "---\ntype: mds\n---\nHi\n")?;
+///
+/// let err = mds::check_module_type("/proj/doc.txt", "./doc.txt", "Hello!\n").unwrap_err();
+/// assert_eq!(err.to_string(), "not an MDS file: ./doc.txt");
+/// # Ok::<(), mds::MdsError>(())
+/// ```
+pub fn check_module_type(key: &str, shown: &str, source: &str) -> Result<(), MdsError> {
+    validate_file_type(KeyRef { key, shown }, source)
+}
+
 /// Return `true` if a frontmatter line declares `type: mds` at the top level.
 ///
 /// Only non-indented lines are matched, consistent with `strip_reserved_keys`

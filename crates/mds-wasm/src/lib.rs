@@ -987,21 +987,32 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
     }))
 }
 
-/// Check a module file's bytes as the native filesystem backend checks every file
-/// it reads, and return its text.
+/// Check a module file as the native backend checks every file it reads, and return
+/// its text.
 ///
 /// `@mdscript/mds`'s WASM backend reads the modules of a `compileFile` itself, in
-/// JS, and hands each file's bytes here, so it refuses exactly the bytes the native
-/// backend refuses, with the same error ([`mds::check_module_bytes`], #414): more
-/// than 10 MiB is `mds::resource_limit` (`file too large (<n> bytes, max 10485760
-/// bytes): <display>`), bytes that are not valid UTF-8 are `mds::io` (`invalid UTF-8
-/// in <display>: <reason>`). A leading byte-order mark is kept.
+/// JS, and hands each file here, so it refuses exactly what the native backend
+/// refuses, with the same error, in the same order:
+///
+/// 1. the bytes, as the native filesystem backend checks them
+///    ([`mds::check_module_bytes`], #414): more than 10 MiB is `mds::resource_limit`
+///    (`file too large (<n> bytes, max 10485760 bytes): <display>`), bytes that are
+///    not valid UTF-8 are `mds::io` (`invalid UTF-8 in <display>: <reason>`);
+/// 2. the file type, as the resolver checks it before it parses a module
+///    ([`mds::check_module_type`], #417): neither a `.mds` file nor a `.md` file whose
+///    frontmatter declares `type: mds` is `mds::not_mds` (`not an MDS file: <shown>`).
+///
+/// A leading byte-order mark is kept.
 ///
 /// ## Arguments
 ///
 /// - `bytes`: the file's content.
-/// - `display`: the file's name in an error message — the pre-scanner passes its
-///   path below the project root. It is escaped as it enters the message.
+/// - `display`: the file's path below the project root, in its on-disk spelling. It
+///    names the file in a bytes error, and its extension is the one judged.
+/// - `shown`: the path the caller typed to reach the file — the entry path as passed,
+///   or the import string as written — which a `not_mds` error names.
+///
+/// Both names are escaped as they enter a message.
 ///
 /// ## Returns
 ///
@@ -1011,15 +1022,19 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
 /// ## Example (JavaScript)
 ///
 /// ```js
-/// const text = preflightModule(new TextEncoder().encode('Hello!\n'), 'hello.mds');
+/// const bytes = new TextEncoder().encode('Hello!\n');
+/// const text = preflightModule(bytes, 'hello.mds', './hello.mds');
 /// console.log(text); // "Hello!\n"
 /// ```
 #[wasm_bindgen(js_name = "preflightModule")]
-pub fn preflight_module(bytes: Vec<u8>, display: &str) -> Result<String, JsValue> {
-    // Owned String required so the closure satisfies UnwindSafe.
+pub fn preflight_module(bytes: Vec<u8>, display: &str, shown: &str) -> Result<String, JsValue> {
+    // Owned Strings required so the closure satisfies UnwindSafe.
     let display = display.to_string();
+    let shown = shown.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
-        mds::check_module_bytes(bytes, &display).map_err(mds_error_to_js)
+        let source = mds::check_module_bytes(bytes, &display).map_err(mds_error_to_js)?;
+        mds::check_module_type(&display, &shown, &source).map_err(mds_error_to_js)?;
+        Ok(source)
     }))
 }

@@ -45,11 +45,12 @@ export interface WasmModule {
   }): unknown;
   scanImports(source: string): string[];
   /**
-   * A module file's text, checked as the native filesystem backend checks every file
-   * it reads (`mds::check_module_bytes`): throws `mds::resource_limit` over 10 MiB and
-   * `mds::io` for invalid UTF-8, naming the file by `display`.
+   * A module file's text, checked as the native backend checks every file it reads:
+   * throws `mds::resource_limit` over 10 MiB and `mds::io` for invalid UTF-8, naming
+   * the file by `display` (`mds::check_module_bytes`), then `mds::not_mds` for a file
+   * that is not an MDS file, naming it by `shown` (`mds::check_module_type`).
    */
-  preflightModule(bytes: Uint8Array, display: string): string;
+  preflightModule(bytes: Uint8Array, display: string, shown: string): string;
   default?: (input?: unknown) => Promise<void>;
 }
 

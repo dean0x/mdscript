@@ -457,11 +457,14 @@ export interface ScannerEngine {
   /** The import paths a module's source names, in the order the resolver resolves them. */
   scanImports(source: string): string[];
   /**
-   * A module file's text, checked as NativeFs checks every file it reads
-   * (`mds::check_module_bytes`: the per-file cap, then UTF-8), or a throw of the
-   * native error. `display` names the file: its path below the project root.
+   * A module file's text, checked as the native backend checks every file it reads,
+   * or a throw of the native error: its bytes as NativeFs checks them
+   * (`mds::check_module_bytes`: the per-file cap, then UTF-8), then its type as the
+   * resolver checks it before parsing (`mds::check_module_type`: `mds::not_mds`).
+   * `display` is the file's path below the project root, in its on-disk spelling;
+   * `shown` is the path the caller typed to reach it, which a `not_mds` error names.
    */
-  preflightModule(bytes: Uint8Array, display: string): string;
+  preflightModule(bytes: Uint8Array, display: string, shown: string): string;
 }
 
 export interface ModuleScannerOptions {
@@ -671,9 +674,12 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  * - a module that is not a regular file or cannot be read (`mds::io`, `cannot read
  *   <path as written>: <errno name>`);
  * - a file over the engine's 10 MiB per-file cap (`mds::resource_limit`) or whose
- *   bytes are not valid UTF-8 (`mds::io`) — refused by the engine's own
- *   `preflightModule`, the checks NativeFs makes on every file it reads, which also
- *   decodes the file (a leading byte-order mark kept).
+ *   bytes are not valid UTF-8 (`mds::io`), then a file that is neither a `.mds` file
+ *   nor a `.md` file declaring `type: mds` (`mds::not_mds`, `not an MDS file: <path as
+ *   typed>`, #417) — refused by the engine's own `preflightModule`, the checks the
+ *   native backend makes on every file it reads, which also decodes the file (a
+ *   leading byte-order mark kept). A file that is not an MDS file is refused before
+ *   any import-like line in it is followed.
  *
  * A project may be rooted at the filesystem root, as on native.
  *
@@ -887,9 +893,11 @@ export async function buildModulesMap(
       const bytes = await handle.readFile().catch((err: unknown) => {
         throw readError(shown, err);
       });
-      // The engine's own post-read checks — the per-file cap, then UTF-8 — decode it,
-      // so it refuses exactly the bytes NativeFs refuses (#414).
-      return { resolved, size: bytes.length, content: engine.preflightModule(bytes, display) };
+      // The engine's own checks, in the native order — the per-file cap and UTF-8
+      // (#414), then the file type (#417) — decode it: it refuses exactly the files the
+      // native backend refuses, and a file that is not an MDS file is refused before
+      // any import-like line in it is followed.
+      return { resolved, size: bytes.length, content: engine.preflightModule(bytes, display, shown) };
     } finally {
       await closeModule(handle, shown);
     }
@@ -965,9 +973,9 @@ export async function buildModulesMap(
       ? await readModule(located, shown)
       : unwrap(readAheadOutcome);
     // The WASM backend's own guard, checked in walk order once the module has passed
-    // every check native makes on it — the per-file cap and UTF-8 — so it never
-    // reports a module native refuses, whichever reads the read-ahead budget let run
-    // ahead of the walk (difference 2 above).
+    // every check native makes on it — the per-file cap, UTF-8 and the file type — so
+    // it never reports a module native refuses, whichever reads the read-ahead budget
+    // let run ahead of the walk (difference 2 above).
     aggregateSize += read.size;
     if (aggregateSize > maxAggregateSize) {
       throw resourceLimitError(`aggregate module size exceeds maximum of ${maxAggregateSize} bytes`);

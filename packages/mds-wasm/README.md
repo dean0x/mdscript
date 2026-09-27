@@ -20,9 +20,11 @@ Two builds, selected by package `exports` conditions:
 
 Each build exposes `compile(source, options)`, `check(source, options)`,
 `lint(source, options)`, `lintVirtual(modules, entry, options)`, `scanImports(source)`, and
-`preflightModule(bytes, display)` — a module file's text from its bytes (a `Uint8Array`), checked as
-the native filesystem backend checks every file it reads: over 10 MiB is `mds::resource_limit`,
-bytes that are not valid UTF-8 are `mds::io`, each naming the file by `display`.
+`preflightModule(bytes, display, shown)` — a module file's text from its bytes (a `Uint8Array`),
+checked as the native backend checks every file it reads: over 10 MiB is `mds::resource_limit` and
+bytes that are not valid UTF-8 are `mds::io`, naming the file by `display` (its path below the project
+root); then a file that is neither `.mds` nor a `.md` declaring `type: mds` is `mds::not_mds`, naming
+it by `shown` (the path as typed).
 
 ### Options
 
