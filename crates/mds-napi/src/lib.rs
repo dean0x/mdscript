@@ -817,13 +817,16 @@ fn extract_rules_direct(
                 ));
             };
             let mut rules = HashMap::new();
+            // The rule name and severity are the caller's text, WIRE-escaped as each
+            // message is built (#418); identifiers, not paths, so TAB stays raw.
             for (key, val) in rules_map {
                 let serde_json::Value::String(s) = &val else {
                     return Err(throw_options_error(
                         env,
                         &format!(
-                            "options.rules[\"{key}\"] must be a severity string, got {}",
-                            mds::json_type_name(&val)
+                            "options.rules[\"{name}\"] must be a severity string, got {}",
+                            mds::json_type_name(&val),
+                            name = mds::sanitize_control_chars_wire(&key),
                         ),
                     ));
                 };
@@ -832,8 +835,10 @@ fn extract_rules_direct(
                     throw_options_error(
                         env,
                         &format!(
-                            "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
-                             valid values are \"off\", \"info\", \"warn\", \"error\""
+                            "options.rules[\"{name}\"]: unknown severity \"{value}\"; \
+                             valid values are \"off\", \"info\", \"warn\", \"error\"",
+                            name = mds::sanitize_control_chars_wire(&key),
+                            value = mds::sanitize_control_chars_wire(s),
                         ),
                     )
                 })?;

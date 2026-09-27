@@ -95,6 +95,17 @@ fn options_error(message: &str) -> JsValue {
     js_error(message, "mds::invalid_options")
 }
 
+/// `invalid <field>: <error>` for a value `serde_wasm_bindgen` could not convert.
+///
+/// The error text names the caller's value — a Symbol's description, verbatim — so it
+/// is WIRE-escaped as it enters the message (#418).
+fn conversion_error(field: &str, e: &serde_wasm_bindgen::Error) -> JsValue {
+    options_error(&format!(
+        "invalid {field}: {}",
+        mds::sanitize_control_chars_wire(&e.to_string())
+    ))
+}
+
 // ── Error conversion helpers ──────────────────────────────────────────────────
 
 /// Convert an [`mds::MdsError`] into a JS `Error` with structured metadata.
@@ -275,8 +286,8 @@ fn extract_modules(obj: &js_sys::Object) -> Result<HashMap<String, String>, JsVa
         return Ok(HashMap::new());
     }
     // Deserialize only the modules sub-object.
-    let modules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
-        .map_err(|e| options_error(&format!("invalid options.modules: {e}")))?;
+    let modules_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.modules", &e))?;
     // Reuse the existing parse_modules logic on the deserialized sub-map.
     let serde_json::Value::Object(mods_map) = modules_json else {
         return Err(options_error(&format!(
@@ -361,8 +372,8 @@ fn extract_vars(obj: &js_sys::Object) -> Result<Option<HashMap<String, Value>>, 
         return Ok(None);
     }
     // Deserialize only the vars sub-value.
-    let vars_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
-        .map_err(|e| options_error(&format!("invalid options.vars: {e}")))?;
+    let vars_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.vars", &e))?;
     parse_json_vars(vars_json).map(Some).map_err(|e| match e {
         VarsError::InvalidType(msg) => options_error(&msg),
         VarsError::Conversion(mds_err) => mds_error_to_js(mds_err),
@@ -477,8 +488,8 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
         return Ok((mds::LintConfig::default(), None));
     }
     // Deserialize the rules sub-object via serde_wasm_bindgen.
-    let rules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
-        .map_err(|e| options_error(&format!("invalid options.rules: {e}")))?;
+    let rules_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.rules", &e))?;
     let serde_json::Value::Object(rules_map) = rules_json else {
         return Err(options_error(&format!(
             "options.rules must be a plain object, got {}",
@@ -487,18 +498,23 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
     };
 
     let mut rules = std::collections::HashMap::new();
+    // The rule name and severity are the caller's text, WIRE-escaped as each message
+    // is built (#418); identifiers, not paths, so TAB stays raw.
     for (key, val) in rules_map {
         let serde_json::Value::String(s) = &val else {
             return Err(options_error(&format!(
-                "options.rules[\"{key}\"] must be a severity string, got {}",
-                json_type_name(&val)
+                "options.rules[\"{name}\"] must be a severity string, got {}",
+                json_type_name(&val),
+                name = mds::sanitize_control_chars_wire(&key),
             )));
         };
         // mds-core's one severity parser: the four exact spellings only (#175).
         let severity: mds::Severity = s.parse().map_err(|_| {
             options_error(&format!(
-                "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
-                 valid values are \"off\", \"info\", \"warn\", \"error\""
+                "options.rules[\"{name}\"]: unknown severity \"{value}\"; \
+                 valid values are \"off\", \"info\", \"warn\", \"error\"",
+                name = mds::sanitize_control_chars_wire(&key),
+                value = mds::sanitize_control_chars_wire(s),
             ))
         })?;
         rules.insert(key, severity);
@@ -902,8 +918,8 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 #[wasm_bindgen(js_name = "lintVirtual")]
 pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<JsValue, JsValue> {
     // Deserialize the modules map.
-    let modules_json: serde_json::Value = serde_wasm_bindgen::from_value(modules)
-        .map_err(|e| options_error(&format!("invalid modules: {e}")))?;
+    let modules_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(modules).map_err(|e| conversion_error("modules", &e))?;
     let serde_json::Value::Object(mods_map) = modules_json else {
         return Err(options_error(&format!(
             "modules must be a plain object, got {}",

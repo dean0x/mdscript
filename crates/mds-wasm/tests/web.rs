@@ -1678,3 +1678,99 @@ fn wasm_lint_virtual_unknown_severity_value_throws_invalid_options() {
         "W-SEVER-2: lint_virtual unknown severity value must throw mds::invalid_options; got: {code}"
     );
 }
+
+/// `a`, ESC, `b`, LF, `c`, TAB, `d` — built with `char::from_u32` at runtime, never
+/// typed as live bytes (PF-018) — and how the WIRE escaper shows it: ESC and LF as
+/// the six-character escape text, TAB raw (#418).
+fn hostile_and_shown() -> (String, String) {
+    let ch = |cp: u32| char::from_u32(cp).expect("a valid scalar value");
+    let esc = |cp: u32| format!("\\u{cp:04X}");
+    let hostile: String = ['a', ch(0x1b), 'b', ch(0x0a), 'c', ch(0x09), 'd']
+        .iter()
+        .collect();
+    let shown = format!("a{}b{}c{}d", esc(0x1b), esc(0x0a), ch(0x09));
+    (hostile, shown)
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_rules_error_wire_escapes_rule_name_and_severity() {
+    // W-RULES-ESC (#418, TP-28): a rule name or severity the `rules` error names is
+    // WIRE-escaped; a clean name's message is unchanged (the control).
+    let (hostile, shown) = hostile_and_shown();
+    let valid = "valid values are \"off\", \"info\", \"warn\", \"error\"";
+    let cases = [
+        (
+            serde_json::json!({ hostile.clone(): 1 }),
+            format!("options.rules[\"{shown}\"] must be a severity string, got number"),
+        ),
+        (
+            serde_json::json!({ "unused-variable": hostile.clone() }),
+            format!("options.rules[\"unused-variable\"]: unknown severity \"{shown}\"; {valid}"),
+        ),
+        (
+            serde_json::json!({ "unused-variable": 1 }),
+            "options.rules[\"unused-variable\"] must be a severity string, got number".to_string(),
+        ),
+    ];
+    for (rules, expected) in cases {
+        let opts = to_js_object(&serde_json::json!({ "rules": rules }));
+        let err = mds_wasm::lint("Hello!\n", opts).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{expected}");
+        assert_eq!(get_str(&err, "message"), expected);
+    }
+}
+
+#[wasm_bindgen_test]
+fn wasm_options_conversion_error_text_is_wire_escaped() {
+    // W-SERDE-ESC (#418, TP-30): a value serde-wasm-bindgen cannot convert — a Symbol —
+    // is named in the conversion error it returns, description included, and each
+    // options field WASM converts that way wraps that text in its own message. The
+    // description must reach the message escaped: present in its shown form (the
+    // positive control, PF-013), and no raw ESC or LF anywhere in it.
+    let (hostile, shown) = hostile_and_shown();
+    let symbol = JsValue::symbol(Some(&hostile));
+    let object_with = |key: &str, value: &JsValue| {
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(&obj, &JsValue::from_str(key), value).expect("set a property");
+        JsValue::from(obj)
+    };
+    let cases = [
+        (
+            "invalid options.rules: ",
+            mds_wasm::lint("Hello!\n", object_with("rules", &object_with("a", &symbol))),
+        ),
+        (
+            "invalid options.vars: ",
+            mds_wasm::compile("Hello!\n", object_with("vars", &object_with("a", &symbol))),
+        ),
+        (
+            "invalid options.modules: ",
+            mds_wasm::compile(
+                "Hello!\n",
+                object_with("modules", &object_with("a.mds", &symbol)),
+            ),
+        ),
+        (
+            "invalid modules: ",
+            mds_wasm::lint_virtual(
+                object_with("main.mds", &symbol),
+                "main.mds",
+                JsValue::UNDEFINED,
+            ),
+        ),
+    ];
+    for (prefix, result) in cases {
+        let err = result.expect_err(prefix);
+        let message = get_str(&err, "message");
+        assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{message:?}");
+        assert!(message.starts_with(prefix), "{prefix}: {message:?}");
+        assert!(
+            message.contains(&shown),
+            "{prefix}: shown form missing: {message:?}"
+        );
+        assert!(
+            !message.chars().any(|c| c == '\u{1b}' || c == '\n'),
+            "{prefix}: raw ESC or LF in {message:?}"
+        );
+    }
+}

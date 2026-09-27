@@ -272,7 +272,7 @@ impl CompileResult {
     #[new]
     fn new(canonical: &Bound<'_, PyAny>) -> PyResult<Self> {
         let value: serde_json::Value = depythonize(canonical).map_err(|e| {
-            options_error(canonical.py(), &format!("invalid CompileResult state: {e}"))
+            options_error_caused_by(canonical.py(), "invalid CompileResult state", &e)
         })?;
         Ok(CompileResult { value })
     }
@@ -655,14 +655,11 @@ impl LintFileReport {
     fn new(py: Python<'_>, file: String, diagnostics: Bound<'_, PyAny>) -> PyResult<Self> {
         let diags: Vec<LintDiagnostic> = diagnostics
             .try_iter()
-            .map_err(|e| options_error(py, &format!("diagnostics must be iterable: {e}")))?
+            .map_err(|e| options_error_caused_by(py, "diagnostics must be iterable", &e))?
             .map(|item| {
                 let item = item?;
                 let d = item.cast::<LintDiagnostic>().map_err(|e| {
-                    options_error(
-                        py,
-                        &format!("diagnostics must be a list of LintDiagnostic: {e}"),
-                    )
+                    options_error_caused_by(py, "diagnostics must be a list of LintDiagnostic", &e)
                 })?;
                 Ok(d.get().clone())
             })
@@ -734,9 +731,8 @@ impl LintResult {
     /// `LintResult(canonical)` constructor (PF-004).
     #[new]
     fn new(canonical: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let mut value: serde_json::Value = depythonize(canonical).map_err(|e| {
-            options_error(canonical.py(), &format!("invalid LintResult state: {e}"))
-        })?;
+        let mut value: serde_json::Value = depythonize(canonical)
+            .map_err(|e| options_error_caused_by(canonical.py(), "invalid LintResult state", &e))?;
         sanitize_lint_value(&mut value);
         Ok(LintResult { value })
     }
@@ -1034,6 +1030,19 @@ fn options_error(py: Python<'_>, message: &str) -> PyErr {
     coded_error(py, "mds::invalid_options", message)
 }
 
+/// `mds::invalid_options` for `<context>: <cause>`, where `cause` is a conversion or
+/// type error that names the caller's own value — a class name, verbatim — so it is
+/// WIRE-escaped as it enters the message (#418).
+fn options_error_caused_by(py: Python<'_>, context: &str, cause: &dyn std::fmt::Display) -> PyErr {
+    options_error(
+        py,
+        &format!(
+            "{context}: {}",
+            mds::sanitize_control_chars_wire(&cause.to_string())
+        ),
+    )
+}
+
 /// `mds::resource_limit` — input exceeds an enforced size / count limit.
 fn resource_limit_error(py: Python<'_>, message: &str) -> PyErr {
     coded_error(py, "mds::resource_limit", message)
@@ -1200,7 +1209,7 @@ fn extract_vars(
         return Ok(None);
     }
     let json: serde_json::Value =
-        depythonize(obj).map_err(|e| options_error(py, &format!("invalid vars: {e}")))?;
+        depythonize(obj).map_err(|e| options_error_caused_by(py, "invalid vars", &e))?;
     parse_json_vars(json).map(Some).map_err(|e| match e {
         VarsError::InvalidType(msg) => options_error(py, &msg),
         VarsError::Conversion(mds_err) => mds_err_to_py(py, &mds_err),
@@ -1245,7 +1254,7 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
     }
 
     let json: serde_json::Value =
-        depythonize(modules).map_err(|e| options_error(py, &format!("invalid modules: {e}")))?;
+        depythonize(modules).map_err(|e| options_error_caused_by(py, "invalid modules", &e))?;
     let serde_json::Value::Object(map) = json else {
         return Err(options_error(
             py,
@@ -1317,7 +1326,7 @@ fn extract_rules(
         return Ok((mds::LintConfig::default(), None));
     }
     let json: serde_json::Value =
-        depythonize(obj).map_err(|e| options_error(py, &format!("invalid rules: {e}")))?;
+        depythonize(obj).map_err(|e| options_error_caused_by(py, "invalid rules", &e))?;
     let serde_json::Value::Object(map) = json else {
         return Err(options_error(
             py,
@@ -1328,13 +1337,16 @@ fn extract_rules(
         ));
     };
     let mut rules_map = HashMap::with_capacity(map.len());
+    // The rule name and severity are the caller's text, WIRE-escaped as each message is
+    // built in the `rules["<name>"]` form napi and WASM use (#418); TAB stays raw.
     for (key, val) in map {
         let serde_json::Value::String(s) = &val else {
             return Err(options_error(
                 py,
                 &format!(
-                    "rules[{key:?}] must be a string, got {}",
-                    json_type_name(&val)
+                    "rules[\"{name}\"] must be a string, got {}",
+                    json_type_name(&val),
+                    name = mds::sanitize_control_chars_wire(&key),
                 ),
             ));
         };
@@ -1343,8 +1355,10 @@ fn extract_rules(
             options_error(
                 py,
                 &format!(
-                    "rules[{key:?}]: unknown severity {s:?}; \
-                     expected \"off\", \"info\", \"warn\", or \"error\""
+                    "rules[\"{name}\"]: unknown severity \"{value}\"; \
+                     expected \"off\", \"info\", \"warn\", or \"error\"",
+                    name = mds::sanitize_control_chars_wire(&key),
+                    value = mds::sanitize_control_chars_wire(s),
                 ),
             )
         })?;

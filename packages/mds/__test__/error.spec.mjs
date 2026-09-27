@@ -717,9 +717,103 @@ describe('error shape', () => {
         py.rejected[i].message.startsWith(`rules["${rule}"]: unknown severity `),
         `${label}: Python message: ${py.rejected[i].message}`,
       );
+      // Python names the value as napi does, not as a Rust debug string (#418).
+      assert.equal(severitySegment(py.rejected[i].message), sev, `${label}: Python severity`);
+    }
+  });
+
+  test('U-E-RULES: napi, WASM and Python escape hostile rule names and severities identically', async (t) => {
+    // #418, a PF-007 differential: a `rules` key or severity a binding names in its
+    // options error is escaped with mds-core's WIRE escaper — ESC, LF, DEL, a C1
+    // control and a bidi override each become the six-character escape text, and TAB
+    // stays raw. Each binding keeps its own wording, so the surfaces are compared on
+    // the quoted rule-name and severity segments; a clean name's whole message is
+    // pinned as it was. Every surface is required in CI; locally a missing one skips.
+    const engines = await loadEngines();
+    const python = findPythonForMarkdownScript();
+    if (!requireEngines(t, { ...engines, python }, 'U-E-RULES')) return;
+    const TAB = 0x09;
+    const cps = [0x1b, 0x0a, 0x7f, 0x9b, 0x202e, TAB];
+    const hostile = 'r' + cps.map((cp) => String.fromCodePoint(cp) + 'x').join('');
+    const shown =
+      'r' + cps.map((cp) => (cp === TAB ? String.fromCodePoint(cp) : escapeText(cp)) + 'x').join('');
+    const rule = 'unused-variable';
+    const modules = { 'main.mds': 'Hello!\n' };
+    const valid = '"off", "info", "warn", "error"';
+    const cases = [
+      { name: 'hostile name, non-string value', rule: hostile, value: 1, ruleShown: shown },
+      { name: 'hostile name, unknown severity', rule: hostile, value: 'bogus', ruleShown: shown, sevShown: 'bogus' },
+      { name: 'hostile severity', rule, value: hostile, ruleShown: rule, sevShown: shown },
+      // Clean controls: the whole message, byte-identical to what each binding said before.
+      {
+        name: 'clean name, non-string value',
+        rule,
+        value: 1,
+        ruleShown: rule,
+        napi: `options.rules["${rule}"] must be a severity string, got number`,
+        python: `rules["${rule}"] must be a string, got number`,
+      },
+      {
+        name: 'clean name, unknown severity',
+        rule,
+        value: 'bogus',
+        ruleShown: rule,
+        sevShown: 'bogus',
+        napi: `options.rules["${rule}"]: unknown severity "bogus"; valid values are ${valid}`,
+        python: `rules["${rule}"]: unknown severity "bogus"; expected "off", "info", "warn", or "error"`,
+      },
+    ];
+    const py = pythonJson(
+      python,
+      [
+        'out["errors"] = []',
+        'for c in case["cases"]:',
+        '    try:',
+        '        m.lint_virtual(case["modules"], "main.mds", rules={c["rule"]: c["value"]})',
+        '        out["errors"].append(None)',
+        '    except m.MdsError as e:',
+        '        out["errors"].append({"code": e.code, "message": e.message})',
+      ],
+      { modules, cases: cases.map(({ rule: r, value }) => ({ rule: r, value })) },
+      'U-E-RULES',
+    );
+
+    for (const [i, c] of cases.entries()) {
+      const label = `U-E-RULES ${c.name}`;
+      const opts = { rules: { [c.rule]: c.value } };
+      const napi = errorShape(
+        thrownBy(() => engines.native.lintVirtual(modules, 'main.mds', opts), `${label} napi`),
+      );
+      const wasm = errorShape(
+        thrownBy(() => engines.wasm.lintVirtual(modules, 'main.mds', opts), `${label} wasm`),
+      );
+      assert.equal(napi.code, 'mds::invalid_options', `${label}: ${napi.message}`);
+      assert.deepEqual(wasm, napi, `${label}: WASM must match napi`);
+      assert.equal(py.errors[i]?.code, 'mds::invalid_options', `${label}: Python`);
+      // The shared value, anchored (PF-013): every surface names the rule and the
+      // severity exactly as the escaper shows them.
+      for (const [surface, message] of [['napi', napi.message], ['Python', py.errors[i].message]]) {
+        const at = `${label}: ${surface} ${JSON.stringify(message)}`;
+        assert.equal(ruleSegment(message), c.ruleShown, `${at} rule`);
+        assert.equal(severitySegment(message), c.sevShown, `${at} severity`);
+      }
+      if (c.napi !== undefined) {
+        assert.equal(napi.message, c.napi, `${label}: napi message`);
+        assert.equal(py.errors[i].message, c.python, `${label}: Python message`);
+      }
     }
   });
 });
+
+/** The rule name a binding's `rules` error quotes (`…rules["<name>"]…`), if any. */
+function ruleSegment(message) {
+  return /rules\["([\s\S]*?)"\]/.exec(message)?.[1];
+}
+
+/** The severity a binding's `rules` error quotes (`unknown severity "<value>";`), if any. */
+function severitySegment(message) {
+  return /unknown severity "([\s\S]*?)";/.exec(message)?.[1];
+}
 
 /**
  * Run a Python snippet against `markdown_script` (imported as `m`) with `input`

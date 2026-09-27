@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+from collections.abc import Callable
 
 import pytest
 
@@ -584,3 +585,46 @@ def test_d3_extends_type_mismatch_spans_its_own_file(
     assert err.code == "mds::type_mismatch", f"expected type_mismatch, got: {err.code}"
     assert err.span is not None, "an inherited type_mismatch must carry a span"
     assert (err.span.offset, err.span.length, err.span.line, err.span.column) == expected
+
+
+# ── #418: conversion error text in an mds::invalid_options message ──────────────
+
+_UNCONVERTIBLE_NAME = "a" + chr(0x1B) + "b" + chr(0x0A) + "c" + chr(0x09) + "d"
+
+
+def _unconvertible() -> object:
+    """An instance of a class whose name carries ESC, LF and TAB (built with ``chr()``,
+    PF-018): no conversion accepts it, and each conversion error names its class."""
+    return type(_UNCONVERTIBLE_NAME, (), {})()
+
+
+@pytest.mark.parametrize(
+    "call,prefix",
+    [
+        (lambda v: m.compile("Hi\n", vars={"a": v}), "invalid vars: "),
+        (lambda v: m.compile_virtual({"main.mds": v}, "main.mds"), "invalid modules: "),
+        (lambda v: m.CompileResult(v), "invalid CompileResult state: "),
+        (lambda v: m.LintResult(v), "invalid LintResult state: "),
+        (lambda v: m.LintFileReport("main.mds", v), "diagnostics must be iterable: "),
+        (
+            lambda v: m.LintFileReport("main.mds", [v]),
+            "diagnostics must be a list of LintDiagnostic: ",
+        ),
+    ],
+    ids=["vars", "modules", "CompileResult", "LintResult", "iterable", "LintDiagnostic"],
+)
+def test_e14_conversion_error_text_is_wire_escaped(
+    call: Callable[[object], object], prefix: str
+) -> None:
+    """#418: every mds::invalid_options message that wraps a conversion error names the
+    unconvertible value's class escaped — ESC and LF as the six-character escape text,
+    TAB raw — as the ``rules`` wrapper does (test_lint.py). The shown form must be
+    present (the positive control, PF-013) and no raw ESC or LF may remain."""
+    shown = "a" + "\\u" + format(0x1B, "04X") + "b" + "\\u" + format(0x0A, "04X") + "c\td"
+    with pytest.raises(m.MdsError) as ei:
+        call(_unconvertible())
+    message = ei.value.message
+    assert ei.value.code == "mds::invalid_options", message
+    assert message.startswith(prefix), message
+    assert shown in message, f"shown form missing: {message!r}"
+    assert chr(0x1B) not in message and chr(0x0A) not in message, repr(message)
