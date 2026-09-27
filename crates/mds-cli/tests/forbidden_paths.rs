@@ -869,15 +869,25 @@ mod config_errors {
     /// `./mds.json`, `sub/../mds.json` — escaped, never by the canonical absolute path
     /// the upward walk uses. That path is what a hostile-named directory above the
     /// project would put a raw TAB into, before the input itself is validated.
+    ///
+    /// `mds watch` names it the same way in file and directory mode (#413). Its rows
+    /// run in a clean working directory: in the hostile one `watch` refuses its input
+    /// before it loads the config. There the absence of the temp directory's name is
+    /// what proves no absolute path is shown, and `-q` keeps `watch`'s `Watching …`
+    /// status line — which names the canonical path, as status lines may — out of it.
     #[test]
     fn config_load_errors_name_the_file_as_reached_from_the_input() {
         let tmp = tempfile::tempdir().unwrap();
         let tmp_name = tmp.path().file_name().unwrap().to_str().unwrap().to_owned();
         let cwd = tmp.path().join("d\te");
-        std::fs::create_dir_all(cwd.join("sub")).unwrap();
-        std::fs::write(cwd.join("in.mds"), "Hi\n").unwrap();
-        std::fs::write(cwd.join("sub").join("in.mds"), "Hi\n").unwrap();
+        let clean = tmp.path().join("clean");
+        for project in [&cwd, &clean] {
+            std::fs::create_dir_all(project.join("sub")).unwrap();
+            std::fs::write(project.join("in.mds"), "Hi\n").unwrap();
+            std::fs::write(project.join("sub").join("in.mds"), "Hi\n").unwrap();
+        }
         let config = cwd.join("mds.json");
+        let clean_config = clean.join("mds.json");
 
         // (content, mode, expected message around the shown path)
         let mut cases: Vec<(Vec<u8>, u32, &str, &str)> = vec![
@@ -891,6 +901,7 @@ mod config_errors {
             (vec![0xFF, 0xFE], 0o644, "invalid UTF-8 in ", ":"),
         ];
         // An unreadable mds.json — unless this process can read it anyway (root).
+        std::fs::write(&clean_config, "{}").unwrap();
         std::fs::write(&config, "{}").unwrap();
         set_mode(&config, 0o000);
         if std::fs::read(&config).is_err() {
@@ -898,16 +909,23 @@ mod config_errors {
         }
 
         for (content, mode, before, after) in &cases {
-            set_mode(&config, 0o644);
-            std::fs::write(&config, content).unwrap();
-            set_mode(&config, *mode);
-            for (args, shown, exit) in [
-                (&["build", "in.mds"][..], "./mds.json", 1),
-                (&["build", "sub/in.mds"], "sub/../mds.json", 1),
-                (&["lint", "in.mds"], "./mds.json", 2),
+            for path in [&config, &clean_config] {
+                set_mode(path, 0o644);
+                std::fs::write(path, content).unwrap();
+                set_mode(path, *mode);
+            }
+            for (dir, args, shown, exit) in [
+                (&cwd, &["build", "in.mds"][..], "./mds.json", 1),
+                (&cwd, &["build", "sub/in.mds"], "sub/../mds.json", 1),
+                (&cwd, &["lint", "in.mds"], "./mds.json", 2),
+                (&clean, &["fmt", "."], "./mds.json", 1),
+                (&clean, &["watch", "-q", "in.mds"], "./mds.json", 1),
+                (&clean, &["watch", "-q", "sub/in.mds"], "sub/../mds.json", 1),
+                (&clean, &["watch", "-q", "."], "./mds.json", 1),
+                (&clean, &["watch", "-q", "sub"], "sub/../mds.json", 1),
             ] {
                 let label = format!("{} [{before}]", args.join(" "));
-                let (code, text) = run(&cwd, args);
+                let (code, text) = run(dir, args);
                 assert_eq!(code, Some(exit), "{label}: got: {text:?}");
                 let expected = format!("{before}{shown}{after}");
                 assert!(
@@ -923,6 +941,7 @@ mod config_errors {
             }
         }
         set_mode(&config, 0o644);
+        set_mode(&clean_config, 0o644);
 
         // `fmt .` never reaches the config: the directory argument `.` resolves into
         // the hostile-named working directory and is refused up front (#413), naming

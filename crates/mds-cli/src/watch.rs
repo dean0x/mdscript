@@ -1190,6 +1190,9 @@ fn rebuild_file(
             } else {
                 // output_path is None: this means either stdout or startup failed.
                 // Re-derive using kind. If -o - or stdin fallback, this returns None (stdout).
+                // By the canonical entry, the file being watched: an error here is
+                // swallowed, so no message ever names the path, and the canonical path
+                // holds no symlink a retarget could move elsewhere (#417).
                 let config = load_config(&ctx.entry).unwrap_or(None);
                 resolve_output_path_for_kind(
                     &Some(ctx.entry.clone()),
@@ -1269,8 +1272,10 @@ fn rebuild_file(
     }
 }
 
-/// Single-file watch: `entry_typed` is the path as typed (the entry is compiled by it,
-/// #417); `entry` is its canonical form, which everything else uses.
+/// Single-file watch: `entry_typed` is the path as typed — the entry is compiled by it
+/// (#417) and `mds.json` is looked up from it at startup (#413), so their errors name
+/// the files as the user reaches them; `entry` is its canonical form, which everything
+/// else uses.
 #[allow(clippy::too_many_arguments)]
 fn run_watch_file(
     entry_typed: PathBuf,
@@ -1395,8 +1400,11 @@ fn run_watch_file(
     emit_duplicate_var_warnings(&resolved, quiet);
     let runtime_vars = resolved.vars;
 
-    // Load project config (for output_dir) — used if no explicit -o / --out-dir.
-    let config = load_config(&entry)?;
+    // Load project config (for output_dir) — used if no explicit -o / --out-dir. By the
+    // typed path, so a config error names `mds.json` as the input reaches it
+    // (`./mds.json`), never by its canonical absolute path (#413); the config
+    // directory it returns is canonical either way.
+    let config = load_config(&entry_typed)?;
 
     // Initial compile: returns (output_path, deps, content).
     // content is captured here so the baseline block below can reuse it without
@@ -2345,8 +2353,10 @@ fn dir_watch_startup(
     quiet: bool,
 ) -> Result<DirStartup> {
     let root = watch_root.canonical.as_path();
-    // Load config once from the root directory.
-    let config = load_config(root)?;
+    // Load config once from the root directory, as typed, so a config error names
+    // `mds.json` as the input reaches it (`./mds.json`, `src/../mds.json`), never by its
+    // canonical absolute path (#413); the config directory it returns is canonical.
+    let config = load_config(&watch_root.typed)?;
     // #326: keep the --vars argument as the user typed it (see FileCompileCtx's
     // vars_path_raw doc for why) — `vars_path` below stays canonical for matching.
     let vars_path_raw = vars.clone();
