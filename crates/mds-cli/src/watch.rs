@@ -4690,7 +4690,7 @@ mod tests {
     /// #417: the watched entry is compiled by the typed path while that path leads to the
     /// canonical entry's directory, and refused — naming the path as typed, never the
     /// canonical one — once it leads into another directory. A typed path that no longer
-    /// resolves is left to the compile's own error.
+    /// resolves is left to the compile's own error, `file not found`, naming it as typed.
     #[test]
     fn watched_entry_refuses_a_typed_path_that_leads_elsewhere() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4735,9 +4735,10 @@ mod tests {
 
         std::fs::remove_file(&typed).unwrap();
         let missing = compile(&here).unwrap_err();
-        assert!(
-            !missing.contains("different file"),
-            "a missing entry is the compile's error: {missing}"
+        assert_eq!(
+            missing,
+            format!("file not found: {}", typed.display()),
+            "a missing entry is the compile's own error, naming the path as typed"
         );
     }
 
