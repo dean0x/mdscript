@@ -236,17 +236,45 @@ fn builtin_replace(args: &[Value]) -> Result<Value, MdsError> {
             "replace() search string must not be empty",
         ));
     }
-    let result = s.replace(from, to);
-    // Guard against amplification: a single-char search replaced by a long
-    // string on large input can produce a result far exceeding MAX_OUTPUT_SIZE
-    // before the evaluator's capped append ever sees it.
-    if result.len() > MAX_OUTPUT_SIZE {
-        return Err(MdsError::builtin_error(format!(
+    // Guard against amplification before allocating (#415): a single-char search
+    // replaced by a long string on large input asks for a result far exceeding
+    // MAX_OUTPUT_SIZE, so the result's length is computed first and an over-cap result
+    // is never built. A fitting result is built at exactly that length.
+    match replace_result_len(s, from, to).filter(|&len| len <= MAX_OUTPUT_SIZE) {
+        Some(len) => {
+            let mut result = String::with_capacity(len);
+            replace_pieces(s, from, to, &mut |piece| result.push_str(piece));
+            Ok(Value::String(result))
+        }
+        None => Err(MdsError::builtin_error(format!(
             "replace() output exceeds maximum size of {} bytes",
             MAX_OUTPUT_SIZE
-        )));
+        ))),
     }
-    Ok(Value::String(result))
+}
+
+/// Length in bytes of `s.replace(from, to)` for a non-empty `from`, without building
+/// it, or `None` when that length does not fit in `usize` — over any cap (`usize` is
+/// 32-bit on wasm32). It walks the same pieces the build appends, so the two agree.
+fn replace_result_len(s: &str, from: &str, to: &str) -> Option<usize> {
+    let mut len = Some(0usize);
+    replace_pieces(s, from, to, &mut |piece| {
+        len = len.and_then(|n| n.checked_add(piece.len()));
+    });
+    len
+}
+
+/// Visit, in order, the pieces of `s.replace(from, to)`: the text between matches and
+/// `to` for each match, matched as `str::replace` matches (non-overlapping, left to
+/// right). One walk — through `dyn` — serves both the length count and the build.
+fn replace_pieces(s: &str, from: &str, to: &str, visit: &mut dyn FnMut(&str)) {
+    let mut last = 0;
+    for (start, matched) in s.match_indices(from) {
+        visit(&s[last..start]);
+        visit(to);
+        last = start + matched.len();
+    }
+    visit(&s[last..]);
 }
 
 fn builtin_split(args: &[Value]) -> Result<Value, MdsError> {
@@ -697,6 +725,110 @@ mod tests {
         assert!(
             err.to_string().contains("maximum size"),
             "expected output size guard, got: {err}"
+        );
+    }
+
+    /// #415: the length counted before allocating, and the string then built, are
+    /// exactly what `str::replace` produces — non-overlapping matches, multibyte text,
+    /// no match, shrinking, equal and growing replacements.
+    #[test]
+    fn replace_counts_and_builds_what_str_replace_produces() {
+        let cases = [
+            ("aaaa", "aa", "b"),
+            ("aaa", "aa", "xyz"),
+            ("héllo wörld", "ö", "oe"),
+            ("hello", "xyz", "abc"),
+            ("a-b-c", "-", ""),
+            ("a-b-c", "-", "+"),
+            ("x x x", "x", "yyyy"),
+            ("xx", "xx", ""),
+            ("", "x", "yz"),
+        ];
+        for (input, from, to) in cases {
+            let expected = input.replace(from, to);
+            assert_eq!(
+                replace_result_len(input, from, to),
+                Some(expected.len()),
+                "{input:?}.replace({from:?}, {to:?}): counted length"
+            );
+            assert_eq!(
+                call_builtin("replace", &[s(input), s(from), s(to)]).unwrap(),
+                s(&expected),
+                "{input:?}.replace({from:?}, {to:?}): built string"
+            );
+        }
+    }
+
+    /// #415 (AC-15): a result of exactly the cap is built; one byte more is refused
+    /// with the built-in's own `mds::builtin` error.
+    #[test]
+    fn replace_output_of_exactly_the_cap_succeeds_one_byte_more_fails() {
+        let to = "a".repeat(1024 * 1024);
+        let matches = MAX_OUTPUT_SIZE / to.len();
+        match call_builtin("replace", &[s(&"x".repeat(matches)), s("x"), s(&to)]) {
+            // Built at exactly the counted length: no doubling past the cap.
+            Ok(Value::String(result)) => assert!(
+                result.len() == MAX_OUTPUT_SIZE && result.capacity() == MAX_OUTPUT_SIZE,
+                "expected exactly the cap, got length {} and capacity {}",
+                result.len(),
+                result.capacity()
+            ),
+            other => panic!(
+                "expected a string of exactly the cap, got {:?}",
+                other.err()
+            ),
+        }
+
+        let one_over = format!("{}y", "x".repeat(matches));
+        let err = call_builtin("replace", &[s(&one_over), s("x"), s(&to)]).unwrap_err();
+        assert!(
+            matches!(err, MdsError::BuiltinError { .. }),
+            "expected mds::builtin, got: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("replace() output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes")
+        );
+    }
+
+    /// #415: an empty search is refused before the result is sized. An empty pattern
+    /// matches at every character boundary, so sizing it first would report the
+    /// output cap for this fixture instead of the empty-search error.
+    #[test]
+    fn replace_empty_search_is_refused_before_the_result_is_sized() {
+        let input = "x".repeat(60);
+        let to = "a".repeat(1024 * 1024);
+        let err = call_builtin("replace", &[s(&input), s(""), s(&to)]).unwrap_err();
+        assert_eq!(err.to_string(), "replace() search string must not be empty");
+
+        // Positive control: the same input and replacement searched by `x` (60 matches,
+        // a 60 MiB result) do ask for a result past the cap.
+        let err = call_builtin("replace", &[s(&input), s("x"), s(&to)]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("replace() output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes")
+        );
+    }
+
+    /// #415: on an input already past the cap, a shrinking or same-length replacement
+    /// is judged by its result, as a growing one is: it is built when the result fits
+    /// and refused when it does not.
+    #[test]
+    fn replace_on_an_input_past_the_cap_is_sized_by_counting() {
+        // Two bytes past the cap, two matches.
+        let input = format!("{}bb", "a".repeat(MAX_OUTPUT_SIZE));
+        match call_builtin("replace", &[s(&input), s("b"), s("")]) {
+            Ok(Value::String(result)) => assert!(
+                result.len() == MAX_OUTPUT_SIZE && !result.contains('b'),
+                "a shrinking replacement whose result fits must be built"
+            ),
+            other => panic!("expected the shrunk string, got {:?}", other.err()),
+        }
+
+        let err = call_builtin("replace", &[s(&input), s("b"), s("c")]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("replace() output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes")
         );
     }
 

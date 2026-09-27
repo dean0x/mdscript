@@ -288,6 +288,25 @@ fn for_loop_output_cap_is_resource_limit() {
     );
 }
 
+/// #415: `replace()` sizes its result in checked arithmetic before allocating it. On
+/// wasm32 `usize` is 32 bits, and 4096 matches of a 1 MiB replacement ask for exactly
+/// 2^32 bytes, which wraps to 0: an unchecked count would admit the call and then try
+/// to build 4 GiB. It must be refused like any other over-cap result.
+#[wasm_bindgen_test]
+fn replace_whose_length_wraps_usize_is_refused() {
+    assert_eq!(usize::BITS, 32, "the wrap needs wasm32's 32-bit usize");
+    let opts = vars_opts(&serde_json::json!({
+        "s": "x".repeat(4096),
+        "to": "a".repeat(1024 * 1024),
+    }));
+    let err = mds_wasm::compile("{{replace(s, \"x\", to)}}\n", opts).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::builtin");
+    assert_eq!(
+        get_str(&err, "message"),
+        "replace() output exceeds maximum size of 52428800 bytes"
+    );
+}
+
 // ── check tests ───────────────────────────────────────────────────────────────
 
 #[wasm_bindgen_test]

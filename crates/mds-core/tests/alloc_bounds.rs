@@ -6,6 +6,8 @@
 //! the cap was checked only after a node had finished, a loop spent all of its memory
 //! first — the error text is identical either way, so this measures the resource the
 //! fix moves (applies PF-013): peak heap growth, under a counting global allocator.
+//! `replace()` likewise computes its result's length before allocating it, so an
+//! over-cap result is refused without being built.
 //!
 //! This binary holds exactly ONE `#[test]`: the allocator is process-wide, and a second
 //! test running on another thread would add its allocations to the measurement.
@@ -171,4 +173,51 @@ fn peak_heap_growth_stays_within_the_output_cap() {
             MAX_OUTPUT_SIZE + SLACK
         );
     }
+
+    // ── replace() (TP-18): an over-cap result is refused before it is allocated ───
+    //
+    // `s` holds one single-byte match per MiB of result and `to` is 1 MiB, so 300
+    // matches ask for a ~300 MiB result. The control's 40 matches give a 40 MiB result
+    // that fits, so the allocator must see `replace()` build it.
+    let to = "a".repeat(1024 * 1024);
+    let replace_measured: Vec<(&str, Result<usize, String>, usize)> =
+        [("over the cap", 300), ("control: under the cap", 40)]
+            .iter()
+            .map(|&(case, matches)| {
+                let vars = HashMap::from([
+                    ("s".to_string(), Value::String("x".repeat(matches))),
+                    ("to".to_string(), Value::String(to.clone())),
+                ]);
+                let (result, peak) = compile_measured("{{replace(s, \"x\", to)}}\n", vars);
+                let outcome = result
+                    .and_then(mds::CompileResult::into_markdown)
+                    .map(|text| text.len())
+                    .map_err(|err| err.to_string());
+                (case, outcome, peak)
+            })
+            .collect();
+    let report =
+        format!("(case, output length or error, peak heap growth in bytes): {replace_measured:#?}");
+    eprintln!("{report}");
+    let [(_, over, over_peak), (_, control, control_peak)] = &replace_measured[..] else {
+        unreachable!("two replace() cases");
+    };
+    assert_eq!(
+        *over,
+        Err(format!(
+            "replace() output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"
+        )),
+        "an over-cap replace() must fail with the built-in's own error; {report}"
+    );
+    assert!(
+        *over_peak < SLACK,
+        "an over-cap replace() must be refused before its result is allocated; {report}"
+    );
+    // Positive control: a result that fits is built (the output is the result and the
+    // template's newline), and the allocator sees it.
+    assert_eq!(*control, Ok(40 * 1024 * 1024 + 1), "{report}");
+    assert!(
+        *control_peak >= 40 * 1024 * 1024,
+        "the allocator must see the control's 40 MiB result; {report}"
+    );
 }
