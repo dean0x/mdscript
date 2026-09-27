@@ -121,6 +121,24 @@ async function withCwd(dir, fn) {
   }
 }
 
+/**
+ * A project directory `proj` (marked by `.mdsroot`) inside a scratch parent, passed
+ * to `fn` as `(proj, parent)`. Shared by the describe blocks below that need a
+ * project nested one level down, so an import can escape it without leaving the
+ * scratch temp directory itself.
+ */
+async function withNestedProject(fn) {
+  const parent = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-native-'));
+  try {
+    const proj = path.join(parent, 'proj');
+    await mkdir(proj);
+    await writeFile(path.join(proj, '.mdsroot'), '');
+    return await fn(proj, parent);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+}
+
 describe('normalizeVirtualKey', () => {
   test('U-S1: root entry (empty base) uses key as-is', () => {
     assert.equal(normalizeVirtualKey('', 'main.mds'), 'main.mds');
@@ -174,6 +192,55 @@ describe('normalizeVirtualKey', () => {
   test('U-S10: no trailing slash in result', () => {
     const key = normalizeVirtualKey('dir/main.mds', './sub/lib.mds');
     assert.ok(!key.endsWith('/'), `key should not end with slash: ${key}`);
+  });
+
+  test("U-S16: every refusal carries the virtual filesystem's code and message (#414)", async (t) => {
+    const { wasm } = await loadEngines();
+    if (!requireEngines(t, { wasm }, 'U-S16')) return;
+    /** The WASM engine's own VirtualFs refusal for the same key or import. */
+    const engineError = (base, relative) => {
+      const [source, options] = base === ''
+        ? ['hi\n', { filename: relative }]
+        : [`@import "${relative}" as m\nhi\n`, { filename: base }];
+      const err = thrownBy(() => wasm.compile(source, options), `engine ${relative}`);
+      return { code: err.code, message: err.message };
+    };
+    const segments = (n) => Array.from({ length: n }, (_, i) => `d${i}`).join('/');
+    const cases = [
+      // `..` past the root of the key space. This is also what a project rooted at the
+      // filesystem root gets for a `../` import, which the native backend resolves to
+      // the root itself (#424).
+      ['x.mds', '../y.mds', 'mds::import', 'import error: import path escapes project directory: "../y.mds"'],
+      ['a/x.mds', './../../y.mds', 'mds::import', 'import error: import path escapes project directory: "./../../y.mds"'],
+      // A key of more than 256 segments, reached by an import or named as the entry.
+      // The import itself has 61 segments: only the key it leads to is over the cap.
+      [
+        `${segments(199)}/x.mds`,
+        `./${segments(60)}/y.mds`,
+        'mds::resource_limit',
+        `resource limit exceeded: import path exceeds maximum segment count (256): "./${segments(60)}/y.mds"`,
+      ],
+      [
+        '',
+        `${segments(256)}/e.mds`,
+        'mds::resource_limit',
+        `resource limit exceeded: import path exceeds maximum segment count (256): "${segments(256)}/e.mds"`,
+      ],
+      ['x.mds', './', 'mds::import', 'import error: import path resolves to empty key: "./"'],
+    ];
+    for (const [base, relative, code, message] of cases) {
+      const label = `U-S16 ${JSON.stringify([base.slice(0, 20), relative.slice(0, 20)])}`;
+      const err = thrownBy(() => normalizeVirtualKey(base, relative), label);
+      assert.equal(err.code, code, `${label}: ${err.message}`);
+      assert.equal(err.message, message, label);
+      assertNoHelp(err, label);
+      // The engine the WASM backend hands the key to refuses it identically.
+      assert.deepEqual(engineError(base, relative), { code, message }, label);
+    }
+    // Controls: at the cap, and `..` back down to the root, are keys.
+    assert.equal(normalizeVirtualKey(`${segments(255)}/x.mds`, './y.mds'), `${segments(255)}/y.mds`);
+    assert.equal(normalizeVirtualKey('', `${segments(255)}/e.mds`), `${segments(255)}/e.mds`);
+    assert.equal(normalizeVirtualKey('a/x.mds', '../y.mds'), 'y.mds');
   });
 });
 
@@ -768,14 +835,21 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       // `..` out of the link: NativeFs reads deep/z.mds; the WASM backend refuses
       // rather than compile the root z.mds its engine would look up by name.
       const dotDot = await dotDotOutOfLink(dir, true);
+      // An ENTRY typed through the link and back out with `..`: the OS applies the
+      // `..` after the link, so both backends compile deep/z.mds — the scanner
+      // resolves the entry's directory as NativeFs does, never lexically (#414).
+      // Joined by hand: path.join would drop the `..` before the OS saw it.
+      const entryOutOfLink = [dir, 'sub', '..', 'z.mds'].join(path.sep);
 
-      const [nativeAlias, nativeDotDot] = await compileFileOutcomes('native', [alias, dotDot]);
-      const [wasmAlias, wasmDotDot] = await compileFileOutcomes('wasm', [alias, dotDot]);
+      const [nativeAlias, nativeDotDot, nativeEntry] = await compileFileOutcomes('native', [alias, dotDot, entryOutOfLink]);
+      const [wasmAlias, wasmDotDot, wasmEntry] = await compileFileOutcomes('wasm', [alias, dotDot, entryOutOfLink]);
       assert.equal(nativeAlias.output, 'X\nY\nX\n', JSON.stringify(nativeAlias));
       assert.deepEqual(wasmAlias, nativeAlias);
       assert.equal(nativeDotDot.output, 'ROOT-Z\nY=\nDEEP-Z\n', JSON.stringify(nativeDotDot));
       assert.equal(wasmDotDot.code, 'mds::import', JSON.stringify(wasmDotDot));
       assert.equal(wasmDotDot.output, undefined, JSON.stringify(wasmDotDot));
+      assert.deepEqual(nativeEntry, { output: 'DEEP-Z\n' });
+      assert.deepEqual(wasmEntry, nativeEntry);
     });
   });
 });
@@ -944,19 +1018,6 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
 // outside the project root, a module that is not a regular file — carry its code
 // and name the path as written, never the resolved one (#408).
 describe('buildModulesMap — symlink, root-escape and non-file refusals match native (#408)', () => {
-  /** A project directory `proj` (marked by `.mdsroot`) inside a scratch parent. */
-  async function withNestedProject(fn) {
-    const parent = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-native-'));
-    try {
-      const proj = path.join(parent, 'proj');
-      await mkdir(proj);
-      await writeFile(path.join(proj, '.mdsroot'), '');
-      return await fn(proj, parent);
-    } finally {
-      await rm(parent, { recursive: true, force: true });
-    }
-  }
-
   const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
 
   test('U-SM30: an import leaving the project root is refused as mds::import before it is opened', async () => {
@@ -967,6 +1028,25 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
       const err = await rejectionOf(buildModulesMap(path.join(proj, 'main.mds'), scanImports), 'U-SM30');
       assertEscapeRefusal(err, '../outside.mds', 'U-SM30');
       assert.ok(!err.message.includes(await realpath(parent)), `U-SM30: no absolute path; got: ${err.message}`);
+
+      // The one deliberate difference from the native backend (#414): containment is
+      // decided before the file is looked at, so a MISSING file outside the root is
+      // refused as escaping it — lexically, or through a symlinked directory — where
+      // native reports it not found. U-SM32 pins native's side.
+      await writeFile(path.join(proj, 'main.mds'), '@import "../missing.mds" as m\n');
+      assertEscapeRefusal(
+        await rejectionOf(buildModulesMap(path.join(proj, 'main.mds'), scanImports), 'U-SM30 missing'),
+        '../missing.mds',
+        'U-SM30 missing',
+      );
+      await mkdir(path.join(parent, 'outside-dir'));
+      await symlink(path.join(parent, 'outside-dir'), path.join(proj, 'escape'), dirLinkType);
+      await writeFile(path.join(proj, 'main.mds'), '@import "./escape/missing.mds" as m\n');
+      assertEscapeRefusal(
+        await rejectionOf(buildModulesMap(path.join(proj, 'main.mds'), scanImports), 'U-SM30 missing via link'),
+        './escape/missing.mds',
+        'U-SM30 missing via link',
+      );
 
       // Control: the same import one level down stays inside the root and builds.
       await mkdir(path.join(proj, 'sub'));
@@ -1029,7 +1109,18 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
           'import error: import path escapes project directory: "./escape/secret.mds"',
         ],
       ];
-      const files = [...cases.map(([file]) => file), path.join(proj, 'control.mds')];
+      // The one deliberate difference (#414): a MISSING file outside the root, named
+      // lexically or through the symlinked directory. Native resolves the file first
+      // and reports it not found; the pre-scanner decides containment first and
+      // refuses it as escaping the project — an existence oracle it does not replicate.
+      await writeFile(path.join(proj, 'imp-missing-outside.mds'), '@import "../missing.mds" as m\n');
+      await writeFile(path.join(proj, 'imp-missing-escape-link.mds'), '@import "./escape/missing.mds" as m\n');
+      const deliberate = [
+        [path.join(proj, 'imp-missing-outside.mds'), '../missing.mds'],
+        [path.join(proj, 'imp-missing-escape-link.mds'), './escape/missing.mds'],
+      ];
+
+      const files = [...cases.map(([file]) => file), path.join(proj, 'control.mds'), ...deliberate.map(([file]) => file)];
       const nativeOutcomes = await compileFileOutcomes('native', files);
       const wasmOutcomes = await compileFileOutcomes('wasm', files);
       for (const [i, [file, code, message]] of cases.entries()) {
@@ -1037,12 +1128,253 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
         const label = `U-SM32 ${file}`;
         assert.equal(native.code, code, `${label}: ${JSON.stringify(native)}`);
         assert.equal(native.message, message, `${label}: ${JSON.stringify(native)}`);
-        assert.equal(wasm.code, native.code, `${label}: ${JSON.stringify({ wasm, native })}`);
-        assert.equal(wasm.message, native.message, `${label}: ${JSON.stringify({ wasm, native })}`);
+        // The whole shape: none of these carries help, and each names an entry or
+        // an import native gives no span for a refusal of (#414).
+        assert.deepEqual(wasm, native, label);
       }
       // Control: the same project compiles through the real file on both backends.
       assert.deepEqual(nativeOutcomes[cases.length], { output: 'REAL\n' });
       assert.deepEqual(wasmOutcomes[cases.length], nativeOutcomes[cases.length]);
+      for (const [j, [file, shown]] of deliberate.entries()) {
+        const i = cases.length + 1 + j;
+        const label = `U-SM32 deliberate ${file}`;
+        assert.deepEqual(withoutSpan(nativeOutcomes[i]), {
+          code: 'mds::file_not_found',
+          message: `file not found: ${shown}`,
+          help: FILE_NOT_FOUND_HELP,
+        }, label);
+        assert.deepEqual(wasmOutcomes[i], {
+          code: 'mds::import',
+          message: `import error: import path escapes project directory: "${shown}"`,
+          help: null,
+          span: null,
+        }, label);
+      }
+    });
+  });
+});
+
+// Every refusal the pre-scanner makes carries the code and message the native backend
+// reports for the same input, and of several faults it reports the one native meets
+// first (#414). One fault per fixture, compared through both backends' compileFile.
+describe('buildModulesMap — each refusal and its order match native (#414)', () => {
+  /** `n` path segments of `name`, joined by `/`. */
+  const segments = (n, name) => Array.from({ length: n }, () => name).join('/');
+
+  /** The engine's per-file cap (`mds::MAX_FILE_SIZE`). */
+  const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+  test("U-SM33: every scanner refusal carries native's code, message and help", async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM33')) return;
+    await withNestedProject(async (proj) => {
+      const write = async (rel, content) => {
+        await mkdir(path.dirname(path.join(proj, rel)), { recursive: true });
+        await writeFile(path.join(proj, rel), content);
+        return path.join(proj, rel);
+      };
+      const tooLong = `./${segments(257, 'a')}.mds`;
+      const tooManyUp = `${segments(257, '..')}/y.mds`;
+      // entry + 64 imports in a chain: the 64th import is one too deep.
+      for (let i = 0; i < 64; i++) await write(`chain/c${i}.mds`, `@import "./c${i + 1}.mds" as n\nx\n`);
+      await write('chain/c64.mds', 'leaf\n');
+      // entry + 256 imports is the most either backend resolves; one more is refused.
+      for (let i = 0; i < 257; i++) await write(`leaves/l${i}.mds`, `L${i}\n`);
+      const importsOf = (n) => Array.from({ length: n }, (_, i) => `@import "./leaves/l${i}.mds" as m${i}`).join('\n');
+      const big = 'x'.repeat(MAX_FILE_SIZE + 1);
+
+      // [label, entry, native expectation]: `entry` rows compare the whole error;
+      // `import` rows compare code, message and help (native's span: #414).
+      const rows = [
+        ['import: more than 256 segments', await write('seg.mds', `@import "${tooLong}" as s\nhi\n`), 'import', {
+          code: 'mds::resource_limit',
+          message: `resource limit exceeded: import path exceeds maximum segment count (256): "${tooLong}"`,
+          help: null,
+        }],
+        // Counted as written, before `..` could take it out of the project.
+        ['import: more than 256 segments of ..', await write('up.mds', `@import "${tooManyUp}" as s\nhi\n`), 'import', {
+          code: 'mds::resource_limit',
+          message: `resource limit exceeded: import path exceeds maximum segment count (256): "${tooManyUp}"`,
+          help: null,
+        }],
+        ['entry: more than 256 segments', `${segments(256, 'x')}/e.mds`, 'entry', {
+          code: 'mds::resource_limit',
+          message: `resource limit exceeded: import path exceeds maximum segment count (256): "${segments(256, 'x')}/e.mds"`,
+          help: null,
+          span: null,
+        }],
+        ['import: one too deep', path.join(proj, 'chain', 'c0.mds'), 'import', {
+          code: 'mds::import',
+          message: 'import error: import depth exceeds maximum of 64 (possible deep chain)',
+          help: null,
+        }],
+        ['import: one module too many', await write('count-258.mds', `${importsOf(257)}\nhi\n`), 'import', {
+          code: 'mds::resource_limit',
+          message: 'resource limit exceeded: module count exceeds maximum of 256 (256 modules resolved)',
+          help: null,
+        }],
+        ['entry: over the per-file cap', await write('big.mds', big), 'entry', {
+          code: 'mds::resource_limit',
+          message: `resource limit exceeded: file too large (${MAX_FILE_SIZE + 1} bytes, max ${MAX_FILE_SIZE} bytes): big.mds`,
+          help: null,
+          span: null,
+        }],
+        ['import: over the per-file cap', await write('imp-big.mds', '@import "./big.mds" as b\nhi\n'), 'import', {
+          code: 'mds::resource_limit',
+          message: `resource limit exceeded: file too large (${MAX_FILE_SIZE + 1} bytes, max ${MAX_FILE_SIZE} bytes): big.mds`,
+          help: null,
+        }],
+        // An import or entry whose last component is `..` names no file for NativeFs:
+        // not found, whatever the directory it leads to.
+        ['import: ends in ..', await write('sub/up.mds', '@import "../" as u\nhi\n'), 'import', {
+          code: 'mds::file_not_found',
+          message: 'file not found: ../',
+          help: FILE_NOT_FOUND_HELP,
+        }],
+        ['import: ends in .. below a name', await write('dotdot.mds', '@import "./sub/.." as u\nhi\n'), 'import', {
+          code: 'mds::file_not_found',
+          message: 'file not found: ./sub/..',
+          help: FILE_NOT_FOUND_HELP,
+        }],
+        ['entry: ends in ..', [proj, 'sub', '..'].join(path.sep), 'entry', {
+          code: 'mds::file_not_found',
+          message: `file not found: ${[proj, 'sub', '..'].join(path.sep)}`,
+          help: FILE_NOT_FOUND_HELP,
+          span: null,
+        }],
+      ];
+      // Controls: exactly the cap resolves on both, with the same output.
+      const atTheCap = [
+        await write('count-257.mds', `${importsOf(256)}\nhi\n`),
+        path.join(proj, 'chain', 'c1.mds'),
+      ];
+      // `./` names the importing module's own directory: NativeFs reads it and fails
+      // with `mds::io`. The message names the path differently on the two backends —
+      // every `cannot read` message does (see buildModulesMap).
+      const ownDir = await write('own.mds', '@import "./" as o\nhi\n');
+
+      const files = [...rows.map(([, file]) => file), ...atTheCap, ownDir];
+      const native = await compileFileOutcomes('native', files);
+      const wasm = await compileFileOutcomes('wasm', files);
+      for (const [i, [label, , kind, expected]] of rows.entries()) {
+        if (kind === 'entry') {
+          assert.deepEqual(native[i], expected, `${label} (native)`);
+          assert.deepEqual(wasm[i], native[i], label);
+        } else {
+          assert.deepEqual(withoutSpan(native[i]), expected, `${label} (native)`);
+          assert.deepEqual(withoutSpan(wasm[i]), withoutSpan(native[i]), label);
+        }
+      }
+      for (const j of atTheCap.keys()) {
+        const i = rows.length + j;
+        assert.equal(typeof native[i].output, 'string', JSON.stringify(native[i]));
+        assert.deepEqual(wasm[i], native[i], `control ${atTheCap[j]}`);
+      }
+      const i = files.length - 1;
+      assert.equal(native[i].code, 'mds::io', JSON.stringify(native[i]));
+      assert.equal(wasm[i].code, 'mds::io', JSON.stringify(wasm[i]));
+    });
+  });
+
+  test('U-SM33b: the aggregate-size guard is the WASM backend\'s own — native has none', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM33b')) return;
+    await withNestedProject(async (proj) => {
+      // Each module is under the per-file cap; together they are over 10 MiB.
+      const half = 'x'.repeat(6 * 1024 * 1024);
+      await writeFile(path.join(proj, 'a.mds'), half);
+      await writeFile(path.join(proj, 'b.mds'), half);
+      const main = path.join(proj, 'main.mds');
+      await writeFile(main, '@import "./a.mds" as a\n@import "./b.mds" as b\nhi\n');
+      const [native] = await compileFileOutcomes('native', [main]);
+      const [wasm] = await compileFileOutcomes('wasm', [main]);
+      assert.deepEqual(native, { output: 'hi\n' });
+      assert.deepEqual(wasm, {
+        code: 'mds::resource_limit',
+        message: `resource limit exceeded: aggregate module size exceeds maximum of ${10 * 1024 * 1024} bytes`,
+        help: null,
+        span: null,
+      });
+    });
+  });
+
+  test('U-SM37: of several faults, both backends report the one native meets first — depth first, in import order', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM37')) return;
+    await withNestedProject(async (proj, parent) => {
+      await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
+      await writeFile(path.join(proj, 'real.mds'), 'REAL\n');
+      await symlink(path.join(proj, 'real.mds'), path.join(proj, 'link.mds'));
+      await writeFile(path.join(proj, 'ok.mds'), '@import "./deep-missing.mds" as d\nOK\n');
+      // Each fault and the error native reports for it. `ok.mds` is fine itself, but
+      // its own import is missing: depth first, that comes before its later siblings.
+      const faults = [
+        ['@import "./missing.mds" as a', 'mds::file_not_found', 'file not found: ./missing.mds'],
+        ['@import "../outside.mds" as b', 'mds::import', 'import error: import path escapes project directory: "../outside.mds"'],
+        ['@import "./link.mds" as c', 'mds::import', 'import error: symlinks are not allowed in imports: ./link.mds'],
+        ['@import "./ok.mds" as d', 'mds::file_not_found', 'file not found: ./deep-missing.mds'],
+      ];
+      const files = [];
+      for (const r of faults.keys()) {
+        const rotated = [...faults.slice(r), ...faults.slice(0, r)];
+        const file = path.join(proj, `rot-${r}.mds`);
+        await writeFile(file, `${rotated.map(([line]) => line).join('\n')}\nhi\n`);
+        files.push(file);
+      }
+      const native = await compileFileOutcomes('native', files);
+      const wasm = await compileFileOutcomes('wasm', files);
+      for (const [r, [, code, message]] of faults.entries()) {
+        const label = `U-SM37 rotation ${r}`;
+        assert.equal(native[r].code, code, `${label}: ${JSON.stringify(native[r])}`);
+        assert.equal(native[r].message, message, `${label}: ${JSON.stringify(native[r])}`);
+        assert.deepEqual(withoutSpan(wasm[r]), withoutSpan(native[r]), label);
+      }
+    });
+  });
+
+  test('U-SM38: an error the engine raises is identical on both backends, but a later refusal pre-empts it on WASM (difference 8)', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM38')) return;
+    await withNestedProject(async (proj) => {
+      const files = {
+        'cyc.mds': '@import "./cyc-a.mds" as a\nhi\n',
+        'cyc-a.mds': '@import "./cyc.mds" as e\nA\n',
+        'ev.mds': '@import "./ev-a.mds" as a\nhi\n',
+        'ev-a.mds': '{{nope}}\n',
+        // The same two faults, each followed by an import of a missing module.
+        'cyc-then.mds': '@import "./cyc-then-a.mds" as a\n@import "./missing.mds" as m\nhi\n',
+        'cyc-then-a.mds': '@import "./cyc-then.mds" as e\nA\n',
+        'ev-then.mds': '@import "./ev-a.mds" as a\n@import "./missing.mds" as m\nhi\n',
+      };
+      for (const [name, content] of Object.entries(files)) {
+        await writeFile(path.join(proj, name), content);
+      }
+      const entries = ['cyc.mds', 'ev.mds', 'cyc-then.mds', 'ev-then.mds'].map((name) => path.join(proj, name));
+      const native = await compileFileOutcomes('native', entries);
+      const wasm = await compileFileOutcomes('wasm', entries);
+      const cycle = (entry) => ({
+        code: 'mds::circular_import',
+        message: `circular import detected: ${entry}.mds → ${entry}-a.mds → ${entry}.mds`,
+      });
+      const undefinedVar = { code: 'mds::undefined_var', message: "undefined variable 'nope'" };
+      // Alone, the engine's own error — a circular import, an evaluation error — is the
+      // same on both backends, span included.
+      assert.deepEqual({ code: native[0].code, message: native[0].message }, cycle('cyc'));
+      assert.deepEqual({ code: native[1].code, message: native[1].message }, undefinedVar);
+      assert.deepEqual(wasm.slice(0, 2), native.slice(0, 2));
+      // Followed by a missing import: native meets its own error first; the WASM
+      // backend reads every module before its engine runs, so the missing import is
+      // refused first.
+      assert.deepEqual({ code: native[2].code, message: native[2].message }, cycle('cyc-then'));
+      assert.deepEqual({ code: native[3].code, message: native[3].message }, undefinedVar);
+      for (const i of [2, 3]) {
+        assert.deepEqual(wasm[i], {
+          code: 'mds::file_not_found',
+          message: 'file not found: ./missing.mds',
+          help: FILE_NOT_FOUND_HELP,
+          span: null,
+        }, entries[i]);
+      }
     });
   });
 });
