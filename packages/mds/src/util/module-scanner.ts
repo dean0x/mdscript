@@ -540,6 +540,7 @@ export interface ModuleScannerOptions {
 }
 
 export interface BuildModulesMapResult {
+  /** The entry's key in `modules`: its path below the project root, in its on-disk spelling. */
   entryFilename: string;
   /**
    * Flat map of virtual filename → source for the entry file and all its
@@ -551,6 +552,13 @@ export interface BuildModulesMapResult {
    * source under `filename`.
    */
   modules: Record<string, string>;
+  /**
+   * The keys an import resolves to by name that are not the key of the module it reads
+   * — an import spelling a file in another case than its on-disk name, or reaching it
+   * through a symbolically linked directory — each mapped to that module's key: the
+   * WASM engine's `moduleAliases` option (#414).
+   */
+  aliases: Record<string, string>;
 }
 
 /**
@@ -637,14 +645,45 @@ async function assertFileNotSymlink(path: string, shown: string): Promise<void> 
   }
 }
 
+/**
+ * The canonical path of `path`, the file `name` in the canonical directory `dir` —
+ * NativeFs's `check_symlink_named`, which canonicalizes the joined path once the final
+ * component is known not to be a symlink. It is not found when it no longer resolves;
+ * a canonical path in another directory means the component was replaced by a link
+ * meanwhile, refused as NativeFs refuses it. On a case-insensitive volume the result
+ * carries the file's on-disk spelling (#408).
+ */
+async function canonicalFile(path: string, dir: string, shown: string): Promise<string> {
+  let resolved: string;
+  try {
+    resolved = await realpath(path);
+  } catch {
+    throw fileNotFoundError(shown);
+  }
+  if (dirname(resolved) !== dir) {
+    throw symlinkError(shown);
+  }
+  return resolved;
+}
+
 /** A module located on disk as NativeFs resolves it, before anything in it is read. */
 interface Located {
-  /** The module's key in the engine's virtual module map. */
+  /**
+   * The module's key in the engine's virtual module map: its canonical path below the
+   * project root — its on-disk spelling, as native keys a module by its canonical path.
+   */
   readonly key: string;
+  /**
+   * The key the engine resolves the import to by name, before an alias maps it to
+   * `key` (#414); the entry's is `key`.
+   */
+  readonly typedKey: string;
   /** Its canonical directory joined with its name as written. */
   readonly path: string;
   /** Its canonical directory. */
   readonly dir: string;
+  /** Its canonical path. */
+  readonly resolved: string;
 }
 
 /** A module file opened, checked and read. */
@@ -672,10 +711,10 @@ const WALK_FINISHED: Settled<never> = { ok: false, error: undefined };
  * (`mds::resource_limit`), and a path with no final name — `.`, a root, one ending in
  * `..` — is not found. Its parent directory is canonicalized as typed, so the OS
  * applies each `..` after the symlinks before it (never lexically), and the final
- * component is refused when missing or a symlink, then when the canonical path
- * carries a forbidden path character.
+ * component is refused when missing or a symlink, then canonicalized, and refused when
+ * its canonical path carries a forbidden path character.
  */
-async function locateEntry(entryPath: string): Promise<{ path: string; dir: string }> {
+async function locateEntry(entryPath: string): Promise<{ path: string; dir: string; resolved: string }> {
   const entryErr = entryPathError(entryPath) ?? segmentCountError(entryPath);
   if (entryErr !== undefined) {
     throw entryErr;
@@ -687,11 +726,12 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
   const dir = await canonicalDirectory(parent, entryPath);
   const path = join(dir, name);
   await assertFileNotSymlink(path, entryPath);
-  const hostileErr = resolvedPathError(path, entryPath);
+  const resolved = await canonicalFile(path, dir, entryPath);
+  const hostileErr = resolvedPathError(resolved, entryPath);
   if (hostileErr !== undefined) {
     throw hostileErr;
   }
-  return { path, dir };
+  return { path, dir, resolved };
 }
 
 /**
@@ -700,13 +740,21 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  *
  * The returned `entryFilename` is a **project-root-relative** slash path
  * (e.g. `"src/templates/foo.mds"`), computed via `path.relative(projectRoot,
- * absoluteEntry)`. This mirrors the virtual key used in the `modules` map and
+ * canonicalEntry)`. This mirrors the virtual key used in the `modules` map and
  * is the value that must be passed as the `filename` argument to
  * `build_modules()` / `check()` on the WASM side.
  *
  * Note: prior to this change `entryFilename` was the basename of the entry
  * file. Callers that relied on the basename form must be updated to use the
  * relative path.
+ *
+ * Every module is keyed by its canonical path below the project root — its on-disk
+ * spelling, as the native backend keys a module by its canonical path — so the engine
+ * names it so in `dependencies`, `sourceMap.sources` and a cycle's text, whatever
+ * spelling reached it. An import the engine resolves by name to another key — a case
+ * variant on a case-insensitive volume, or a path through a symbolically linked
+ * directory — is listed in `aliases`, which the engine's `moduleAliases` option maps
+ * to the module's key (#414).
  *
  * Every refusal is the error the native backend throws for the same input — its
  * code, its message and its `help` — naming the path as written, never a resolved
@@ -770,8 +818,10 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  * 4. Module count: native refuses a module once 256 others are fully resolved, so a
  *    graph whose modules are still being resolved can hold more; the engine takes
  *    the entry plus 256, and a larger graph is refused here (#427).
- * 5. An import that leaves a symlinked directory through `..` is refused
- *    (`mds::import`): the engine resolves it by name, NativeFs on disk (#408).
+ * 5. An import that names a symlinked directory and leaves it again through `..`
+ *    (`./link/../x.mds`) is refused (`mds::import`): the engine resolves the name,
+ *    NativeFs the disk, so the key it resolves to names another file than the one
+ *    native reads (#408, U-SM22).
  * 6. A module more than 256 directories below the project root is refused: the
  *    engine's key of it is capped at 256 segments, where native caps only the path
  *    as written.
@@ -795,9 +845,11 @@ export async function buildModulesMap(
   // then admits every path, exactly as NativeFs's does.
   const projectRoot = findProjectRoot(entry.dir);
   // Virtual keys are always slash-separated to mirror Rust's VirtualFs.
-  const entryFilename = keyOf(projectRoot, entry.path);
+  const entryFilename = keyOf(projectRoot, entry.resolved);
 
   const modules: Record<string, string> = {};
+  /** The key an import resolves to by name → the key of the module it reads. */
+  const aliases = new Map<string, string>();
   /** Keys of modules walked to the end: the native resolver's module cache. */
   const completed = new Set<string>();
   /** Keys of modules being walked: the native resolver's stack of modules resolving. */
@@ -816,11 +868,12 @@ export async function buildModulesMap(
    *
    * The WASM engine resolves an import by name, from the importing module's key.
    * NativeFs resolves it on disk, from the importing module's canonical directory,
-   * where the OS applies each `..` after the symbolic links before it. The two
-   * agree for every import except one that leaves a symlinked directory through
-   * `..`: its key names the directory beside the link, while the file on disk sits
-   * beside the link's target. Whichever file were stored under that key, the
-   * engine would compile a module the native backend never reads (#408).
+   * where the OS applies each `..` after the symbolic links before it. A module's key
+   * is its canonical path, so the two agree for every import except one that names a
+   * symlinked directory and leaves it through `..` (`./link/../x.mds`): its key names
+   * the directory beside the link, while the file on disk sits beside the link's
+   * target. Whichever file were stored under that key, the engine would compile a
+   * module the native backend never reads (#408).
    */
   async function assertKeyMatchesDisk(
     importerDir: string,
@@ -849,7 +902,10 @@ export async function buildModulesMap(
    * Locate an import of `importer` as the native resolver does — `validate_import_path`,
    * then NativeFs's `normalize_in_dir` — refusing it with native's error, except that
    * containment in the project root is decided before the file is looked at
-   * (difference 1 above).
+   * (difference 1 above). The module is keyed by its canonical path, which a hostile
+   * character is looked for in: a spelling the engine resolves to another key is
+   * checked there too, never trusted from the key it was typed as (case folding and
+   * other respellings are lossy, #414).
    */
   async function locateImport(importer: Located, importPath: string): Promise<Located> {
     const stringErr = importPathError(importPath) ?? segmentCountError(importPath);
@@ -869,10 +925,10 @@ export async function buildModulesMap(
     }
     // An import of `./` names the importing module's own directory, which NativeFs
     // opens and fails to read (`mds::io`); the engine has no key for it.
-    let key = '';
+    let typedKey = '';
     if (name !== undefined) {
-      key = normalizeVirtualKey(importer.key, importPath);
-      await assertKeyMatchesDisk(importer.dir, importPath, key);
+      typedKey = normalizeVirtualKey(importer.key, importPath);
+      await assertKeyMatchesDisk(importer.dir, importPath, typedKey);
     }
     // The parent directory canonicalized (its symlinks followed), the final
     // component joined as written — the pattern of NativeFs::check_symlink_named.
@@ -884,13 +940,16 @@ export async function buildModulesMap(
       throw escapesProjectError(importPath);
     }
     await assertFileNotSymlink(path, importPath);
+    const resolved = await canonicalFile(path, dir, importPath);
     // Security (#265): a directory the import never named, reached through a
-    // symlink, can carry a forbidden path character.
-    const hostileErr = resolvedPathError(path, importPath);
+    // symlink, can carry a forbidden path character — and so can the on-disk name of
+    // a file the import spelled differently.
+    const hostileErr = resolvedPathError(resolved, importPath);
     if (hostileErr !== undefined) {
       throw hostileErr;
     }
-    return { key, path, dir };
+    const key = name === undefined ? '' : keyOf(projectRoot, resolved);
+    return { key, typedKey, path, dir, resolved };
   }
 
   /**
@@ -903,8 +962,9 @@ export async function buildModulesMap(
    * read. Where O_NOFOLLOW is unavailable (Windows) open() follows it, and `lstat` —
    * which reports a junction as a symlink too — refuses it before a byte is read.
    * Canonicalizing a non-symlink final component only respells its name; a canonical
-   * path in another directory means the component was replaced by a link — refused as
-   * NativeFs refuses it. The file type decides, never a comparison of the canonical
+   * path other than the one it was located at — the one its key names — means the
+   * component was replaced meanwhile, by a link or another file — refused as NativeFs
+   * refuses a replaced component. The file type decides, never a comparison of the canonical
    * path with the path as written: on a case-insensitive volume realpath returns the
    * on-disk spelling, so `Entry.mds` for `entry.mds` differs from its canonical form
    * without being a symlink (#408).
@@ -938,7 +998,7 @@ export async function buildModulesMap(
           throw fileNotFoundError(shown);
         }),
       ]);
-      if (linkStats.isSymbolicLink() || dirname(resolved) !== located.dir) {
+      if (linkStats.isSymbolicLink() || resolved !== located.resolved) {
         throw symlinkError(shown);
       }
       // fstat on the opened fd: a module that is not a regular file (a directory,
@@ -1002,6 +1062,23 @@ export async function buildModulesMap(
     }
     // A module the read-ahead budget left unread is read by the walk itself.
     return { located, read: read.value === undefined ? undefined : { ok: true, value: read.value } };
+  }
+
+  /**
+   * Record that the engine resolves the import `shown` of a walked module, by name, to
+   * `located.typedKey`, so its alias names the module read: `located.key`. A key names
+   * one file on disk; should it name another later in the scan, the file was replaced
+   * meanwhile, refused as `readModule` refuses a replaced component.
+   */
+  function recordAlias(located: Located, shown: string): void {
+    if (located.typedKey === '' || located.typedKey === located.key) {
+      return;
+    }
+    const known = aliases.get(located.typedKey);
+    if (known !== undefined && known !== located.key) {
+      throw symlinkError(shown);
+    }
+    aliases.set(located.typedKey, located.key);
   }
 
   /**
@@ -1077,7 +1154,9 @@ export async function buildModulesMap(
       refill();
       const { located: child, read: childRead } = await item.ahead;
       try {
-        await walk(unwrap(child), item.record.path, depth + 1, childRead, item.record.kind === 'extends');
+        const next = unwrap(child);
+        recordAlias(next, item.record.path);
+        await walk(next, item.record.path, depth + 1, childRead, item.record.kind === 'extends');
       } catch (err) {
         throw withImportContext(err, item.record);
       }
@@ -1087,10 +1166,11 @@ export async function buildModulesMap(
   }
 
   try {
-    await walk({ key: entryFilename, path: entry.path, dir: entry.dir }, entryPath, 0, undefined, false);
+    const entryLocated = { key: entryFilename, typedKey: entryFilename, ...entry };
+    await walk(entryLocated, entryPath, 0, undefined, false);
   } finally {
     walkFinished = true;
   }
 
-  return { entryFilename, modules };
+  return { entryFilename, modules, aliases: Object.fromEntries(aliases) };
 }

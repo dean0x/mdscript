@@ -120,6 +120,41 @@ fn scan_import_records_function_exists() {
     assert_eq!(kind, record.kind.name());
 }
 
+/// #414: `VirtualFs::with_aliases` and the compile, check and lint entry points that
+/// take a `VirtualFs` are reachable from an external crate: an aliased import reaches
+/// the module its alias names, and an alias that names no module is refused.
+#[test]
+fn virtual_fs_aliases_api_exists() {
+    type Vars = Option<HashMap<String, Value>>;
+    let _: fn(VirtualFs, HashMap<String, String>) -> Result<VirtualFs, MdsError> =
+        VirtualFs::with_aliases;
+    let _: fn(VirtualFs, &str, Vars, mds::CompileOptions) -> Result<CompileResult, MdsError> =
+        mds::compile_virtual_fs;
+    type Checked = Result<((), Vec<String>), MdsError>;
+    let _: fn(VirtualFs, &str, Vars) -> Checked = mds::check_virtual_fs;
+    let _: fn(VirtualFs, &str, Vars, &LintConfig) -> Result<LintResult, MdsError> =
+        mds::lint_virtual_fs;
+
+    let modules = HashMap::from([
+        (
+            "main.mds".to_string(),
+            "@import \"./Hi.mds\" as h\n@include h\n".to_string(),
+        ),
+        ("hi.mds".to_string(), "Hi!\n".to_string()),
+    ]);
+    let alias = |target: &str| HashMap::from([("Hi.mds".to_string(), target.to_string())]);
+    let fs = VirtualFs::new(modules.clone())
+        .with_aliases(alias("hi.mds"))
+        .unwrap();
+    let result =
+        mds::compile_virtual_fs(fs, "main.mds", None, mds::CompileOptions::default()).unwrap();
+    assert_eq!(result.dependencies, ["hi.mds"]);
+    let err = VirtualFs::new(modules)
+        .with_aliases(alias("gone.mds"))
+        .unwrap_err();
+    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+}
+
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`
 /// forbids a struct literal, so the type is only obtainable through the load API.
 #[test]

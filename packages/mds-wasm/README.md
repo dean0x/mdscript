@@ -40,6 +40,13 @@ it by `shown` (the path as typed).
 //   you want a meaningful name to appear in source maps or import paths.
 // options.modules — { [key: string]: string }: additional virtual modules for
 //   @import resolution. The entry source is inserted under options.filename.
+// options.moduleAliases — { [key: string]: string }: other keys an import may reach a
+//   module by — the key an import resolves to → the key of the module (in modules, or
+//   options.filename) it names, which is then the module's name in dependencies,
+//   sources[] and a cycle's text. Every alias and module key must be a normalized key
+//   (no forbidden characters, no empty/./.. segment, at most 256 segments); every alias
+//   must name a module and none may be a module key: mds::invalid_options otherwise.
+//   Also accepted by check and lint.
 // options.vars — { [key: string]: any }: runtime variable overrides.
 // options.sourceMap — boolean: generate a Source Map v3 document; result gains .sourceMap.
 //   sources[0] is options.filename (default "input.mds"), unless the source @extends

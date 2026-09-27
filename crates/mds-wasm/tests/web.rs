@@ -686,6 +686,125 @@ fn scan_import_records_returns_error_for_malformed_source() {
     assert_eq!(get_str(&err, "code"), "mds::syntax");
 }
 
+// ── moduleAliases (#414) ─────────────────────────────────────────────────────
+
+/// Options with `modules` and `moduleAliases` built from `(key, value)` pairs, so a
+/// key can be built at runtime.
+fn aliased_opts(modules: &[(&str, &str)], aliases: serde_json::Value) -> JsValue {
+    let modules: serde_json::Map<String, serde_json::Value> = modules
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), serde_json::Value::from(*v)))
+        .collect();
+    to_js_object(&serde_json::json!({ "modules": modules, "moduleAliases": aliases }))
+}
+
+/// An alias map of `(alias, value)` pairs.
+fn alias_map(pairs: &[(&str, serde_json::Value)]) -> serde_json::Value {
+    serde_json::Value::Object(
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect(),
+    )
+}
+
+/// `moduleAliases` lets an import reach a module by another key: compile, check and
+/// lint resolve it to the module it names, which the result names by its own key.
+#[wasm_bindgen_test]
+fn module_aliases_resolve_an_import_to_the_module_they_name() {
+    let source = "@import \"./Hi.mds\" as h\n@include h\n";
+    let opts = || {
+        aliased_opts(
+            &[("hi.mds", "Hi!\n")],
+            alias_map(&[("Hi.mds", "hi.mds".into())]),
+        )
+    };
+    let result = mds_wasm::compile(source, opts()).unwrap();
+    assert_eq!(get_str(&result, "output"), "Hi!\n");
+    let deps = js_sys::Array::from(&get_prop(&result, "dependencies"));
+    assert_eq!(deps.length(), 1);
+    assert_eq!(deps.get(0).as_string().as_deref(), Some("hi.mds"));
+    mds_wasm::check(source, opts()).unwrap();
+    mds_wasm::lint(source, opts()).unwrap();
+    // Control: without the alias the spelling is a key of its own, and names no module.
+    let err = mds_wasm::compile(
+        source,
+        modules_opts(&serde_json::json!({ "hi.mds": "Hi!\n" })),
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
+}
+
+/// A malformed alias map — or an alias or the module key it names that is not a
+/// module key, hostile ones included — is refused by compile, check and lint with
+/// `mds::invalid_options`, the key escaped: its escape text is shown and the raw
+/// character never is (PF-013).
+#[wasm_bindgen_test]
+fn module_aliases_refuse_a_malformed_or_hostile_alias() {
+    let esc = char::from_u32(0x1b).expect("U+001B is a char");
+    let hostile = format!("a{esc}b.mds");
+    let shown = format!("a{}u001Bb.mds", '\\');
+    let invalid = |detail: &str| format!("invalid options.moduleAliases: {detail}");
+    let cases = [
+        (
+            serde_json::json!([]),
+            "options.moduleAliases must be a plain object, got array".to_owned(),
+        ),
+        (
+            alias_map(&[("A.mds", 1.into())]),
+            "options.moduleAliases[\"A.mds\"] must be a string, got number".to_owned(),
+        ),
+        (
+            alias_map(&[(&hostile, 1.into())]),
+            format!("options.moduleAliases[\"{shown}\"] must be a string, got number"),
+        ),
+        (
+            alias_map(&[(&hostile, "hi.mds".into())]),
+            invalid(&format!(
+                "module alias \"{shown}\": the alias contains forbidden character U+001B"
+            )),
+        ),
+        (
+            alias_map(&[("A.mds", hostile.clone().into())]),
+            invalid(&format!(
+                "module alias \"A.mds\": its module key \"{shown}\" contains forbidden character U+001B"
+            )),
+        ),
+        (
+            alias_map(&[("../hi.mds", "hi.mds".into())]),
+            invalid("module alias \"../hi.mds\": the alias has a '..' segment"),
+        ),
+        (
+            alias_map(&[("A.mds", "gone.mds".into())]),
+            invalid("module alias \"A.mds\": its module key \"gone.mds\" names no module"),
+        ),
+        (
+            alias_map(&[("hi.mds", "input.mds".into())]),
+            invalid("module alias \"hi.mds\": the alias is a module key itself"),
+        ),
+    ];
+    let source = "@import \"./A.mds\" as a\n";
+    for (aliases, message) in cases {
+        let opts = || aliased_opts(&[("hi.mds", "Hi!\n")], aliases.clone());
+        for err in [
+            mds_wasm::compile(source, opts()).unwrap_err(),
+            mds_wasm::check(source, opts()).unwrap_err(),
+            mds_wasm::lint(source, opts()).unwrap_err(),
+        ] {
+            assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{message}");
+            assert_eq!(get_str(&err, "message"), message);
+            assert!(!get_str(&err, "message").contains(esc), "{message}");
+        }
+    }
+    // Control: an alias of the entry itself is a module key, and accepted.
+    let opts = aliased_opts(
+        &[("hi.mds", "Hi!\n")],
+        alias_map(&[("A.mds", "input.mds".into())]),
+    );
+    let err = mds_wasm::compile(source, opts).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::circular_import");
+}
+
 // ── preflightModule (#414) ───────────────────────────────────────────────────
 
 /// `preflightModule` returns a module's text, a leading byte-order mark kept, and

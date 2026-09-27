@@ -28,15 +28,23 @@ export interface WasmModule {
   compile(source: string, options?: {
     filename?: string;
     modules?: Record<string, string>;
+    /** Other keys an import may reach a module by: the key it resolves to → the module's key. */
+    moduleAliases?: Record<string, string>;
     vars?: Record<string, unknown>;
     sourceMap?: boolean;
     sourcesContent?: boolean;
   }): unknown;
-  check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
+  check(source: string, options?: {
+    filename?: string;
+    modules?: Record<string, string>;
+    moduleAliases?: Record<string, string>;
+    vars?: Record<string, unknown>;
+  }): unknown;
   /** Lint a source string. Returns the canonical lint JSON object. */
   lint(source: string, options?: {
     filename?: string;
     modules?: Record<string, string>;
+    moduleAliases?: Record<string, string>;
     vars?: Record<string, unknown>;
     rules?: Record<string, string>;
   }): unknown;
@@ -404,24 +412,34 @@ function checkOpts(
     : DEFAULT_COMPILE_OPTS;
 }
 
-/** Build the options object for compileFile, merging vars and source-map options when present. */
+/**
+ * Build the options object for compileFile, merging vars and source-map options when
+ * present, and the pre-scanner's module aliases when there are any (#414).
+ */
 export function fileOpts(
   entryFilename: string,
   modules: Record<string, string>,
+  moduleAliases: Record<string, string>,
   options?: CompileFileOptions,
 ): {
   filename: string;
   modules: Record<string, string>;
+  moduleAliases?: Record<string, string>;
   vars?: Record<string, unknown>;
   sourceMap?: boolean;
   sourcesContent?: boolean;
 } {
   // Use forwardOpts for the user-visible keys (vars, sourceMap, sourcesContent)
   // so METHOD_KEYS.compileFile is the single authoritative source for what is forwarded.
+  // Spread first, so a key added to METHOD_KEYS.compileFile can never clobber the
+  // WASM-internal ones (avoids PF-004).
   const extra = forwardOpts(options, 'compileFile');
-  return extra != null
-    ? { filename: entryFilename, modules, ...extra }
-    : { filename: entryFilename, modules };
+  return {
+    ...extra,
+    filename: entryFilename,
+    modules,
+    ...(Object.keys(moduleAliases).length > 0 ? { moduleAliases } : undefined),
+  };
 }
 
 /**

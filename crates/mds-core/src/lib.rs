@@ -1234,8 +1234,37 @@ pub fn compile_virtual_with_deps_opts(
     runtime_vars: Option<HashMap<String, Value>>,
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
+    compile_virtual_fs(VirtualFs::new(modules), entry, runtime_vars, opts)
+}
+
+/// Compile a module from a [`VirtualFs`] — one built with
+/// [`VirtualFs::with_aliases`], say — with optional source-map generation.
+///
+/// Like [`compile_virtual_with_deps_opts`], whose module map is the filesystem.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// let modules = HashMap::from([
+///     ("main.mds".to_string(), "@import \"./Hi.mds\" as h\n@include h\n".to_string()),
+///     ("hi.mds".to_string(), "Hi!\n".to_string()),
+/// ]);
+/// let aliases = HashMap::from([("Hi.mds".to_string(), "hi.mds".to_string())]);
+/// let fs = mds::VirtualFs::new(modules).with_aliases(aliases)?;
+/// let result = mds::compile_virtual_fs(fs, "main.mds", None, mds::CompileOptions::default())?;
+/// assert_eq!(result.dependencies, ["hi.mds"]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_virtual_fs(
+    fs: VirtualFs,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::virtual_fs(modules);
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_virtual_intrinsic_opts(entry, &vars, &opts, &mut warnings)?;
@@ -1312,8 +1341,32 @@ pub fn check_virtual_collecting_warnings(
     entry: &str,
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<((), Vec<String>), MdsError> {
+    check_virtual_fs(VirtualFs::new(modules), entry, runtime_vars)
+}
+
+/// Check (validate) a module from a [`VirtualFs`] — one built with
+/// [`VirtualFs::with_aliases`], say — and return any collected warnings without
+/// rendering output.
+///
+/// Like [`check_virtual_collecting_warnings`], whose module map is the filesystem.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// let modules = HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
+/// let ((), warnings) = mds::check_virtual_fs(mds::VirtualFs::new(modules), "main.mds", None)?;
+/// assert!(warnings.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "warnings should be used"]
+pub fn check_virtual_fs(
+    fs: VirtualFs,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<((), Vec<String>), MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::virtual_fs(modules);
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
     let mut warnings = vec![];
     // Dispatch on output shape so a messages template's mixed-content check runs
     // during validation; the CompiledOutput itself is discarded.
@@ -1443,15 +1496,40 @@ pub fn lint_virtual(
     runtime_vars: Option<HashMap<String, Value>>,
     config: &LintConfig,
 ) -> Result<LintResult, MdsError> {
+    lint_virtual_fs(VirtualFs::new(modules), entry, runtime_vars, config)
+}
+
+/// Lint an entry module from a [`VirtualFs`] — one built with
+/// [`VirtualFs::with_aliases`], say.
+///
+/// Like [`lint_virtual`], whose module map is the filesystem.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// let modules = HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
+/// let fs = mds::VirtualFs::new(modules);
+/// let result = mds::lint_virtual_fs(fs, "main.mds", None, &mds::LintConfig::default())?;
+/// assert!(result.diagnostics.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "lint findings should be used"]
+pub fn lint_virtual_fs(
+    fs: VirtualFs,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+    config: &LintConfig,
+) -> Result<LintResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    // Take the entry source before moving `modules` into the check gate, but
+    // Take the entry source before moving the filesystem into the check gate, but
     // report nothing about it until the gate has run: the gate validates the
     // entry key first (an empty or NUL key is `mds::io` on every virtual entry
     // API) and reports a missing key as ModuleNotFound (R6), like compile_virtual.
-    let source = modules.get(entry).cloned();
+    let source = fs.module(entry).map(str::to_owned);
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
     {
-        let mut cache = ModuleCache::virtual_fs(modules);
+        let mut cache = ModuleCache::with_fs(Box::new(fs));
         let mut warnings = vec![];
         cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
     }
@@ -2727,6 +2805,79 @@ mod tests {
             ["./a.mds".to_owned(), "./c.mds".to_owned()]
         );
         assert!(records.iter().all(|r| r.span.is_none()), "{records:?}");
+    }
+
+    // ── VirtualFs aliases through compile, check and lint (#414) ─────────────
+
+    /// With aliases, a module reached under another spelling is the module its alias
+    /// names: dependencies, source-map sources and a cycle's text name each module by
+    /// its own key, whatever spelling an import used.
+    #[test]
+    fn virtual_fs_aliases_name_each_module_by_its_own_key() {
+        let owned = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let modules = owned(&[
+            (
+                "main.mds",
+                "@import \"./Header.mds\" as a\n@import \"./SUB/Footer.mds\" as f\n{{a.hi()}}{{f.bye()}}\n",
+            ),
+            ("header.mds", "@define hi():\nHi\n@end\n"),
+            (
+                "sub/footer.mds",
+                "@import \"../HEADER.mds\" as h\n@define bye():\n{{h.hi()}} bye\n@end\n",
+            ),
+        ]);
+        let aliases = owned(&[
+            ("Header.mds", "header.mds"),
+            ("HEADER.mds", "header.mds"),
+            ("SUB/Footer.mds", "sub/footer.mds"),
+        ]);
+        let fs = || {
+            VirtualFs::new(modules.clone())
+                .with_aliases(aliases.clone())
+                .expect("valid aliases")
+        };
+        let result = compile_virtual_fs(
+            fs(),
+            "main.mds",
+            None,
+            CompileOptions::default().with_source_map(true),
+        )
+        .expect("compiles");
+        assert_eq!(result.dependencies, ["header.mds", "sub/footer.mds"]);
+        assert_eq!(
+            result.source_map.as_ref().expect("a source map").sources,
+            ["main.mds", "header.mds", "sub/footer.mds"]
+        );
+        assert_eq!(result.into_markdown().unwrap(), "HiHi bye\n");
+        check_virtual_fs(fs(), "main.mds", None).expect("checks");
+        lint_virtual_fs(fs(), "main.mds", None, &LintConfig::default()).expect("lints");
+        // Control: without the aliases the spellings are keys of their own, and missing.
+        let err =
+            compile_virtual_with_deps_opts(modules, "main.mds", None, CompileOptions::default())
+                .expect_err("Header.mds is no module");
+        assert!(
+            matches!(err, MdsError::ModuleNotFound { ref key, .. } if key == "Header.mds"),
+            "{err:?}"
+        );
+
+        // A cycle closed through an alias of the entry is named by the modules' keys.
+        let cycle = owned(&[
+            ("cyc.mds", "@import \"./CYC-B.mds\" as b\nhi\n"),
+            ("cyc-b.mds", "@import \"./Cyc.mds\" as a\nB\n"),
+        ]);
+        let fs = VirtualFs::new(cycle)
+            .with_aliases(owned(&[("CYC-B.mds", "cyc-b.mds"), ("Cyc.mds", "cyc.mds")]))
+            .expect("valid aliases");
+        let err = check_virtual_fs(fs, "cyc.mds", None).expect_err("a cycle");
+        assert_eq!(
+            err.to_string(),
+            "circular import detected: cyc.mds \u{2192} cyc-b.mds \u{2192} cyc.mds"
+        );
     }
 
     #[test]

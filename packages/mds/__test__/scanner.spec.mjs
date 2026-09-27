@@ -631,10 +631,11 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       const entry = path.join(dir, 'MAIN.mds');
       const build = buildModulesMap(entry, scanImports);
       if (insensitive) {
-        // The entry is keyed as typed: that key is what the WASM engine is handed.
-        const { entryFilename, modules } = await build;
-        assert.equal(entryFilename, 'MAIN.mds');
-        assert.deepEqual(modules, { 'MAIN.mds': 'Hello!\n' });
+        // The entry is keyed by its on-disk spelling, as native keys it (#414).
+        const { entryFilename, modules, aliases } = await build;
+        assert.equal(entryFilename, 'main.mds');
+        assert.deepEqual(modules, { 'main.mds': 'Hello!\n' });
+        assert.deepEqual(aliases, {});
       } else {
         assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM14'), entry, 'U-SM14');
       }
@@ -650,10 +651,12 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       const insensitive = await caseInsensitive(dir);
       const build = buildModulesMap(path.join(dir, 'main.mds'), scanImports);
       if (insensitive) {
-        // Keyed as written, since the engine's virtual filesystem looks the import
-        // up under exactly that key.
-        const { modules } = await build;
-        assert.equal(modules['Header.mds'], 'hi\n');
+        // Keyed by its on-disk spelling, as native keys it; the spelling the engine
+        // looks the import up under is an alias of that key (#414).
+        const { modules, aliases } = await build;
+        assert.deepEqual(Object.keys(modules).sort(), ['header.mds', 'main.mds']);
+        assert.equal(modules['header.mds'], 'hi\n');
+        assert.deepEqual(aliases, { 'Header.mds': 'header.mds' });
       } else {
         assertNotFoundNotSymlink(await rejectionOf(build, 'U-SM15'), './Header.mds', 'U-SM15');
       }
@@ -693,8 +696,12 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       await writeFile(path.join(dir, 'real', 'lib.mds'), 'lib\n');
       await symlink(path.join(dir, 'real'), path.join(dir, 'alias'), dirLinkType);
       await writeFile(path.join(dir, 'main.mds'), '@import "./alias/lib.mds" as l\n');
-      const { modules } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
-      assert.equal(modules['alias/lib.mds'], 'lib\n');
+      const { modules, aliases } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      // Keyed by its canonical path, as native keys it; the spelling through the link
+      // is an alias of that key (#414).
+      assert.equal(modules['real/lib.mds'], 'lib\n');
+      assert.equal(modules['alias/lib.mds'], undefined);
+      assert.deepEqual(aliases, { 'alias/lib.mds': 'real/lib.mds' });
 
       // Outside: the canonical path is what containment is checked on.
       const outside = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-408-outside-'));
@@ -800,9 +807,10 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
 
   // The WASM engine resolves an import BY NAME, from the importing module's key;
   // NativeFs resolves it ON DISK, from the importing module's canonical directory.
-  // Through a symlinked directory the two agree for every import except one that
-  // leaves the link through `..`: its key names the directory beside the link,
-  // the file NativeFs reads sits beside the link's target.
+  // A module's key is its canonical path (#414), so through a symlinked directory the
+  // two agree for every import except one whose own path names the link and leaves
+  // it through `..`: its key names the directory beside the link, the file NativeFs
+  // reads sits beside the link's target.
 
   /** sub -> deep/other; sub/y.mds imports ../z.mds; both z.mds files exist. */
   async function dotDotOutOfLink(dir, linked) {
@@ -820,14 +828,24 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     return path.join(dir, 'main.mds');
   }
 
-  test("U-SM22: an import that leaves a symlinked directory through '..' is refused, never read from the other side", async () => {
+  test("U-SM22: an import naming a symlinked directory and leaving it through '..' is refused, never read from the other side", async () => {
     await withProject(async (dir) => {
+      // A module reached through the link is keyed by its canonical path, so its own
+      // `../z.mds` names, by key and on disk alike, the z.mds beside the link's target.
       const main = await dotDotOutOfLink(dir, true);
-      const err = await rejectionOf(buildModulesMap(main, scanImports), 'U-SM22');
+      const { modules, aliases } = await buildModulesMap(main, scanImports);
+      assert.equal(modules['deep/z.mds'], 'DEEP-Z\n');
+      assert.equal(modules['deep/other/y.mds'], '@import "../z.mds" as dz\nY=\n@include dz\n');
+      assert.deepEqual(aliases, { 'sub/y.mds': 'deep/other/y.mds' });
+      // An import whose own path runs through the link and back out: its key names the
+      // root's z.mds, the file on disk is deep/z.mds.
+      const through = path.join(dir, 'through.mds');
+      await writeFile(through, '@import "./sub/../z.mds" as z\n@include z\n');
+      const err = await rejectionOf(buildModulesMap(through, scanImports), 'U-SM22');
       assert.equal(err.code, 'mds::import', err.message);
       assert.equal(
         err.message,
-        `import error: import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "../z.mds"`,
+        `import error: import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "./sub/../z.mds"`,
       );
     });
     // Control: the same tree with `sub` a real directory builds, and `../z.mds`
@@ -839,18 +857,20 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     });
   });
 
-  test('U-SM23: a file reached through a symlinked directory is stored under every key the engine looks up', async () => {
+  test('U-SM23: a file reached through a symlinked directory is one module, keyed by its canonical path', async () => {
     await withProject(async (dir) => {
       await mkdir(path.join(dir, 'lib'));
       await writeFile(path.join(dir, 'lib', 'x.mds'), 'X\n');
       await writeFile(path.join(dir, 'lib', 'y.mds'), '@import "./x.mds" as x\n');
       await symlink(path.join(dir, 'lib'), path.join(dir, 'alias'), dirLinkType);
       await writeFile(path.join(dir, 'main.mds'), '@import "./lib/x.mds" as a\n@import "./alias/y.mds" as b\n');
-      const { modules } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
-      // lib/x.mds and alias/x.mds are one file on disk, but the engine resolves
-      // alias/y.mds's `./x.mds` to the key alias/x.mds: both keys must be present.
+      const { modules, aliases } = await buildModulesMap(path.join(dir, 'main.mds'), scanImports);
+      // alias/y.mds is lib/y.mds on disk: one module, as on native, keyed by its
+      // canonical path, and its `./x.mds` is lib/x.mds by key too. The spelling through
+      // the link is an alias the engine maps to that key (#414).
+      assert.deepEqual(Object.keys(modules).sort(), ['lib/x.mds', 'lib/y.mds', 'main.mds']);
       assert.equal(modules['lib/x.mds'], 'X\n');
-      assert.equal(modules['alias/x.mds'], 'X\n');
+      assert.deepEqual(aliases, { 'alias/y.mds': 'lib/y.mds' });
     });
   });
 
@@ -865,24 +885,32 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       await symlink(path.join(dir, 'lib'), path.join(dir, 'alias'), dirLinkType);
       const alias = path.join(dir, 'alias-main.mds');
       await writeFile(alias, '@import "./lib/x.mds" as a\n@import "./alias/y.mds" as b\n@include a\n@include b\n');
-      // `..` out of the link: NativeFs reads deep/z.mds; the WASM backend refuses
-      // rather than compile the root z.mds its engine would look up by name.
+      // A module reached through the link imports `../z.mds`: both backends read
+      // deep/z.mds, the module's key being its canonical path (#414).
       const dotDot = await dotDotOutOfLink(dir, true);
+      // An import whose own path runs through the link and back out: NativeFs reads
+      // deep/z.mds; the WASM backend refuses rather than compile the root z.mds its
+      // engine would look up by name (difference 5).
+      const through = path.join(dir, 'through.mds');
+      await writeFile(through, '@import "./sub/../z.mds" as z\n@include z\n');
       // An ENTRY typed through the link and back out with `..`: the OS applies the
       // `..` after the link, so both backends compile deep/z.mds — the scanner
       // resolves the entry's directory as NativeFs does, never lexically (#414).
       // Joined by hand: path.join would drop the `..` before the OS saw it.
       const entryOutOfLink = [dir, 'sub', '..', 'z.mds'].join(path.sep);
 
-      const [nativeAlias, nativeDotDot, nativeEntry] = await compileFileOutcomes('native', [alias, dotDot, entryOutOfLink]);
-      const [wasmAlias, wasmDotDot, wasmEntry] = await compileFileOutcomes('wasm', [alias, dotDot, entryOutOfLink]);
+      const files = [alias, dotDot, entryOutOfLink, through];
+      const [nativeAlias, nativeDotDot, nativeEntry, nativeThrough] = await compileFileOutcomes('native', files);
+      const [wasmAlias, wasmDotDot, wasmEntry, wasmThrough] = await compileFileOutcomes('wasm', files);
       assert.equal(nativeAlias.output, 'X\nY\nX\n', JSON.stringify(nativeAlias));
       assert.deepEqual(wasmAlias, nativeAlias);
       assert.equal(nativeDotDot.output, 'ROOT-Z\nY=\nDEEP-Z\n', JSON.stringify(nativeDotDot));
-      assert.equal(wasmDotDot.code, 'mds::import', JSON.stringify(wasmDotDot));
-      assert.equal(wasmDotDot.output, undefined, JSON.stringify(wasmDotDot));
+      assert.deepEqual(wasmDotDot, nativeDotDot);
       assert.deepEqual(nativeEntry, { output: 'DEEP-Z\n' });
       assert.deepEqual(wasmEntry, nativeEntry);
+      assert.deepEqual(nativeThrough, { output: 'DEEP-Z\n' });
+      assert.equal(wasmThrough.code, 'mds::import', JSON.stringify(wasmThrough));
+      assert.equal(wasmThrough.output, undefined, JSON.stringify(wasmThrough));
     });
   });
 });

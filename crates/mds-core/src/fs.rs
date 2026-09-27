@@ -442,13 +442,123 @@ fn resolve_relative_segments<'a>(
 #[derive(Debug)]
 pub struct VirtualFs {
     modules: HashMap<String, String>,
+    /// A key an import resolves to → the key of the module in `modules` it names
+    /// (see [`VirtualFs::with_aliases`]).
+    aliases: HashMap<String, String>,
 }
 
 impl VirtualFs {
     /// Create a new `VirtualFs` from a map of key → content.
     pub fn new(modules: HashMap<String, String>) -> Self {
-        Self { modules }
+        Self {
+            modules,
+            aliases: HashMap::new(),
+        }
     }
+
+    /// Let an import that resolves to the key `alias` reach the module keyed
+    /// `aliases[alias]` instead: that module's key is the one the import resolves to,
+    /// and so the one its dependency, its source-map source and a cycle through it are
+    /// named by. An entry key is taken as given.
+    ///
+    /// `@mdscript/mds`'s WASM backend reads the modules of a `compileFile` itself and
+    /// keys each by its path on disk below the project root. An import can name a file
+    /// by another spelling — a case variant on a case-insensitive volume, or a path
+    /// through a symbolic link — which the backend passes as an alias, so every module
+    /// is named by its on-disk path, as the native backend names it (#414).
+    ///
+    /// Every alias and every module key it names is checked as a key an import can
+    /// resolve to — not empty, free of [`crate::is_forbidden_path_char`] codepoints, and
+    /// made of at most 256 segments, none of them empty, `.` or `..` — however the
+    /// spelling that led to it was checked: folding a name's case is a lossy mapping,
+    /// so the key a module is reached by is validated as the key it is. Every alias must
+    /// name a module, and no alias may be a module key itself.
+    ///
+    /// # Errors
+    ///
+    /// [`MdsError::Io`] for the first offending alias in key order, naming it escaped
+    /// with [`crate::escape_path_for_message`]: `module alias "<alias>": <reason>`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mds::FileSystem;
+    ///
+    /// let modules = HashMap::from([("header.mds".to_string(), "Hi\n".to_string())]);
+    /// let aliases = HashMap::from([("Header.mds".to_string(), "header.mds".to_string())]);
+    /// let fs = mds::VirtualFs::new(modules.clone()).with_aliases(aliases)?;
+    /// assert_eq!(fs.normalize_in_dir("", "./Header.mds")?, "header.mds");
+    ///
+    /// let missing = HashMap::from([("Header.mds".to_string(), "gone.mds".to_string())]);
+    /// let err = mds::VirtualFs::new(modules).with_aliases(missing).unwrap_err();
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "module alias \"Header.mds\": its module key \"gone.mds\" names no module"
+    /// );
+    /// # Ok::<(), mds::MdsError>(())
+    /// ```
+    pub fn with_aliases(mut self, aliases: HashMap<String, String>) -> Result<Self, MdsError> {
+        let mut keys: Vec<&String> = aliases.keys().collect();
+        keys.sort_unstable();
+        for alias in keys {
+            if let Some(reason) = alias_violation(&self.modules, alias, &aliases[alias]) {
+                return Err(MdsError::io(format!(
+                    "module alias \"{}\": {reason}",
+                    crate::lint::escape_path_for_message(alias)
+                )));
+            }
+        }
+        self.aliases = aliases;
+        Ok(self)
+    }
+
+    /// The source of the module keyed `key`, if there is one.
+    pub(crate) fn module(&self, key: &str) -> Option<&str> {
+        self.modules.get(key).map(String::as_str)
+    }
+}
+
+/// Why `alias` → `target` cannot join a `VirtualFs` holding `modules`, if it cannot
+/// (see [`VirtualFs::with_aliases`]).
+fn alias_violation(modules: &HashMap<String, String>, alias: &str, target: &str) -> Option<String> {
+    if let Some(reason) = module_key_violation(alias) {
+        return Some(format!("the alias {reason}"));
+    }
+    if modules.contains_key(alias) {
+        return Some("the alias is a module key itself".to_owned());
+    }
+    let shown = crate::lint::escape_path_for_message(target);
+    if let Some(reason) = module_key_violation(target) {
+        return Some(format!("its module key \"{shown}\" {reason}"));
+    }
+    (!modules.contains_key(target)).then(|| format!("its module key \"{shown}\" names no module"))
+}
+
+/// Why `key` is not a key an import can resolve to on a [`VirtualFs`] — the form
+/// `normalize_in_dir` produces — if it is not.
+fn module_key_violation(key: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("is empty".to_owned());
+    }
+    if let Some(ch) = first_forbidden_char(key) {
+        return Some(format!(
+            "contains forbidden character U+{:04X}",
+            u32::from(ch)
+        ));
+    }
+    let mut segments = 0usize;
+    for segment in key.split('/') {
+        match segment {
+            ".." => return Some("has a '..' segment".to_owned()),
+            "" | "." => {
+                return Some("is not normalized: it has an empty or '.' segment".to_owned())
+            }
+            _ => segments += 1,
+        }
+    }
+    (segments > MAX_PATH_SEGMENTS)
+        .then(|| format!("exceeds maximum segment count ({MAX_PATH_SEGMENTS})"))
 }
 
 impl FileSystem for VirtualFs {
@@ -472,7 +582,12 @@ impl FileSystem for VirtualFs {
         // `join("/")` inside `resolve_relative_segments` allocates.
         let dir_segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
 
-        resolve_relative_segments(dir_segments, relative)
+        let key = resolve_relative_segments(dir_segments, relative)?;
+        // An alias resolves to the key of the module it names (`with_aliases`).
+        Ok(match self.aliases.get(&key) {
+            Some(target) => target.clone(),
+            None => key,
+        })
     }
 
     fn parent_dir(&self, key: &str) -> String {
@@ -1002,6 +1117,194 @@ mod tests {
             matches!(err, MdsError::ModuleNotFound { .. }),
             "expected ModuleNotFound, got {err:?}"
         );
+    }
+
+    // ── VirtualFs::with_aliases (#414) ────────────────────────────────────────
+
+    /// A module map holding each of `keys`.
+    fn modules_of(keys: &[&str]) -> HashMap<String, String> {
+        keys.iter()
+            .map(|k| ((*k).to_owned(), format!("{k}\n")))
+            .collect()
+    }
+
+    /// An alias map of `(alias, module key)` pairs.
+    fn aliases_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, t)| ((*a).to_owned(), (*t).to_owned()))
+            .collect()
+    }
+
+    /// An import that resolves to an alias resolves to the module it names; any other
+    /// import, and an entry key, resolves as without aliases.
+    #[test]
+    fn vfs_alias_resolves_an_import_to_the_module_it_names() {
+        let modules = modules_of(&["main.mds", "sub/header.mds"]);
+        let fs = VirtualFs::new(modules.clone())
+            .with_aliases(aliases_of(&[("SUB/Header.mds", "sub/header.mds")]))
+            .expect("a valid alias");
+        assert_eq!(
+            fs.normalize_in_dir("", "./SUB/Header.mds").unwrap(),
+            "sub/header.mds"
+        );
+        assert_eq!(
+            fs.normalize_in_dir("sub", "../SUB/Header.mds").unwrap(),
+            "sub/header.mds"
+        );
+        assert_eq!(
+            fs.normalize_in_dir("", "./sub/header.mds").unwrap(),
+            "sub/header.mds"
+        );
+        assert_eq!(
+            fs.resolve_entry("SUB/Header.mds").unwrap(),
+            "SUB/Header.mds"
+        );
+        // Control: without the alias, the spelling is a key of its own.
+        assert_eq!(
+            VirtualFs::new(modules)
+                .normalize_in_dir("", "./SUB/Header.mds")
+                .unwrap(),
+            "SUB/Header.mds"
+        );
+    }
+
+    /// Every alias and every module key it names is checked as a key an import can
+    /// resolve to — a hostile or malformed one is refused, never trusted from the
+    /// spelling that led to it — a target must be a module and an alias must not be;
+    /// the offending alias is named escaped (PF-013: the hostile character is shown as
+    /// escape text, never raw).
+    #[test]
+    fn vfs_with_aliases_refuses_an_alias_that_is_not_a_module_key() {
+        let esc = char::from_u32(0x1b).expect("U+001B is a char");
+        let hostile = format!("a{esc}b.mds");
+        let shown = format!("a{}u001Bb.mds", '\\');
+        let long = ["s"; 257].join("/");
+        let modules = modules_of(&["a.mds", "sub/b.mds"]);
+        let cases: Vec<(String, String, String)> = vec![
+            ("".into(), "a.mds".into(), "module alias \"\": the alias is empty".into()),
+            (
+                hostile.clone(),
+                "a.mds".into(),
+                format!("module alias \"{shown}\": the alias contains forbidden character U+001B"),
+            ),
+            ("../a.mds".into(), "a.mds".into(), "module alias \"../a.mds\": the alias has a '..' segment".into()),
+            ("x/../a.mds".into(), "a.mds".into(), "module alias \"x/../a.mds\": the alias has a '..' segment".into()),
+            (
+                "x/./a.mds".into(),
+                "a.mds".into(),
+                "module alias \"x/./a.mds\": the alias is not normalized: it has an empty or '.' segment".into(),
+            ),
+            (
+                "/A.mds".into(),
+                "a.mds".into(),
+                "module alias \"/A.mds\": the alias is not normalized: it has an empty or '.' segment".into(),
+            ),
+            (
+                long.clone(),
+                "a.mds".into(),
+                format!("module alias \"{long}\": the alias exceeds maximum segment count (256)"),
+            ),
+            (
+                "A.mds".into(),
+                "../a.mds".into(),
+                "module alias \"A.mds\": its module key \"../a.mds\" has a '..' segment".into(),
+            ),
+            (
+                "A.mds".into(),
+                hostile.clone(),
+                format!("module alias \"A.mds\": its module key \"{shown}\" contains forbidden character U+001B"),
+            ),
+            (
+                "A.mds".into(),
+                "gone.mds".into(),
+                "module alias \"A.mds\": its module key \"gone.mds\" names no module".into(),
+            ),
+            (
+                "a.mds".into(),
+                "sub/b.mds".into(),
+                "module alias \"a.mds\": the alias is a module key itself".into(),
+            ),
+        ];
+        for (alias, target, message) in cases {
+            let err = VirtualFs::new(modules.clone())
+                .with_aliases(HashMap::from([(alias.clone(), target.clone())]))
+                .expect_err(&message);
+            assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+            assert_eq!(err.to_string(), message);
+            assert!(!err.to_string().contains(esc), "{message}");
+        }
+        // Of several offending aliases, the first in key order is named.
+        let err = VirtualFs::new(modules.clone())
+            .with_aliases(aliases_of(&[("b.mds", "nope.mds"), ("A.mds", "gone.mds")]))
+            .expect_err("two aliases name no module");
+        assert_eq!(
+            err.to_string(),
+            "module alias \"A.mds\": its module key \"gone.mds\" names no module"
+        );
+        // No alias leads to another: one naming an alias names no module, and one
+        // named by an alias is a module key, so either link of a chain is refused.
+        for (chain, message) in [
+            (
+                aliases_of(&[("A.mds", "B.mds"), ("B.mds", "a.mds")]),
+                "module alias \"A.mds\": its module key \"B.mds\" names no module",
+            ),
+            (
+                aliases_of(&[("X.mds", "a.mds"), ("a.mds", "sub/b.mds")]),
+                "module alias \"a.mds\": the alias is a module key itself",
+            ),
+        ] {
+            let err = VirtualFs::new(modules.clone())
+                .with_aliases(chain)
+                .expect_err(message);
+            assert_eq!(err.to_string(), message);
+        }
+        // Control: a clean alias to either module is accepted.
+        VirtualFs::new(modules)
+            .with_aliases(aliases_of(&[
+                ("A.mds", "a.mds"),
+                ("SUB/B.mds", "sub/b.mds"),
+            ]))
+            .expect("clean aliases");
+    }
+
+    /// The key rule is exactly the form `normalize_in_dir` gives a key: a key passes it
+    /// if and only if resolving it from the key-space root returns it unchanged and it
+    /// carries no forbidden path character.
+    #[test]
+    fn vfs_module_key_rule_is_the_form_an_import_resolves_to() {
+        let at_cap = ["s"; 256].join("/");
+        let over_cap = ["s"; 257].join("/");
+        let hostile = format!("a{}b", char::from_u32(0x202e).expect("U+202E is a char"));
+        let keys = [
+            "a.mds",
+            "sub/a.mds",
+            "a b/\u{e9}.mds",
+            "back\\slash.mds",
+            "",
+            ".",
+            "..",
+            "./a.mds",
+            "a/./b",
+            "a/../b",
+            "a//b",
+            "/a",
+            "a/",
+            "../a",
+            &at_cap,
+            &over_cap,
+            &hostile,
+        ];
+        for key in keys {
+            let resolves_to_itself = first_forbidden_char(key).is_none()
+                && resolve_relative_segments(Vec::new(), key).ok().as_deref() == Some(key);
+            assert_eq!(
+                module_key_violation(key).is_none(),
+                resolves_to_itself,
+                "{key:?}: {:?}",
+                module_key_violation(key)
+            );
+        }
     }
 
     // ── VirtualFs::is_markdown ────────────────────────────────────────────────
