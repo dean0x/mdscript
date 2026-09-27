@@ -827,17 +827,16 @@ fn extract_rules_direct(
                         ),
                     ));
                 };
-                // Parse severity via serde — validates against the closed enum.
-                let severity: mds::Severity =
-                    serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
-                        throw_options_error(
-                            env,
-                            &format!(
-                                "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
-                                 valid values are \"off\", \"info\", \"warn\", \"error\""
-                            ),
-                        )
-                    })?;
+                // mds-core's one severity parser: the four exact spellings only (#175).
+                let severity: mds::Severity = s.parse().map_err(|_| {
+                    throw_options_error(
+                        env,
+                        &format!(
+                            "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
+                             valid values are \"off\", \"info\", \"warn\", \"error\""
+                        ),
+                    )
+                })?;
                 rules.insert(key, severity);
             }
             // D8: detect unknown rule names and build config in one step via

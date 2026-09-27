@@ -1338,16 +1338,16 @@ fn extract_rules(
                 ),
             ));
         };
-        let severity: mds::Severity = serde_json::from_value(serde_json::Value::String(s.clone()))
-            .map_err(|_| {
-                options_error(
-                    py,
-                    &format!(
-                        "rules[{key:?}]: unknown severity {s:?}; \
-                         expected \"off\", \"info\", \"warn\", or \"error\""
-                    ),
-                )
-            })?;
+        // mds-core's one severity parser: the four exact spellings only (#175).
+        let severity: mds::Severity = s.parse().map_err(|_| {
+            options_error(
+                py,
+                &format!(
+                    "rules[{key:?}]: unknown severity {s:?}; \
+                     expected \"off\", \"info\", \"warn\", or \"error\""
+                ),
+            )
+        })?;
         rules_map.insert(key, severity);
     }
     // D8: detect unknown rule names and build config in one step via

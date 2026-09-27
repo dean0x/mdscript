@@ -39,7 +39,7 @@ pub use config::{
 pub use diagnostic::{
     escape_path_for_message, is_forbidden_path_char, named_source_for_render,
     neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire, FixLineSpan,
-    LintDiagnostic, LintResult, Severity, TextEdit,
+    LintDiagnostic, LintResult, ParseSeverityError, Severity, TextEdit,
 };
 
 use crate::error::MdsError;

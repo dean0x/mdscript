@@ -494,8 +494,8 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
                 json_type_name(&val)
             )));
         };
-        // Parse the severity via serde (validates against the closed enum).
-        let severity: mds::Severity = serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
+        // mds-core's one severity parser: the four exact spellings only (#175).
+        let severity: mds::Severity = s.parse().map_err(|_| {
             options_error(&format!(
                 "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
                  valid values are \"off\", \"info\", \"warn\", \"error\""

@@ -647,4 +647,97 @@ describe('error shape', () => {
     });
     assert.deepEqual(wasm, native, 'U-E-CAP: native and WASM must throw identical errors');
   });
+
+  test('U-E-SEV: napi, WASM and Python accept exactly the four severity spellings', async (t) => {
+    // #175, a PF-007 differential: every binding parses a `rules` severity through
+    // mds-core's one `Severity` parser. The four exact spellings configure the rule
+    // identically on all three; every other spelling is `mds::invalid_options` —
+    // including the escaped spelling (backslash, `u`, `0077`, then `arn`), which napi
+    // and WASM decoded into "warn" by parsing the value as a JSON string, while
+    // Python refused it. Every surface is required in CI; locally a missing one skips.
+    const engines = await loadEngines();
+    const python = findPythonForMarkdownScript();
+    if (!requireEngines(t, { ...engines, python }, 'U-E-SEV')) return;
+    const rule = 'unused-variable';
+    const modules = { 'main.mds': '---\nunused_key: value\n---\nHello!\n' };
+    const accepted = ['off', 'info', 'warn', 'error'];
+    const rejected = [escapeText(0x77) + 'arn', 'Warn', ' warn', 'warn ', ''];
+    const lintBoth = (sev) => {
+      const opts = { rules: { [rule]: sev } };
+      return {
+        napi: () => engines.native.lintVirtual(modules, 'main.mds', opts),
+        wasm: () => engines.wasm.lintVirtual(modules, 'main.mds', opts),
+      };
+    };
+    const py = pythonJson(
+      python,
+      [
+        'for sev in case["accepted"]:',
+        '    r = m.lint_virtual(case["modules"], "main.mds", rules={case["rule"]: sev})',
+        '    out.setdefault("accepted", []).append(r.to_dict())',
+        'for sev in case["rejected"]:',
+        '    try:',
+        '        m.lint_virtual(case["modules"], "main.mds", rules={case["rule"]: sev})',
+        '        out.setdefault("rejected", []).append(None)',
+        '    except m.MdsError as e:',
+        '        out.setdefault("rejected", []).append({"code": e.code, "message": e.message})',
+      ],
+      { rule, modules, accepted, rejected },
+      'U-E-SEV',
+    );
+
+    for (const [i, sev] of accepted.entries()) {
+      const { napi, wasm } = lintBoth(sev);
+      const native = JSON.parse(JSON.stringify(napi()));
+      // Non-vacuity (PF-013): the spelling configured the rule — no finding when
+      // `off`, one finding at exactly that severity otherwise.
+      const severities = native.files
+        .flatMap((f) => f.diagnostics)
+        .filter((d) => d.rule === rule)
+        .map((d) => d.severity);
+      assert.deepEqual(severities, sev === 'off' ? [] : [sev], `U-E-SEV "${sev}": napi`);
+      assert.deepEqual(JSON.parse(JSON.stringify(wasm())), native, `U-E-SEV "${sev}": WASM`);
+      assert.deepEqual(py.accepted[i], native, `U-E-SEV "${sev}": Python`);
+    }
+    for (const [i, sev] of rejected.entries()) {
+      const { napi, wasm } = lintBoth(sev);
+      const label = `U-E-SEV ${JSON.stringify(sev)}`;
+      const native = errorShape(thrownBy(napi, `${label} napi`));
+      assert.deepEqual(native, {
+        code: 'mds::invalid_options',
+        message:
+          `options.rules["${rule}"]: unknown severity "${sev}"; ` +
+          'valid values are "off", "info", "warn", "error"',
+        help: null,
+        span: null,
+      });
+      assert.deepEqual(errorShape(thrownBy(wasm, `${label} wasm`)), native, `${label}: WASM`);
+      assert.equal(py.rejected[i]?.code, 'mds::invalid_options', `${label}: Python`);
+      assert.ok(
+        py.rejected[i].message.startsWith(`rules["${rule}"]: unknown severity `),
+        `${label}: Python message: ${py.rejected[i].message}`,
+      );
+    }
+  });
 });
+
+/**
+ * Run a Python snippet against `markdown_script` (imported as `m`) with `input`
+ * decoded from stdin as `case`; the snippet fills the dict `out`, which is returned
+ * parsed. The exchange is JSON both ways — UTF-8 in, ASCII out (`json.dumps`
+ * escapes every non-ASCII character) — so no platform newline or encoding
+ * translation can touch the values under test (PF-020).
+ */
+function pythonJson(python, body, input, label) {
+  const script = [
+    'import json, sys',
+    'import markdown_script as m',
+    'case = json.loads(sys.stdin.buffer.read().decode("utf-8"))',
+    'out = {}',
+    ...body,
+    'print(json.dumps(out))',
+  ].join('\n');
+  const py = spawnSync(python, ['-c', script], { input: JSON.stringify(input), encoding: 'utf-8' });
+  assert.equal(py.status, 0, `${label}: Python failed: ${py.stderr}`);
+  return JSON.parse(py.stdout);
+}

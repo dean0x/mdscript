@@ -4,8 +4,8 @@ use std::path::Path;
 
 use mds::{
     CompileResult, CompiledOutput, FileSystem, FixLineSpan, LintConfig, LintDiagnostic, LintResult,
-    MdsError, ModuleCache, NativeFs, Severity, Value, VirtualFs, MAX_DIAGNOSTICS, MAX_FILE_SIZE,
-    MAX_TRAVERSAL_DEPTH,
+    MdsError, ModuleCache, NativeFs, ParseSeverityError, Severity, Value, VirtualFs,
+    MAX_DIAGNOSTICS, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
 };
 
 #[test]
@@ -1692,6 +1692,18 @@ fn lint_types_exist() {
     let _info = Severity::Info;
     let _warn = Severity::Warn;
     let _err = Severity::Error;
+
+    // #175: Severity parses its four exact spellings through FromStr; anything else is
+    // a ParseSeverityError, which is Display + Error and not constructible outside
+    // mds-core (#[non_exhaustive]) — an external crate obtains one only from parse().
+    assert_eq!("info".parse::<Severity>(), Ok(Severity::Info));
+    let err: ParseSeverityError = "Info".parse::<Severity>().unwrap_err();
+    let as_error: &dyn std::error::Error = &err;
+    assert_eq!(
+        as_error.to_string(),
+        "unknown severity; expected \"off\", \"info\", \"warn\" or \"error\""
+    );
+    assert_eq!(err, " info".parse::<Severity>().unwrap_err());
 
     // LintConfig has a `rules` field (HashMap<String, Severity>).
     let (config, _) = LintConfig::from_rules_checked(HashMap::from([(
