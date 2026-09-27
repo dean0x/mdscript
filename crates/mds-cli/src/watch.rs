@@ -834,6 +834,56 @@ fn clamp_poll_interval(poll_interval: u64) -> Option<Duration> {
     }
 }
 
+// ── Working directory ─────────────────────────────────────────────────────────
+
+/// The working directory `mds watch` started in, by its canonical path.
+///
+/// Every path typed relative — the entry, a directory argument such as `.`, `--vars`, a
+/// file-mode `-o` — is resolved against the process's working directory on every
+/// rebuild. Once that directory is deleted, the process is left in it, and none of them
+/// resolves again, even after a directory is recreated at the same path, as a
+/// `git checkout` that removes and restores it does (#417).
+/// [`restore_if_recreated`](Self::restore_if_recreated) moves the process back into it.
+struct WorkingDir {
+    /// `None` when the working directory did not resolve at startup: nothing is restored.
+    canonical: Option<PathBuf>,
+}
+
+impl WorkingDir {
+    /// Record the working directory at startup, before any rebuild reads a path typed
+    /// relative to it.
+    fn record() -> Self {
+        WorkingDir {
+            canonical: std::env::current_dir()
+                .and_then(|dir| dir.canonicalize())
+                .ok(),
+        }
+    }
+
+    /// Called first by every rebuild, before it reads anything. When the working
+    /// directory has been deleted and a directory exists again at its recorded canonical
+    /// path, reached through no symlink (canonical compared with canonical, #408), it
+    /// becomes the working directory again. A working directory that still exists is
+    /// never changed. Otherwise nothing changes, and a path typed relative that does not
+    /// resolve is reported as typed by the read that needs it, as any missing file is.
+    ///
+    /// A directory swapped in between the check and the move is the check-then-open
+    /// window every path-based read has; the compile checks that the path it compiles
+    /// still leads to the file being watched either way.
+    fn restore_if_recreated(&self) {
+        let Some(recorded) = &self.canonical else {
+            return;
+        };
+        if std::env::current_dir().is_ok() {
+            return;
+        }
+        if recorded.canonicalize().is_ok_and(|now| now == *recorded) {
+            // A failure leaves the process where it was; see above.
+            let _ = std::env::set_current_dir(recorded);
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
@@ -965,6 +1015,8 @@ impl WatchEntry {
 struct FileCompileCtx {
     /// The watched entry, as typed and canonical.
     entry: WatchEntry,
+    /// The working directory at startup, restored first by every rebuild.
+    working_dir: WorkingDir,
     /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
     /// used for `dirs_to_watch`/`files_of_interest` (never for display, #326).
     vars_path: Option<PathBuf>,
@@ -1180,11 +1232,15 @@ fn handle_fs_event_file(
 /// - PF-004: all reads go through `compile_to_content`.
 /// - Error-settle: every failure — the vars file, the compile, the output route or its
 ///   #425 refusal, the write — goes through [`settle_after_error`].
+/// - A recreated working directory is restored before anything is read
+///   ([`WorkingDir::restore_if_recreated`]).
 fn rebuild_file(
     ctx: &FileCompileCtx,
     watcher: &mut RecommendedWatcher,
     state: &mut FileWatchState,
 ) {
+    ctx.working_dir.restore_if_recreated();
+
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
     // Print the error, settle mtime to avoid re-fire, and keep watching.
     //
@@ -1327,6 +1383,7 @@ fn run_watch_file(
     quiet: bool,
     tick: Option<Duration>,
 ) -> Result<()> {
+    let working_dir = WorkingDir::record();
     // #326: keep the --vars argument as the user typed it, separately from the
     // canonicalized form below. `vars_path` (canonical) is used for everything that
     // must match notify's canonicalized event paths (dirs_to_watch, files_of_interest,
@@ -1608,6 +1665,7 @@ fn run_watch_file(
     // #[allow(clippy::too_many_arguments)] suppressions).
     let ctx = FileCompileCtx {
         entry,
+        working_dir,
         vars_path,
         vars_path_raw,
         static_set_vars,
@@ -2031,6 +2089,8 @@ struct DirStartup {
 /// from the extracted helper functions (issue #6 / zero-warnings policy).
 struct DirWatchCtx {
     root: WatchRoot,
+    /// The working directory at startup, restored first by every rebuild.
+    working_dir: WorkingDir,
     /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
     /// used for matching/watching (never for display, #326).
     vars_path: Option<PathBuf>,
@@ -2202,46 +2262,70 @@ fn liveness_probe_dir(
     }
 
     if !batch.is_empty() {
-        // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-        let resolved = match build_runtime_vars(RuntimeVarArgs {
-            vars: ctx.vars_path_raw.clone(),
-            set_vars: ctx.static_set_vars.clone(),
-            set_string_vars: ctx.static_set_string_vars.clone(),
-        }) {
-            // --set/--set-string are fixed for the session and warned once at
-            // startup — discarded (via `resolved.vars` below). The vars file is
-            // reloaded on every rebuild (freshness rule); this self-heal path emits under
-            // the same content-changed gate as `handle_fs_event_dir`, so one
-            // logical edit observed by both paths still warns once — tests I17 and
-            // I19. Without this, a self-heal recompile driven purely by this
-            // content-backstop/full-reconcile tick (no FS event ever delivered,
-            // e.g. after a root delete+recreate) could print "Recompiled" with no
-            // vars-file duplicate warning at all.
-            Ok(v) => v,
-            Err(e) => {
-                eprint_error(e);
-                // Re-baseline so the next tick does not report the same change again
-                // and turn one unreadable vars file into per-tick error spam.
-                state.last_mtimes = snapshot_state(&state.tracked_set());
-                return;
-            }
-        };
-        let any_changed = process_dir_batch(
-            &batch,
-            false, /* vars_changed */
-            &ctx.root,
-            &ctx.output_base,
-            &resolved.vars,
-            ctx.quiet,
-            state,
-        );
-        if any_changed {
-            crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
-        }
+        // The event handler's rebuild path, so a recompile driven purely by this
+        // content-backstop/full-reconcile tick (no FS event ever delivered, e.g. after a
+        // root delete+recreate) re-reports the vars-file duplicate keys under the same
+        // content-changed gate, and one logical edit observed by both paths still warns
+        // once — tests I17 and I19.
+        rebuild_dir_batch(ctx, &batch, false /* vars_changed */, state);
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
     // post-batch tracked set, and an empty batch means nothing appeared, was removed, or
     // changed — so the existing baseline is by definition still accurate.
+}
+
+/// Rebuild `batch` in directory mode — the one rebuild path of the event handler and of
+/// the idle tick's content backstop alike.
+///
+/// A recreated working directory is restored first ([`WorkingDir::restore_if_recreated`]),
+/// before anything is read. The vars file is then reloaded (freshness rule), and a
+/// failure to read it is reported and settled: it may be temporarily absent (AC-W7 /
+/// AC-C5). `--set`/`--set-string` are fixed for the session and warned once at startup —
+/// discarded here (via `resolved.vars`). The vars file's duplicate keys are re-reported
+/// only when the batch produced an OBSERVABLE rebuild (#326, test I17): at `--debounce 0`
+/// a single edit can generate more than one raw FS event, each reaching the event handler
+/// separately, and the idle tick can observe the same edit again, so the warning is
+/// emitted after `process_dir_batch` reports whether anything actually changed rather
+/// than unconditionally — one logical edit warns once.
+fn rebuild_dir_batch(
+    ctx: &DirWatchCtx,
+    batch: &BTreeSet<PathBuf>,
+    vars_changed: bool,
+    state: &mut DirWatchState,
+) {
+    ctx.working_dir.restore_if_recreated();
+
+    let resolved = match build_runtime_vars(RuntimeVarArgs {
+        vars: ctx.vars_path_raw.clone(),
+        set_vars: ctx.static_set_vars.clone(),
+        set_string_vars: ctx.static_set_string_vars.clone(),
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            eprint_error(e);
+            // Re-baseline so the idle-tick content backstop does not report the same
+            // change again and turn one unreadable vars file into per-tick error spam.
+            state.last_mtimes = snapshot_state(&state.tracked_set());
+            return;
+        }
+    };
+
+    // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
+    // directly rather than cloning it — `resolved` (and its `.vars_file`,
+    // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
+    // needed below, after this borrow ends, for the warning emission.
+    let any_changed = process_dir_batch(
+        batch,
+        vars_changed,
+        &ctx.root,
+        &ctx.output_base,
+        &resolved.vars,
+        ctx.quiet,
+        state,
+    );
+    if any_changed {
+        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+    }
 }
 
 /// Outcome returned by `handle_fs_event_dir` to tell the loop what to do next.
@@ -2256,8 +2340,8 @@ enum DirEventOutcome {
 
 /// Process a single incoming `Msg` for directory mode.
 ///
-/// Collects changed paths, drains the debounce window, filters irrelevant paths,
-/// reloads vars, and calls `process_dir_batch`. Returns `DirEventOutcome` so the
+/// Collects changed paths, drains the debounce window, filters irrelevant paths, and
+/// rebuilds what is left through [`rebuild_dir_batch`]. Returns `DirEventOutcome` so the
 /// caller knows whether to `continue`, `return`, or proceed.
 fn handle_fs_event_dir(
     msg: Msg,
@@ -2338,48 +2422,7 @@ fn handle_fs_event_dir(
         clear_terminal();
     }
 
-    // Freshness rule: reload vars from disk on every rebuild.
-    // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-    let resolved = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_raw.clone(),
-        set_vars: ctx.static_set_vars.clone(),
-        set_string_vars: ctx.static_set_string_vars.clone(),
-    }) {
-        // --set/--set-string are fixed for the session and warned once at startup —
-        // discarded (via `resolved.vars` below). The vars file is reloaded on every
-        // rebuild (freshness rule), so its duplicate keys are re-reported too — but only when
-        // this batch produces an OBSERVABLE rebuild (#326, test I17): at
-        // `--debounce 0` a single edit can generate more than one raw FS event, each
-        // reaching this function separately, so the warning is emitted after
-        // `process_dir_batch` reports whether anything actually changed rather than
-        // unconditionally here.
-        Ok(v) => v,
-        Err(e) => {
-            eprint_error(e);
-            // Re-baseline so the idle-tick content backstop does not report the same
-            // change again and turn one unreadable vars file into per-tick error spam.
-            state.last_mtimes = snapshot_state(&state.tracked_set());
-            return DirEventOutcome::Done;
-        }
-    };
-
-    // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
-    // directly rather than cloning it — `resolved` (and its `.vars_file`,
-    // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
-    // needed below, after this borrow ends, for the warning emission.
-    let any_changed = process_dir_batch(
-        &mds_changed,
-        vars_changed,
-        &ctx.root,
-        &ctx.output_base,
-        &resolved.vars,
-        ctx.quiet,
-        state,
-    );
-    if any_changed {
-        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
-    }
-
+    rebuild_dir_batch(ctx, &mds_changed, vars_changed, state);
     DirEventOutcome::Done
 }
 
@@ -2403,6 +2446,7 @@ fn dir_watch_startup(
     debounce_ms: u64,
     quiet: bool,
 ) -> Result<DirStartup> {
+    let working_dir = WorkingDir::record();
     let root = watch_root.canonical.as_path();
     // Load config once from the root directory, as typed, so a config error names
     // `mds.json` as the input reaches it (`./mds.json`, `src/../mds.json`), never by its
@@ -2741,6 +2785,7 @@ fn dir_watch_startup(
 
     let ctx = DirWatchCtx {
         root: watch_root,
+        working_dir,
         vars_path,
         vars_path_raw,
         static_set_vars,

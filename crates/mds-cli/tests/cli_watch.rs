@@ -174,6 +174,8 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// - `watch_file_mode_parent_dir_delete_recreate_recovers`
 /// - `watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers`
 /// - `watch_dir_mode_root_delete_recreate_recovers`
+/// - `watch_file_mode_relative_paths_recover_after_the_working_directory_is_recreated`
+/// - `watch_dot_recovers_after_the_working_directory_is_recreated`
 /// - `watch_vars_dir_delete_recreate_rearms`
 ///
 /// Every other wait in this file is satisfied by an inotify event on a watch that was
@@ -2451,6 +2453,169 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
         "watcher must recover after root delete+recreate and compile new file"
     );
 
+    drop(child);
+}
+
+// ── AC-W1 / AC-W2 with paths typed relative to a recreated working directory ──
+
+/// AC-W1 with every path typed relative to the working directory, which is the entry's
+/// own directory: `mds watch entry.mds --vars vars.json -o ../out.md` run inside `src`
+/// (#417). Deleting `src` leaves the process in a dead directory, in which no relative
+/// path resolves, even once `src` is recreated. The watcher moves back into the
+/// recreated directory before the next rebuild, so the entry, the vars file and the
+/// output all resolve again: the output is compiled from the recreated entry AND the
+/// recreated vars file. Control: `watch_file_mode_parent_dir_delete_recreate_recovers`,
+/// the same scenario with the entry typed absolute.
+///
+/// Unix-only: Windows cannot delete a process's working directory.
+#[cfg(unix)]
+#[test]
+fn watch_file_mode_relative_paths_recover_after_the_working_directory_is_recreated() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    std::fs::create_dir(&src_dir).unwrap();
+    std::fs::write(src_dir.join("entry.mds"), "Entry {{name}}\n").unwrap();
+    std::fs::write(src_dir.join("vars.json"), r#"{"name": "Before"}"#).unwrap();
+    let out = base.path().join("out.md");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&src_dir)
+            .args([
+                "watch",
+                "entry.mds",
+                "--vars",
+                "vars.json",
+                "-o",
+                "../out.md",
+            ])
+            .args(["--debounce", "0", "--poll-interval", "100", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Entry Before", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&src_dir).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir(&src_dir).unwrap();
+    write_atomic(&src_dir.join("vars.json"), r#"{"name": "After"}"#);
+    write_atomic(&src_dir.join("entry.mds"), "Recreated {{name}}\n");
+
+    // TICK-DEPENDENT: the watch on `src` died with it (see
+    // `watch_file_mode_parent_dir_delete_recreate_recovers`).
+    assert!(
+        wait_for_file_contains(&out, "Recreated After", TICK_TIMEOUT),
+        "the watcher moves back into the recreated working directory and reads the entry \
+         and the vars file through it; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// AC-W2 with the root typed `.`: `mds watch .` run inside the watched directory (#413).
+/// Deleting it leaves the process in a dead directory, in which `.` never resolves again,
+/// even once the directory is recreated. The watcher moves back into it before the next
+/// rebuild, so the new file is compiled — with the recreated `--vars vars.json`, typed
+/// relative too. Control: `watch_dir_mode_root_delete_recreate_recovers`, the same
+/// scenario with the root typed absolute.
+///
+/// Unix-only: Windows cannot delete a process's working directory.
+#[cfg(unix)]
+#[test]
+fn watch_dot_recovers_after_the_working_directory_is_recreated() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("watched");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.mds"), "Old {{n}}\n").unwrap();
+    std::fs::write(root.join("vars.json"), r#"{"n": "A"}"#).unwrap();
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&root)
+            .args(["watch", ".", "--vars", "vars.json", "--out-dir"])
+            .arg(&out_dir)
+            .args(["--debounce", "0", "--poll-interval", "100", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out_dir.join("a.md"), "Old A", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir(&root).unwrap();
+    write_atomic(&root.join("vars.json"), r#"{"n": "N"}"#);
+    write_atomic(&root.join("new.mds"), "New file {{n}}\n");
+
+    // TICK-DEPENDENT: the recursive watch died with the old root (see
+    // `watch_dir_mode_root_delete_recreate_recovers`).
+    assert!(
+        wait_for_file_contains(&out_dir.join("new.md"), "New file N", TICK_TIMEOUT),
+        "the watcher moves back into the recreated working directory and compiles the \
+         new file through `.`; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// A working directory recreated as a symbolic link to another directory is not moved
+/// back into (#417): only a directory that resolves to the recorded canonical path again
+/// is the working directory `mds watch` started in. Moving through the link would read a
+/// relative `--vars` from, and write a relative `-o` into, the link's target, and neither
+/// is checked the way the entry is. The entry is typed absolute here and its directory is
+/// never lost, so its edit is an ordinary event rebuild, and only the working directory
+/// decides where `-o out.md` lands: the write fails in the dead directory, and nothing is
+/// written through the link. Positive control: before the swap, the startup compile
+/// writes `out.md`.
+///
+/// Unix-only: Windows cannot delete a process's working directory.
+#[cfg(unix)]
+#[test]
+fn watch_does_not_follow_a_working_directory_recreated_as_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let base = tempfile::tempdir().unwrap();
+    let entry = base.path().join("entry.mds");
+    std::fs::write(&entry, "Entry\n").unwrap();
+    let proj = base.path().join("proj");
+    let other = base.path().join("other");
+    std::fs::create_dir(&proj).unwrap();
+    std::fs::create_dir(&other).unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&proj)
+            .arg("watch")
+            .arg(&entry)
+            .args(["-o", "out.md", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&proj.join("out.md"), "Entry", TIMEOUT),
+        "control: the startup compile writes out.md; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&proj).unwrap();
+    symlink("other", &proj).unwrap();
+    write_atomic(&entry, "Edited\n");
+
+    let stderr = wait_for_stderr_contains_str(&tap, "out.md: ", TIMEOUT);
+    assert!(
+        stderr.contains("out.md: "),
+        "the rebuild cannot write out.md in the dead working directory; stderr: {stderr}"
+    );
+    assert!(
+        !other.join("out.md").exists(),
+        "nothing is written through the link; stderr: {stderr}"
+    );
     drop(child);
 }
 
