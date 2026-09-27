@@ -987,6 +987,61 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
     }))
 }
 
+/// Extract the import paths of an MDS source string with their records: in
+/// [`scan_imports`]'s order, each with the directive it is written in and the context
+/// the resolver adds to an error that resolving it raises ([`mds::scan_import_records`],
+/// #414). The `@extends` base is recorded on its own, even when an import names the
+/// same path.
+///
+/// ## Returns
+///
+/// An array of `{ path, kind, frontmatterIndex, span }` objects, every key present:
+/// - `path`: the path as written;
+/// - `kind`: `"extends"`, `"frontmatter"`, `"import"` or `"export-from"`;
+/// - `frontmatterIndex`: a frontmatter import's position in the `imports:` list, else
+///   `null`;
+/// - `span`: for `@extends` and `@import`, the span a `mds::file_not_found` error for
+///   the path carries — `{ offset, length, line?, column? }`, the shape of an error's
+///   `span` — else `null`.
+///
+/// On failure, throws a JS `Error` with the same structure as [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const [record] = scanImportRecords('@import "./a.mds" as a\n');
+/// console.log(record.kind); // "import"
+/// console.log(record.span); // { offset: 0, length: 22, line: 1, column: 1 }
+/// ```
+#[wasm_bindgen(js_name = "scanImportRecords")]
+pub fn scan_import_records(source: &str) -> Result<JsValue, JsValue> {
+    check_source_size(source)?;
+
+    // Owned String required so the closure satisfies UnwindSafe.
+    let source = source.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let records = mds::scan_import_records(&source).map_err(mds_error_to_js)?;
+        let array = js_sys::Array::new();
+        for record in &records {
+            let obj = js_sys::Object::new();
+            set_prop(&obj, "path", &JsValue::from_str(&record.path));
+            set_prop(&obj, "kind", &JsValue::from_str(record.kind.name()));
+            let index = record
+                .frontmatter_index
+                .map_or(JsValue::NULL, |i| JsValue::from_f64(i as f64));
+            set_prop(&obj, "frontmatterIndex", &index);
+            let span = record
+                .span
+                .as_ref()
+                .map_or(JsValue::NULL, |span| span_to_js(span).into());
+            set_prop(&obj, "span", &span);
+            array.push(&obj);
+        }
+        Ok(array.into())
+    }))
+}
+
 /// Check a module file as the native backend checks every file it reads, and return
 /// its text.
 ///

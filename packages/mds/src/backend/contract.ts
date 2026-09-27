@@ -33,11 +33,17 @@ export const BASE_METHODS = ['compile', 'check', 'lint'] as const;
 export const NODE_METHODS = ['compileFile', 'checkFile', 'lintFile'] as const;
 
 /**
- * WASM module exports — BASE_METHODS plus the two calls the JS-side file
- * pre-scanner makes (scanImports, preflightModule), plus lintVirtual for
+ * WASM module exports — BASE_METHODS plus scanImports, the two calls the JS-side
+ * file pre-scanner makes (scanImportRecords, preflightModule), and lintVirtual for
  * multi-module lint.
  */
-export const WASM_EXPORTS = [...BASE_METHODS, 'scanImports', 'lintVirtual', 'preflightModule'] as const;
+export const WASM_EXPORTS = [
+  ...BASE_METHODS,
+  'scanImports',
+  'lintVirtual',
+  'scanImportRecords',
+  'preflightModule',
+] as const;
 
 export type BaseMethodName = (typeof BASE_METHODS)[number];
 export type NodeMethodName = (typeof NODE_METHODS)[number];

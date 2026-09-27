@@ -2851,7 +2851,7 @@ fn parse_frontmatter_mapping(
 /// degrade gracefully rather than panic (ADR-005 — degrade rather than
 /// mis-attribute; consistent with the `is_char_boundary` guard in
 /// `build_type_mismatch` in evaluator.rs).
-fn line_len_at(source: &str, offset: usize) -> usize {
+pub(crate) fn line_len_at(source: &str, offset: usize) -> usize {
     if source.is_char_boundary(offset) {
         source[offset..]
             .find('\n')

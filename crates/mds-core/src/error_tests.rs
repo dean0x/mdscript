@@ -53,6 +53,38 @@ fn line_col_empty_source() {
     assert_eq!(compute_line_column("", 0), Some((1, 1)));
 }
 
+/// One cursor answers every offset — asked in increasing order, then in decreasing
+/// order (it walks again from the start) — with the line and column counted afresh
+/// from the source, and refuses a non-boundary or out-of-range offset.
+#[test]
+fn line_columns_cursor_answers_every_offset_in_any_order() {
+    let src = "café\r\nwörld\n\nx — y\n";
+    // Counted independently of the cursor: lines before the offset, and the
+    // characters since the last newline.
+    let expected = |offset: usize| {
+        let before = &src[..offset];
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        Some((line, column))
+    };
+    let boundaries: Vec<usize> = (0..=src.len())
+        .filter(|&o| src.is_char_boundary(o))
+        .collect();
+    let mut cursor = LineColumns::new(src);
+    for &offset in boundaries.iter().chain(boundaries.iter().rev()) {
+        assert_eq!(cursor.at(offset), expected(offset), "{offset}");
+        assert_eq!(
+            compute_line_column(src, offset),
+            expected(offset),
+            "{offset}"
+        );
+    }
+    // 'é' is two bytes: its second byte is no boundary.
+    assert_eq!(cursor.at(4), None);
+    assert_eq!(cursor.at(src.len() + 1), None);
+    assert_eq!(cursor.at(src.len()), expected(src.len()));
+}
+
 // ── MdsError::serialize — per-variant tests ───────────────────────────────
 
 #[test]

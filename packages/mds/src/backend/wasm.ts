@@ -11,13 +11,15 @@ import type {
   LintResult,
   MdsBaseBackend,
 } from '../types.js';
+import type { ImportRecord } from '../util/module-scanner.js';
 import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
 import { forwardOpts } from '../util/options.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
- * The WASM module exports compile, check, lint, lintVirtual, scanImports and
- * preflightModule. options shapes mirror the Rust wasm-bindgen signatures.
+ * The WASM module exports compile, check, lint, lintVirtual, scanImports,
+ * scanImportRecords and preflightModule. options shapes mirror the Rust
+ * wasm-bindgen signatures.
  *
  * Exported so callers can type-annotate pre-loaded modules passed to
  * createWasmBackend().
@@ -44,6 +46,12 @@ export interface WasmModule {
     rules?: Record<string, string>;
   }): unknown;
   scanImports(source: string): string[];
+  /**
+   * `scanImports`' paths, each with its record: the directive it is written in and the
+   * context the resolver adds to an error that resolving it raises
+   * (`mds::scan_import_records`).
+   */
+  scanImportRecords(source: string): ImportRecord[];
   /**
    * A module file's text, checked as the native backend checks every file it reads:
    * throws `mds::resource_limit` over 10 MiB and `mds::io` for invalid UTF-8, naming

@@ -58,7 +58,7 @@ export function _resetForTesting(): void {
 /**
  * Wrap a MdsBaseBackend with file-based compile/check operations, producing
  * a MdsNodeBackend. The wasmModule is captured so compileFile/checkFile/lintFile can
- * hand it to buildModulesMap, whose file pre-scanner calls its scanImports() and
+ * hand it to buildModulesMap, whose file pre-scanner calls its scanImportRecords() and
  * preflightModule() exports.
  *
  * buildModulesMap is imported here (Node-only), not in wasm.ts, so that

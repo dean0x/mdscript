@@ -1,7 +1,7 @@
 import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, parse, sep } from 'node:path';
-import type { MdsError } from '../types.js';
+import type { MdsError, MdsErrorSpan } from '../types.js';
 import {
   escapePathForMessage,
   firstForbiddenChar,
@@ -198,10 +198,16 @@ function pathError(code: PathErrorCode, message: string): PathError {
   return err;
 }
 
+/** The prefix the Rust `ImportError`'s display adds to its message. */
+const IMPORT_ERROR_PREFIX = 'import error: ';
+
 /** `mds::import`, with the `import error: ` prefix the Rust error's display adds. */
 function importError(detail: string): PathError {
-  return pathError('mds::import', `import error: ${detail}`);
+  return pathError('mds::import', `${IMPORT_ERROR_PREFIX}${detail}`);
 }
+
+/** The prefix of a `mds::file_not_found` message: the Rust `FileNotFound`'s display. */
+const FILE_NOT_FOUND_PREFIX = 'file not found: ';
 
 /**
  * `mds::file_not_found`, matching Rust `MdsError::file_not_found`'s message
@@ -213,7 +219,43 @@ function importError(detail: string): PathError {
  * this module builds can carry a forbidden character.
  */
 function fileNotFoundError(shown: string): PathError {
-  return pathError('mds::file_not_found', `file not found: ${escapePathForMessage(shown)}`);
+  return pathError('mds::file_not_found', `${FILE_NOT_FOUND_PREFIX}${escapePathForMessage(shown)}`);
+}
+
+/**
+ * `err`, thrown while the import `record` was resolved — by the import itself or by a
+ * module below it — with the context the Rust resolver adds at that step
+ * (`attach_import_span` and `attach_frontmatter_index`, #414). Only an error that
+ * points into no source yet gains any:
+ * - through a frontmatter import, `mds::file_not_found` becomes `mds::import`
+ *   (`file not found: "<path>" (in frontmatter imports[<i>])`), and an `mds::import`
+ *   error not already placed in a frontmatter gets ` (in frontmatter imports[<i>])`;
+ * - through `@extends` or `@import`, `mds::file_not_found` names the import as written
+ *   and points at its directive;
+ * - through `@export … from`, nothing changes. So does every other error.
+ */
+function withImportContext(err: unknown, record: ImportRecord): unknown {
+  if (!(err instanceof Error)) {
+    return err;
+  }
+  const { code, message, span } = err as PathError;
+  if (span !== undefined) {
+    return err;
+  }
+  if (record.frontmatterIndex !== null) {
+    const where = ` (in frontmatter imports[${record.frontmatterIndex}])`;
+    if (code === 'mds::file_not_found') {
+      return importError(`file not found: "${message.slice(FILE_NOT_FOUND_PREFIX.length)}"${where}`);
+    }
+    const detail = message.slice(IMPORT_ERROR_PREFIX.length);
+    return code === 'mds::import' && !detail.includes('in frontmatter') ? importError(`${detail}${where}`) : err;
+  }
+  if (record.span !== null && code === 'mds::file_not_found') {
+    const located = fileNotFoundError(record.path);
+    located.span = { ...record.span };
+    return located;
+  }
+  return err;
 }
 
 /**
@@ -450,12 +492,29 @@ function resolvedPathError(resolved: string, shown: string): PathError | undefin
 }
 
 /**
+ * An import path of a module as the engine's `scanImportRecords` reports it: the path
+ * as written, the directive it is written in, and the context the resolver adds to an
+ * error that resolving it raises (#414).
+ */
+export interface ImportRecord {
+  readonly path: string;
+  readonly kind: 'extends' | 'frontmatter' | 'import' | 'export-from';
+  /** A frontmatter import's position in the `imports:` list: `(in frontmatter imports[<i>])`. */
+  readonly frontmatterIndex: number | null;
+  /** For `@extends` and `@import`, the span a `mds::file_not_found` error for the path carries. */
+  readonly span: MdsErrorSpan | null;
+}
+
+/**
  * The WASM engine calls the scanner makes — the WASM module's own exports, so every
  * check they make is the Rust engine's, never a TypeScript copy of it (#414).
  */
 export interface ScannerEngine {
-  /** The import paths a module's source names, in the order the resolver resolves them. */
-  scanImports(source: string): string[];
+  /**
+   * The import paths a module's source names, in the order the resolver resolves them,
+   * each with its record.
+   */
+  scanImportRecords(source: string): ImportRecord[];
   /**
    * A module file's text, checked as the native backend checks every file it reads,
    * or a throw of the native error: its bytes as NativeFs checks them
@@ -681,14 +740,22 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  *   leading byte-order mark kept). A file that is not an MDS file is refused before
  *   any import-like line in it is followed.
  *
+ * A refusal raised while an import is resolved carries the context the native resolver
+ * gives it, from the engine's `scanImportRecords`: a missing module imported by
+ * `@import` or `@extends` points at that directive (`span`); one reached through a
+ * frontmatter import is `mds::import`, `file not found: "<path>" (in frontmatter
+ * imports[<i>])`, and an `mds::import` refusal there gets ` (in frontmatter
+ * imports[<i>])` (#414).
+ *
  * A project may be rooted at the filesystem root, as on native.
  *
  * Modules are read concurrently — at most MAX_CONCURRENT_OPENS files open at once,
  * at most MAX_IMPORTS_READ_AHEAD of a module's imports and no more than
  * `maxAggregateSize` bytes read ahead of the walk — but checked in
  * the order the native resolver resolves them: depth first, each module's imports in
- * the order `scanImports` lists them, each step's checks in `resolve_by_key`'s order.
- * Of several faults, the one reported is the one the native backend reports.
+ * the order `scanImportRecords` lists them — a module reached as the `@extends` base of
+ * another resolving its own `@extends` last — each step's checks in `resolve_by_key`'s
+ * order. Of several faults, the one reported is the one the native backend reports.
  *
  * Differences from the native backend that remain (#414):
  * 1. A MISSING module outside the project root — named lexically, or through a
@@ -939,15 +1006,20 @@ export async function buildModulesMap(
 
   /**
    * Walk the located module, reached as `shown` `depth` imports below the entry, then
-   * its imports in order — the native resolver's `resolve_by_key`: a module already
-   * resolved, or still resolving (a cycle, the engine's to report), is not read again,
-   * and the depth and module-count limits apply before the file is read.
+   * its imports in the order the native resolver resolves them — its `resolve_by_key`:
+   * a module already resolved, or still resolving (a cycle, the engine's to report), is
+   * not read again, and the depth and module-count limits apply before the file is
+   * read. A module reached as the `@extends` base of another (`asBase`) resolves its
+   * own `@extends` after its imports, as the resolver's skeleton pass does; any other,
+   * before them. An error resolving an import is reported with the context the
+   * resolver adds to it (`withImportContext`).
    */
   async function walk(
     located: Located,
     shown: string,
     depth: number,
     readAheadOutcome: Settled<ReadModule> | undefined,
+    asBase: boolean,
   ): Promise<void> {
     const { key } = located;
     if (completed.has(key) || walking.has(key)) {
@@ -984,16 +1056,19 @@ export async function buildModulesMap(
 
     // The next MAX_IMPORTS_READ_AHEAD imports are read ahead of the walk; each one
     // walked starts the next.
-    const upcoming = engine.scanImports(read.content).values();
-    const queued: Array<{ readonly importPath: string; readonly ahead: Promise<ReadAhead> }> = [];
+    const records = engine.scanImportRecords(read.content);
+    // The engine lists a module's `@extends` base first, on its own.
+    const inOrder = asBase && records[0]?.kind === 'extends' ? [...records.slice(1), records[0]] : records;
+    const upcoming = inOrder.values();
+    const queued: Array<{ readonly record: ImportRecord; readonly ahead: Promise<ReadAhead> }> = [];
     const refill = (): void => {
       while (queued.length < MAX_IMPORTS_READ_AHEAD) {
         const step = upcoming.next();
         if (step.done === true) {
           return;
         }
-        const importPath = step.value;
-        queued.push({ importPath, ahead: limit(() => readAhead(located, importPath)) });
+        const record = step.value;
+        queued.push({ record, ahead: limit(() => readAhead(located, record.path)) });
       }
     };
     walking.add(key);
@@ -1001,14 +1076,18 @@ export async function buildModulesMap(
     for (let item = queued.shift(); item !== undefined; item = queued.shift()) {
       refill();
       const { located: child, read: childRead } = await item.ahead;
-      await walk(unwrap(child), item.importPath, depth + 1, childRead);
+      try {
+        await walk(unwrap(child), item.record.path, depth + 1, childRead, item.record.kind === 'extends');
+      } catch (err) {
+        throw withImportContext(err, item.record);
+      }
     }
     walking.delete(key);
     completed.add(key);
   }
 
   try {
-    await walk({ key: entryFilename, path: entry.path, dir: entry.dir }, entryPath, 0, undefined);
+    await walk({ key: entryFilename, path: entry.path, dir: entry.dir }, entryPath, 0, undefined, false);
   } finally {
     walkFinished = true;
   }

@@ -1,6 +1,6 @@
 /**
  * WASM backend unit tests for @mdscript/mds universal package.
- * Tests: U-WB1 through U-WB26
+ * Tests: U-WB1 through U-WB27
  *
  * Imports dist/backend/wasm.js directly to exercise internal state
  * without going through the full node.ts entry point.
@@ -360,13 +360,14 @@ describe('wasm backend — browser shape validation', () => {
     _resetForTesting(0);
   });
 
-  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, lint, scanImports, lintVirtual, preflightModule)', () => {
+  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, lint, scanImports, lintVirtual, scanImportRecords, preflightModule)', () => {
     const validMod = {
       compile: () => {},
       check: () => {},
       lint: () => {},
       scanImports: () => [],
       lintVirtual: () => {},
+      scanImportRecords: () => [],
       preflightModule: () => '',
     };
     assert.doesNotThrow(
@@ -408,7 +409,14 @@ describe('wasm backend — browser shape validation', () => {
   test('U-WB26: validateWasmShape throws when preflightModule is missing (#414)', () => {
     // The WASM backend's file pre-scanner checks every module's bytes through this
     // export: a module without it must be refused at load, not fail mid-compile.
-    const mod = { compile: () => {}, check: () => {}, lint: () => {}, lintVirtual: () => {}, scanImports: () => [] };
+    const mod = {
+      compile: () => {},
+      check: () => {},
+      lint: () => {},
+      lintVirtual: () => {},
+      scanImports: () => [],
+      scanImportRecords: () => [],
+    };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -416,6 +424,30 @@ describe('wasm backend — browser shape validation', () => {
         assert.ok(
           err.message.includes('"preflightModule"'),
           `error must mention missing function "preflightModule", got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-WB27: validateWasmShape throws when scanImportRecords is missing (#414)', () => {
+    // The WASM backend's file pre-scanner walks every module's imports through this
+    // export: a module without it must be refused at load, not fail mid-compile.
+    const mod = {
+      compile: () => {},
+      check: () => {},
+      lint: () => {},
+      lintVirtual: () => {},
+      scanImports: () => [],
+      preflightModule: () => '',
+    };
+    assert.throws(
+      () => validateWasmShape(mod),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('"scanImportRecords"'),
+          `error must mention missing function "scanImportRecords", got: ${err.message}`,
         );
         return true;
       },

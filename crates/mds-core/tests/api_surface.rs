@@ -102,6 +102,24 @@ fn check_module_type_function_exists() {
     assert_eq!(err.to_string(), "not an MDS file: ./sub/../doc.txt");
 }
 
+/// #414: `scan_import_records` and its `#[non_exhaustive]` `ImportRecord` /
+/// `ImportKind` are reachable from the crate root: the fields are readable, and a
+/// match on the kind needs a wildcard arm, as a new kind may be added.
+#[test]
+fn scan_import_records_function_exists() {
+    let _: fn(&str) -> Result<Vec<mds::ImportRecord>, MdsError> = mds::scan_import_records;
+    let records = mds::scan_import_records("@extends \"./base.mds\"\n").expect("the source parses");
+    let record: &mds::ImportRecord = &records[0];
+    let _: &String = &record.path;
+    let _: Option<usize> = record.frontmatter_index;
+    let _: &Option<mds::SerializedSpan> = &record.span;
+    let kind = match record.kind {
+        mds::ImportKind::Extends => "extends",
+        _ => "another kind",
+    };
+    assert_eq!(kind, record.kind.name());
+}
+
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`
 /// forbids a struct literal, so the type is only obtainable through the load API.
 #[test]

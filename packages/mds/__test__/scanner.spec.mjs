@@ -50,9 +50,18 @@ function preflightModule(bytes, display, shown) {
   return wasmEngine.preflightModule(bytes, display, shown);
 }
 
-/** buildModulesMap with `scan` as the engine's import scanner. */
+/**
+ * `scan`, a plain path-list import scanner, as a `scanImportRecords` engine method:
+ * each path it lists is an `@import` with no span (the engine's `scanImportRecords`
+ * spans them; these tests judge the refusals themselves).
+ */
+function importRecordsOf(scan) {
+  return (source) => scan(source).map((p) => ({ path: p, kind: 'import', frontmatterIndex: null, span: null }));
+}
+
+/** buildModulesMap with `scan` as the engine's import scanner (see `importRecordsOf`). */
 function buildModulesMap(entryPath, scan, options) {
-  return buildModulesMapWith(entryPath, { scanImports: scan, preflightModule }, options);
+  return buildModulesMapWith(entryPath, { scanImportRecords: importRecordsOf(scan), preflightModule }, options);
 }
 
 // A minimal scanImports implementation using the napi addon.
@@ -126,9 +135,12 @@ function assertEscapeRefusal(err, shown, label) {
   assertNoHelp(err, label);
 }
 
-/** An outcome of `compileFileOutcomes` without its `span` — see U-SM21 for why. */
-function withoutSpan({ span: _span, ...rest }) {
-  return rest;
+/**
+ * The span an error for the import written on the first line of an ASCII module
+ * points at: that whole line, as the Rust resolver's `attach_import_span` gives it.
+ */
+function firstLineSpan(line) {
+  return { offset: 0, length: line.length, line: 1, column: 1 };
 }
 
 /** Run `fn` with `dir` as the working directory, restoring it afterwards. */
@@ -773,16 +785,16 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
         help: FILE_NOT_FOUND_HELP,
         span: null,
       });
-      assert.deepEqual(withoutSpan(nativeImport), {
+      // An import's error points at its directive: the whole line.
+      assert.deepEqual(nativeImport, {
         code: 'mds::file_not_found',
         message: 'file not found: ./missing.mds',
         help: FILE_NOT_FOUND_HELP,
+        span: firstLineSpan('@import "./missing.mds" as m'),
       });
-      // An entry error points into no source: the whole shape agrees.
+      // The whole shape agrees, the import's span included (#414).
       assert.deepEqual(wasmEntry, nativeEntry);
-      // An import agrees on code, message and help. Native also points at the
-      // import directive (its span), which the pre-scanner does not yet (#414).
-      assert.deepEqual(withoutSpan(wasmImport), withoutSpan(nativeImport));
+      assert.deepEqual(wasmImport, nativeImport);
     });
   });
 
@@ -1159,10 +1171,11 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
       for (const [j, [file, shown]] of deliberate.entries()) {
         const i = cases.length + 1 + j;
         const label = `U-SM32 deliberate ${file}`;
-        assert.deepEqual(withoutSpan(nativeOutcomes[i]), {
+        assert.deepEqual(nativeOutcomes[i], {
           code: 'mds::file_not_found',
           message: `file not found: ${shown}`,
           help: FILE_NOT_FOUND_HELP,
+          span: firstLineSpan(`@import "${shown}" as m`),
         }, label);
         assert.deepEqual(wasmOutcomes[i], {
           code: 'mds::import',
@@ -1204,60 +1217,67 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const importsOf = (n) => Array.from({ length: n }, (_, i) => `@import "./leaves/l${i}.mds" as m${i}`).join('\n');
       const big = 'x'.repeat(MAX_FILE_SIZE + 1);
 
-      // [label, entry, native expectation]: `entry` rows compare the whole error;
-      // `import` rows compare code, message and help (native's span: #414).
+      // [label, entry, native expectation]: the whole error. A missing import points
+      // at its directive (`span`), every other refusal at nothing.
       const rows = [
-        ['import: more than 256 segments', await write('seg.mds', `@import "${tooLong}" as s\nhi\n`), 'import', {
+        ['import: more than 256 segments', await write('seg.mds', `@import "${tooLong}" as s\nhi\n`), {
           code: 'mds::resource_limit',
           message: `resource limit exceeded: import path exceeds maximum segment count (256): "${tooLong}"`,
           help: null,
+          span: null,
         }],
         // Counted as written, before `..` could take it out of the project.
-        ['import: more than 256 segments of ..', await write('up.mds', `@import "${tooManyUp}" as s\nhi\n`), 'import', {
+        ['import: more than 256 segments of ..', await write('up.mds', `@import "${tooManyUp}" as s\nhi\n`), {
           code: 'mds::resource_limit',
           message: `resource limit exceeded: import path exceeds maximum segment count (256): "${tooManyUp}"`,
           help: null,
+          span: null,
         }],
-        ['entry: more than 256 segments', `${segments(256, 'x')}/e.mds`, 'entry', {
+        ['entry: more than 256 segments', `${segments(256, 'x')}/e.mds`, {
           code: 'mds::resource_limit',
           message: `resource limit exceeded: import path exceeds maximum segment count (256): "${segments(256, 'x')}/e.mds"`,
           help: null,
           span: null,
         }],
-        ['import: one too deep', path.join(proj, 'chain', 'c0.mds'), 'import', {
+        ['import: one too deep', path.join(proj, 'chain', 'c0.mds'), {
           code: 'mds::import',
           message: 'import error: import depth exceeds maximum of 64 (possible deep chain)',
           help: null,
+          span: null,
         }],
-        ['import: one module too many', await write('count-258.mds', `${importsOf(257)}\nhi\n`), 'import', {
+        ['import: one module too many', await write('count-258.mds', `${importsOf(257)}\nhi\n`), {
           code: 'mds::resource_limit',
           message: 'resource limit exceeded: module count exceeds maximum of 256 (256 modules resolved)',
           help: null,
+          span: null,
         }],
-        ['entry: over the per-file cap', await write('big.mds', big), 'entry', {
+        ['entry: over the per-file cap', await write('big.mds', big), {
           code: 'mds::resource_limit',
           message: `resource limit exceeded: file too large (${MAX_FILE_SIZE + 1} bytes, max ${MAX_FILE_SIZE} bytes): big.mds`,
           help: null,
           span: null,
         }],
-        ['import: over the per-file cap', await write('imp-big.mds', '@import "./big.mds" as b\nhi\n'), 'import', {
+        ['import: over the per-file cap', await write('imp-big.mds', '@import "./big.mds" as b\nhi\n'), {
           code: 'mds::resource_limit',
           message: `resource limit exceeded: file too large (${MAX_FILE_SIZE + 1} bytes, max ${MAX_FILE_SIZE} bytes): big.mds`,
           help: null,
+          span: null,
         }],
         // An import or entry whose last component is `..` names no file for NativeFs:
         // not found, whatever the directory it leads to.
-        ['import: ends in ..', await write('sub/up.mds', '@import "../" as u\nhi\n'), 'import', {
+        ['import: ends in ..', await write('sub/up.mds', '@import "../" as u\nhi\n'), {
           code: 'mds::file_not_found',
           message: 'file not found: ../',
           help: FILE_NOT_FOUND_HELP,
+          span: firstLineSpan('@import "../" as u'),
         }],
-        ['import: ends in .. below a name', await write('dotdot.mds', '@import "./sub/.." as u\nhi\n'), 'import', {
+        ['import: ends in .. below a name', await write('dotdot.mds', '@import "./sub/.." as u\nhi\n'), {
           code: 'mds::file_not_found',
           message: 'file not found: ./sub/..',
           help: FILE_NOT_FOUND_HELP,
+          span: firstLineSpan('@import "./sub/.." as u'),
         }],
-        ['entry: ends in ..', [proj, 'sub', '..'].join(path.sep), 'entry', {
+        ['entry: ends in ..', [proj, 'sub', '..'].join(path.sep), {
           code: 'mds::file_not_found',
           message: `file not found: ${[proj, 'sub', '..'].join(path.sep)}`,
           help: FILE_NOT_FOUND_HELP,
@@ -1277,14 +1297,9 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const files = [...rows.map(([, file]) => file), ...atTheCap, ownDir];
       const native = await compileFileOutcomes('native', files);
       const wasm = await compileFileOutcomes('wasm', files);
-      for (const [i, [label, , kind, expected]] of rows.entries()) {
-        if (kind === 'entry') {
-          assert.deepEqual(native[i], expected, `${label} (native)`);
-          assert.deepEqual(wasm[i], native[i], label);
-        } else {
-          assert.deepEqual(withoutSpan(native[i]), expected, `${label} (native)`);
-          assert.deepEqual(withoutSpan(wasm[i]), withoutSpan(native[i]), label);
-        }
+      for (const [i, [label, , expected]] of rows.entries()) {
+        assert.deepEqual(native[i], expected, `${label} (native)`);
+        assert.deepEqual(wasm[i], native[i], label);
       }
       for (const j of atTheCap.keys()) {
         const i = rows.length + j;
@@ -1473,12 +1488,15 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       await writeFile(path.join(proj, 'ok.mds'), '@import "./deep-missing.mds" as d\nOK\n');
       // Each fault and the error native reports for it. `ok.mds` is fine itself, but
       // its own import is missing: depth first, that comes before its later siblings.
+      // A missing module's error points at the directive that imports it: in rotation
+      // `r`, fault `r` is on the first line; `ok.mds`'s import is on its own first line.
       const faults = [
         ['@import "./missing.mds" as a', 'mds::file_not_found', 'file not found: ./missing.mds'],
         ['@import "../outside.mds" as b', 'mds::import', 'import error: import path escapes project directory: "../outside.mds"'],
         ['@import "./link.mds" as c', 'mds::import', 'import error: symlinks are not allowed in imports: ./link.mds'],
         ['@import "./ok.mds" as d', 'mds::file_not_found', 'file not found: ./deep-missing.mds'],
       ];
+      const spans = [firstLineSpan(faults[0][0]), null, null, firstLineSpan('@import "./deep-missing.mds" as d')];
       const files = [];
       for (const r of faults.keys()) {
         const rotated = [...faults.slice(r), ...faults.slice(0, r)];
@@ -1490,9 +1508,13 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const wasm = await compileFileOutcomes('wasm', files);
       for (const [r, [, code, message]] of faults.entries()) {
         const label = `U-SM37 rotation ${r}`;
-        assert.equal(native[r].code, code, `${label}: ${JSON.stringify(native[r])}`);
-        assert.equal(native[r].message, message, `${label}: ${JSON.stringify(native[r])}`);
-        assert.deepEqual(withoutSpan(wasm[r]), withoutSpan(native[r]), label);
+        assert.deepEqual(native[r], {
+          code,
+          message,
+          help: code === 'mds::file_not_found' ? FILE_NOT_FOUND_HELP : null,
+          span: spans[r],
+        }, label);
+        assert.deepEqual(wasm[r], native[r], label);
       }
     });
   });
@@ -1533,12 +1555,168 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       assert.deepEqual({ code: native[2].code, message: native[2].message }, cycle('cyc-then'));
       assert.deepEqual({ code: native[3].code, message: native[3].message }, undefinedVar);
       for (const i of [2, 3]) {
+        const second = '@import "./missing.mds" as m';
+        const first = files[path.basename(entries[i])].split('\n')[0];
         assert.deepEqual(wasm[i], {
           code: 'mds::file_not_found',
           message: 'file not found: ./missing.mds',
           help: FILE_NOT_FOUND_HELP,
-          span: null,
+          span: { offset: first.length + 1, length: second.length, line: 2, column: 1 },
         }, entries[i]);
+      }
+    });
+  });
+
+  /** A module whose frontmatter imports `paths`, the i-th as `m<i>`. */
+  const frontmatterImports = (...paths) =>
+    `---\nimports:\n${paths.map((p, i) => `  - path: ${p}\n    as: m${i}\n`).join('')}---\nhi\n`;
+
+  test("U-SM40: a frontmatter import is refused with native's import error, naming its imports index", async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM40')) return;
+    await withNestedProject(async (proj, parent) => {
+      await writeFile(path.join(proj, 'ok.mds'), '@define f():\nOK\n@end\n');
+      await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
+      await writeFile(path.join(proj, 'real.mds'), 'REAL\n');
+      await symlink(path.join(proj, 'real.mds'), path.join(proj, 'link.mds'));
+      // A module whose own `@export … from` names a missing module, and one whose own
+      // frontmatter import does (at imports[1]).
+      await writeFile(path.join(proj, 'mid.mds'), '@export x from "./gone.mds"\nhi\n');
+      await writeFile(path.join(proj, 'fmid.mds'), frontmatterImports('./ok.mds', './nope.mds'));
+      const importError = (detail) => ({ code: 'mds::import', message: `import error: ${detail}`, help: null, span: null });
+      const rows = [
+        ['fm-missing.mds', frontmatterImports('./ok.mds', './missing.mds'),
+          importError('file not found: "./missing.mds" (in frontmatter imports[1])')],
+        ['fm-escape.mds', frontmatterImports('../outside.mds'),
+          importError('import path escapes project directory: "../outside.mds" (in frontmatter imports[0])')],
+        ['fm-link.mds', frontmatterImports('./ok.mds', './link.mds'),
+          importError('symlinks are not allowed in imports: ./link.mds (in frontmatter imports[1])')],
+        // Raised below a frontmatter import with no span: the index of the import that
+        // reached it is added, whatever the module that names the missing file.
+        ['fm-nested.mds', frontmatterImports('./mid.mds'),
+          importError('file not found: "./gone.mds" (in frontmatter imports[0])')],
+        // Already placed in a frontmatter: nothing more is added.
+        ['fm-fm.mds', frontmatterImports('./fmid.mds'),
+          importError('file not found: "./nope.mds" (in frontmatter imports[1])')],
+        // Control: the same missing module through a body import is not found, and
+        // points at its directive.
+        ['body-missing.mds', '@import "./missing.mds" as m\nhi\n', {
+          code: 'mds::file_not_found',
+          message: 'file not found: ./missing.mds',
+          help: FILE_NOT_FOUND_HELP,
+          span: firstLineSpan('@import "./missing.mds" as m'),
+        }],
+      ];
+      for (const [name, content] of rows) {
+        await writeFile(path.join(proj, name), content);
+      }
+      const entries = rows.map(([name]) => path.join(proj, name));
+      const native = await compileFileOutcomes('native', entries);
+      const wasm = await compileFileOutcomes('wasm', entries);
+      for (const [i, [name, , expected]] of rows.entries()) {
+        assert.deepEqual(native[i], expected, `${name} (native)`);
+        assert.deepEqual(wasm[i], native[i], name);
+      }
+    });
+  });
+
+  test("U-SM41: a missing import's error points where native's does — every directive, byte offset and line", async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM41')) return;
+    await withNestedProject(async (proj) => {
+      const bom = String.fromCodePoint(0xfeff);
+      await writeFile(path.join(proj, 'mid.mds'), '@export * from "./gone.mds"\nhi\n');
+      // [name, content, native's message, the line native's span is on (null: no
+      // span)]. Multi-byte text, CRLF line ends and a byte-order mark precede the
+      // directive, so its byte offset differs from its character offset.
+      const rows = [
+        ['multibyte.mds', '---\ntitle: "héllo — wörld"\n---\r\ncafé\r\n@import "./missing.mds" as m\r\nhi\n',
+          'file not found: ./missing.mds', 5],
+        // A directive starts its line: the byte-order mark opens a text line.
+        ['bom.mds', `${bom}hi\n@import "./missing.mds"\nhi\n`, 'file not found: ./missing.mds', 2],
+        ['selective.mds', 'ünï\n@import { a } from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', 2],
+        ['extends.mds', '---\nx: é\n---\n@extends "./missing.mds"\n', 'file not found: ./missing.mds', 4],
+        // `@export … from` adds no span.
+        ['export-from.mds', '@export x from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', null],
+        ['wildcard.mds', 'ü\n@export * from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', null],
+        // Raised below an @import with no span: native names the import that reached it
+        // and points at its directive.
+        ['body-nested.mds', 'ü\n@import "./mid.mds" as m\nhi\n', 'file not found: ./mid.mds', 2],
+      ];
+      for (const [name, content] of rows) {
+        await writeFile(path.join(proj, name), content);
+      }
+      const entries = rows.map(([name]) => path.join(proj, name));
+      const native = await compileFileOutcomes('native', entries);
+      const wasm = await compileFileOutcomes('wasm', entries);
+      for (const [i, [name, , message, line]] of rows.entries()) {
+        assert.equal(native[i].code, 'mds::file_not_found', `${name}: ${JSON.stringify(native[i])}`);
+        assert.equal(native[i].message, message, name);
+        assert.equal(native[i].span?.line ?? null, line, `${name}: ${JSON.stringify(native[i].span)}`);
+        assert.deepEqual(wasm[i], native[i], name);
+      }
+      // Non-vacuity: offsets are in bytes — the byte-order mark is three.
+      assert.equal(Buffer.byteLength(bom), 3);
+      assert.deepEqual(native[1].span, { offset: 6, length: '@import "./missing.mds"'.length, line: 2, column: 1 });
+      const multibyte = Buffer.from(rows[0][1]);
+      assert.equal(native[0].span.offset, multibyte.indexOf('@import'));
+      assert.notEqual(native[0].span.offset, rows[0][1].indexOf('@import'));
+    });
+  });
+
+  test('U-SM42: a template reached as an @extends base resolves its imports before its own base, as on native', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM42')) return;
+    await withNestedProject(async (proj) => {
+      // Each base both imports a missing module and extends a missing base. Native
+      // resolves a base template's frontmatter and body imports first, and its own
+      // `@extends` last; a template compiled for itself resolves its `@extends` first.
+      const files = {
+        'fm-base.mds': '---\nimports:\n  - path: ./gone-fm.mds\n---\n@extends "./gone-base.mds"\n',
+        'body-base.mds': '@extends "./gone-base.mds"\n@import "./gone-body.mds" as g\n',
+        // The same path extended and imported: it is the import that fails first.
+        'same-base.mds': '---\nimports:\n  - path: ./gone-base.mds\n---\n@extends "./gone-base.mds"\n',
+        'child-fm.mds': '@extends "./fm-base.mds"\n',
+        'child-body.mds': '@extends "./body-base.mds"\n',
+        'child-same.mds': '@extends "./same-base.mds"\n',
+      };
+      for (const [name, content] of Object.entries(files)) {
+        await writeFile(path.join(proj, name), content);
+      }
+      const extendsLine = '@extends "./gone-base.mds"';
+      const rows = [
+        ['child-fm.mds', {
+          code: 'mds::import',
+          message: 'import error: file not found: "./gone-fm.mds" (in frontmatter imports[0])',
+          help: null,
+          span: null,
+        }],
+        ['child-body.mds', {
+          code: 'mds::file_not_found',
+          message: 'file not found: ./gone-body.mds',
+          help: FILE_NOT_FOUND_HELP,
+          span: { offset: `${extendsLine}\n`.length, length: '@import "./gone-body.mds" as g'.length, line: 2, column: 1 },
+        }],
+        ['child-same.mds', {
+          code: 'mds::import',
+          message: 'import error: file not found: "./gone-base.mds" (in frontmatter imports[0])',
+          help: null,
+          span: null,
+        }],
+        // Control: compiled for itself, the base resolves its own `@extends` first.
+        ['fm-base.mds', {
+          code: 'mds::file_not_found',
+          message: 'file not found: ./gone-base.mds',
+          help: FILE_NOT_FOUND_HELP,
+          span: { offset: files['fm-base.mds'].indexOf(extendsLine), length: extendsLine.length, line: 5, column: 1 },
+        }],
+      ];
+      const entries = rows.map(([name]) => path.join(proj, name));
+      const native = await compileFileOutcomes('native', entries);
+      const wasm = await compileFileOutcomes('wasm', entries);
+      for (const [i, [name, expected]] of rows.entries()) {
+        assert.deepEqual(native[i], expected, `${name} (native)`);
+        assert.deepEqual(wasm[i], native[i], name);
       }
     });
   });

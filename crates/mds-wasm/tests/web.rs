@@ -620,6 +620,72 @@ fn scan_imports_returns_empty_array_for_importless_source() {
     assert_eq!(js_array_len(&result), 0);
 }
 
+// ── scanImportRecords (#414) ─────────────────────────────────────────────────
+
+/// The `{ offset, length, line, column }` of a JS span object, `None` for `null`.
+fn span_fields(span: &JsValue) -> Option<[JsValue; 4]> {
+    (!span.is_null()).then(|| ["offset", "length", "line", "column"].map(|key| get_prop(span, key)))
+}
+
+/// `scanImportRecords` lists `scanImports`' paths with their records, every key
+/// present; an `@import`'s span is the object the engine's own error for a missing
+/// module carries, a frontmatter import's index the one its error names (#414).
+#[wasm_bindgen_test]
+fn scan_import_records_carry_the_errors_context() {
+    let source = concat!(
+        "---\nimports:\n  - path: ./fm.mds\n---\n",
+        "caf\u{e9}\n@import \"./missing.mds\" as m\n",
+        "@export x from \"./exp.mds\"\n",
+    );
+    let records = mds_wasm::scan_import_records(source).unwrap();
+    assert_eq!(js_array_len(&records), 3);
+    let record = |i: u32| js_sys::Array::from(&records).get(i);
+    let fields = |i: u32| {
+        let r = record(i);
+        (
+            get_str(&r, "path"),
+            get_str(&r, "kind"),
+            get_prop(&r, "frontmatterIndex").as_f64(),
+            get_prop(&r, "span").is_null(),
+        )
+    };
+    assert_eq!(
+        fields(0),
+        ("./fm.mds".into(), "frontmatter".into(), Some(0.0), true)
+    );
+    assert_eq!(
+        fields(1),
+        ("./missing.mds".into(), "import".into(), None, false)
+    );
+    assert!(get_prop(&record(1), "frontmatterIndex").is_null());
+    assert_eq!(
+        fields(2),
+        ("./exp.mds".into(), "export-from".into(), None, true)
+    );
+
+    // The engine's own error for the missing module: the same span object.
+    let err = mds_wasm::compile(
+        source,
+        modules_opts(&serde_json::json!({ "fm.mds": "F\n", "exp.mds": "@define x():\nX\n@end\n@export x\n" })),
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
+    let span = span_fields(&get_prop(&record(1), "span")).expect("an @import has a span");
+    assert_eq!(
+        span_fields(&get_prop(&err, "span")).expect("the error has a span"),
+        span
+    );
+    // Non-vacuity: the directive is past the frontmatter and a multi-byte line.
+    assert_eq!(span[2].as_f64(), Some(6.0));
+    assert_eq!(span[1].as_f64(), Some(28.0));
+}
+
+#[wasm_bindgen_test]
+fn scan_import_records_returns_error_for_malformed_source() {
+    let err = mds_wasm::scan_import_records("Hello {{name\n").unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::syntax");
+}
+
 // ── preflightModule (#414) ───────────────────────────────────────────────────
 
 /// `preflightModule` returns a module's text, a leading byte-order mark kept, and

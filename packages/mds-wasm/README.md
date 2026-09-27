@@ -19,7 +19,12 @@ Two builds, selected by package `exports` conditions:
 | `browser` / `default` | `dist/web/mds_wasm.js` | ESM (`wasm-pack --target web`) | call `default()` with the `.wasm` URL |
 
 Each build exposes `compile(source, options)`, `check(source, options)`,
-`lint(source, options)`, `lintVirtual(modules, entry, options)`, `scanImports(source)`, and
+`lint(source, options)`, `lintVirtual(modules, entry, options)`, `scanImports(source)`,
+`scanImportRecords(source)` — `scanImports`' paths as `{ path, kind, frontmatterIndex, span }`
+records: the directive each is written in (`"extends"`, `"frontmatter"`, `"import"` or
+`"export-from"`), a frontmatter import's index in its `imports:` list, and for `@extends` and
+`@import` the `span` a `mds::file_not_found` error for the path points at (the `@extends` base is
+recorded on its own, even when an import names it too) — and
 `preflightModule(bytes, display, shown)` — a module file's text from its bytes (a `Uint8Array`),
 checked as the native backend checks every file it reads: over 10 MiB is `mds::resource_limit` and
 bytes that are not valid UTF-8 are `mds::io`, naming the file by `display` (its path below the project
