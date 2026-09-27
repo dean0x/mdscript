@@ -229,27 +229,57 @@ pub(crate) fn reject_forbidden_path_chars(what: &str, path: &str) -> Result<(), 
     }
 }
 
+/// Refuse `path` when it carries a [`crate::is_forbidden_path_char`] codepoint
+/// anywhere in it (#265): [`MdsError::Io`], `<what> contains forbidden character
+/// U+XXXX: "<shown>"`, naming the first such codepoint.
+///
+/// `path` is what is scanned and `shown` what the message names, escaped with
+/// [`crate::escape_path_for_message`]: the path as the caller typed it, which differs
+/// from `path` when `path` is the form it resolves to, so the message never shows a
+/// resolved absolute path the caller did not type. A path that is not valid UTF-8 is
+/// scanned lossily: every forbidden codepoint that is validly encoded survives the
+/// conversion.
+///
+/// mds-core words its own refusals of a path with the same message, so a caller that
+/// checks a path mds-core never sees (an output location, say) refuses it in the same
+/// words.
+///
+/// # Errors
+///
+/// [`MdsError::Io`] when `path` carries a forbidden path character.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// mds::reject_forbidden_path("output", Path::new("out/page.md"), "out/page.md")?;
+///
+/// let err = mds::reject_forbidden_path("output", Path::new("out\tdir"), "link").unwrap_err();
+/// assert_eq!(
+///     err.to_string(),
+///     "output contains forbidden character U+0009: \"link\""
+/// );
+/// # Ok::<(), mds::MdsError>(())
+/// ```
+pub fn reject_forbidden_path(what: &str, path: &Path, shown: &str) -> Result<(), MdsError> {
+    match first_forbidden_char(&path.to_string_lossy()) {
+        Some(ch) => Err(MdsError::io(forbidden_char_message(what, ch, shown))),
+        None => Ok(()),
+    }
+}
+
 /// Refuse a resolved path that carries a forbidden path character anywhere in it
-/// (`mds::io`, #265).
+/// (`mds::io`, #265): [`reject_forbidden_path`] as `resolved path`.
 ///
 /// The typed path has already been checked by the time a path is resolved; this
 /// catches what the typed form cannot show — a symlinked directory whose target has a
 /// hostile name, or a project that lives under one. The WHOLE path is scanned, not
 /// only its final component. The message names `shown`, the path the caller typed,
-/// never the absolute resolved path (R3 / CWE-209).
-///
-/// A path that is not valid UTF-8 is scanned lossily: every forbidden codepoint that
-/// is validly encoded survives the conversion, and `key_of` then refuses the path
-/// rather than turn it into a key.
+/// never the absolute resolved path (R3 / CWE-209). A path that is not valid UTF-8 is
+/// scanned lossily, and `key_of` then refuses it rather than turn it into a key.
 pub(crate) fn reject_forbidden_in_path(resolved: &Path, shown: &str) -> Result<(), MdsError> {
-    match first_forbidden_char(&resolved.to_string_lossy()) {
-        Some(ch) => Err(MdsError::io(forbidden_char_message(
-            "resolved path",
-            ch,
-            shown,
-        ))),
-        None => Ok(()),
-    }
+    reject_forbidden_path("resolved path", resolved, shown)
 }
 
 /// The key of a resolved `canonical` path: its exact UTF-8 string form.
@@ -741,6 +771,12 @@ pub fn effective_parent(path: &Path) -> &Path {
     }
 }
 
+/// The refusal of a directory path, named by `shown`, that resolves to something other
+/// than a directory (`mds::io`).
+fn not_a_directory(shown: &str) -> MdsError {
+    MdsError::io(format!("cannot resolve path {shown}: not a directory"))
+}
+
 impl NativeFs {
     /// Create a new `NativeFs` with no root directory set.
     ///
@@ -784,6 +820,58 @@ impl NativeFs {
         Self::check_symlink_named(path, &shown)
     }
 
+    /// Canonicalize the directory `path`, taking a path with no final name (`.`, `..`,
+    /// `sub/..`) as well as one with a final name, which is all
+    /// [`check_symlink`](Self::check_symlink) takes (#413).
+    ///
+    /// A path with a final name (`src`, `src/`, `src/.`) is checked by `check_symlink`'s
+    /// rule: its final component is judged by its own file type, so a trailing `/` or
+    /// `/.` does not make it follow a link. A path with no final name is canonicalized as
+    /// the operating system resolves it, and names no link: `link/..` is the directory
+    /// above the link's target on Unix. Either way, a canonical form carrying a
+    /// [`crate::is_forbidden_path_char`] codepoint — which a symlinked or hostile-named
+    /// directory above the path can bring in — is refused with the same message, and
+    /// the canonical form must be a directory. A filesystem root is accepted.
+    ///
+    /// Every message names `path` as passed, never its canonical form.
+    ///
+    /// # Errors
+    ///
+    /// - `MdsError::Io` — `path` carries a forbidden path character (`path contains
+    ///   forbidden character U+XXXX: "<path>"`), checked before the filesystem is
+    ///   touched; its canonical form carries one (`resolved path contains forbidden
+    ///   character U+XXXX: "<path>"`); or it is not a directory (`cannot resolve path
+    ///   <path>: not a directory`).
+    /// - `MdsError::ImportError` — its final component is a symlink.
+    /// - `MdsError::FileNotFound` — it does not resolve.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// let here = mds::NativeFs::check_directory(Path::new("."))?;
+    /// assert_eq!(here, std::env::current_dir()?.canonicalize()?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn check_directory(path: &Path) -> Result<PathBuf, MdsError> {
+        let shown = path.display().to_string();
+        reject_forbidden_path_chars("path", &shown)?;
+        let canonical = if path.file_name().is_some() {
+            Self::check_symlink_named(path, &shown)?
+        } else {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| MdsError::file_not_found(shown.clone()))?;
+            reject_forbidden_in_path(&canonical, &shown)?;
+            canonical
+        };
+        if !canonical.is_dir() {
+            return Err(not_a_directory(&shown));
+        }
+        Ok(canonical)
+    }
+
     /// Canonicalize a directory path, handling the filesystem-root edge case (#371).
     ///
     /// A filesystem root (`/` on Unix, or a drive root such as `C:\` on
@@ -825,9 +913,7 @@ impl NativeFs {
                 .canonicalize()
                 .map_err(|e| MdsError::io(format!("cannot resolve path {shown}: {e}")))?;
             if !canonical.is_dir() {
-                return Err(MdsError::io(format!(
-                    "cannot resolve path {shown}: not a directory"
-                )));
+                return Err(not_a_directory(shown));
             }
             reject_forbidden_in_path(&canonical, shown)?;
             Ok(canonical)
@@ -2718,6 +2804,94 @@ mod tests {
             msg.contains("symlinks"),
             "expected symlink rejection, got: {msg}"
         );
+    }
+
+    // ── NativeFs::check_directory ─────────────────────────────────────────────
+
+    /// #413: a directory resolves to its canonical form whether the path has a final
+    /// name (`d`, `d/`, `d/.`) or not (`d/sub/..`, `d/..`, `.`), and every refusal names
+    /// the path as passed: missing is not found, a file is not a directory, a symlinked
+    /// final component is a symlink however it is spelled, and `link/..` names no link.
+    /// A canonical form carrying a forbidden character is refused with one message for
+    /// a named path and one with no final name (Unix: a Windows name cannot hold TAB).
+    #[test]
+    fn check_directory_takes_a_path_with_or_without_a_final_name() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("d").join("sub")).unwrap();
+        std::fs::write(root.join("f.mds"), "x").unwrap();
+        let at = |rel: &str| root.join(rel);
+        let not_found = |p: &Path| Err(format!("file not found: {}", p.display()));
+        let symlink = |p: &Path| {
+            Err(format!(
+                "import error: symlinks are not allowed in imports: {}",
+                p.display()
+            ))
+        };
+
+        let mut rows: Vec<(PathBuf, Result<PathBuf, String>)> = vec![
+            (at("d"), Ok(at("d"))),
+            (at("d/"), Ok(at("d"))),
+            (at("d/."), Ok(at("d"))),
+            (at("d/sub/.."), Ok(at("d"))),
+            (at("d/.."), Ok(root.clone())),
+            (
+                PathBuf::from("."),
+                Ok(std::env::current_dir().unwrap().canonicalize().unwrap()),
+            ),
+            (at("gone"), not_found(&at("gone"))),
+            (
+                at("f.mds"),
+                Err(format!(
+                    "cannot resolve path {}: not a directory",
+                    at("f.mds").display()
+                )),
+            ),
+        ];
+        // Windows resolves `gone\..` lexically, to the directory above it.
+        #[cfg(unix)]
+        rows.push((at("gone/.."), not_found(&at("gone/.."))));
+        if make_symlink(&at("d"), &at("link")) {
+            rows.extend([
+                (at("link"), symlink(&at("link"))),
+                (at("link/"), symlink(&at("link/"))),
+                (at("link/."), symlink(&at("link/."))),
+                (at("link/.."), Ok(root.clone())),
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("x\ty").join("sub")).unwrap();
+            assert!(make_symlink(&at("x\ty"), &at("clink")));
+            let hostile = |p: &Path| {
+                Err(format!(
+                    "resolved path contains forbidden character U+0009: \"{}\"",
+                    p.display()
+                ))
+            };
+            rows.extend([
+                (at("clink/sub"), hostile(&at("clink/sub"))),
+                (at("clink/sub/.."), hostile(&at("clink/sub/.."))),
+                (at("clink"), symlink(&at("clink"))),
+            ]);
+            let typed = at(&format!("d{}e", '\x1b'));
+            let shown = format!("{}", at("d").display()) + &format!("{}u001Be", '\\');
+            rows.push((
+                typed,
+                Err(format!(
+                    "path contains forbidden character U+001B: \"{shown}\""
+                )),
+            ));
+        }
+
+        let mut mismatches = Vec::new();
+        for (path, want) in rows {
+            let got = NativeFs::check_directory(&path).map_err(|e| e.to_string());
+            if got != want {
+                mismatches.push(format!("{path:?}: got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     #[test]

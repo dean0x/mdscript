@@ -209,7 +209,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
         // refusal is an analysis failure: the JSON envelope in --format json mode
         // (AC-F-14), exit 2.
         return match crate::input::resolve_directory_argument(&input) {
-            Ok((dir, _)) => run_lint_directory(&dir, flags, runtime_vars),
+            Ok(_) => run_lint_directory(&input, flags, runtime_vars),
             Err(mds_err) => {
                 emit_analysis_failure_json_or_stderr(&mds_err, format, None);
                 std::process::exit(2);

@@ -62,7 +62,9 @@ pub(crate) mod vars_json;
 pub(crate) mod verbatim;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
-pub use fs::{check_module_bytes, effective_parent, FileSystem, NativeFs, VirtualFs};
+pub use fs::{
+    check_module_bytes, effective_parent, reject_forbidden_path, FileSystem, NativeFs, VirtualFs,
+};
 pub use lint::{
     escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
     is_forbidden_path_char, named_source_for_render, neutralize_source_for_render,

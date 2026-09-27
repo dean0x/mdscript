@@ -74,6 +74,21 @@ fn forbidden_path_char_functions_exist() {
     assert_eq!(&*mds::escape_path_for_message("a\tb"), "a\\u0009b");
 }
 
+/// #413: `reject_forbidden_path` — the forbidden-character refusal the CLI words its
+/// own path refusals with — is callable via the crate root: it scans one path and names
+/// another, as typed.
+#[test]
+fn reject_forbidden_path_function_exists() {
+    let _: fn(&str, &Path, &str) -> Result<(), MdsError> = mds::reject_forbidden_path;
+    mds::reject_forbidden_path("path", Path::new("clean"), "clean").unwrap();
+    let err = mds::reject_forbidden_path("resolved path", Path::new("a\tb"), "typed").unwrap_err();
+    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "resolved path contains forbidden character U+0009: \"typed\""
+    );
+}
+
 /// #414: `check_module_bytes` — NativeFs's post-read checks, shared with the WASM
 /// backend's `preflightModule` — is callable via the crate root with the expected
 /// signature: text in, the size and UTF-8 refusals out.
@@ -2221,6 +2236,18 @@ fn native_fs_check_symlink_is_public() {
     use std::path::PathBuf;
     type CheckSymlinkFn = fn(&Path) -> Result<PathBuf, MdsError>;
     let _: CheckSymlinkFn = mds::NativeFs::check_symlink;
+}
+
+/// #413: `NativeFs::check_directory` — the check every CLI directory argument goes
+/// through — is callable from an external crate: a path with no final name resolves to
+/// the canonical directory, and a file is refused as not a directory.
+#[test]
+fn native_fs_check_directory_function_exists() {
+    let _: fn(&Path) -> Result<std::path::PathBuf, MdsError> = NativeFs::check_directory;
+    let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(NativeFs::check_directory(Path::new(".")).unwrap(), here);
+    let err = NativeFs::check_directory(Path::new("Cargo.toml")).unwrap_err();
+    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
 }
 
 // ── CompileOptions shape (T1 wire-format parity gate) ────────────────────────

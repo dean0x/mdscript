@@ -71,9 +71,8 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
     if input.is_dir() {
         // #413: the one directory-argument check every directory-mode subcommand makes
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
-        let (dir, _) =
-            crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
-        return run_fmt_directory(&dir, flags);
+        crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
+        return run_fmt_directory(&input, flags);
     }
 
     ensure_existing_mds_file(&input).map_err(miette::Error::from)?;

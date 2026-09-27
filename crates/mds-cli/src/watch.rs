@@ -1091,11 +1091,11 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`). It
         // takes `.`, `..` and `sub/..`, which `check_symlink` cannot, and returns the
         // canonical form notify reports event paths under.
-        let (typed, canonical) = crate::input::resolve_directory_argument(&resolved_input)
+        let canonical = crate::input::resolve_directory_argument(&resolved_input)
             .map_err(miette::Error::from)?;
         run_watch_dir(
             WatchedPath {
-                typed,
+                typed: resolved_input,
                 canonical,
                 what: Watched::Root,
             },

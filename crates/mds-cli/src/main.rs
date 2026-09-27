@@ -277,8 +277,8 @@ fn run_check(
     if input != std::path::Path::new("-") && input.is_dir() {
         // #413: the one directory-argument check every directory-mode subcommand makes
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
-        let (dir, _) = input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
-        return run_check_directory(&dir, runtime_vars, quiet);
+        input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
+        return run_check_directory(&input, runtime_vars, quiet);
     }
 
     // Single-file / stdin path.

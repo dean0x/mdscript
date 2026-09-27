@@ -1444,11 +1444,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         }
         // #413: the one directory-argument check every directory-mode subcommand makes
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
-        let (dir, _) =
-            crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
+        crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
 
         // Load project config to determine effective flags for directory mode.
-        let dir_config = load_config(&dir)?;
+        let dir_config = load_config(&input)?;
         let cfg_source_map = dir_config
             .as_ref()
             .map(|(c, _)| c.build.source_map)
@@ -1469,7 +1468,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         }
 
         return run_build_directory(
-            &dir,
+            &input,
             out_dir,
             runtime_vars,
             quiet,
