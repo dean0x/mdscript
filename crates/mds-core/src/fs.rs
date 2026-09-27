@@ -5,7 +5,7 @@
 //! - [`VirtualFs`] — in-memory HashMap-backed filesystem for testing and WASM
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::error::MdsError;
@@ -945,16 +945,25 @@ impl NativeFs {
     /// security primitives — no `Path`→`String`→`Path` round-trip on the hot path.
     ///
     /// Validates `relative` (empty, null byte, forbidden path characters, segment
-    /// cap), joins with `dir` via `Path::join` (verbatim-path-safe on Windows;
-    /// avoids PF-003 / #133), then runs `check_symlink_named` (which also refuses a
-    /// forbidden character anywhere in the canonical path) and
-    /// `check_path_traversal` before returning the canonical key string.
+    /// cap), refuses one whose last component is `..` as not found, joins with `dir`
+    /// via `Path::join` (verbatim-path-safe on Windows; avoids PF-003 / #133), then
+    /// runs `check_symlink_named` (which also refuses a forbidden character anywhere
+    /// in the canonical path) and `check_path_traversal` before returning the
+    /// canonical key string.
     ///
     /// Does NOT call `init_root` — only entry-point resolution
     /// ([`FileSystem::resolve_entry`]) anchors the security root.
     fn normalize_in_dir_impl(&self, dir: &Path, relative: &str) -> Result<String, MdsError> {
         validate_relative_import(relative)?;
         check_segment_count(relative)?;
+        // A path whose last component is `..` (`../`, `./sub/..`, and `sub\..` on
+        // Windows) names a directory, never a file: not found, on every OS (#414).
+        // Decided on the path as written: on POSIX the joined path has no final name
+        // either, but on Windows joining onto the verbatim (`\\?\`) canonical `dir`
+        // collapses the `..` lexically and names that directory by its own name.
+        if Path::new(relative).components().next_back() == Some(Component::ParentDir) {
+            return Err(MdsError::file_not_found(relative));
+        }
         let path = dir.join(relative);
         // Use check_symlink_named so the error message shows the relative import
         // string (what the user typed) rather than the absolute joined path (R3 / CWE-209).
@@ -2529,6 +2538,48 @@ mod tests {
             .normalize_in_dir(&dir_str, &escape_to(&entry))
             .expect("control: escape_to(entry) must resolve inside the project");
         assert_eq!(Path::new(&inside), entry.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn native_normalize_in_dir_import_ending_in_dot_dot_is_not_found() {
+        // An import whose last component is `..` names a directory, never a file:
+        // `file not found: <import as written>` on every OS, as the WASM pre-scanner
+        // reports it (#414). The directories are the canonical keys' parents the
+        // resolver passes — verbatim (`\\?\`) paths on Windows, where joining collapses
+        // `..` lexically and so used to name, and open, the directory it leads to.
+        let dir = TempDir::new().unwrap();
+        let entry = make_temp_file(&dir, "main.mds", "hello");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let fs = NativeFs::new();
+        let root = fs.parent_dir(&fs.resolve_entry(&entry.display().to_string()).unwrap());
+        let sub = Path::new(&root).join("sub").display().to_string();
+
+        let mut rows = vec![
+            (sub.as_str(), "../"),
+            (sub.as_str(), ".."),
+            (root.as_str(), "./sub/.."),
+            (root.as_str(), "sub/../"),
+            (root.as_str(), "./sub/../."),
+        ];
+        if cfg!(windows) {
+            rows.push((root.as_str(), r".\sub\.."));
+        }
+        let mismatches: Vec<String> = rows
+            .iter()
+            .filter_map(|&(from, relative)| {
+                let expected = format!("file not found: {relative}");
+                match fs.normalize_in_dir(from, relative) {
+                    Err(err @ MdsError::FileNotFound { .. }) if err.to_string() == expected => None,
+                    other => Some(format!("{relative:?} from {from:?}: {other:?}")),
+                }
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+        // Control: a `..` that is not the last component resolves, so the refusal
+        // above is the final `..`, not any `..`.
+        let key = fs.normalize_in_dir(&sub, "../main.mds").unwrap();
+        assert_eq!(Path::new(&key), entry.canonicalize().unwrap());
     }
 
     #[test]

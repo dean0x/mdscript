@@ -8,6 +8,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, open, realpath, symlink, writeFile, rm } from 'node:fs/promises';
@@ -1292,8 +1293,8 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
           help: null,
           span: null,
         }],
-        // An import or entry whose last component is `..` names no file for NativeFs:
-        // not found, whatever the directory it leads to.
+        // An import or entry whose last component is `..` names no file for NativeFs,
+        // on every OS: not found, whatever the directory it leads to.
         ['import: ends in ..', await write('sub/up.mds', '@import "../" as u\nhi\n'), {
           code: 'mds::file_not_found',
           message: 'file not found: ../',
@@ -1328,18 +1329,25 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const files = [...rows.map(([, file]) => file), ...atTheCap, ownDir];
       const native = await compileFileOutcomes('native', files);
       const wasm = await compileFileOutcomes('wasm', files);
+      // Every row is judged before anything is asserted, so a row that fails on one
+      // platform cannot hide the rows after it.
+      const mismatches = [];
+      const judge = (label, actual, expected, ok = isDeepStrictEqual(actual, expected)) => {
+        if (!ok) mismatches.push({ label, actual, expected });
+      };
       for (const [i, [label, , expected]] of rows.entries()) {
-        assert.deepEqual(native[i], expected, `${label} (native)`);
-        assert.deepEqual(wasm[i], native[i], label);
+        judge(`${label} (native)`, native[i], expected);
+        judge(label, wasm[i], native[i]);
       }
       for (const j of atTheCap.keys()) {
         const i = rows.length + j;
-        assert.equal(typeof native[i].output, 'string', JSON.stringify(native[i]));
-        assert.deepEqual(wasm[i], native[i], `control ${atTheCap[j]}`);
+        judge(`control ${atTheCap[j]} (native)`, native[i], 'an output', typeof native[i]?.output === 'string');
+        judge(`control ${atTheCap[j]}`, wasm[i], native[i]);
       }
       const i = files.length - 1;
-      assert.equal(native[i].code, 'mds::io', JSON.stringify(native[i]));
-      assert.equal(wasm[i].code, 'mds::io', JSON.stringify(wasm[i]));
+      judge('import: ./ (native)', native[i], { code: 'mds::io' }, native[i]?.code === 'mds::io');
+      judge('import: ./', wasm[i], { code: 'mds::io' }, wasm[i]?.code === 'mds::io');
+      assert.deepEqual(mismatches, []);
     });
   });
 
