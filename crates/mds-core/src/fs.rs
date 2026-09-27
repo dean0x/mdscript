@@ -2275,6 +2275,151 @@ mod tests {
         );
     }
 
+    // ── read_at_most: the bounded read (#428) ─────────────────────────────────
+
+    /// The reads a [`Scripted`] reader serves before it fails with its own error: far
+    /// more than any case below needs, so a loop that never gives up ends the test
+    /// instead of hanging it.
+    const READ_BUDGET: usize = 100_000;
+
+    /// A fake reader: its `n`th read follows `script[n - 1]` — `None` is an interrupted
+    /// read, `Some(k)` a read of up to `k` bytes — and every read after the script
+    /// follows `then`. It counts its reads.
+    struct Scripted {
+        script: Vec<Option<usize>>,
+        then: Option<usize>,
+        reads: usize,
+    }
+
+    impl Scripted {
+        fn new(script: Vec<Option<usize>>, then: Option<usize>) -> Self {
+            Scripted {
+                script,
+                then,
+                reads: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads > READ_BUDGET {
+                return Err(std::io::Error::other("read budget spent"));
+            }
+            let step = self.script.get(self.reads - 1).copied();
+            match step.unwrap_or(self.then) {
+                None => Err(std::io::ErrorKind::Interrupted.into()),
+                Some(k) => {
+                    let n = k.min(buf.len());
+                    buf[..n].fill(b'x');
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    /// `n` interrupted reads in a row.
+    fn interruptions(n: usize) -> Vec<Option<usize>> {
+        vec![None; n]
+    }
+
+    /// Up to 64 reads in a row may be interrupted; the 65th ends the read with that
+    /// error, and a read that returns bytes starts the count again. Every case runs on
+    /// every OS, and each is judged before anything is asserted.
+    #[test]
+    fn read_at_most_gives_up_after_64_interrupted_reads_in_a_row() {
+        let cases = [
+            (
+                "64 interrupted, then data",
+                [interruptions(64), vec![Some(3), Some(0)]].concat(),
+                Some(0),
+            ),
+            (
+                "65 interrupted, then data",
+                [interruptions(65), vec![Some(3)]].concat(),
+                Some(0),
+            ),
+            ("interrupted without end", Vec::new(), None),
+            (
+                "64 interrupted, a byte, 64 interrupted, a byte",
+                [
+                    interruptions(64),
+                    vec![Some(1)],
+                    interruptions(64),
+                    vec![Some(1)],
+                ]
+                .concat(),
+                Some(0),
+            ),
+        ];
+        let outcomes: Vec<(&str, Result<usize, std::io::ErrorKind>, usize)> = cases
+            .into_iter()
+            .map(|(case, script, then)| {
+                let mut reader = Scripted::new(script, then);
+                let outcome = read_at_most(&mut reader, 1024, 0)
+                    .map(|bytes| bytes.len())
+                    .map_err(|e| e.kind());
+                (case, outcome, reader.reads)
+            })
+            .collect();
+        let interrupted = std::io::ErrorKind::Interrupted;
+        assert_eq!(
+            outcomes,
+            [
+                ("64 interrupted, then data", Ok(3), 66),
+                ("65 interrupted, then data", Err(interrupted), 65),
+                ("interrupted without end", Err(interrupted), 65),
+                ("64 interrupted, a byte, 64 interrupted, a byte", Ok(2), 131),
+            ]
+        );
+    }
+
+    /// The buffer never holds more than `limit`, whatever the chunks a source returns
+    /// and however far it runs past its size hint — a file that grows after its size
+    /// was taken, or reports none — and no read asks for a byte past `limit`. A source
+    /// of exactly its size hint is read into the first buffer, without growing it.
+    #[test]
+    fn read_at_most_never_grows_its_buffer_past_limit() {
+        // (case, bytes per read, size hint, limit); every source is endless.
+        let cases = [
+            ("1-byte reads, no size hint", 1, 0, 10_000),
+            ("8 KiB reads, no size hint", 8192, 0, 100_000),
+            ("8 KiB reads past a hint of 100", 8192, 100, 100_000),
+            ("8 KiB reads, hint over limit", 8192, 1_000_000, 100_000),
+        ];
+        let mut mismatches = Vec::new();
+        for (case, chunk, size_hint, limit) in cases {
+            let mut reader = Scripted::new(Vec::new(), Some(chunk));
+            match read_at_most(&mut reader, limit as u64, size_hint) {
+                Ok(bytes) if bytes.len() == limit && bytes.capacity() <= limit => {}
+                Ok(bytes) => mismatches.push(format!(
+                    "{case}: len {}, capacity {} (limit {limit})",
+                    bytes.len(),
+                    bytes.capacity()
+                )),
+                Err(e) => mismatches.push(format!("{case}: {e}")),
+            }
+            // Every read returned `chunk` bytes but the last, which asked for the rest.
+            if reader.reads != limit.div_ceil(chunk) {
+                mismatches.push(format!("{case}: {} reads", reader.reads));
+            }
+        }
+        // A source of exactly its size hint: the first buffer — the hint plus the one
+        // byte that sees its end — is never grown.
+        let mut reader = Scripted::new(vec![Some(5000)], Some(0));
+        match read_at_most(&mut reader, 100_000, 5000) {
+            Ok(bytes) if bytes.len() == 5000 && bytes.capacity() == 5001 => {}
+            Ok(bytes) => mismatches.push(format!(
+                "exactly its size hint: len {}, capacity {}",
+                bytes.len(),
+                bytes.capacity()
+            )),
+            Err(e) => mismatches.push(format!("exactly its size hint: {e}")),
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
     // ── NativeFs empty-path guards ────────────────────────────────────────────
 
     #[test]
