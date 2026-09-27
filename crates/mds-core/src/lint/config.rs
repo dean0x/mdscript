@@ -142,11 +142,12 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
 /// - `"unknown lint rules: 'A', 'B'; recognised rules are: ...; ignoring"`
 #[must_use]
 pub fn format_unknown_rule_names_warning(unknown: &UnknownRuleNames) -> String {
-    // Assembled with `push_str` rather than `format!` + `join`. This function is
-    // reachable from the WASM binary, which runs against a hard 850,000-byte guard
-    // (AC-224-18); `[&str]::join` and `Vec<String>::join` each monomorphise into
-    // kilobytes there, and nothing else in the WASM surface pulls them in. The output
-    // is byte-identical to the `format!` form.
+    // Assembled with `push_str` rather than `format!` + `join`, to keep this function's
+    // code small: it is reachable from the WASM binary, which runs against a hard
+    // 850,000-byte guard (AC-224-18). `join` itself is in that binary regardless —
+    // `format_unknown_keys_error` (options.rs), also WASM-reachable, uses
+    // `[&str]::join` and `Vec<String>::join`. The output is byte-identical to the
+    // `format!` form.
     let names = unknown.names();
     let mut out = String::with_capacity(256);
     if let [only] = names {

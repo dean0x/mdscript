@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use crate::error::MdsError;
+use crate::lint::sanitize_control_chars_wire;
 use crate::value::Value;
 
 // ── json_type_name ────────────────────────────────────────────────────────────
@@ -135,6 +136,12 @@ pub fn parse_json_vars(vars_value: serde_json::Value) -> Result<HashMap<String, 
 /// - Multiple unknown keys:
 ///   `unknown option keys: "foo", "bar"; recognised keys are: basePath, vars`
 ///
+/// Each unknown key is the caller's text, so it is WIRE-escaped with
+/// [`sanitize_control_chars_wire`] as the message is built (#418): control characters,
+/// DEL and the bidi/format hazards become escape text, and TAB stays raw. A clean key
+/// shows unchanged. `@mdscript/mds`'s own key check (`assertKnownKeys`) escapes
+/// identically, so the two messages stay byte-identical.
+///
 /// # Panics
 ///
 /// Panics (in debug builds) if `unknowns` is empty — callers must only call
@@ -143,13 +150,17 @@ pub fn parse_json_vars(vars_value: serde_json::Value) -> Result<HashMap<String, 
 pub fn format_unknown_keys_error(unknowns: &[&str], known: &[&str]) -> String {
     debug_assert!(!unknowns.is_empty(), "called with empty unknowns list");
     let recognised = known.join(", ");
-    if unknowns.len() == 1 {
+    if let [only] = unknowns {
         format!(
             "unknown option key \"{}\"; recognised keys are: {}",
-            unknowns[0], recognised
+            sanitize_control_chars_wire(only),
+            recognised
         )
     } else {
-        let listed: Vec<String> = unknowns.iter().map(|k| format!("\"{k}\"")).collect();
+        let listed: Vec<String> = unknowns
+            .iter()
+            .map(|k| format!("\"{}\"", sanitize_control_chars_wire(k)))
+            .collect();
         format!(
             "unknown option keys: {}; recognised keys are: {}",
             listed.join(", "),
@@ -385,6 +396,76 @@ mod tests {
         );
         assert!(err.contains("\"foo\""), "should name 'foo': {err}");
         assert!(err.contains("\"bar\""), "should name 'bar': {err}");
+    }
+
+    // ── #418: unknown option keys are WIRE-escaped ────────────────────────────
+
+    /// `a`, ESC, `b`, LF, `c`, TAB, `d` — built with `char::from_u32` at runtime, never
+    /// typed as live bytes (PF-018) — and how the WIRE escaper shows it.
+    fn hostile_key() -> (String, String) {
+        let ch = |cp: u32| char::from_u32(cp).expect("a valid scalar value");
+        let esc = |cp: u32| format!("\\u{cp:04X}");
+        let hostile: String = ['a', ch(0x1b), 'b', ch(0x0a), 'c', ch(0x09), 'd']
+            .iter()
+            .collect();
+        let shown = format!("a{}b{}c{}d", esc(0x1b), esc(0x0a), ch(0x09));
+        (hostile, shown)
+    }
+
+    #[test]
+    fn format_unknown_keys_error_wire_escapes_keys_in_both_forms() {
+        let (hostile, shown) = hostile_key();
+        assert_eq!(
+            format_unknown_keys_error(&[&hostile], &["basePath", "vars"]),
+            format!("unknown option key \"{shown}\"; recognised keys are: basePath, vars")
+        );
+        assert_eq!(
+            format_unknown_keys_error(&["typo", &hostile], &["vars"]),
+            format!("unknown option keys: \"typo\", \"{shown}\"; recognised keys are: vars")
+        );
+        // Clean keys (the control): byte-identical to the unescaped form.
+        assert_eq!(
+            format_unknown_keys_error(&["typo"], &["basePath", "vars"]),
+            "unknown option key \"typo\"; recognised keys are: basePath, vars"
+        );
+        assert_eq!(
+            format_unknown_keys_error(&["foo", "bar"], &["vars"]),
+            "unknown option keys: \"foo\", \"bar\"; recognised keys are: vars"
+        );
+    }
+
+    #[test]
+    fn format_unknown_keys_error_leaves_only_tab_raw() {
+        // A key holding every forbidden path character: WIRE escapes all but TAB.
+        let key: String = (0..=0xFFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|&c| crate::is_forbidden_path_char(c))
+            .collect();
+        assert_eq!(key.chars().count(), 80, "non-vacuity: the whole class");
+        for message in [
+            format_unknown_keys_error(&[&key], &["vars"]),
+            format_unknown_keys_error(&[&key, &key], &["vars"]),
+        ] {
+            let raw: Vec<char> = message
+                .chars()
+                .filter(|&c| crate::is_forbidden_path_char(c))
+                .collect();
+            assert!(
+                raw.iter().all(|&c| c == '\t') && !raw.is_empty(),
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unknown_json_keys_wire_escapes_the_key() {
+        let (hostile, shown) = hostile_key();
+        let mut map = serde_json::Map::new();
+        map.insert(hostile, json!(1));
+        assert_eq!(
+            reject_unknown_json_keys(&map, &["vars"]).unwrap_err(),
+            format!("unknown option key \"{shown}\"; recognised keys are: vars")
+        );
     }
 
     // ── VarsError Display / source ────────────────────────────────────────────

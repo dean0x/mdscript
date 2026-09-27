@@ -6,6 +6,7 @@ import type {
   LintFileOptions,
   LintOptions,
 } from '../types.js';
+import { sanitizeControlCharsWire } from './path-chars.js';
 
 // ── keysOf helper ──────────────────────────────────────────────────────────────
 
@@ -253,13 +254,14 @@ export function assertKnownKeys(options: object, method: MethodName): void {
   });
   if (unknowns.length === 0) return;
   const recognised = known.join(', ');
-  let message: string;
-  if (unknowns.length === 1) {
-    message = `unknown option key "${unknowns[0]}"; recognised keys are: ${recognised}`;
-  } else {
-    const listed = unknowns.map((k) => `"${k}"`).join(', ');
-    message = `unknown option keys: ${listed}; recognised keys are: ${recognised}`;
-  }
+  // A key is the caller's text: WIRE-escaped exactly as `format_unknown_keys_error`
+  // escapes it, so the two messages stay byte-identical for any key that is valid
+  // Unicode (#418). A lone surrogate is shown as is here; napi receives it as U+FFFD.
+  const quoted = unknowns.map((k) => `"${sanitizeControlCharsWire(k)}"`);
+  const message =
+    quoted.length === 1
+      ? `unknown option key ${quoted[0]}; recognised keys are: ${recognised}`
+      : `unknown option keys: ${quoted.join(', ')}; recognised keys are: ${recognised}`;
   const err = new Error(message) as Error & { code: string };
   err.code = 'mds::invalid_options';
   throw err;

@@ -35,11 +35,22 @@ import {
   getBackend,
 } from '../dist/node.js';
 import { assertKnownKeys, METHOD_KEYS, forwardOpts } from '../dist/util/options.js';
+import { FORBIDDEN_PATH_CODEPOINTS, escapeText } from './helpers.mjs';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 const require = createRequire(import.meta.url);
+
+/**
+ * An option key holding every forbidden path character (#418), built at runtime
+ * (PF-018), and how the WIRE escaper shows it: each as its six-character escape
+ * text except TAB, which WIRE leaves raw.
+ */
+const HOSTILE_KEY = 'k' + FORBIDDEN_PATH_CODEPOINTS.map((cp) => String.fromCodePoint(cp)).join('');
+const HOSTILE_SHOWN =
+  'k' +
+  FORBIDDEN_PATH_CODEPOINTS.map((cp) => (cp === 0x09 ? String.fromCodePoint(cp) : escapeText(cp))).join('');
 
 describe('options-validation', () => {
   before(() => init());
@@ -281,9 +292,9 @@ describe('options-validation', () => {
     // A key not recognised by any method: triggers the standard
     // "unknown option key" format from both wrapper and napi.
     // 'sourceMaps' is a common typo for 'sourceMap'; not in any method's list.
-    const BAD_OPT = { sourceMaps: true };
-
-    const cases = [
+    // #418: a hostile key must be escaped identically by both — the anchor below
+    // proves it reached each message in its escaped form (PF-013).
+    const casesFor = (BAD_OPT) => [
       {
         name: 'compile',
         wrapperFn: () => compile('', BAD_OPT),
@@ -323,17 +334,26 @@ describe('options-validation', () => {
       },
     ];
 
-    for (const { name, wrapperFn, addonFn } of cases) {
-      const wrapperMsg = await captureMsg(wrapperFn);
-      const addonMsg   = await captureMsg(addonFn);
+    for (const [BAD_OPT, shownKey] of [
+      [{ sourceMaps: true }, 'sourceMaps'],
+      [{ [HOSTILE_KEY]: true }, HOSTILE_SHOWN],
+    ]) {
+      for (const { name, wrapperFn, addonFn } of casesFor(BAD_OPT)) {
+        const wrapperMsg = await captureMsg(wrapperFn);
+        const addonMsg   = await captureMsg(addonFn);
 
-      assert.ok(wrapperMsg.length > 0, `wrapper should have thrown for ${name}`);
-      assert.ok(addonMsg.length > 0,   `napi backend should have thrown for ${name}`);
-      assert.strictEqual(
-        wrapperMsg,
-        addonMsg,
-        `byte-identical messages required for ${name} — wrapper: "${wrapperMsg}" | napi: "${addonMsg}"`,
-      );
+        assert.ok(wrapperMsg.length > 0, `wrapper should have thrown for ${name}`);
+        assert.ok(addonMsg.length > 0,   `napi backend should have thrown for ${name}`);
+        assert.strictEqual(
+          wrapperMsg,
+          addonMsg,
+          `byte-identical messages required for ${name} — wrapper: "${wrapperMsg}" | napi: "${addonMsg}"`,
+        );
+        assert.ok(
+          wrapperMsg.startsWith(`unknown option key "${shownKey}"; `),
+          `${name}: the key must be named escaped — got ${JSON.stringify(wrapperMsg)}`,
+        );
+      }
     }
   });
 
@@ -912,10 +932,10 @@ describe('options-validation', () => {
     // Hard-fail without addon — same rationale as U-OV-14 (avoids PF-013).
     const addon = require('@mdscript/mds-napi');
 
-    // Two unknown keys: triggers the plural "unknown option keys:" form.
-    const BAD_OPT = { sourceMaps: true, varsJson: '{}' };
-
-    const cases = [
+    // Two unknown keys: triggers the plural "unknown option keys:" form. #418: with
+    // a hostile second key, both must escape it identically, and the anchor proves
+    // it reached each message in its escaped form (PF-013).
+    const casesFor = (BAD_OPT) => [
       { name: 'compile',     wrapperFn: () => compile('', BAD_OPT),                               addonFn: () => addon.compile('', BAD_OPT) },
       { name: 'check',       wrapperFn: () => check('', BAD_OPT),                                 addonFn: () => addon.check('', BAD_OPT) },
       { name: 'compileFile', wrapperFn: () => compileFile('/nonexistent.mds', BAD_OPT),            addonFn: () => addon.compileFile('/nonexistent.mds', BAD_OPT) },
@@ -925,16 +945,25 @@ describe('options-validation', () => {
       { name: 'lintVirtual', wrapperFn: () => lintVirtual(VIRTUAL_MODS, VIRTUAL_ENTRY, BAD_OPT),  addonFn: () => addon.lintVirtual(VIRTUAL_MODS, VIRTUAL_ENTRY, BAD_OPT) },
     ];
 
-    for (const { name, wrapperFn, addonFn } of cases) {
-      const wrapperMsg = await captureMsg(wrapperFn);
-      const addonMsg   = await captureMsg(addonFn);
-      assert.ok(wrapperMsg.length > 0, `wrapper must throw for ${name} (positive control)`);
-      assert.ok(addonMsg.length > 0,   `napi must throw for ${name} (positive control)`);
-      assert.strictEqual(
-        wrapperMsg,
-        addonMsg,
-        `plural form must be byte-identical for ${name} — wrapper: "${wrapperMsg}" | napi: "${addonMsg}"`,
-      );
+    for (const [BAD_OPT, listed] of [
+      [{ sourceMaps: true, varsJson: '{}' }, '"sourceMaps", "varsJson"'],
+      [{ sourceMaps: true, [HOSTILE_KEY]: true }, `"sourceMaps", "${HOSTILE_SHOWN}"`],
+    ]) {
+      for (const { name, wrapperFn, addonFn } of casesFor(BAD_OPT)) {
+        const wrapperMsg = await captureMsg(wrapperFn);
+        const addonMsg   = await captureMsg(addonFn);
+        assert.ok(wrapperMsg.length > 0, `wrapper must throw for ${name} (positive control)`);
+        assert.ok(addonMsg.length > 0,   `napi must throw for ${name} (positive control)`);
+        assert.strictEqual(
+          wrapperMsg,
+          addonMsg,
+          `plural form must be byte-identical for ${name} — wrapper: "${wrapperMsg}" | napi: "${addonMsg}"`,
+        );
+        assert.ok(
+          wrapperMsg.startsWith(`unknown option keys: ${listed}; `),
+          `${name}: the keys must be named escaped — got ${JSON.stringify(wrapperMsg)}`,
+        );
+      }
     }
   });
 

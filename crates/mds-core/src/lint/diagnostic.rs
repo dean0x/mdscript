@@ -75,6 +75,7 @@
 //! | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings; *distinct method from `LintResult::to_canonical_json`, not a duplicate* |
 //! | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | `message`, `help`, `file` — construction-time, so typed getters read pre-sanitized data (PF-004) |
 //! | Binding `mds::invalid_options` messages (napi, WASM, Python) | WIRE | construction-time: the `rules` key and severity value a message names, and the text of a conversion error it wraps (#418) |
+//! | `format_unknown_keys_error()` (options.rs) | WIRE | construction-time: every unknown option key, in the single and plural forms — napi, WASM and `reject_unknown_json_keys`; `@mdscript/mds`'s `assertKnownKeys` mirrors it (#418) |
 //! | `--diff` preview output (mds-cli/src/output.rs) | neutralized, TTY-gated | source excerpts neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable. **`--check` alone emits no preview text** — only status lines, which are unconditionally sanitized via `safe_path`. |
 //!
 //! **Scope of the table.** It covers every path that carries *untrusted text* —
