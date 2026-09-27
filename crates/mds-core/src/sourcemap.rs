@@ -35,7 +35,7 @@
 //! call site in the parent output is mapped.
 //!
 //! **S6** — `@include` fragment splice carrying foreign source
-//! indices.  `push_fragment_segment` on `MapBuilder` inserts rebased
+//! indices.  `splice_fragment` on `MapBuilder` inserts rebased
 //! `FragmentMap` segments from the included module using that
 //! module's own source index rather than `current_src`.
 //!
@@ -99,6 +99,7 @@
 //! unrelated slice labels from other workstreams, not part of this
 //! scheme.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -116,7 +117,7 @@ use serde::Serialize;
 /// Placed here (rather than `resolver.rs`) so [`crate::scope`] can import it
 /// without creating a scope → resolver cycle.
 ///
-/// `Clone` = two refcount bumps (`O(1)`).
+/// `Clone` = three refcount bumps (`O(1)`).
 ///
 /// # Debug output
 ///
@@ -159,10 +160,11 @@ impl std::fmt::Debug for Origin {
 
 /// Canonical `sources[]` label for in-memory (string-source) compilations.
 ///
-/// All paths that produce a `MapBuilder` for string-source input converge
-/// on `MapBuilder::new` or `MapBuilder::source_index`.  Both choke-points
-/// apply `map_source_label` so the diagnostic sentinel `"<source>"` can
-/// never appear in `sources[]`.
+/// Every source a `MapBuilder` registers — its seed, a region or function-body
+/// origin, a spliced fragment's sources — enters through `SourceTable::intern`,
+/// which indexes it under `map_source_label` of its key, and `MapBuilder::finalize`
+/// emits that same label, so the diagnostic sentinel `"<source>"` can never appear
+/// in `sources[]`.
 ///
 /// All binding surfaces (WASM, napi, Python, CLI) that handle string-source
 /// compiles must import this constant rather than redeclaring the literal, so
@@ -177,11 +179,13 @@ pub const STRING_SOURCE_MAP_LABEL: &str = "input.mds";
 /// source maps is identical across native, WASM, napi, and Python surfaces
 /// (fixes the PF-007 cross-surface divergence).
 ///
-/// Applied at BOTH choke-points where new labels enter a [`MapBuilder`]:
-/// - [`MapBuilder::new`] (the seed label at index 0), and
-/// - [`MapBuilder::source_index`] (before the dedup compare, so `"<source>"`
-///   and `"input.mds"` can never coexist as two distinct `sources[]` entries
-///   even if S8 or spliced-region paths pass the sentinel separately).
+/// Applied on both sides of a [`MapBuilder`]'s source registry:
+/// - [`SourceTable::intern`], to the key it indexes — before the dedup lookup,
+///   so `"<source>"` and `"input.mds"` can never coexist as two distinct
+///   `sources[]` entries even if S8 or spliced-region paths pass the sentinel
+///   separately — and
+/// - [`MapBuilder::finalize`], to each emitted `sources[]` entry (the stored
+///   `Origin` keeps its raw key).
 ///
 /// References `crate::resolver::SOURCE_LABEL` (now `pub(crate)`) so that a change
 /// to the sentinel value is caught at compile time rather than silently drifting.
@@ -666,6 +670,74 @@ pub(crate) struct RawSegment {
 }
 
 // ---------------------------------------------------------------------------
+// SourceTable — the sources a MapBuilder has registered
+// ---------------------------------------------------------------------------
+
+/// The sources a [`MapBuilder`] has registered, in registration order.
+///
+/// Each entry is the [`Origin`] that first registered its key, kept as is: it shares
+/// that module's `Arc<str>` key, display path and source, so registering a source
+/// bumps three refcounts and never copies text (#416). `display` is therefore always
+/// the root-relative path the module was loaded with, whichever path registered it
+/// first — an `@include` splice included (R3 / CWE-209).
+///
+/// `key_index` maps each entry's source-map label — [`map_source_label`] of
+/// `Origin::file` — to its index, so a lookup hashes the key once instead of
+/// scanning. The label is applied to the incoming key and to the stored one alike;
+/// the stored `Origin` itself is never relabelled.
+///
+/// Append-only by construction: the fields are private and no method removes or
+/// reorders an entry. An index, once returned, is stored in every segment recorded
+/// against it and cached in [`MapBuilder`]'s remap cache, so it must name the same
+/// source for the builder's whole life.
+#[derive(Default)]
+pub(crate) struct SourceTable {
+    origins: Vec<Origin>,
+    key_index: HashMap<Arc<str>, u32>,
+}
+
+impl SourceTable {
+    /// The index of `origin`'s key, registering `origin` when the key is new.
+    pub(crate) fn intern(&mut self, origin: &Origin) -> u32 {
+        let label = map_source_label(&origin.file);
+        if let Some(&idx) = self.key_index.get(label) {
+            return idx;
+        }
+        // One entry per distinct module key: bounded by MAX_MODULE_COUNT plus the
+        // string-source label, far below u32::MAX.
+        let idx = self.len() as u32;
+        let key: Arc<str> = if label == &*origin.file {
+            Arc::clone(&origin.file)
+        } else {
+            Arc::from(label)
+        };
+        self.key_index.insert(key, idx);
+        self.origins.push(origin.clone());
+        idx
+    }
+
+    /// The origin registered at `idx`, if any.
+    pub(crate) fn get(&self, idx: u32) -> Option<&Origin> {
+        self.origins.get(idx as usize)
+    }
+
+    /// The number of registered sources.
+    pub(crate) fn len(&self) -> usize {
+        self.origins.len()
+    }
+
+    /// The registered origins, in index order.
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Origin> {
+        self.origins.iter()
+    }
+
+    /// The registered origins, in index order, by value.
+    pub(crate) fn into_origins(self) -> Vec<Origin> {
+        self.origins
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MapBuilder — accumulates segments during evaluation
 // ---------------------------------------------------------------------------
 
@@ -697,22 +769,21 @@ pub(crate) struct MapBuilder {
     pub(crate) suppress: u32,
     /// Index of the source file currently being recorded (0-based into `sources`).
     pub(crate) current_src: u32,
-    /// Source file canonical keys, in registration order (parallel to `sources_content`
-    /// and `display_names`).
+    /// The registered sources, each the [`Origin`] that first registered its key.
     ///
-    /// Used for Source Map v3 `sources[]` entries — these may be absolute paths; they
-    /// are relativized by the caller's `finalize` + `relativize_source` step (ADR-005).
-    /// Never use these for user-visible diagnostic strings — use `display_names` instead.
-    pub(crate) sources: Vec<String>,
-    /// Display-safe (root-relative) paths, parallel to `sources` (R3 / CWE-209).
+    /// `Origin::file` becomes the Source Map v3 `sources[]` entry — it may be absolute;
+    /// the caller relativizes it after [`Self::finalize`] (ADR-005). `Origin::display`
+    /// is the root-relative path for diagnostics (R3 / CWE-209), and `Origin::source`
+    /// resolves segment offsets and feeds `sourcesContent`.
+    pub(crate) sources: SourceTable,
+    /// Local → global source indices for each [`FragmentMap`] spliced so far, keyed by
+    /// the fragment's `Arc` pointer (S6 / AC-PERF-05). An `@include` of one module in a
+    /// loop, or from several sites, registers the module's sources once.
     ///
-    /// Populated at registration time from `display_path_for(fs, key)`.  Read by
-    /// `evaluate_with_map` at line ~180 to seed `EvalContext::file` for diagnostics.
-    /// The `debug_assert_eq!` in `source_index` enforces strict length parity with
-    /// `sources` so any registration mismatch is caught in debug builds.
-    pub(crate) display_names: Vec<String>,
-    /// Source file contents, parallel to `sources` (for `sourcesContent`).
-    pub(crate) sources_content: Vec<String>,
+    /// The entry keeps its `Arc`, so the pointer cannot be freed and reused by another
+    /// fragment while the key is live, and its indices stay valid because
+    /// [`SourceTable`] is append-only.
+    remap_cache: HashMap<usize, (Arc<FragmentMap>, Vec<u32>)>,
     /// True when at least one segment was silently dropped due to the
     /// [`crate::limits::MAX_SOURCEMAP_SEGMENTS`] cap (AC-PERF-03).
     ///
@@ -728,77 +799,59 @@ pub(crate) struct MapBuilder {
 }
 
 impl MapBuilder {
-    /// Create a builder seeded with a single source file.
+    /// Create a builder seeded with `origin` at source index 0.
     ///
-    /// - `source_name` — canonical key (absolute path on `NativeFs`, virtual key or
-    ///   sentinel on `VirtualFs`); stored in `sources[]` for Source Map v3 emission.
-    /// - `display_name` — display-safe (root-relative) path from `display_path_for`;
-    ///   stored in `display_names[]` for diagnostic use only (R3 / CWE-209).
-    /// - `source_content` — raw source bytes for `sourcesContent[]`.
-    ///
-    /// The source file at index 0 is used for all segments until
-    /// [`source_index`] registers additional sources (e.g. for `@extends`
-    /// base templates in CP3+).
-    pub(crate) fn new(source_name: String, display_name: String, source_content: String) -> Self {
-        // Canonicalize the label at the choke-point: "<source>" (the diagnostic
-        // sentinel for string-source compiles) becomes STRING_SOURCE_MAP_LABEL.
-        let canonical = map_source_label(&source_name).to_string();
+    /// Segments are recorded against the seed until [`Self::source_index`] switches
+    /// `current_src` to another source (an `@extends` region, an S8 function body).
+    pub(crate) fn new(origin: Origin) -> Self {
+        let mut sources = SourceTable::default();
+        let current_src = sources.intern(&origin);
         Self {
             segments: Vec::new(),
             cursor: 0,
             suppress: 0,
-            current_src: 0,
-            sources: vec![canonical],
-            display_names: vec![display_name],
-            sources_content: vec![source_content],
+            current_src,
+            sources,
+            remap_cache: HashMap::new(),
             segments_dropped: false,
             no_sources_content: false,
         }
     }
 
-    /// Return the index for `file`, registering it as a new source if needed.
-    ///
-    /// - `file` — canonical key; used for dedup and stored in `sources[]`.
-    /// - `display` — display-safe path stored in `display_names[]`; only relevant
-    ///   for newly registered entries (dedup returns the existing index unchanged).
-    /// - `content` — raw source bytes for `sources_content[]`.
-    ///
-    /// Scans linearly (sources vecs are small — typically 1-3 entries per
-    /// single-file compilation).
-    pub(crate) fn source_index(&mut self, file: &str, display: &str, content: &str) -> u32 {
-        // Apply the canonical label BEFORE the dedup compare so that "<source>"
-        // and "input.mds" can never coexist as two distinct entries (e.g. when
-        // S8 function-body attribution passes the sentinel after the seed is
-        // already "input.mds").
-        let canonical = map_source_label(file);
-        if let Some(pos) = self.sources.iter().position(|s| s == canonical) {
-            debug_assert_eq!(
-                self.display_names.len(),
-                self.sources.len(),
-                "display_names and sources must always be the same length"
-            );
-            return pos as u32;
-        }
-        let idx = self.sources.len() as u32;
-        self.sources.push(canonical.to_string());
-        self.display_names.push(display.to_string());
-        self.sources_content.push(content.to_string());
-        debug_assert_eq!(
-            self.display_names.len(),
-            self.sources.len(),
-            "display_names and sources must always be the same length"
-        );
-        idx
+    /// Test shim: [`Self::new`] from owned key, display path and source text.
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        source_name: String,
+        display_name: String,
+        source_content: String,
+    ) -> Self {
+        Self::new(Origin {
+            file: Arc::from(source_name),
+            display: Arc::from(display_name),
+            source: Arc::from(source_content),
+        })
     }
 
-    /// Total byte size of all registered `sourcesContent` strings.
+    /// The index of `origin`'s source, registering `origin` when its key is new.
     ///
-    /// Called by the resolver before [`finalize`][Self::finalize] to check
-    /// whether the AC-SEC-04 ceiling is exceeded.  Uses `sources_content`
-    /// (the builder's internal vec) rather than the finalized struct, so the
-    /// check can gate the degradation flag before any allocation.
+    /// The source currently being recorded is recognised by pointer; any other is
+    /// looked up by key in the [`SourceTable`], so a separate `Origin` of the same
+    /// module resolves to the entry that registered it first.
+    pub(crate) fn source_index(&mut self, origin: &Origin) -> u32 {
+        let current = self.sources.get(self.current_src);
+        if current.is_some_and(|current| Arc::ptr_eq(&current.file, &origin.file)) {
+            return self.current_src;
+        }
+        self.sources.intern(origin)
+    }
+
+    /// Total byte size of every registered source (the future `sourcesContent`).
+    ///
+    /// Called by the resolver before [`finalize`][Self::finalize] to check whether the
+    /// AC-SEC-04 ceiling is exceeded, so the degradation flag is set before
+    /// `finalize` copies any source text.
     pub(crate) fn sources_content_bytes(&self) -> usize {
-        self.sources_content.iter().map(|s| s.len()).sum()
+        self.sources.iter().map(|origin| origin.source.len()).sum()
     }
 
     /// Push a new segment, capping at [`crate::limits::MAX_SOURCEMAP_SEGMENTS`].
@@ -808,37 +861,85 @@ impl MapBuilder {
     /// Sets [`Self::segments_dropped`] when the cap is first hit so callers
     /// can degrade to `source_map: None` + warning (AC-PERF-03).
     pub(crate) fn push_segment(&mut self, out: u32, src_off: u32, len: u32) {
-        let src = self.current_src;
-        self.push_raw(out, src, src_off, len);
+        let segment = RawSegment {
+            out,
+            src: self.current_src,
+            src_off,
+            len,
+        };
+        push_capped_segment(&mut self.segments, &mut self.segments_dropped, segment);
     }
 
-    /// Push a segment with an explicit source index, bypassing `current_src`.
+    /// Splice `fragment` — an included module's pre-computed map — into this
+    /// builder, its segments rebased to start at output offset `base` (S6).
     ///
-    /// Used by the `@include` splice path (S6) to insert rebased [`FragmentMap`]
-    /// segments with foreign source indices.  Subject to the same
-    /// [`crate::limits::MAX_SOURCEMAP_SEGMENTS`] cap as [`push_segment`].
-    /// Sets [`Self::segments_dropped`] when the cap is first hit (AC-PERF-03).
-    pub(crate) fn push_fragment_segment(&mut self, out: u32, src: u32, src_off: u32, len: u32) {
-        self.push_raw(out, src, src_off, len);
+    /// The fragment's sources are registered here on its first splice and their
+    /// local → global remap cached against the fragment, so the next `@include` of
+    /// the same module (in a loop, or from another site) only rebases. Once the
+    /// segment cap has dropped a segment the map is discarded anyway, so nothing more
+    /// is registered or pushed (AC-PERF-03).
+    pub(crate) fn splice_fragment(&mut self, fragment: &Arc<FragmentMap>, base: u32) {
+        if self.segments_dropped {
+            return;
+        }
+        let key = Arc::as_ptr(fragment) as usize;
+        if !self.remap_cache.contains_key(&key) {
+            // Computed before the insert: `source_index` needs `self` mutably.
+            let remap: Vec<u32> = fragment
+                .sources
+                .iter()
+                .map(|origin| self.source_index(origin))
+                .collect();
+            self.remap_cache.insert(key, (Arc::clone(fragment), remap));
+        }
+        let MapBuilder {
+            segments,
+            segments_dropped,
+            remap_cache,
+            ..
+        } = self;
+        // Always present: inserted just above when it was absent. (An `entry` rewrite
+        // without this branch measured about 7 KB more WASM.)
+        let Some((_, remap)) = remap_cache.get(&key) else {
+            return;
+        };
+        for seg in &fragment.segments {
+            // `into_fragment` — the only way to build a `FragmentMap` — records every
+            // segment against one of the fragment's own sources, so the remap has an entry
+            // for each. A miss is a compiler bug: debug builds stop on it; release drops
+            // the segment, never attributing it to another file, as `expand_per_line`
+            // drops a segment it cannot resolve.
+            debug_assert!(
+                (seg.src as usize) < remap.len(),
+                "FragmentMap segment names no fragment source"
+            );
+            let Some(&src) = remap.get(seg.src as usize) else {
+                continue;
+            };
+            let segment = RawSegment {
+                out: base + seg.out,
+                src,
+                ..*seg
+            };
+            push_capped_segment(segments, segments_dropped, segment);
+            if *segments_dropped {
+                break;
+            }
+        }
     }
 
-    /// Inner push: enforces the segment cap and the debug invariant.
-    fn push_raw(&mut self, out: u32, src: u32, src_off: u32, len: u32) {
-        debug_assert!(
-            self.segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
-            "segments.len() {} exceeds cap {}; segments_dropped should be set",
-            self.segments.len(),
-            crate::limits::MAX_SOURCEMAP_SEGMENTS,
-        );
-        if self.segments.len() < crate::limits::MAX_SOURCEMAP_SEGMENTS {
-            self.segments.push(RawSegment {
-                out,
-                src,
-                src_off,
-                len,
-            });
-        } else {
-            self.segments_dropped = true;
+    /// The number of fragments whose remap is cached (one per spliced fragment).
+    #[cfg(test)]
+    pub(crate) fn remap_cache_len(&self) -> usize {
+        self.remap_cache.len()
+    }
+
+    /// Convert this builder — an imported module's evaluation — into the
+    /// [`FragmentMap`] its importers splice.
+    pub(crate) fn into_fragment(self) -> FragmentMap {
+        FragmentMap {
+            sources: self.sources.into_origins(),
+            segments: self.segments,
         }
     }
 
@@ -873,14 +974,13 @@ impl MapBuilder {
         // Destructure to allow independent moves/borrows of each field.
         let MapBuilder {
             segments,
-            sources,
-            sources_content,
+            sources: table,
             no_sources_content,
             ..
         } = self;
 
         // Stage 1: resolve source-side byte offsets to (line, col).
-        // `sources_content` is needed here for LineTable resolution even when
+        // The source text is needed here for LineTable resolution even when
         // AC-SEC-04 degradation drops it from the final artifact.
         // debug_assert: the segment count must never exceed the cap (AC-PERF-03).
         debug_assert!(
@@ -888,20 +988,22 @@ impl MapBuilder {
             "segments.len() {} exceeds cap at finalize; segments_dropped should have been set",
             segments.len(),
         );
-        let points = expand_per_line(segments, &sources_content);
+        let contents: Vec<&str> = table.iter().map(|origin| &*origin.source).collect();
+        let points = expand_per_line(segments, &contents);
         // Stage 2: adjust output offsets for \r stripping.
         let points = compensate_cr(points, body_raw);
         // Stage 3: drop segments beyond the trailing-trim boundary.
         let points = clamp_trailing_trim(points, body_clean_len);
 
-        // AC-SEC-04: honour the ceiling flag set by the caller.
-        // Only omit sourcesContent from the final artifact — resolution above
-        // already used it to expand segments to (line, col) form.
-        let opt_sources_content = if no_sources_content {
-            None
-        } else {
-            Some(sources_content)
-        };
+        // The public arrays are built here, once: `sources` always, labelled like the
+        // key index; `sourcesContent` only when the caller keeps it (AC-SEC-04 ceiling
+        // or opt-out) — resolution above already used the text either way.
+        let sources: Vec<String> = table
+            .iter()
+            .map(|origin| map_source_label(&origin.file).to_string())
+            .collect();
+        let opt_sources_content = (!no_sources_content)
+            .then(|| contents.iter().map(|text| (*text).to_string()).collect());
 
         // Empty body: return a SourceMap with an empty mappings string.
         if body_clean_len == 0 {
@@ -922,6 +1024,25 @@ impl MapBuilder {
     }
 }
 
+/// Push `segment` unless the segment cap is reached; at the cap, set `dropped`
+/// instead (AC-PERF-03).
+///
+/// A free function over the two fields it touches, so a splice can push while it
+/// holds a borrow of the builder's remap cache.
+fn push_capped_segment(segments: &mut Vec<RawSegment>, dropped: &mut bool, segment: RawSegment) {
+    debug_assert!(
+        segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
+        "segments.len() {} exceeds cap {}; segments_dropped should be set",
+        segments.len(),
+        crate::limits::MAX_SOURCEMAP_SEGMENTS,
+    );
+    if segments.len() < crate::limits::MAX_SOURCEMAP_SEGMENTS {
+        segments.push(segment);
+    } else {
+        *dropped = true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FragmentMap — pre-computed source attribution for an imported module
 // ---------------------------------------------------------------------------
@@ -929,16 +1050,23 @@ impl MapBuilder {
 /// A pre-computed source-map fragment for an imported module's `prompt` body.
 ///
 /// Computed once when a module is resolved in source-map mode (see
-/// `process_module` in `resolver.rs`) and cached inside
-/// `ResolvedModule` / [`crate::scope::NamespaceScope`] behind an `Arc` so
+/// `process_module` in `resolver.rs`, via [`MapBuilder::into_fragment`]) and cached
+/// inside `ResolvedModule` / [`crate::scope::NamespaceScope`] behind an `Arc` so
 /// every `@include` call-site can share the same allocation.
 ///
 /// # Local coordinate space
 ///
 /// `sources` is a **local interner** — source indices in `segments` are
 /// 0-based into THIS vector and must be remapped to the global
-/// [`MapBuilder`] source indices before splicing (see `evaluate_include`
-/// in `evaluator.rs`).
+/// [`MapBuilder`] source indices before splicing (see
+/// [`MapBuilder::splice_fragment`]).
+///
+/// Each entry is the whole [`Origin`] the module's builder registered — canonical
+/// key, root-relative display path and source — in registration order: index 0 is
+/// the first-evaluated origin (the module itself), later entries the files it pulled
+/// in (an S8 function body's defining file, a nested `@include`'s sources). A splice
+/// registers them by key with their own display path, so a file first registered by
+/// a splice still names its root-relative path in a later diagnostic (R3 / CWE-209).
 ///
 /// Segment `out` offsets are **0-based byte offsets within the module's
 /// own raw evaluator output** (the `prompt_body` string before
@@ -953,15 +1081,27 @@ impl MapBuilder {
 /// splices C's `FragmentMap` into B's local builder — so B's `FragmentMap`
 /// already contains segments attributed to C's source file.  When A later
 /// splices B, the three-source attribution comes along for free.
-#[derive(Debug)]
+///
+/// # Debug output
+///
+/// The manual `Debug` impl prints counts only — never a path or source text.
+///
+/// The fields are private: [`MapBuilder::into_fragment`] is the only way to build one,
+/// so every segment names one of the fragment's own sources.
 pub(crate) struct FragmentMap {
-    /// Local source interner: `(display_path, raw_content)` pairs.
-    ///
-    /// Index 0 is always the module's own file.  Additional entries appear
-    /// when the module itself `@include`s nested partials.
-    pub(crate) sources: Vec<(std::sync::Arc<str>, std::sync::Arc<str>)>,
+    /// Local source interner, in the module builder's registration order.
+    sources: Vec<Origin>,
     /// Raw segments local to this module's prompt body.
-    pub(crate) segments: Vec<RawSegment>,
+    segments: Vec<RawSegment>,
+}
+
+impl std::fmt::Debug for FragmentMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FragmentMap")
+            .field("sources", &self.sources.len())
+            .field("segments", &self.segments.len())
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,13 +1184,16 @@ pub(crate) fn rebase_trim(
 /// not on a UTF-8 char boundary) are silently dropped.
 ///
 /// Returns `Vec<(out, src_index, src_line, src_col)>` — all 0-based.
-pub(crate) fn expand_per_line(
+pub(crate) fn expand_per_line<S: AsRef<str>>(
     segments: Vec<RawSegment>,
-    sources_content: &[String],
+    sources_content: &[S],
 ) -> Vec<(u32, u32, u32, u32)> {
     // Build one LineTable per source to amortize construction cost when multiple
     // segments reference the same source file.
-    let tables: Vec<LineTable<'_>> = sources_content.iter().map(|s| LineTable::new(s)).collect();
+    let tables: Vec<LineTable<'_>> = sources_content
+        .iter()
+        .map(|s| LineTable::new(s.as_ref()))
+        .collect();
 
     segments
         .into_iter()
@@ -1765,41 +1908,265 @@ mod tests {
     // MapBuilder
     // -----------------------------------------------------------------------
 
+    fn origin(file: &str, display: &str, source: &str) -> Origin {
+        Origin {
+            file: Arc::from(file),
+            display: Arc::from(display),
+            source: Arc::from(source),
+        }
+    }
+
+    /// `(file, display, source)` of every registered source, in index order.
+    fn registered(b: &MapBuilder) -> Vec<(String, String, String)> {
+        b.sources
+            .iter()
+            .map(|o| {
+                (
+                    o.file.to_string(),
+                    o.display.to_string(),
+                    o.source.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The fragment a module builder produces after registering `sources` in order
+    /// and recording one segment against each (`out = 10 × i`, `src_off = i`).
+    fn fragment_of(sources: &[&Origin]) -> Arc<FragmentMap> {
+        let mut b = MapBuilder::new(sources[0].clone());
+        for (i, source) in sources.iter().enumerate() {
+            b.current_src = b.source_index(source);
+            b.push_segment(10 * i as u32, i as u32, 1);
+        }
+        Arc::new(b.into_fragment())
+    }
+
     #[test]
     fn map_builder_new_seeds_source_at_index_zero() {
-        let b = MapBuilder::new(
+        let b = MapBuilder::from_parts(
             "a.mds".to_string(),
             "a.mds".to_string(),
             "source".to_string(),
         );
-        assert_eq!(b.sources, vec!["a.mds"]);
-        assert_eq!(b.display_names, vec!["a.mds"]);
-        assert_eq!(b.sources_content, vec!["source"]);
+        assert_eq!(
+            registered(&b),
+            vec![("a.mds".into(), "a.mds".into(), "source".into())]
+        );
         assert_eq!(b.current_src, 0);
         assert_eq!(b.cursor, 0);
         assert_eq!(b.suppress, 0);
         assert!(b.segments.is_empty());
+        assert!(b.sources.get(1).is_none(), "only the seed is registered");
     }
 
+    /// #416 / AC-1: every entry is the `Origin` that registered it, sharing that
+    /// module's `Arc`s — no source text is copied.
     #[test]
-    fn map_builder_source_index_deduplicates() {
-        let mut b = MapBuilder::new(
-            "a.mds".to_string(),
-            "a.mds".to_string(),
-            "content-a".to_string(),
+    fn map_builder_shares_origin_arc_with_every_registered_source() {
+        let seed = origin("/p/a.mds", "a.mds", "text a");
+        let other = origin("/p/b.mds", "b.mds", "text b");
+        let mut b = MapBuilder::new(seed.clone());
+        assert_eq!(b.source_index(&other), 1);
+
+        for (idx, expected) in [(0, &seed), (1, &other)] {
+            let entry = b.sources.get(idx).expect("registered");
+            assert!(
+                Arc::ptr_eq(&entry.file, &expected.file),
+                "entry {idx}: file"
+            );
+            assert!(
+                Arc::ptr_eq(&entry.display, &expected.display),
+                "entry {idx}: display"
+            );
+            assert!(
+                Arc::ptr_eq(&entry.source, &expected.source),
+                "entry {idx}: source"
+            );
+        }
+
+        // Control: an equal-content Origin in its own allocation is not pointer-equal,
+        // so the checks above can fail — and it resolves to the entry registered
+        // first, which keeps that first registration's Arc.
+        let copy = origin("/p/b.mds", "b.mds", "text b");
+        assert!(!Arc::ptr_eq(&copy.source, &other.source));
+        assert_eq!(b.source_index(&copy), 1);
+        let entry = b.sources.get(1).expect("registered");
+        assert!(Arc::ptr_eq(&entry.source, &other.source));
+        assert!(!Arc::ptr_eq(&entry.source, &copy.source));
+    }
+
+    /// #416 / AC-2: `source_index` dedups through the key index — by key, not by
+    /// pointer, display or content — with `"<source>"` and `"input.mds"` one key.
+    #[test]
+    fn map_builder_source_index_dedups_by_key() {
+        let mut b = MapBuilder::new(origin("<source>", "<source>", "seed"));
+        assert_eq!(b.source_index(&origin("b.mds", "b.mds", "content-b")), 1);
+        assert_eq!(b.source_index(&origin("c.mds", "c.mds", "content-c")), 2);
+        // Same key, separate allocation, different display and text: first one wins.
+        assert_eq!(b.source_index(&origin("b.mds", "other", "other")), 1);
+        // The string-source sentinel and its map label are one key.
+        assert_eq!(b.source_index(&origin("input.mds", "input.mds", "x")), 0);
+        b.current_src = 2;
+        assert_eq!(b.source_index(&origin("<source>", "<source>", "y")), 0);
+        assert_eq!(
+            registered(&b),
+            vec![
+                ("<source>".into(), "<source>".into(), "seed".into()),
+                ("b.mds".into(), "b.mds".into(), "content-b".into()),
+                ("c.mds".into(), "c.mds".into(), "content-c".into()),
+            ],
+            "stored origins are kept as registered, never relabelled"
         );
-        assert_eq!(b.source_index("a.mds", "a.mds", "content-a"), 0);
-        assert_eq!(b.source_index("b.mds", "b.mds", "content-b"), 1);
-        assert_eq!(b.source_index("a.mds", "a.mds", "content-a"), 0); // dedup
-        assert_eq!(b.source_index("b.mds", "b.mds", "content-b"), 1); // dedup
-        assert_eq!(b.sources.len(), 2);
-        assert_eq!(b.display_names.len(), 2);
+        let sm = b.finalize("", "", 0, None);
+        assert_eq!(sm.sources, vec!["input.mds", "b.mds", "c.mds"]);
+    }
+
+    /// #416 / AC-2: the remap cache lives in the builder — K splices of one fragment
+    /// register its sources once and hold one cache entry — and a splice carries each
+    /// source's own display path (AC-9).
+    #[test]
+    fn map_builder_remap_cache_holds_one_entry_per_fragment() {
+        let m = origin("/p/m.mds", "m.mds", "m text");
+        let h = origin("/p/h.mds", "h.mds", "h text");
+        let fragment = fragment_of(&[&m, &h]);
+        let mut b = MapBuilder::from_parts("/p/main.mds".into(), "main.mds".into(), "main".into());
+        for k in 0..4u32 {
+            b.splice_fragment(&fragment, 100 * k);
+        }
+        assert_eq!(b.remap_cache_len(), 1, "one entry for one fragment");
+        assert_eq!(
+            registered(&b),
+            vec![
+                ("/p/main.mds".into(), "main.mds".into(), "main".into()),
+                ("/p/m.mds".into(), "m.mds".into(), "m text".into()),
+                ("/p/h.mds".into(), "h.mds".into(), "h text".into()),
+            ],
+            "each spliced source is registered once, with its own display path"
+        );
+        let entry = b.sources.get(2).expect("registered");
+        assert!(Arc::ptr_eq(&entry.source, &h.source), "no text copied");
+        let spliced: Vec<(u32, u32, u32)> = b
+            .segments
+            .iter()
+            .map(|s| (s.out, s.src, s.src_off))
+            .collect();
+        let expected: Vec<(u32, u32, u32)> = (0..4u32)
+            .flat_map(|k| [(100 * k, 1, 0), (100 * k + 10, 2, 1)])
+            .collect();
+        assert_eq!(
+            spliced, expected,
+            "rebased at each base, remapped to 1 and 2"
+        );
+
+        // A separate fragment of the same module is a new cache entry and no new source.
+        b.splice_fragment(&fragment_of(&[&m, &h]), 500);
+        assert_eq!(b.remap_cache_len(), 2);
+        assert_eq!(b.sources.len(), 3);
+    }
+
+    /// #416 / AC-2 (G10): once the segment cap has dropped a segment the map is
+    /// discarded, so a later splice registers nothing and builds no remap.
+    #[test]
+    fn map_builder_remap_stops_once_the_segment_cap_has_dropped() {
+        use crate::limits::MAX_SOURCEMAP_SEGMENTS;
+        let mut b = MapBuilder::from_parts("main.mds".into(), "main.mds".into(), "main".into());
+        for i in 0..MAX_SOURCEMAP_SEGMENTS as u32 {
+            b.push_segment(i, 0, 1);
+        }
+        assert!(
+            !b.segments_dropped,
+            "exactly at the cap nothing is dropped yet"
+        );
+
+        // The splice that crosses the cap still registers its fragment (control).
+        let m = origin("m.mds", "m.mds", "m text");
+        b.splice_fragment(&fragment_of(&[&m]), 0);
+        assert!(b.segments_dropped);
+        assert_eq!(b.segments.len(), MAX_SOURCEMAP_SEGMENTS);
+        assert_eq!((b.remap_cache_len(), b.sources.len()), (1, 2));
+
+        let late = origin("late.mds", "late.mds", "late text");
+        b.splice_fragment(&fragment_of(&[&late]), 0);
+        assert_eq!(
+            (b.remap_cache_len(), b.sources.len()),
+            (1, 2),
+            "no splice work once the cap has dropped"
+        );
+    }
+
+    /// A fragment segment naming a source the fragment does not carry is a compiler bug:
+    /// debug builds stop on it; release drops that segment — never attributing it to
+    /// another file — and splices the rest.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "FragmentMap segment names no fragment source")
+    )]
+    fn splice_fragment_drops_a_segment_with_no_fragment_source() {
+        let fragment = Arc::new(FragmentMap {
+            sources: vec![origin("m.mds", "m.mds", "m text")],
+            segments: vec![
+                // Local source 1 does not exist. Pushed unmapped, it would land on
+                // global index 1 — m.mds — a file it never came from.
+                RawSegment {
+                    out: 0,
+                    src: 1,
+                    src_off: 0,
+                    len: 1,
+                },
+                // Control: a segment against the fragment's own source.
+                RawSegment {
+                    out: 5,
+                    src: 0,
+                    src_off: 2,
+                    len: 1,
+                },
+            ],
+        });
+        let mut b = MapBuilder::from_parts("main.mds".into(), "main.mds".into(), "main".into());
+        b.splice_fragment(&fragment, 100);
+        let spliced: Vec<(u32, u32, u32)> = b
+            .segments
+            .iter()
+            .map(|s| (s.out, s.src, s.src_off))
+            .collect();
+        assert_eq!(
+            spliced,
+            vec![(105, 1, 2)],
+            "only the control, against m.mds"
+        );
+    }
+
+    /// A fragment's `Debug` output shows counts only — never a path or source text.
+    #[test]
+    fn fragment_map_debug_prints_counts_only() {
+        let fragment = fragment_of(&[&origin("/secret/dir/p.mds", "p.mds", "SECRET TEXT")]);
+        assert_eq!(
+            format!("{fragment:?}"),
+            "FragmentMap { sources: 1, segments: 1 }"
+        );
+    }
+
+    /// `finalize` builds `sourcesContent` only when the caller keeps it.
+    #[test]
+    fn finalize_builds_sources_content_only_when_kept() {
+        for (no_sources_content, expected) in [
+            (false, Some(vec!["seed".to_string(), "text b".to_string()])),
+            (true, None),
+        ] {
+            let mut b = MapBuilder::new(origin("<source>", "<source>", "seed"));
+            b.source_index(&origin("b.mds", "b.mds", "text b"));
+            b.no_sources_content = no_sources_content;
+            let sm = b.finalize("", "", 0, None);
+            assert_eq!(sm.sources, vec!["input.mds", "b.mds"]);
+            assert_eq!(sm.sources_content, expected);
+        }
     }
 
     #[test]
     fn map_builder_push_segment_caps_at_limit() {
         use crate::limits::MAX_SOURCEMAP_SEGMENTS;
-        let mut b = MapBuilder::new("a.mds".to_string(), "a.mds".to_string(), String::new());
+        let mut b = MapBuilder::from_parts("a.mds".to_string(), "a.mds".to_string(), String::new());
         for i in 0..=(MAX_SOURCEMAP_SEGMENTS + 5) as u32 {
             b.push_segment(i, i, 1);
         }
@@ -1986,7 +2353,7 @@ mod tests {
         // clean_output: same (no trailing whitespace change)
         // Segments: Text("Hello ") at src_off=0, len=6; Interpolation at src_off=6, inner-len=4
         // Source: "Hello {{name}}!\n" — `{{` starts at byte 6, inner `name` is 4 bytes
-        let mut b = MapBuilder::new(
+        let mut b = MapBuilder::from_parts(
             "t.mds".to_string(),
             "t.mds".to_string(),
             "Hello {{name}}!\n".to_string(),
@@ -2019,7 +2386,7 @@ mod tests {
     #[test]
     fn finalize_empty_body_yields_empty_mappings() {
         // Raw output is whitespace-only; clean_output produces "".
-        let mut b = MapBuilder::new(
+        let mut b = MapBuilder::from_parts(
             "t.mds".to_string(),
             "t.mds".to_string(),
             "  \n  ".to_string(),
@@ -2037,7 +2404,7 @@ mod tests {
     fn finalize_with_frontmatter_shifts_points() {
         // "---\nfm: v\n---\nHello\n" — frontmatter prefix = 14 bytes
         // Segment at out=0 in raw output → out=14 in final output after shift
-        let mut b = MapBuilder::new(
+        let mut b = MapBuilder::from_parts(
             "t.mds".to_string(),
             "t.mds".to_string(),
             "Hello\n".to_string(),
@@ -2067,7 +2434,8 @@ mod tests {
         // "Hello\r\nWorld\r\n" → clean: "Hello\nWorld\n"
         // Segment at raw out=7 ("\r\n" takes bytes 5-6, "World" starts at 7)
         // → compensated: 7 - 1 cr before 7 = 6 (correct position in clean output)
-        let mut b = MapBuilder::new("t.mds".to_string(), "t.mds".to_string(), "src".to_string());
+        let mut b =
+            MapBuilder::from_parts("t.mds".to_string(), "t.mds".to_string(), "src".to_string());
         b.push_segment(0, 0, 5); // "Hello" in raw output
         b.push_segment(7, 0, 5); // "World" in raw output (byte 7 after \r\n)
 
@@ -2178,7 +2546,7 @@ mod tests {
     #[test]
     fn map_builder_segments_dropped_flag() {
         use crate::limits::MAX_SOURCEMAP_SEGMENTS;
-        let mut b = MapBuilder::new(
+        let mut b = MapBuilder::from_parts(
             "test.mds".to_string(),
             "test.mds".to_string(),
             "source".to_string(),
@@ -2207,12 +2575,12 @@ mod tests {
     /// `sources_content_bytes()` returns the sum of all registered source sizes.
     #[test]
     fn map_builder_sources_content_bytes() {
-        let mut b = MapBuilder::new(
+        let mut b = MapBuilder::from_parts(
             "a.mds".to_string(),
             "a.mds".to_string(),
             "hello".to_string(),
         ); // 5 bytes
-        let _ = b.source_index("b.mds", "b.mds", "world!"); // 6 bytes
+        let _ = b.source_index(&origin("b.mds", "b.mds", "world!")); // 6 bytes
         assert_eq!(
             b.sources_content_bytes(),
             11,

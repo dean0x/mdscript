@@ -3695,8 +3695,8 @@ fn r3_cross_file_error_keeps_own_files_display() {
 
 #[test]
 fn r3_sources_stay_map_relative_with_source_map_base() {
-    // ADR-005 byte-identity: sources[] emission reads MapBuilder.sources
-    // (canonical keys relativized at finalize), never display_names. With
+    // ADR-005 byte-identity: sources[] emission reads each registered Origin's
+    // canonical key (relativized after finalize), never its display. With
     // source_map_base set, the entries are exactly the pre-R3 map-relative
     // values. The CLI-level goldens (cli_source_map.rs SM-GOLD / SM-DET) pin
     // the end-to-end surface; this is the core-level pin with an explicit base.
@@ -3738,10 +3738,10 @@ fn r3_sources_stay_map_relative_with_source_map_base() {
 
 #[test]
 fn r3_map_mode_eval_diagnostic_display_is_root_relative() {
-    // Map-mode diagnostics derive their file label from MapBuilder.display_names
-    // (evaluate_with_map_seeded), not from the canonical sources keys. A
+    // Map-mode diagnostics derive their file label from the current source's
+    // Origin.display (evaluate_with_map_seeded), not from its canonical key. A
     // cross-type comparison errors at eval time — exactly the path that reads
-    // display_names — and must show the root-relative display.
+    // that display — and must show the root-relative display.
     let (_guard, root) = r3_project();
     let entry = root.join("sub").join("cond.mds");
     std::fs::write(&entry, "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n").unwrap();
@@ -3815,6 +3815,126 @@ fn r3_extends_errors_name_the_base_root_relative() {
             );
         }
     }
+}
+
+// ── #416: the source-map builder shares module sources ──────────────────────
+
+fn arc_origin(file: &str, display: &str, source: &str) -> Origin {
+    Origin {
+        file: Arc::from(file),
+        display: Arc::from(display),
+        source: Arc::from(source),
+    }
+}
+
+fn parse_nodes(source: &str) -> Vec<Node> {
+    let tokens = tokenize(source, "t.mds").expect("fixture must tokenize");
+    parse_with_ctx(&tokens, "t.mds", source)
+        .expect("fixture must parse")
+        .body
+}
+
+/// #416 / AC-1: after region-by-region evaluation every builder entry is the region
+/// origin that registered it, pointer-identical to that module's source — including
+/// when a later region carries another `Origin` value of an already-registered module
+/// (a clone, or a separate allocation of the same key).
+#[test]
+fn map_builder_shares_origin_arc_across_regions() {
+    let base = arc_origin("/p/base.mds", "base.mds", "one {{v}}\ntwo\n");
+    let child = arc_origin("/p/child.mds", "child.mds", "child {{v}}\n");
+    let base_clone = base.clone();
+    let base_copy = arc_origin("/p/base.mds", "base.mds", "one {{v}}\ntwo\n");
+    let base_nodes = parse_nodes(&base.source);
+    let child_nodes = parse_nodes(&child.source);
+    let regions: Vec<(&[Node], &Origin)> = vec![
+        (&base_nodes[..1], &base),
+        (&base_nodes[1..], &base),
+        (&child_nodes, &child),
+        (&base_nodes, &base_clone),
+        (&base_nodes, &base_copy),
+    ];
+    let mut scope = Scope::new();
+    scope.set_var("v", Value::String("V".to_string()));
+
+    let (output, map) = ModuleCache::evaluate_regions_with_map(
+        &regions,
+        &mut scope,
+        &mut vec![],
+        Some(crate::sourcemap::MapBuilder::new(base.clone())),
+    )
+    .expect("regions must evaluate");
+    let map = map.expect("the builder must be handed back");
+
+    assert_eq!(output, "one V\ntwo\nchild V\none V\ntwo\none V\ntwo\n");
+    assert_eq!(map.sources.len(), 2, "one entry per module key");
+    for (idx, expected) in [(0, &base), (1, &child)] {
+        let entry = map.sources.get(idx).expect("registered");
+        assert!(
+            Arc::ptr_eq(&entry.source, &expected.source),
+            "entry {idx}: source must be the module's own Arc"
+        );
+    }
+    // Control: the separate allocation is not pointer-equal to the stored entry.
+    assert!(!Arc::ptr_eq(&base_copy.source, &base.source));
+    assert!(
+        map.segments.iter().any(|s| s.src == 1),
+        "non-vacuity: the child region records against its own entry"
+    );
+}
+
+/// #416 / AC-9 (G5): a region whose module was first registered in the builder by an
+/// `@include` splice — a source of the included module's fragment — names that
+/// module's root-relative display path in a runtime diagnostic, never its canonical
+/// key, and the error is identical with and without a builder.
+#[test]
+fn region_first_registered_by_a_splice_names_its_display_path() {
+    let helper = arc_origin(
+        "/abs/proj/g5/b.mds",
+        "g5/b.mds",
+        "@if n == 5:\nfive\n@end\n",
+    );
+    let module = arc_origin("/abs/proj/g5/m.mds", "g5/m.mds", "{{b.helper()}}\n");
+    let root = arc_origin("/abs/proj/g5/a.mds", "g5/a.mds", "@block second:\n@end\n");
+
+    // The included module's own builder registered the helper file through an S8
+    // call, with that module's own Origin value of it.
+    let mut module_builder = crate::sourcemap::MapBuilder::new(module);
+    let helper_as_imported = arc_origin(&helper.file, &helper.display, &helper.source);
+    module_builder.current_src = module_builder.source_index(&helper_as_imported);
+    module_builder.push_segment(0, 0, 4);
+    let fragment = Arc::new(module_builder.into_fragment());
+
+    let mut importer = crate::sourcemap::MapBuilder::new(root);
+    importer.splice_fragment(&fragment, 0);
+    assert!(
+        importer.sources.iter().any(|o| *o.file == *helper.file),
+        "precondition: the splice registered the helper's key"
+    );
+    // Positive control (PF-013): the key is absolute, so the equality below fails if
+    // the key reaches the diagnostic.
+    assert!(helper.file.starts_with('/') && *helper.file != *helper.display);
+
+    let nodes = parse_nodes(&helper.source);
+    let regions: Vec<(&[Node], &Origin)> = vec![(&nodes, &helper)];
+    let [off, on] = [None, Some(importer)].map(|map| {
+        let mut scope = Scope::new();
+        scope.set_var("n", Value::String("hi".to_string()));
+        match ModuleCache::evaluate_regions_with_map(&regions, &mut scope, &mut vec![], map) {
+            Ok(_) => panic!("a cross-type comparison must fail"),
+            Err(err) => err,
+        }
+    });
+    assert_eq!(on.serialize().code, "mds::type_mismatch", "{on}");
+    assert_eq!(
+        on.source_name(),
+        Some("g5/b.mds"),
+        "the diagnostic must name the root-relative display, never the key"
+    );
+    assert_eq!(
+        off.serialize(),
+        on.serialize(),
+        "the error must not depend on source maps"
+    );
 }
 
 // ── #371: filesystem-root base dir ────────────────────────────────────────

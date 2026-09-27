@@ -42,8 +42,14 @@
 //! #415 tests pin that the output cap is checked before each append: a `@for` of
 //! exactly the cap compiles, one byte more fails, and a crossing loop stops on the
 //! pass that crosses the cap in an `@extends` region and in an included module.
+//!
+//! #416 pins that a source-mapped `@extends` compile stays linear in its region count:
+//! the builder shares each module's source instead of copying it per region.
 
 use std::collections::HashMap;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use mds::{
     CompileOptions, CompileResult, CompiledOutput, MdsError, SerializedError, SerializedSpan, Value,
@@ -2171,4 +2177,80 @@ fn d1_extends_from_string_no_source_sentinel() {
         "child source must be labeled \"input.mds\"; got: {:?}",
         sm.sources
     );
+}
+
+// ── #416: source-mapped @extends evaluation is linear in the region count ─────
+
+/// Skeleton lines in the many-regions base. Each `{{v}}\n` line is two spliced
+/// regions (an interpolation node and a text node), all owned by the base.
+const MANY_REGIONS_LINES: usize = 262_144;
+
+/// The value each many-regions line renders to — a whole output line nothing else
+/// in the chain can produce.
+const MANY_REGIONS_VALUE: &str = "V416";
+
+/// Absolute smoke bound on one compile of the many-regions chain. Calibrated against
+/// the builder before #416, which copied the base's whole source once per region: that
+/// build runs past five times this bound, while the shared-source builder finishes well
+/// inside a fifth of it (debug profile).
+const MANY_REGIONS_BOUND: Duration = Duration::from_secs(10);
+
+/// #416 / AC-3: a source-mapped compile of a base with very many top-level skeleton
+/// nodes finishes under an absolute bound; the same chain with maps off is the control.
+///
+/// The compile runs on its own thread and is awaited with `recv_timeout`, so a
+/// quadratic regression fails at the bound instead of hanging the suite.
+#[test]
+fn extends_many_regions_source_map_is_not_quadratic() {
+    let base = format!(
+        "---\nv: {MANY_REGIONS_VALUE}\n---\n{}",
+        "{{v}}\n".repeat(MANY_REGIONS_LINES)
+    );
+    for source_map in [false, true] {
+        let modules = extends_chain(&base, "@extends \"./base.mds\"\n");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = mds::compile_virtual_with_deps_opts(
+                modules,
+                "child.mds",
+                None,
+                CompileOptions::default().with_source_map(source_map),
+            )
+            .map(|result| {
+                let lines = output_text(result.output)
+                    .lines()
+                    .filter(|line| *line == MANY_REGIONS_VALUE)
+                    .count();
+                (lines, result.source_map.map(|sm| sm.sources))
+            })
+            .map_err(|err| err.to_string());
+            // The receiver is gone only when the bound already failed the test.
+            let _ = tx.send((outcome, started.elapsed()));
+        });
+        let (outcome, elapsed) = match rx.recv_timeout(MANY_REGIONS_BOUND) {
+            Ok(received) => received,
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines did not \
+                 compile within {MANY_REGIONS_BOUND:?}"
+            ),
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("source_map={source_map}: the compile thread panicked")
+            }
+        };
+        eprintln!("source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines in {elapsed:?}");
+        let (lines, sources) =
+            outcome.unwrap_or_else(|err| panic!("source_map={source_map}: {err}"));
+        // Non-vacuity: every line came from the base through `@extends` — the child's
+        // whole body is the directive, so nothing else can render the value.
+        assert_eq!(
+            lines, MANY_REGIONS_LINES,
+            "source_map={source_map}: every base line must be rendered"
+        );
+        let expected_sources = source_map.then(|| vec!["base.mds".to_string()]);
+        assert_eq!(
+            sources, expected_sources,
+            "source_map={source_map}: only the base owns a region"
+        );
+    }
 }

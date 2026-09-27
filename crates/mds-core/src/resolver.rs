@@ -766,16 +766,21 @@ impl ModuleCache {
         // across ALL regions.  A fresh budget per region would give K regions an
         // independent 1 M budget each — CPU/DoS amplification ∝ region count.
         let mut budget = EvalBudget::default();
+        // The previous region's origin and source index: consecutive regions from one
+        // file (every between-block skeleton node) reuse the index without a lookup.
+        let mut previous: Option<(&Origin, u32)> = None;
 
         for (nodes, origin) in regions {
-            // Switch the builder's current_src to the source that owns this region.
+            // Switch the builder's current_src to the source that owns this region —
+            // assigned for every region, a reused index included, so no region relies
+            // on the one before it having restored current_src.
             if let Some(ref mut builder) = current_map {
-                let src_idx = builder.source_index(
-                    origin.file.as_ref(),
-                    origin.display.as_ref(),
-                    origin.source.as_ref(),
-                );
+                let src_idx = match previous {
+                    Some((prev, idx)) if Arc::ptr_eq(&prev.file, &origin.file) => idx,
+                    _ => builder.source_index(origin),
+                };
                 builder.current_src = src_idx;
+                previous = Some((origin, src_idx));
                 // Cursor must equal accumulated output length before entering each region.
                 // evaluate_with_map_seeded maintains this invariant internally, but after
                 // each region we push the raw output and the builder's cursor is correct.
@@ -939,13 +944,9 @@ impl ModuleCache {
             }
 
             // Seed builder with the skeleton's root file (source maps only).
-            let builder = opts.source_map.then(|| {
-                crate::sourcemap::MapBuilder::new(
-                    skeleton_origin.file.to_string(),
-                    skeleton_origin.display.to_string(),
-                    skeleton_origin.source.to_string(),
-                )
-            });
+            let builder = opts
+                .source_map
+                .then(|| crate::sourcemap::MapBuilder::new(skeleton_origin.clone()));
             let (raw, maybe_builder) =
                 Self::evaluate_regions_with_map(&regions, &mut scope, warnings, builder)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
@@ -1015,11 +1016,11 @@ impl ModuleCache {
         let (body_raw, map_out) = if opts.source_map {
             // Builder seeds current_src=0 pointing to ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
-            let builder = crate::sourcemap::MapBuilder::new(
-                ctx.key.to_string(),
-                ctx.file_str.to_string(),
-                ctx.source.to_string(),
-            );
+            let builder = crate::sourcemap::MapBuilder::new(Origin {
+                file: Arc::from(ctx.key),
+                display: Arc::from(ctx.file_str),
+                source: Arc::from(ctx.source),
+            });
             let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             apply_map_degradation(raw, returned, opts, warnings)
@@ -1131,6 +1132,14 @@ impl ModuleCache {
         // Mirrors the `is_exported("prompt")` logic on `ResolvedModule`.
         let prompt_exported = !has_explicit_exports || explicit_exports.contains("prompt");
 
+        // Build Origin once for this module — Arc::clone'd into the source-map builder
+        // below and into each EffectiveBlock (P3), so every copy shares one source text.
+        let origin = Origin {
+            file: Arc::from(ctx.key),
+            display: Arc::from(ctx.file_str),
+            source: Arc::from(ctx.source),
+        };
+
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
         // When source-map mode is active and the module exports "prompt", run a
@@ -1139,11 +1148,7 @@ impl ModuleCache {
         // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
         // that imports this module, enabling @include splice attribution (S6).
         let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
-            let builder = crate::sourcemap::MapBuilder::new(
-                ctx.key.to_string(),
-                ctx.file_str.to_string(),
-                ctx.source.to_string(),
-            );
+            let builder = crate::sourcemap::MapBuilder::new(origin.clone());
             // evaluate_with_map derives file/source from builder.current_src (issue #58).
             let (body_raw, returned) =
                 evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
@@ -1168,30 +1173,13 @@ impl ModuleCache {
             } else {
                 // Only keep the FragmentMap when the body is non-empty — an empty prompt
                 // has no segments worth recording.
-                body.as_ref().map(|_| {
-                    Arc::new(crate::sourcemap::FragmentMap {
-                        sources: returned
-                            .sources
-                            .iter()
-                            .zip(returned.sources_content.iter())
-                            .map(|(p, c)| (Arc::from(p.as_str()), Arc::from(c.as_str())))
-                            .collect(),
-                        segments: returned.segments,
-                    })
-                })
+                body.as_ref().map(|_| Arc::new(returned.into_fragment()))
             };
             (body, fmap)
         } else {
             let body_raw = evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
             (body, None)
-        };
-
-        // Build Origin once for this module — Arc::clone'd into each EffectiveBlock (P3).
-        let origin = Origin {
-            file: Arc::from(ctx.key),
-            display: Arc::from(ctx.file_str),
-            source: Arc::from(ctx.source),
         };
 
         // Build effective_blocks first so module.body can be moved into the Arc below.

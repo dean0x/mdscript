@@ -61,18 +61,6 @@ pub(crate) struct EvalContext<'a> {
     /// `true`.  `None` when the caller did not request a source map — zero-cost path
     /// (AC-PERF-01: no allocation when off).
     pub(crate) map: Option<crate::sourcemap::MapBuilder>,
-    /// Per-include-site remap cache for source-map splice (S6 / AC-PERF-05).
-    ///
-    /// Maps `Arc<FragmentMap>` pointer identity (as `usize`) to the
-    /// local-source-index → global-`MapBuilder`-source-index remap `Vec`.
-    ///
-    /// When `@include` appears inside a `@for` loop, the remap is built on the
-    /// first iteration and retrieved from this cache on every subsequent
-    /// iteration — O(1) map lookup instead of re-running `source_index` scans.
-    ///
-    /// The cache is scoped to one `evaluate_with_map` invocation and is empty at
-    /// the start of each top-level compile; no cross-compilation state leaks.
-    pub(crate) fragment_remap_cache: std::collections::HashMap<usize, Vec<u32>>,
     /// S8 signal: set to `true` by `invoke_function` when it takes the fine-grained
     /// body-descent path (S8), so the calling `Node::Interpolation` arm knows the body
     /// already recorded its own segments and the call-site point should be skipped.
@@ -152,7 +140,6 @@ pub(crate) fn evaluate_seeded(
         budget: *budget,
         warnings,
         map: None,
-        fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
         file,
         source,
@@ -202,7 +189,9 @@ pub(crate) fn evaluate_with_map(
 /// iteration cap across all spliced `@extends` regions (REL-1, applies PF-004).
 ///
 /// The `MapBuilder` is returned as a structured error rather than a panic if it
-/// disappears — aligns with PF-005 (don't rely on panic for invariants).
+/// disappears, and a `current_src` with no registered source is an internal error
+/// rather than an empty file context — aligns with PF-005 (don't rely on panic or a
+/// silent fallback for invariants).
 pub(crate) fn evaluate_with_map_seeded(
     nodes: &[Node],
     scope: &mut Scope,
@@ -210,33 +199,32 @@ pub(crate) fn evaluate_with_map_seeded(
     builder: crate::sourcemap::MapBuilder,
     budget: &mut EvalBudget,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
-    // Clone display name / source from the builder's current source entry before
-    // moving builder into EvalContext.map.  This is the single source of truth for
-    // diagnostic span attribution — eliminates the redundant explicit params
-    // that caused mis-attributed spans before c5a4d65 (issue #58).
+    // Take the current source's Origin before moving builder into EvalContext.map.
+    // This is the single source of truth for diagnostic span attribution —
+    // eliminates the redundant explicit params that caused mis-attributed spans
+    // before c5a4d65 (issue #58). Cloning it bumps refcounts; it copies no text, so
+    // evaluating an @extends chain region by region stays linear (#416).
     //
-    // R3 (CWE-209): read from display_names (root-relative, never absolute) rather
-    // than from sources (canonical keys, may be absolute) so that file-backed
-    // compile error messages show "src/a.mds" instead of "/proj/src/a.mds".
-    let file_owned = builder
-        .display_names
-        .get(builder.current_src as usize)
+    // R3 (CWE-209): `display` (root-relative, never absolute), not `file` (the
+    // canonical key, may be absolute), so that file-backed compile error messages
+    // show "src/a.mds" instead of "/proj/src/a.mds".
+    let origin = builder
+        .sources
+        .get(builder.current_src)
         .cloned()
-        .unwrap_or_default();
-    let source_owned = builder
-        .sources_content
-        .get(builder.current_src as usize)
-        .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            MdsError::syntax(
+                "internal: MapBuilder current_src names no registered source — compiler bug",
+            )
+        })?;
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
         budget: *budget,
         warnings,
         map: Some(builder),
-        fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
-        file: &file_owned,
-        source: &source_owned,
+        file: &origin.display,
+        source: &origin.source,
         body_origin: None,
     };
     let result = evaluate_nodes(nodes, scope, &mut ctx);
@@ -743,11 +731,7 @@ fn invoke_function(
                 let sc = map.cursor;
                 let ss = map.segments.len();
                 let sr = map.current_src;
-                let def_src = map.source_index(
-                    origin.file.as_ref(),
-                    origin.display.as_ref(),
-                    origin.source.as_ref(),
-                );
+                let def_src = map.source_index(origin);
                 map.current_src = def_src;
                 (sc, ss, sr)
                 // map and origin borrows released here; ctx is usable below.
@@ -1243,49 +1227,14 @@ fn evaluate_include(
         }
     };
 
-    // S6: Splice source-map fragment segments when a builder is active.
-    //
-    // The local→global source-index remap is cached by Arc<FragmentMap> pointer
-    // identity (AC-PERF-05): built once on the first `@include` call for a given
-    // module and reused on all subsequent calls (e.g. inside a `@for` loop).
-    //
-    // The MapBuilder is temporarily taken out of ctx to allow concurrent mutable
-    // access to ctx.fragment_remap_cache (avoiding Rust split-borrow issues).
-    if let Some(fmap) = ns.prompt_map.as_ref() {
-        if let Some(mut map) = ctx.map.take() {
-            // Stable pointer identity of the Arc — used as the cache key.
-            // The Arc lives as long as the NamespaceScope is in scope (at least
-            // for the duration of this compilation), so the pointer is valid.
-            let fmap_ptr = std::sync::Arc::as_ptr(fmap) as usize;
-
-            // Build the remap if not already cached for this include site,
-            // then borrow it directly from the entry return value.
-            let remap: &Vec<u32> = ctx.fragment_remap_cache.entry(fmap_ptr).or_insert_with(|| {
-                // S6 @include splice: register each included source in the outer builder.
-                // `path` is the canonical key from the fragment's MapBuilder.sources[].
-                // Display names for @include sources are not read via EvalContext.file
-                // (current_src is never changed during splice), so using the canonical
-                // path as the display_name here is safe — it never surfaces in diagnostics.
-                fmap.sources
-                    .iter()
-                    .map(|(path, content)| {
-                        map.source_index(path.as_ref(), path.as_ref(), content.as_ref())
-                    })
-                    .collect()
-            });
-
-            // Splice: rebase each fragment segment into the global output stream.
-            // `map.cursor` is the absolute byte offset where this include's body
-            // starts in the parent output (set by the Node::Include arm in
-            // evaluate_nodes just before calling evaluate_include).
-            let base = map.cursor;
-            for seg in &fmap.segments {
-                let remapped_src = remap[seg.src as usize];
-                map.push_fragment_segment(base + seg.out, remapped_src, seg.src_off, seg.len);
-            }
-
-            ctx.map = Some(map);
-        }
+    // S6: splice the included module's source-map fragment when a builder is active.
+    // `map.cursor` is the absolute byte offset where this include's body starts in
+    // the parent output (set by the Node::Include arm in evaluate_nodes just before
+    // calling evaluate_include). The builder caches the fragment's source remap, so
+    // an @include inside a @for loop registers the module's sources once (AC-PERF-05).
+    if let (Some(fragment), Some(map)) = (ns.prompt_map.as_ref(), ctx.map.as_mut()) {
+        let base = map.cursor;
+        map.splice_fragment(fragment, base);
     }
 
     Ok(prompt_body)
@@ -1356,7 +1305,6 @@ pub(crate) fn evaluate_messages_seeded(
         budget: *budget,
         warnings,
         map: None,
-        fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
         file,
         source,
@@ -2868,7 +2816,7 @@ mod tests {
             ]),
         );
 
-        let builder = crate::sourcemap::MapBuilder::new(
+        let builder = crate::sourcemap::MapBuilder::from_parts(
             "t.mds".to_string(),
             "t.mds".to_string(),
             source.to_string(),
@@ -3016,7 +2964,7 @@ mod tests {
         let source = "@for i in items:\n.\n@end\n";
         let body = parse_body(source);
         let builder = || {
-            crate::sourcemap::MapBuilder::new(
+            crate::sourcemap::MapBuilder::from_parts(
                 "t.mds".to_string(),
                 "t.mds".to_string(),
                 source.to_string(),
@@ -3061,6 +3009,107 @@ mod tests {
                 &mut budget,
             ),
             ITERATION_LIMIT_MSG,
+        );
+    }
+
+    // ── #416: the builder shares module sources and caches splice remaps ───────
+
+    fn origin(file: &str, display: &str, source: &str) -> crate::sourcemap::Origin {
+        crate::sourcemap::Origin {
+            file: Arc::from(file),
+            display: Arc::from(display),
+            source: Arc::from(source),
+        }
+    }
+
+    /// The namespace an importer sees for `module`, whose prompt was evaluated by its
+    /// own builder: one segment of its own text, then one of `helper`'s — the file an
+    /// S8 function call pulled in.
+    fn included_namespace(
+        module: &crate::sourcemap::Origin,
+        helper: &crate::sourcemap::Origin,
+    ) -> crate::scope::NamespaceScope {
+        let mut b = crate::sourcemap::MapBuilder::new(module.clone());
+        b.push_segment(0, 0, 4);
+        b.current_src = b.source_index(helper);
+        b.push_segment(5, 0, 4);
+        crate::scope::NamespaceScope {
+            functions: std::collections::HashMap::new(),
+            prompt_body: Some("mmmm hhhh\n".to_string()),
+            prompt_map: Some(Arc::new(b.into_fragment())),
+            prompt_suppressed_by_exports: false,
+        }
+    }
+
+    /// #416 / AC-1, AC-2: K `@include`s of one module — separate sites and a loop —
+    /// splice through one remap-cache entry in the builder, and every registered
+    /// source is the `Origin` that registered it, sharing its `Arc`s.
+    #[test]
+    fn map_builder_remap_cache_holds_one_entry_for_k_includes_of_one_module() {
+        let main_src = "@include m\n@for i in items:\n@include m\n@end\n@include m\n";
+        let main = origin("/p/main.mds", "main.mds", main_src);
+        let module = origin("/p/m.mds", "m.mds", "m text");
+        let helper = origin("/p/h.mds", "h.mds", "h text");
+        let mut scope = Scope::new();
+        scope.set_var("items", Value::Array(vec![Value::Number(1.0); 3]));
+        scope.set_namespace("m", included_namespace(&module, &helper));
+
+        let (output, map) = evaluate_with_map(
+            &parse_body(main_src),
+            &mut scope,
+            &mut vec![],
+            crate::sourcemap::MapBuilder::new(main.clone()),
+        )
+        .expect("fixture must evaluate");
+
+        assert_eq!(
+            output.matches("mmmm hhhh").count(),
+            5,
+            "non-vacuity: two include sites plus three loop passes"
+        );
+        assert_eq!(
+            map.remap_cache_len(),
+            1,
+            "one entry for one included module"
+        );
+        assert_eq!(
+            map.segments.iter().filter(|s| s.src != 0).count(),
+            10,
+            "every include splices both fragment segments"
+        );
+        let expected = [&main, &module, &helper];
+        assert_eq!(map.sources.len(), expected.len());
+        for (idx, (entry, want)) in map.sources.iter().zip(expected).enumerate() {
+            assert!(
+                Arc::ptr_eq(&entry.source, &want.source),
+                "entry {idx}: source must be the module's own Arc"
+            );
+            assert!(
+                Arc::ptr_eq(&entry.display, &want.display),
+                "entry {idx}: display must be the module's own Arc"
+            );
+        }
+    }
+
+    /// PF-005: a builder whose `current_src` names no registered source is an internal
+    /// error, not an evaluation with an empty file context.
+    #[test]
+    fn evaluate_with_map_seeded_rejects_an_unregistered_current_src() {
+        let body = parse_body("text\n");
+        let mut builder = crate::sourcemap::MapBuilder::new(origin("t.mds", "t.mds", "text\n"));
+        // Control: the seed's index evaluates.
+        let (out, returned) = evaluate_with_map(&body, &mut Scope::new(), &mut vec![], builder)
+            .expect("the seed must evaluate");
+        assert_eq!(out, "text\n");
+        builder = returned;
+        builder.current_src = 1;
+        let Err(err) = evaluate_with_map(&body, &mut Scope::new(), &mut vec![], builder) else {
+            panic!("an unregistered current_src must not evaluate");
+        };
+        assert_eq!(
+            err.to_string(),
+            "syntax error: internal: MapBuilder current_src names no registered source — \
+             compiler bug"
         );
     }
 
