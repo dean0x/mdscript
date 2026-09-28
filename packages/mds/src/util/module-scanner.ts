@@ -1,6 +1,7 @@
 // Naming in this file: `shown` is a path as the caller wrote it, raw until it enters a
 // message (the engine calls it `typed`); `display` is a path below the project root, in
 // its on-disk spelling.
+import { isUtf8 } from 'node:buffer';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, parse, sep } from 'node:path';
@@ -402,12 +403,47 @@ function nativeParentAndName(path: string): { parent: string; name: string | und
 }
 
 /**
- * Canonicalize the directory `dir`, translating every failure — it does not exist
- * (ENOENT), a path component above it is a regular file (ENOTDIR), a symlink loop
- * (ELOOP), a name too long (ENAMETOOLONG), a directory that cannot be searched
- * (EACCES) — into the `mds::file_not_found` shape `fileNotFoundError` builds, keyed
- * on `shown`, never Node's error, which names the raw absolute path (R3 / CWE-209,
- * #408).
+ * NativeFs's refusal of a resolved path that is not valid UTF-8 (`key_of`), keyed on
+ * `shown`, the path as written: no string names such a path, and the one closest to it
+ * names another (#414).
+ */
+function notUtf8Error(shown: string): PathError {
+  return pathError('mds::io', `resolved path is not valid UTF-8: "${escapePathForMessage(shown)}"`);
+}
+
+/** What a path resolves to (`resolvePath`). */
+type Resolution =
+  | { readonly kind: 'resolved'; readonly path: string }
+  | { readonly kind: 'unresolved' }
+  | { readonly kind: 'not-utf8' };
+
+/**
+ * `path` resolved as the OS resolves it (`realpath`), taken in the exact bytes the OS
+ * gives. Node's default decoding of them replaces each byte that is not valid UTF-8
+ * with U+FFFD, and that string names another path — a "twin" none of the checks here
+ * has seen (#414). So bytes that are not valid UTF-8 are reported as such, never
+ * decoded: no string names them.
+ */
+async function resolvePath(path: string): Promise<Resolution> {
+  let bytes: Buffer;
+  try {
+    bytes = await realpath(path, { encoding: 'buffer' });
+  } catch {
+    return { kind: 'unresolved' };
+  }
+  return isUtf8(bytes) ? { kind: 'resolved', path: bytes.toString('utf8') } : { kind: 'not-utf8' };
+}
+
+/**
+ * Canonicalize `path`, translating every failure — it does not exist (ENOENT), a path
+ * component above it is a regular file (ENOTDIR), a symlink loop (ELOOP), a name too
+ * long (ENAMETOOLONG), a directory that cannot be searched (EACCES) — into the
+ * `mds::file_not_found` shape `fileNotFoundError` builds, keyed on `shown`, never
+ * Node's error, which names the raw absolute path (R3 / CWE-209, #408). A canonical
+ * path that is not valid UTF-8 — a directory reached through a symlink, or the working
+ * directory a relative path starts from — is refused (`notUtf8Error`) before anything
+ * below it is looked at: every file there would be reached through a string that names
+ * another.
  *
  * Mirrors Rust `check_symlink_named`, whose `parent.canonicalize()` step maps
  * every canonicalize failure on the parent — it does not distinguish errno —
@@ -415,17 +451,25 @@ function nativeParentAndName(path: string): { parent: string; name: string | und
  * for NativeFs: physically, after the symlinks before it, on POSIX; lexically, before
  * any link is followed, on Windows.
  */
-async function canonicalDirectory(dir: string, shown: string): Promise<string> {
-  try {
-    return await realpath(dir);
-  } catch {
-    throw fileNotFoundError(shown);
+async function canonicalPath(path: string, shown: string): Promise<string> {
+  const resolution = await resolvePath(path);
+  switch (resolution.kind) {
+    case 'resolved':
+      return resolution.path;
+    case 'unresolved':
+      throw fileNotFoundError(shown);
+    case 'not-utf8':
+      throw notUtf8Error(shown);
+    default: {
+      const exhaustive: never = resolution;
+      throw new Error(`unknown resolution: ${JSON.stringify(exhaustive)}`);
+    }
   }
 }
 
-/** `canonicalDirectory` of `path`'s parent directory. */
+/** `canonicalPath` of `path`'s parent directory. */
 async function realpathParent(path: string, shown: string): Promise<string> {
-  return canonicalDirectory(dirname(path), shown);
+  return canonicalPath(dirname(path), shown);
 }
 
 /** The result of `promise`, or what it threw — never a rejection. */
@@ -700,18 +744,14 @@ async function assertFileNotSymlink(path: string, shown: string): Promise<void> 
 /**
  * The canonical path of `path`, the file `name` in the canonical directory `dir` —
  * NativeFs's `check_symlink_named`, which canonicalizes the joined path once the final
- * component is known not to be a symlink. It is not found when it no longer resolves;
- * a canonical path in another directory means the component was replaced by a link
- * meanwhile, refused as NativeFs refuses it. On a case-insensitive volume the result
- * carries the file's on-disk spelling (#408).
+ * component is known not to be a symlink. It is not found when it no longer resolves,
+ * and refused when it is not valid UTF-8 (`canonicalPath`); a canonical path in another
+ * directory means the component was replaced by a link meanwhile, refused as NativeFs
+ * refuses it. On a case-insensitive volume the result carries the file's on-disk
+ * spelling (#408).
  */
 async function canonicalFile(path: string, dir: string, shown: string): Promise<string> {
-  let resolved: string;
-  try {
-    resolved = await realpath(path);
-  } catch {
-    throw fileNotFoundError(shown);
-  }
+  const resolved = await canonicalPath(path, shown);
   if (dirname(resolved) !== dir) {
     throw symlinkError(shown);
   }
@@ -773,11 +813,13 @@ const WALK_FINISHED: Settled<never> = { ok: false, error: undefined };
  * Locate the entry file as NativeFs's `resolve_entry` does, before anything under it
  * is read: the entry path is validated as written (`mds::io`), its segments counted
  * (`mds::resource_limit`), and a path with no final name — `.`, a root, one ending in
- * `..` — is not found. Its parent directory is canonicalized as typed, so the OS
+ * `..` — is not found. Its parent directory is canonicalized as typed — a relative one
+ * from the working directory the OS holds, never from a string of it — so the OS
  * applies each `..` as it does for NativeFs (after the symlinks before it on POSIX,
- * lexically on Windows), never the scanner itself, and the final
- * component is refused when missing or a symlink, then canonicalized, and refused when
- * its canonical path carries a forbidden path character.
+ * lexically on Windows), never the scanner itself, and it is refused when its canonical
+ * path is not valid UTF-8. The final component is refused when missing or a symlink,
+ * then canonicalized, and refused when its canonical path carries a forbidden path
+ * character.
  */
 async function locateEntry(entryPath: string): Promise<{ path: string; dir: string; resolved: string }> {
   const entryErr = entryPathError(entryPath) ?? segmentCountError(entryPath);
@@ -788,7 +830,7 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
   if (name === undefined || name === '..') {
     throw fileNotFoundError(entryPath);
   }
-  const dir = await canonicalDirectory(parent, entryPath);
+  const dir = await canonicalPath(parent, entryPath);
   const path = join(dir, name);
   await assertFileNotSymlink(path, entryPath);
   const resolved = await canonicalFile(path, dir, entryPath);
@@ -823,17 +865,14 @@ async function assertKeyMatchesDisk(
 ): Promise<string> {
   // realpath() resolves each `..` as the OS does for NativeFs — after the links
   // before it on POSIX, lexically on Windows — so this is the directory NativeFs
-  // reads from. A missing directory is file-not-found there.
+  // reads from. A missing directory is file-not-found there, and one that is not
+  // valid UTF-8 is refused.
   const onDisk = await realpathParent(importerDir + sep + importPath, importPath);
-  // The directory the engine's key names. If it cannot be resolved at all, it
-  // is not the directory above, and the import is refused below.
-  let byName: string | undefined;
-  try {
-    byName = await realpath(dirname(join(projectRoot, ...childKey.split('/'))));
-  } catch {
-    byName = undefined;
-  }
-  if (byName !== onDisk) {
+  // The directory the engine's key names. If it cannot be resolved at all, or only to
+  // a path that is not valid UTF-8, it is not the directory above, and the import is
+  // refused below.
+  const byName = await resolvePath(dirname(join(projectRoot, ...childKey.split('/'))));
+  if (byName.kind !== 'resolved' || byName.path !== onDisk) {
     throw importError(
       `import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "${escapePathForMessage(importPath)}"`,
     );
@@ -949,20 +988,23 @@ async function readModule(
     // reported as the engine would report it: `lstat`/`realpath` are NativeFs's
     // stat and canonicalize steps (file-not-found), the fd-based `stat` is part of
     // reading the file.
-    const [stats, linkStats, resolved] = await Promise.all([
+    const [stats, linkStats, resolution] = await Promise.all([
       handle.stat().catch((err: unknown) => {
         throw readError(shown, err);
       }),
       lstat(located.path).catch(() => {
         throw fileNotFoundError(shown);
       }),
-      realpath(located.path).catch(() => {
-        throw fileNotFoundError(shown);
-      }),
+      resolvePath(located.path),
     ]);
-    if (linkStats.isSymbolicLink() || resolved !== located.resolved) {
+    if (resolution.kind === 'unresolved') {
+      throw fileNotFoundError(shown);
+    }
+    // A canonical path that is not valid UTF-8 is not the one located, which is.
+    if (linkStats.isSymbolicLink() || resolution.kind === 'not-utf8' || resolution.path !== located.resolved) {
       throw symlinkError(shown);
     }
+    const { resolved } = located;
     // Checked again on the opened fd, as NativeFs checks its opened file: another
     // file may have taken the module's place since it was checked above.
     if (!stats.isFile()) {
@@ -1034,7 +1076,9 @@ async function readModule(
  *   lexically and on the canonical path (`mds::import`, `import path escapes project
  *   directory: "<import as written>"`);
  * - a module whose resolved path carries a forbidden path character — a hostile-named
- *   directory reached through a symlink (`mds::io`);
+ *   directory reached through a symlink (`mds::io`) — or is not valid UTF-8 (`mds::io`,
+ *   `resolved path is not valid UTF-8: "<path as written>"`): no string names such a
+ *   path, and the one closest to it names another, which is never read;
  * - an import chain deeper than 64 modules (`mds::import`); more modules than the
  *   engine takes, the entry plus `maxModules` (`mds::resource_limit`);
  * - a module that is not a regular file — a directory, device, FIFO or socket —
@@ -1104,6 +1148,14 @@ async function readModule(
  *    `options.moduleAliases`): a graph whose imports reach its modules by more
  *    spellings than that, other than their on-disk keys, compiles only on native,
  *    which has no aliases to count (#414).
+ * 10. A module below a directory whose canonical path is not valid UTF-8 — reached
+ *    through a symlink, or the working directory of a relative entry — is refused as
+ *    soon as that directory is resolved, before the file in it is looked at: the
+ *    scanner reaches every file through a string, and none names that directory.
+ *    Native refuses it with the same error only once it has checked the file, so where
+ *    the file is also missing or a symlink, lies outside the project root, or has a
+ *    forbidden character in its path, native reports that instead (U-SM48, which runs
+ *    where a file name can hold such bytes: APFS refuses them).
  */
 export async function buildModulesMap(
   entryPath: string,

@@ -2049,6 +2049,56 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       assert.equal(calls.filter((c) => c === sub).length, 1, JSON.stringify(calls));
     });
   });
+
+  // A file name that is not valid UTF-8 exists only where names are stored as bytes:
+  // APFS refuses one, and Windows names are UTF-16. Everywhere else — Linux, in CI —
+  // the row must run, so a filesystem that refuses the name fails it.
+  const noByteNames =
+    (process.platform === 'darwin' && 'APFS refuses a file name that is not valid UTF-8: this row runs on Linux (CI)') ||
+    (process.platform === 'win32' && 'Windows file names are UTF-16, never bytes: this row runs on Linux (CI)');
+
+  test('U-SM48: a path resolved into a directory whose name is not valid UTF-8 is refused as native refuses it, never read as its U+FFFD twin', { skip: noByteNames }, async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM48')) return;
+    await withNestedProject(async (proj) => {
+      // `sub` and the byte 0xFF, built from bytes: no string names it. `link` leads there.
+      const hostile = Buffer.concat([Buffer.from(path.join(proj, 'sub')), Buffer.from([0xff])]);
+      await mkdir(hostile);
+      await writeFile(Buffer.concat([hostile, Buffer.from(`${path.sep}x.mds`)]), 'REAL\n');
+      await symlink(hostile, path.join(proj, 'link'), 'dir');
+      // Its twin: the name a lossy decoding of the link's target spells, with U+FFFD for
+      // the byte, holding another file.
+      const twin = path.join(proj, `sub${String.fromCodePoint(0xfffd)}`);
+      await mkdir(twin);
+      await writeFile(path.join(twin, 'x.mds'), 'TWIN\n');
+      const main = path.join(proj, 'main.mds');
+      await writeFile(main, '@import "./link/x.mds" as x\n@include x\n');
+      const throughLink = path.join(proj, 'link', 'x.mds');
+      const linked = path.join(proj, 'link');
+      const refused = (shown) => ({
+        code: 'mds::io',
+        message: `resolved path is not valid UTF-8: "${shown}"`,
+        help: null,
+        span: null,
+      });
+
+      // An import through the link, an entry through it, and a relative entry whose
+      // working directory is the directory it leads to.
+      const outcomes = async (backend) => [
+        ...(await compileFileOutcomes(backend, [main, throughLink])),
+        ...(await compileFileOutcomes(backend, ['x.mds'], { cwd: linked })),
+      ];
+      const native = await outcomes('native');
+      // Positive control (PF-013): native refuses each one.
+      assert.deepEqual(native, [refused('./link/x.mds'), refused(throughLink), refused('x.mds')]);
+      assert.deepEqual(await outcomes('wasm'), native);
+      // Control: the twin, named as itself, compiles on both backends — the file a lossy
+      // path would have read in place of the real one.
+      const direct = path.join(twin, 'x.mds');
+      assert.deepEqual(await compileFileOutcomes('native', [direct]), [{ output: 'TWIN\n' }]);
+      assert.deepEqual(await compileFileOutcomes('wasm', [direct]), [{ output: 'TWIN\n' }]);
+    });
+  });
 });
 
 describe('slidingWindow — the read-ahead window of the buildModulesMap walk (#414)', () => {
