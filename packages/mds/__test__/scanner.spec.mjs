@@ -1432,12 +1432,12 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     });
   });
 
-  // Writing at the filesystem root needs root: TP-39 runs this in a throwaway container
+  // Writing at the filesystem root needs root, so this runs in a throwaway container
   // (`docker run --rm -v "$PWD":/repo -w /repo/packages/mds node:22 node --test
   // --test-name-pattern U-SM34 __test__/scanner.spec.mjs`).
   const notRoot =
     !(typeof process.getuid === 'function' && process.getuid() === 0) &&
-    'needs root, to write at the filesystem root: run it in a throwaway container (TP-39)';
+    'needs root, to write at the filesystem root: run it in a throwaway container';
 
   test('U-SM34: a project rooted at the filesystem root compiles through the WASM backend as on native', { skip: notRoot }, async (t) => {
     const engines = await loadEngines();
