@@ -39,6 +39,7 @@ const {
   normalizeVirtualKey,
   buildModulesMap: buildModulesMapWith,
   findProjectRoot,
+  _unwrapWalkFinishedForTesting,
 } = await import('../dist/util/module-scanner.js');
 const { slidingWindow } = await import('../dist/util/sliding-window.js');
 
@@ -2097,6 +2098,50 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const direct = path.join(twin, 'x.mds');
       assert.deepEqual(await compileFileOutcomes('native', [direct]), [{ output: 'TWIN\n' }]);
       assert.deepEqual(await compileFileOutcomes('wasm', [direct]), [{ output: 'TWIN\n' }]);
+    });
+  });
+
+  test("U-SM49: a refusal has the engine error's own fields and no others — `help` only where the engine gives one", async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM49')) return;
+    const engine = { scanImportRecords: engines.wasm.scanImportRecords, preflightModule };
+    await withNestedProject(async (proj, parent) => {
+      await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
+      // [label, entry source, scan options, the refusal's code, its own enumerable fields].
+      // The frontmatter rows are rebuilt with the context the resolver adds to them; a
+      // missing module there becomes `mds::import`, which has no `help`.
+      const rows = [
+        ['an import string that is not relative', '@import "x.mds" as x\nhi\n', {}, 'mds::import', ['code']],
+        ['an import out of the project', '@import "../outside.mds" as o\nhi\n', {}, 'mds::import', ['code']],
+        ['a frontmatter import out of the project', frontmatterImports('../outside.mds'), {}, 'mds::import', ['code']],
+        ['a missing frontmatter import', frontmatterImports('./gone.mds'), {}, 'mds::import', ['code']],
+        ["the importing module's own directory", '@import "./" as o\nhi\n', {}, 'mds::io', ['code']],
+        ['one module too many', 'hi\n', { maxModules: 0 }, 'mds::resource_limit', ['code']],
+        // Controls (PF-013): the engine gives `mds::file_not_found` a `help`, and a
+        // missing `@import` a `span` too.
+        ['a missing import', '@import "./gone.mds" as g\nhi\n', {}, 'mds::file_not_found', ['code', 'help', 'span']],
+      ];
+      for (const [i, [label, source, options, code, fields]] of rows.entries()) {
+        const entry = path.join(proj, `e${i}.mds`);
+        await writeFile(entry, source);
+        const err = await rejectionOf(buildModulesMapWith(entry, engine, options), label);
+        assert.equal(err.code, code, `${label}: ${err.message}`);
+        assert.deepEqual(Object.keys(err).sort(), fields, label);
+        assert.equal(Object.hasOwn(err, 'help'), fields.includes('help'), label);
+      }
+      const missing = await rejectionOf(buildModulesMapWith(path.join(proj, 'gone.mds'), engine), 'a missing entry');
+      assert.equal(missing.code, 'mds::file_not_found', missing.message);
+      assert.deepEqual(Object.keys(missing).sort(), ['code', 'help']);
+    });
+  });
+
+  test('U-SM50: the outcome of a read ahead that starts after its walk has finished throws an Error when unwrapped', () => {
+    // Nothing unwraps one: the walk is over. Should anything ever do so, it fails with an
+    // Error that says what happened, never a throw of `undefined`.
+    assert.throws(_unwrapWalkFinishedForTesting, (err) => {
+      assert.ok(err instanceof Error, `an Error, not ${String(err)}`);
+      assert.match(err.message, /after its scan had finished/);
+      return true;
     });
   });
 });

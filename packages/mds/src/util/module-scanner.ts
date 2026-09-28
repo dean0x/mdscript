@@ -5,7 +5,7 @@ import { isUtf8 } from 'node:buffer';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, parse, sep } from 'node:path';
-import type { MdsError, MdsErrorSpan } from '../types.js';
+import { isMdsError, type MdsError, type MdsErrorSpan } from '../types.js';
 import {
   escapePathForMessage,
   firstForbiddenChar,
@@ -240,16 +240,25 @@ function pathError(code: PathErrorCode, message: string): PathError {
   return err;
 }
 
-/** The prefix the Rust `ImportError`'s display adds to its message. */
-const IMPORT_ERROR_PREFIX = 'import error: ';
+/**
+ * What `importError` and `fileNotFoundError` build a refusal's message from — the detail
+ * after its prefix, the path as written — for `withImportContext` to rebuild the refusal
+ * as the resolver rebuilds it once an import has reached it, never read back out of the
+ * message. Kept beside the error, not on it, so a refusal has exactly the fields the
+ * engine's error has (#414).
+ */
+type RefusalParts =
+  | { readonly code: 'mds::import'; readonly detail: string }
+  | { readonly code: 'mds::file_not_found'; readonly shown: string };
+
+const refusalParts = new WeakMap<Error, RefusalParts>();
 
 /** `mds::import`, with the `import error: ` prefix the Rust error's display adds. */
 function importError(detail: string): PathError {
-  return pathError('mds::import', `${IMPORT_ERROR_PREFIX}${detail}`);
+  const err = pathError('mds::import', `import error: ${detail}`);
+  refusalParts.set(err, { code: 'mds::import', detail });
+  return err;
 }
-
-/** The prefix of a `mds::file_not_found` message: the Rust `FileNotFound`'s display. */
-const FILE_NOT_FOUND_PREFIX = 'file not found: ';
 
 /**
  * `mds::file_not_found`, matching Rust `MdsError::file_not_found`'s message
@@ -261,38 +270,37 @@ const FILE_NOT_FOUND_PREFIX = 'file not found: ';
  * this module builds can carry a forbidden character.
  */
 function fileNotFoundError(shown: string): PathError {
-  return pathError('mds::file_not_found', `${FILE_NOT_FOUND_PREFIX}${escapePathForMessage(shown)}`);
+  const err = pathError('mds::file_not_found', `file not found: ${escapePathForMessage(shown)}`);
+  refusalParts.set(err, { code: 'mds::file_not_found', shown });
+  return err;
 }
 
 /**
  * `err`, thrown while the import `record` was resolved — by the import itself or by a
  * module below it — with the context the Rust resolver adds at that step
- * (`attach_import_span` and `attach_frontmatter_index`, #414). Only an error that
- * points into no source yet gains any:
+ * (`attach_import_span` and `attach_frontmatter_index`, #414). Only a refusal built
+ * here (`refusalParts`) that points into no source yet gains any:
  * - through a frontmatter import, `mds::file_not_found` becomes `mds::import`
  *   (`file not found: "<path>" (in frontmatter imports[<i>])`), and an `mds::import`
  *   error not already placed in a frontmatter gets ` (in frontmatter imports[<i>])`;
  * - through `@extends` or `@import`, `mds::file_not_found` names the import as written
  *   and points at its directive;
- * - through `@export … from`, nothing changes. So does every other error.
+ * - through `@export … from`, nothing changes. So does every other error: the engine's
+ *   own checks, `preflightModule` and `scanImportRecords`, raise neither code.
  */
 function withImportContext(err: unknown, record: ImportRecord): unknown {
-  if (!(err instanceof Error)) {
-    return err;
-  }
-  const { code, message, span } = err as PathError;
-  if (span !== undefined) {
+  const parts = isMdsError(err) && err.span === undefined ? refusalParts.get(err) : undefined;
+  if (parts === undefined) {
     return err;
   }
   if (record.frontmatterIndex !== null) {
     const where = ` (in frontmatter imports[${record.frontmatterIndex}])`;
-    if (code === 'mds::file_not_found') {
-      return importError(`file not found: "${message.slice(FILE_NOT_FOUND_PREFIX.length)}"${where}`);
+    if (parts.code === 'mds::file_not_found') {
+      return importError(`file not found: "${escapePathForMessage(parts.shown)}"${where}`);
     }
-    const detail = message.slice(IMPORT_ERROR_PREFIX.length);
-    return code === 'mds::import' && !detail.includes('in frontmatter') ? importError(`${detail}${where}`) : err;
+    return parts.detail.includes('in frontmatter') ? err : importError(`${parts.detail}${where}`);
   }
-  if (record.span !== null && code === 'mds::file_not_found') {
+  if (record.span !== null && parts.code === 'mds::file_not_found') {
     const located = fileNotFoundError(record.path);
     located.span = { ...record.span };
     return located;
@@ -601,8 +609,11 @@ export interface ImportRecord {
 }
 
 /**
- * The WASM engine calls the scanner makes — the WASM module's own exports, so every
- * check they make is the Rust engine's, never a TypeScript copy of it (#414).
+ * The two WASM engine calls the scanner makes, the WASM module's own exports (#414):
+ * listing a module's imports, and checking a file's bytes and type. What those two check
+ * is the Rust engine's own code. The scanner's other checks — of paths, symlinks, the
+ * project root and the limits, and the context an import's error gains — are TypeScript
+ * mirrors of the native backend's, held to it by the native-vs-WASM differentials.
  */
 export interface ScannerEngine {
   /**
@@ -806,8 +817,25 @@ interface ReadAhead {
   readonly read: Settled<ReadModule> | undefined;
 }
 
-/** The outcome of a read-ahead that starts after the walk has already finished. */
-const WALK_FINISHED: Settled<never> = { ok: false, error: undefined };
+/**
+ * The outcome of a read-ahead that starts after the walk has already finished, which
+ * nothing unwraps: the walk is over. Should anything ever do so, it throws this Error,
+ * which says what happened, never `undefined`.
+ */
+const WALK_FINISHED: Settled<never> = {
+  ok: false,
+  error: new Error('@mdscript/mds: internal error: an import read ahead after its scan had finished was used'),
+};
+
+/**
+ * Unwrap `WALK_FINISHED`, as nothing in the scan ever does — for the test that pins what
+ * that throws. Intended for use in tests only.
+ *
+ * @internal
+ */
+export function _unwrapWalkFinishedForTesting(): never {
+  return unwrap(WALK_FINISHED);
+}
 
 /**
  * Locate the entry file as NativeFs's `resolve_entry` does, before anything under it
