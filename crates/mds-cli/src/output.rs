@@ -219,14 +219,14 @@ pub(crate) fn reject_forbidden_output_path(
 /// it up front beside the typed check, so a refused location is never created or
 /// written, and no later status line can show it.
 ///
-/// The message, `<what> resolved path contains forbidden character U+XXXX: "<shown>"`,
-/// names `shown`, the value as typed, escaped by [`mds::escape_path_for_message`] —
+/// The message, `<what> resolved path contains forbidden character U+XXXX: "<typed>"`,
+/// names `typed`, the value as typed, escaped by [`mds::escape_path_for_message`] —
 /// never the absolute resolved path. The scan and the message are
 /// [`mds::reject_forbidden_path`]'s.
 pub(crate) fn reject_forbidden_resolved_output_path(
     what: &str,
     path: &Path,
-    shown: &OsStr,
+    typed: &OsStr,
 ) -> std::result::Result<(), mds::MdsError> {
     let Some(resolved) = resolve_existing_prefix(path) else {
         return Ok(());
@@ -234,7 +234,7 @@ pub(crate) fn reject_forbidden_resolved_output_path(
     mds::reject_forbidden_path(
         &format!("{what} resolved path"),
         &resolved,
-        &shown.to_string_lossy(),
+        &typed.to_string_lossy(),
     )
 }
 

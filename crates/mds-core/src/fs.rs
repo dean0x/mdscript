@@ -210,17 +210,17 @@ pub(crate) fn first_forbidden_char(path: &str) -> Option<char> {
 }
 
 /// The message for a path refused because it carries a forbidden path character
-/// (#265): `<what> contains forbidden character U+XXXX: "<shown>"`.
+/// (#265): `<what> contains forbidden character U+XXXX: "<typed>"`.
 ///
-/// `shown` is the path as the caller typed it, escaped with
+/// `typed` is the path as the caller typed it, raw: it is escaped here, with
 /// [`crate::escape_path_for_message`], so the message itself carries none of the
 /// 80 forbidden codepoints (TAB included) and never substitutes a resolved absolute
 /// path for what the caller passed.
-pub(crate) fn forbidden_char_message(what: &str, ch: char, shown: &str) -> String {
+pub(crate) fn forbidden_char_message(what: &str, ch: char, typed: &str) -> String {
     format!(
         "{what} contains forbidden character U+{:04X}: \"{}\"",
         u32::from(ch),
-        crate::lint::escape_path_for_message(shown)
+        crate::lint::escape_path_for_message(typed)
     )
 }
 
@@ -235,14 +235,14 @@ pub(crate) fn reject_forbidden_path_chars(what: &str, path: &str) -> Result<(), 
 
 /// Refuse `path` when it carries a [`crate::is_forbidden_path_char`] codepoint
 /// anywhere in it (#265): [`MdsError::Io`], `<what> contains forbidden character
-/// U+XXXX: "<shown>"`, naming the first such codepoint.
+/// U+XXXX: "<typed>"`, naming the first such codepoint.
 ///
-/// `path` is what is scanned and `shown` what the message names, escaped with
-/// [`crate::escape_path_for_message`]: the path as the caller typed it, which differs
-/// from `path` when `path` is the form it resolves to, so the message never shows a
-/// resolved absolute path the caller did not type. A path that is not valid UTF-8 is
-/// scanned lossily: every forbidden codepoint that is validly encoded survives the
-/// conversion.
+/// `path` is what is scanned and `typed` what the message names: the path as the
+/// caller typed it, raw — the message escapes it with
+/// [`crate::escape_path_for_message`], so pass it unescaped. It differs from `path`
+/// when `path` is the form it resolves to, so the message never shows a resolved
+/// absolute path the caller did not type. A path that is not valid UTF-8 is scanned
+/// lossily: every forbidden codepoint that is validly encoded survives the conversion.
 ///
 /// mds-core words its own refusals of a path with the same message, so a caller that
 /// checks a path mds-core never sees (an output location, say) refuses it in the same
@@ -266,9 +266,9 @@ pub(crate) fn reject_forbidden_path_chars(what: &str, path: &str) -> Result<(), 
 /// );
 /// # Ok::<(), mds::MdsError>(())
 /// ```
-pub fn reject_forbidden_path(what: &str, path: &Path, shown: &str) -> Result<(), MdsError> {
+pub fn reject_forbidden_path(what: &str, path: &Path, typed: &str) -> Result<(), MdsError> {
     match first_forbidden_char(&path.to_string_lossy()) {
-        Some(ch) => Err(MdsError::io(forbidden_char_message(what, ch, shown))),
+        Some(ch) => Err(MdsError::io(forbidden_char_message(what, ch, typed))),
         None => Ok(()),
     }
 }
@@ -279,11 +279,11 @@ pub fn reject_forbidden_path(what: &str, path: &Path, shown: &str) -> Result<(),
 /// The typed path has already been checked by the time a path is resolved; this
 /// catches what the typed form cannot show — a symlinked directory whose target has a
 /// hostile name, or a project that lives under one. The WHOLE path is scanned, not
-/// only its final component. The message names `shown`, the path the caller typed,
-/// never the absolute resolved path (R3 / CWE-209). A path that is not valid UTF-8 is
+/// only its final component. The message names `typed`, the path the caller typed
+/// (raw, escaped in the message), never the absolute resolved path (R3 / CWE-209). A path that is not valid UTF-8 is
 /// scanned lossily, and `key_of` then refuses it rather than turn it into a key.
-pub(crate) fn reject_forbidden_in_path(resolved: &Path, shown: &str) -> Result<(), MdsError> {
-    reject_forbidden_path("resolved path", resolved, shown)
+pub(crate) fn reject_forbidden_in_path(resolved: &Path, typed: &str) -> Result<(), MdsError> {
+    reject_forbidden_path("resolved path", resolved, typed)
 }
 
 /// The key of a resolved `canonical` path: its exact UTF-8 string form.

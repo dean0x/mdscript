@@ -216,12 +216,12 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
             // (every input mode) and `fmt` directory mode. `check` does not load
             // mds.json.
             if let Some(output_dir) = &config.build.output_dir {
-                let shown = std::ffi::OsStr::new(output_dir);
-                crate::output::reject_forbidden_output_path("mds.json build.output_dir", shown)?;
+                let typed = std::ffi::OsStr::new(output_dir);
+                crate::output::reject_forbidden_output_path("mds.json build.output_dir", typed)?;
                 crate::output::reject_forbidden_resolved_output_path(
                     "mds.json build.output_dir",
                     &current.join(output_dir),
-                    shown,
+                    typed,
                 )?;
             }
             return Ok(Some((config, current)));
