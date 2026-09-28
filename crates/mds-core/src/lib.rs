@@ -64,7 +64,7 @@ pub(crate) mod verbatim;
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{
     check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, FileSystem,
-    NativeFs, VirtualFs,
+    ModuleAliasError, NativeFs, VirtualFs,
 };
 pub use lint::{
     escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
@@ -380,6 +380,15 @@ pub const MAX_TRAVERSAL_DEPTH: usize = limits::MAX_TRAVERSAL_DEPTH;
 ///
 /// Pin guard: L-API-5 / AC-API-10.
 pub const MAX_DIAGNOSTICS: usize = limits::MAX_DIAGNOSTICS;
+
+/// Maximum number of aliases a [`VirtualFs`] takes: 65,536.
+///
+/// An alias is another key an import reaches a module by ([`VirtualFs::with_aliases`]);
+/// `@mdscript/mds`'s WASM backend passes one for each spelling that reaches a module by
+/// other than its on-disk key. Past it, `with_aliases` refuses the map with
+/// [`ModuleAliasError::TooMany`] (`mds::resource_limit`) before it checks any alias,
+/// and the WASM `moduleAliases` option is refused as it is read (#414).
+pub const MAX_MODULE_ALIASES: usize = limits::MAX_MODULE_ALIASES;
 
 /// Compile an MDS file, returning a [`CompileResult`].
 ///

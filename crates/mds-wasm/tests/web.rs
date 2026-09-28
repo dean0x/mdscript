@@ -738,13 +738,15 @@ fn module_aliases_resolve_an_import_to_the_module_they_name() {
 /// A malformed alias map — or an alias or the module key it names that is not a
 /// module key, hostile ones included — is refused by compile, check and lint with
 /// `mds::invalid_options`, the key escaped: its escape text is shown and the raw
-/// character never is (PF-013).
+/// character never is (PF-013). An alias that breaks a rule is named per key, as a
+/// value of the wrong type is (#414).
 #[wasm_bindgen_test]
 fn module_aliases_refuse_a_malformed_or_hostile_alias() {
     let esc = char::from_u32(0x1b).expect("U+001B is a char");
     let hostile = format!("a{esc}b.mds");
     let shown = format!("a{}u001Bb.mds", '\\');
-    let invalid = |detail: &str| format!("invalid options.moduleAliases: {detail}");
+    let invalid =
+        |alias: &str, reason: &str| format!("options.moduleAliases[\"{alias}\"]: {reason}");
     let cases = [
         (
             serde_json::json!([]),
@@ -760,27 +762,26 @@ fn module_aliases_refuse_a_malformed_or_hostile_alias() {
         ),
         (
             alias_map(&[(&hostile, "hi.mds".into())]),
-            invalid(&format!(
-                "module alias \"{shown}\": the alias contains forbidden character U+001B"
-            )),
+            invalid(&shown, "the alias contains forbidden character U+001B"),
         ),
         (
             alias_map(&[("A.mds", hostile.clone().into())]),
-            invalid(&format!(
-                "module alias \"A.mds\": its module key \"{shown}\" contains forbidden character U+001B"
-            )),
+            invalid(
+                "A.mds",
+                &format!("its module key \"{shown}\" contains forbidden character U+001B"),
+            ),
         ),
         (
             alias_map(&[("../hi.mds", "hi.mds".into())]),
-            invalid("module alias \"../hi.mds\": the alias has a '..' segment"),
+            invalid("../hi.mds", "the alias has a '..' segment"),
         ),
         (
             alias_map(&[("A.mds", "gone.mds".into())]),
-            invalid("module alias \"A.mds\": its module key \"gone.mds\" names no module"),
+            invalid("A.mds", "its module key \"gone.mds\" names no module"),
         ),
         (
             alias_map(&[("hi.mds", "input.mds".into())]),
-            invalid("module alias \"hi.mds\": the alias is a module key itself"),
+            invalid("hi.mds", "the alias is a module key itself"),
         ),
     ];
     let source = "@import \"./A.mds\" as a\n";
@@ -803,6 +804,60 @@ fn module_aliases_refuse_a_malformed_or_hostile_alias() {
     );
     let err = mds_wasm::compile(source, opts).unwrap_err();
     assert_eq!(get_str(&err, "code"), "mds::circular_import");
+}
+
+/// `moduleAliases` is bounded as `modules` is, as the option is read and before any
+/// alias is checked (#414): more than 65,536 aliases, or aliases and the module keys
+/// they name that together pass 10 MiB, is `mds::resource_limit`, worded like the
+/// `modules` refusals. A map at either bound compiles (the controls), and one past a
+/// bound is refused so even when every alias in it would be refused too.
+#[wasm_bindgen_test]
+fn module_aliases_are_bounded_like_modules() {
+    const COUNT: usize = 65_536;
+    const SIZE: usize = 10 * 1024 * 1024;
+    let source = "@import \"./Hi.mds\" as h\n@include h\n";
+    let opts = |aliases: &serde_json::Value| aliased_opts(&[("hi.mds", "Hi!\n")], aliases.clone());
+    // `Hi.mds` → `hi.mds`, which the source imports, and `n - 1` more aliases.
+    let many = |n: usize, target: &str| {
+        let mut aliases: serde_json::Map<String, serde_json::Value> = (1..n)
+            .map(|i| (format!("A{i}.mds"), target.into()))
+            .collect();
+        aliases.insert("Hi.mds".to_owned(), "hi.mds".into());
+        serde_json::Value::Object(aliases)
+    };
+    // `Hi.mds` → `hi.mds` (12 bytes), and one alias taking the rest of `total` bytes.
+    let sized = |total: usize, target: &str| {
+        let long = format!(
+            "{}.mds",
+            "x".repeat(total - 12 - target.len() - ".mds".len())
+        );
+        alias_map(&[("Hi.mds", "hi.mds".into()), (&long, target.into())])
+    };
+
+    for aliases in [many(COUNT, "hi.mds"), sized(SIZE, "hi.mds")] {
+        let result = mds_wasm::compile(source, opts(&aliases)).expect("at a bound");
+        assert_eq!(get_str(&result, "output"), "Hi!\n");
+    }
+    let too_many = format!(
+        "options.moduleAliases exceeds maximum alias count of {COUNT} ({} provided)",
+        COUNT + 1
+    );
+    let too_large = format!("options.moduleAliases aggregate size exceeds maximum of {SIZE} bytes");
+    for (aliases, message) in [
+        (many(COUNT + 1, "hi.mds"), &too_many),
+        (many(COUNT + 1, "gone.mds"), &too_many),
+        (sized(SIZE + 1, "hi.mds"), &too_large),
+        (sized(SIZE + 1, "gone.mds"), &too_large),
+    ] {
+        for err in [
+            mds_wasm::compile(source, opts(&aliases)).unwrap_err(),
+            mds_wasm::check(source, opts(&aliases)).unwrap_err(),
+            mds_wasm::lint(source, opts(&aliases)).unwrap_err(),
+        ] {
+            assert_eq!(get_str(&err, "code"), "mds::resource_limit", "{message}");
+            assert_eq!(get_str(&err, "message"), *message);
+        }
+    }
 }
 
 // ── preflightModule (#414) ───────────────────────────────────────────────────
@@ -2033,6 +2088,13 @@ fn wasm_options_conversion_error_text_is_wire_escaped() {
             mds_wasm::compile(
                 "Hello!\n",
                 object_with("modules", &object_with("a.mds", &symbol)),
+            ),
+        ),
+        (
+            "invalid options.moduleAliases: ",
+            mds_wasm::compile(
+                "Hello!\n",
+                object_with("moduleAliases", &object_with("A.mds", &symbol)),
             ),
         ),
         (

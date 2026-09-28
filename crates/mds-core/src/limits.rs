@@ -182,3 +182,19 @@ pub(crate) const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
 ///
 /// 256 matches the binding-layer constant so all code paths behave identically.
 pub(crate) const MAX_MODULE_COUNT: usize = 256;
+
+/// Maximum number of aliases a `VirtualFs` takes (`VirtualFs::with_aliases`), and the
+/// WASM `moduleAliases` option (#414).
+///
+/// An alias is another key an import reaches a module by: `@mdscript/mds`'s WASM
+/// backend passes one for each spelling that reaches a module by other than its on-disk
+/// key — a case variant on a case-insensitive volume, or a path through a symbolically
+/// linked directory — so a project holds a handful. 65,536 is 256 such spellings for
+/// each of 256 modules.
+pub(crate) const MAX_MODULE_ALIASES: usize = 65_536;
+
+/// Maximum total length in bytes of the aliases and the module keys they name in one
+/// alias map: 10 MiB, the aggregate the WASM `modules` option allows its module text.
+/// With `MAX_MODULE_ALIASES` it bounds what an alias map holds before any alias in it
+/// is checked (#414).
+pub(crate) const MAX_MODULE_ALIASES_SIZE: usize = MAX_FILE_SIZE as usize;

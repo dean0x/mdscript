@@ -9,7 +9,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::error::MdsError;
-use crate::limits::{MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use crate::limits::{
+    MAX_FILE_SIZE, MAX_MODULE_ALIASES, MAX_MODULE_ALIASES_SIZE, MAX_TRAVERSAL_DEPTH,
+};
 
 /// Maximum number of path segments allowed in a single import path.
 ///
@@ -653,10 +655,18 @@ impl VirtualFs {
     /// so the key a module is reached by is validated as the key it is. Every alias must
     /// name a module, and no alias may be a module key itself.
     ///
+    /// The map is bounded before any alias in it is checked: at most
+    /// [`crate::MAX_MODULE_ALIASES`] aliases, whose keys and the module keys they name
+    /// total at most 10 MiB — the bounds the WASM `moduleAliases` option applies as it
+    /// is read.
+    ///
     /// # Errors
     ///
-    /// [`MdsError::Io`] for the first offending alias in key order, naming it escaped
-    /// with [`crate::escape_path_for_message`]: `module alias "<alias>": <reason>`.
+    /// A [`ModuleAliasError`], which converts into an [`MdsError`]:
+    /// [`ModuleAliasError::TooMany`] or [`ModuleAliasError::TooLarge`] for a map past a
+    /// bound (`mds::resource_limit`), then [`ModuleAliasError::Refused`] for the first
+    /// offending alias in key order (`mds::io`), naming it escaped with
+    /// [`crate::escape_path_for_message`]: `module alias "<alias>": <reason>`.
     ///
     /// # Examples
     ///
@@ -671,21 +681,37 @@ impl VirtualFs {
     ///
     /// let missing = HashMap::from([("Header.mds".to_string(), "gone.mds".to_string())]);
     /// let err = mds::VirtualFs::new(modules).with_aliases(missing).unwrap_err();
+    /// assert!(matches!(err, mds::ModuleAliasError::Refused { .. }));
     /// assert_eq!(
     ///     err.to_string(),
     ///     "module alias \"Header.mds\": its module key \"gone.mds\" names no module"
     /// );
     /// # Ok::<(), mds::MdsError>(())
     /// ```
-    pub fn with_aliases(mut self, aliases: HashMap<String, String>) -> Result<Self, MdsError> {
+    pub fn with_aliases(
+        mut self,
+        aliases: HashMap<String, String>,
+    ) -> Result<Self, ModuleAliasError> {
+        if aliases.len() > MAX_MODULE_ALIASES {
+            return Err(ModuleAliasError::TooMany {
+                count: aliases.len(),
+            });
+        }
+        let size = aliases.iter().fold(0usize, |size, (alias, target)| {
+            size.saturating_add(alias.len())
+                .saturating_add(target.len())
+        });
+        if size > MAX_MODULE_ALIASES_SIZE {
+            return Err(ModuleAliasError::TooLarge);
+        }
         let mut keys: Vec<&String> = aliases.keys().collect();
         keys.sort_unstable();
         for alias in keys {
             if let Some(reason) = alias_violation(&self.modules, alias, &aliases[alias]) {
-                return Err(MdsError::io(format!(
-                    "module alias \"{}\": {reason}",
-                    crate::lint::escape_path_for_message(alias)
-                )));
+                return Err(ModuleAliasError::Refused {
+                    alias: crate::lint::escape_path_for_message(alias).into_owned(),
+                    reason,
+                });
             }
         }
         self.aliases = aliases;
@@ -695,6 +721,73 @@ impl VirtualFs {
     /// The source of the module keyed `key`, if there is one.
     pub(crate) fn module(&self, key: &str) -> Option<&str> {
         self.modules.get(key).map(String::as_str)
+    }
+}
+
+/// Why [`VirtualFs::with_aliases`] refused an alias map (#414).
+///
+/// Its text is the message of the [`MdsError`] it converts into (with `?`, or
+/// [`From`]): [`TooMany`](Self::TooMany) and [`TooLarge`](Self::TooLarge) become
+/// `mds::resource_limit`, [`Refused`](Self::Refused) `mds::io`. A binding that names the
+/// alias in its own words reads [`Refused`](Self::Refused)'s fields, which are escaped.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleAliasError {
+    /// More than [`crate::MAX_MODULE_ALIASES`] aliases:
+    /// `module alias count exceeds maximum of 65536 (<count> provided)`.
+    #[non_exhaustive]
+    TooMany {
+        /// How many aliases the map holds.
+        count: usize,
+    },
+    /// Aliases whose keys and module keys total more than 10 MiB:
+    /// `module aliases aggregate size exceeds maximum of 10485760 bytes`.
+    #[non_exhaustive]
+    TooLarge,
+    /// The first alias, in key order, that cannot join the filesystem:
+    /// `module alias "<alias>": <reason>`.
+    #[non_exhaustive]
+    Refused {
+        /// The alias, escaped with [`crate::escape_path_for_message`].
+        alias: String,
+        /// Why it is refused; a module key it names is escaped the same way.
+        reason: String,
+    },
+}
+
+// `#[inline]` on `fmt` and `from` so a binding compiles them at its own optimization
+// level: mds-wasm is built for size, and compiled in mds-core (opt-level 3) these two
+// measured about 5.6 KB larger in the WASM binary.
+impl std::fmt::Display for ModuleAliasError {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleAliasError::TooMany { count } => write!(
+                f,
+                "module alias count exceeds maximum of {MAX_MODULE_ALIASES} ({count} provided)"
+            ),
+            ModuleAliasError::TooLarge => write!(
+                f,
+                "module aliases aggregate size exceeds maximum of {MAX_MODULE_ALIASES_SIZE} bytes"
+            ),
+            ModuleAliasError::Refused { alias, reason } => {
+                write!(f, "module alias \"{alias}\": {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModuleAliasError {}
+
+impl From<ModuleAliasError> for MdsError {
+    #[inline]
+    fn from(err: ModuleAliasError) -> Self {
+        match err {
+            ModuleAliasError::Refused { .. } => MdsError::io(err.to_string()),
+            ModuleAliasError::TooMany { .. } | ModuleAliasError::TooLarge => {
+                MdsError::resource_limit(err.to_string())
+            }
+        }
     }
 }
 
@@ -1473,6 +1566,16 @@ mod tests {
             let err = VirtualFs::new(modules.clone())
                 .with_aliases(HashMap::from([(alias.clone(), target.clone())]))
                 .expect_err(&message);
+            // The alias and the reason apart, as a binding words them.
+            let ModuleAliasError::Refused {
+                alias: ref shown_alias,
+                ref reason,
+            } = err
+            else {
+                panic!("{err:?}");
+            };
+            assert_eq!(format!("module alias \"{shown_alias}\": {reason}"), message);
+            let err = MdsError::from(err);
             assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
             assert_eq!(err.to_string(), message);
             assert!(!err.to_string().contains(esc), "{message}");
@@ -1509,6 +1612,72 @@ mod tests {
                 ("SUB/B.mds", "sub/b.mds"),
             ]))
             .expect("clean aliases");
+    }
+
+    /// #414: an alias map is bounded before any alias is checked, as the WASM `modules`
+    /// option is: more than 65,536 aliases, or aliases and the module keys they name that
+    /// together pass 10 MiB, is `mds::resource_limit`. A map at either bound is accepted
+    /// (the controls), and one past a bound is refused so even when every alias in it
+    /// would be refused too.
+    #[test]
+    fn vfs_with_aliases_bounds_the_count_and_the_size_of_the_map() {
+        const COUNT: usize = 65_536;
+        let size = usize::try_from(MAX_FILE_SIZE).expect("10 MiB fits a usize");
+        let modules = modules_of(&["a.mds"]);
+        let with = |aliases: HashMap<String, String>| {
+            VirtualFs::new(modules.clone())
+                .with_aliases(aliases)
+                .map(drop)
+                .map_err(MdsError::from)
+        };
+        let refused = |aliases: HashMap<String, String>, message: &str| {
+            let err = with(aliases).expect_err(message);
+            assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                format!("resource limit exceeded: {message}")
+            );
+        };
+
+        let many = |n: usize, target: &str| -> HashMap<String, String> {
+            (0..n)
+                .map(|i| (format!("A{i}.mds"), target.to_owned()))
+                .collect()
+        };
+        with(many(COUNT, "a.mds")).expect("at the count bound");
+        let too_many = format!(
+            "module alias count exceeds maximum of {COUNT} ({} provided)",
+            COUNT + 1
+        );
+        refused(many(COUNT + 1, "a.mds"), &too_many);
+        refused(many(COUNT + 1, "gone.mds"), &too_many);
+
+        // One alias whose key and module key total `total` bytes.
+        let sized = |total: usize, target: &str| {
+            let alias = format!("{}.mds", "x".repeat(total - target.len() - ".mds".len()));
+            HashMap::from([(alias, target.to_owned())])
+        };
+        with(sized(size, "a.mds")).expect("at the size bound");
+        let too_large = format!("module aliases aggregate size exceeds maximum of {size} bytes");
+        refused(sized(size + 1, "a.mds"), &too_large);
+        refused(sized(size + 1, "gone.mds"), &too_large);
+
+        // The typed refusals, and the constants they name.
+        assert_eq!(COUNT, MAX_MODULE_ALIASES);
+        assert_eq!(size, MAX_MODULE_ALIASES_SIZE);
+        let typed = |aliases| {
+            VirtualFs::new(modules.clone())
+                .with_aliases(aliases)
+                .map(drop)
+        };
+        assert_eq!(
+            typed(many(COUNT + 1, "a.mds")),
+            Err(ModuleAliasError::TooMany { count: COUNT + 1 })
+        );
+        assert_eq!(
+            typed(sized(size + 1, "a.mds")),
+            Err(ModuleAliasError::TooLarge)
+        );
     }
 
     /// The key rule is exactly the form `normalize_in_dir` gives a key: a key passes it

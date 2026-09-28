@@ -166,7 +166,7 @@ fn scan_import_records_function_exists() {
 #[test]
 fn virtual_fs_aliases_api_exists() {
     type Vars = Option<HashMap<String, Value>>;
-    let _: fn(VirtualFs, HashMap<String, String>) -> Result<VirtualFs, MdsError> =
+    let _: fn(VirtualFs, HashMap<String, String>) -> Result<VirtualFs, mds::ModuleAliasError> =
         VirtualFs::with_aliases;
     let _: fn(VirtualFs, &str, Vars, mds::CompileOptions) -> Result<CompileResult, MdsError> =
         mds::compile_virtual_fs;
@@ -188,10 +188,37 @@ fn virtual_fs_aliases_api_exists() {
     let result =
         mds::compile_virtual_fs(fs, "main.mds", None, mds::CompileOptions::default()).unwrap();
     assert_eq!(result.dependencies, ["hi.mds"]);
-    let err = VirtualFs::new(modules)
+    let err = VirtualFs::new(modules.clone())
         .with_aliases(alias("gone.mds"))
         .unwrap_err();
-    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+    // #414: the refusal carries the alias and the reason apart, and converts into
+    // `mds::io`; a map past a bound converts into `mds::resource_limit`.
+    assert!(
+        matches!(
+            &err,
+            mds::ModuleAliasError::Refused { alias, reason, .. }
+                if alias == "Hi.mds" && reason == "its module key \"gone.mds\" names no module"
+        ),
+        "{err:?}"
+    );
+    let as_error: &dyn std::error::Error = &err;
+    assert_eq!(
+        as_error.to_string(),
+        "module alias \"Hi.mds\": its module key \"gone.mds\" names no module"
+    );
+    assert!(matches!(MdsError::from(err), MdsError::Io { .. }));
+    let too_many: HashMap<String, String> = (0..=mds::MAX_MODULE_ALIASES)
+        .map(|i| (format!("A{i}.mds"), "hi.mds".to_string()))
+        .collect();
+    let err = VirtualFs::new(modules).with_aliases(too_many).unwrap_err();
+    assert!(
+        matches!(err, mds::ModuleAliasError::TooMany { count, .. } if count == mds::MAX_MODULE_ALIASES + 1),
+        "{err:?}"
+    );
+    assert!(matches!(
+        MdsError::from(err),
+        MdsError::ResourceLimit { .. }
+    ));
 
     // `check_virtual_fs` returns its warnings — an `@include` of a module with no body
     // text warns — and an empty list for a clean module.
@@ -478,6 +505,7 @@ fn mds_error_is_string_source() {
 #[test]
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
+    assert_eq!(mds::MAX_MODULE_ALIASES, 65_536);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
 }

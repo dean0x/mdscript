@@ -45,8 +45,10 @@ it by `typed` (the path as typed).
 //   options.filename) it names, which is then the module's name in dependencies,
 //   sources[] and a cycle's text. Every alias and module key must be a normalized key
 //   (no forbidden characters, no empty/./.. segment, at most 256 segments); every alias
-//   must name a module and none may be a module key: mds::invalid_options otherwise.
-//   Also accepted by check and lint.
+//   must name a module and none may be a module key: mds::invalid_options otherwise,
+//   naming the alias (options.moduleAliases["<alias>"]: <reason>). At most 65,536
+//   aliases, whose keys and module keys total at most 10 MiB: mds::resource_limit
+//   otherwise. Also accepted by check and lint.
 // options.vars — { [key: string]: any }: runtime variable overrides.
 // options.sourceMap — boolean: generate a Source Map v3 document; result gains .sourceMap.
 //   sources[0] is options.filename (default "input.mds"), unless the source @extends

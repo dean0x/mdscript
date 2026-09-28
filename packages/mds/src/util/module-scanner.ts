@@ -888,6 +888,11 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  *    reported before an error the engine raises at a point native reaches first: a
  *    compile error in a module native reads first, or a circular import native meets
  *    first (U-SM38).
+ * 9. The engine takes at most 65,536 `aliases`, whose keys and module keys total at
+ *    most 10 MiB, and refuses more (`mds::resource_limit`, naming
+ *    `options.moduleAliases`): a graph whose imports reach its modules by more
+ *    spellings than that, other than their on-disk keys, compiles only on native,
+ *    which has no aliases to count (#414).
  */
 export async function buildModulesMap(
   entryPath: string,

@@ -98,7 +98,9 @@ fn options_error(message: &str) -> JsValue {
 /// `invalid <field>: <error>` for a value `serde_wasm_bindgen` could not convert.
 ///
 /// The error text names the caller's value — a Symbol's description, verbatim — so it
-/// is WIRE-escaped as it enters the message (#418).
+/// is WIRE-escaped as it enters the message (#418). Only a value that does not convert
+/// is worded so: one that converts but breaks a rule of its option is named by its key,
+/// `options.<field>["<key>"]: …` (#414).
 fn conversion_error(field: &str, e: &serde_wasm_bindgen::Error) -> JsValue {
     options_error(&format!(
         "invalid {field}: {}",
@@ -368,8 +370,11 @@ fn parse_modules_from_map(
 /// Extract the `moduleAliases` field from the options object: a plain object of
 /// strings, an import key → the key of the module it names.
 ///
-/// Only its shape is checked here; [`virtual_fs`] checks every alias and module key it
-/// names against the modules, with [`mds::VirtualFs::with_aliases`].
+/// Bounded as `modules` is, before the map is collected (#414): more than
+/// [`mds::MAX_MODULE_ALIASES`] aliases, or aliases and module keys that together pass
+/// [`MAX_MODULES_AGGREGATE_SIZE`] bytes, is `mds::resource_limit` — the bounds
+/// [`mds::VirtualFs::with_aliases`] applies too. Otherwise only its shape is checked
+/// here; [`virtual_fs`] checks every alias and module key it names against the modules.
 fn extract_module_aliases(obj: &js_sys::Object) -> Result<HashMap<String, String>, JsValue> {
     let val = get_prop_js(obj, "moduleAliases");
     if val.is_undefined() || val.is_null() {
@@ -383,33 +388,63 @@ fn extract_module_aliases(obj: &js_sys::Object) -> Result<HashMap<String, String
             json_type_name(&aliases_json)
         )));
     };
-    aliases
-        .into_iter()
-        .map(|(alias, target)| match target {
-            serde_json::Value::String(target) => Ok((alias, target)),
-            other => Err(options_error(&format!(
-                "options.moduleAliases[\"{}\"] must be a string, got {}",
-                mds::escape_path_for_message(&alias),
-                json_type_name(&other)
-            ))),
-        })
-        .collect()
+    if aliases.len() > mds::MAX_MODULE_ALIASES {
+        return Err(js_error(
+            &format!(
+                "options.moduleAliases exceeds maximum alias count of {} ({} provided)",
+                mds::MAX_MODULE_ALIASES,
+                aliases.len()
+            ),
+            "mds::resource_limit",
+        ));
+    }
+    let mut result = HashMap::with_capacity(aliases.len());
+    let mut aggregate_size: usize = 0;
+    for (alias, target) in aliases {
+        let target = match target {
+            serde_json::Value::String(target) => target,
+            other => {
+                return Err(options_error(&format!(
+                    "options.moduleAliases[\"{}\"] must be a string, got {}",
+                    mds::escape_path_for_message(&alias),
+                    json_type_name(&other)
+                )))
+            }
+        };
+        aggregate_size = aggregate_size
+            .saturating_add(alias.len())
+            .saturating_add(target.len());
+        if aggregate_size > MAX_MODULES_AGGREGATE_SIZE {
+            return Err(js_error(
+                &format!(
+                    "options.moduleAliases aggregate size exceeds maximum of {} bytes",
+                    MAX_MODULES_AGGREGATE_SIZE
+                ),
+                "mds::resource_limit",
+            ));
+        }
+        result.insert(alias, target);
+    }
+    Ok(result)
 }
 
 /// The virtual filesystem of a compile: `modules`, with `aliases` checked against
 /// them (#414). An alias that is not a module key, or names no module, is refused
-/// with `mds::invalid_options`.
+/// with `mds::invalid_options`, named by its key as a value of the wrong type is:
+/// `options.moduleAliases["<alias>"]: <reason>`.
 fn virtual_fs(
     modules: HashMap<String, String>,
     aliases: HashMap<String, String>,
 ) -> Result<mds::VirtualFs, JsValue> {
     mds::VirtualFs::new(modules)
         .with_aliases(aliases)
-        .map_err(|e| {
-            options_error(&format!(
-                "invalid options.moduleAliases: {}",
-                e.serialize().message
-            ))
+        .map_err(|e| match e {
+            // mds-core escaped the alias, and any module key the reason names.
+            mds::ModuleAliasError::Refused { alias, reason, .. } => {
+                options_error(&format!("options.moduleAliases[\"{alias}\"]: {reason}"))
+            }
+            // A map past a bound, which `extract_module_aliases` has refused already.
+            other => mds_error_to_js(other.into()),
         })
 }
 
