@@ -2788,10 +2788,10 @@ fn diagnostic_in_a_file_first_registered_by_a_splice_names_it_root_relative() {
         )
     };
     write("c.mds", &leaf("hi"));
-    // Positive control (PF-013): the file's canonical path is absolute, so the equality
-    // below fails if it reaches the diagnostic.
-    assert!(g5.join("b.mds").canonicalize().unwrap().is_absolute());
 
+    // The root-relative name below is not vacuous: the control at the end shows that the
+    // included module's splice carries `b.mds`, which it registers before the region
+    // raising the error runs (PF-013).
     let [off, on] = [false, true].map(|source_map| {
         let err = mds::compile_with_deps_opts(
             g5.join("c.mds"),

@@ -798,6 +798,19 @@ pub(crate) struct MapBuilder {
     pub(crate) no_sources_content: bool,
 }
 
+/// `seg`, a segment of a spliced fragment, rebased to start at output offset `base`
+/// and attributed to its source's global index through `remap` — the fragment's local →
+/// global source indices — or `None` when `remap` has no entry for its source: the
+/// segment is then dropped, never attributed to another file (#416).
+fn rebased(seg: &RawSegment, remap: &[u32], base: u32) -> Option<RawSegment> {
+    let &src = remap.get(seg.src as usize)?;
+    Some(RawSegment {
+        out: base + seg.out,
+        src,
+        ..*seg
+    })
+}
+
 impl MapBuilder {
     /// Create a builder seeded with `origin` at source index 0.
     ///
@@ -907,19 +920,14 @@ impl MapBuilder {
             // `into_fragment` — the only way to build a `FragmentMap` — records every
             // segment against one of the fragment's own sources, so the remap has an entry
             // for each. A miss is a compiler bug: debug builds stop on it; release drops
-            // the segment, never attributing it to another file, as `expand_per_line`
-            // drops a segment it cannot resolve.
+            // the segment (`rebased`), never attributing it to another file, as
+            // `expand_per_line` drops a segment it cannot resolve.
             debug_assert!(
                 (seg.src as usize) < remap.len(),
                 "FragmentMap segment names no fragment source"
             );
-            let Some(&src) = remap.get(seg.src as usize) else {
+            let Some(segment) = rebased(seg, remap, base) else {
                 continue;
-            };
-            let segment = RawSegment {
-                out: base + seg.out,
-                src,
-                ..*seg
             };
             push_capped_segment(segments, segments_dropped, segment);
             if *segments_dropped {
@@ -2098,14 +2106,16 @@ mod tests {
     }
 
     /// A fragment segment naming a source the fragment does not carry is a compiler bug:
-    /// debug builds stop on it; release drops that segment — never attributing it to
-    /// another file — and splices the rest.
+    /// debug builds stop on it — what CI, which tests the debug profile, checks here —
+    /// and release drops that segment, never attributing it to another file, and splices
+    /// the rest (checked here under `--release`). The drop itself is `rebased`'s, which
+    /// `rebased_drops_a_segment_whose_source_the_remap_lacks` checks in every profile.
     #[test]
     #[cfg_attr(
         debug_assertions,
         should_panic(expected = "FragmentMap segment names no fragment source")
     )]
-    fn splice_fragment_drops_a_segment_with_no_fragment_source() {
+    fn splice_fragment_panics_in_debug_and_drops_in_release_a_segment_naming_no_source() {
         let fragment = Arc::new(FragmentMap {
             sources: vec![origin("m.mds", "m.mds", "m text")],
             segments: vec![
@@ -2137,6 +2147,41 @@ mod tests {
             spliced,
             vec![(105, 1, 2)],
             "only the control, against m.mds"
+        );
+    }
+
+    /// `splice_fragment`'s release behaviour, in every profile: a segment whose source
+    /// the remap has no entry for is dropped (`None`), never given another file's index;
+    /// one against a source the fragment carries is rebased and remapped.
+    #[test]
+    fn rebased_drops_a_segment_whose_source_the_remap_lacks() {
+        // A fragment of one source, registered at global index 1 (0 is the builder's
+        // seed). Kept as its own local index, source 1 would land on that index too — a
+        // file the segment never came from.
+        let remap = [1];
+        let unmapped = RawSegment {
+            out: 0,
+            src: 1,
+            src_off: 0,
+            len: 1,
+        };
+        let own = RawSegment {
+            out: 5,
+            src: 0,
+            src_off: 2,
+            len: 1,
+        };
+        assert_eq!(
+            [rebased(&unmapped, &remap, 100), rebased(&own, &remap, 100)],
+            [
+                None,
+                Some(RawSegment {
+                    out: 105,
+                    src: 1,
+                    src_off: 2,
+                    len: 1
+                })
+            ]
         );
     }
 
