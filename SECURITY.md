@@ -94,12 +94,12 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 
 | Limit | Value | Location |
 |-------|-------|----------|
-| Max file size | 10 MB per source file (file, virtual module, or in-memory string); a file is never read more than one byte past it — one over it when it is opened is refused unread, and one that grows past it while it is read is read no further ([#428](https://github.com/dean0x/mdscript/issues/428)) | `limits.rs` (`MAX_FILE_SIZE`) |
+| Max file size | 10 MiB (10,485,760 bytes) per source file (file, virtual module, or in-memory string); a file is never read more than one byte past it — one over it when it is opened is refused unread, and one that grows past it while it is read is read no further ([#428](https://github.com/dean0x/mdscript/issues/428)) | `limits.rs` (`MAX_FILE_SIZE`) |
 | Max frontmatter size | 1 MiB per block | `limits.rs` (`MAX_FRONTMATTER_SIZE`) |
 | Max frontmatter YAML nodes | 200,000 per block (alias expansion counted) | `limits.rs` (`MAX_FRONTMATTER_NODES`) |
 | Max frontmatter flow-nesting depth | 1024 (checked pre-parse) | `limits.rs` (`MAX_FRONTMATTER_FLOW_DEPTH`) |
 | YAML parser nesting depth | 128 | serde_yaml_ng (reported as `mds::yaml`) |
-| Max `mds.json` size | 1 MB, read no more than one byte past it | `mds-cli/src/build.rs` (`MAX_CONFIG_SIZE`) |
+| Max `mds.json` size | 1 MiB (1,048,576 bytes), read no more than one byte past it | `mds-cli/src/build.rs` (`MAX_CONFIG_SIZE`) |
 | Max call depth | 128 | `evaluator.rs` (`MAX_CALL_DEPTH`) |
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
 | Max total iterations | 1,000,000 | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
