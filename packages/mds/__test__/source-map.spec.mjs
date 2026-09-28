@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { compile, compileFile, checkFile, lintFile, isMdsError, init } from '../dist/node.js';
+import { compile, compileFile, checkFile, lintFile, isMdsError, init, getBackend } from '../dist/node.js';
 import { SIMPLE_MDS, findPythonForMarkdownScript } from './helpers.mjs';
 import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
 import { buildModulesMap } from '../dist/util/module-scanner.js';
@@ -53,6 +53,23 @@ function findMdsCli() {
     .filter(existsSync);
   if (!candidates.length) return null;
   return candidates.reduce((a, b) => statSync(a).mtimeMs >= statSync(b).mtimeMs ? a : b);
+}
+
+/**
+ * Whether the native leg of a native-vs-WASM differential runs on the native addon.
+ * `init()` falls back to WASM when the addon does not load, and the comparison would
+ * then be WASM against itself, passing whatever either backend does. Required in CI;
+ * a local run without the addon skips the test.
+ */
+async function requireNativeLeg(t, label) {
+  await init();
+  const backend = getBackend();
+  if (backend === 'native') return true;
+  if (process.env.CI) {
+    throw new Error(`${label}: the native leg ran on the ${backend} backend: the native addon did not load`);
+  }
+  t.skip(`the native addon did not load, so ${label}'s native leg would run on ${backend}`);
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +494,8 @@ describe('source maps — WASM backend (W-SM)', () => {
   // This is a true differential test (PF-007): compare backends to each
   // other rather than to per-surface constants.
 
-  test('W-SM3: WASM and native backends produce identical full sourceMap for same input', () => {
+  test('W-SM3: WASM and native backends produce identical full sourceMap for same input', async (t) => {
+    if (!(await requireNativeLeg(t, 'W-SM3'))) return;
     const src = 'Hello World!\n';
     const nativeResult = compile(src, { sourceMap: true });
     const wasmResult = wasmBackend.compile(src, { sourceMap: true });
@@ -505,7 +523,8 @@ describe('source maps — WASM backend (W-SM)', () => {
   // Same input, sourcesContent:true — verify that both backends embed
   // identical source content and the labeling is consistent (PF-007).
 
-  test('W-SM3b: WASM and native produce identical sourceMap with sourcesContent:true', () => {
+  test('W-SM3b: WASM and native produce identical sourceMap with sourcesContent:true', async (t) => {
+    if (!(await requireNativeLeg(t, 'W-SM3b'))) return;
     const src = 'Hello World!\n';
     const nativeResult = compile(src, { sourceMap: true, sourcesContent: true });
     const wasmResult = wasmBackend.compile(src, { sourceMap: true, sourcesContent: true });
@@ -538,7 +557,8 @@ describe('source maps — WASM backend (W-SM)', () => {
   // sources[], not per-surface goldens (catches future divergence between
   // STRING_SOURCE_MAP_LABEL and the WASM filename passthrough).
 
-  test('V-SM1: WASM compile() with explicit filename + empty modules produces same sources[] as native', () => {
+  test('V-SM1: WASM compile() with explicit filename + empty modules produces same sources[] as native', async (t) => {
+    if (!(await requireNativeLeg(t, 'V-SM1'))) return;
     const src = 'Hello World!\n';
 
     // Native compile: sources[0] = STRING_SOURCE_MAP_LABEL = "input.mds".
@@ -592,7 +612,8 @@ describe('source maps — compileFile differential (CF-SM)', () => {
     wasmMod = await initWasmNode();
   });
 
-  test('CF-SM1: native compileFile and WASM-via-buildModulesMap produce identical sources[]', async () => {
+  test('CF-SM1: native compileFile and WASM-via-buildModulesMap produce identical sources[]', async (t) => {
+    if (!(await requireNativeLeg(t, 'CF-SM1'))) return;
     // Create a temp dir with .mdsroot so buildModulesMap identifies it as the
     // project root, making the entry filename root-relative.
     const dir = await mkdtemp(join(tmpdir(), 'cf-sm1-'));
@@ -670,7 +691,8 @@ describe('source maps — compileFile differential (CF-SM)', () => {
   // for the Python surface only when no usable interpreter is found, so it never
   // silently passes against a missing surface — the other three still run.
   // -------------------------------------------------------------------------
-  test('CF-SM2: napi, WASM, CLI, and Python produce identical sources[] for nested @import fixture', async () => {
+  test('CF-SM2: napi, WASM, CLI, and Python produce identical sources[] for nested @import fixture', async (t) => {
+    if (!(await requireNativeLeg(t, 'CF-SM2'))) return;
     const dir = await mkdtemp(join(tmpdir(), 'cf-sm2-'));
     try {
       // -- Setup fixture -------------------------------------------------------
@@ -830,7 +852,8 @@ describe('source maps — compileFile differential (CF-SM)', () => {
   // anchors sources[] there. Only the CLI map carries `file` (the output's
   // basename); it is checked, then set aside for the comparison.
   // -------------------------------------------------------------------------
-  test('CF-SM3: napi, WASM, CLI and Python produce one full source map for an @include of an extending chain', async () => {
+  test('CF-SM3: napi, WASM, CLI and Python produce one full source map for an @include of an extending chain', async (t) => {
+    if (!(await requireNativeLeg(t, 'CF-SM3'))) return;
     const dir = await mkdtemp(join(tmpdir(), 'cf-sm3-'));
     try {
       const files = {
