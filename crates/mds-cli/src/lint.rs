@@ -204,28 +204,22 @@ fn do_lint(args: LintArgs) -> Result<()> {
 
     // Directory mode.
     if input.is_dir() {
-        // Reject a symlinked directory root (build/check/fmt parity).
-        if input
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            // Directory-root symlink → JSON envelope in --format json mode (AC-F-14).
-            let mds_err = MdsError::Io {
-                message: format!(
-                    "directory argument must not be a symlink: {}",
-                    input.display()
-                ),
-            };
-            emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-            std::process::exit(2);
-        }
-        return run_lint_directory(&input, flags, runtime_vars);
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`). A
+        // refusal is an analysis failure: the JSON envelope in --format json mode
+        // (AC-F-14), exit 2.
+        return match crate::input::resolve_directory_argument(&input) {
+            Ok(_) => run_lint_directory(&input, flags, runtime_vars),
+            Err(mds_err) => {
+                emit_analysis_failure_json_or_stderr(&mds_err, format, None);
+                std::process::exit(2);
+            }
+        };
     }
 
     // Single-file mode.
     // Check existence first, then extension (C4/F6): a non-existent path must report
-    // mds::file_not_found, not mds::not_mds_file, regardless of the extension.
+    // mds::file_not_found, not mds::not_mds, regardless of the extension.
     // Route through emit_analysis_failure_json_or_stderr so --format json produces the
     // correct error envelope (L-CLI-JSON4 / AC-F-14). Do NOT use `?` here.
     if let Err(mds_err) = ensure_existing_mds_file(&input) {

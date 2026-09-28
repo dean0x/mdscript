@@ -95,6 +95,19 @@ fn options_error(message: &str) -> JsValue {
     js_error(message, "mds::invalid_options")
 }
 
+/// `invalid <field>: <error>` for a value `serde_wasm_bindgen` could not convert.
+///
+/// The error text names the caller's value — a Symbol's description, verbatim — so it
+/// is WIRE-escaped as it enters the message (#418). Only a value that does not convert
+/// is worded so: one that converts but breaks a rule of its option is named by its key,
+/// `options.<field>["<key>"]: …` (#414).
+fn conversion_error(field: &str, e: &serde_wasm_bindgen::Error) -> JsValue {
+    options_error(&format!(
+        "invalid {field}: {}",
+        mds::sanitize_control_chars_wire(&e.to_string())
+    ))
+}
+
 // ── Error conversion helpers ──────────────────────────────────────────────────
 
 /// Convert an [`mds::MdsError`] into a JS `Error` with structured metadata.
@@ -186,6 +199,8 @@ where
 struct ParsedOptions {
     filename: String,
     extra_modules: HashMap<String, String>,
+    /// Other keys imports may reach a module by (`moduleAliases`).
+    module_aliases: HashMap<String, String>,
     vars: Option<HashMap<String, Value>>,
     /// Whether to generate a Source Map v3 document (`sourceMap` option).
     source_map: bool,
@@ -198,6 +213,7 @@ impl Default for ParsedOptions {
         ParsedOptions {
             filename: DEFAULT_FILENAME.to_string(),
             extra_modules: HashMap::new(),
+            module_aliases: HashMap::new(),
             vars: None,
             source_map: false,
             include_sources_content: false,
@@ -275,8 +291,8 @@ fn extract_modules(obj: &js_sys::Object) -> Result<HashMap<String, String>, JsVa
         return Ok(HashMap::new());
     }
     // Deserialize only the modules sub-object.
-    let modules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
-        .map_err(|e| options_error(&format!("invalid options.modules: {e}")))?;
+    let modules_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.modules", &e))?;
     // Reuse the existing parse_modules logic on the deserialized sub-map.
     let serde_json::Value::Object(mods_map) = modules_json else {
         return Err(options_error(&format!(
@@ -351,6 +367,87 @@ fn parse_modules_from_map(
     Ok(result)
 }
 
+/// Extract the `moduleAliases` field from the options object: a plain object of
+/// strings, an import key → the key of the module it names.
+///
+/// Bounded as `modules` is, before the map is collected (#414): more than
+/// [`mds::MAX_MODULE_ALIASES`] aliases, or aliases and module keys that together pass
+/// [`MAX_MODULES_AGGREGATE_SIZE`] bytes, is `mds::resource_limit` — the bounds
+/// [`mds::VirtualFs::with_aliases`] applies too. Otherwise only its shape is checked
+/// here; [`virtual_fs`] checks every alias and module key it names against the modules.
+fn extract_module_aliases(obj: &js_sys::Object) -> Result<HashMap<String, String>, JsValue> {
+    let val = get_prop_js(obj, "moduleAliases");
+    if val.is_undefined() || val.is_null() {
+        return Ok(HashMap::new());
+    }
+    let aliases_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
+        .map_err(|e| conversion_error("options.moduleAliases", &e))?;
+    let serde_json::Value::Object(aliases) = aliases_json else {
+        return Err(options_error(&format!(
+            "options.moduleAliases must be a plain object, got {}",
+            json_type_name(&aliases_json)
+        )));
+    };
+    if aliases.len() > mds::MAX_MODULE_ALIASES {
+        return Err(js_error(
+            &format!(
+                "options.moduleAliases exceeds maximum alias count of {} ({} provided)",
+                mds::MAX_MODULE_ALIASES,
+                aliases.len()
+            ),
+            "mds::resource_limit",
+        ));
+    }
+    let mut result = HashMap::with_capacity(aliases.len());
+    let mut aggregate_size: usize = 0;
+    for (alias, target) in aliases {
+        let target = match target {
+            serde_json::Value::String(target) => target,
+            other => {
+                return Err(options_error(&format!(
+                    "options.moduleAliases[\"{}\"] must be a string, got {}",
+                    mds::escape_path_for_message(&alias),
+                    json_type_name(&other)
+                )))
+            }
+        };
+        aggregate_size = aggregate_size
+            .saturating_add(alias.len())
+            .saturating_add(target.len());
+        if aggregate_size > MAX_MODULES_AGGREGATE_SIZE {
+            return Err(js_error(
+                &format!(
+                    "options.moduleAliases aggregate size exceeds maximum of {} bytes",
+                    MAX_MODULES_AGGREGATE_SIZE
+                ),
+                "mds::resource_limit",
+            ));
+        }
+        result.insert(alias, target);
+    }
+    Ok(result)
+}
+
+/// The virtual filesystem of a compile: `modules`, with `aliases` checked against
+/// them (#414). An alias that is not a module key, or names no module, is refused
+/// with `mds::invalid_options`, named by its key as a value of the wrong type is:
+/// `options.moduleAliases["<alias>"]: <reason>`.
+fn virtual_fs(
+    modules: HashMap<String, String>,
+    aliases: HashMap<String, String>,
+) -> Result<mds::VirtualFs, JsValue> {
+    mds::VirtualFs::new(modules)
+        .with_aliases(aliases)
+        .map_err(|e| match e {
+            // mds-core escaped the alias, and any module key the reason names.
+            mds::ModuleAliasError::Refused { alias, reason, .. } => {
+                options_error(&format!("options.moduleAliases[\"{alias}\"]: {reason}"))
+            }
+            // A map past a bound, which `extract_module_aliases` has refused already.
+            other => mds_error_to_js(other.into()),
+        })
+}
+
 /// Extract and validate the `vars` field from the options object.
 ///
 /// Deserializes only the vars sub-value via serde_wasm_bindgen, then
@@ -361,8 +458,8 @@ fn extract_vars(obj: &js_sys::Object) -> Result<Option<HashMap<String, Value>>, 
         return Ok(None);
     }
     // Deserialize only the vars sub-value.
-    let vars_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
-        .map_err(|e| options_error(&format!("invalid options.vars: {e}")))?;
+    let vars_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.vars", &e))?;
     parse_json_vars(vars_json).map(Some).map_err(|e| match e {
         VarsError::InvalidType(msg) => options_error(&msg),
         VarsError::Conversion(mds_err) => mds_error_to_js(mds_err),
@@ -409,6 +506,7 @@ fn extract_compile_options_wasm(obj: &js_sys::Object) -> Result<mds::CompileOpti
 /// - `options` may be `null` or `undefined` — all fields default.
 /// - `filename`: string key for the source in the virtual FS; default `"input.mds"`.
 /// - `modules`: `Record<string, string>` of additional virtual files.
+/// - `moduleAliases`: `Record<string, string>` of other keys imports reach a module by.
 /// - `vars`: `Record<string, any>` of runtime variable overrides.
 /// - `sourceMap`: enable Source Map v3 generation (default `false`).
 /// - `sourcesContent`: embed source file content in the map (requires `sourceMap`).
@@ -428,17 +526,26 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
 
     reject_unknown_wasm_keys(
         &obj,
-        &["filename", "modules", "vars", "sourceMap", "sourcesContent"],
+        &[
+            "filename",
+            "modules",
+            "moduleAliases",
+            "vars",
+            "sourceMap",
+            "sourcesContent",
+        ],
     )?;
 
     let filename = extract_filename(&obj)?;
     let extra_modules = extract_modules(&obj)?;
+    let module_aliases = extract_module_aliases(&obj)?;
     let vars = extract_vars(&obj)?;
     let compile_opts = extract_compile_options_wasm(&obj)?;
 
     Ok(ParsedOptions {
         filename,
         extra_modules,
+        module_aliases,
         vars,
         source_map: compile_opts.source_map,
         include_sources_content: compile_opts.include_sources_content,
@@ -477,8 +584,8 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
         return Ok((mds::LintConfig::default(), None));
     }
     // Deserialize the rules sub-object via serde_wasm_bindgen.
-    let rules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
-        .map_err(|e| options_error(&format!("invalid options.rules: {e}")))?;
+    let rules_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.rules", &e))?;
     let serde_json::Value::Object(rules_map) = rules_json else {
         return Err(options_error(&format!(
             "options.rules must be a plain object, got {}",
@@ -486,23 +593,10 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
         )));
     };
 
-    let mut rules = std::collections::HashMap::new();
-    for (key, val) in rules_map {
-        let serde_json::Value::String(s) = &val else {
-            return Err(options_error(&format!(
-                "options.rules[\"{key}\"] must be a severity string, got {}",
-                json_type_name(&val)
-            )));
-        };
-        // Parse the severity via serde (validates against the closed enum).
-        let severity: mds::Severity = serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
-            options_error(&format!(
-                "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
-                 valid values are \"off\", \"info\", \"warn\", \"error\""
-            ))
-        })?;
-        rules.insert(key, severity);
-    }
+    // mds-core parses every severity and words the error, the rule name and the value
+    // escaped, as it does for napi and Python (#418).
+    let rules = mds::parse_rule_severities(rules_map, "options.rules")
+        .map_err(|message| options_error(&message))?;
     // D8: detect unknown rule names and build config in one step via
     // from_rules_checked. The return type structurally forces the caller
     // to handle the unknowns report — a fifth caller cannot accidentally
@@ -535,10 +629,14 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
     // SAFETY: we verified options.is_object() above.
     let obj: js_sys::Object = options.unchecked_into();
 
-    reject_unknown_wasm_keys(&obj, &["filename", "modules", "vars", "rules"])?;
+    reject_unknown_wasm_keys(
+        &obj,
+        &["filename", "modules", "moduleAliases", "vars", "rules"],
+    )?;
 
     let filename = extract_filename(&obj)?;
     let extra_modules = extract_modules(&obj)?;
+    let module_aliases = extract_module_aliases(&obj)?;
     let vars = extract_vars(&obj)?;
     let (lint_config, lint_warnings) = extract_rules(&obj)?;
 
@@ -546,6 +644,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
         opts: ParsedOptions {
             filename,
             extra_modules,
+            module_aliases,
             vars,
             source_map: false,
             include_sources_content: false,
@@ -562,7 +661,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
 /// both keys are rejected with `mds::invalid_options`, matching the
 /// `packages/mds` `CheckOptions` type split (V-11) and napi behaviour.
 ///
-/// Valid keys: `filename`, `modules`, `vars`.
+/// Valid keys: `filename`, `modules`, `moduleAliases`, `vars`.
 fn parse_check_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
     // null / undefined → all defaults.
     if options.is_null() || options.is_undefined() {
@@ -577,15 +676,17 @@ fn parse_check_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
     // SAFETY: we verified options.is_object() above.
     let obj: js_sys::Object = options.unchecked_into();
 
-    reject_unknown_wasm_keys(&obj, &["filename", "modules", "vars"])?;
+    reject_unknown_wasm_keys(&obj, &["filename", "modules", "moduleAliases", "vars"])?;
 
     let filename = extract_filename(&obj)?;
     let extra_modules = extract_modules(&obj)?;
+    let module_aliases = extract_module_aliases(&obj)?;
     let vars = extract_vars(&obj)?;
 
     Ok(ParsedOptions {
         filename,
         extra_modules,
+        module_aliases,
         vars,
         source_map: false,
         include_sources_content: false,
@@ -621,6 +722,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
         opts: ParsedOptions {
             filename: DEFAULT_FILENAME.to_string(),
             extra_modules: HashMap::new(),
+            module_aliases: HashMap::new(),
             vars,
             source_map: false,
             include_sources_content: false,
@@ -708,6 +810,10 @@ fn build_canonical_js(result: mds::CompileResult) -> Result<JsValue, JsValue> {
 /// - `options`: optional configuration object with the following optional fields:
 ///   - `filename` (string, default `"input.mds"`): the entry module key.
 ///   - `modules` (`Record<string, string>`): additional virtual modules for import resolution.
+///   - `moduleAliases` (`Record<string, string>`): other keys an import may reach a module
+///     by — the key an import resolves to → the key of the module in `modules` (or
+///     `filename`) it names ([`mds::VirtualFs::with_aliases`]); each is checked as a module
+///     key, and a malformed or dangling alias is `mds::invalid_options`.
 ///   - `vars` (`Record<string, any>`): runtime variable overrides.
 ///
 /// ## Returns
@@ -744,9 +850,9 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
             .with_source_map(opts.source_map)
             .with_include_sources_content(opts.include_sources_content);
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
-        let result =
-            mds::compile_virtual_with_deps_opts(modules, &opts.filename, opts.vars, compile_opts)
-                .map_err(mds_error_to_js)?;
+        let fs = virtual_fs(modules, opts.module_aliases)?;
+        let result = mds::compile_virtual_fs(fs, &opts.filename, opts.vars, compile_opts)
+            .map_err(mds_error_to_js)?;
 
         build_canonical_js(result)
     }))
@@ -760,6 +866,10 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// - `options`: optional configuration object with the following optional fields:
 ///   - `filename` (string, default `"input.mds"`): the entry module key.
 ///   - `modules` (`Record<string, string>`): additional virtual modules for import resolution.
+///   - `moduleAliases` (`Record<string, string>`): other keys an import may reach a module
+///     by — the key an import resolves to → the key of the module in `modules` (or
+///     `filename`) it names ([`mds::VirtualFs::with_aliases`]); each is checked as a module
+///     key, and a malformed or dangling alias is `mds::invalid_options`.
 ///   - `vars` (`Record<string, any>`): runtime variable overrides.
 ///
 /// ## Returns
@@ -790,9 +900,9 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
     catch_panic(AssertUnwindSafe(move || {
         let opts = parse_check_options(options)?;
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
-        let ((), warnings) =
-            mds::check_virtual_collecting_warnings(modules, &opts.filename, opts.vars)
-                .map_err(mds_error_to_js)?;
+        let fs = virtual_fs(modules, opts.module_aliases)?;
+        let warnings =
+            mds::check_virtual_fs(fs, &opts.filename, opts.vars).map_err(mds_error_to_js)?;
 
         to_js(&CheckOutput { warnings })
     }))
@@ -810,6 +920,10 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// - `options`: optional configuration object:
 ///   - `filename` (string, default `"input.mds"`): the entry module key.
 ///   - `modules` (`Record<string, string>`): additional virtual modules for import resolution.
+///   - `moduleAliases` (`Record<string, string>`): other keys an import may reach a module
+///     by — the key an import resolves to → the key of the module in `modules` (or
+///     `filename`) it names ([`mds::VirtualFs::with_aliases`]); each is checked as a module
+///     key, and a malformed or dangling alias is `mds::invalid_options`.
 ///   - `vars` (`Record<string, any>`): runtime variable overrides.
 ///   - `rules` (`Record<string, string>`): per-rule severity overrides (e.g.
 ///     `{ "shadow-variable": "warn", "unused-variable": "off" }`).
@@ -851,8 +965,9 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
             &lint_opts.opts.filename,
             lint_opts.opts.extra_modules,
         )?;
-        let result = mds::lint_virtual(
-            modules,
+        let fs = virtual_fs(modules, lint_opts.opts.module_aliases)?;
+        let result = mds::lint_virtual_fs(
+            fs,
             &lint_opts.opts.filename,
             lint_opts.opts.vars,
             &lint_opts.lint_config,
@@ -902,8 +1017,8 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 #[wasm_bindgen(js_name = "lintVirtual")]
 pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<JsValue, JsValue> {
     // Deserialize the modules map.
-    let modules_json: serde_json::Value = serde_wasm_bindgen::from_value(modules)
-        .map_err(|e| options_error(&format!("invalid modules: {e}")))?;
+    let modules_json: serde_json::Value =
+        serde_wasm_bindgen::from_value(modules).map_err(|e| conversion_error("modules", &e))?;
     let serde_json::Value::Object(mods_map) = modules_json else {
         return Err(options_error(&format!(
             "modules must be a plain object, got {}",
@@ -968,5 +1083,126 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
         let paths = mds::scan_imports(&source).map_err(mds_error_to_js)?;
         serde_wasm_bindgen::to_value(&paths)
             .map_err(|e| js_error(&format!("failed to serialize result: {e}"), "mds::internal"))
+    }))
+}
+
+/// Extract the import paths of an MDS source string with their records: in the order
+/// the resolver resolves them, each with the directive it is written in and the context
+/// the resolver adds to an error that resolving it raises ([`mds::scan_import_records`],
+/// #414). With `as_base` false — a module compiled for itself — that is
+/// [`scan_imports`]' order, the `@extends` base first; with `as_base` true — a module
+/// reached as the `@extends` base of another — the base comes after the imports. The
+/// `@extends` base is recorded on its own, even when an import names the same path.
+///
+/// ## Returns
+///
+/// An array of `{ path, kind, frontmatterIndex, span }` objects, every key present:
+/// - `path`: the path as written;
+/// - `kind`: `"extends"`, `"frontmatter"`, `"import"` or `"export-from"`;
+/// - `frontmatterIndex`: a frontmatter import's position in the `imports:` list, else
+///   `null`;
+/// - `span`: for `@extends` and `@import`, the span a `mds::file_not_found` error for
+///   the path carries — `{ offset, length, line?, column? }`, the shape of an error's
+///   `span` — else `null`.
+///
+/// On failure, throws a JS `Error` with the same structure as [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const [record] = scanImportRecords('@import "./a.mds" as a\n', false);
+/// console.log(record.kind); // "import"
+/// console.log(record.span); // { offset: 0, length: 22, line: 1, column: 1 }
+/// ```
+#[wasm_bindgen(js_name = "scanImportRecords")]
+pub fn scan_import_records(source: &str, as_base: bool) -> Result<JsValue, JsValue> {
+    check_source_size(source)?;
+
+    // Owned String required so the closure satisfies UnwindSafe.
+    let source = source.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let resolve_as = if as_base {
+            mds::ResolveAs::Base
+        } else {
+            mds::ResolveAs::Standalone
+        };
+        let records = mds::scan_import_records(&source, resolve_as).map_err(mds_error_to_js)?;
+        let array = js_sys::Array::new();
+        for record in &records {
+            let obj = js_sys::Object::new();
+            set_prop(&obj, "path", &JsValue::from_str(&record.path));
+            set_prop(&obj, "kind", &JsValue::from_str(record.kind.name()));
+            let index = record
+                .frontmatter_index
+                .map_or(JsValue::NULL, |i| JsValue::from_f64(i as f64));
+            set_prop(&obj, "frontmatterIndex", &index);
+            let span = record
+                .span
+                .as_ref()
+                .map_or(JsValue::NULL, |span| span_to_js(span).into());
+            set_prop(&obj, "span", &span);
+            array.push(&obj);
+        }
+        Ok(array.into())
+    }))
+}
+
+/// Check a module file as the native backend checks every file it reads, and return
+/// its text.
+///
+/// `@mdscript/mds`'s WASM backend reads the modules of a `compileFile` itself, in
+/// JS, and hands each file here, so it refuses exactly what the native backend
+/// refuses, with the same error, in the same order:
+///
+/// 1. the bytes, as the native filesystem backend checks them
+///    ([`mds::check_module_bytes`], #414): more than 10 MiB is `mds::resource_limit`
+///    (`file too large (<n> bytes, max 10485760 bytes): <display>`), bytes that are
+///    not valid UTF-8 are `mds::io` (`invalid UTF-8 in <display>: <reason>`);
+/// 2. the file type, as the resolver checks it before it parses a module
+///    ([`mds::check_module_type`], #417): neither a `.mds` file nor a `.md` file whose
+///    frontmatter declares `type: mds` is `mds::not_mds` (`not an MDS file: <typed>`).
+///
+/// A leading byte-order mark is kept.
+///
+/// `bytes` is copied into this module's memory before any check runs, as wasm-bindgen
+/// copies every argument, so the 10 MiB check bounds what is accepted, not what a call
+/// costs: a caller bounds the bytes it passes. `@mdscript/mds` reads at most 10 MiB and
+/// one byte of a file — the one byte past the cap tells a file of exactly the cap from a
+/// larger one (#428).
+///
+/// ## Arguments
+///
+/// - `bytes`: the file's content.
+/// - `display`: the file's path below the project root, in its on-disk spelling. It
+///    names the file in a bytes error, and its extension is the one judged.
+/// - `typed`: the path the caller typed to reach the file — the entry path as passed,
+///   or the import string as written — which a `not_mds` error names.
+///
+/// Both names are escaped as they enter a message.
+///
+/// ## Returns
+///
+/// The file's text. On failure, throws a JS `Error` with the same structure as
+/// [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const bytes = new TextEncoder().encode('Hello!\n');
+/// const text = preflightModule(bytes, 'hello.mds', './hello.mds');
+/// console.log(text); // "Hello!\n"
+/// ```
+#[wasm_bindgen(js_name = "preflightModule")]
+pub fn preflight_module(bytes: Vec<u8>, display: &str, typed: &str) -> Result<String, JsValue> {
+    // Owned Strings required so the closure satisfies UnwindSafe.
+    let display = display.to_string();
+    let typed = typed.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let source = mds::check_module_bytes(bytes, &display).map_err(mds_error_to_js)?;
+        let module = mds::ModuleRef::keyed(&display).typed(&typed);
+        mds::check_module_type(module, &source).map_err(mds_error_to_js)?;
+        Ok(source)
     }))
 }

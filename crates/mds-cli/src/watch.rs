@@ -69,9 +69,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use mds::MdsError;
 
 use crate::build::{
-    auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content,
+    admit_output, auto_detect_mds_file, build_runtime_vars, compile_to_content,
     emit_duplicate_var_warnings, load_config, resolve_output_path_for_kind, write_output,
-    OutputKind, RuntimeVarArgs,
+    CompileOutput, EntryPaths, MdsConfig, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
@@ -834,6 +834,211 @@ fn clamp_poll_interval(poll_interval: u64) -> Option<Duration> {
     }
 }
 
+// ── Working directory ─────────────────────────────────────────────────────────
+
+/// The working directory `mds watch` started in, by its canonical path.
+///
+/// Every path typed relative — the entry, a directory argument such as `.`, `--vars`, a
+/// file-mode `-o` — is resolved against the process's working directory on every
+/// rebuild. Once that directory is deleted, the process is left in it, and none of them
+/// resolves again, even after a directory is recreated at the same path, as a
+/// `git checkout` that removes and restores it does (#417).
+/// [`restore_if_recreated`](Self::restore_if_recreated) moves the process back into it.
+struct WorkingDir {
+    /// `None` when the working directory did not resolve at startup: nothing is restored.
+    canonical: Option<PathBuf>,
+}
+
+impl WorkingDir {
+    /// Record the working directory at startup, before any rebuild reads a path typed
+    /// relative to it.
+    fn record() -> Self {
+        WorkingDir {
+            canonical: std::env::current_dir()
+                .and_then(|dir| dir.canonicalize())
+                .ok(),
+        }
+    }
+
+    /// Called first by every rebuild, before it reads anything. When the working
+    /// directory has been deleted and a directory exists again at its recorded canonical
+    /// path, reached through no symlink (canonical compared with canonical, #408), it
+    /// becomes the working directory again. A working directory that still exists is
+    /// never changed. Otherwise nothing changes, and a path typed relative that does not
+    /// resolve is reported as typed by the read that needs it, as any missing file is.
+    ///
+    /// A directory swapped in between the check and the move is the check-then-open
+    /// window every path-based read has; the compile checks that the path it compiles
+    /// still leads to the file being watched either way
+    /// ([`WatchedPath::ensure_unmoved`]).
+    fn restore_if_recreated(&self) {
+        let Some(recorded) = &self.canonical else {
+            return;
+        };
+        if std::env::current_dir().is_ok() {
+            return;
+        }
+        if recorded.canonicalize().is_ok_and(|now| now == *recorded) {
+            // A failure leaves the process where it was; see above.
+            let _ = std::env::set_current_dir(recorded);
+        }
+    }
+}
+
+// ── Watched paths ─────────────────────────────────────────────────────────────
+
+/// What a [`WatchedPath`] is: it decides how the typed form is resolved and how a
+/// refusal names it.
+#[derive(Clone, Copy)]
+enum Watched {
+    /// File mode's entry.
+    Entry,
+    /// Directory mode's root.
+    Root,
+    /// A source below directory mode's root, by its walked path.
+    Source,
+}
+
+impl Watched {
+    /// The refusal once `typed`, a path of this kind, leads somewhere other than the
+    /// watched file or directory: `mds::io`, naming the path as typed, escaped — never by
+    /// its canonical absolute path (#417, #413).
+    fn moved(self, typed: &Path) -> MdsError {
+        let (watched, different) = match self {
+            Watched::Entry => ("entry", "file"),
+            Watched::Root => ("directory", "directory"),
+            Watched::Source => ("file", "file"),
+        };
+        MdsError::Io {
+            message: format!(
+                "watched {watched} now resolves to a different {different}: \"{}\"; \
+                 restart mds watch to follow it",
+                mds::escape_path_for_message(&typed.to_string_lossy())
+            ),
+        }
+    }
+}
+
+/// A path `mds watch` holds in two forms (#417, #413): file mode's entry, directory
+/// mode's root, or a source below that root — one type, checked by one rule.
+///
+/// `typed` is the path as the user reaches it: as typed, or for a source the root as
+/// typed joined with the source's path below it, the form `mds build <dir>` walks. Every
+/// compile goes through it, so an error names the file that way, never by its canonical
+/// absolute path (#417, #265), and `mds.json` is looked up from it at startup (#413).
+/// `canonical` is the form notify reports event paths under: every identity check —
+/// watched directories, files of interest, graph keys, output paths, baselines — uses
+/// it. The two are never compared as text (#408):
+/// [`ensure_unmoved`](Self::ensure_unmoved) resolves `typed` again and compares the
+/// result with `canonical`, canonical with canonical.
+struct WatchedPath {
+    typed: PathBuf,
+    canonical: PathBuf,
+    what: Watched,
+}
+
+impl WatchedPath {
+    /// The entry in the form [`admit_output`] takes, typed first, so the two forms
+    /// cannot be handed over swapped.
+    fn paths(&self) -> EntryPaths<'_> {
+        EntryPaths {
+            typed: &self.typed,
+            canonical: &self.canonical,
+        }
+    }
+
+    /// Refuse to compile once `typed` leads somewhere other than `canonical` — the one
+    /// rule for the entry, the root and each source ([`Watched::moved`]).
+    ///
+    /// Every compile resolves `typed` afresh, while notify keeps watching `canonical`.
+    /// Once a symlink on the typed path is retargeted — `link/..` is the directory above
+    /// the link's target — or a directory on it is replaced, a symlink included, the two
+    /// name different files: the compile would read one while the watched directories,
+    /// graph keys, output path and change detection follow the other. So the directory
+    /// `typed` now leads into must be the one `canonical` names: the root's own canonical
+    /// form, and the canonical parent of the entry or a source — the directories, not
+    /// the files, so a file name the volume respells (its case, on a case-insensitive
+    /// volume) is not a move (#408). A typed path that no longer resolves — deleted,
+    /// before it is recreated — and a file whose final component is a symlink are left
+    /// to the compile, which reports the first as typed and refuses the second. A
+    /// retarget racing the compile itself is the check-then-open window every
+    /// path-based read has.
+    fn ensure_unmoved(&self) -> Result<(), MdsError> {
+        let moved = match self.what {
+            Watched::Root => self
+                .typed
+                .canonicalize()
+                .is_ok_and(|now| now != self.canonical),
+            Watched::Entry | Watched::Source => mds::NativeFs::check_symlink(&self.typed)
+                .is_ok_and(|now| now.parent() != self.canonical.parent()),
+        };
+        if moved {
+            Err(self.what.moved(&self.typed))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Compile the entry, or a source, by its typed path once
+    /// [`ensure_unmoved`](Self::ensure_unmoved) has confirmed that it still leads to the
+    /// file being watched. `mds watch` writes no source maps, so the compile takes the
+    /// default options.
+    fn compile(
+        &self,
+        runtime_vars: Option<HashMap<String, mds::Value>>,
+        quiet: bool,
+    ) -> Result<CompileOutput> {
+        self.ensure_unmoved().map_err(miette::Error::from)?;
+        compile_to_content(
+            &self.typed,
+            runtime_vars,
+            quiet,
+            mds::CompileOptions::default(),
+        )
+    }
+
+    /// The path `src` (a walked or graph-key path under the root's `canonical`) is
+    /// compiled by.
+    ///
+    /// A source outside the root — an out-of-root dependency (DD3) — has no walked
+    /// form and is compiled by its canonical path.
+    fn walked(&self, src: &Path) -> PathBuf {
+        match src.strip_prefix(&self.canonical) {
+            Ok(below) => self.typed.join(below),
+            Err(_) => src.to_path_buf(),
+        }
+    }
+
+    /// Compile `src` below the root — every directory-mode compile goes through here.
+    ///
+    /// A source under the root is compiled as a [`Watched::Source`] by its
+    /// [walked](Self::walked) path, keyed by `src`, after the root itself: a moved root
+    /// is refused naming the root, and a directory moved below it naming the source. The
+    /// startup walk skips symlinked directories, but a rebuild compiles the sources it
+    /// already knows, and the idle tick's content check follows a link — so a directory
+    /// below the root replaced by a symlink after startup is caught at the source. `src`
+    /// is canonical: a key the walk of the canonical root produced, or a graph key. An
+    /// out-of-root dependency is compiled by its canonical path, with no walked form to
+    /// check.
+    fn compile_source(
+        &self,
+        src: &Path,
+        runtime_vars: Option<HashMap<String, mds::Value>>,
+        quiet: bool,
+    ) -> Result<CompileOutput> {
+        if !src.starts_with(&self.canonical) {
+            return compile_to_content(src, runtime_vars, quiet, mds::CompileOptions::default());
+        }
+        self.ensure_unmoved().map_err(miette::Error::from)?;
+        WatchedPath {
+            typed: self.walked(src),
+            canonical: src.to_path_buf(),
+            what: Watched::Source,
+        }
+        .compile(runtime_vars, quiet)
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
@@ -878,20 +1083,21 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         ));
     }
 
-    // Reject a symlinked entry/target (build parity — PF-004); plain canonicalize
-    // would silently follow it. check_symlink returns the canonical path for
-    // non-symlinks, preserving FSEvents path-matching.
-    let canonical_input =
-        mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
-
     // Clamp poll_interval: 0 = disable; nonzero ≥ 50ms floor (reconcile rule).
     let tick_opt: Option<Duration> = clamp_poll_interval(poll_interval);
 
     if is_dir {
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`). It
+        // takes `.`, `..` and `sub/..`, which `check_symlink` cannot, and returns the
+        // canonical form notify reports event paths under.
+        let canonical = crate::input::resolve_directory_argument(&resolved_input)
+            .map_err(miette::Error::from)?;
         run_watch_dir(
-            WatchRoot {
-                canonical: canonical_input,
+            WatchedPath {
                 typed: resolved_input,
+                canonical,
+                what: Watched::Root,
             },
             out_dir,
             vars,
@@ -903,8 +1109,17 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
             tick_opt,
         )
     } else {
+        // Reject a symlinked entry (build parity — PF-004); plain canonicalize would
+        // silently follow it. check_symlink returns the canonical path for
+        // non-symlinks, preserving FSEvents path-matching.
+        let canonical =
+            mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
         run_watch_file(
-            canonical_input,
+            WatchedPath {
+                typed: resolved_input,
+                canonical,
+                what: Watched::Entry,
+            },
             output,
             out_dir,
             vars,
@@ -920,34 +1135,108 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 
 // ── Single-file watch ─────────────────────────────────────────────────────────
 
+/// What [`compile_and_write`] returns on success, `(output_path, deps, content)`:
+/// - `output_path`: the resolved output path (None for stdout).
+/// - `deps`: transitive dependency paths.
+/// - `content`: the compiled string (issue 3 — reused by the watch baseline block
+///   so startup does not compile twice).
+type WrittenEntry = (Option<PathBuf>, Vec<String>, String);
+
+/// Outcome of [`compile_and_write`]'s compile-and-write attempt, for an output route every
+/// rebuild can use.
+enum CompileWriteOutcome {
+    /// Compiled, routed and written.
+    Written(WrittenEntry),
+    /// A failure — compile or write — that `mds watch` reports and keeps watching
+    /// through.
+    Failed(miette::Report),
+}
+
+/// Compile `entry` ([`WatchedPath::compile`]), derive the output path from the compiled
+/// kind and `entry.canonical`, and write — file mode's startup compile.
+///
+/// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
+/// reports and keeps watching through: the compile, the write. The `Err` this function
+/// itself returns is an output route no rebuild can use, which ends `mds watch` at
+/// startup (exit 2), since every rebuild writes where startup resolved: a route that
+/// fails to resolve — `mds.json` `build.output_dir` with a `..` component, refused with
+/// the error `mds build` gives for it — or an output that is the entry file itself
+/// ([`admit_output`], #425).
+///
+/// The output path is derived AFTER compiling (compile-then-route) so the kind
+/// (and thus extension: `.json` for messages, `.md` for markdown) is known before
+/// the path is constructed. This is the single-file intrinsic extension path.
+///
+/// If `-o <path>` is given explicitly, that path is used verbatim, and once
+/// [`admit_output`] has admitted it an ext-mismatch warning is emitted when the
+/// extension contradicts the kind (AC-FUNC-11). If `-o -`, content is written to stdout.
+/// No source map is written: `mds watch` emits none.
+///
+/// # PF-004 compliance
+/// All file reads go through `compile_to_content` → `mds::compile_with_deps_opts`
+/// (which uses the resolver that enforces MAX_FILE_SIZE). There is no bare
+/// `std::fs::read_to_string` path here.
+fn compile_and_write(
+    entry: &WatchedPath,
+    output: &Option<String>,
+    out_dir: &Option<PathBuf>,
+    config: &Option<(MdsConfig, PathBuf)>,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    quiet: bool,
+) -> Result<CompileWriteOutcome> {
+    let compiled = match entry.compile(runtime_vars, quiet) {
+        Ok(compiled) => compiled,
+        Err(e) => return Ok(CompileWriteOutcome::Failed(e)),
+    };
+    let output_path = resolve_output_path_for_kind(
+        &Some(entry.canonical.clone()),
+        output,
+        out_dir,
+        config,
+        compiled.kind,
+    )?;
+    admit_output(
+        output_path.as_deref(),
+        entry.paths(),
+        output,
+        compiled.kind,
+        quiet,
+    )
+    .map_err(miette::Error::from)?;
+    Ok(
+        match write_output(output_path.clone(), &compiled.content, quiet, true) {
+            Ok(()) => {
+                CompileWriteOutcome::Written((output_path, compiled.dependencies, compiled.content))
+            }
+            Err(e) => CompileWriteOutcome::Failed(e),
+        },
+    )
+}
+
 /// Compile-time context for single-file watch mode.
 ///
 /// Holds the parameters that are resolved once at startup and passed to every
 /// rebuild — replaces the 6-7 individual constant args on `rebuild_file` and
 /// `liveness_probe_file`, removing the `#[allow(clippy::too_many_arguments)]`
 /// suppressions (issue #6 / zero-warnings policy).
-///
-/// `output_path` is the path resolved from the startup compile (intrinsic: kind
-/// derived from the first compile result). On each rebuild the same path is reused
-/// unless `-o` was specified explicitly, in which case that path is canonical.
-/// For the watch single-file case the path is stable across recompiles (the template
-/// kind cannot change without the template itself changing, which triggers a rebuild).
 struct FileCompileCtx {
-    entry: PathBuf,
+    /// The watched entry, as typed and canonical ([`Watched::Entry`]).
+    entry: WatchedPath,
+    /// The working directory at startup, restored first by every rebuild.
+    working_dir: WorkingDir,
     /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
     /// used for `dirs_to_watch`/`files_of_interest` (never for display, #326).
     vars_path: Option<PathBuf>,
     /// The `--vars` path exactly as the user typed it, uncanonicalized (#326, D4).
     /// Used for `RuntimeVarArgs.vars` so the vars-file duplicate-key warning displays
     /// (and reads) the as-typed path rather than its canonical form.
-    vars_path_raw: Option<PathBuf>,
+    vars_path_typed: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
-    /// The `-o <path>` or `--out-dir` argument passed by the user, if any.
-    /// Kept here so `rebuild_file` can reuse the same path-derivation logic for
-    /// the dynamic path case (where output_path itself stays None until after compile).
-    output_arg: Option<String>,
-    out_dir: Option<PathBuf>,
+    /// Where every rebuild writes, resolved once at startup: from the startup compile's
+    /// kind (intrinsic extension), or the Markdown fallback of a failed startup compile.
+    /// `None` is stdout (`-o -`). A route that fails to resolve never gets here: it ends
+    /// `mds watch` at startup.
     output_path: Option<PathBuf>,
     quiet: bool,
 }
@@ -1006,10 +1295,11 @@ fn liveness_probe_file(
     //    A dir "needs attention" if it was previously missing OR not yet armed.
     //    Already-armed, currently-present dirs are not touched — steady-state idle
     //    cost becomes O(missing_dirs) ≈ O(0), not O(watched_dirs).
-    let desired_dirs: BTreeSet<PathBuf> = dirs_to_watch(&ctx.entry, &[], ctx.vars_path.as_deref())
-        .union(&state.watched_dirs)
-        .cloned()
-        .collect();
+    let desired_dirs: BTreeSet<PathBuf> =
+        dirs_to_watch(&ctx.entry.canonical, &[], ctx.vars_path.as_deref())
+            .union(&state.watched_dirs)
+            .cloned()
+            .collect();
     let dir_statuses: Vec<(PathBuf, bool, bool)> = desired_dirs
         .iter()
         .map(|d| {
@@ -1048,7 +1338,7 @@ fn liveness_probe_file(
     // 2. Determine if we need a full reconcile:
     //    (a) first tick, (b) edge-triggered dir recovery,
     //    (c) entry was missing and now exists (vanish→reappear edge).
-    let entry_now_exists = ctx.entry.exists();
+    let entry_now_exists = ctx.entry.canonical.exists();
     let recovery =
         state.first_tick || dirs_recovery || (state.entry_was_missing && entry_now_exists);
     state.first_tick = false;
@@ -1120,12 +1410,17 @@ fn handle_fs_event_file(
 /// # Invariants preserved
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output.
 /// - PF-004: all reads go through `compile_to_content`.
-/// - Error-settle: `last_mtimes` updated on vars error, compile error, and write error.
+/// - Error-settle: every failure — the vars file, the compile, the output route or its
+///   #425 refusal, the write — goes through [`settle_after_error`].
+/// - A recreated working directory is restored before anything is read
+///   ([`WorkingDir::restore_if_recreated`]).
 fn rebuild_file(
     ctx: &FileCompileCtx,
     watcher: &mut RecommendedWatcher,
     state: &mut FileWatchState,
 ) {
+    ctx.working_dir.restore_if_recreated();
+
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
     // Print the error, settle mtime to avoid re-fire, and keep watching.
     //
@@ -1140,16 +1435,12 @@ fn rebuild_file(
     // the "Recompiled" line — so the vars-file duplicate is re-reported exactly
     // once per OBSERVABLE rebuild (tests I16, I18, I20).
     let mut resolved = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_raw.clone(),
+        vars: ctx.vars_path_typed.clone(),
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
         Ok(v) => v,
-        Err(e) => {
-            eprint_error(e);
-            state.last_mtimes = snapshot_state(&state.foi);
-            return;
-        }
+        Err(e) => return settle_after_error(state, e),
     };
     // Move the map out instead of cloning it: `compile_to_content` takes
     // `runtime_vars` by value, and the emitter below only ever reads
@@ -1158,106 +1449,103 @@ fn rebuild_file(
     let runtime_vars = resolved.vars.take();
 
     let t0 = Instant::now();
-    match compile_to_content(
-        &ctx.entry,
-        runtime_vars,
-        ctx.quiet,
-        mds::CompileOptions::default(),
-    ) {
-        Ok(compiled) => {
-            // Derive the output path from the compiled kind (intrinsic extension).
-            // If ctx.output_path is already set (startup succeeded), reuse it.
-            // If ctx.output_path is None: either output is stdout (output_arg == Some("-")
-            // or no flags) OR startup failed. In either case, re-derive from kind + args.
-            // We load project config lazily here only if output_path is None and we need
-            // to derive from mds.json — for the common "startup succeeded" path this is free.
-            let output_path = if ctx.output_path.is_some() {
-                ctx.output_path.clone()
-            } else {
-                // output_path is None: this means either stdout or startup failed.
-                // Re-derive using kind. If -o - or stdin fallback, this returns None (stdout).
-                let config = load_config(&ctx.entry).unwrap_or(None);
-                resolve_output_path_for_kind(
-                    &Some(ctx.entry.clone()),
-                    &ctx.output_arg,
-                    &ctx.out_dir,
-                    &config,
-                    compiled.kind,
-                    ctx.quiet,
-                )
-                .unwrap_or(None)
-            };
+    // Compile and admit as one step, so a failure of either is reported and settled the
+    // same way, and watching continues.
+    let entry = &ctx.entry;
+    let routed = entry.compile(runtime_vars, ctx.quiet).and_then(|compiled| {
+        let output_path = ctx.output_path.clone();
+        // #425: a rebuild never writes over the entry — reachable when a failed startup
+        // compile left the Markdown default in place as the output path. No `-o`
+        // extension warning (`&None`): startup printed it for the path every rebuild
+        // reuses.
+        admit_output(
+            output_path.as_deref(),
+            entry.paths(),
+            &None,
+            compiled.kind,
+            ctx.quiet,
+        )
+        .map_err(miette::Error::from)?;
+        Ok((compiled, output_path))
+    });
+    let (compiled, output_path) = match routed {
+        Ok(routed) => routed,
+        Err(e) => return settle_after_error(state, e),
+    };
 
-            // Build the output_key for content-dedup.
-            let output_key: String = output_path
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<stdout>".to_string());
+    // The content-dedup key, and the name the "Recompiled" line shows.
+    let output_key: String = output_path
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<stdout>".to_string());
 
-            // Content-based dedup: skip write + summary line when unchanged.
-            let content_changed = state
-                .last_written
-                .get(&output_key)
-                .is_none_or(|prev| *prev != compiled.content);
+    // Content-based dedup: skip write + summary line when unchanged.
+    let content_changed = state
+        .last_written
+        .get(&output_key)
+        .is_none_or(|prev| *prev != compiled.content);
 
-            // #326: re-report the vars-file duplicate-key warnings exactly when an
-            // observable rebuild happens (same gate as the "Recompiled" line below),
-            // not on the liveness probe's redundant no-op recompile.
-            if content_changed {
-                crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+    // #326: re-report the vars-file duplicate-key warnings exactly when an
+    // observable rebuild happens (same gate as the "Recompiled" line below),
+    // not on the liveness probe's redundant no-op recompile.
+    if content_changed {
+        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+    }
+
+    // Freshness rule: always recompute dep set from fresh output.
+    let new_dirs = dirs_to_watch(
+        &ctx.entry.canonical,
+        &compiled.dependencies,
+        ctx.vars_path.as_deref(),
+    );
+    state.watched_dirs = resync_watches(watcher, &state.watched_dirs, &new_dirs);
+    // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
+    // dirs removed by resync_watches are no longer in watched_dirs.
+    state.armed_dirs = state.watched_dirs.clone();
+    state.foi = files_of_interest(
+        &ctx.entry.canonical,
+        &compiled.dependencies,
+        ctx.vars_path.as_deref(),
+    );
+    // Update mtime snapshot after a compile (even if content unchanged).
+    state.last_mtimes = snapshot_state(&state.foi);
+
+    if !content_changed {
+        return;
+    }
+    match write_output(output_path, &compiled.content, ctx.quiet, false) {
+        Ok(()) => {
+            let elapsed = t0.elapsed().as_millis();
+            let dep_count = compiled.dependencies.len();
+            if !ctx.quiet {
+                eprintln!(
+                    "Recompiled {} ({} deps) in {}ms",
+                    safe_inline(&output_key),
+                    dep_count,
+                    elapsed
+                );
             }
-
-            // Freshness rule: always recompute dep set from fresh output.
-            let new_dirs =
-                dirs_to_watch(&ctx.entry, &compiled.dependencies, ctx.vars_path.as_deref());
-            state.watched_dirs = resync_watches(watcher, &state.watched_dirs, &new_dirs);
-            // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
-            // dirs removed by resync_watches are no longer in watched_dirs.
-            state.armed_dirs = state.watched_dirs.clone();
-            state.foi =
-                files_of_interest(&ctx.entry, &compiled.dependencies, ctx.vars_path.as_deref());
-            // Update mtime snapshot after a compile (even if content unchanged).
-            state.last_mtimes = snapshot_state(&state.foi);
-
-            if content_changed {
-                match write_output(output_path.clone(), &compiled.content, ctx.quiet, false) {
-                    Ok(()) => {
-                        let elapsed = t0.elapsed().as_millis();
-                        let dep_count = compiled.dependencies.len();
-                        let out_display = output_path
-                            .as_deref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<stdout>".to_string());
-                        state.last_written.insert(output_key, compiled.content);
-                        if !ctx.quiet {
-                            eprintln!(
-                                "Recompiled {} ({} deps) in {}ms",
-                                safe_inline(&out_display),
-                                dep_count,
-                                elapsed
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprint_error(e);
-                        // Error-settle: update snapshot so we don't re-fire.
-                        state.last_mtimes = snapshot_state(&state.foi);
-                    }
-                }
-            }
+            state.last_written.insert(output_key, compiled.content);
         }
-        Err(e) => {
-            eprint_error(e);
-            // Error-settle: snapshot current state so the tick gate
-            // won't re-fire on the same unchanged files (AC-R7/W6).
-            state.last_mtimes = snapshot_state(&state.foi);
-        }
+        Err(e) => settle_after_error(state, e),
     }
 }
 
+/// Report a failed file-mode rebuild and settle: snapshot the files of interest, so the
+/// tick gate does not re-fire on the same unchanged files (AC-R7/W6). Watching
+/// continues. Every failure [`rebuild_file`] meets ends here.
+fn settle_after_error(state: &mut FileWatchState, e: miette::Report) {
+    eprint_error(e);
+    state.last_mtimes = snapshot_state(&state.foi);
+}
+
+/// Single-file watch: `entry.typed` is the path as typed — the entry is compiled by it
+/// (#417) and `mds.json` is looked up from it at startup (#413), so their errors name
+/// the files as the user reaches them; `entry.canonical` is its canonical form, which
+/// everything else uses.
 #[allow(clippy::too_many_arguments)]
 fn run_watch_file(
-    entry: PathBuf,
+    entry: WatchedPath,
     output: Option<String>,
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
@@ -1268,14 +1556,15 @@ fn run_watch_file(
     quiet: bool,
     tick: Option<Duration>,
 ) -> Result<()> {
+    let working_dir = WorkingDir::record();
     // #326: keep the --vars argument as the user typed it, separately from the
     // canonicalized form below. `vars_path` (canonical) is used for everything that
     // must match notify's canonicalized event paths (dirs_to_watch, files_of_interest,
-    // event matching); `vars_path_raw` is used only for `RuntimeVarArgs.vars`, so the
+    // event matching); `vars_path_typed` is used only for `RuntimeVarArgs.vars`, so the
     // vars-file duplicate-key warning (D4: "{path} = the --vars arg as typed") displays
     // and reads through the same path the user gave — reading a valid, possibly
     // symlinked path is fine either way, only the DISPLAYED text differs.
-    let vars_path_raw = vars.clone();
+    let vars_path_typed = vars.clone();
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
@@ -1285,7 +1574,7 @@ fn run_watch_file(
     let static_set_string_vars = set_string_vars;
 
     if !quiet {
-        eprintln!("Watching {}", safe_path(&entry));
+        eprintln!("Watching {}", safe_path(&entry.canonical));
     }
 
     // ── Arm before publish (startup race) ─────────────────────────────────────
@@ -1353,7 +1642,7 @@ fn run_watch_file(
     // full dir set. Splitting it this way keeps startup failure messages identical
     // to the pre-reorder behaviour.
     let mut watched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    for dir in dirs_to_watch(&entry, &[], vars_path.as_deref()) {
+    for dir in dirs_to_watch(&entry.canonical, &[], vars_path.as_deref()) {
         if dir.exists() && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
             watched_dirs.insert(dir);
         }
@@ -1363,52 +1652,68 @@ fn run_watch_file(
     // `build_runtime_vars` (reads the vars file) and `compile_and_write` (reads
     // the entry) come after this point, so an edit landing during startup leaves
     // this snapshot strictly older than the file — and the liveness probe sees it.
-    let mut pre_mtimes = snapshot_state(&files_of_interest(&entry, &[], vars_path.as_deref()));
-    let entry_was_missing = !entry.exists();
+    let mut pre_mtimes = snapshot_state(&files_of_interest(
+        &entry.canonical,
+        &[],
+        vars_path.as_deref(),
+    ));
+    let entry_was_missing = !entry.canonical.exists();
 
     // Initial compile: compile first, derive output path from kind (compile-then-route).
     // For explicit -o / --out-dir the path is determined by the flag.
     // For the default case (no explicit flag), the path depends on the output kind, which
     // is only known after compilation — so we compile first, then derive.
     let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path_raw.clone(),
+        vars: vars_path_typed.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
     emit_duplicate_var_warnings(&resolved, quiet);
     let runtime_vars = resolved.vars;
 
-    // Load project config (for output_dir) — used if no explicit -o / --out-dir.
-    let config = load_config(&entry)?;
+    // Load project config (for output_dir) — used if no explicit -o / --out-dir. By the
+    // typed path, so a config error names `mds.json` as the input reaches it
+    // (`./mds.json`), never by its canonical absolute path (#413); the config
+    // directory it returns is canonical either way.
+    let config = load_config(&entry.typed)?;
 
     // Initial compile: returns (output_path, deps, content).
     // content is captured here so the baseline block below can reuse it without
     // recompiling (issue 3 — avoids a redundant second compile at startup).
-    let (output_path, initial_deps, initial_content) = match compile_and_write(
-        &entry,
-        &output,
-        &out_dir,
-        &config,
-        runtime_vars,
-        quiet,
-        mds::CompileOptions::default(),
-    ) {
-        Ok(result) => result,
-        Err(e) => {
+    // The outer `?` is an output route no rebuild can use — one that fails to resolve, or
+    // the entry file itself (#425): refused at startup, exit 2, before anything is
+    // written. A compile or write error is reported, and watching continues.
+    let startup = compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet)?;
+    let (output_path, initial_deps, initial_content) = match startup {
+        CompileWriteOutcome::Written(result) => result,
+        CompileWriteOutcome::Failed(e) => {
             // Initial compile error: print and continue watching (entry dir still watched).
             eprint_error(e);
             // Fall back: resolve output path with Markdown kind as a placeholder so we
             // know where to watch. This path may not match a later successful compile if
-            // the template has @message blocks, but it will correct on first successful rebuild.
+            // the template has @message blocks, and every rebuild reuses it
+            // (`FileCompileCtx.output_path`) — so it can be the entry itself, which
+            // `rebuild_file` refuses to write over (#425). A route that fails to resolve
+            // is refused here as after a successful compile (exit 2): no rebuild could
+            // write anywhere else.
             let fallback_path = resolve_output_path_for_kind(
-                &Some(entry.clone()),
+                &Some(entry.canonical.clone()),
                 &output,
                 &out_dir,
                 &config,
                 OutputKind::Markdown,
+            )?;
+            // Nothing is written now. Every rebuild reuses this path, and refuses and
+            // reports one that is the entry (#425), so the refusal is dropped here:
+            // admitting the fallback only decides whether the `-o` extension warning,
+            // which announces a write, is printed — never for a fallback that is the entry.
+            let _ = admit_output(
+                fallback_path.as_deref(),
+                entry.paths(),
+                &output,
+                OutputKind::Markdown,
                 quiet,
-            )
-            .unwrap_or(None);
+            );
             (fallback_path, vec![], String::new())
         }
     };
@@ -1446,7 +1751,7 @@ fn run_watch_file(
     // Arm the dependency directories the compile just reported. Dirs already armed
     // above are skipped; anything still unarmed — including a pre-arm attempt that
     // failed — is a hard startup error, as it was before the reorder.
-    let init_dirs = dirs_to_watch(&entry, &initial_deps, vars_path.as_deref());
+    let init_dirs = dirs_to_watch(&entry.canonical, &initial_deps, vars_path.as_deref());
     let unarmed: Vec<PathBuf> = init_dirs.difference(&watched_dirs).cloned().collect();
     for dir in unarmed {
         match watcher.watch(&dir, RecursiveMode::NonRecursive) {
@@ -1473,11 +1778,11 @@ fn run_watch_file(
         last_written.insert(output_key.clone(), initial_content);
     }
 
-    let foi = files_of_interest(&entry, &initial_deps, vars_path.as_deref());
+    let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
 
     // Build pre-loop FileWatchState (mtime snapshot + edge-trigger seeds).
     let missing_watched_dirs: BTreeSet<PathBuf> = {
-        let desired = dirs_to_watch(&entry, &[], vars_path.as_deref())
+        let desired = dirs_to_watch(&entry.canonical, &[], vars_path.as_deref())
             .union(&watched_dirs)
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -1494,15 +1799,15 @@ fn run_watch_file(
     // only the pre-compile pair predates an edit that landed during startup, so
     // inverting the merge (or switching to an `or_insert`-style one that keeps the
     // value already present) silently restores the lost-save bug while every test
-    // still passes. `entry` is inserted verbatim by `files_of_interest`, so this
+    // still passes. `entry.canonical` is inserted verbatim by `files_of_interest`, so this
     // lookup hits. The previous assertion here compared the key sets of
     // `files_of_interest(entry, &[], vars)` and `files_of_interest(entry, &deps, vars)`
     // — a subset relation those two calls guarantee by construction, so it could
     // never fail and guarded nothing.
-    let entry_pre = pre_mtimes.get(&entry).copied();
+    let entry_pre = pre_mtimes.get(&entry.canonical).copied();
     last_mtimes.extend(pre_mtimes);
     debug_assert_eq!(
-        last_mtimes.get(&entry).copied(),
+        last_mtimes.get(&entry.canonical).copied(),
         entry_pre,
         "baseline merge inverted: the entry's pre-compile (mtime, size) must survive \
          the merge with the post-compile snapshot, or an edit made during startup can \
@@ -1527,12 +1832,11 @@ fn run_watch_file(
     // #[allow(clippy::too_many_arguments)] suppressions).
     let ctx = FileCompileCtx {
         entry,
+        working_dir,
         vars_path,
-        vars_path_raw,
+        vars_path_typed,
         static_set_vars,
         static_set_string_vars,
-        output_arg: output,
-        out_dir,
         output_path,
         quiet,
     };
@@ -1589,31 +1893,6 @@ fn run_watch_file(
 // ── Directory watch ───────────────────────────────────────────────────────────
 
 const MAX_COLLECT_DEPTH: usize = 64;
-
-/// The watched directory in the two forms directory mode needs.
-///
-/// `canonical` is the form notify reports event paths under, so every graph key,
-/// output mapping and containment check uses it. A source is COMPILED by its walked
-/// path instead — `typed` joined with the source's path below the root, the form
-/// `mds build <dir>` compiles — so an error names the file as the user reached it,
-/// never by its canonical absolute path (#265).
-struct WatchRoot {
-    canonical: PathBuf,
-    typed: PathBuf,
-}
-
-impl WatchRoot {
-    /// The path `src` (a walked or graph-key path under `canonical`) is compiled by.
-    ///
-    /// A source outside the root — an out-of-root dependency (DD3) — has no walked
-    /// form and is compiled by its canonical path.
-    fn walked(&self, src: &Path) -> PathBuf {
-        match src.strip_prefix(&self.canonical) {
-            Ok(below) => self.typed.join(below),
-            Err(_) => src.to_path_buf(),
-        }
-    }
-}
 
 /// Mutable state for the directory-mode watch loop.
 struct DirWatchState {
@@ -1786,7 +2065,7 @@ struct LivenessState {
 /// same content-based signal `rebuild_file` uses in single-file mode).
 fn compile_one_source(
     src: &Path,
-    watch_root: &WatchRoot,
+    watch_root: &WatchedPath,
     output_base: &OutputBase,
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
@@ -1794,12 +2073,7 @@ fn compile_one_source(
 ) -> bool {
     let root = watch_root.canonical.as_path();
     let t0 = Instant::now();
-    match compile_to_content(
-        &watch_root.walked(src),
-        runtime_vars.clone(),
-        quiet,
-        mds::CompileOptions::default(),
-    ) {
+    match watch_root.compile_source(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths: Vec<PathBuf> = compiled.dependencies.iter().map(PathBuf::from).collect();
 
@@ -1909,14 +2183,17 @@ struct DirStartup {
 /// liveness-probe and event-handler call — removes `#[allow(clippy::too_many_arguments)]`
 /// from the extracted helper functions (issue #6 / zero-warnings policy).
 struct DirWatchCtx {
-    root: WatchRoot,
+    /// The watched directory, as typed and canonical ([`Watched::Root`]).
+    root: WatchedPath,
+    /// The working directory at startup, restored first by every rebuild.
+    working_dir: WorkingDir,
     /// Canonicalized `--vars` path — matches notify's canonicalized event paths;
     /// used for matching/watching (never for display, #326).
     vars_path: Option<PathBuf>,
     /// The `--vars` path exactly as the user typed it, uncanonicalized (#326, D4).
     /// Used for `RuntimeVarArgs.vars` so the vars-file duplicate-key warning displays
     /// (and reads) the as-typed path rather than its canonical form.
-    vars_path_raw: Option<PathBuf>,
+    vars_path_typed: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
     output_base: OutputBase,
@@ -2081,46 +2358,70 @@ fn liveness_probe_dir(
     }
 
     if !batch.is_empty() {
-        // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-        let resolved = match build_runtime_vars(RuntimeVarArgs {
-            vars: ctx.vars_path_raw.clone(),
-            set_vars: ctx.static_set_vars.clone(),
-            set_string_vars: ctx.static_set_string_vars.clone(),
-        }) {
-            // --set/--set-string are fixed for the session and warned once at
-            // startup — discarded (via `resolved.vars` below). The vars file is
-            // reloaded on every rebuild (freshness rule); this self-heal path emits under
-            // the same content-changed gate as `handle_fs_event_dir`, so one
-            // logical edit observed by both paths still warns once — tests I17 and
-            // I19. Without this, a self-heal recompile driven purely by this
-            // content-backstop/full-reconcile tick (no FS event ever delivered,
-            // e.g. after a root delete+recreate) could print "Recompiled" with no
-            // vars-file duplicate warning at all.
-            Ok(v) => v,
-            Err(e) => {
-                eprint_error(e);
-                // Re-baseline so the next tick does not report the same change again
-                // and turn one unreadable vars file into per-tick error spam.
-                state.last_mtimes = snapshot_state(&state.tracked_set());
-                return;
-            }
-        };
-        let any_changed = process_dir_batch(
-            &batch,
-            false, /* vars_changed */
-            &ctx.root,
-            &ctx.output_base,
-            &resolved.vars,
-            ctx.quiet,
-            state,
-        );
-        if any_changed {
-            crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
-        }
+        // The event handler's rebuild path, so a recompile driven purely by this
+        // content-backstop/full-reconcile tick (no FS event ever delivered, e.g. after a
+        // root delete+recreate) re-reports the vars-file duplicate keys under the same
+        // content-changed gate, and one logical edit observed by both paths still warns
+        // once — tests I17 and I19.
+        rebuild_dir_batch(ctx, &batch, false /* vars_changed */, state);
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
     // post-batch tracked set, and an empty batch means nothing appeared, was removed, or
     // changed — so the existing baseline is by definition still accurate.
+}
+
+/// Rebuild `batch` in directory mode — the one rebuild path of the event handler and of
+/// the idle tick's content backstop alike.
+///
+/// A recreated working directory is restored first ([`WorkingDir::restore_if_recreated`]),
+/// before anything is read. The vars file is then reloaded (freshness rule), and a
+/// failure to read it is reported and settled: it may be temporarily absent (AC-W7 /
+/// AC-C5). `--set`/`--set-string` are fixed for the session and warned once at startup —
+/// discarded here (via `resolved.vars`). The vars file's duplicate keys are re-reported
+/// only when the batch produced an OBSERVABLE rebuild (#326, test I17): at `--debounce 0`
+/// a single edit can generate more than one raw FS event, each reaching the event handler
+/// separately, and the idle tick can observe the same edit again, so the warning is
+/// emitted after `process_dir_batch` reports whether anything actually changed rather
+/// than unconditionally — one logical edit warns once.
+fn rebuild_dir_batch(
+    ctx: &DirWatchCtx,
+    batch: &BTreeSet<PathBuf>,
+    vars_changed: bool,
+    state: &mut DirWatchState,
+) {
+    ctx.working_dir.restore_if_recreated();
+
+    let resolved = match build_runtime_vars(RuntimeVarArgs {
+        vars: ctx.vars_path_typed.clone(),
+        set_vars: ctx.static_set_vars.clone(),
+        set_string_vars: ctx.static_set_string_vars.clone(),
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            eprint_error(e);
+            // Re-baseline so the idle-tick content backstop does not report the same
+            // change again and turn one unreadable vars file into per-tick error spam.
+            state.last_mtimes = snapshot_state(&state.tracked_set());
+            return;
+        }
+    };
+
+    // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
+    // directly rather than cloning it — `resolved` (and its `.vars_file`,
+    // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
+    // needed below, after this borrow ends, for the warning emission.
+    let any_changed = process_dir_batch(
+        batch,
+        vars_changed,
+        &ctx.root,
+        &ctx.output_base,
+        &resolved.vars,
+        ctx.quiet,
+        state,
+    );
+    if any_changed {
+        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+    }
 }
 
 /// Outcome returned by `handle_fs_event_dir` to tell the loop what to do next.
@@ -2135,8 +2436,8 @@ enum DirEventOutcome {
 
 /// Process a single incoming `Msg` for directory mode.
 ///
-/// Collects changed paths, drains the debounce window, filters irrelevant paths,
-/// reloads vars, and calls `process_dir_batch`. Returns `DirEventOutcome` so the
+/// Collects changed paths, drains the debounce window, filters irrelevant paths, and
+/// rebuilds what is left through [`rebuild_dir_batch`]. Returns `DirEventOutcome` so the
 /// caller knows whether to `continue`, `return`, or proceed.
 fn handle_fs_event_dir(
     msg: Msg,
@@ -2217,48 +2518,7 @@ fn handle_fs_event_dir(
         clear_terminal();
     }
 
-    // Freshness rule: reload vars from disk on every rebuild.
-    // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-    let resolved = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_raw.clone(),
-        set_vars: ctx.static_set_vars.clone(),
-        set_string_vars: ctx.static_set_string_vars.clone(),
-    }) {
-        // --set/--set-string are fixed for the session and warned once at startup —
-        // discarded (via `resolved.vars` below). The vars file is reloaded on every
-        // rebuild (freshness rule), so its duplicate keys are re-reported too — but only when
-        // this batch produces an OBSERVABLE rebuild (#326, test I17): at
-        // `--debounce 0` a single edit can generate more than one raw FS event, each
-        // reaching this function separately, so the warning is emitted after
-        // `process_dir_batch` reports whether anything actually changed rather than
-        // unconditionally here.
-        Ok(v) => v,
-        Err(e) => {
-            eprint_error(e);
-            // Re-baseline so the idle-tick content backstop does not report the same
-            // change again and turn one unreadable vars file into per-tick error spam.
-            state.last_mtimes = snapshot_state(&state.tracked_set());
-            return DirEventOutcome::Done;
-        }
-    };
-
-    // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
-    // directly rather than cloning it — `resolved` (and its `.vars_file`,
-    // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
-    // needed below, after this borrow ends, for the warning emission.
-    let any_changed = process_dir_batch(
-        &mds_changed,
-        vars_changed,
-        &ctx.root,
-        &ctx.output_base,
-        &resolved.vars,
-        ctx.quiet,
-        state,
-    );
-    if any_changed {
-        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
-    }
-
+    rebuild_dir_batch(ctx, &mds_changed, vars_changed, state);
     DirEventOutcome::Done
 }
 
@@ -2273,7 +2533,7 @@ fn handle_fs_event_dir(
 /// tested in isolation (review issue #3 / architecture.md).
 #[allow(clippy::too_many_arguments)]
 fn dir_watch_startup(
-    watch_root: WatchRoot,
+    watch_root: WatchedPath,
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
@@ -2282,12 +2542,15 @@ fn dir_watch_startup(
     debounce_ms: u64,
     quiet: bool,
 ) -> Result<DirStartup> {
+    let working_dir = WorkingDir::record();
     let root = watch_root.canonical.as_path();
-    // Load config once from the root directory.
-    let config = load_config(root)?;
+    // Load config once from the root directory, as typed, so a config error names
+    // `mds.json` as the input reaches it (`./mds.json`, `src/../mds.json`), never by its
+    // canonical absolute path (#413); the config directory it returns is canonical.
+    let config = load_config(&watch_root.typed)?;
     // #326: keep the --vars argument as the user typed it (see FileCompileCtx's
-    // vars_path_raw doc for why) — `vars_path` below stays canonical for matching.
-    let vars_path_raw = vars.clone();
+    // vars_path_typed doc for why) — `vars_path` below stays canonical for matching.
+    let vars_path_typed = vars.clone();
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
@@ -2387,7 +2650,7 @@ fn dir_watch_startup(
     // Startup compile: compile all .mds files found under root.
     let all_files = collect_mds_files(root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
     let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path_raw.clone(),
+        vars: vars_path_typed.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
@@ -2429,12 +2692,7 @@ fn dir_watch_startup(
 
     for source in &all_files {
         let key = graph_key(source);
-        match compile_to_content(
-            &watch_root.walked(source),
-            runtime_vars.clone(),
-            quiet,
-            mds::CompileOptions::default(),
-        ) {
+        match watch_root.compile_source(source, runtime_vars.clone(), quiet) {
             Ok(compiled) => {
                 // Collect dep paths (graph keys from compile_to_content).
                 let dep_paths: Vec<PathBuf> =
@@ -2521,7 +2779,7 @@ fn dir_watch_startup(
     // the mechanical guard on this.
     {
         let baseline_resolved = build_runtime_vars(RuntimeVarArgs {
-            vars: vars_path_raw.clone(),
+            vars: vars_path_typed.clone(),
             set_vars: static_set_vars.clone(),
             set_string_vars: static_set_string_vars.clone(),
         })?;
@@ -2533,11 +2791,10 @@ fn dir_watch_startup(
             if is_partial(source) {
                 continue; // Partials have no output path in last_written.
             }
-            match compile_to_content(
-                &watch_root.walked(source),
+            match watch_root.compile_source(
+                source,
                 baseline_vars.clone(),
                 true, /* quiet for baseline */
-                mds::CompileOptions::default(),
             ) {
                 Ok(compiled) => {
                     // Derive output path from the compiled kind (intrinsic extension).
@@ -2624,8 +2881,9 @@ fn dir_watch_startup(
 
     let ctx = DirWatchCtx {
         root: watch_root,
+        working_dir,
         vars_path,
-        vars_path_raw,
+        vars_path_typed,
         static_set_vars,
         static_set_string_vars,
         output_base,
@@ -2664,7 +2922,7 @@ fn dir_watch_startup(
 
 #[allow(clippy::too_many_arguments)]
 fn run_watch_dir(
-    root: WatchRoot,
+    root: WatchedPath,
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
@@ -2734,7 +2992,7 @@ fn run_watch_dir(
 fn process_dir_batch(
     changed: &BTreeSet<PathBuf>,
     vars_changed: bool,
-    watch_root: &WatchRoot,
+    watch_root: &WatchedPath,
     output_base: &OutputBase,
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
@@ -2773,7 +3031,7 @@ fn process_dir_batch(
 /// Returns `true` when at least one source in the batch produced an observable,
 /// content-changed rebuild (see `compile_one_source`).
 fn process_dir_batch_vars_changed(
-    watch_root: &WatchRoot,
+    watch_root: &WatchedPath,
     output_base: &OutputBase,
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
@@ -2851,7 +3109,7 @@ fn process_dir_batch_vars_changed(
 /// content-changed rebuild (see `compile_one_source`).
 fn process_dir_batch_incremental(
     changed: &BTreeSet<PathBuf>,
-    watch_root: &WatchRoot,
+    watch_root: &WatchedPath,
     output_base: &OutputBase,
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
@@ -2928,12 +3186,7 @@ fn process_dir_batch_incremental(
         // hidden dirs) are graph nodes but never emit their own output (DD3 pattern).
         if !is_in_root || is_excluded_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
-            match compile_to_content(
-                &watch_root.walked(src),
-                runtime_vars.clone(),
-                true,
-                mds::CompileOptions::default(),
-            ) {
+            match watch_root.compile_source(src, runtime_vars.clone(), true) {
                 Ok(compiled) => {
                     let dep_paths: Vec<PathBuf> =
                         compiled.dependencies.iter().map(PathBuf::from).collect();
@@ -4224,9 +4477,10 @@ mod tests {
         let changed: BTreeSet<PathBuf> = std::iter::once(other).collect();
         process_dir_batch_incremental(
             &changed,
-            &WatchRoot {
-                canonical: root.clone(),
-                typed: root,
+            &WatchedPath {
+                typed: root.clone(),
+                canonical: root,
+                what: Watched::Root,
             },
             &OutputBase::Dir(out.clone()),
             &None,
@@ -4251,9 +4505,10 @@ mod tests {
     /// below the canonical root; an out-of-root dependency keeps its canonical path.
     #[test]
     fn watch_root_walked_keeps_the_typed_prefix() {
-        let root = WatchRoot {
-            canonical: PathBuf::from("/abs/project/src"),
+        let root = WatchedPath {
             typed: PathBuf::from("src"),
+            canonical: PathBuf::from("/abs/project/src"),
+            what: Watched::Root,
         };
         assert_eq!(
             root.walked(Path::new("/abs/project/src/sub/a.mds")),
@@ -4363,16 +4618,18 @@ mod tests {
         // Use -o <out> style to direct output to a specific path.
         let out = dir.path().join("entry.md");
         let out_str = out.display().to_string();
-        let (_written_path, deps, _content) = compile_and_write(
-            &entry,
-            &Some(out_str),
-            &None,
-            &None,
-            None,
-            true,
-            mds::CompileOptions::default(),
-        )
-        .unwrap();
+        // The canonical form `run_watch` derives, which the compile checks the typed path
+        // against (on macOS the temporary directory is not canonical).
+        let watched = WatchedPath {
+            canonical: mds::NativeFs::check_symlink(&entry).unwrap(),
+            typed: entry,
+            what: Watched::Entry,
+        };
+        let (_written_path, deps, _content) =
+            match compile_and_write(&watched, &Some(out_str), &None, &None, None, true).unwrap() {
+                CompileWriteOutcome::Written(result) => result,
+                CompileWriteOutcome::Failed(e) => panic!("compile_and_write failed: {e}"),
+            };
         // The entry's compile output should list helper as a dependency.
         assert!(out.exists(), "output file should be created");
         assert!(
@@ -4392,5 +4649,136 @@ mod tests {
             dep_names.iter().any(|n| n == "helper.mds"),
             "deps should contain helper.mds, got: {dep_names:?}"
         );
+    }
+
+    /// #417: the watched entry is compiled by the typed path while that path leads to the
+    /// canonical entry's directory, and refused — naming the path as typed, never the
+    /// canonical one — once it leads into another directory. A typed path that no longer
+    /// resolves is left to the compile's own error, `file not found`, naming it as typed.
+    #[test]
+    fn watched_entry_refuses_a_typed_path_that_leads_elsewhere() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["a", "b"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(
+                dir.path().join(name).join("page.mds"),
+                format!("Hi {name}\n"),
+            )
+            .unwrap();
+        }
+        let typed = dir.path().join("a").join("page.mds");
+        let compile = |canonical: &Path| {
+            WatchedPath {
+                typed: typed.clone(),
+                canonical: canonical.to_path_buf(),
+                what: Watched::Entry,
+            }
+            .compile(None, true)
+            .map(|compiled| compiled.content)
+            .map_err(|e| e.to_string())
+        };
+
+        let here = mds::NativeFs::check_symlink(&typed).unwrap();
+        assert_eq!(compile(&here), Ok("Hi a\n".to_string()), "control");
+
+        let elsewhere =
+            mds::NativeFs::check_symlink(&dir.path().join("b").join("page.mds")).unwrap();
+        let refused = compile(&elsewhere).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "watched entry now resolves to a different file: \"{}\"; \
+                 restart mds watch to follow it",
+                typed.display()
+            )
+        );
+        assert!(
+            !refused.contains(&*elsewhere.to_string_lossy()),
+            "{refused}"
+        );
+
+        std::fs::remove_file(&typed).unwrap();
+        let missing = compile(&here).unwrap_err();
+        assert_eq!(
+            missing,
+            format!("file not found: {}", typed.display()),
+            "a missing entry is the compile's own error, naming the path as typed"
+        );
+    }
+
+    /// #413: the root and a source below it are checked by the entry's rule — the
+    /// directory the typed path leads into against the one the canonical path names —
+    /// and each refusal names its own kind and the path as typed. Controls: each kind
+    /// whose typed path still leads to its canonical form, and each whose typed path no
+    /// longer resolves, which is left to the compile.
+    #[test]
+    fn watched_root_and_source_share_the_entry_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["a", "b"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("page.mds"), "Hi\n").unwrap();
+        }
+        let canonical = |p: PathBuf| p.canonicalize().unwrap();
+        let check = |typed: PathBuf, canonical: PathBuf, what: Watched| {
+            WatchedPath {
+                typed,
+                canonical,
+                what,
+            }
+            .ensure_unmoved()
+            .map_err(|e| e.to_string())
+        };
+        let moved = |kind: &str, now: &str, typed: &Path| {
+            Err(format!(
+                "watched {kind} now resolves to a different {now}: \"{}\"; \
+                 restart mds watch to follow it",
+                typed.display()
+            ))
+        };
+
+        let root = dir.path().join("a");
+        let source = root.join("page.mds");
+        let root_b = canonical(dir.path().join("b"));
+        let source_b = canonical(dir.path().join("b").join("page.mds"));
+
+        let mut mismatches = Vec::new();
+        let rows = [
+            (
+                "root, unmoved",
+                check(root.clone(), canonical(root.clone()), Watched::Root),
+                Ok(()),
+            ),
+            (
+                "root, moved",
+                check(root.clone(), root_b.clone(), Watched::Root),
+                moved("directory", "directory", &root),
+            ),
+            (
+                "source, unmoved",
+                check(source.clone(), canonical(source.clone()), Watched::Source),
+                Ok(()),
+            ),
+            (
+                "source, moved",
+                check(source.clone(), source_b.clone(), Watched::Source),
+                moved("file", "file", &source),
+            ),
+            (
+                "root, gone",
+                check(dir.path().join("gone"), root_b, Watched::Root),
+                Ok(()),
+            ),
+            (
+                "source, gone",
+                check(root.join("gone.mds"), source_b, Watched::Source),
+                Ok(()),
+            ),
+        ];
+        for (label, got, want) in rows {
+            if got != want {
+                mismatches.push(format!("{label}: got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 }

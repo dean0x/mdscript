@@ -19,20 +19,43 @@ Two builds, selected by package `exports` conditions:
 | `browser` / `default` | `dist/web/mds_wasm.js` | ESM (`wasm-pack --target web`) | call `default()` with the `.wasm` URL |
 
 Each build exposes `compile(source, options)`, `check(source, options)`,
-`lint(source, options)`, `lintVirtual(modules, entry, options)`, and `scanImports(source)`.
+`lint(source, options)`, `lintVirtual(modules, entry, options)`, `scanImports(source)`,
+`scanImportRecords(source, asBase)` — `scanImports`' paths as `{ path, kind, frontmatterIndex, span }`
+records: the directive each is written in (`"extends"`, `"frontmatter"`, `"import"` or
+`"export-from"`), a frontmatter import's index in its `imports:` list, and for `@extends` and
+`@import` the `span` a `mds::file_not_found` error for the path points at, in the order the resolver
+resolves them: the `@extends` base first for a module compiled for itself (`asBase` false), after the
+imports for one reached as the base of another template (`asBase` true); the base is recorded on its
+own, even when an import names it too — and
+`preflightModule(bytes, display, typed)` — a module file's text from its bytes (a `Uint8Array`),
+checked as the native backend checks every file it reads: over 10 MiB is `mds::resource_limit` and
+bytes that are not valid UTF-8 are `mds::io`, naming the file by `display` (its path below the project
+root); then a file that is neither `.mds` nor a `.md` declaring `type: mds` is `mds::not_mds`, naming
+it by `typed` (the path as typed). The bytes are copied into WebAssembly memory before any check
+runs, so a caller bounds what it passes: `@mdscript/mds` reads at most 10 MiB and one byte of a file.
 
 ### Options
 
 ```js
 // compile(source, options)
 // options.filename — string (default "input.mds"): key used for this source in the
-//   virtual FS and as sources[0] in the generated source map. Override when you want
-//   a meaningful name to appear in source maps or import paths.
+//   virtual FS and as its name in the generated source map's sources[]. Override when
+//   you want a meaningful name to appear in source maps or import paths.
 // options.modules — { [key: string]: string }: additional virtual modules for
 //   @import resolution. The entry source is inserted under options.filename.
+// options.moduleAliases — { [key: string]: string }: other keys an import may reach a
+//   module by — the key an import resolves to → the key of the module (in modules, or
+//   options.filename) it names, which is then the module's name in dependencies,
+//   sources[] and a cycle's text. Every alias and module key must be a normalized key
+//   (no forbidden characters, no empty/./.. segment, at most 256 segments); every alias
+//   must name a module and none may be a module key: mds::invalid_options otherwise,
+//   naming the alias (options.moduleAliases["<alias>"]: <reason>). At most 65,536
+//   aliases, whose keys and module keys total at most 10 MiB: mds::resource_limit
+//   otherwise. Also accepted by check and lint.
 // options.vars — { [key: string]: any }: runtime variable overrides.
 // options.sourceMap — boolean: generate a Source Map v3 document; result gains .sourceMap.
-//   sources[0] is options.filename (default "input.mds").
+//   sources[0] is options.filename (default "input.mds"), unless the source @extends
+//   a base: then the chain's root base comes first.
 // options.sourcesContent — boolean: embed original source text in sourcesContent[]
 //   (requires sourceMap: true). ⚠ Privacy: embeds the full template source.
 const result = compile(source, { sourceMap: true, vars: { name: 'World' } });

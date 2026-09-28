@@ -928,6 +928,105 @@ fn sm17_include_multi_file_attribution() {
     );
 }
 
+// ── SM-18: an @include of an extending chain names relative sources (#412) ──
+
+/// #412 (on disk): an importer in `src/` that `@include`s a three-level
+/// extending chain in `lib/`, built into `build/`, lists every chain file in its
+/// sidecar map with its text, each relative to the map and contained in the project —
+/// never an absolute path.
+#[test]
+fn sm18_include_of_extending_chain_sources_are_relative() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join(".mdsroot"), "").unwrap();
+    for sub in ["src", "lib", "build"] {
+        std::fs::create_dir(root.join(sub)).unwrap();
+    }
+    let files = [
+        (
+            "lib/a.mds",
+            "A-HEAD\n@block b1:\nA-ONE\n@end\n@block b2:\nA-TWO\n@end\nA-TAIL\n",
+        ),
+        (
+            "lib/b.mds",
+            "@extends \"./a.mds\"\n@block b1:\nB-ONE\n@end\n",
+        ),
+        (
+            "lib/c.mds",
+            "@extends \"./b.mds\"\n@block b2:\nC-TWO\n@end\n",
+        ),
+        (
+            "src/main.mds",
+            "@import \"../lib/c.mds\" as c\nMAIN-HEAD\n@include c\n",
+        ),
+    ];
+    for (name, text) in files {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    // Positive control (PF-013): the chain's canonical paths are absolute, so the
+    // containment checks below fail if one reaches the map.
+    assert!(root.join("lib/a.mds").canonicalize().unwrap().is_absolute());
+
+    // Relative arguments from the project root: the map's directory then resolves
+    // the way the root does, so the sources anchor at the map (`../…`).
+    let result = mds_bin()
+        .current_dir(root)
+        .args(["build", "src/main.mds", "--source-map", "--embed-sources"])
+        .args(["-o", "build/out.md"])
+        .output()
+        .expect("mds binary should run");
+    assert!(
+        result.status.success(),
+        "build should succeed, stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("build").join("out.md")).unwrap(),
+        "MAIN-HEAD\nA-HEAD\nB-ONE\nC-TWO\nA-TAIL\n"
+    );
+
+    let v = read_map_json(&root.join("build").join("out.md.map"));
+    let sources: Vec<&str> = v["sources"]
+        .as_array()
+        .expect("sources must be an array")
+        .iter()
+        .map(|s| s.as_str().expect("each source is a string"))
+        .collect();
+    // Map-relative (`../…`): `build/` resolves inside the project root as the root
+    // itself does. On Windows a working directory reached through an 8.3 short name can
+    // resolve `build/` outside the root's spelling, and the sources are then
+    // root-relative, also a correct anchor (ADR-005), so there the anchor is read off
+    // the first source. Either way every file of the chain is listed after the importer.
+    #[cfg(not(windows))]
+    let anchor = "../";
+    #[cfg(windows)]
+    let anchor = if sources.first() == Some(&"../src/main.mds") {
+        "../"
+    } else {
+        ""
+    };
+    let files_in_order = ["src/main.mds", "lib/a.mds", "lib/b.mds", "lib/c.mds"];
+    assert_eq!(
+        sources,
+        files_in_order.map(|file| format!("{anchor}{file}")),
+        "the importer, then every file of the included chain"
+    );
+    for source in &sources {
+        assert_source_is_contained(source, root, &root.join("build"), &[]);
+    }
+    let contents: Vec<&str> = v["sourcesContent"]
+        .as_array()
+        .expect("--embed-sources keeps sourcesContent")
+        .iter()
+        .map(|s| s.as_str().expect("each entry is a string"))
+        .collect();
+    let expected: Vec<&str> = files_in_order
+        .iter()
+        .map(|name| files.iter().find(|(file, _)| file == name).unwrap().1)
+        .collect();
+    assert_eq!(contents, expected, "sourcesContent must align with sources");
+}
+
 // ── SM-VLQ-INT: VLQ integration test with actual map output ──────────────────
 
 #[test]
@@ -1003,6 +1102,112 @@ fn sm16_stale_map_not_smv3_preserved_with_warning() {
         !quiet_stderr.contains("warning:"),
         "--quiet must suppress the warning; got stderr: {quiet_stderr:?}"
     );
+}
+
+// ── SM-16c: the stale-map check deletes only a sidecar mds wrote (#428) ───────
+
+/// Run `mds <args>` in `dir` and return `(exit code, stderr)`. Bounded: a run still going
+/// after 20 s — blocked opening a FIFO, say — is killed, and reported with no exit code.
+fn run_bounded(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    use std::io::Read as _;
+    let mut child = mds_bin()
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mds binary should spawn");
+    let mut pipe = child.stderr.take().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = pipe.read_to_string(&mut text);
+        text
+    });
+    // Bounded: at most 20 s / 10 ms iterations.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = drain.join().unwrap();
+            return (None, format!("killed: still running after 20 s; {stderr}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    (status.code(), drain.join().unwrap())
+}
+
+/// #428: a build without `--source-map` deletes the sidecar an earlier `--source-map`
+/// build wrote (the control), and leaves anything else at `<output>.map` in place with
+/// the warning: a hand-formatted map with the same fields, a 64 MiB file of anything
+/// else (only a sidecar's first bytes are read), and on Unix a FIFO, which is never
+/// opened — opening one with no writer blocks.
+#[test]
+fn sm16c_stale_map_check_leaves_anything_but_a_sidecar_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("page.mds"), "Hi\n").unwrap();
+    let map = dir.path().join("out.md.map");
+    let rebuild = ["build", "page.mds", "-o", "out.md"];
+    let warning =
+        "warning: leaving out.md.map in place — not a tool-generated SMv3 map (version/file mismatch)";
+
+    let (code, stderr) = run_bounded(
+        dir.path(),
+        &["build", "page.mds", "--source-map", "-o", "out.md"],
+    );
+    assert_eq!(code, Some(0), "source-map build: {stderr}");
+    assert!(map.is_file(), "the sidecar is written");
+    let (code, stderr) = run_bounded(dir.path(), &rebuild);
+    assert_eq!(code, Some(0), "control rebuild: {stderr}");
+    assert!(
+        !map.exists(),
+        "control: the sidecar is deleted; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Removed stale map out.md.map"),
+        "control: {stderr}"
+    );
+
+    let mut mismatches = Vec::new();
+    let hand_formatted =
+        b"{ \"version\": 3, \"file\": \"out.md\", \"sources\": [], \"names\": [], \"mappings\": \"\" }"
+            .to_vec();
+    for (label, bytes) in [
+        ("hand-formatted, same fields", hand_formatted),
+        ("64 MiB of x", vec![b'x'; 64 * 1024 * 1024]),
+    ] {
+        std::fs::write(&map, &bytes).unwrap();
+        let (code, stderr) = run_bounded(dir.path(), &rebuild);
+        let kept = std::fs::read(&map).is_ok_and(|now| now == bytes);
+        if code != Some(0) || !kept || !stderr.lines().any(|l| l == warning) {
+            mismatches.push(format!(
+                "{label}: exit {code:?}, left in place: {kept}; stderr: {stderr}"
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        std::fs::remove_file(&map).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&map)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo out.md.map");
+        let (code, stderr) = run_bounded(dir.path(), &rebuild);
+        let fifo = std::fs::symlink_metadata(&map).is_ok_and(|m| m.file_type().is_fifo());
+        if code != Some(0) || !fifo || !stderr.lines().any(|l| l == warning) {
+            mismatches.push(format!(
+                "FIFO: exit {code:?}, left in place: {fifo}; stderr: {stderr}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
 // ── SM-14b: stdin --source-map sidecar relabels source to <stdin> ────────────

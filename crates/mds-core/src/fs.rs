@@ -5,11 +5,13 @@
 //! - [`VirtualFs`] — in-memory HashMap-backed filesystem for testing and WASM
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::error::MdsError;
-use crate::limits::{MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use crate::limits::{
+    MAX_FILE_SIZE, MAX_MODULE_ALIASES, MAX_MODULE_ALIASES_SIZE, MAX_TRAVERSAL_DEPTH,
+};
 
 /// Maximum number of path segments allowed in a single import path.
 ///
@@ -55,7 +57,9 @@ const MAX_PATH_SEGMENTS: usize = 256;
 ///   returns `true`. The resolver never sees those paths, so this is the one check
 ///   it cannot make on the backend's behalf. [`NativeFs`] scans every canonical path
 ///   it resolves (`mds::io`); [`VirtualFs`] composes its keys only from entry keys,
-///   import strings and base directories the resolver has already checked.
+///   import strings and base directories the resolver has already checked, and from
+///   alias targets, each of which [`VirtualFs::with_aliases`] checks as a key an
+///   import can resolve to.
 /// - **Path traversal prevention**: `resolve_entry` and `normalize_in_dir` must
 ///   reject paths that escape the intended root (e.g., `../../../etc/passwd`).
 /// - **Direct calls**: `resolve_entry` and `normalize_in_dir` must refuse an empty
@@ -206,17 +210,17 @@ pub(crate) fn first_forbidden_char(path: &str) -> Option<char> {
 }
 
 /// The message for a path refused because it carries a forbidden path character
-/// (#265): `<what> contains forbidden character U+XXXX: "<shown>"`.
+/// (#265): `<what> contains forbidden character U+XXXX: "<typed>"`.
 ///
-/// `shown` is the path as the caller typed it, escaped with
+/// `typed` is the path as the caller typed it, raw: it is escaped here, with
 /// [`crate::escape_path_for_message`], so the message itself carries none of the
 /// 80 forbidden codepoints (TAB included) and never substitutes a resolved absolute
 /// path for what the caller passed.
-pub(crate) fn forbidden_char_message(what: &str, ch: char, shown: &str) -> String {
+pub(crate) fn forbidden_char_message(what: &str, ch: char, typed: &str) -> String {
     format!(
         "{what} contains forbidden character U+{:04X}: \"{}\"",
         u32::from(ch),
-        crate::lint::escape_path_for_message(shown)
+        crate::lint::escape_path_for_message(typed)
     )
 }
 
@@ -229,27 +233,57 @@ pub(crate) fn reject_forbidden_path_chars(what: &str, path: &str) -> Result<(), 
     }
 }
 
+/// Refuse `path` when it carries a [`crate::is_forbidden_path_char`] codepoint
+/// anywhere in it (#265): [`MdsError::Io`], `<what> contains forbidden character
+/// U+XXXX: "<typed>"`, naming the first such codepoint.
+///
+/// `path` is what is scanned and `typed` what the message names: the path as the
+/// caller typed it, raw — the message escapes it with
+/// [`crate::escape_path_for_message`], so pass it unescaped. It differs from `path`
+/// when `path` is the form it resolves to, so the message never shows a resolved
+/// absolute path the caller did not type. A path that is not valid UTF-8 is scanned
+/// lossily: every forbidden codepoint that is validly encoded survives the conversion.
+///
+/// mds-core words its own refusals of a path with the same message, so a caller that
+/// checks a path mds-core never sees (an output location, say) refuses it in the same
+/// words.
+///
+/// # Errors
+///
+/// [`MdsError::Io`] when `path` carries a forbidden path character.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// mds::reject_forbidden_path("output", Path::new("out/page.md"), "out/page.md")?;
+///
+/// let err = mds::reject_forbidden_path("output", Path::new("out\tdir"), "link").unwrap_err();
+/// assert_eq!(
+///     err.to_string(),
+///     "output contains forbidden character U+0009: \"link\""
+/// );
+/// # Ok::<(), mds::MdsError>(())
+/// ```
+pub fn reject_forbidden_path(what: &str, path: &Path, typed: &str) -> Result<(), MdsError> {
+    match first_forbidden_char(&path.to_string_lossy()) {
+        Some(ch) => Err(MdsError::io(forbidden_char_message(what, ch, typed))),
+        None => Ok(()),
+    }
+}
+
 /// Refuse a resolved path that carries a forbidden path character anywhere in it
-/// (`mds::io`, #265).
+/// (`mds::io`, #265): [`reject_forbidden_path`] as `resolved path`.
 ///
 /// The typed path has already been checked by the time a path is resolved; this
 /// catches what the typed form cannot show — a symlinked directory whose target has a
 /// hostile name, or a project that lives under one. The WHOLE path is scanned, not
-/// only its final component. The message names `shown`, the path the caller typed,
-/// never the absolute resolved path (R3 / CWE-209).
-///
-/// A path that is not valid UTF-8 is scanned lossily: every forbidden codepoint that
-/// is validly encoded survives the conversion, and `key_of` then refuses the path
-/// rather than turn it into a key.
-pub(crate) fn reject_forbidden_in_path(resolved: &Path, shown: &str) -> Result<(), MdsError> {
-    match first_forbidden_char(&resolved.to_string_lossy()) {
-        Some(ch) => Err(MdsError::io(forbidden_char_message(
-            "resolved path",
-            ch,
-            shown,
-        ))),
-        None => Ok(()),
-    }
+/// only its final component. The message names `typed`, the path the caller typed
+/// (raw, escaped in the message), never the absolute resolved path (R3 / CWE-209). A path that is not valid UTF-8 is
+/// scanned lossily, and `key_of` then refuses it rather than turn it into a key.
+pub(crate) fn reject_forbidden_in_path(resolved: &Path, typed: &str) -> Result<(), MdsError> {
+    reject_forbidden_path("resolved path", resolved, typed)
 }
 
 /// The key of a resolved `canonical` path: its exact UTF-8 string form.
@@ -337,6 +371,198 @@ fn check_segment_count(path: &str) -> Result<(), MdsError> {
     Ok(())
 }
 
+// ── Module bytes ─────────────────────────────────────────────────────────────
+
+/// Check a module file's bytes as [`NativeFs`] checks every file it reads, and
+/// return its text: more than [`crate::MAX_FILE_SIZE`] bytes is refused with
+/// [`MdsError::ResourceLimit`] (`file too large (<n> bytes, max <max> bytes):
+/// <display>`), and bytes that are not valid UTF-8 with [`MdsError::Io`] (`invalid
+/// UTF-8 in <display>: <reason>`). A leading byte-order mark is kept, as the
+/// template's first character.
+///
+/// `display` names the file in both messages — [`NativeFs`] passes its path relative
+/// to the project root — escaped with [`crate::escape_path_for_message`]. It is the
+/// one implementation of these checks for a module read as bytes: [`NativeFs`] reads a
+/// module and calls it, `mds::lint` calls it when it re-reads its entry, and so does
+/// `@mdscript/mds`'s WASM backend, whose JS pre-scanner reads each file itself
+/// (`preflightModule`), so both backends refuse the same bytes with the same error
+/// (#414). [`VirtualFs`] holds text, not bytes: its `read` keeps its own size check.
+///
+/// # Errors
+///
+/// [`MdsError::ResourceLimit`] over the size cap; [`MdsError::Io`] for invalid UTF-8,
+/// including an incomplete sequence at the end.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(mds::check_module_bytes(b"Hello!\n".to_vec(), "hi.mds")?, "Hello!\n");
+///
+/// let err = mds::check_module_bytes(vec![b'h', 0xff], "bad.mds").unwrap_err();
+/// assert_eq!(
+///     err.to_string(),
+///     "invalid UTF-8 in bad.mds: invalid utf-8 sequence of 1 bytes from index 1"
+/// );
+/// # Ok::<(), mds::MdsError>(())
+/// ```
+pub fn check_module_bytes(bytes: Vec<u8>, display: &str) -> Result<String, MdsError> {
+    if bytes.len() as u64 > MAX_FILE_SIZE {
+        return Err(file_too_large(bytes.len() as u64, display));
+    }
+    String::from_utf8(bytes).map_err(|e| {
+        MdsError::io(format!(
+            "invalid UTF-8 in {}: {e}",
+            crate::lint::escape_path_for_message(display)
+        ))
+    })
+}
+
+/// The refusal of a module file of `size` bytes, over [`crate::MAX_FILE_SIZE`], named
+/// by `display`, escaped.
+fn file_too_large(size: u64, display: &str) -> MdsError {
+    MdsError::resource_limit(format!(
+        "file too large ({size} bytes, max {MAX_FILE_SIZE} bytes): {}",
+        crate::lint::escape_path_for_message(display)
+    ))
+}
+
+/// Read the module file at `path` and check it as [`check_module_bytes`] does, naming
+/// it by `display`, escaped in every refusal, without ever holding more than one byte
+/// over [`crate::MAX_FILE_SIZE`] of it (#428): a file over the cap when it is opened is
+/// refused before a byte is read, with its size; one that grows past the cap while it
+/// is read is read to one byte past the cap and refused. A module that is not a regular
+/// file — a directory, a FIFO, a device, a socket — is refused before it is opened, as
+/// `cannot read <display>: not a regular file`, the refusal `@mdscript/mds`'s WASM
+/// backend makes: opening a FIFO nobody writes to blocks. [`NativeFs::read`] and
+/// `mds::lint`'s re-read of its entry read a module through it.
+pub(crate) fn read_module_file(path: &Path, display: &str) -> Result<String, MdsError> {
+    let bytes = match read_regular_capped(path, MAX_FILE_SIZE) {
+        Ok(Capped::Bytes(bytes)) => bytes,
+        Ok(Capped::TooLarge(size)) => return Err(file_too_large(size, display)),
+        Err(e) => {
+            return Err(MdsError::io(format!(
+                "cannot read {}: {e}",
+                crate::lint::escape_path_for_message(display)
+            )));
+        }
+    };
+    check_module_bytes(bytes, display)
+}
+
+/// A file read under a size cap (see [`read_capped`]).
+pub(crate) enum Capped {
+    /// Its bytes: at most one more than the cap, and one more means it is over it.
+    Bytes(Vec<u8>),
+    /// Its size when it was opened, over the cap: nothing was read.
+    TooLarge(u64),
+}
+
+/// Open `path` and read it, holding no more than one byte over `cap` of it: a file
+/// over `cap` when it is opened is reported by its size, unread; any other is read to
+/// its end or to one byte past `cap`, whichever comes first. The size is taken from
+/// the opened file, so no other file can take its place between the two.
+pub(crate) fn read_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    read_opened_capped(file, size, cap)
+}
+
+/// [`read_capped`] for a regular file only: anything else fails with
+/// [`not_a_regular_file`], judged on `path` before it is opened — opening a FIFO nobody
+/// writes to blocks — and again on the opened file, which may have taken its place in
+/// between.
+fn read_regular_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_a_regular_file());
+    }
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(not_a_regular_file());
+    }
+    read_opened_capped(file, metadata.len(), cap)
+}
+
+/// Read the opened `file`, whose size taken from it is `size`, as [`read_capped`] reads.
+fn read_opened_capped(mut file: std::fs::File, size: u64, cap: u64) -> std::io::Result<Capped> {
+    if size > cap {
+        return Ok(Capped::TooLarge(size));
+    }
+    read_at_most(&mut file, cap.saturating_add(1), size).map(Capped::Bytes)
+}
+
+/// Why a module that is not a regular file is not read — the reason
+/// `@mdscript/mds`'s WASM backend gives for it too.
+fn not_a_regular_file() -> std::io::Error {
+    std::io::Error::other("not a regular file")
+}
+
+/// How many reads in a row may be interrupted before `read_at_most` gives up.
+const MAX_INTERRUPTED_READS: u32 = 64;
+
+/// Read `reader` to its end or to `limit` bytes, whichever comes first, into a buffer
+/// whose capacity never exceeds `limit` (#428): it starts at `size_hint` plus one byte
+/// (room to see the end of a source whose size is known without growing) and grows by
+/// at most doubling, capped at `limit`.
+///
+/// Pass one byte more than a size cap as `limit` to tell a source of exactly the cap
+/// from a larger one while holding no more than that one byte over it; mds-core reads
+/// every module file this way, and the CLI its stdin, its `mds.json` and the head of a
+/// stale source map.
+///
+/// Every read that returns bytes brings the buffer closer to `limit`, and at most 64
+/// reads in a row may be interrupted, so the loop is bounded.
+///
+/// # Errors
+///
+/// The first error `reader` returns other than [`std::io::ErrorKind::Interrupted`], and
+/// that one when more than 64 reads in a row are interrupted.
+///
+/// # Examples
+///
+/// ```
+/// let bytes = mds::read_at_most(&mut &b"Hello!\n"[..], 4, 0)?;
+/// assert_eq!(bytes, b"Hell");
+/// assert!(bytes.capacity() <= 4);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn read_at_most(
+    reader: &mut impl std::io::Read,
+    limit: u64,
+    size_hint: u64,
+) -> std::io::Result<Vec<u8>> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let first = usize::try_from(size_hint)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1)
+        .min(limit);
+    let mut buf: Vec<u8> = Vec::with_capacity(first);
+    let mut chunk = [0u8; 8 * 1024];
+    let mut interrupted = 0;
+    while buf.len() < limit {
+        let want = chunk.len().min(limit - buf.len());
+        let n = match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                interrupted += 1;
+                if interrupted > MAX_INTERRUPTED_READS {
+                    return Err(e);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        interrupted = 0;
+        if buf.capacity() - buf.len() < n {
+            // Double, but never past `limit`: `n` fits, as `want` did.
+            buf.reserve_exact(buf.capacity().max(n).min(limit - buf.len()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
 // ── VirtualFs segment logic ──────────────────────────────────────────────────
 
 /// Resolve a relative path string against a pre-split directory segment stack.
@@ -397,13 +623,214 @@ fn resolve_relative_segments<'a>(
 #[derive(Debug)]
 pub struct VirtualFs {
     modules: HashMap<String, String>,
+    /// A key an import resolves to → the key of the module in `modules` it names
+    /// (see [`VirtualFs::with_aliases`]).
+    aliases: HashMap<String, String>,
 }
 
 impl VirtualFs {
     /// Create a new `VirtualFs` from a map of key → content.
     pub fn new(modules: HashMap<String, String>) -> Self {
-        Self { modules }
+        Self {
+            modules,
+            aliases: HashMap::new(),
+        }
     }
+
+    /// Let an import that resolves to the key `alias` reach the module keyed
+    /// `aliases[alias]` instead: that module's key is the one the import resolves to,
+    /// and so the one its dependency, its source-map source and a cycle through it are
+    /// named by. An entry key is taken as given.
+    ///
+    /// `@mdscript/mds`'s WASM backend reads the modules of a `compileFile` itself and
+    /// keys each by its path on disk below the project root. An import can name a file
+    /// by another spelling — a case variant on a case-insensitive volume, or a path
+    /// through a symbolic link — which the backend passes as an alias, so every module
+    /// is named by its on-disk path, as the native backend names it (#414).
+    ///
+    /// Every alias and every module key it names is checked as a key an import can
+    /// resolve to — not empty, free of [`crate::is_forbidden_path_char`] codepoints, and
+    /// made of at most 256 segments, none of them empty, `.` or `..` — however the
+    /// spelling that led to it was checked: folding a name's case is a lossy mapping,
+    /// so the key a module is reached by is validated as the key it is. Every alias must
+    /// name a module, and no alias may be a module key itself.
+    ///
+    /// The map is bounded before any alias in it is checked: at most
+    /// [`crate::MAX_MODULE_ALIASES`] aliases, whose keys and the module keys they name
+    /// total at most 10 MiB — the bounds the WASM `moduleAliases` option applies as it
+    /// is read.
+    ///
+    /// # Errors
+    ///
+    /// A [`ModuleAliasError`], which converts into an [`MdsError`]:
+    /// [`ModuleAliasError::TooMany`] or [`ModuleAliasError::TooLarge`] for a map past a
+    /// bound (`mds::resource_limit`), then [`ModuleAliasError::Refused`] for the first
+    /// offending alias in key order (`mds::io`), naming it escaped with
+    /// [`crate::escape_path_for_message`]: `module alias "<alias>": <reason>`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mds::FileSystem;
+    ///
+    /// let modules = HashMap::from([("header.mds".to_string(), "Hi\n".to_string())]);
+    /// let aliases = HashMap::from([("Header.mds".to_string(), "header.mds".to_string())]);
+    /// let fs = mds::VirtualFs::new(modules.clone()).with_aliases(aliases)?;
+    /// assert_eq!(fs.normalize_in_dir("", "./Header.mds")?, "header.mds");
+    ///
+    /// let missing = HashMap::from([("Header.mds".to_string(), "gone.mds".to_string())]);
+    /// let err = mds::VirtualFs::new(modules).with_aliases(missing).unwrap_err();
+    /// assert!(matches!(err, mds::ModuleAliasError::Refused { .. }));
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "module alias \"Header.mds\": its module key \"gone.mds\" names no module"
+    /// );
+    /// # Ok::<(), mds::MdsError>(())
+    /// ```
+    pub fn with_aliases(
+        mut self,
+        aliases: HashMap<String, String>,
+    ) -> Result<Self, ModuleAliasError> {
+        if aliases.len() > MAX_MODULE_ALIASES {
+            return Err(ModuleAliasError::TooMany {
+                count: aliases.len(),
+            });
+        }
+        let size = aliases.iter().fold(0usize, |size, (alias, target)| {
+            size.saturating_add(alias.len())
+                .saturating_add(target.len())
+        });
+        if size > MAX_MODULE_ALIASES_SIZE {
+            return Err(ModuleAliasError::TooLarge);
+        }
+        let mut keys: Vec<&String> = aliases.keys().collect();
+        keys.sort_unstable();
+        for alias in keys {
+            if let Some(reason) = alias_violation(&self.modules, alias, &aliases[alias]) {
+                return Err(ModuleAliasError::Refused {
+                    alias: crate::lint::escape_path_for_message(alias).into_owned(),
+                    reason,
+                });
+            }
+        }
+        self.aliases = aliases;
+        Ok(self)
+    }
+
+    /// The source of the module keyed `key`, if there is one.
+    pub(crate) fn module(&self, key: &str) -> Option<&str> {
+        self.modules.get(key).map(String::as_str)
+    }
+}
+
+/// Why [`VirtualFs::with_aliases`] refused an alias map (#414).
+///
+/// Its text is the message of the [`MdsError`] it converts into (with `?`, or
+/// [`From`]): [`TooMany`](Self::TooMany) and [`TooLarge`](Self::TooLarge) become
+/// `mds::resource_limit`, [`Refused`](Self::Refused) `mds::io`. A binding that names the
+/// alias in its own words reads [`Refused`](Self::Refused)'s fields, which are escaped.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleAliasError {
+    /// More than [`crate::MAX_MODULE_ALIASES`] aliases:
+    /// `module alias count exceeds maximum of 65536 (<count> provided)`.
+    #[non_exhaustive]
+    TooMany {
+        /// How many aliases the map holds.
+        count: usize,
+    },
+    /// Aliases whose keys and module keys total more than 10 MiB:
+    /// `module aliases aggregate size exceeds maximum of 10485760 bytes`.
+    #[non_exhaustive]
+    TooLarge,
+    /// The first alias, in key order, that cannot join the filesystem:
+    /// `module alias "<alias>": <reason>`.
+    #[non_exhaustive]
+    Refused {
+        /// The alias, escaped with [`crate::escape_path_for_message`].
+        alias: String,
+        /// Why it is refused; a module key it names is escaped the same way.
+        reason: String,
+    },
+}
+
+// `#[inline]` on `fmt` and `from` so a binding compiles them at its own optimization
+// level: mds-wasm is built for size, and compiled in mds-core (opt-level 3) these two
+// measured about 5.6 KB larger in the WASM binary.
+impl std::fmt::Display for ModuleAliasError {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleAliasError::TooMany { count } => write!(
+                f,
+                "module alias count exceeds maximum of {MAX_MODULE_ALIASES} ({count} provided)"
+            ),
+            ModuleAliasError::TooLarge => write!(
+                f,
+                "module aliases aggregate size exceeds maximum of {MAX_MODULE_ALIASES_SIZE} bytes"
+            ),
+            ModuleAliasError::Refused { alias, reason } => {
+                write!(f, "module alias \"{alias}\": {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModuleAliasError {}
+
+impl From<ModuleAliasError> for MdsError {
+    #[inline]
+    fn from(err: ModuleAliasError) -> Self {
+        match err {
+            ModuleAliasError::Refused { .. } => MdsError::io(err.to_string()),
+            ModuleAliasError::TooMany { .. } | ModuleAliasError::TooLarge => {
+                MdsError::resource_limit(err.to_string())
+            }
+        }
+    }
+}
+
+/// Why `alias` → `target` cannot join a `VirtualFs` holding `modules`, if it cannot
+/// (see [`VirtualFs::with_aliases`]).
+fn alias_violation(modules: &HashMap<String, String>, alias: &str, target: &str) -> Option<String> {
+    if let Some(reason) = module_key_violation(alias) {
+        return Some(format!("the alias {reason}"));
+    }
+    if modules.contains_key(alias) {
+        return Some("the alias is a module key itself".to_owned());
+    }
+    let shown = crate::lint::escape_path_for_message(target);
+    if let Some(reason) = module_key_violation(target) {
+        return Some(format!("its module key \"{shown}\" {reason}"));
+    }
+    (!modules.contains_key(target)).then(|| format!("its module key \"{shown}\" names no module"))
+}
+
+/// Why `key` is not a key an import can resolve to on a [`VirtualFs`] — the form
+/// `normalize_in_dir` produces — if it is not.
+fn module_key_violation(key: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("is empty".to_owned());
+    }
+    if let Some(ch) = first_forbidden_char(key) {
+        return Some(format!(
+            "contains forbidden character U+{:04X}",
+            u32::from(ch)
+        ));
+    }
+    let mut segments = 0usize;
+    for segment in key.split('/') {
+        match segment {
+            ".." => return Some("has a '..' segment".to_owned()),
+            "" | "." => {
+                return Some("is not normalized: it has an empty or '.' segment".to_owned())
+            }
+            _ => segments += 1,
+        }
+    }
+    (segments > MAX_PATH_SEGMENTS)
+        .then(|| format!("exceeds maximum segment count ({MAX_PATH_SEGMENTS})"))
 }
 
 impl FileSystem for VirtualFs {
@@ -427,7 +854,12 @@ impl FileSystem for VirtualFs {
         // `join("/")` inside `resolve_relative_segments` allocates.
         let dir_segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
 
-        resolve_relative_segments(dir_segments, relative)
+        let key = resolve_relative_segments(dir_segments, relative)?;
+        // An alias resolves to the key of the module it names (`with_aliases`).
+        Ok(match self.aliases.get(&key) {
+            Some(target) => target.clone(),
+            None => key,
+        })
     }
 
     fn parent_dir(&self, key: &str) -> String {
@@ -488,6 +920,12 @@ pub fn effective_parent(path: &Path) -> &Path {
     }
 }
 
+/// The refusal of a directory path, named by `shown`, that resolves to something other
+/// than a directory (`mds::io`).
+fn not_a_directory(shown: &str) -> MdsError {
+    MdsError::io(format!("cannot resolve path {shown}: not a directory"))
+}
+
 impl NativeFs {
     /// Create a new `NativeFs` with no root directory set.
     ///
@@ -531,6 +969,58 @@ impl NativeFs {
         Self::check_symlink_named(path, &shown)
     }
 
+    /// Canonicalize the directory `path`, taking a path with no final name (`.`, `..`,
+    /// `sub/..`) as well as one with a final name, which is all
+    /// [`check_symlink`](Self::check_symlink) takes (#413).
+    ///
+    /// A path with a final name (`src`, `src/`, `src/.`) is checked by `check_symlink`'s
+    /// rule: its final component is judged by its own file type, so a trailing `/` or
+    /// `/.` does not make it follow a link. A path with no final name is canonicalized as
+    /// the operating system resolves it, and names no link: `link/..` is the directory
+    /// above the link's target on Unix. Either way, a canonical form carrying a
+    /// [`crate::is_forbidden_path_char`] codepoint — which a symlinked or hostile-named
+    /// directory above the path can bring in — is refused with the same message, and
+    /// the canonical form must be a directory. A filesystem root is accepted.
+    ///
+    /// Every message names `path` as passed, never its canonical form.
+    ///
+    /// # Errors
+    ///
+    /// - `MdsError::Io` — `path` carries a forbidden path character (`path contains
+    ///   forbidden character U+XXXX: "<path>"`), checked before the filesystem is
+    ///   touched; its canonical form carries one (`resolved path contains forbidden
+    ///   character U+XXXX: "<path>"`); or it is not a directory (`cannot resolve path
+    ///   <path>: not a directory`).
+    /// - `MdsError::ImportError` — its final component is a symlink.
+    /// - `MdsError::FileNotFound` — it does not resolve.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// let here = mds::NativeFs::check_directory(Path::new("."))?;
+    /// assert_eq!(here, std::env::current_dir()?.canonicalize()?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn check_directory(path: &Path) -> Result<PathBuf, MdsError> {
+        let shown = path.display().to_string();
+        reject_forbidden_path_chars("path", &shown)?;
+        let canonical = if path.file_name().is_some() {
+            Self::check_symlink_named(path, &shown)?
+        } else {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| MdsError::file_not_found(shown.clone()))?;
+            reject_forbidden_in_path(&canonical, &shown)?;
+            canonical
+        };
+        if !canonical.is_dir() {
+            return Err(not_a_directory(&shown));
+        }
+        Ok(canonical)
+    }
+
     /// Canonicalize a directory path, handling the filesystem-root edge case (#371).
     ///
     /// A filesystem root (`/` on Unix, or a drive root such as `C:\` on
@@ -572,9 +1062,7 @@ impl NativeFs {
                 .canonicalize()
                 .map_err(|e| MdsError::io(format!("cannot resolve path {shown}: {e}")))?;
             if !canonical.is_dir() {
-                return Err(MdsError::io(format!(
-                    "cannot resolve path {shown}: not a directory"
-                )));
+                return Err(not_a_directory(shown));
             }
             reject_forbidden_in_path(&canonical, shown)?;
             Ok(canonical)
@@ -692,16 +1180,25 @@ impl NativeFs {
     /// security primitives — no `Path`→`String`→`Path` round-trip on the hot path.
     ///
     /// Validates `relative` (empty, null byte, forbidden path characters, segment
-    /// cap), joins with `dir` via `Path::join` (verbatim-path-safe on Windows;
-    /// avoids PF-003 / #133), then runs `check_symlink_named` (which also refuses a
-    /// forbidden character anywhere in the canonical path) and
-    /// `check_path_traversal` before returning the canonical key string.
+    /// cap), refuses one whose last component is `..` as not found, joins with `dir`
+    /// via `Path::join` (verbatim-path-safe on Windows; avoids PF-003 / #133), then
+    /// runs `check_symlink_named` (which also refuses a forbidden character anywhere
+    /// in the canonical path) and `check_path_traversal` before returning the
+    /// canonical key string.
     ///
     /// Does NOT call `init_root` — only entry-point resolution
     /// ([`FileSystem::resolve_entry`]) anchors the security root.
     fn normalize_in_dir_impl(&self, dir: &Path, relative: &str) -> Result<String, MdsError> {
         validate_relative_import(relative)?;
         check_segment_count(relative)?;
+        // A path whose last component is `..` (`../`, `./sub/..`, and `sub\..` on
+        // Windows) names a directory, never a file: not found, on every OS (#414).
+        // Decided on the path as written: on POSIX the joined path has no final name
+        // either, but on Windows joining onto the verbatim (`\\?\`) canonical `dir`
+        // collapses the `..` lexically and names that directory by its own name.
+        if Path::new(relative).components().next_back() == Some(Component::ParentDir) {
+            return Err(MdsError::file_not_found(relative));
+        }
         let path = dir.join(relative);
         // Use check_symlink_named so the error message shows the relative import
         // string (what the user typed) rather than the absolute joined path (R3 / CWE-209).
@@ -763,20 +1260,11 @@ impl FileSystem for NativeFs {
         // Compute a display-safe (root-relative) path before any IO so errors
         // always show a relative path rather than the canonical absolute key (R3 / CWE-209).
         let display = self.display_of(path);
-        // Read bytes first, then check size — this is the TOCTOU-safe pattern.
-        // A metadata() pre-check would introduce a race window between the size
-        // check and the actual read. Read first, reject after.
-        let bytes =
-            std::fs::read(path).map_err(|e| MdsError::io(format!("cannot read {display}: {e}")))?;
-        if bytes.len() as u64 > MAX_FILE_SIZE {
-            return Err(MdsError::resource_limit(format!(
-                "file too large ({} bytes, max {} bytes): {display}",
-                bytes.len(),
-                MAX_FILE_SIZE,
-            )));
-        }
-        String::from_utf8(bytes)
-            .map_err(|e| MdsError::io(format!("invalid UTF-8 in {display}: {e}")))
+        // A module that is not a regular file is refused before it is opened; the size
+        // is taken from the opened file, and the read itself stops one byte past the
+        // cap, so neither a file swapped nor one grown after the check is held in
+        // memory whole (#428).
+        read_module_file(path, &display)
     }
 
     fn is_markdown(&self, normalized: &str) -> bool {
@@ -965,6 +1453,270 @@ mod tests {
             matches!(err, MdsError::ModuleNotFound { .. }),
             "expected ModuleNotFound, got {err:?}"
         );
+    }
+
+    // ── VirtualFs::with_aliases (#414) ────────────────────────────────────────
+
+    /// A module map holding each of `keys`.
+    fn modules_of(keys: &[&str]) -> HashMap<String, String> {
+        keys.iter()
+            .map(|k| ((*k).to_owned(), format!("{k}\n")))
+            .collect()
+    }
+
+    /// An alias map of `(alias, module key)` pairs.
+    fn aliases_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, t)| ((*a).to_owned(), (*t).to_owned()))
+            .collect()
+    }
+
+    /// An import that resolves to an alias resolves to the module it names; any other
+    /// import, and an entry key, resolves as without aliases.
+    #[test]
+    fn vfs_alias_resolves_an_import_to_the_module_it_names() {
+        let modules = modules_of(&["main.mds", "sub/header.mds"]);
+        let fs = VirtualFs::new(modules.clone())
+            .with_aliases(aliases_of(&[("SUB/Header.mds", "sub/header.mds")]))
+            .expect("a valid alias");
+        assert_eq!(
+            fs.normalize_in_dir("", "./SUB/Header.mds").unwrap(),
+            "sub/header.mds"
+        );
+        assert_eq!(
+            fs.normalize_in_dir("sub", "../SUB/Header.mds").unwrap(),
+            "sub/header.mds"
+        );
+        assert_eq!(
+            fs.normalize_in_dir("", "./sub/header.mds").unwrap(),
+            "sub/header.mds"
+        );
+        assert_eq!(
+            fs.resolve_entry("SUB/Header.mds").unwrap(),
+            "SUB/Header.mds"
+        );
+        // Control: without the alias, the spelling is a key of its own.
+        assert_eq!(
+            VirtualFs::new(modules)
+                .normalize_in_dir("", "./SUB/Header.mds")
+                .unwrap(),
+            "SUB/Header.mds"
+        );
+    }
+
+    /// Every alias and every module key it names is checked as a key an import can
+    /// resolve to — a hostile or malformed one is refused, never trusted from the
+    /// spelling that led to it — a target must be a module and an alias must not be;
+    /// the offending alias is named escaped (PF-013: the hostile character is shown as
+    /// escape text, never raw).
+    #[test]
+    fn vfs_with_aliases_refuses_an_alias_that_is_not_a_module_key() {
+        let esc = char::from_u32(0x1b).expect("U+001B is a char");
+        let hostile = format!("a{esc}b.mds");
+        let shown = format!("a{}u001Bb.mds", '\\');
+        let long = ["s"; 257].join("/");
+        let modules = modules_of(&["a.mds", "sub/b.mds"]);
+        let cases: Vec<(String, String, String)> = vec![
+            ("".into(), "a.mds".into(), "module alias \"\": the alias is empty".into()),
+            (
+                hostile.clone(),
+                "a.mds".into(),
+                format!("module alias \"{shown}\": the alias contains forbidden character U+001B"),
+            ),
+            ("../a.mds".into(), "a.mds".into(), "module alias \"../a.mds\": the alias has a '..' segment".into()),
+            ("x/../a.mds".into(), "a.mds".into(), "module alias \"x/../a.mds\": the alias has a '..' segment".into()),
+            (
+                "x/./a.mds".into(),
+                "a.mds".into(),
+                "module alias \"x/./a.mds\": the alias is not normalized: it has an empty or '.' segment".into(),
+            ),
+            (
+                "/A.mds".into(),
+                "a.mds".into(),
+                "module alias \"/A.mds\": the alias is not normalized: it has an empty or '.' segment".into(),
+            ),
+            (
+                long.clone(),
+                "a.mds".into(),
+                format!("module alias \"{long}\": the alias exceeds maximum segment count (256)"),
+            ),
+            (
+                "A.mds".into(),
+                "../a.mds".into(),
+                "module alias \"A.mds\": its module key \"../a.mds\" has a '..' segment".into(),
+            ),
+            (
+                "A.mds".into(),
+                hostile.clone(),
+                format!("module alias \"A.mds\": its module key \"{shown}\" contains forbidden character U+001B"),
+            ),
+            (
+                "A.mds".into(),
+                "gone.mds".into(),
+                "module alias \"A.mds\": its module key \"gone.mds\" names no module".into(),
+            ),
+            (
+                "a.mds".into(),
+                "sub/b.mds".into(),
+                "module alias \"a.mds\": the alias is a module key itself".into(),
+            ),
+        ];
+        for (alias, target, message) in cases {
+            let err = VirtualFs::new(modules.clone())
+                .with_aliases(HashMap::from([(alias.clone(), target.clone())]))
+                .expect_err(&message);
+            // The alias and the reason apart, as a binding words them.
+            let ModuleAliasError::Refused {
+                alias: ref shown_alias,
+                ref reason,
+            } = err
+            else {
+                panic!("{err:?}");
+            };
+            assert_eq!(format!("module alias \"{shown_alias}\": {reason}"), message);
+            let err = MdsError::from(err);
+            assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+            assert_eq!(err.to_string(), message);
+            assert!(!err.to_string().contains(esc), "{message}");
+        }
+        // Of several offending aliases, the first in key order is named.
+        let err = VirtualFs::new(modules.clone())
+            .with_aliases(aliases_of(&[("b.mds", "nope.mds"), ("A.mds", "gone.mds")]))
+            .expect_err("two aliases name no module");
+        assert_eq!(
+            err.to_string(),
+            "module alias \"A.mds\": its module key \"gone.mds\" names no module"
+        );
+        // No alias leads to another: one naming an alias names no module, and one
+        // named by an alias is a module key, so either link of a chain is refused.
+        for (chain, message) in [
+            (
+                aliases_of(&[("A.mds", "B.mds"), ("B.mds", "a.mds")]),
+                "module alias \"A.mds\": its module key \"B.mds\" names no module",
+            ),
+            (
+                aliases_of(&[("X.mds", "a.mds"), ("a.mds", "sub/b.mds")]),
+                "module alias \"a.mds\": the alias is a module key itself",
+            ),
+        ] {
+            let err = VirtualFs::new(modules.clone())
+                .with_aliases(chain)
+                .expect_err(message);
+            assert_eq!(err.to_string(), message);
+        }
+        // Control: a clean alias to either module is accepted.
+        VirtualFs::new(modules)
+            .with_aliases(aliases_of(&[
+                ("A.mds", "a.mds"),
+                ("SUB/B.mds", "sub/b.mds"),
+            ]))
+            .expect("clean aliases");
+    }
+
+    /// #414: an alias map is bounded before any alias is checked, as the WASM `modules`
+    /// option is: more than 65,536 aliases, or aliases and the module keys they name that
+    /// together pass 10 MiB, is `mds::resource_limit`. A map at either bound is accepted
+    /// (the controls), and one past a bound is refused so even when every alias in it
+    /// would be refused too.
+    #[test]
+    fn vfs_with_aliases_bounds_the_count_and_the_size_of_the_map() {
+        const COUNT: usize = 65_536;
+        let size = usize::try_from(MAX_FILE_SIZE).expect("10 MiB fits a usize");
+        let modules = modules_of(&["a.mds"]);
+        let with = |aliases: HashMap<String, String>| {
+            VirtualFs::new(modules.clone())
+                .with_aliases(aliases)
+                .map(drop)
+                .map_err(MdsError::from)
+        };
+        let refused = |aliases: HashMap<String, String>, message: &str| {
+            let err = with(aliases).expect_err(message);
+            assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                format!("resource limit exceeded: {message}")
+            );
+        };
+
+        let many = |n: usize, target: &str| -> HashMap<String, String> {
+            (0..n)
+                .map(|i| (format!("A{i}.mds"), target.to_owned()))
+                .collect()
+        };
+        with(many(COUNT, "a.mds")).expect("at the count bound");
+        let too_many = format!(
+            "module alias count exceeds maximum of {COUNT} ({} provided)",
+            COUNT + 1
+        );
+        refused(many(COUNT + 1, "a.mds"), &too_many);
+        refused(many(COUNT + 1, "gone.mds"), &too_many);
+
+        // One alias whose key and module key total `total` bytes.
+        let sized = |total: usize, target: &str| {
+            let alias = format!("{}.mds", "x".repeat(total - target.len() - ".mds".len()));
+            HashMap::from([(alias, target.to_owned())])
+        };
+        with(sized(size, "a.mds")).expect("at the size bound");
+        let too_large = format!("module aliases aggregate size exceeds maximum of {size} bytes");
+        refused(sized(size + 1, "a.mds"), &too_large);
+        refused(sized(size + 1, "gone.mds"), &too_large);
+
+        // The typed refusals, and the constants they name.
+        assert_eq!(COUNT, MAX_MODULE_ALIASES);
+        assert_eq!(size, MAX_MODULE_ALIASES_SIZE);
+        let typed = |aliases| {
+            VirtualFs::new(modules.clone())
+                .with_aliases(aliases)
+                .map(drop)
+        };
+        assert_eq!(
+            typed(many(COUNT + 1, "a.mds")),
+            Err(ModuleAliasError::TooMany { count: COUNT + 1 })
+        );
+        assert_eq!(
+            typed(sized(size + 1, "a.mds")),
+            Err(ModuleAliasError::TooLarge)
+        );
+    }
+
+    /// The key rule is exactly the form `normalize_in_dir` gives a key: a key passes it
+    /// if and only if resolving it from the key-space root returns it unchanged and it
+    /// carries no forbidden path character.
+    #[test]
+    fn vfs_module_key_rule_is_the_form_an_import_resolves_to() {
+        let at_cap = ["s"; 256].join("/");
+        let over_cap = ["s"; 257].join("/");
+        let hostile = format!("a{}b", char::from_u32(0x202e).expect("U+202E is a char"));
+        let keys = [
+            "a.mds",
+            "sub/a.mds",
+            "a b/\u{e9}.mds",
+            "back\\slash.mds",
+            "",
+            ".",
+            "..",
+            "./a.mds",
+            "a/./b",
+            "a/../b",
+            "a//b",
+            "/a",
+            "a/",
+            "../a",
+            &at_cap,
+            &over_cap,
+            &hostile,
+        ];
+        for key in keys {
+            let resolves_to_itself = first_forbidden_char(key).is_none()
+                && resolve_relative_segments(Vec::new(), key).ok().as_deref() == Some(key);
+            assert_eq!(
+                module_key_violation(key).is_none(),
+                resolves_to_itself,
+                "{key:?}: {:?}",
+                module_key_violation(key)
+            );
+        }
     }
 
     // ── VirtualFs::is_markdown ────────────────────────────────────────────────
@@ -1636,6 +2388,347 @@ mod tests {
         );
     }
 
+    // ── check_module_bytes: the one post-read check (#414) ───────────────────
+
+    #[test]
+    fn check_module_bytes_returns_the_text_keeping_a_bom() {
+        assert_eq!(
+            check_module_bytes(b"Hello!\n".to_vec(), "a.mds").unwrap(),
+            "Hello!\n"
+        );
+        let bom = [&[0xef, 0xbb, 0xbf][..], b"Hi\n"].concat();
+        assert_eq!(
+            check_module_bytes(bom, "a.mds").unwrap(),
+            format!("{}Hi\n", char::from_u32(0xfeff).unwrap())
+        );
+        assert_eq!(check_module_bytes(Vec::new(), "a.mds").unwrap(), "");
+    }
+
+    #[test]
+    fn check_module_bytes_refuses_one_byte_over_the_cap() {
+        let at_cap = vec![b'x'; MAX_FILE_SIZE as usize];
+        assert_eq!(
+            check_module_bytes(at_cap, "big.mds").unwrap().len(),
+            MAX_FILE_SIZE as usize
+        );
+        let err =
+            check_module_bytes(vec![b'x'; MAX_FILE_SIZE as usize + 1], "big.mds").unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::resource_limit"));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "resource limit exceeded: file too large ({} bytes, max {MAX_FILE_SIZE} bytes): big.mds",
+                MAX_FILE_SIZE + 1
+            )
+        );
+    }
+
+    #[test]
+    fn check_module_bytes_refuses_invalid_utf8_with_the_std_reason() {
+        for (bytes, reason) in [
+            (
+                vec![b'h', b'i', 0xff, b'\n'],
+                "invalid utf-8 sequence of 1 bytes from index 2",
+            ),
+            // An incomplete sequence at the very end (the first two bytes of U+20AC).
+            (
+                vec![b'h', b'i', b'\n', 0xe2, 0x82],
+                "incomplete utf-8 byte sequence from index 3",
+            ),
+        ] {
+            let err = check_module_bytes(bytes, "sub/bad.mds").unwrap_err();
+            assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+            assert_eq!(
+                err.to_string(),
+                format!("invalid UTF-8 in sub/bad.mds: {reason}")
+            );
+        }
+    }
+
+    /// The display is escaped as it enters a message; a clean one is unchanged (the
+    /// cases above).
+    #[test]
+    fn check_module_bytes_escapes_the_display() {
+        let esc = char::from_u32(0x1b).unwrap();
+        let hostile = format!("a{esc}b.mds");
+        let err = check_module_bytes(vec![0xff], &hostile).unwrap_err();
+        let message = err.to_string();
+        assert!(!message.contains(esc), "raw ESC in {message:?}");
+        assert!(
+            message.starts_with(&format!("invalid UTF-8 in a{}u001Bb.mds: ", '\\')),
+            "{message:?}"
+        );
+    }
+
+    /// NativeFs::read refuses exactly what check_module_bytes refuses, naming the file
+    /// by its path below the project root.
+    #[test]
+    fn native_read_refuses_invalid_utf8_as_check_module_bytes_does() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+        let bytes = vec![b'h', b'i', 0xff, b'\n'];
+        let path = dir.path().join("bad.mds");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let fs = NativeFs::new();
+        let key = fs.resolve_entry(&path.display().to_string()).unwrap();
+        let err = fs.read(&key).unwrap_err();
+        let expected = check_module_bytes(bytes, "bad.mds").unwrap_err();
+        assert_eq!(code_of(&err), code_of(&expected));
+        assert_eq!(err.to_string(), expected.to_string());
+        assert_eq!(
+            err.to_string(),
+            "invalid UTF-8 in bad.mds: invalid utf-8 sequence of 1 bytes from index 2"
+        );
+    }
+
+    /// `cannot read` escapes the display it names, as the size and UTF-8 refusals do,
+    /// whether the file is missing or not a regular file; a clean one is unchanged.
+    #[test]
+    fn read_module_file_escapes_the_display_in_cannot_read() {
+        let dir = TempDir::new().unwrap();
+        let esc = char::from_u32(0x1b).unwrap();
+        let hostile = format!("a{esc}b.mds");
+        let missing = dir.path().join("missing.mds");
+        let gone = std::fs::metadata(&missing).unwrap_err().to_string();
+        let mut mismatches = Vec::new();
+        for (path, reason) in [
+            (missing, gone),
+            (dir.path().to_path_buf(), "not a regular file".to_string()),
+        ] {
+            for (display, named) in [
+                (hostile.as_str(), format!("a{}u001Bb.mds", '\\')),
+                ("clean.mds", "clean.mds".to_string()),
+            ] {
+                let got = read_module_file(&path, display).map_err(|e| e.to_string());
+                if got != Err(format!("cannot read {named}: {reason}")) {
+                    mismatches.push(format!("{display:?} at {}: {got:?}", path.display()));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// Resolve `entry` as the resolver resolves an entry, then read it on a thread of
+    /// its own: its display name, and its text or its error's code and message — or
+    /// "still blocked after 10 s" for a read that has not returned by then, which a
+    /// detached thread then unblocks by opening `entry` for writing, as a FIFO's writer
+    /// would. Nothing waits for either thread, so no read can hang the test.
+    fn read_bounded(entry: &Path) -> (String, Result<String, String>) {
+        let fs = std::sync::Arc::new(NativeFs::new());
+        let key = fs
+            .resolve_entry(&entry.display().to_string())
+            .expect("the entry resolves");
+        let display = fs.display_of(Path::new(&key));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::sync::Arc::clone(&fs);
+        std::thread::spawn(move || {
+            let read = reader.read(&key).map_err(|e| {
+                let code = code_of(&e).unwrap_or_default();
+                format!("{code}: {e}")
+            });
+            let _ = tx.send(read);
+        });
+        let outcome = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(read) => read,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let fifo = entry.to_path_buf();
+                std::thread::spawn(move || {
+                    drop(std::fs::OpenOptions::new().write(true).open(fifo));
+                });
+                Err("still blocked after 10 s".to_string())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the read panicked".to_string())
+            }
+        };
+        (display, outcome)
+    }
+
+    /// A module that is not a regular file is refused before it is opened, with the
+    /// refusal `@mdscript/mds`'s WASM backend makes (#428): opening a FIFO nobody writes
+    /// to blocked, a device reporting no size was read to one byte past the cap, and a
+    /// directory failed with the operating system's own text.
+    #[test]
+    fn native_read_refuses_a_module_that_is_not_a_regular_file_before_opening_it() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+        std::fs::write(dir.path().join("ok.mds"), "Hi\n").unwrap();
+        std::fs::create_dir(dir.path().join("dir.mds")).unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut refused = vec![dir.path().join("dir.mds")];
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo.mds");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "mkfifo {}", fifo.display());
+            refused.push(fifo);
+            refused.push(PathBuf::from("/dev/zero"));
+        }
+        let mut mismatches = Vec::new();
+        for entry in &refused {
+            let (display, outcome) = read_bounded(entry);
+            let expected = format!("mds::io: cannot read {display}: not a regular file");
+            if outcome.as_ref() != Err(&expected) {
+                mismatches.push(format!("{}: {outcome:?}", entry.display()));
+            }
+        }
+        // Control: a regular file is read, named as the others are.
+        let (display, outcome) = read_bounded(&dir.path().join("ok.mds"));
+        if (display.as_str(), outcome.as_deref()) != ("ok.mds", Ok("Hi\n")) {
+            mismatches.push(format!("ok.mds ({display}): {outcome:?}"));
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    // ── read_at_most: the bounded read (#428) ─────────────────────────────────
+
+    /// The reads a [`Scripted`] reader serves before it fails with its own error: far
+    /// more than any case below needs, so a loop that never gives up ends the test
+    /// instead of hanging it.
+    const READ_BUDGET: usize = 100_000;
+
+    /// A fake reader: its `n`th read follows `script[n - 1]` — `None` is an interrupted
+    /// read, `Some(k)` a read of up to `k` bytes — and every read after the script
+    /// follows `then`. It counts its reads.
+    struct Scripted {
+        script: Vec<Option<usize>>,
+        then: Option<usize>,
+        reads: usize,
+    }
+
+    impl Scripted {
+        fn new(script: Vec<Option<usize>>, then: Option<usize>) -> Self {
+            Scripted {
+                script,
+                then,
+                reads: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads > READ_BUDGET {
+                return Err(std::io::Error::other("read budget spent"));
+            }
+            let step = self.script.get(self.reads - 1).copied();
+            match step.unwrap_or(self.then) {
+                None => Err(std::io::ErrorKind::Interrupted.into()),
+                Some(k) => {
+                    let n = k.min(buf.len());
+                    buf[..n].fill(b'x');
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    /// `n` interrupted reads in a row.
+    fn interruptions(n: usize) -> Vec<Option<usize>> {
+        vec![None; n]
+    }
+
+    /// Up to 64 reads in a row may be interrupted; the 65th ends the read with that
+    /// error, and a read that returns bytes starts the count again. Every case runs on
+    /// every OS, and each is judged before anything is asserted.
+    #[test]
+    fn read_at_most_gives_up_after_64_interrupted_reads_in_a_row() {
+        let cases = [
+            (
+                "64 interrupted, then data",
+                [interruptions(64), vec![Some(3), Some(0)]].concat(),
+                Some(0),
+            ),
+            (
+                "65 interrupted, then data",
+                [interruptions(65), vec![Some(3)]].concat(),
+                Some(0),
+            ),
+            ("interrupted without end", Vec::new(), None),
+            (
+                "64 interrupted, a byte, 64 interrupted, a byte",
+                [
+                    interruptions(64),
+                    vec![Some(1)],
+                    interruptions(64),
+                    vec![Some(1)],
+                ]
+                .concat(),
+                Some(0),
+            ),
+        ];
+        let outcomes: Vec<(&str, Result<usize, std::io::ErrorKind>, usize)> = cases
+            .into_iter()
+            .map(|(case, script, then)| {
+                let mut reader = Scripted::new(script, then);
+                let outcome = read_at_most(&mut reader, 1024, 0)
+                    .map(|bytes| bytes.len())
+                    .map_err(|e| e.kind());
+                (case, outcome, reader.reads)
+            })
+            .collect();
+        let interrupted = std::io::ErrorKind::Interrupted;
+        assert_eq!(
+            outcomes,
+            [
+                ("64 interrupted, then data", Ok(3), 66),
+                ("65 interrupted, then data", Err(interrupted), 65),
+                ("interrupted without end", Err(interrupted), 65),
+                ("64 interrupted, a byte, 64 interrupted, a byte", Ok(2), 131),
+            ]
+        );
+    }
+
+    /// The buffer never holds more than `limit`, whatever the chunks a source returns
+    /// and however far it runs past its size hint — a file that grows after its size
+    /// was taken, or reports none — and no read asks for a byte past `limit`. A source
+    /// of exactly its size hint is read into the first buffer, without growing it.
+    #[test]
+    fn read_at_most_never_grows_its_buffer_past_limit() {
+        // (case, bytes per read, size hint, limit); every source is endless.
+        let cases = [
+            ("1-byte reads, no size hint", 1, 0, 10_000),
+            ("8 KiB reads, no size hint", 8192, 0, 100_000),
+            ("8 KiB reads past a hint of 100", 8192, 100, 100_000),
+            ("8 KiB reads, hint over limit", 8192, 1_000_000, 100_000),
+        ];
+        let mut mismatches = Vec::new();
+        for (case, chunk, size_hint, limit) in cases {
+            let mut reader = Scripted::new(Vec::new(), Some(chunk));
+            match read_at_most(&mut reader, limit as u64, size_hint) {
+                Ok(bytes) if bytes.len() == limit && bytes.capacity() <= limit => {}
+                Ok(bytes) => mismatches.push(format!(
+                    "{case}: len {}, capacity {} (limit {limit})",
+                    bytes.len(),
+                    bytes.capacity()
+                )),
+                Err(e) => mismatches.push(format!("{case}: {e}")),
+            }
+            // Every read returned `chunk` bytes but the last, which asked for the rest.
+            if reader.reads != limit.div_ceil(chunk) {
+                mismatches.push(format!("{case}: {} reads", reader.reads));
+            }
+        }
+        // A source of exactly its size hint: the first buffer — the hint plus the one
+        // byte that sees its end — is never grown.
+        let mut reader = Scripted::new(vec![Some(5000)], Some(0));
+        match read_at_most(&mut reader, 100_000, 5000) {
+            Ok(bytes) if bytes.len() == 5000 && bytes.capacity() == 5001 => {}
+            Ok(bytes) => mismatches.push(format!(
+                "exactly its size hint: len {}, capacity {}",
+                bytes.len(),
+                bytes.capacity()
+            )),
+            Err(e) => mismatches.push(format!("exactly its size hint: {e}")),
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
     // ── NativeFs empty-path guards ────────────────────────────────────────────
 
     #[test]
@@ -2007,6 +3100,48 @@ mod tests {
     }
 
     #[test]
+    fn native_normalize_in_dir_import_ending_in_dot_dot_is_not_found() {
+        // An import whose last component is `..` names a directory, never a file:
+        // `file not found: <import as written>` on every OS, as the WASM pre-scanner
+        // reports it (#414). The directories are the canonical keys' parents the
+        // resolver passes — verbatim (`\\?\`) paths on Windows, where joining collapses
+        // `..` lexically and names the directory it leads to by its own name.
+        let dir = TempDir::new().unwrap();
+        let entry = make_temp_file(&dir, "main.mds", "hello");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let fs = NativeFs::new();
+        let root = fs.parent_dir(&fs.resolve_entry(&entry.display().to_string()).unwrap());
+        let sub = Path::new(&root).join("sub").display().to_string();
+
+        let mut rows = vec![
+            (sub.as_str(), "../"),
+            (sub.as_str(), ".."),
+            (root.as_str(), "./sub/.."),
+            (root.as_str(), "sub/../"),
+            (root.as_str(), "./sub/../."),
+        ];
+        if cfg!(windows) {
+            rows.push((root.as_str(), r".\sub\.."));
+        }
+        let mismatches: Vec<String> = rows
+            .iter()
+            .filter_map(|&(from, relative)| {
+                let expected = format!("file not found: {relative}");
+                match fs.normalize_in_dir(from, relative) {
+                    Err(err @ MdsError::FileNotFound { .. }) if err.to_string() == expected => None,
+                    other => Some(format!("{relative:?} from {from:?}: {other:?}")),
+                }
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+        // Control: a `..` that is not the last component resolves, so the refusal
+        // above is the final `..`, not any `..`.
+        let key = fs.normalize_in_dir(&sub, "../main.mds").unwrap();
+        assert_eq!(Path::new(&key), entry.canonicalize().unwrap());
+    }
+
+    #[test]
     fn native_normalize_in_dir_null_byte_errors() {
         let dir = TempDir::new().unwrap();
         let dir_str = dir.path().display().to_string();
@@ -2142,6 +3277,94 @@ mod tests {
             msg.contains("symlinks"),
             "expected symlink rejection, got: {msg}"
         );
+    }
+
+    // ── NativeFs::check_directory ─────────────────────────────────────────────
+
+    /// #413: a directory resolves to its canonical form whether the path has a final
+    /// name (`d`, `d/`, `d/.`) or not (`d/sub/..`, `d/..`, `.`), and every refusal names
+    /// the path as passed: missing is not found, a file is not a directory, a symlinked
+    /// final component is a symlink however it is spelled, and `link/..` names no link.
+    /// A canonical form carrying a forbidden character is refused with one message for
+    /// a named path and one with no final name (Unix: a Windows name cannot hold TAB).
+    #[test]
+    fn check_directory_takes_a_path_with_or_without_a_final_name() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("d").join("sub")).unwrap();
+        std::fs::write(root.join("f.mds"), "x").unwrap();
+        let at = |rel: &str| root.join(rel);
+        let not_found = |p: &Path| Err(format!("file not found: {}", p.display()));
+        let symlink = |p: &Path| {
+            Err(format!(
+                "import error: symlinks are not allowed in imports: {}",
+                p.display()
+            ))
+        };
+
+        let mut rows: Vec<(PathBuf, Result<PathBuf, String>)> = vec![
+            (at("d"), Ok(at("d"))),
+            (at("d/"), Ok(at("d"))),
+            (at("d/."), Ok(at("d"))),
+            (at("d/sub/.."), Ok(at("d"))),
+            (at("d/.."), Ok(root.clone())),
+            (
+                PathBuf::from("."),
+                Ok(std::env::current_dir().unwrap().canonicalize().unwrap()),
+            ),
+            (at("gone"), not_found(&at("gone"))),
+            (
+                at("f.mds"),
+                Err(format!(
+                    "cannot resolve path {}: not a directory",
+                    at("f.mds").display()
+                )),
+            ),
+        ];
+        // Windows resolves `gone\..` lexically, to the directory above it.
+        #[cfg(unix)]
+        rows.push((at("gone/.."), not_found(&at("gone/.."))));
+        if make_symlink(&at("d"), &at("link")) {
+            rows.extend([
+                (at("link"), symlink(&at("link"))),
+                (at("link/"), symlink(&at("link/"))),
+                (at("link/."), symlink(&at("link/."))),
+                (at("link/.."), Ok(root.clone())),
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("x\ty").join("sub")).unwrap();
+            assert!(make_symlink(&at("x\ty"), &at("clink")));
+            let hostile = |p: &Path| {
+                Err(format!(
+                    "resolved path contains forbidden character U+0009: \"{}\"",
+                    p.display()
+                ))
+            };
+            rows.extend([
+                (at("clink/sub"), hostile(&at("clink/sub"))),
+                (at("clink/sub/.."), hostile(&at("clink/sub/.."))),
+                (at("clink"), symlink(&at("clink"))),
+            ]);
+            let typed = at(&format!("d{}e", '\x1b'));
+            let shown = format!("{}", at("d").display()) + &format!("{}u001Be", '\\');
+            rows.push((
+                typed,
+                Err(format!(
+                    "path contains forbidden character U+001B: \"{shown}\""
+                )),
+            ));
+        }
+
+        let mut mismatches = Vec::new();
+        for (path, want) in rows {
+            let got = NativeFs::check_directory(&path).map_err(|e| e.to_string());
+            if got != want {
+                mismatches.push(format!("{path:?}: got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     #[test]

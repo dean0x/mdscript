@@ -45,7 +45,8 @@ Options:
 - `basePath` (string) — base directory for `@import` resolution; defaults to cwd.
 - `vars` (object) — runtime variable overrides.
 - `sourceMap` (boolean) — generate a Source Map v3 document; result gains `sourceMap`.
-  For string-source compiles `sources[0]` is `"input.mds"`.
+  For string-source compiles the source string is named `"input.mds"` — `sources[0]`,
+  unless the string `@extends` a base: then the chain's root base comes first.
 - `sourcesContent` (boolean) — embed original source text in the map (requires `sourceMap`).
   ⚠ Privacy: embeds the full template source.
 

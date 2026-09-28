@@ -661,6 +661,52 @@ def test_py_warn_live_lint_escapes_hostile_rule_name() -> None:
     )
 
 
+def _hostile_and_shown() -> tuple[str, str]:
+    """``a``, ESC, ``b``, LF, ``c``, TAB, ``d`` — built with ``chr()`` (PF-018) — and how
+    the WIRE escaper shows it: ESC and LF as the six-character escape text, TAB raw (#418)."""
+
+    def esc(cp: int) -> str:
+        return "\\u" + format(cp, "04X")
+
+    hostile = "a" + chr(0x1B) + "b" + chr(0x0A) + "c" + chr(0x09) + "d"
+    shown = "a" + esc(0x1B) + "b" + esc(0x0A) + "c" + chr(0x09) + "d"
+    return hostile, shown
+
+
+def test_py_rules_error_wire_escapes_rule_name_and_severity() -> None:
+    """#418: a rule name or severity the ``rules`` error names is WIRE-escaped,
+    in the wording mds-core gives napi and WASM too, the map named ``rules``; a clean
+    name's message is the control."""
+    hostile, shown = _hostile_and_shown()
+    expected = '"off", "info", "warn", or "error"'
+    cases: list[tuple[dict[str, object], str]] = [
+        ({hostile: 1}, f'rules["{shown}"] must be a severity string, got number'),
+        (
+            {"unused-variable": hostile},
+            f'rules["unused-variable"]: unknown severity "{shown}"; expected {expected}',
+        ),
+        ({"unused-variable": 1}, 'rules["unused-variable"] must be a severity string, got number'),
+    ]
+    for rules, message in cases:
+        with pytest.raises(m.MdsError) as ei:
+            m.lint(CLEAN_SOURCE, rules=rules)  # type: ignore[arg-type]
+        assert ei.value.code == "mds::invalid_options"
+        assert ei.value.message == message
+
+
+def test_py_rules_conversion_error_text_is_wire_escaped() -> None:
+    """#418: a ``rules`` value that cannot be converted — an instance of a class
+    whose name carries ESC, LF and TAB — is named in the conversion error by that class
+    name, which must reach the message escaped: present in its shown form (the positive
+    control, PF-013) and with no raw ESC or LF."""
+    hostile, shown = _hostile_and_shown()
+    unconvertible = type(hostile, (), {})()
+    with pytest.raises(m.MdsError) as ei:
+        m.lint(CLEAN_SOURCE, rules={"unused-variable": unconvertible})  # type: ignore[dict-item]
+    assert ei.value.code == "mds::invalid_options"
+    assert ei.value.message == f"invalid rules: unsupported type {shown}"
+
+
 # ── R6: VirtualFs emits mds::module_not_found, not mds::file_not_found ───────
 
 

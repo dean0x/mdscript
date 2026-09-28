@@ -599,3 +599,168 @@ mod on_disk {
         mds::compile_str_with("Hi\n", Some(&root.join("alias2")), None).expect("control");
     }
 }
+
+// ── #417: `not_mds` names the path as the caller typed it ───────────────────
+
+/// `mds::not_mds` names the path the caller typed — the entry path passed to the API,
+/// or the `@import`, `@export … from`, frontmatter `imports:` or `@extends` string as
+/// written in the template that names the file — never the key the backend resolved
+/// it to (#417). Every typed form here runs through `sub/..`, so it differs from the
+/// canonical absolute path and from the root-relative display name alike; the entry is
+/// also passed as the uncanonicalized temporary directory joined with its name.
+#[test]
+fn not_mds_names_the_typed_path() {
+    let dir = tempfile::tempdir().unwrap();
+    // As typed: never canonicalized (on macOS the temporary directory is `/var/…`,
+    // its canonical form `/private/var/…`).
+    let root = dir.path();
+    std::fs::write(root.join(".mdsroot"), "").unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::create_dir(root.join("lib")).unwrap();
+    std::fs::write(root.join("doc.txt"), "Hi\n").unwrap();
+    std::fs::write(
+        root.join("lib").join("notes.txt"),
+        "@define greet():\nhi\n@end\n",
+    )
+    .unwrap();
+
+    const LIB: &str = "./sub/../lib/notes.txt";
+    const FROM_LIB: &str = "../sub/../lib/notes.txt";
+    let templates = [
+        ("imp.mds", format!("@import \"{LIB}\"\nHi\n")),
+        ("exp.mds", format!("@export greet from \"{LIB}\"\n")),
+        (
+            "fm.mds",
+            format!("---\nimports:\n  - path: {LIB}\n    as: n\n---\nHi\n"),
+        ),
+        ("child.mds", format!("@extends \"{LIB}\"\n")),
+        (
+            "grandchild.mds",
+            "@extends \"./lib/base.mds\"\n".to_string(),
+        ),
+    ];
+    for (name, text) in &templates {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    // The intermediate base names the grandparent relative to its own directory.
+    std::fs::write(
+        root.join("lib").join("base.mds"),
+        format!("@extends \"{FROM_LIB}\"\n"),
+    )
+    .unwrap();
+
+    let canonical = |rel: &[&str]| {
+        let mut p = root.to_path_buf();
+        p.extend(rel);
+        Some(p.canonicalize().unwrap().display().to_string())
+    };
+    let doc = canonical(&["doc.txt"]);
+    let notes = canonical(&["lib", "notes.txt"]);
+    let entry = root.join("doc.txt");
+    let entry_dotted = root.join("sub").join("..").join("doc.txt");
+    // (label, path passed to the API, shown, the resolved file's canonical path).
+    // The plain entry has no resolved form to exclude: off macOS the temporary
+    // directory is already canonical, so the path as typed IS that path there.
+    let rows: [(&str, std::path::PathBuf, String, Option<String>); 7] = [
+        ("entry", entry.clone(), entry.display().to_string(), None),
+        (
+            "entry through sub/..",
+            entry_dotted.clone(),
+            entry_dotted.display().to_string(),
+            doc.clone(),
+        ),
+        (
+            "@import",
+            root.join("imp.mds"),
+            LIB.to_string(),
+            notes.clone(),
+        ),
+        (
+            "@export … from",
+            root.join("exp.mds"),
+            LIB.to_string(),
+            notes.clone(),
+        ),
+        (
+            "frontmatter import",
+            root.join("fm.mds"),
+            LIB.to_string(),
+            notes.clone(),
+        ),
+        (
+            "@extends parent",
+            root.join("child.mds"),
+            LIB.to_string(),
+            notes.clone(),
+        ),
+        (
+            "@extends grandparent",
+            root.join("grandchild.mds"),
+            FROM_LIB.to_string(),
+            notes.clone(),
+        ),
+    ];
+    for (label, path, shown, resolved) in &rows {
+        let err = mds::compile(path, None).expect_err(label);
+        assert_eq!(code_of(&err), "mds::not_mds", "{label}: {err:?}");
+        let msg = err.to_string();
+        assert_eq!(
+            msg,
+            format!("not an MDS file: {shown}"),
+            "{label}: names the path as typed"
+        );
+        assert_eq!(
+            miette::Diagnostic::help(&err)
+                .map(|h| h.to_string())
+                .as_deref(),
+            Some("use .mds extension or add 'type: mds' to frontmatter"),
+            "{label}"
+        );
+        if let Some(resolved) = resolved {
+            assert!(
+                !msg.contains(resolved.as_str()),
+                "{label}: never the resolved absolute path: {msg}"
+            );
+        }
+        assert_no_forbidden(&msg, label);
+    }
+
+    // A virtual import is named as written too, not by the key it normalizes to.
+    let modules = vfs(&[
+        ("main.mds", "@import \"./sub/../notes.txt\"\nHi\n"),
+        ("notes.txt", "Hi\n"),
+    ]);
+    let err = mds::compile_virtual(modules, "main.mds", None).expect_err("virtual import");
+    assert_eq!(code_of(&err), "mds::not_mds", "{err:?}");
+    assert_eq!(err.to_string(), "not an MDS file: ./sub/../notes.txt");
+
+    // Controls. The same typed forms reach an MDS file and compile: only the file's
+    // type is refused. And they resolve to keys that are NOT the typed text — the
+    // dependency is the canonical file, with no `sub/..` in it — so a message equal
+    // to the typed text cannot be the key.
+    std::fs::write(
+        root.join("lib").join("notes.md"),
+        "---\ntype: mds\n---\n@define greet():\nhi\n@end\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("ok.mds"),
+        "@import \"./sub/../lib/notes.md\" as n\n{{n.greet()}}\n",
+    )
+    .unwrap();
+    let ok = mds::compile_with_deps(root.join("sub").join("..").join("ok.mds"), None)
+        .expect("control: an MDS file through the same typed forms compiles");
+    let deps: Vec<String> = ok.dependencies.clone();
+    assert_eq!(ok.into_markdown().unwrap(), "hi\n");
+    assert_eq!(deps.len(), 1, "{deps:?}");
+    // Compared by component: a substring test would trip on a temporary directory whose
+    // random name happens to contain `sub`.
+    let dep = Path::new(&deps[0]);
+    assert!(
+        dep.ends_with(Path::new("lib").join("notes.md"))
+            && !dep
+                .components()
+                .any(|c| c == std::path::Component::ParentDir || c.as_os_str() == "sub"),
+        "control: the key is the resolved file, not the typed text: {deps:?}"
+    );
+}

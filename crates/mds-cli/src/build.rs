@@ -32,7 +32,7 @@ pub(crate) struct MdsConfig {
     pub(crate) fmt: FmtConfig,
     /// Per-rule severity overrides for `mds lint` (AC-F-17).
     ///
-    /// Unknown severity VALUES fail config loading loudly (closed enum).
+    /// Unknown severity VALUES fail config loading loudly (see [`LintCliConfig`]).
     /// Unknown rule NAMES: only `mds lint` warns on stderr and continues — single-file
     /// mode via `load_lint_config`, directory mode via `LintDirCtx::config_for`.
     /// `mds build`, `check`, `fmt`, and `watch` load this field but do not emit the
@@ -46,16 +46,32 @@ pub(crate) struct MdsConfig {
 /// Mirrors the core `LintConfig` shape but lives in the CLI so it can be
 /// loaded alongside `BuildConfig` / `FmtConfig` as part of `MdsConfig`.
 ///
-/// Unknown severity VALUES (e.g. `"banana"`) cause a hard parse error (exit 2)
-/// because `Severity` is a closed enum with no sensible fallback. Unknown rule
-/// NAMES: only `mds lint` warns on stderr and continues — single-file mode via
+/// Unknown severity VALUES (e.g. `"banana"`) fail config loading (exit 1), because
+/// `Severity` is a closed enum with no sensible fallback. Unknown rule NAMES: only
+/// `mds lint` warns on stderr and continues — single-file mode via
 /// `load_lint_config`, directory mode via `LintDirCtx::config_for`. `mds build`,
 /// `check`, `fmt`, and `watch` deserialize this struct but do not emit the
 /// warning — an accepted asymmetry, not an oversight (see CHANGELOG).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct LintCliConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lint_rules")]
     pub(crate) rules: HashMap<String, mds::Severity>,
+}
+
+/// `lint.rules` read by [`mds::parse_rule_severities`], the reader the napi, WASM and
+/// Python bindings use for their `rules` option (#175, #418): a value that is not one
+/// of the four severity spellings fails with its error, which names the rule and the
+/// value — `lint.rules["<name>"]: unknown severity "<value>"; …`, or `lint.rules["<name>"]
+/// must be a severity string, got <type>` — each WIRE-escaped as the message is built.
+/// serde_json appends the line and column it had reached once the map was read.
+fn deserialize_lint_rules<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, mds::Severity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rules = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+    mds::parse_rule_severities(rules, "lint.rules").map_err(serde::de::Error::custom)
 }
 
 impl LintCliConfig {
@@ -159,16 +175,25 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
         let candidate = current.join("mds.json");
         if candidate.is_file() {
             let shown = crate::output::safe_path(&shown_dir.join("mds.json"));
-            // Read the file first, then check size — avoids a TOCTOU race between
-            // a separate metadata() call and the actual read().
-            let bytes = std::fs::read(&candidate).map_err(|e| {
+            // The size is taken from the opened file, and the read stops one byte past
+            // the cap into a buffer that never grows past it, so an oversized mds.json
+            // — or one that grows while it is read — is never held in memory whole
+            // (#428).
+            let cannot_read = |e: std::io::Error| {
                 miette::miette!("cannot read {shown}: {}", crate::output::safe_inline(&e))
-            })?;
+            };
+            let too_large = |size: u64| {
+                miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MB)")
+            };
+            let mut file = std::fs::File::open(&candidate).map_err(cannot_read)?;
+            let size = file.metadata().map_err(cannot_read)?.len();
+            if size > MAX_CONFIG_SIZE {
+                return Err(too_large(size));
+            }
+            let bytes =
+                mds::read_at_most(&mut file, MAX_CONFIG_SIZE + 1, size).map_err(cannot_read)?;
             if bytes.len() as u64 > MAX_CONFIG_SIZE {
-                return Err(miette::miette!(
-                    "mds.json at {shown} is too large ({} bytes; maximum is 1 MB)",
-                    bytes.len()
-                ));
+                return Err(too_large(bytes.len() as u64));
             }
             let raw = String::from_utf8(bytes).map_err(|e| {
                 miette::miette!(
@@ -191,12 +216,12 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
             // (every input mode) and `fmt` directory mode. `check` does not load
             // mds.json.
             if let Some(output_dir) = &config.build.output_dir {
-                let shown = std::ffi::OsStr::new(output_dir);
-                crate::output::reject_forbidden_output_path("mds.json build.output_dir", shown)?;
+                let typed = std::ffi::OsStr::new(output_dir);
+                crate::output::reject_forbidden_output_path("mds.json build.output_dir", typed)?;
                 crate::output::reject_forbidden_resolved_output_path(
                     "mds.json build.output_dir",
                     &current.join(output_dir),
-                    shown,
+                    typed,
                 )?;
             }
             return Ok(Some((config, current)));
@@ -283,7 +308,7 @@ pub(crate) fn derive_output_filename_for_kind(input: &Path, kind: OutputKind) ->
 /// `input_path` drives the filename: if `Some`, the stem is reused (e.g. `foo.mds` → `foo.md`);
 /// if `None` (stdin), the fallback name is `output.md` for markdown, `output.json` for messages.
 ///
-/// Use [`prepare_output_dir_for_kind`] when the directory also needs to be created.
+/// [`write_output`] creates the directory, just before the write.
 pub(crate) fn compute_output_dir_path_for_kind(
     dir: &Path,
     input_path: Option<&Path>,
@@ -300,24 +325,11 @@ pub(crate) fn compute_output_dir_path_for_kind(
     dir.join(filename)
 }
 
-/// Create `dir` (if absent) and return `dir/<derived-name>.<ext>`.
-///
-/// Extension is determined by `kind` (markdown → `.md`, messages → `.json`).
-/// `input_path` drives the filename stem: if `Some`, the stem is reused;
-/// if `None` (stdin), the fallback is `output.md` / `output.json`.
-pub(crate) fn prepare_output_dir_for_kind(
-    dir: &Path,
-    input_path: Option<&Path>,
-    kind: OutputKind,
-) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| miette::miette!("cannot create output directory {}: {e}", dir.display()))?;
-    Ok(compute_output_dir_path_for_kind(dir, input_path, kind))
-}
-
 /// Resolve the output path according to the precedence chain (kind-aware variant).
 ///
-/// Any required output directory is created via `create_dir_all`.
+/// Nothing is created: [`write_output`] creates the output's directory just before the
+/// write, so an output [`admit_output`] refuses as the entry file itself (#425) leaves
+/// no directory behind — `--out-dir newdir/..` included.
 ///
 /// Precedence:
 /// 1. `-o -`                         → stdout (returns `None`)
@@ -328,45 +340,19 @@ pub(crate) fn prepare_output_dir_for_kind(
 /// 6. Default                        → source dir + `<name>.<ext>` (ext from kind)
 ///
 /// For rules 4–6 the extension is derived from `kind` (markdown → `.md`, messages → `.json`).
-/// For rule 2 (`-o <path>`), the path is used verbatim; if its extension conflicts with `kind`
-/// a warning is emitted to stderr (AC-FUNC-11: write still proceeds to the requested path).
+/// For rule 2 (`-o <path>`), the path is used verbatim, whatever its extension; once the
+/// write is certain, [`warn_output_extension_mismatch`] warns when it conflicts with `kind`.
 pub(crate) fn resolve_output_path_for_kind(
     input: &Option<PathBuf>,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<(MdsConfig, PathBuf)>,
     kind: OutputKind,
-    quiet: bool,
 ) -> Result<Option<PathBuf>> {
     // 1 & 2. Explicit `-o` flag: `-` means stdout, anything else is a literal path.
     match output.as_deref() {
         Some("-") => return Ok(None),
-        Some(o) => {
-            let path = PathBuf::from(o);
-            // AC-FUNC-11: warn when the extension contradicts the kind.
-            if !quiet {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    let expected = kind.extension();
-                    if ext != expected {
-                        // The `-o` value and the extension derived from it occupy a
-                        // diagnostic `file` field on a status line: WIRE (spec §7.5
-                        // per-field rule).
-                        // The escape call is repeated rather than bound to a local so it
-                        // is visible at each interpolation — the print-discipline guard
-                        // reads call sites, not bindings.
-                        eprintln!(
-                            "warning: output path '{}' has extension '.{}' but compiled \
-                             output is {}; writing to '{}' anyway",
-                            crate::output::safe_inline(o),
-                            crate::output::safe_inline(ext),
-                            kind_label(kind),
-                            crate::output::safe_inline(o)
-                        );
-                    }
-                }
-            }
-            return Ok(Some(path));
-        }
+        Some(o) => return Ok(Some(PathBuf::from(o))),
         None => {}
     }
 
@@ -383,7 +369,9 @@ pub(crate) fn resolve_output_path_for_kind(
 
     // 4. `--out-dir <dir>`
     if let Some(dir) = out_dir {
-        return Ok(Some(prepare_output_dir_for_kind(dir, input_path, kind)?));
+        return Ok(Some(compute_output_dir_path_for_kind(
+            dir, input_path, kind,
+        )));
     }
 
     // 5. `mds.json` output_dir
@@ -393,7 +381,9 @@ pub(crate) fn resolve_output_path_for_kind(
             // (exit 2). A forbidden character was already refused by `load_config`.
             crate::output::reject_output_dir_traversal(output_dir)?;
             let dir = config_dir.join(output_dir);
-            return Ok(Some(prepare_output_dir_for_kind(&dir, input_path, kind)?));
+            return Ok(Some(compute_output_dir_path_for_kind(
+                &dir, input_path, kind,
+            )));
         }
     }
 
@@ -407,6 +397,37 @@ pub(crate) fn resolve_output_path_for_kind(
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
         None => Ok(None),
+    }
+}
+
+/// Warn when an explicit `-o <path>`'s extension contradicts the compiled `kind`
+/// (AC-FUNC-11): the output is still written to the path as given. The warning
+/// announces that write, so it is emitted only once the write is certain — by
+/// [`admit_output`], after the #425 refusal has passed, never for an output that is
+/// refused; `mds build -` (stdin), which has no entry file to refuse, emits it directly.
+fn warn_output_extension_mismatch(output: &Option<String>, kind: OutputKind, quiet: bool) {
+    let Some(o) = output.as_deref().filter(|o| *o != "-") else {
+        return;
+    };
+    if quiet {
+        return;
+    }
+    if let Some(ext) = Path::new(o).extension().and_then(|e| e.to_str()) {
+        if ext != kind.extension() {
+            // The `-o` value and the extension derived from it occupy a diagnostic
+            // `file` field on a status line: WIRE (spec §7.5 per-field rule).
+            // The escape call is repeated rather than bound to a local so it is visible
+            // at each interpolation — the print-discipline guard reads call sites, not
+            // bindings.
+            eprintln!(
+                "warning: output path '{}' has extension '.{}' but compiled \
+                 output is {}; writing to '{}' anyway",
+                crate::output::safe_inline(o),
+                crate::output::safe_inline(ext),
+                kind_label(kind),
+                crate::output::safe_inline(o)
+            );
+        }
     }
 }
 
@@ -502,33 +523,36 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
 
 // ── Input-validation helpers ──────────────────────────────────────────────────
 
-/// Validate `path` for single-file build/fmt/lint: a forbidden path character is
+/// Validate `path` for single-file fmt/lint: a forbidden path character is
 /// refused first (→ `mds::io`, exit 2, #265), then existence is checked (→
 /// `mds::file_not_found`, exit 2) and then the `.mds` extension (→
-/// `mds::not_mds_file`, exit 2).
+/// `mds::not_mds`, exit 2).
 ///
-/// The refusal comes first because the two errors after it show the path as
-/// given, unescaped; it is worded like `NativeFs::check_symlink`'s, so a hostile
-/// file argument reports the same error whether or not the file exists.
+/// Every error names the path as the user typed it, escaped with
+/// [`mds::escape_path_for_message`] (#417). The refusal comes first and is worded
+/// like `NativeFs::check_symlink`'s, so a hostile file argument reports the same
+/// error whether or not the file exists.
 ///
 /// Existence-before-extension ordering is required so that a user pointing at a
 /// non-existent path without `.mds` receives a "file not found" error rather than
-/// the confusing "not an .mds file" error (C4/F6).
+/// the confusing "not an MDS file" error (C4/F6).
 pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
     crate::output::reject_forbidden_output_path("path", path.as_os_str())?;
+    let lossy = path.to_string_lossy();
+    let shown = mds::escape_path_for_message(&lossy);
     let exists = path.try_exists().map_err(|e| MdsError::Io {
-        message: format!("cannot check {}: {e}", path.display()),
+        message: format!("cannot check {shown}: {e}"),
     })?;
     if !exists {
         return Err(MdsError::FileNotFound {
-            path: path.display().to_string(),
+            path: shown.into_owned(),
             span: None,
             src: None,
         });
     }
     if path.extension().and_then(|e| e.to_str()) != Some("mds") {
         return Err(MdsError::NotMdsFile {
-            path: path.display().to_string(),
+            path: shown.into_owned(),
         });
     }
     Ok(())
@@ -724,10 +748,7 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
     }
 }
 
-/// Read the source from stdin.
-///
-/// Reads at most `MAX_FILE_SIZE + 1` bytes so we can detect over-sized input without
-/// buffering the entire stream first.
+/// Read the source from stdin (see [`read_stdin_from`]).
 ///
 /// A stdin source resolves its imports against the working directory. Callers pass
 /// `None` as the base directory for that, never the absolute `current_dir()`: core
@@ -735,15 +756,22 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
 /// path character, #265) then names it `"."` — the caller typed no path, so no
 /// message shows the absolute one.
 pub(crate) fn read_stdin() -> Result<String> {
-    let mut source = String::new();
-    std::io::stdin()
-        .take(MAX_FILE_SIZE + 1)
-        .read_to_string(&mut source)
+    read_stdin_from(&mut std::io::stdin().lock())
+}
+
+/// Read a stdin source from `reader`, holding no more than one byte over
+/// `MAX_FILE_SIZE` of it and reading no further (#428): [`mds::read_at_most`], as
+/// mds-core reads a module file. More than the cap is refused before the bytes are
+/// checked as UTF-8; bytes that are not UTF-8 keep the message `read_to_string` gave
+/// them.
+fn read_stdin_from(reader: &mut impl Read) -> Result<String> {
+    let bytes = mds::read_at_most(reader, MAX_FILE_SIZE + 1, 0)
         .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
-    if source.len() as u64 > MAX_FILE_SIZE {
+    if bytes.len() as u64 > MAX_FILE_SIZE {
         return Err(miette::miette!("stdin input exceeds maximum size of 10 MB"));
     }
-    Ok(source)
+    String::from_utf8(bytes)
+        .map_err(|_| miette::miette!("cannot read stdin: stream did not contain valid UTF-8"))
 }
 
 /// Write compiled output to a file or stdout.
@@ -751,7 +779,9 @@ pub(crate) fn read_stdin() -> Result<String> {
 /// When `output_path` is `Some(path)`, creates any missing parent directories,
 /// writes the compiled string, and prints `"Compiled to {path}"` to stderr
 /// unless `quiet` or `announce` is false.  When `output_path` is `None`,
-/// prints the compiled string to stdout with no trailing newline.
+/// prints the compiled string to stdout with no trailing newline. This is where a
+/// single-file output's directory is created — [`resolve_output_path_for_kind`] creates
+/// nothing — so an output refused before the write leaves no directory behind (#425).
 ///
 /// Set `announce = false` in watch-loop rebuilds so only the `"Recompiled …"`
 /// summary line is emitted (not a redundant `"Compiled to …"` line).
@@ -891,8 +921,8 @@ fn serialize_output(output: CompiledOutput) -> Result<String> {
 /// result — the caller does not specify it. This is the pure "compile" step used by the
 /// watch loop for content-based dedup.
 ///
-/// `build` and the initial watch compile use [`compile_and_write`], which calls
-/// this internally and then always writes.
+/// `build` calls this directly; `mds watch` calls it for its entry and every source
+/// once it has checked that the path it compiles still leads to the file it watches.
 ///
 /// Pass `opts = mds::CompileOptions::default()` from watch callers that do not want
 /// source maps; the watch paths never emit maps so they always use the default.
@@ -951,50 +981,145 @@ pub(crate) fn compile_to_content(
     })
 }
 
-/// Compile `input`, derive the output path from the compiled kind, and write.
+/// A single-file entry in the two forms [`admit_output`] takes, always in
+/// `(typed, canonical)` order, so the two cannot be passed swapped.
 ///
-/// Returns `(output_path, deps, content)`:
-/// - `output_path`: the resolved output path (None for stdout).
-/// - `deps`: transitive dependency paths.
-/// - `content`: the compiled string (issue 3 — reused by the watch baseline block
-///   so startup does not compile twice).
+/// `typed` is the path as the user typed it: a refusal names the entry that way, never
+/// by its canonical absolute path. `canonical` is the entry's identity, which
+/// [`admit_output`] compares with the output's through [`file_identity`], canonical with
+/// canonical — `typed` is never compared with it as text (#408). `mds watch` lends the
+/// entry it watches in its two forms. `mds build` compiles its entry once, by the path as
+/// typed, and never holds a canonical form, so it passes the typed path as both:
+/// [`file_identity`] canonicalizes it.
+#[derive(Clone, Copy)]
+pub(crate) struct EntryPaths<'a> {
+    pub(crate) typed: &'a Path,
+    pub(crate) canonical: &'a Path,
+}
+
+/// The canonical path of the file `path` names, for comparing two paths as files, or
+/// `None` when not even its directory resolves.
 ///
-/// The output path is derived AFTER compiling (compile-then-route) so the kind
-/// (and thus extension: `.json` for messages, `.md` for markdown) is known before
-/// the path is constructed. This is the single-file intrinsic extension path.
+/// Its directory is resolved as [`write_output`] will leave it, created if it does not
+/// exist yet ([`resolve_dir_as_created`]), and its name is looked up there. An existing
+/// file is canonicalized, which respells its name the way the volume stores it — so
+/// `PAGE.md` and `page.md` are one file on a case-insensitive volume (#408), in a
+/// directory reached back out of one the write creates (`newdir/../PAGE.md`) as much as
+/// in one that exists. A name that does not exist yet, or is a symlink, is kept as it
+/// stands: the symlink itself is the directory entry a write would replace, not the
+/// file it points to.
+fn file_identity(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let file = resolve_dir_as_created(effective_parent(path))?.join(name);
+    let is_link = std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        if let Ok(canonical) = file.canonicalize() {
+            return Some(canonical);
+        }
+    }
+    Some(file)
+}
+
+/// The canonical path `dir` has once [`write_output`]'s `create_dir_all(dir)` has run,
+/// found without creating anything; `None` when not even the working directory
+/// resolves, which a write of `dir` could not get past either.
 ///
-/// If `-o <path>` is given explicitly, that path is used verbatim and an ext-mismatch
-/// warning is emitted when the extension contradicts the kind (AC-FUNC-11).
-/// If `-o -` or stdin-with-no-flags, content is written to stdout.
+/// An existing `dir` is canonicalized. Otherwise it is walked component by component, as
+/// the system resolves it while creating it: an existing component is canonicalized —
+/// a symlink is followed — and the first missing one is created as a plain directory,
+/// so below it nothing exists yet: a name is appended as it stands, and a `..` leads back
+/// to the parent, where the next name is looked up on disk again. So `newdir/..` is the
+/// directory `newdir` would be created in, and `newdir/../lnk` follows `lnk`. The walk
+/// visits each component of `dir` once, and a `..` never climbs above the root.
 ///
-/// Source-map writing is NOT performed here — callers that need maps handle them
-/// after this call returns (so map writing logic stays in `run_build`, not here).
-/// Watch callers pass `opts = mds::CompileOptions::default()` to opt out of maps.
+/// A relative `dir` is anchored at the working directory with [`std::path::absolute`].
+/// On Windows that also collapses `..` lexically, which is how every Win32 file call
+/// reads a path, so the walk and the write agree there too.
+fn resolve_dir_as_created(dir: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if let Ok(canonical) = dir.canonicalize() {
+        return Some(canonical);
+    }
+    let absolute = std::path::absolute(dir).ok()?;
+    let mut resolved = PathBuf::new();
+    // How many trailing components of `resolved` the write creates.
+    let mut created: usize = 0;
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                created = created.saturating_sub(1);
+            }
+            Component::Normal(name) => {
+                let next = resolved.join(name);
+                if created > 0 {
+                    resolved = next;
+                    created += 1;
+                } else if let Ok(existing) = next.canonicalize() {
+                    resolved = existing;
+                } else {
+                    resolved = next;
+                    created = 1;
+                }
+            }
+        }
+    }
+    Some(resolved)
+}
+
+/// Refuse to write the compiled entry over the entry file itself (#425): `mds::io`,
+/// exit 2, naming the entry as `typed`, escaped.
 ///
-/// # PF-004 compliance
-/// All file reads go through `compile_to_content` → `mds::compile_with_deps_opts` or
-/// `mds::compile_str_with_deps_opts` (which use the resolver that enforces MAX_FILE_SIZE).
-/// There is no bare `std::fs::read_to_string` path here.
-pub(crate) fn compile_and_write(
-    input: &Path,
-    output: &Option<String>,
-    out_dir: &Option<PathBuf>,
-    config: &Option<(MdsConfig, PathBuf)>,
-    runtime_vars: Option<HashMap<String, mds::Value>>,
+/// A `.md` entry that declares `type: mds` compiles to Markdown, whose default output
+/// name — the entry's stem plus `.md` — is the entry's own name; `--out-dir` or
+/// `mds.json` `build.output_dir` naming the entry's directory, and `-o` naming the
+/// entry itself (any extension), land on it too. Writing would replace the source with
+/// its compiled form, which no longer declares `type: mds`, so the next build fails.
+///
+/// `output` and `entry.canonical` are compared as the files they name
+/// ([`file_identity`]), canonical with canonical, never a path with a spelling of it
+/// (#408) — an output whose directory does not exist yet as the write will create it, so
+/// `newdir/../page.md` is `page.md`. `None` (stdout) is never the entry. It runs only
+/// inside [`admit_output`], after the output path is resolved and before anything is
+/// written.
+fn refuse_output_over_entry(output: Option<&Path>, entry: EntryPaths<'_>) -> Result<(), MdsError> {
+    let Some(output) = output else {
+        return Ok(());
+    };
+    match (file_identity(output), file_identity(entry.canonical)) {
+        (Some(output), Some(canonical)) if output == canonical => Err(MdsError::Io {
+            message: format!(
+                "output would overwrite the entry file: \"{}\"; \
+                 write it elsewhere with -o <file> or --out-dir <dir>",
+                mds::escape_path_for_message(&entry.typed.to_string_lossy())
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Admit `output_path` as the destination of the compiled `entry`: refuse it when it is
+/// the entry file itself ([`refuse_output_over_entry`], #425), and only then warn when
+/// an explicit `-o` (`output_arg`) contradicts `kind` ([`warn_output_extension_mismatch`])
+/// — the warning announces the write, so a refused output never gets one.
+///
+/// Every route to a compiled entry's output goes through it: `mds build` file mode,
+/// `mds watch`'s startup compile, its startup fallback and every rebuild. A rebuild
+/// passes no `output_arg`: the warning is a startup message, printed once for the path
+/// every rebuild reuses.
+pub(crate) fn admit_output(
+    output_path: Option<&Path>,
+    entry: EntryPaths<'_>,
+    output_arg: &Option<String>,
+    kind: OutputKind,
     quiet: bool,
-    opts: mds::CompileOptions,
-) -> Result<(Option<PathBuf>, Vec<String>, String)> {
-    let compiled = compile_to_content(input, runtime_vars, quiet, opts)?;
-    let output_path = resolve_output_path_for_kind(
-        &Some(input.to_path_buf()),
-        output,
-        out_dir,
-        config,
-        compiled.kind,
-        quiet,
-    )?;
-    write_output(output_path.clone(), &compiled.content, quiet, true)?;
-    Ok((output_path, compiled.dependencies, compiled.content))
+) -> Result<(), MdsError> {
+    refuse_output_over_entry(output_path, entry)?;
+    warn_output_extension_mismatch(output_arg, kind, quiet);
+    Ok(())
 }
 
 // ── Build args struct ─────────────────────────────────────────────────────────
@@ -1222,37 +1347,23 @@ pub(crate) fn apply_source_map_file_label(
     }
 }
 
-/// Verify a `.map` file is a valid source-map v3 for `expected_basename`,
-/// then delete it (AC-FUNC-10: stale-map reconciliation).
+/// Delete the `.map` file at `map_path` when it is the sidecar an earlier
+/// `--source-map` build wrote for the output named `expected_basename` (stale-map
+/// reconciliation), and leave anything else in place, never clobbering a hand-authored
+/// file that happens to share its name.
 ///
-/// Silently skips deletion if:
-/// - The file does not exist.
-/// - The file is not valid UTF-8 JSON.
-/// - `version != 3`.
-/// - `file` does not match `expected_basename`.
-///
-/// This avoids clobbering a hand-authored file that happens to share a name with
-/// a tool-generated map.
+/// A missing file is skipped silently. Anything else that is not such a sidecar is left
+/// in place with a warning (unless `quiet`): one that is not a regular file is never
+/// opened — opening a FIFO with no writer blocks — and a regular file is recognised by
+/// its first bytes alone ([`has_sidecar_head`]), so none is read whole (#428).
 pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, quiet: bool) {
-    let Ok(bytes) = std::fs::read(map_path) else {
+    let Ok(metadata) = std::fs::metadata(map_path) else {
         return;
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return;
-    };
-    if v.get("version").and_then(|x| x.as_u64()) != Some(3) {
-        if !quiet {
-            eprintln!(
-                "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
-                crate::output::safe_path(map_path)
-            );
-        }
-        return;
-    }
-    if v.get("file").and_then(|x| x.as_str()) != Some(expected_basename) {
+    let sidecar = metadata.is_file()
+        && std::fs::File::open(map_path)
+            .is_ok_and(|mut file| has_sidecar_head(&mut file, expected_basename));
+    if !sidecar {
         if !quiet {
             eprintln!(
                 "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
@@ -1272,6 +1383,21 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
     } else if !quiet {
         eprintln!("Removed stale map {}", crate::output::safe_path(map_path));
     }
+}
+
+/// Whether `reader` starts with the bytes every sidecar mds writes for the output named
+/// `expected_basename` starts with: `{"version":3,"file":<the name as a JSON string>,`.
+/// `SourceMap::to_json` writes `version`, `file` and then `sources` in that order, with
+/// no whitespace, and a sidecar always carries the output's name as `file`, so a map it
+/// wrote always starts so; a map formatted by hand does not, even with the same fields.
+/// Only those bytes are read (#428).
+fn has_sidecar_head(reader: &mut impl Read, expected_basename: &str) -> bool {
+    let Ok(name) = serde_json::to_string(expected_basename) else {
+        return false;
+    };
+    let head = format!("{{\"version\":3,\"file\":{name},");
+    let len = head.len() as u64;
+    mds::read_at_most(reader, len, len).is_ok_and(|bytes| bytes == head.as_bytes())
 }
 
 /// Refuse `-o/--output` and `--out-dir` values carrying a forbidden path character
@@ -1338,17 +1464,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                  use --out-dir to specify an output directory"
             ));
         }
-        // Reject a symlinked directory root for build parity (commit aa0c538).
-        if input
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(miette::miette!(
-                "directory argument must not be a symlink: {}",
-                input.display()
-            ));
-        }
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
+        crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
 
         // Load project config to determine effective flags for directory mode.
         let dir_config = load_config(&input)?;
@@ -1428,8 +1546,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         let content = serialize_output(result.output)?;
 
         // Stdin: no project config; output path follows -o flag or defaults to stdout.
+        // There is no entry file to refuse (#425), so the `-o` warning is printed now.
         let output_path =
-            resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind, quiet)?;
+            resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind)?;
+        warn_output_extension_mismatch(&output, kind, quiet);
 
         if let Some(ref mut sm) = source_map {
             // Set `file` field and relabel source entry for stdin builds (AC-FUNC-12).
@@ -1541,8 +1661,16 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         &out_dir,
         &config,
         compiled.kind,
-        quiet,
     )?;
+    // #425: nothing — output or sidecar map — is written once the output is the entry,
+    // and no warning announces that write. `mds build` holds only the typed path;
+    // `admit_output` canonicalizes both sides itself.
+    let entry = EntryPaths {
+        typed: &input,
+        canonical: &input,
+    };
+    admit_output(output_path.as_deref(), entry, &output, compiled.kind, quiet)
+        .map_err(miette::Error::from)?;
 
     let mut source_map = compiled.source_map;
     if let Some(ref mut sm) = source_map {
@@ -1788,9 +1916,9 @@ fn run_build_directory(
         }
 
         // Per-file source_map_base: the output directory for this file, computed
-        // from the kind-independent directory oracle (avoids calling
-        // prepare_output_dir_for_kind here — an early create_dir_all would leave
-        // an empty directory on compile failure; Step 6 Caveat 1 / PF-004).
+        // from the kind-independent directory oracle, without creating it — an early
+        // create_dir_all would leave an empty directory on compile failure (Step 6
+        // Caveat 1 / PF-004).
         let base_no_ext = output_base_no_ext(file, dir, &output_base);
         let source_map_base = base_no_ext
             .parent()
@@ -1985,6 +2113,113 @@ mod tests {
         }
     }
 
+    /// #425: `admit_output` refuses an output that is the entry file and names the entry
+    /// by `typed`, never by `canonical`; any other output is admitted, stdout included.
+    /// Every write site — `mds build`, `mds watch`'s startup compile, its startup
+    /// fallback and every rebuild — passes the entry as one `EntryPaths`, so none of them
+    /// can hand the two forms over swapped.
+    #[test]
+    fn admit_output_refuses_naming_the_entry_as_typed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("page.md"), "x").unwrap();
+        let typed = dir.path().join("sub").join("..").join("page.md");
+        let canonical = dir.path().join("page.md").canonicalize().unwrap();
+        let entry = EntryPaths {
+            typed: &typed,
+            canonical: &canonical,
+        };
+        let admit = |output: Option<&Path>| {
+            admit_output(output, entry, &None, OutputKind::Markdown, true)
+                .map_err(|e| e.to_string())
+        };
+
+        let refused = admit(Some(&canonical)).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "output would overwrite the entry file: \"{}\"; \
+                 write it elsewhere with -o <file> or --out-dir <dir>",
+                typed.display()
+            )
+        );
+        assert!(
+            !refused.contains(&*canonical.to_string_lossy()),
+            "{refused}"
+        );
+        assert_eq!(
+            admit(Some(&dir.path().join("sub").join("..").join("page.md"))),
+            Err(refused),
+            "another spelling of the entry is the entry"
+        );
+
+        assert_eq!(admit(Some(&dir.path().join("out.md"))), Ok(()), "control");
+        assert_eq!(admit(None), Ok(()), "stdout is never the entry");
+    }
+
+    /// #425: an output whose directory does not exist yet is the file the write will
+    /// reach once `write_output` has created that directory. A created directory is a
+    /// plain one, so a `..` after it leads back to its parent — the entry's directory
+    /// here — while an existing component is followed as the write follows it, a
+    /// symlink included. The name is then looked up in the directory reached, so on a
+    /// case-insensitive volume a case variant of the entry's name is the entry there
+    /// too, however that directory was reached. Nothing is created by asking.
+    #[test]
+    fn file_identity_resolves_a_directory_the_write_creates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("page.md"), "x").unwrap();
+        let page = root.join("page.md");
+        let case_insensitive = root.join("PAGE.md").exists();
+        // A case variant is the entry on a case-insensitive volume, another file on a
+        // case-sensitive one: each volume holds the variant to its own answer.
+        let variant = if case_insensitive {
+            page.clone()
+        } else {
+            root.join("PAGE.md")
+        };
+
+        let rows = [
+            ("page.md", page.clone()),
+            ("sub/../page.md", page.clone()),
+            ("newdir/../page.md", page.clone()),
+            ("a/b/../../page.md", page.clone()),
+            ("sub/new/../../page.md", page.clone()),
+            ("new/./x/../../page.md", page.clone()),
+            ("newdir/page.md", root.join("newdir").join("page.md")),
+            (
+                "sub/new/page.md",
+                root.join("sub").join("new").join("page.md"),
+            ),
+            ("PAGE.md", variant.clone()),
+            ("newdir/../PAGE.md", variant.clone()),
+            ("a/b/../../PAGE.md", variant),
+        ];
+        // `dir.path()` is not canonical on macOS (`/var` → `/private/var`), so the
+        // existing part of each path is canonicalized, not merely joined.
+        let mismatches: Vec<String> = rows
+            .iter()
+            .filter_map(|(rel, expected)| {
+                let got = file_identity(&dir.path().join(rel));
+                (got.as_ref() != Some(expected)).then(|| format!("{rel}: {got:?}"))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+        #[cfg(unix)]
+        {
+            // Out of a directory the write creates, then through an existing link that
+            // leads back to the entry's directory: the link is followed.
+            std::os::unix::fs::symlink(&root, root.join("lnk")).unwrap();
+            assert_eq!(
+                file_identity(&dir.path().join("newdir/../lnk/page.md")),
+                Some(page.clone())
+            );
+        }
+        assert!(!root.join("newdir").exists() && !root.join("a").exists());
+    }
+
     // ── compute_source_map_base ───────────────────────────────────────────────
     //
     // `source_map_base` is the anchor core's `relativize_source` uses to emit
@@ -2133,7 +2368,6 @@ mod tests {
             &None,
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(result, None, "-o - should resolve to stdout (None)");
@@ -2147,7 +2381,6 @@ mod tests {
             &None,
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(
@@ -2164,7 +2397,6 @@ mod tests {
             &None,
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(
@@ -2184,7 +2416,6 @@ mod tests {
             &Some(out_dir.clone()),
             &None,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(
@@ -2192,6 +2423,9 @@ mod tests {
             Some(out_dir.join("output.md")),
             "stdin with --out-dir should produce output.md inside the out dir"
         );
+        // #425: resolving creates nothing — `write_output` creates the directory, once
+        // the output has been admitted — so a refused output leaves no directory behind.
+        assert!(!out_dir.exists(), "resolving creates no directory");
     }
 
     #[test]
@@ -2212,7 +2446,6 @@ mod tests {
             &None,
             &config,
             OutputKind::Markdown,
-            true,
         )
         .unwrap();
         assert_eq!(
@@ -2589,5 +2822,137 @@ mod tests {
             msg.contains("variable 'x' is set by both --set and --set-string"),
             "error must be the cross-flag collision, not a file-read error; got: {msg}"
         );
+    }
+
+    // ── Bounded reads (#428) ────────────────────────────────────────────────────
+
+    /// A stream of `x` bytes — `len` of them, or without end — handed out at most 64 KiB
+    /// per read, as a pipe does, counting how many it served.
+    struct Stream {
+        left: Option<u64>,
+        served: u64,
+    }
+
+    impl Stream {
+        fn sized(len: u64) -> Self {
+            Self {
+                left: Some(len),
+                served: 0,
+            }
+        }
+
+        fn endless() -> Self {
+            Self {
+                left: None,
+                served: 0,
+            }
+        }
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(64 * 1024);
+            let n = self
+                .left
+                .map_or(n, |left| n.min(usize::try_from(left).unwrap_or(n)));
+            buf[..n].fill(b'x');
+            if let Some(left) = self.left.as_mut() {
+                *left -= n as u64;
+            }
+            self.served += n as u64;
+            Ok(n)
+        }
+    }
+
+    /// #428: stdin is read into a buffer that never holds more than the per-file cap
+    /// plus one byte — a buffer only grows, so its final capacity is the most it ever
+    /// held — and never past that byte: exactly the cap is accepted, one byte more is
+    /// refused, and an endless stream is read to one byte past the cap. Bytes that are
+    /// not UTF-8 keep their message.
+    #[test]
+    fn read_stdin_holds_at_most_the_cap_plus_one_byte() {
+        let at_cap = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE)).unwrap();
+        assert_eq!(
+            at_cap.len() as u64,
+            MAX_FILE_SIZE,
+            "exactly the cap is read"
+        );
+        assert!(
+            at_cap.capacity() as u64 <= MAX_FILE_SIZE + 1,
+            "capacity {} for {MAX_FILE_SIZE} bytes, over the cap plus one byte",
+            at_cap.capacity()
+        );
+
+        let over = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE + 1)).unwrap_err();
+        assert_eq!(
+            over.to_string(),
+            "stdin input exceeds maximum size of 10 MB"
+        );
+
+        let mut endless = Stream::endless();
+        let err = read_stdin_from(&mut endless).unwrap_err();
+        assert_eq!(err.to_string(), "stdin input exceeds maximum size of 10 MB");
+        assert_eq!(endless.served, MAX_FILE_SIZE + 1, "read no further");
+
+        let err = read_stdin_from(&mut &b"ok \xff"[..]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot read stdin: stream did not contain valid UTF-8"
+        );
+        assert_eq!(read_stdin_from(&mut &b"Hello!\n"[..]).unwrap(), "Hello!\n");
+    }
+
+    /// #428: the stale-map check reads only the bytes a sidecar mds wrote starts with —
+    /// `SourceMap::to_json` writes `version`, then `file`, then `sources` — and deletes
+    /// nothing else: a map written for the output (its name escaped as JSON, or not) is
+    /// recognised, while one for another output, a hand-formatted one with the same
+    /// fields, one that ends after `file`, and a large file of anything else are not,
+    /// and the large one is never read whole.
+    #[test]
+    fn stale_map_check_reads_only_the_sidecar_head() {
+        let sidecar = |name: &str| {
+            let mut sm = mds::compile_str_with_deps_opts(
+                "Hi\n",
+                None,
+                None,
+                mds::CompileOptions::default().with_source_map(true),
+            )
+            .unwrap()
+            .source_map
+            .expect("a map was built");
+            apply_source_map_file_label(&mut sm, Some(Path::new(name)), false);
+            sm.to_json()
+        };
+        let verdict = |bytes: &str, name: &str| has_sidecar_head(&mut bytes.as_bytes(), name);
+
+        let mut mismatches = Vec::new();
+        for name in ["out.md", "a \"quoted\" name.md", "caf\u{e9}.md"] {
+            if !verdict(&sidecar(name), name) {
+                mismatches.push(format!("{name}: its own sidecar is not recognised"));
+            }
+        }
+        let rows = [
+            ("another output's sidecar", sidecar("other.md")),
+            (
+                "hand-formatted, same fields",
+                "{ \"version\": 3, \"file\": \"out.md\", \"sources\": [], \"names\": [], \"mappings\": \"\" }".to_owned(),
+            ),
+            ("ends after file", "{\"version\":3,\"file\":\"out.md\"}".to_owned()),
+            ("version 2", "{\"version\":2,\"file\":\"out.md\",\"sources\":[]}".to_owned()),
+        ];
+        for (label, bytes) in rows {
+            if verdict(&bytes, "out.md") {
+                mismatches.push(format!("{label}: recognised as out.md's sidecar"));
+            }
+        }
+        let head = "{\"version\":3,\"file\":\"out.md\",".len() as u64;
+        let mut large = Stream::sized(64 * 1024 * 1024);
+        if has_sidecar_head(&mut large, "out.md") || large.served > head {
+            mismatches.push(format!(
+                "64 MiB of x: read {} bytes; the head is {head}",
+                large.served
+            ));
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 }

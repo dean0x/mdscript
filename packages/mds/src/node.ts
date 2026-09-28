@@ -57,8 +57,9 @@ export function _resetForTesting(): void {
 
 /**
  * Wrap a MdsBaseBackend with file-based compile/check operations, producing
- * a MdsNodeBackend. The wasmModule is captured so compileFile/checkFile can
- * call wasm.scanImports() to resolve @import directives.
+ * a MdsNodeBackend. The wasmModule is captured so compileFile/checkFile/lintFile can
+ * hand it to buildModulesMap, whose file pre-scanner calls its scanImportRecords() and
+ * preflightModule() exports.
  *
  * buildModulesMap is imported here (Node-only), not in wasm.ts, so that
  * wasm.ts remains browser-safe.
@@ -77,7 +78,7 @@ function wrapWithFileOps(
     path: string,
     options: CompileFileOptions | undefined,
   ): Promise<{ source: string; opts: ReturnType<typeof fileOpts> }> {
-    const { entryFilename, modules } = await buildModulesMap(path, (src) => wasmModule.scanImports(src));
+    const { entryFilename, modules, aliases } = await buildModulesMap(path, wasmModule);
     const source = modules[entryFilename];
     if (source === undefined) {
       throw new Error(
@@ -85,7 +86,7 @@ function wrapWithFileOps(
       );
     }
     delete modules[entryFilename];
-    return { source, opts: fileOpts(entryFilename, modules, options) };
+    return { source, opts: fileOpts(entryFilename, modules, aliases, options) };
   }
 
   return {
@@ -137,10 +138,7 @@ function wrapWithFileOps(
       // not just the basename — this differs from the native backend's filename
       // in the canonical JSON. Use lintVirtual for byte-identical cross-surface
       // comparison.
-      const { entryFilename, modules } = await buildModulesMap(
-        path,
-        (src) => wasmModule.scanImports(src),
-      );
+      const { entryFilename, modules, aliases } = await buildModulesMap(path, wasmModule);
       const entrySource = modules[entryFilename];
       if (entrySource === undefined) {
         throw new Error(
@@ -162,6 +160,8 @@ function wrapWithFileOps(
         ...forwarded,
         filename: entryFilename,
         ...(Object.keys(extraModules).length > 0 ? { modules: extraModules } : undefined),
+        // The keys imports reach a module by other than its own (#414).
+        ...(Object.keys(aliases).length > 0 ? { moduleAliases: aliases } : undefined),
       };
       const result: unknown = wasmModule.lint(entrySource, lintOpts);
       assertResultShape(result, 'lint');

@@ -4,8 +4,8 @@ use std::path::Path;
 
 use mds::{
     CompileResult, CompiledOutput, FileSystem, FixLineSpan, LintConfig, LintDiagnostic, LintResult,
-    MdsError, ModuleCache, NativeFs, Severity, Value, VirtualFs, MAX_DIAGNOSTICS, MAX_FILE_SIZE,
-    MAX_TRAVERSAL_DEPTH,
+    MdsError, ModuleCache, NativeFs, ParseSeverityError, Severity, Value, VirtualFs,
+    MAX_DIAGNOSTICS, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
 };
 
 #[test]
@@ -72,6 +72,182 @@ fn forbidden_path_char_functions_exist() {
     assert!(mds::is_forbidden_path_char('\t'));
     assert!(!mds::is_forbidden_path_char('a'));
     assert_eq!(&*mds::escape_path_for_message("a\tb"), "a\\u0009b");
+}
+
+/// #413: `reject_forbidden_path` — the forbidden-character refusal the CLI words its
+/// own path refusals with — is callable via the crate root: it scans one path and names
+/// another, as typed.
+#[test]
+fn reject_forbidden_path_function_exists() {
+    let _: fn(&str, &Path, &str) -> Result<(), MdsError> = mds::reject_forbidden_path;
+    mds::reject_forbidden_path("path", Path::new("clean"), "clean").unwrap();
+    let err = mds::reject_forbidden_path("resolved path", Path::new("a\tb"), "typed").unwrap_err();
+    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "resolved path contains forbidden character U+0009: \"typed\""
+    );
+}
+
+/// #428: `read_at_most` — the bounded read behind every capped read, the CLI's stdin
+/// and stale-map check included — is callable via the crate root: it stops at `limit`
+/// bytes and never holds more.
+#[test]
+fn read_at_most_function_exists() {
+    let _: fn(&mut &'static [u8], u64, u64) -> std::io::Result<Vec<u8>> = mds::read_at_most;
+    let bytes = mds::read_at_most(&mut &b"Hello!\n"[..], 4, 0).unwrap();
+    assert_eq!(bytes, b"Hell");
+    assert!(bytes.capacity() <= 4, "capacity {}", bytes.capacity());
+}
+
+/// #414: `check_module_bytes` — NativeFs's post-read checks, shared with the WASM
+/// backend's `preflightModule` — is callable via the crate root with the expected
+/// signature: text in, the size and UTF-8 refusals out.
+#[test]
+fn check_module_bytes_function_exists() {
+    let _: fn(Vec<u8>, &str) -> Result<String, MdsError> = mds::check_module_bytes;
+    assert_eq!(
+        mds::check_module_bytes(b"hi\n".to_vec(), "a.mds").unwrap(),
+        "hi\n"
+    );
+    let err = mds::check_module_bytes(vec![0xff], "a.mds").unwrap_err();
+    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+    let err = mds::check_module_bytes(vec![b'x'; MAX_FILE_SIZE as usize + 1], "a.mds").unwrap_err();
+    assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err:?}");
+}
+
+/// #417: `check_module_type` — the resolver's not-an-MDS-file check, shared with the
+/// WASM backend's `preflightModule` — is callable via the crate root: it judges the
+/// key's extension and names the path as typed. It takes the two as one
+/// `#[non_exhaustive]` `ModuleRef`, built in two named steps — `ModuleRef::keyed`,
+/// then `ModuleKey::typed` — whose fields are readable.
+#[test]
+fn check_module_type_function_exists() {
+    let _: for<'a> fn(mds::ModuleRef<'a>, &str) -> Result<(), MdsError> = mds::check_module_type;
+    let _: fn(&'static str) -> mds::ModuleKey<'static> = mds::ModuleRef::keyed;
+    let _: fn(mds::ModuleKey<'static>, &'static str) -> mds::ModuleRef<'static> =
+        mds::ModuleKey::typed;
+
+    let module = mds::ModuleRef::keyed("/p/doc.txt").typed("./sub/../doc.txt");
+    let mds::ModuleRef { key, typed, .. } = module;
+    assert_eq!((key, typed), ("/p/doc.txt", "./sub/../doc.txt"));
+    let err = mds::check_module_type(module, "hi\n").unwrap_err();
+    assert!(matches!(err, MdsError::NotMdsFile { .. }), "{err:?}");
+    assert_eq!(err.to_string(), "not an MDS file: ./sub/../doc.txt");
+    // Control: the extension judged is the key's.
+    mds::check_module_type(
+        mds::ModuleRef::keyed("/p/Doc.mds").typed("./doc.txt"),
+        "hi\n",
+    )
+    .unwrap();
+}
+
+/// #414: `scan_import_records` and its `#[non_exhaustive]` `ImportRecord` /
+/// `ImportKind` / `ResolveAs` are reachable from the crate root: the fields are
+/// readable, and a match on the kind or on `ResolveAs` needs a wildcard arm, as a new
+/// variant may be added.
+#[test]
+fn scan_import_records_function_exists() {
+    let _: fn(&str, mds::ResolveAs) -> Result<Vec<mds::ImportRecord>, MdsError> =
+        mds::scan_import_records;
+    let name = |resolve_as| match resolve_as {
+        mds::ResolveAs::Standalone => "standalone",
+        mds::ResolveAs::Base => "base",
+        _ => "another way",
+    };
+    assert_eq!(name(mds::ResolveAs::Base), "base");
+    let records = mds::scan_import_records("@extends \"./base.mds\"\n", mds::ResolveAs::Standalone)
+        .expect("the source parses");
+    let record: &mds::ImportRecord = &records[0];
+    let _: &String = &record.path;
+    let _: Option<usize> = record.frontmatter_index;
+    let _: &Option<mds::SerializedSpan> = &record.span;
+    let kind = match record.kind {
+        mds::ImportKind::Extends => "extends",
+        _ => "another kind",
+    };
+    assert_eq!(kind, record.kind.name());
+}
+
+/// #414: `VirtualFs::with_aliases` and the compile, check and lint entry points that
+/// take a `VirtualFs` are reachable from an external crate: an aliased import reaches
+/// the module its alias names, and an alias that names no module is refused.
+#[test]
+fn virtual_fs_aliases_api_exists() {
+    type Vars = Option<HashMap<String, Value>>;
+    let _: fn(VirtualFs, HashMap<String, String>) -> Result<VirtualFs, mds::ModuleAliasError> =
+        VirtualFs::with_aliases;
+    let _: fn(VirtualFs, &str, Vars, mds::CompileOptions) -> Result<CompileResult, MdsError> =
+        mds::compile_virtual_fs;
+    let _: fn(VirtualFs, &str, Vars) -> Result<Vec<String>, MdsError> = mds::check_virtual_fs;
+    let _: fn(VirtualFs, &str, Vars, &LintConfig) -> Result<LintResult, MdsError> =
+        mds::lint_virtual_fs;
+
+    let modules = HashMap::from([
+        (
+            "main.mds".to_string(),
+            "@import \"./Hi.mds\" as h\n@include h\n".to_string(),
+        ),
+        ("hi.mds".to_string(), "Hi!\n".to_string()),
+    ]);
+    let alias = |target: &str| HashMap::from([("Hi.mds".to_string(), target.to_string())]);
+    let fs = VirtualFs::new(modules.clone())
+        .with_aliases(alias("hi.mds"))
+        .unwrap();
+    let result =
+        mds::compile_virtual_fs(fs, "main.mds", None, mds::CompileOptions::default()).unwrap();
+    assert_eq!(result.dependencies, ["hi.mds"]);
+    let err = VirtualFs::new(modules.clone())
+        .with_aliases(alias("gone.mds"))
+        .unwrap_err();
+    // #414: the refusal carries the alias and the reason apart, and converts into
+    // `mds::io`; a map past a bound converts into `mds::resource_limit`.
+    assert!(
+        matches!(
+            &err,
+            mds::ModuleAliasError::Refused { alias, reason, .. }
+                if alias == "Hi.mds" && reason == "its module key \"gone.mds\" names no module"
+        ),
+        "{err:?}"
+    );
+    let as_error: &dyn std::error::Error = &err;
+    assert_eq!(
+        as_error.to_string(),
+        "module alias \"Hi.mds\": its module key \"gone.mds\" names no module"
+    );
+    assert!(matches!(MdsError::from(err), MdsError::Io { .. }));
+    let too_many: HashMap<String, String> = (0..=mds::MAX_MODULE_ALIASES)
+        .map(|i| (format!("A{i}.mds"), "hi.mds".to_string()))
+        .collect();
+    let err = VirtualFs::new(modules).with_aliases(too_many).unwrap_err();
+    assert!(
+        matches!(err, mds::ModuleAliasError::TooMany { count, .. } if count == mds::MAX_MODULE_ALIASES + 1),
+        "{err:?}"
+    );
+    assert!(matches!(
+        MdsError::from(err),
+        MdsError::ResourceLimit { .. }
+    ));
+
+    // `check_virtual_fs` returns its warnings — an `@include` of a module with no body
+    // text warns — and an empty list for a clean module.
+    let modules = HashMap::from([
+        (
+            "main.mds".to_string(),
+            "@import \"./fns.mds\" as fns\n@include fns\n".to_string(),
+        ),
+        ("fns.mds".to_string(), "@define f():\nF\n@end\n".to_string()),
+    ]);
+    let warnings = mds::check_virtual_fs(VirtualFs::new(modules), "main.mds", None).unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains("no body text")),
+        "{warnings:?}"
+    );
+    let clean = HashMap::from([("main.mds".to_string(), "Hi!\n".to_string())]);
+    assert_eq!(
+        mds::check_virtual_fs(VirtualFs::new(clean), "main.mds", None).unwrap(),
+        Vec::<String>::new()
+    );
 }
 
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`
@@ -338,6 +514,7 @@ fn mds_error_is_string_source() {
 #[test]
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
+    assert_eq!(mds::MAX_MODULE_ALIASES, 65_536);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
 }
@@ -1693,6 +1870,49 @@ fn lint_types_exist() {
     let _warn = Severity::Warn;
     let _err = Severity::Error;
 
+    // #175: Severity parses its four exact spellings through FromStr; anything else is
+    // a ParseSeverityError, which is Display + Error and not constructible outside
+    // mds-core (#[non_exhaustive]) — an external crate obtains one only from parse().
+    assert_eq!("info".parse::<Severity>(), Ok(Severity::Info));
+    let err: ParseSeverityError = "Info".parse::<Severity>().unwrap_err();
+    let as_error: &dyn std::error::Error = &err;
+    assert_eq!(
+        as_error.to_string(),
+        "unknown severity; expected \"off\", \"info\", \"warn\", or \"error\""
+    );
+    assert_eq!(err, " info".parse::<Severity>().unwrap_err());
+    // Its serde form is the same parser: the same spellings, the same message.
+    let from_json = |value| serde_json::from_value::<Severity>(value).map_err(|e| e.to_string());
+    assert_eq!(from_json(serde_json::json!("info")), Ok(Severity::Info));
+    assert_eq!(from_json(serde_json::json!("Info")), Err(err.to_string()));
+
+    // #418: a binding's `rules` map goes through one parser, which words both errors —
+    // the rule name and the value escaped, the field named as the binding passes it.
+    type Rules = serde_json::Map<String, serde_json::Value>;
+    type Severities = HashMap<String, Severity>;
+    let _: fn(Rules, &str) -> Result<Severities, String> = mds::parse_rule_severities;
+    let rules = |value| -> Rules {
+        serde_json::from_value(serde_json::json!({ "unused-variable": value })).unwrap()
+    };
+    assert_eq!(
+        mds::parse_rule_severities(rules(serde_json::json!("warn")), "options.rules"),
+        Ok(HashMap::from([(
+            "unused-variable".to_string(),
+            Severity::Warn
+        )]))
+    );
+    assert_eq!(
+        mds::parse_rule_severities(rules(serde_json::json!("Warn")), "rules"),
+        Err(format!(
+            "rules[\"unused-variable\"]: unknown severity \"Warn\"; {}",
+            &err.to_string()["unknown severity; ".len()..]
+        ))
+    );
+    assert_eq!(
+        mds::parse_rule_severities(rules(serde_json::json!(1)), "options.rules"),
+        Err("options.rules[\"unused-variable\"] must be a severity string, got number".to_string())
+    );
+
     // LintConfig has a `rules` field (HashMap<String, Severity>).
     let (config, _) = LintConfig::from_rules_checked(HashMap::from([(
         "unused-variable".to_string(),
@@ -2128,6 +2348,18 @@ fn native_fs_check_symlink_is_public() {
     use std::path::PathBuf;
     type CheckSymlinkFn = fn(&Path) -> Result<PathBuf, MdsError>;
     let _: CheckSymlinkFn = mds::NativeFs::check_symlink;
+}
+
+/// #413: `NativeFs::check_directory` — the check every CLI directory argument goes
+/// through — is callable from an external crate: a path with no final name resolves to
+/// the canonical directory, and a file is refused as not a directory.
+#[test]
+fn native_fs_check_directory_function_exists() {
+    let _: fn(&Path) -> Result<std::path::PathBuf, MdsError> = NativeFs::check_directory;
+    let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(NativeFs::check_directory(Path::new(".")).unwrap(), here);
+    let err = NativeFs::check_directory(Path::new("Cargo.toml")).unwrap_err();
+    assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
 }
 
 // ── CompileOptions shape (T1 wire-format parity gate) ────────────────────────

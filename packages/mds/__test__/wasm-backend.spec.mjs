@@ -1,6 +1,6 @@
 /**
  * WASM backend unit tests for @mdscript/mds universal package.
- * Tests: U-WB1 through U-WB20
+ * Tests: U-WB1 through U-WB27
  *
  * Imports dist/backend/wasm.js directly to exercise internal state
  * without going through the full node.ts entry point.
@@ -8,6 +8,9 @@
 import { test, describe, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initWasmNode, initWasmBrowser, createWasmBackend, _resetForTesting, validateWasmShape } from '../dist/backend/wasm.js';
+import { WASM_EXPORTS } from '../dist/backend/contract.js';
+import { buildModulesMap } from '../dist/util/module-scanner.js';
+import { IMPORT_CONSUMER_MDS } from './helpers.mjs';
 
 // Mirror of MAX_INIT_RETRIES from src/backend/wasm.ts.
 // If this value drifts from the source, U-WB2 will fail to trigger the
@@ -51,7 +54,7 @@ describe('wasm backend — circuit breaker', () => {
 
   test('U-WB3: initWasmNode() succeeds and produces a valid WasmModule when WASM module is present', async () => {
     // Regression: shape-check in tryLoadCandidate must accept a well-formed WASM
-    // module (compile/check/scanImports all present). Before the fix, ALL errors
+    // module (every WASM_EXPORTS member present). Before the fix, ALL errors
     // were swallowed and the module was cast blindly via "as WasmModule".
     // This test confirms the happy path: a correct module passes the shape check.
     await assert.doesNotReject(
@@ -87,11 +90,12 @@ describe('wasm backend — circuit breaker', () => {
   // New tests for the split API
   // ---------------------------------------------------------------------------
 
-  test('U-WB5: initWasmNode() returns WasmModule with compile, check, and scanImports (no compileMessages)', async () => {
+  test('U-WB5: initWasmNode() returns WasmModule with compile, check, scanImportRecords and preflightModule (no compileMessages)', async () => {
     const mod = await initWasmNode();
     assert.equal(typeof mod.compile, 'function', 'WasmModule must have compile');
     assert.equal(typeof mod.check, 'function', 'WasmModule must have check');
-    assert.equal(typeof mod.scanImports, 'function', 'WasmModule must have scanImports');
+    assert.equal(typeof mod.scanImportRecords, 'function', 'WasmModule must have scanImportRecords');
+    assert.equal(typeof mod.preflightModule, 'function', 'WasmModule must have preflightModule');
     // compileMessages was removed in PR-2/PR-3 — output kind is intrinsic
     assert.equal(typeof mod.compileMessages, 'undefined', 'WasmModule must NOT have compileMessages');
   });
@@ -152,16 +156,13 @@ describe('wasm backend — circuit breaker', () => {
     );
   });
 
-  test('U-WB13: initWasmNode() only succeeds when module has scanImports', async () => {
+  test('U-WB13: initWasmNode() only succeeds when module has every WASM_EXPORTS member', async () => {
     // Verifies that initWasmNode() only resolves when the loaded module passes
-    // validateWasmShape (compile, check, and scanImports all present). The built
-    // WASM module must expose scanImports for this call to succeed.
+    // validateWasmShape: every WASM_EXPORTS member is present.
     const mod = await initWasmNode();
-    assert.equal(
-      typeof mod.scanImports,
-      'function',
-      'initWasmNode() must only succeed when scanImports is present in the WASM module',
-    );
+    for (const name of WASM_EXPORTS) {
+      assert.equal(typeof mod[name], 'function', `initWasmNode() resolved a module without ${name}`);
+    }
   });
 });
 
@@ -360,13 +361,14 @@ describe('wasm backend — browser shape validation', () => {
     _resetForTesting(0);
   });
 
-  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, lint, scanImports, lintVirtual)', () => {
+  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, lint, lintVirtual, scanImportRecords, preflightModule)', () => {
     const validMod = {
       compile: () => {},
       check: () => {},
       lint: () => {},
-      scanImports: () => [],
       lintVirtual: () => {},
+      scanImportRecords: () => [],
+      preflightModule: () => '',
     };
     assert.doesNotThrow(
       () => validateWasmShape(validMod),
@@ -375,7 +377,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB18: validateWasmShape throws when compile is missing', () => {
-    const mod = { check: () => {}, scanImports: () => [] };
+    const mod = { check: () => {} };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -390,7 +392,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB19: validateWasmShape throws when check is missing', () => {
-    const mod = { compile: () => {}, scanImports: () => [] };
+    const mod = { compile: () => {} };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -404,18 +406,59 @@ describe('wasm backend — browser shape validation', () => {
     );
   });
 
-  test('U-WB20: validateWasmShape throws when scanImports is missing', () => {
-    const mod = { compile: () => {}, check: () => {}, lint: () => {}, lintVirtual: () => {} };
+  test('U-WB26: validateWasmShape throws when preflightModule is missing (#414)', () => {
+    // The WASM backend's file pre-scanner checks every module's bytes through this
+    // export: a module without it must be refused at load, not fail mid-compile.
+    const mod = {
+      compile: () => {},
+      check: () => {},
+      lint: () => {},
+      lintVirtual: () => {},
+      scanImportRecords: () => [],
+    };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
         assert.ok(err instanceof Error);
         assert.ok(
-          err.message.includes('scanImports'),
-          `error must mention missing function "scanImports", got: ${err.message}`,
+          err.message.includes('"preflightModule"'),
+          `error must mention missing function "preflightModule", got: ${err.message}`,
         );
         return true;
       },
     );
+  });
+
+  test('U-WB27: validateWasmShape throws when scanImportRecords is missing (#414)', () => {
+    // The WASM backend's file pre-scanner walks every module's imports through this
+    // export: a module without it must be refused at load, not fail mid-compile.
+    const mod = {
+      compile: () => {},
+      check: () => {},
+      lint: () => {},
+      lintVirtual: () => {},
+      preflightModule: () => '',
+    };
+    assert.throws(
+      () => validateWasmShape(mod),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('"scanImportRecords"'),
+          `error must mention missing function "scanImportRecords", got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-WB20: a WASM module without scanImports loads, and the file pre-scanner runs on it (#414)', async () => {
+    // @mdscript/mds never calls scanImports: the pre-scanner calls scanImportRecords.
+    // The built module exports it (the @mdscript/mds-wasm API), so it is taken away here.
+    const { scanImports, ...mod } = await initWasmNode();
+    assert.equal(typeof scanImports, 'function', 'the built module exports scanImports');
+    assert.doesNotThrow(() => validateWasmShape(mod));
+    const { modules } = await buildModulesMap(IMPORT_CONSUMER_MDS, mod);
+    assert.equal(Object.keys(modules).length, 2, JSON.stringify(Object.keys(modules)));
   });
 });

@@ -1304,11 +1304,12 @@ fn fmt_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
 // ── C4/F6: existence-before-extension ordering for fmt ───────────────────────
 
 /// A non-existent path that also lacks the `.mds` extension must report
-/// `mds::file_not_found` (exit 2), NOT `mds::not_mds_file` (exit 2).
+/// `mds::file_not_found` (exit 2), NOT `mds::not_mds` (exit 2): `ensure_existing_mds_file`
+/// checks existence before the extension.
 ///
-/// Before C4/F6, `ensure_mds_extension` ran before existence was checked, so
-/// a user pointing at `/nonexistent.txt` got "not an .mds file" — confusing
-/// because the path doesn't exist at all.
+/// Positive control (PF-013): once the same path exists it IS refused as
+/// `mds::not_mds`, `not an MDS file`, so the absence check looks for the code and text
+/// that error really carries.
 #[test]
 fn fmt_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -1325,12 +1326,25 @@ fn fmt_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("mds::file_not_found") || stderr.contains("file not found"),
+        stderr.contains("mds::file_not_found") && stderr.contains("file not found"),
         "error must be file-not-found (not extension error); got: {stderr:?}"
     );
     assert!(
-        !stderr.contains("mds::not_mds_file") && !stderr.contains("not an .mds"),
-        "must NOT report 'not an .mds file' for a non-existent path; got: {stderr:?}"
+        !stderr.contains("mds::not_mds") && !stderr.contains("not an MDS file"),
+        "must NOT report 'not an MDS file' for a non-existent path; got: {stderr:?}"
+    );
+
+    std::fs::write(&missing, "Hello!\n").unwrap();
+    let output = fmt_path(&missing, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "control: an existing .txt exits 2"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::not_mds") && stderr.contains("not an MDS file"),
+        "control: an existing .txt is mds::not_mds; got: {stderr:?}"
     );
 }
 

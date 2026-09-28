@@ -640,8 +640,9 @@ fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
 
 /// Compile an MDS template source string and return a structured result.
 ///
-/// For string-source compiles the `sources[0]` field in any generated source map is
-/// `"input.mds"`.
+/// For string-source compiles the source string is named `"input.mds"` in a generated
+/// source map's `sources` — `sources[0]`, unless the string `@extends` a base: then the
+/// chain's root base comes first.
 ///
 /// ## Arguments
 ///
@@ -816,30 +817,10 @@ fn extract_rules_direct(
                     ),
                 ));
             };
-            let mut rules = HashMap::new();
-            for (key, val) in rules_map {
-                let serde_json::Value::String(s) = &val else {
-                    return Err(throw_options_error(
-                        env,
-                        &format!(
-                            "options.rules[\"{key}\"] must be a severity string, got {}",
-                            mds::json_type_name(&val)
-                        ),
-                    ));
-                };
-                // Parse severity via serde — validates against the closed enum.
-                let severity: mds::Severity =
-                    serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
-                        throw_options_error(
-                            env,
-                            &format!(
-                                "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
-                                 valid values are \"off\", \"info\", \"warn\", \"error\""
-                            ),
-                        )
-                    })?;
-                rules.insert(key, severity);
-            }
+            // mds-core parses every severity and words the error, the rule name and
+            // the value escaped, as it does for WASM and Python (#418).
+            let rules = mds::parse_rule_severities(rules_map, "options.rules")
+                .map_err(|message| throw_options_error(env, &message))?;
             // D8: detect unknown rule names and build config in one step via
             // from_rules_checked. The return type structurally forces the caller
             // to handle the unknowns report — a fifth caller cannot accidentally

@@ -1,6 +1,6 @@
 /**
  * #265 forbidden path characters — Rust↔JS differential (AC-265-5).
- * Tests: U-FP1 through U-FP5
+ * Tests: U-FP1 through U-FP6
  *
  * The JS pre-scanner (src/util/path-chars.ts + src/util/module-scanner.ts)
  * re-implements `mds::is_forbidden_path_char` and the refusal messages in another
@@ -29,13 +29,14 @@ import {
   uPlus,
 } from './helpers.mjs';
 
-const { isForbiddenPathChar } = await import('../dist/util/path-chars.js');
+const { isForbiddenPathChar, sanitizeControlCharsWire } = await import('../dist/util/path-chars.js');
 const { normalizeVirtualKey } = await import('../dist/util/module-scanner.js');
 
 function codepointRange(first, last) {
   return Array.from({ length: last - first + 1 }, (_, i) => first + i);
 }
 
+const TAB = 0x09;
 const LF = 0x0a;
 const QUOTE = 0x22;
 
@@ -288,4 +289,51 @@ describe('forbidden path characters — Rust↔JS differential (#265)', () => {
       }
     },
   );
+
+  // #418: `@mdscript/mds` escapes an unknown option key with sanitizeControlCharsWire
+  // before any backend sees it; the engine escapes one with the Rust WIRE escaper
+  // (`format_unknown_keys_error`). U-OV-14 compares the two messages for a key made of
+  // the class; this covers everything else too — every scalar value goes through all
+  // three, 2,048 to a key, so a codepoint that one side alone escapes fails here.
+  test('U-FP6: option keys — sanitizeControlCharsWire and the Rust WIRE escaper agree on every scalar value', (t) => {
+    if (!requireEngines(t, engines, 'U-FP6')) return;
+    const escaped = [];
+    for (let cp = 0; cp <= 0x10ffff; cp++) {
+      if (cp >= 0xd800 && cp <= 0xdfff) continue; // surrogates are not scalar values
+      const c = String.fromCodePoint(cp);
+      if (sanitizeControlCharsWire(c) !== c) escaped.push(cp);
+    }
+    // The forbidden-path class minus TAB, which WIRE leaves raw — 79 codepoints.
+    assert.deepEqual(escaped, FORBIDDEN_PATH_CODEPOINTS.filter((cp) => cp !== TAB));
+
+    const messageFor = (engine, key) => {
+      try {
+        engine.compile('', { [key]: true });
+      } catch (err) {
+        return err.message;
+      }
+      return 'accepted';
+    };
+    // Control (PF-013): the engine really escapes a key, so the prefix comparison
+    // below can tell an escaped key from a raw one.
+    assert.ok(
+      messageFor(engines.native, String.fromCodePoint(0x1b)).startsWith(
+        `unknown option key "${escapeText(0x1b)}"; `,
+      ),
+    );
+    const CHUNK = 2048;
+    const mismatches = [];
+    for (let start = 0; start <= 0x10ffff; start += CHUNK) {
+      let key = '';
+      for (let cp = start; cp < Math.min(start + CHUNK, 0x110000); cp++) {
+        if (cp < 0xd800 || cp > 0xdfff) key += String.fromCodePoint(cp);
+      }
+      if (key === '') continue; // U+D800–U+DFFF fill one whole chunk
+      const expected = `unknown option key "${sanitizeControlCharsWire(key)}"; `;
+      for (const [name, engine] of [['native', engines.native], ['wasm', engines.wasm]]) {
+        if (!messageFor(engine, key).startsWith(expected)) mismatches.push(`${name} ${uPlus(start)}`);
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
 });

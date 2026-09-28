@@ -81,11 +81,17 @@ fn spawn_unsynchronized(cmd: &mut Command) -> (ChildGuard, StderrTap) {
     assert!(
         stdout_tap.is_none(),
         "this spawn piped stdout, and the harness has already drained it — the tap \
-         would be discarded here. Add a `spawn_unsynchronized_piped_stdout` wrapper \
-         mirroring `spawn_ready_piped_stdout` and use that instead; none exists yet \
-         because no unsynchronized test pipes stdout."
+         would be discarded here; use spawn_unsynchronized_piped_stdout instead"
     );
     (ChildGuard(child), tap)
+}
+
+/// [`spawn_unsynchronized`] for a command that set `.stdout(Stdio::piped())`; the
+/// drained stdout comes back as by [`spawn_ready_piped_stdout`].
+fn spawn_unsynchronized_piped_stdout(cmd: &mut Command) -> (ChildGuard, StderrTap, StdoutTap) {
+    let (child, tap, stdout_tap) = spawn_watch_unsynchronized(cmd);
+    let stdout_tap = stdout_tap.expect("caller must set .stdout(Stdio::piped())");
+    (ChildGuard(child), tap, stdout_tap)
 }
 
 /// Poll `path` until its content contains `needle`, or `timeout` elapses.
@@ -119,6 +125,14 @@ fn wait_for_file_contains_tight(path: &Path, needle: &str, timeout: Duration) ->
         std::thread::sleep(Duration::from_millis(1));
     }
     false
+}
+
+/// `s` without whitespace or miette's `│` frame marker, so a message miette wrapped
+/// (at a space or after a `/`) compares equal to the unwrapped one.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+        .collect()
 }
 
 /// Poll `path` until it no longer exists, or `timeout` elapses.
@@ -158,15 +172,24 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// can ever announce the recovery: `rmdir` of a watched directory removes the kernel's
 /// watch, and the directory recreated in its place is a different inode that nothing is
 /// watching. Recovery there is the `liveness_probe_*` re-arm, which runs once per
-/// `--poll-interval`. Such a wait is denominated in **ticks**, and pricing it with
-/// [`TIMEOUT`] — a latency bound — conflates two unrelated quantities and leaves the
-/// headroom silently dependent on whatever `--poll-interval` the test happens to pass.
+/// `--poll-interval`. An edit that lands before the watch is armed (the startup-window
+/// tests) is announced by no event either, and is recovered by the tick's content
+/// backstop. Such a wait is denominated in **ticks**, and pricing it with [`TIMEOUT`] —
+/// a latency bound — conflates two unrelated quantities and leaves the headroom
+/// silently dependent on whatever `--poll-interval` the test happens to pass.
 ///
 /// The tick-dependent waits, all of which use this bound:
 /// - `watch_file_mode_parent_dir_delete_recreate_recovers`
 /// - `watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers`
 /// - `watch_dir_mode_root_delete_recreate_recovers`
+/// - `watch_file_mode_relative_paths_recover_after_the_working_directory_is_recreated`
+/// - `watch_dot_recovers_after_the_working_directory_is_recreated`
 /// - `watch_vars_dir_delete_recreate_rearms`
+/// - `watch_dir_mode_cross_root_edit_during_startup_window_is_not_lost`
+/// - `watch_file_mode_dep_edit_during_startup_window_is_not_lost`
+/// - `watch_dir_mode_idle_tick_fires_under_event_flood`
+/// - `i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate`
+/// - `watch_help_example_src_poll_interval_500_self_heals`
 ///
 /// Every other wait in this file is satisfied by an inotify event on a watch that was
 /// never lost, and keeps [`TIMEOUT`].
@@ -238,6 +261,142 @@ fn watch_initial_compile_writes_output() {
 
     let found = wait_for_file_contains(&out, "Hello World!", TIMEOUT);
     assert!(found, "initial compile should write output to hello.md");
+    drop(child);
+}
+
+/// A `.md` entry that declares `type: mds` is an MDS file: file mode compiles it and
+/// rebuilds it on an edit. The resolver judges the file type, so watch must not run
+/// the CLI's `.mds`-extension check on its entry (#417 compiles the entry by the path
+/// as typed, and nothing else changes). Written to `-o`, since the default output
+/// path of `page.md` is the entry itself.
+#[test]
+fn watch_type_mds_markdown_entry_compiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, "---\ntype: mds\nname: World\n---\nHello {{name}}!\n").unwrap();
+    let out = dir.path().join("out.md");
+
+    let (child, _stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md", "-o", "out.md", "--debounce", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello World!", TIMEOUT),
+        "a type: mds .md entry compiles at startup"
+    );
+
+    write_atomic(&src, "---\ntype: mds\nname: Again\n---\nHello {{name}}!\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello Again!", TIMEOUT),
+        "and is rebuilt on an edit"
+    );
+    drop(child);
+}
+
+/// A rebuild compiles the entry by the path as typed as well, so an error about the
+/// entry raised on a rebuild names it that way (#417): once `page.md` drops its
+/// `type: mds`, the rebuild reports `not an MDS file: ./sub/../page.md`, never the
+/// canonical absolute path. Control: the same typed path compiled at startup.
+#[test]
+fn watch_rebuild_names_the_entry_as_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, "---\ntype: mds\n---\nHello!\n").unwrap();
+    let out = dir.path().join("out.md");
+    let typed = "./sub/../page.md";
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", typed, "-o", "out.md", "--debounce", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello!", TIMEOUT),
+        "control: the typed path compiles at startup"
+    );
+
+    write_atomic(&src, "Hello again!\n");
+    let needle = format!("not an MDS file: {typed}");
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, &needle, TIMEOUT);
+    assert!(
+        stderr.contains(&needle),
+        "the rebuild names the entry as typed; stderr: {stderr}"
+    );
+    // Squashed: miette wraps a long absolute path across lines.
+    let canonical = src.canonicalize().unwrap();
+    assert!(
+        !squash(&stderr).contains(&squash(&format!(
+            "not an MDS file: {}",
+            canonical.display()
+        ))),
+        "never by its canonical absolute path; stderr: {stderr}"
+    );
+    drop(child);
+}
+
+/// File mode compiles the entry by the path as typed but watches its canonical file
+/// (#417). Once a symlinked directory on the typed path is retargeted, the typed path
+/// leads to another file: the rebuild is refused (`mds::io`), naming the entry as typed,
+/// and nothing is written — rather than compiling the new target while watching the
+/// old one. Control: through the link as it was, an edit rebuilds.
+///
+/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_entry_through_a_retargeted_directory_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in [("a", "Hello A\n"), ("b", "Hello B\n")] {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+        std::fs::write(dir.path().join(name).join("page.mds"), text).unwrap();
+    }
+    let link = dir.path().join("link");
+    symlink("a", &link).unwrap();
+    let watched = dir.path().join("a").join("page.mds");
+    let out = dir.path().join("out.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "link/page.mds",
+                "-o",
+                "out.md",
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(wait_for_file_contains(&out, "Hello A", TIMEOUT), "startup");
+    write_atomic(&watched, "Hello A1\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello A1", TIMEOUT),
+        "control: an edit rebuilds through the link"
+    );
+
+    std::fs::remove_file(&link).unwrap();
+    symlink("b", &link).unwrap();
+    write_atomic(&watched, "Hello A2\n");
+    let stderr = wait_for_stderr_contains_str(&stderr_tap, "watched entry now resolves", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(
+            "mds::io×watchedentrynowresolvestoadifferentfile:\"link/page.mds\";\
+             restartmdswatchtofollowit"
+        ),
+        "the rebuild is refused, naming the entry as typed; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "Hello A1\n",
+        "nothing is written from the retargeted file"
+    );
     drop(child);
 }
 
@@ -753,17 +912,11 @@ fn watch_messages_template_produces_json_intrinsically() {
     std::fs::write(&src, "@message user:\nWhat is 2+2?\n@end\n").unwrap();
     let out = dir.path().join("chat.json");
 
+    // No `-o`: the `mds watch chat.mds` example of `--help` — the `.json` extension is
+    // the default output path's, derived from the compiled kind.
     let (child, _stderr_tap) = spawn_ready(
         mds_bin()
-            .args([
-                "watch",
-                src.to_str().unwrap(),
-                "-o",
-                out.to_str().unwrap(),
-                "--debounce",
-                "0",
-                "-q",
-            ])
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
             .stdout(Stdio::null()),
     );
 
@@ -2313,6 +2466,169 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
         "watcher must recover after root delete+recreate and compile new file"
     );
 
+    drop(child);
+}
+
+// ── AC-W1 / AC-W2 with paths typed relative to a recreated working directory ──
+
+/// AC-W1 with every path typed relative to the working directory, which is the entry's
+/// own directory: `mds watch entry.mds --vars vars.json -o ../out.md` run inside `src`
+/// (#417). Deleting `src` leaves the process in a dead directory, in which no relative
+/// path resolves, even once `src` is recreated. The watcher moves back into the
+/// recreated directory before the next rebuild, so the entry, the vars file and the
+/// output all resolve again: the output is compiled from the recreated entry AND the
+/// recreated vars file. Control: `watch_file_mode_parent_dir_delete_recreate_recovers`,
+/// the same scenario with the entry typed absolute.
+///
+/// Unix-only: Windows cannot delete a process's working directory.
+#[cfg(unix)]
+#[test]
+fn watch_file_mode_relative_paths_recover_after_the_working_directory_is_recreated() {
+    let base = tempfile::tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    std::fs::create_dir(&src_dir).unwrap();
+    std::fs::write(src_dir.join("entry.mds"), "Entry {{name}}\n").unwrap();
+    std::fs::write(src_dir.join("vars.json"), r#"{"name": "Before"}"#).unwrap();
+    let out = base.path().join("out.md");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&src_dir)
+            .args([
+                "watch",
+                "entry.mds",
+                "--vars",
+                "vars.json",
+                "-o",
+                "../out.md",
+            ])
+            .args(["--debounce", "0", "--poll-interval", "100", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Entry Before", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&src_dir).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir(&src_dir).unwrap();
+    write_atomic(&src_dir.join("vars.json"), r#"{"name": "After"}"#);
+    write_atomic(&src_dir.join("entry.mds"), "Recreated {{name}}\n");
+
+    // TICK-DEPENDENT: the watch on `src` died with it (see
+    // `watch_file_mode_parent_dir_delete_recreate_recovers`).
+    assert!(
+        wait_for_file_contains(&out, "Recreated After", TICK_TIMEOUT),
+        "the watcher moves back into the recreated working directory and reads the entry \
+         and the vars file through it; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// AC-W2 with the root typed `.`: `mds watch .` run inside the watched directory (#413).
+/// Deleting it leaves the process in a dead directory, in which `.` never resolves again,
+/// even once the directory is recreated. The watcher moves back into it before the next
+/// rebuild, so the new file is compiled — with the recreated `--vars vars.json`, typed
+/// relative too. Control: `watch_dir_mode_root_delete_recreate_recovers`, the same
+/// scenario with the root typed absolute.
+///
+/// Unix-only: Windows cannot delete a process's working directory.
+#[cfg(unix)]
+#[test]
+fn watch_dot_recovers_after_the_working_directory_is_recreated() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("watched");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.mds"), "Old {{n}}\n").unwrap();
+    std::fs::write(root.join("vars.json"), r#"{"n": "A"}"#).unwrap();
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&root)
+            .args(["watch", ".", "--vars", "vars.json", "--out-dir"])
+            .arg(&out_dir)
+            .args(["--debounce", "0", "--poll-interval", "100", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out_dir.join("a.md"), "Old A", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir(&root).unwrap();
+    write_atomic(&root.join("vars.json"), r#"{"n": "N"}"#);
+    write_atomic(&root.join("new.mds"), "New file {{n}}\n");
+
+    // TICK-DEPENDENT: the recursive watch died with the old root (see
+    // `watch_dir_mode_root_delete_recreate_recovers`).
+    assert!(
+        wait_for_file_contains(&out_dir.join("new.md"), "New file N", TICK_TIMEOUT),
+        "the watcher moves back into the recreated working directory and compiles the \
+         new file through `.`; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// A working directory recreated as a symbolic link to another directory is not moved
+/// back into (#417): only a directory that resolves to the recorded canonical path again
+/// is the working directory `mds watch` started in. Moving through the link would read a
+/// relative `--vars` from, and write a relative `-o` into, the link's target, and neither
+/// is checked the way the entry is. The entry is typed absolute here and its directory is
+/// never lost, so its edit is an ordinary event rebuild, and only the working directory
+/// decides where `-o out.md` lands: the write fails in the dead directory, and nothing is
+/// written through the link. Positive control: before the swap, the startup compile
+/// writes `out.md`.
+///
+/// Unix-only: Windows cannot delete a process's working directory.
+#[cfg(unix)]
+#[test]
+fn watch_does_not_follow_a_working_directory_recreated_as_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let base = tempfile::tempdir().unwrap();
+    let entry = base.path().join("entry.mds");
+    std::fs::write(&entry, "Entry\n").unwrap();
+    let proj = base.path().join("proj");
+    let other = base.path().join("other");
+    std::fs::create_dir(&proj).unwrap();
+    std::fs::create_dir(&other).unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&proj)
+            .arg("watch")
+            .arg(&entry)
+            .args(["-o", "out.md", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&proj.join("out.md"), "Entry", TIMEOUT),
+        "control: the startup compile writes out.md; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&proj).unwrap();
+    symlink("other", &proj).unwrap();
+    write_atomic(&entry, "Edited\n");
+
+    let stderr = wait_for_stderr_contains_str(&tap, "out.md: ", TIMEOUT);
+    assert!(
+        stderr.contains("out.md: "),
+        "the rebuild cannot write out.md in the dead working directory; stderr: {stderr}"
+    );
+    assert!(
+        !other.join("out.md").exists(),
+        "nothing is written through the link; stderr: {stderr}"
+    );
     drop(child);
 }
 
@@ -5226,4 +5542,952 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
         stdout.len(),
         body.len()
     );
+}
+
+// ── #413: directory arguments, and every `--help` example has a test ────────
+
+/// `mds watch .`, `./`, `..` and `sub/..` watch the directory they resolve to (#413).
+/// Directory mode takes its argument through the resolver every directory-mode
+/// subcommand shares, where it used to run `NativeFs::check_symlink`, which cannot take
+/// a path with no final name and failed with `file not found: .`. Each form compiles
+/// every file at startup, announces the canonical directory and rebuilds on an edit.
+/// The banner prints the canonical path in its on-disk spelling, so it is compared
+/// canonical to canonical, never with a typed spelling (#408).
+#[test]
+fn watch_dot_forms_watch_the_canonical_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("proj");
+    std::fs::create_dir_all(proj.join("sub")).unwrap();
+    std::fs::write(proj.join("p.mds"), "P\n").unwrap();
+    std::fs::write(proj.join("sub").join("s.mds"), "S\n").unwrap();
+    let canonical = proj.canonicalize().unwrap();
+
+    for (i, (cwd, typed)) in [
+        (proj.clone(), "."),
+        (proj.clone(), "./"),
+        (proj.join("sub"), ".."),
+        (proj.clone(), "sub/.."),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = format!("(in {}) mds watch {typed}", cwd.display());
+        let out = dir.path().join(format!("out{i}"));
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(&cwd)
+                .args(["watch", typed, "--out-dir", out.to_str().unwrap()])
+                .args(["--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("p.md"), "P", TIMEOUT),
+            "{label}: p.mds compiles at startup; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            wait_for_file_contains(&out.join("sub").join("s.md"), "S", TIMEOUT),
+            "{label}: sub/s.mds compiles at startup; stderr: {}",
+            tap.text()
+        );
+
+        let stderr = wait_for_stderr_contains_str(&tap, "Watching directory ", TIMEOUT);
+        let banner = stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("Watching directory "))
+            .unwrap_or_else(|| panic!("{label}: no banner; stderr: {stderr}"));
+        assert_eq!(
+            Path::new(banner.trim()).canonicalize().unwrap(),
+            canonical,
+            "{label}: the banner names the directory `{typed}` resolves to"
+        );
+
+        let edited = format!("P{i}");
+        write_atomic(&proj.join("p.mds"), format!("{edited}\n"));
+        assert!(
+            wait_for_file_contains(&out.join("p.md"), &edited, TIMEOUT),
+            "{label}: an edit rebuilds; stderr: {}",
+            tap.text()
+        );
+        drop(child);
+    }
+}
+
+/// Directory mode compiles each source by its walked path — the directory argument as
+/// typed, joined with the source's path below it — but watches the canonical directory
+/// (#413). `link/..` is accepted as the directory above the link's target; once the
+/// link is retargeted, the walked path leads into another directory: the rebuild is
+/// refused (`mds::io`), naming the directory as typed, and nothing is written from the
+/// other directory — rather than compiling its file into the watched one's output.
+/// Control: before the retarget, an edit rebuilds.
+///
+/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_dir_through_a_retargeted_link_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, below, text) in [("a", "x", "Hello A\n"), ("b", "y", "Hello B\n")] {
+        std::fs::create_dir_all(dir.path().join(name).join(below)).unwrap();
+        std::fs::write(dir.path().join(name).join("p.mds"), text).unwrap();
+    }
+    let link = dir.path().join("link");
+    symlink("a/x", &link).unwrap();
+    let watched = dir.path().join("a").join("p.mds");
+    let out = dir.path().join("out").join("p.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "link/..",
+                "--out-dir",
+                "out",
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(wait_for_file_contains(&out, "Hello A", TIMEOUT), "startup");
+    write_atomic(&watched, "Hello A1\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello A1", TIMEOUT),
+        "control: an edit rebuilds through the link"
+    );
+
+    std::fs::remove_file(&link).unwrap();
+    symlink("b/y", &link).unwrap();
+    write_atomic(&watched, "Hello A2\n");
+    let stderr =
+        wait_for_stderr_contains_str(&stderr_tap, "watched directory now resolves", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(
+            "mds::io×watcheddirectorynowresolvestoadifferentdirectory:\"link/..\";\
+             restartmdswatchtofollowit"
+        ),
+        "the rebuild is refused, naming the directory as typed; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "Hello A1\n",
+        "nothing is written from the retargeted directory"
+    );
+    drop(child);
+}
+
+/// Directory mode checks before every compile that the source's own walked path still
+/// leads to the file it watches, not only that the root does (#413). Once a subdirectory
+/// below the root is replaced by a symbolic link to a directory outside the tree,
+/// `root/sub/x.mds` still names a file — through the link — while the root itself is
+/// unmoved; the startup walk skips symlinked directories, but a rebuild compiles the
+/// sources it already knows. The rebuild of `sub/x.mds` is refused (`mds::io`, naming
+/// its walked path as typed) and nothing is written from outside the tree, rather than
+/// compiling the outside file into the watched one's output. The vars-file edit rebuilds
+/// every known source; `top.mds` rebuilding is its positive control, and before the swap
+/// an edit under the unchanged subdirectory rebuilds.
+///
+/// Unix-only: it replaces a directory with a symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_dir_source_under_a_subdirectory_swapped_for_a_link_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("top.mds"), "Top {{v}}\n").unwrap();
+    std::fs::write(root.join("sub").join("x.mds"), "Inside {{v}}\n").unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("x.mds"), "Outside {{v}}\n").unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "1"}"#).unwrap();
+    let out = dir.path().join("out");
+    let x_out = out.join("sub").join("x.md");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "root", "--out-dir", "out", "--vars", "vars.json"])
+            .args(["--debounce", "0", "--poll-interval", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&x_out, "Inside 1", TIMEOUT),
+        "startup; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&root.join("sub").join("x.mds"), "Inside {{v}} again\n");
+    assert!(
+        wait_for_file_contains(&x_out, "Inside 1 again", TIMEOUT),
+        "control: an edit under the unchanged subdirectory rebuilds; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::rename(root.join("sub"), dir.path().join("sub.old")).unwrap();
+    symlink(&outside, root.join("sub")).unwrap();
+    write_atomic(&vars, r#"{"v": "2"}"#);
+    assert!(
+        wait_for_file_contains(&out.join("top.md"), "Top 2", TIMEOUT),
+        "control: the vars edit rebuilds every known source; stderr: {}",
+        tap.text()
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "watched file now resolves", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(
+            "mds::io×watchedfilenowresolvestoadifferentfile:\"root/sub/x.mds\";\
+             restartmdswatchtofollowit"
+        ),
+        "the rebuild is refused, naming the source as walked; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&x_out).unwrap(),
+        "Inside 1 again\n",
+        "nothing is written from outside the tree; stderr: {stderr}"
+    );
+    drop(child);
+}
+
+/// `mds watch --help`'s examples, each with the test that runs it (#413).
+const WATCH_HELP_EXAMPLES: [(&str, &str); 10] = [
+    (
+        "mds watch template.mds",
+        "watch_initial_compile_writes_output",
+    ),
+    (
+        "mds watch chat.mds",
+        "watch_messages_template_produces_json_intrinsically",
+    ),
+    (
+        "mds watch template.mds -o out.md",
+        "watch_output_flag_writes_to_specified_file",
+    ),
+    (
+        "mds watch template.mds -o -",
+        "watch_stdout_contains_content_when_o_stdout",
+    ),
+    (
+        "mds watch .",
+        "watch_help_example_dot_watches_the_working_directory",
+    ),
+    (
+        "mds watch src/ --out-dir dist",
+        "watch_help_example_src_out_dir_dist_mirrors_the_subtree",
+    ),
+    (
+        "mds watch template.mds --vars v.json",
+        "watch_vars_file_change_triggers_recompile",
+    ),
+    (
+        "mds watch template.mds --clear",
+        "watch_clear_non_tty_no_ansi_escape",
+    ),
+    (
+        "mds watch src/ --poll-interval 500",
+        "watch_help_example_src_poll_interval_500_self_heals",
+    ),
+    (
+        "mds watch src/ --poll-interval 0",
+        "watch_help_example_src_poll_interval_0_rebuilds_on_native_events",
+    ),
+];
+
+/// How this file defines `name`: `None` when it has no `fn <name>() {` — the shape of
+/// a test fn — and otherwise whether that fn is a `#[test]`.
+fn test_attribute(name: &str) -> Option<bool> {
+    const SOURCE: &str = include_str!("cli_watch.rs");
+    let at = SOURCE.find(&format!("\nfn {name}() {{"))?;
+    // The attributes and doc comment above the fn, back to the previous item's end.
+    let before = &SOURCE[..at];
+    let preamble = &before[before.rfind("\n}\n").map_or(0, |i| i + 3)..];
+    Some(preamble.lines().any(|l| l.trim() == "#[test]"))
+}
+
+/// A zero-argument fn that is not a test: [`test_attribute`] must find it, as it finds
+/// a test, and still tell that it is not one.
+fn not_a_test() {}
+
+/// Every example `mds watch --help` prints has a named test that runs it, and every
+/// test the table names exists (#413): an example added without a test, edited so it
+/// no longer matches, or whose test was renamed away fails here.
+#[test]
+fn watch_help_examples_each_have_a_named_test() {
+    let output = mds_bin().args(["watch", "--help"]).output().unwrap();
+    assert!(output.status.success(), "mds watch --help exits 0");
+    let help = String::from_utf8(output.stdout).unwrap();
+    let (_, examples) = help
+        .split_once("Examples:")
+        .unwrap_or_else(|| panic!("--help has an Examples section; got: {help}"));
+    // An example line is the command, two or more spaces, then its description.
+    let shown: std::collections::BTreeSet<&str> = examples
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("mds watch"))
+        .map(|l| l.split("  ").next().unwrap_or(l).trim_end())
+        .collect();
+    let mapped: std::collections::BTreeSet<&str> =
+        WATCH_HELP_EXAMPLES.iter().map(|(ex, _)| *ex).collect();
+    assert_eq!(
+        shown, mapped,
+        "every --help example, and only those, is mapped"
+    );
+
+    for (example, test) in WATCH_HELP_EXAMPLES {
+        assert_eq!(
+            test_attribute(test),
+            Some(true),
+            "{example:?} maps to `{test}`, which is not a #[test] in this file"
+        );
+    }
+    // Controls, one for each answer: a name this file does not define; a fn it defines
+    // in a test's shape (`fn()`, which the coercion below pins) that is not a test; and
+    // this test.
+    let _: fn() = not_a_test;
+    assert_eq!(
+        test_attribute("watch_help_example_that_does_not_exist"),
+        None
+    );
+    assert_eq!(test_attribute("not_a_test"), Some(false));
+    assert_eq!(
+        test_attribute("watch_help_examples_each_have_a_named_test"),
+        Some(true)
+    );
+}
+
+/// `mds watch .` — watch every `.mds` file in the working directory, writing each
+/// output next to its source (#413: `.` used to fail with `file not found: .`).
+#[test]
+fn watch_help_example_dot_watches_the_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("template.mds"), "Hello!\n").unwrap();
+    let out = dir.path().join("template.md");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", ".", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello!", TIMEOUT),
+        "the startup compile writes template.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&dir.path().join("template.mds"), "Hello again!\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello again!", TIMEOUT),
+        "an edit rebuilds; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch src/ --out-dir dist` — the trailing slash is accepted, and the output
+/// mirrors the source subtree under `dist/`.
+#[test]
+fn watch_help_example_src_out_dir_dist_mirrors_the_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+    std::fs::write(src.join("sub").join("b.mds"), "B\n").unwrap();
+    let dist = dir.path().join("dist");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "src/", "--out-dir", "dist", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&dist.join("a.md"), "A", TIMEOUT),
+        "src/a.mds → dist/a.md; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        wait_for_file_contains(&dist.join("sub").join("b.md"), "B", TIMEOUT),
+        "src/sub/b.mds → dist/sub/b.md; stderr: {}",
+        tap.text()
+    );
+    assert!(!dist.join("b.md").exists(), "mirrored, not flattened");
+    write_atomic(&src.join("sub").join("b.mds"), "B2\n");
+    assert!(
+        wait_for_file_contains(&dist.join("sub").join("b.md"), "B2", TIMEOUT),
+        "an edit rebuilds the mirrored output; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch src/ --poll-interval 500` — the help example runs, and it self-heals once
+/// the watched root is deleted and recreated: the file written into the new root is
+/// compiled. On Linux no event announces it (the watch died with the old directory), so
+/// the idle tick re-arms the watch; on macOS FSEvents reports it without a tick.
+///
+/// This does not measure the 500 ms interval: the default 1000 ms tick recovers within
+/// [`TICK_TIMEOUT`] too, and a wall-clock assertion on the interval would only make the
+/// test a timing flake. `watch_poll_interval_zero_works`,
+/// `watch_poll_interval_invalid_exits_2` and `watch_poll_interval_tiny_clamped` pin how
+/// the flag is parsed and clamped.
+#[test]
+fn watch_help_example_src_poll_interval_500_self_heals() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "Old A\n").unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "src/", "--poll-interval", "500", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&src.join("a.md"), "Old A", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_dir_all(&src).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir(&src).unwrap();
+    write_atomic(&src.join("new.mds"), "New file\n");
+    // TICK-DEPENDENT (see TICK_TIMEOUT): on Linux only the self-heal tick can recover.
+    assert!(
+        wait_for_file_contains(&src.join("new.md"), "New file", TICK_TIMEOUT),
+        "the self-heal tick recovers the recreated root; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch src/ --poll-interval 0` — the self-heal check is off; native events alone
+/// compile at startup and rebuild on an edit.
+#[test]
+fn watch_help_example_src_poll_interval_0_rebuilds_on_native_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "src/", "--poll-interval", "0", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&src.join("a.md"), "A", TIMEOUT),
+        "startup compile; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src.join("a.mds"), "A2\n");
+    assert!(
+        wait_for_file_contains(&src.join("a.md"), "A2", TIMEOUT),
+        "a native event rebuilds with the self-heal tick off; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+// ── #425: output over the entry file is refused ──────────────────────────────
+
+/// A `.md` entry that declares `type: mds`: its default output name is its own name.
+const TYPE_MDS_PAGE: &str = "---\ntype: mds\nname: X\n---\nHello {{name}}!\n";
+
+/// The #425 refusal naming the entry as `typed`, squashed (miette wraps long lines).
+fn entry_overwrite_refusal(typed: &str) -> String {
+    squash(&format!(
+        "mds::io × output would overwrite the entry file: \"{typed}\"; \
+         write it elsewhere with -o <file> or --out-dir <dir>"
+    ))
+}
+
+/// Wait for a watcher expected to refuse at startup to exit, and return its exit
+/// status and stderr. Bounded: 10 s at a 10 ms poll — a watcher that did not refuse
+/// keeps running, and fails here.
+fn startup_refusal_exit(
+    child: &mut ChildGuard,
+    tap: StderrTap,
+    label: &str,
+) -> (Option<i32>, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: still running, so it did not refuse; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    (status.code(), tap.finish_text(child))
+}
+
+/// `mds watch` in file mode refuses at startup, exit 2, when the output it resolves is
+/// the entry file itself — the default route of a `type: mds` `.md` entry, `--out-dir`
+/// naming its directory, `-o` naming it, also through a `..` after a directory that
+/// does not exist yet, and on a case-insensitive volume in another case — and writes
+/// nothing: the source stays byte-identical, and no directory is created. It used to
+/// write the compiled output over the source and keep watching a file that no longer
+/// declared `type: mds`.
+#[test]
+fn watch_refuses_at_startup_to_write_over_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, TYPE_MDS_PAGE).unwrap();
+
+    let mut extras: Vec<&[&str]> = vec![
+        &[],
+        &["--out-dir", "."],
+        &["-o", "page.md"],
+        &["-o", "newdir/../page.md"],
+        &["--out-dir", "newdir/.."],
+    ];
+    if dir.path().join("PAGE.md").exists() {
+        extras.push(&["-o", "newdir/../PAGE.md"]);
+    }
+    for extra in extras {
+        let label = format!("mds watch page.md {}", extra.join(" "));
+        let (mut child, tap) = spawn_unsynchronized(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "page.md", "--debounce", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        let (code, stderr) = startup_refusal_exit(&mut child, tap, &label);
+        assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+        assert!(
+            squash(&stderr).contains(&entry_overwrite_refusal("page.md")),
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src).unwrap(),
+            TYPE_MDS_PAGE,
+            "{label}: the source is untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "{label}: nothing is written"
+        );
+    }
+
+    // Control: an `--out-dir` that does not exist yet is created by the write.
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md", "--out-dir", "fresh", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(
+            &dir.path().join("fresh").join("page.md"),
+            "Hello X!",
+            TIMEOUT
+        ),
+        "control: --out-dir fresh is created and written; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// A rebuild never writes over the entry either. When the startup compile fails, the
+/// output path is resolved without knowing the kind and falls back to the Markdown
+/// default — the entry itself here, or the `-o` path as given, which leads back to the
+/// entry out of a directory that does not exist yet; once the source is fixed, the
+/// rebuild refuses (`mds::io`, the entry named as typed), keeps watching, and the fixed
+/// source stays byte-identical, with no directory created. It used to overwrite it
+/// with the compiled output.
+#[test]
+fn watch_rebuild_never_writes_over_the_entry() {
+    for extra in [&[][..], &["-o", "newdir/../page.md"]] {
+        let label = format!("mds watch page.md {}", extra.join(" "));
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("page.md");
+        std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
+
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "page.md", "--debounce", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+        assert!(
+            stderr.contains("mds::syntax"),
+            "{label}: control: the startup compile fails; stderr: {stderr}"
+        );
+
+        write_atomic(&src, TYPE_MDS_PAGE);
+        let needle = "output would overwrite the entry file";
+        let stderr = wait_for_stderr_contains_str(&tap, needle, TIMEOUT);
+        assert!(
+            squash(&stderr).contains(&entry_overwrite_refusal("page.md")),
+            "{label}: the rebuild is refused; stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src).unwrap(),
+            TYPE_MDS_PAGE,
+            "{label}: the fixed source is untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "{label}: nothing is written"
+        );
+        let mut child = child;
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{label}: watch keeps running after a refused rebuild"
+        );
+        drop(child);
+    }
+
+    // Control: a fallback that is not the entry is written by the first rebuild that
+    // compiles, which creates its directory; the failed startup compile created nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md", "--out-dir", "fresh", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+    assert!(
+        stderr.contains("mds::syntax"),
+        "control: the startup compile fails; stderr: {stderr}"
+    );
+    assert!(
+        !dir.path().join("fresh").exists(),
+        "control: a failed startup compile creates no directory"
+    );
+    write_atomic(&src, TYPE_MDS_PAGE);
+    assert!(
+        wait_for_file_contains(
+            &dir.path().join("fresh").join("page.md"),
+            "Hello X!",
+            TIMEOUT
+        ),
+        "control: the rebuild creates fresh/ and writes it; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// The #425 refusal is all `mds watch` says about an output that is the entry: the `-o`
+/// extension-mismatch warning, which announces a write (`… writing to '<path>'
+/// anyway`), is not printed for it — neither at startup, where the refusal ends the
+/// run, nor for the fallback output of a failed startup compile, which every rebuild
+/// refuses. Control: an `-o` with the same mismatched extension that is not the entry
+/// still gets the warning, and is written.
+#[test]
+fn watch_refusal_is_not_preceded_by_the_extension_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("e.mds");
+    let no_warning = |stderr: &str, label: &str| {
+        assert!(
+            !stderr.contains("warning:"),
+            "{label}: no warning announces a write that is refused; stderr: {stderr}"
+        );
+    };
+
+    // Startup: the compile succeeds, and its output is the entry.
+    std::fs::write(&src, "E\n").unwrap();
+    let label = "startup: mds watch e.mds -o e.mds";
+    let (mut child, tap) = spawn_unsynchronized(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "e.mds", "-o", "e.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let (code, stderr) = startup_refusal_exit(&mut child, tap, label);
+    assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+    assert!(
+        squash(&stderr).contains(&entry_overwrite_refusal("e.mds")),
+        "{label}: stderr: {stderr}"
+    );
+    no_warning(&stderr, label);
+    drop(child);
+
+    // A failed startup compile: its fallback output is the entry, so the rebuild after
+    // the fix is refused, and nothing ever announced a write to it.
+    std::fs::write(&src, "Hello {{name\n").unwrap();
+    let label = "fallback: mds watch e.mds -o e.mds";
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "e.mds", "-o", "e.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+    assert!(
+        stderr.contains("mds::syntax"),
+        "{label}: control: the startup compile fails; stderr: {stderr}"
+    );
+    write_atomic(&src, "E\n");
+    let stderr =
+        wait_for_stderr_contains_str(&tap, "output would overwrite the entry file", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(&entry_overwrite_refusal("e.mds")),
+        "{label}: the rebuild is refused; stderr: {stderr}"
+    );
+    no_warning(&stderr, label);
+    assert_eq!(std::fs::read_to_string(&src).unwrap(), "E\n", "{label}");
+    drop(child);
+
+    // Control: the same mismatched extension on an output that is not the entry.
+    let other = dir.path().join("other.mds");
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "e.mds", "-o", "other.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&other, "E", TIMEOUT),
+        "control: other.mds is written; stderr: {}",
+        tap.text()
+    );
+    let warning = "warning: output path 'other.mds' has extension '.mds' but compiled output \
+                   is markdown (.md); writing to 'other.mds' anyway";
+    let stderr = wait_for_stderr_contains_str(&tap, warning, TIMEOUT);
+    assert!(
+        stderr.contains(warning),
+        "control: the warning still announces a write that happens; stderr: {stderr}"
+    );
+    drop(child);
+}
+
+// ── An output route that fails at startup is refused ─────────────────────────
+
+/// An `mds.json` whose `build.output_dir` leaves its directory: the output route error
+/// file-mode resolution raises, which `mds build` refuses (`mds::io`, exit 2).
+const DOTDOT_OUTPUT_DIR: &str = r#"{"build":{"output_dir":"../x"}}"#;
+
+/// The refusal of [`DOTDOT_OUTPUT_DIR`], squashed (miette wraps long lines).
+fn dotdot_output_dir_refusal() -> String {
+    squash("mds::io × mds.json output_dir '../x' must not contain '..' components")
+}
+
+/// `mds watch` refuses at startup an output route that fails to resolve — `mds.json`
+/// `build.output_dir` with a `..` component — with the error `mds build` gives for the
+/// same route (`mds::io`, exit 2), reported once, and writes nothing: no file, no
+/// directory, no byte on stdout. In file mode it used to report the error once and then
+/// write every rebuild to stdout (`Recompiled <stdout>`); after a failed startup compile
+/// it did so without reporting the route error at all. A failed startup compile is still
+/// reported, and the route is refused after it. Directory mode already refused the route
+/// at startup; it is pinned here with the same error.
+#[test]
+fn watch_refuses_at_startup_an_output_route_that_fails() {
+    // (mode, input, source, whether the startup compile succeeds)
+    let rows = [
+        ("file mode", "page.mds", "Hello one\n", true),
+        (
+            "file mode, failed startup compile",
+            "page.mds",
+            "Hello {{name\n",
+            false,
+        ),
+        ("directory mode", ".", "Hello one\n", true),
+    ];
+    for (mode, input, source, compiles) in rows {
+        let label = format!("{mode}: mds watch {input}");
+        // `../x` resolves beside `proj`, in `top`, which holds nothing else.
+        let top = tempfile::tempdir().unwrap();
+        let proj = top.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        std::fs::write(proj.join("mds.json"), DOTDOT_OUTPUT_DIR).unwrap();
+        std::fs::write(proj.join("page.mds"), source).unwrap();
+
+        let (mut child, tap, stdout_tap) = spawn_unsynchronized_piped_stdout(
+            mds_bin()
+                .current_dir(&proj)
+                .args(["watch", input, "--debounce", "0"])
+                .stdout(Stdio::piped()),
+        );
+        let (code, stderr) = startup_refusal_exit(&mut child, tap, &label);
+        let stdout = stdout_tap.finish_text(&mut child);
+        assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+        assert_eq!(
+            count_occurrences(&squash(&stderr), &dotdot_output_dir_refusal()),
+            1,
+            "{label}: the refusal is reported, once; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Compiled to"),
+            "{label}: nothing is compiled to a file; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Recompiled"),
+            "{label}: no rebuild runs; stderr: {stderr}"
+        );
+        assert_eq!(stdout, "", "{label}: nothing is written to stdout");
+        let mut names: Vec<String> = std::fs::read_dir(&proj)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["mds.json", "page.mds"],
+            "{label}: nothing is written"
+        );
+        assert_eq!(
+            std::fs::read_dir(top.path()).unwrap().count(),
+            1,
+            "{label}: no output directory is created"
+        );
+
+        if compiles {
+            // Differential: `mds build` refuses the same route with the same error.
+            let build = mds_bin()
+                .current_dir(&proj)
+                .args(["build", input])
+                .output()
+                .unwrap();
+            let build_stderr = String::from_utf8_lossy(&build.stderr);
+            assert_eq!(
+                build.status.code(),
+                code,
+                "{label}: mds build {input} exits as watch does; stderr: {build_stderr}"
+            );
+            assert!(
+                squash(&build_stderr).contains(&dotdot_output_dir_refusal()),
+                "{label}: mds build {input} gives the same error; stderr: {build_stderr}"
+            );
+        } else {
+            // Control: the startup compile ran, and its failure is reported.
+            assert!(
+                stderr.contains("mds::syntax"),
+                "{label}: the compile error is reported; stderr: {stderr}"
+            );
+        }
+    }
+}
+
+/// Controls for [`watch_refuses_at_startup_an_output_route_that_fails`] — only a route
+/// that fails is refused:
+/// - a failed startup compile with a route that resolves is reported, watching
+///   continues, and the next rebuild writes the fixed source;
+/// - with the same `mds.json`, `-o <file>` and `--out-dir <dir>` route the output (the
+///   config's `output_dir` is not consulted), and the startup compile and a rebuild are
+///   written there;
+/// - with the same `mds.json`, `-o -` streams the startup output and a rebuild to stdout,
+///   as documented.
+#[test]
+fn watch_startup_route_refusal_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello {{name\n").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+    assert!(
+        stderr.contains("mds::syntax"),
+        "failed startup compile: the compile error is reported; stderr: {stderr}"
+    );
+    write_atomic(&src, "Hello fixed\n");
+    assert!(
+        wait_for_file_contains(&dir.path().join("page.md"), "Hello fixed", TIMEOUT),
+        "failed startup compile: the rebuild writes page.md; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "failed startup compile: watch keeps running"
+    );
+    drop(child);
+
+    for (flag, value, written) in [
+        ("-o", "out.md", "out.md"),
+        ("--out-dir", "out", "out/page.md"),
+    ] {
+        let label = format!("mds watch page.mds {flag} {value}");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mds.json"), DOTDOT_OUTPUT_DIR).unwrap();
+        let src = dir.path().join("page.mds");
+        std::fs::write(&src, "Hello one\n").unwrap();
+        let out = dir.path().join(written);
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "page.mds", flag, value, "--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out, "Hello one", TIMEOUT),
+            "{label}: startup writes {written}; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, "Hello two\n");
+        assert!(
+            wait_for_file_contains(&out, "Hello two", TIMEOUT),
+            "{label}: the rebuild writes {written}; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            !tap.text().contains("must not contain"),
+            "{label}: nothing is refused; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{label}: watch keeps running"
+        );
+        drop(child);
+    }
+
+    let label = "mds watch page.mds -o -";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mds.json"), DOTDOT_OUTPUT_DIR).unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let (mut child, tap, stdout_tap) = spawn_ready_piped_stdout(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.mds", "-o", "-", "--debounce", "0"])
+            .stdout(Stdio::piped()),
+    );
+    // `wait_for_stderr_contains_str` polls any pipe tap; this one is stdout.
+    let stdout = wait_for_stderr_contains_str(&stdout_tap, "Hello one", TIMEOUT);
+    assert!(
+        stdout.contains("Hello one"),
+        "{label}: startup streams to stdout; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, "Hello two\n");
+    let stdout = wait_for_stderr_contains_str(&stdout_tap, "Hello two", TIMEOUT);
+    assert!(
+        stdout.contains("Hello two"),
+        "{label}: the rebuild streams to stdout; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        !tap.text().contains("must not contain"),
+        "{label}: nothing is refused; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "{label}: watch keeps running"
+    );
+    assert!(
+        !dir.path().join("page.md").exists(),
+        "{label}: nothing is written next to the source"
+    );
+    drop(child);
 }

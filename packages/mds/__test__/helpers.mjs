@@ -186,13 +186,15 @@ export async function symlinkOrSkip(t, target, link, type) {
  * `compileFile` each of `files` through the public `@mdscript/mds` API with the
  * backend forced by MDS_BACKEND, in a fresh process (the backend is a module-level
  * singleton). Returns the backend that actually ran and, per file, the error shape
- * it threw or `{ output }`.
+ * it threw or `{ output }`. A relative file is typed relative to `options.cwd` when
+ * given, and to the package root otherwise.
  */
-export async function compileFileOutcomes(backend, files) {
+export async function compileFileOutcomes(backend, files, options = {}) {
   const script = `
     import { init, compileFile, getBackend } from './dist/node.js';
     const files = JSON.parse(process.env.MDS_TEST_FILES);
     await init();
+    if (process.env.MDS_TEST_CWD) process.chdir(process.env.MDS_TEST_CWD);
     const outcomes = [];
     for (const file of files) {
       try {
@@ -206,7 +208,7 @@ export async function compileFileOutcomes(backend, files) {
   `;
   const { stdout } = await exec(process.execPath, ['--input-type=module', '-e', script], {
     cwd: pkgRoot,
-    env: { ...process.env, MDS_BACKEND: backend, MDS_TEST_FILES: JSON.stringify(files) },
+    env: { ...process.env, MDS_BACKEND: backend, MDS_TEST_FILES: JSON.stringify(files), MDS_TEST_CWD: options.cwd ?? '' },
     timeout: 60000,
     maxBuffer: 16 * 1024 * 1024,
   });

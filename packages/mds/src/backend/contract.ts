@@ -20,7 +20,7 @@
 
 /**
  * Base backend methods — shared by the browser-safe MdsBaseBackend and all
- * Node.js backends. WASM module exports also belong here (plus scanImports).
+ * Node.js backends. The WASM module exports them too (WASM_EXPORTS).
  * compile and check are the only synchronous source-string operations.
  * lint is a source-string lint operation available on all backends.
  */
@@ -33,10 +33,17 @@ export const BASE_METHODS = ['compile', 'check', 'lint'] as const;
 export const NODE_METHODS = ['compileFile', 'checkFile', 'lintFile'] as const;
 
 /**
- * WASM module exports — BASE_METHODS plus the import scanner needed for
- * JS-side file resolution, plus lintVirtual for multi-module lint.
+ * WASM module exports @mdscript/mds calls — BASE_METHODS, lintVirtual for
+ * multi-module lint, and the two calls the JS-side file pre-scanner makes
+ * (scanImportRecords, preflightModule). The module may export more (the
+ * @mdscript/mds-wasm package also exports scanImports); only these are required.
  */
-export const WASM_EXPORTS = [...BASE_METHODS, 'scanImports', 'lintVirtual'] as const;
+export const WASM_EXPORTS = [
+  ...BASE_METHODS,
+  'lintVirtual',
+  'scanImportRecords',
+  'preflightModule',
+] as const;
 
 export type BaseMethodName = (typeof BASE_METHODS)[number];
 export type NodeMethodName = (typeof NODE_METHODS)[number];

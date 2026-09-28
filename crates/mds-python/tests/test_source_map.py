@@ -11,6 +11,7 @@ Covers:
 - SM-PY-8: SOURCE_MAP_GOLDENS — byte-identical compile_virtual JSON
 - SM-PY-9: live CLI sidecar parity (skipped when CLI unavailable)
 - SM-PY-10: compile_file source_map support
+- SM-PY-11: an @extends string compile names its base as sources[0] (#412)
 """
 
 from __future__ import annotations
@@ -326,3 +327,25 @@ def test_sm_py10_compile_file_source_map() -> None:
 def test_sm_py10_compile_file_default_no_source_map() -> None:
     result = m.compile_file(FIXTURES / "simple.mds")
     assert result.source_map is None
+
+
+# ── SM-PY-11: an @extends string compile names its base first (#412) ──────
+
+def test_sm_py11_extends_string_compile_names_base_first(tmp_path: Path) -> None:
+    """A string compile of an extending child seeds its map with the root base, as a
+    direct compile of the same file does, so ``sources[0]`` is the base and the
+    string's own ``input.mds`` label follows it (the README's ``source_map`` note)."""
+    # PF-020: write_bytes keeps the fixture's bytes exact on every platform.
+    (tmp_path / ".mdsroot").write_bytes(b"")
+    (tmp_path / "base.mds").write_bytes(b"BASE-HEAD\n@block body:\nBASE-DEFAULT\n@end\n")
+    result = m.compile(
+        '@extends "./base.mds"\n@block body:\nCHILD\n@end\n',
+        base_path=tmp_path,
+        source_map=True,
+    )
+    # Non-vacuity: the child really extended the base.
+    assert result.output == "BASE-HEAD\nCHILD\n"
+    sm = result.source_map
+    assert sm is not None
+    _check_sm_structure(sm)
+    assert sm["sources"] == ["base.mds", "input.mds"]

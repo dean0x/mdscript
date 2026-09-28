@@ -3,6 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
+use crate::limits::MAX_OUTPUT_SIZE;
 use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
 
 // ── Serializable error types ──────────────────────────────────────────────────
@@ -113,20 +114,52 @@ pub struct SerializedError {
 /// line, not bytes. This matches the convention used by editors and language
 /// servers that report character-based positions.
 fn compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
-    if offset > source.len() || !source.is_char_boundary(offset) {
-        return None;
-    }
-    let mut line = 1usize;
-    let mut col = 1usize;
-    for ch in source[..offset].chars() {
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
+    LineColumns::new(source).at(offset)
+}
+
+/// The 1-indexed line and column of byte offsets in one source, by the rule
+/// [`compute_line_column`] states, found with a cursor that only moves forward: for
+/// offsets asked in increasing order the source is walked once, however many there
+/// are ([`crate::scan_import_records`] asks for every import directive of a module).
+pub(crate) struct LineColumns<'a> {
+    source: &'a str,
+    /// A character boundary of `source`: the start, or the last offset asked for.
+    offset: usize,
+    line: usize,
+    column: usize,
+}
+
+impl<'a> LineColumns<'a> {
+    pub(crate) fn new(source: &'a str) -> Self {
+        LineColumns {
+            source,
+            offset: 0,
+            line: 1,
+            column: 1,
         }
     }
-    Some((line, col))
+
+    /// The line and column of `offset`, or `None` when it is past the end of the
+    /// source or not on a character boundary. An offset before the last one asked for
+    /// is found by walking again from the start.
+    pub(crate) fn at(&mut self, offset: usize) -> Option<(usize, usize)> {
+        if offset > self.source.len() || !self.source.is_char_boundary(offset) {
+            return None;
+        }
+        if offset < self.offset {
+            *self = LineColumns::new(self.source);
+        }
+        for ch in self.source[self.offset..offset].chars() {
+            if ch == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+        }
+        self.offset = offset;
+        Some((self.line, self.column))
+    }
 }
 
 /// Format an arity range for display in error messages.
@@ -373,6 +406,13 @@ pub enum MdsError {
         src: Option<Arc<miette::NamedSource<String>>>,
     },
 
+    /// An entry file, or the target of an `@import`, `@export … from`, frontmatter
+    /// import or `@extends`, is not an MDS file: neither a `.mds` file nor a `.md` file
+    /// whose frontmatter declares `type: mds`.
+    ///
+    /// `path` is display text: the path as the caller typed it — the entry path passed
+    /// to the API, or the string as written in the template — escaped with
+    /// [`crate::escape_path_for_message`]; never the resolved key (#417).
     #[error("not an MDS file: {path}")]
     #[diagnostic(
         code(mds::not_mds),
@@ -887,6 +927,16 @@ impl MdsError {
         MdsError::ResourceLimit {
             message: message.into(),
         }
+    }
+
+    /// The output-cap error: an output buffer would grow past `MAX_OUTPUT_SIZE`.
+    ///
+    /// The only place this message is built (#415); every output append reports it
+    /// through the evaluator's `push_capped`.
+    pub(crate) fn output_size_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"
+        ))
     }
 
     /// Upgrade a spanless `Syntax` error with a span; no-op for other variants or if

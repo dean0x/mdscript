@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::arity::check_arity;
@@ -60,18 +61,6 @@ pub(crate) struct EvalContext<'a> {
     /// `true`.  `None` when the caller did not request a source map — zero-cost path
     /// (AC-PERF-01: no allocation when off).
     pub(crate) map: Option<crate::sourcemap::MapBuilder>,
-    /// Per-include-site remap cache for source-map splice (S6 / AC-PERF-05).
-    ///
-    /// Maps `Arc<FragmentMap>` pointer identity (as `usize`) to the
-    /// local-source-index → global-`MapBuilder`-source-index remap `Vec`.
-    ///
-    /// When `@include` appears inside a `@for` loop, the remap is built on the
-    /// first iteration and retrieved from this cache on every subsequent
-    /// iteration — O(1) map lookup instead of re-running `source_index` scans.
-    ///
-    /// The cache is scoped to one `evaluate_with_map` invocation and is empty at
-    /// the start of each top-level compile; no cross-compilation state leaks.
-    pub(crate) fragment_remap_cache: std::collections::HashMap<usize, Vec<u32>>,
     /// S8 signal: set to `true` by `invoke_function` when it takes the fine-grained
     /// body-descent path (S8), so the calling `Node::Interpolation` arm knows the body
     /// already recorded its own segments and the call-site point should be skipped.
@@ -151,7 +140,6 @@ pub(crate) fn evaluate_seeded(
         budget: *budget,
         warnings,
         map: None,
-        fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
         file,
         source,
@@ -169,8 +157,8 @@ pub(crate) fn evaluate_seeded(
 /// finalization stage.  The builder's `cursor` is guaranteed to equal
 /// `output.len() as u32` when this function returns.
 ///
-/// `file` and `source` for `EvalContext` diagnostic spans are derived from
-/// `builder.current_src` — single source of truth, no redundant parameter
+/// `file` and `source` for `EvalContext` diagnostic spans are derived from the
+/// builder's current source — single source of truth, no redundant parameter
 /// (avoids the dual-channel mis-attribution class fixed in c5a4d65; issue #58).
 ///
 /// Delegates to [`evaluate_with_map_seeded`] with a fresh [`EvalBudget`].
@@ -191,9 +179,9 @@ pub(crate) fn evaluate_with_map(
 /// (e.g. earlier `@extends` regions); `budget` holds the running totals when this
 /// returns, on success and on error alike.
 ///
-/// `file` and `source` for `EvalContext` diagnostic spans are derived from
-/// `builder.current_src` — the single source of truth.  Callers must update
-/// `builder.current_src` before each call (as `evaluate_regions_with_map` does)
+/// `file` and `source` for `EvalContext` diagnostic spans are derived from the
+/// builder's current source — the single source of truth.  Callers must switch
+/// it to the region's origin before each call (as `evaluate_regions_with_map` does)
 /// so that the derived values reflect the correct region origin (issue #58;
 /// avoids the dual-channel mis-attribution class fixed in c5a4d65).
 ///
@@ -201,7 +189,9 @@ pub(crate) fn evaluate_with_map(
 /// iteration cap across all spliced `@extends` regions (REL-1, applies PF-004).
 ///
 /// The `MapBuilder` is returned as a structured error rather than a panic if it
-/// disappears — aligns with PF-005 (don't rely on panic for invariants).
+/// disappears, and a current source the builder has not registered (an index from
+/// another builder) is an internal error rather than an empty file context — aligns
+/// with PF-005 (don't rely on panic or a silent fallback for invariants).
 pub(crate) fn evaluate_with_map_seeded(
     nodes: &[Node],
     scope: &mut Scope,
@@ -209,33 +199,28 @@ pub(crate) fn evaluate_with_map_seeded(
     builder: crate::sourcemap::MapBuilder,
     budget: &mut EvalBudget,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
-    // Clone display name / source from the builder's current source entry before
-    // moving builder into EvalContext.map.  This is the single source of truth for
-    // diagnostic span attribution — eliminates the redundant explicit params
-    // that caused mis-attributed spans before c5a4d65 (issue #58).
+    // Take the current source's Origin before moving builder into EvalContext.map.
+    // This is the single source of truth for diagnostic span attribution —
+    // eliminates the redundant explicit params that caused mis-attributed spans
+    // before c5a4d65 (issue #58). Cloning it bumps refcounts; it copies no text, so
+    // evaluating an @extends chain region by region stays linear (#416).
     //
-    // R3 (CWE-209): read from display_names (root-relative, never absolute) rather
-    // than from sources (canonical keys, may be absolute) so that file-backed
-    // compile error messages show "src/a.mds" instead of "/proj/src/a.mds".
-    let file_owned = builder
-        .display_names
-        .get(builder.current_src as usize)
-        .cloned()
-        .unwrap_or_default();
-    let source_owned = builder
-        .sources_content
-        .get(builder.current_src as usize)
-        .cloned()
-        .unwrap_or_default();
+    // R3 (CWE-209): `display` (root-relative, never absolute), not `file` (the
+    // canonical key, may be absolute), so that file-backed compile error messages
+    // show "src/a.mds" instead of "/proj/src/a.mds".
+    let origin = builder.current_origin().cloned().ok_or_else(|| {
+        MdsError::syntax(
+            "internal: MapBuilder current_src names no registered source — compiler bug",
+        )
+    })?;
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
         budget: *budget,
         warnings,
         map: Some(builder),
-        fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
-        file: &file_owned,
-        source: &source_owned,
+        file: &origin.display,
+        source: &origin.source,
         body_origin: None,
     };
     let result = evaluate_nodes(nodes, scope, &mut ctx);
@@ -265,7 +250,11 @@ fn evaluate_nodes(
     let saved_cursor: u32 = ctx.map.as_ref().map_or(0, |m| m.cursor);
 
     for node in nodes {
-        match node {
+        // Each arm yields the text its node renders; the one capped append after the
+        // match lands it, so every node's output passes the cap check before it is
+        // appended (#415). One append site also keeps this recursive frame small: in
+        // a debug build each `?` site reserves its own error temporaries.
+        let piece: Cow<'_, str> = match node {
             Node::Text(t) => {
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 {
@@ -287,10 +276,7 @@ fn evaluate_nodes(
                         map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
                     }
                 }
-                output.push_str(&t.text);
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Borrowed(t.text.as_str())
             }
             Node::EscapedBrace { offset } => {
                 if let Some(ref mut map) = ctx.map {
@@ -307,10 +293,7 @@ fn evaluate_nodes(
                         map.push_segment(abs_out, *offset as u32, 3);
                     }
                 }
-                output.push_str("{{");
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Borrowed("{{")
             }
             Node::Interpolation(interp) => {
                 // S8: reset ownership flag before each call so arg-evaluation
@@ -345,46 +328,33 @@ fn evaluate_nodes(
                         map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
                     }
                 }
-                output.push_str(&rendered);
-                // Correct cursor after render_expr.  For S8, invoke_function already
-                // set cursor to start_cursor + trimmed_len; this final assignment
-                // re-anchors it to the outer output length (same value after push_str).
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Owned(rendered)
             }
             Node::If(block) => {
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
-                output.push_str(&evaluate_if(block, scope, ctx)?);
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Owned(evaluate_if(block, scope, ctx)?)
             }
             Node::For(block) => {
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
-                output.push_str(&evaluate_for(block, scope, ctx)?);
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Owned(evaluate_for(block, scope, ctx)?)
             }
             Node::Define(_) => {
                 // Handled by resolver with full lexical capture; no output.
+                continue;
             }
             Node::Import(_) | Node::Export(_) => {
                 // Handled by resolver, skip during evaluation.
+                continue;
             }
             Node::Include(inc) => {
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
-                output.push_str(&evaluate_include(inc, scope, ctx)?);
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Owned(evaluate_include(inc, scope, ctx)?)
             }
             Node::Message(block) => {
                 // Text mode: render the body inline, ignoring the role marker.
@@ -393,10 +363,7 @@ fn evaluate_nodes(
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
-                output.push_str(&evaluate_nodes(&block.body, scope, ctx)?);
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Owned(evaluate_nodes(&block.body, scope, ctx)?)
             }
             Node::Block(block) => {
                 // Standalone mode: render the block's default body inline.
@@ -407,21 +374,49 @@ fn evaluate_nodes(
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
-                output.push_str(&evaluate_block(block, scope, ctx)?);
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
-                }
+                Cow::Owned(evaluate_block(block, scope, ctx)?)
             }
-        }
-        if output.len() > MAX_OUTPUT_SIZE {
-            return Err(MdsError::resource_limit(format!(
-                "output exceeds maximum size of {} bytes",
-                MAX_OUTPUT_SIZE
-            )));
+        };
+        push_capped(&mut output, &piece)?;
+        // Re-anchor the cursor to the output length after the append. For an S8
+        // interpolation, invoke_function already set it to start_cursor +
+        // trimmed_len, the same value.
+        if let Some(ref mut map) = ctx.map {
+            map.cursor = saved_cursor + output.len() as u32;
         }
     }
 
     Ok(output)
+}
+
+/// Append `add` to the output buffer `out`, or fail with the output-cap error and
+/// leave `out` unchanged.
+///
+/// Every output accumulator appends through this (#415), so `MAX_OUTPUT_SIZE` is
+/// checked before the bytes land: a loop crossing the cap stops on the crossing pass
+/// instead of building its whole output first. Growth stays geometric, like
+/// `push_str`, but never reserves past the cap, so capacity is bounded too — plain
+/// doubling would take a buffer to about twice the cap.
+///
+/// The cap bounds each buffer, not a compile's total memory: nested blocks, function
+/// results and imported modules each hold a buffer of their own (#420).
+pub(crate) fn push_capped(out: &mut String, add: &str) -> Result<(), MdsError> {
+    let needed = out
+        .len()
+        .checked_add(add.len())
+        .filter(|&needed| needed <= MAX_OUTPUT_SIZE)
+        .ok_or_else(MdsError::output_size_exceeded)?;
+    if needed > out.capacity() {
+        // `needed <= MAX_OUTPUT_SIZE`, so the target is at least `needed`.
+        let target = out
+            .capacity()
+            .saturating_mul(2)
+            .max(needed)
+            .min(MAX_OUTPUT_SIZE);
+        out.reserve_exact(target - out.len());
+    }
+    out.push_str(add);
+    Ok(())
 }
 
 /// Render a `@block` node's body inline.
@@ -708,7 +703,7 @@ fn invoke_function(
     //     unconditionally since B1 dropped the source_map_mode gate, S7).
     //
     // On this path, instead of suppressing the body, we:
-    //  - Switch MapBuilder::current_src to the definition file.
+    //  - Switch the MapBuilder's current source to the definition file.
     //  - Evaluate the body without suppression so each leaf node pushes its own
     //    segment attributed to the definition file.
     //  - Run rebase_trim to drop segments in the trimmed-away leading/trailing
@@ -731,13 +726,7 @@ fn invoke_function(
                 // Snapshot pre-body state and register the definition file in one binding.
                 let sc = map.cursor;
                 let ss = map.segments.len();
-                let sr = map.current_src;
-                let def_src = map.source_index(
-                    origin.file.as_ref(),
-                    origin.display.as_ref(),
-                    origin.source.as_ref(),
-                );
-                map.current_src = def_src;
+                let sr = map.switch_to(origin);
                 (sc, ss, sr)
                 // map and origin borrows released here; ctx is usable below.
             } else {
@@ -755,7 +744,7 @@ fn invoke_function(
 
         // Restore source attribution for the outer scope.
         if let Some(ref mut map) = ctx.map {
-            map.current_src = saved_src;
+            map.switch_to_index(saved_src);
         }
         // B1: restore body_origin before `?` so LIFO is correct even on error paths.
         ctx.body_origin = prev_body_origin;
@@ -1186,10 +1175,11 @@ fn evaluate_for(
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     let mut output = String::new();
+    // A pass that would take the loop's output past the cap fails inside the body, so
+    // `drive_for` still pops that pass's scope and no later pass runs (#415).
     drive_for(block, scope, ctx, |scope, ctx| {
         let rendered = evaluate_nodes(&block.body, scope, ctx)?;
-        output.push_str(&rendered);
-        Ok(())
+        push_capped(&mut output, &rendered)
     })?;
     Ok(output)
 }
@@ -1231,49 +1221,14 @@ fn evaluate_include(
         }
     };
 
-    // S6: Splice source-map fragment segments when a builder is active.
-    //
-    // The local→global source-index remap is cached by Arc<FragmentMap> pointer
-    // identity (AC-PERF-05): built once on the first `@include` call for a given
-    // module and reused on all subsequent calls (e.g. inside a `@for` loop).
-    //
-    // The MapBuilder is temporarily taken out of ctx to allow concurrent mutable
-    // access to ctx.fragment_remap_cache (avoiding Rust split-borrow issues).
-    if let Some(fmap) = ns.prompt_map.as_ref() {
-        if let Some(mut map) = ctx.map.take() {
-            // Stable pointer identity of the Arc — used as the cache key.
-            // The Arc lives as long as the NamespaceScope is in scope (at least
-            // for the duration of this compilation), so the pointer is valid.
-            let fmap_ptr = std::sync::Arc::as_ptr(fmap) as usize;
-
-            // Build the remap if not already cached for this include site,
-            // then borrow it directly from the entry return value.
-            let remap: &Vec<u32> = ctx.fragment_remap_cache.entry(fmap_ptr).or_insert_with(|| {
-                // S6 @include splice: register each included source in the outer builder.
-                // `path` is the canonical key from the fragment's MapBuilder.sources[].
-                // Display names for @include sources are not read via EvalContext.file
-                // (current_src is never changed during splice), so using the canonical
-                // path as the display_name here is safe — it never surfaces in diagnostics.
-                fmap.sources
-                    .iter()
-                    .map(|(path, content)| {
-                        map.source_index(path.as_ref(), path.as_ref(), content.as_ref())
-                    })
-                    .collect()
-            });
-
-            // Splice: rebase each fragment segment into the global output stream.
-            // `map.cursor` is the absolute byte offset where this include's body
-            // starts in the parent output (set by the Node::Include arm in
-            // evaluate_nodes just before calling evaluate_include).
-            let base = map.cursor;
-            for seg in &fmap.segments {
-                let remapped_src = remap[seg.src as usize];
-                map.push_fragment_segment(base + seg.out, remapped_src, seg.src_off, seg.len);
-            }
-
-            ctx.map = Some(map);
-        }
+    // S6: splice the included module's source-map fragment when a builder is active.
+    // `map.cursor` is the absolute byte offset where this include's body starts in
+    // the parent output (set by the Node::Include arm in evaluate_nodes just before
+    // calling evaluate_include). The builder caches the fragment's source remap, so
+    // an @include inside a @for loop registers the module's sources once (AC-PERF-05).
+    if let (Some(fragment), Some(map)) = (ns.prompt_map.as_ref(), ctx.map.as_mut()) {
+        let base = map.cursor;
+        map.splice_fragment(fragment, base);
     }
 
     Ok(prompt_body)
@@ -1344,7 +1299,6 @@ pub(crate) fn evaluate_messages_seeded(
         budget: *budget,
         warnings,
         map: None,
-        fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
         file,
         source,
@@ -1970,28 +1924,229 @@ mod tests {
 
     #[test]
     fn output_size_limit_rejects_oversized_output() {
-        // Build a node list that accumulates past MAX_OUTPUT_SIZE (50 MB) across two
-        // nodes, rather than allocating a single 50 MB+ string in one shot.
-        // Each node is ~26 MB; after the second node the accumulated output exceeds
-        // the limit and evaluate_nodes returns a ResourceLimit error.
+        // Build a node list whose output crosses MAX_OUTPUT_SIZE (50 MiB) across two
+        // nodes, rather than allocating a single 50 MiB+ string in one shot.
+        // Each node is ~26 MB: the first is appended, and the second node's append
+        // would pass the limit, so evaluate_nodes refuses it before it lands and
+        // returns a ResourceLimit error.
         //
-        // Using two nodes of ~26 MB each keeps peak allocation at ~52 MB total
-        // (26 MB node + 26 MB node + accumulating output buffer), which is safer
-        // for CI environments than a single 50 MB+ pre-allocated string.
+        // Two nodes of ~26 MB each keep every single string under the limit, which
+        // is safer for CI environments than a single 50 MiB+ pre-allocated string.
         let half = MAX_OUTPUT_SIZE / 2 + 1;
         let chunk = "x".repeat(half);
         let nodes = vec![text(&chunk), text(&chunk)];
         let mut scope = Scope::new();
         let mut warnings = vec![];
         let result = evaluate(&nodes, &mut scope, &mut warnings, "", "");
+        assert_output_cap_error(result, "two text nodes past MAX_OUTPUT_SIZE");
+    }
+
+    // ── #415: the output cap stops a loop at the pass that crosses it ─────────
+    //
+    // The error text is the same whether the cap is checked before each append or
+    // once a whole node has finished, so these tests assert the axis the check moves
+    // (applies PF-013): how many loop passes ran before evaluation stopped, read from
+    // the budget the evaluator hands back on error.
+
+    /// One loop pass renders `{{x}}\n`: `x` is 1 MiB, plus the newline.
+    const CAP_PASS: usize = 1024 * 1024 + 1;
+
+    /// The pass whose append would take a loop's buffer past `MAX_OUTPUT_SIZE`:
+    /// 49 passes fit (51,380,273 bytes), the 50th does not (52,428,850).
+    const CAP_CROSSING_PASS: usize = MAX_OUTPUT_SIZE / CAP_PASS + 1;
+
+    /// Loop length: twice the crossing pass, so a check made only once the loop has
+    /// finished lets all 100 passes run.
+    const CAP_LOOP_LEN: usize = 2 * CAP_CROSSING_PASS;
+
+    const _: () = assert!((CAP_CROSSING_PASS - 1) * CAP_PASS <= MAX_OUTPUT_SIZE);
+    const _: () = assert!(CAP_CROSSING_PASS * CAP_PASS > MAX_OUTPUT_SIZE);
+
+    /// The error of `result`. An `Ok` is reported by length only: the output runs to
+    /// tens of megabytes.
+    fn err_of(result: Result<String, MdsError>, context: &str) -> MdsError {
+        match result {
+            Ok(out) => panic!(
+                "{context}: evaluated {} bytes, expected an error",
+                out.len()
+            ),
+            Err(err) => err,
+        }
+    }
+
+    /// The exact output-cap error, as `Display` renders it.
+    fn output_cap_message() -> String {
+        format!("resource limit exceeded: output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes")
+    }
+
+    /// Assert `result` is exactly the output-cap `mds::resource_limit` error.
+    fn assert_output_cap_error(result: Result<String, MdsError>, context: &str) {
+        let err = err_of(result, context);
         assert!(
-            result.is_err(),
-            "output exceeding MAX_OUTPUT_SIZE must be rejected"
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "{context}: expected mds::resource_limit, got: {err}"
         );
-        let err = format!("{}", result.unwrap_err());
+        assert_eq!(err.to_string(), output_cap_message(), "{context}");
+    }
+
+    /// Parse `src` and register its top-level `@define`s in `scope`, as the resolver
+    /// does before it evaluates a module body.
+    fn parse_into(src: &str, scope: &mut Scope) -> Vec<Node> {
+        let tokens = crate::lexer::tokenize(src, "").expect("fixture must tokenize");
+        let module = crate::parser::parse_with_ctx(&tokens, "", "").expect("fixture must parse");
+        for node in &module.body {
+            if let Node::Define(def) = node {
+                scope.set_function(&def.name, Arc::new(FunctionDef::from(def)));
+            }
+        }
+        module.body
+    }
+
+    /// Evaluate `src` from `seed` with `x` (1 MiB), `items` (`CAP_LOOP_LEN` numbers)
+    /// and `one` (a single number) in scope; return the result and the budget spent.
+    fn eval_capped(src: &str, seed: EvalBudget) -> (Result<String, MdsError>, EvalBudget) {
+        let numbers = |n: usize| Value::Array((0..n).map(|i| Value::Number(i as f64)).collect());
+        let mut scope = Scope::new();
+        scope.set_var("x", Value::String("a".repeat(CAP_PASS - 1)));
+        scope.set_var("items", numbers(CAP_LOOP_LEN));
+        scope.set_var("one", numbers(1));
+        let nodes = parse_into(src, &mut scope);
+        let mut budget = seed;
+        let mut warnings = vec![];
+        let result = evaluate_seeded(&nodes, &mut scope, &mut warnings, "", "", &mut budget);
+        (result, budget)
+    }
+
+    /// #415: a `@for` whose output crosses the cap stops on the crossing pass.
+    /// Checked only once the loop had finished, all `CAP_LOOP_LEN` passes ran first.
+    #[test]
+    fn for_loop_output_cap_stops_iterating() {
+        let (result, budget) =
+            eval_capped("@for i in items:\n{{x}}\n@end\n", EvalBudget::default());
+        assert_output_cap_error(result, "a loop crossing the output cap");
+        assert_eq!(
+            budget.iterations, CAP_CROSSING_PASS,
+            "the loop must stop on the pass that crosses the cap, not run all {CAP_LOOP_LEN}"
+        );
+    }
+
+    /// #415: every container that holds a crossing loop reports the same
+    /// error, and the loop stops on the crossing pass in each of them.
+    #[test]
+    fn for_loop_output_cap_stops_iterating_in_every_container() {
+        // (container, source, loop passes run when the crossing pass is reached)
+        let cases = [
+            (
+                // The outer loop's buffer crosses: each outer pass runs one inner pass.
+                "nested @for",
+                "@for o in items:\n@for i in one:\n{{x}}\n@end\n@end\n",
+                2 * CAP_CROSSING_PASS,
+            ),
+            (
+                "@for in @define",
+                "@define f():\n@for i in items:\n{{x}}\n@end\n@end\n{{f()}}\n",
+                CAP_CROSSING_PASS,
+            ),
+            (
+                "@for in @block",
+                "@block b:\n@for i in items:\n{{x}}\n@end\n@end\n",
+                CAP_CROSSING_PASS,
+            ),
+            (
+                "@for in a text-mode @message",
+                "@message user:\n@for i in items:\n{{x}}\n@end\n@end\n",
+                CAP_CROSSING_PASS,
+            ),
+        ];
+        // Every container runs before anything is asserted, so a failure reports them all.
+        let expected: Vec<(&str, String, usize)> = cases
+            .iter()
+            .map(|&(container, _, passes)| (container, output_cap_message(), passes))
+            .collect();
+        let actual: Vec<(&str, String, usize)> = cases
+            .iter()
+            .map(|&(container, src, _)| {
+                let (result, budget) = eval_capped(src, EvalBudget::default());
+                let err = err_of(result, container);
+                assert!(
+                    matches!(err, MdsError::ResourceLimit { .. }),
+                    "{container}: expected mds::resource_limit, got: {err}"
+                );
+                (container, err.to_string(), budget.iterations)
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "each container must report the output cap and stop its loop on the crossing pass \
+             (container, error, loop passes run)"
+        );
+    }
+
+    /// #415: with exactly `CAP_CROSSING_PASS` passes left in the budget, the
+    /// output cap stops the loop on its last allowed pass; with one fewer, the
+    /// iteration cap stops it first — on the same pass, before its body runs.
+    #[test]
+    fn for_loop_iteration_cap_still_wins_on_the_crossing_pass() {
+        let src = "@for i in items:\n{{x}}\n@end\n";
+        let seeded = |left: usize| EvalBudget {
+            iterations: MAX_TOTAL_ITERATIONS - left,
+            message_bytes: 0,
+        };
+
+        let (result, budget) = eval_capped(src, seeded(CAP_CROSSING_PASS));
+        assert_output_cap_error(
+            result,
+            "the crossing pass is the last one the budget allows",
+        );
+        assert_eq!(budget.iterations, MAX_TOTAL_ITERATIONS);
+
+        let (result, budget) = eval_capped(src, seeded(CAP_CROSSING_PASS - 1));
+        let err = err_of(result, "the iteration cap must fire on the crossing pass");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "resource limit exceeded: total loop iterations exceeded maximum of \
+                 {MAX_TOTAL_ITERATIONS} across all loops in this compilation"
+            )
+        );
+        assert_eq!(budget.iterations, MAX_TOTAL_ITERATIONS + 1);
+    }
+
+    /// #415: a buffer grown through `push_capped` never reserves past the cap.
+    /// Plain doubling from 32 MiB would reserve 64 MiB for a 33 MiB buffer.
+    #[test]
+    fn push_capped_growth_never_reserves_past_the_cap() {
+        let mut out = String::new();
+        let chunk = "a".repeat(1024 * 1024);
+        for pass in 1..=MAX_OUTPUT_SIZE / chunk.len() {
+            push_capped(&mut out, &chunk).expect("appends up to the cap must succeed");
+            assert!(
+                out.capacity() >= out.len() && out.capacity() <= MAX_OUTPUT_SIZE,
+                "pass {pass}: capacity {} must lie between the length {} and the cap",
+                out.capacity(),
+                out.len()
+            );
+        }
+        // Positive control: the buffer reached exactly the cap, so the bound above was
+        // tested where doubling would have overshot it.
+        assert_eq!(out.len(), MAX_OUTPUT_SIZE);
+    }
+
+    /// #415: at the cap, `push_capped` accepts an empty append and refuses one
+    /// more byte with the output-cap error, leaving the buffer unchanged.
+    #[test]
+    fn push_capped_refuses_past_the_cap_and_leaves_the_buffer_unchanged() {
+        let mut out = String::new();
+        push_capped(&mut out, &"a".repeat(MAX_OUTPUT_SIZE - 1)).expect("under the cap");
+        push_capped(&mut out, "b").expect("exactly the cap is allowed");
+        push_capped(&mut out, "").expect("an empty append at the cap is allowed");
+        assert_eq!(out.len(), MAX_OUTPUT_SIZE);
+
+        let err = push_capped(&mut out, "c").expect_err("one byte past the cap");
+        assert_eq!(err.to_string(), output_cap_message());
         assert!(
-            err.contains("output") || err.contains("maximum size") || err.contains("50"),
-            "error should mention output size limit, got: {err}"
+            out.len() == MAX_OUTPUT_SIZE && out.ends_with('b'),
+            "a refused append must leave the buffer unchanged"
         );
     }
 
@@ -2655,7 +2810,7 @@ mod tests {
             ]),
         );
 
-        let builder = crate::sourcemap::MapBuilder::new(
+        let builder = crate::sourcemap::MapBuilder::from_parts(
             "t.mds".to_string(),
             "t.mds".to_string(),
             source.to_string(),
@@ -2803,7 +2958,7 @@ mod tests {
         let source = "@for i in items:\n.\n@end\n";
         let body = parse_body(source);
         let builder = || {
-            crate::sourcemap::MapBuilder::new(
+            crate::sourcemap::MapBuilder::from_parts(
                 "t.mds".to_string(),
                 "t.mds".to_string(),
                 source.to_string(),
@@ -2848,6 +3003,110 @@ mod tests {
                 &mut budget,
             ),
             ITERATION_LIMIT_MSG,
+        );
+    }
+
+    // ── #416: the builder shares module sources and caches splice remaps ───────
+
+    fn origin(file: &str, display: &str, source: &str) -> crate::sourcemap::Origin {
+        crate::sourcemap::Origin {
+            file: Arc::from(file),
+            display: Arc::from(display),
+            source: Arc::from(source),
+        }
+    }
+
+    /// The namespace an importer sees for `module`, whose prompt was evaluated by its
+    /// own builder: one segment of its own text, then one of `helper`'s — the file an
+    /// S8 function call pulled in.
+    fn included_namespace(
+        module: &crate::sourcemap::Origin,
+        helper: &crate::sourcemap::Origin,
+    ) -> crate::scope::NamespaceScope {
+        let mut b = crate::sourcemap::MapBuilder::new(module.clone());
+        b.push_segment(0, 0, 4);
+        b.switch_to(helper);
+        b.push_segment(5, 0, 4);
+        crate::scope::NamespaceScope {
+            functions: std::collections::HashMap::new(),
+            prompt_body: Some("mmmm hhhh\n".to_string()),
+            prompt_map: Some(Arc::new(b.into_fragment())),
+            prompt_suppressed_by_exports: false,
+        }
+    }
+
+    /// #416: K `@include`s of one module — separate sites and a loop —
+    /// splice through one remap-cache entry in the builder, and every registered
+    /// source is the `Origin` that registered it, sharing its `Arc`s.
+    #[test]
+    fn map_builder_remap_cache_holds_one_entry_for_k_includes_of_one_module() {
+        let main_src = "@include m\n@for i in items:\n@include m\n@end\n@include m\n";
+        let main = origin("/p/main.mds", "main.mds", main_src);
+        let module = origin("/p/m.mds", "m.mds", "m text");
+        let helper = origin("/p/h.mds", "h.mds", "h text");
+        let mut scope = Scope::new();
+        scope.set_var("items", Value::Array(vec![Value::Number(1.0); 3]));
+        scope.set_namespace("m", included_namespace(&module, &helper));
+
+        let (output, map) = evaluate_with_map(
+            &parse_body(main_src),
+            &mut scope,
+            &mut vec![],
+            crate::sourcemap::MapBuilder::new(main.clone()),
+        )
+        .expect("fixture must evaluate");
+
+        assert_eq!(
+            output.matches("mmmm hhhh").count(),
+            5,
+            "non-vacuity: two include sites plus three loop passes"
+        );
+        assert_eq!(
+            map.remap_cache_len(),
+            1,
+            "one entry for one included module"
+        );
+        assert_eq!(
+            map.segments.iter().filter(|s| s.src != 0).count(),
+            10,
+            "every include splices both fragment segments"
+        );
+        let expected = [&main, &module, &helper];
+        assert_eq!(map.sources().len(), expected.len());
+        for (idx, (entry, want)) in map.sources().iter().zip(expected).enumerate() {
+            assert!(
+                Arc::ptr_eq(&entry.source, &want.source),
+                "entry {idx}: source must be the module's own Arc"
+            );
+            assert!(
+                Arc::ptr_eq(&entry.display, &want.display),
+                "entry {idx}: display must be the module's own Arc"
+            );
+        }
+    }
+
+    /// PF-005: a builder whose current source names no registered source is an internal
+    /// error, not an evaluation with an empty file context. Only an index another
+    /// builder handed out can do that: every index a builder hands out is its own.
+    #[test]
+    fn evaluate_with_map_seeded_rejects_an_unregistered_current_src() {
+        let body = parse_body("text\n");
+        let mut builder = crate::sourcemap::MapBuilder::new(origin("t.mds", "t.mds", "text\n"));
+        // Control: the seed's index evaluates.
+        let (out, returned) = evaluate_with_map(&body, &mut Scope::new(), &mut vec![], builder)
+            .expect("the seed must evaluate");
+        assert_eq!(out, "text\n");
+        builder = returned;
+        let mut other = crate::sourcemap::MapBuilder::new(origin("a.mds", "a.mds", "a"));
+        let foreign = other.register(&origin("b.mds", "b.mds", "b"));
+        builder.switch_to_index(foreign);
+        let Err(err) = evaluate_with_map(&body, &mut Scope::new(), &mut vec![], builder) else {
+            panic!("an unregistered current_src must not evaluate");
+        };
+        assert_eq!(
+            err.to_string(),
+            "syntax error: internal: MapBuilder current_src names no registered source — \
+             compiler bug"
         );
     }
 

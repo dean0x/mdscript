@@ -271,6 +271,42 @@ fn check_source_too_large_returns_resource_limit() {
     assert_eq!(code, "mds::resource_limit", "got: {code}");
 }
 
+/// #415 (a guard — no RED claim): a `@for` whose output crosses the 50 MiB output
+/// cap is a coded `mds::resource_limit` error with native's exact message. Its 100
+/// passes of 1 MiB fit in linear memory whether the cap is checked before each append
+/// or after the loop, so this pins the error's shape, not where the loop stopped.
+#[wasm_bindgen_test]
+fn for_loop_output_cap_is_resource_limit() {
+    let source = "@for i in items:\n{{x}}\n@end\n";
+    let items: Vec<u32> = (0..100).collect();
+    let opts = vars_opts(&serde_json::json!({ "x": "a".repeat(1024 * 1024), "items": items }));
+    let err = mds_wasm::compile(source, opts).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_eq!(
+        get_str(&err, "message"),
+        "resource limit exceeded: output exceeds maximum size of 52428800 bytes"
+    );
+}
+
+/// #415: `replace()` sizes its result in checked arithmetic before allocating it. On
+/// wasm32 `usize` is 32 bits, and 4096 matches of a 1 MiB replacement ask for exactly
+/// 2^32 bytes, which wraps to 0: an unchecked count would admit the call and then try
+/// to build 4 GiB. It must be refused like any other over-cap result.
+#[wasm_bindgen_test]
+fn replace_whose_length_wraps_usize_is_refused() {
+    assert_eq!(usize::BITS, 32, "the wrap needs wasm32's 32-bit usize");
+    let opts = vars_opts(&serde_json::json!({
+        "s": "x".repeat(4096),
+        "to": "a".repeat(1024 * 1024),
+    }));
+    let err = mds_wasm::compile("{{replace(s, \"x\", to)}}\n", opts).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::builtin");
+    assert_eq!(
+        get_str(&err, "message"),
+        "replace() output exceeds maximum size of 52428800 bytes"
+    );
+}
+
 // ── check tests ───────────────────────────────────────────────────────────────
 
 #[wasm_bindgen_test]
@@ -582,6 +618,371 @@ fn scan_imports_returns_array_for_source_with_imports() {
 fn scan_imports_returns_empty_array_for_importless_source() {
     let result = mds_wasm::scan_imports("Hello World!\n").unwrap();
     assert_eq!(js_array_len(&result), 0);
+}
+
+// ── scanImportRecords (#414) ─────────────────────────────────────────────────
+
+/// The `{ offset, length, line, column }` of a JS span object, `None` for `null`.
+fn span_fields(span: &JsValue) -> Option<[JsValue; 4]> {
+    (!span.is_null()).then(|| ["offset", "length", "line", "column"].map(|key| get_prop(span, key)))
+}
+
+/// `scanImportRecords` lists `scanImports`' paths with their records, every key
+/// present; an `@import`'s span is the object the engine's own error for a missing
+/// module carries, a frontmatter import's index the one its error names (#414).
+#[wasm_bindgen_test]
+fn scan_import_records_carry_the_errors_context() {
+    let source = concat!(
+        "---\nimports:\n  - path: ./fm.mds\n---\n",
+        "caf\u{e9}\n@import \"./missing.mds\" as m\n",
+        "@export x from \"./exp.mds\"\n",
+    );
+    let records = mds_wasm::scan_import_records(source, false).unwrap();
+    assert_eq!(js_array_len(&records), 3);
+    let record = |i: u32| js_sys::Array::from(&records).get(i);
+    let fields = |i: u32| {
+        let r = record(i);
+        (
+            get_str(&r, "path"),
+            get_str(&r, "kind"),
+            get_prop(&r, "frontmatterIndex").as_f64(),
+            get_prop(&r, "span").is_null(),
+        )
+    };
+    assert_eq!(
+        fields(0),
+        ("./fm.mds".into(), "frontmatter".into(), Some(0.0), true)
+    );
+    assert_eq!(
+        fields(1),
+        ("./missing.mds".into(), "import".into(), None, false)
+    );
+    assert!(get_prop(&record(1), "frontmatterIndex").is_null());
+    assert_eq!(
+        fields(2),
+        ("./exp.mds".into(), "export-from".into(), None, true)
+    );
+
+    // The engine's own error for the missing module: the same span object.
+    let err = mds_wasm::compile(
+        source,
+        modules_opts(&serde_json::json!({ "fm.mds": "F\n", "exp.mds": "@define x():\nX\n@end\n@export x\n" })),
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
+    let span = span_fields(&get_prop(&record(1), "span")).expect("an @import has a span");
+    assert_eq!(
+        span_fields(&get_prop(&err, "span")).expect("the error has a span"),
+        span
+    );
+    // Non-vacuity: the directive is past the frontmatter and a multi-byte line.
+    assert_eq!(span[2].as_f64(), Some(6.0));
+    assert_eq!(span[1].as_f64(), Some(28.0));
+}
+
+/// `asBase` places a template's `@extends` base where the resolver resolves it: before
+/// its imports for a template compiled for itself, after them for one reached as the
+/// base of another (#414).
+#[wasm_bindgen_test]
+fn scan_import_records_place_the_extends_base_as_the_resolver_resolves_it() {
+    let source = "---\nimports:\n  - path: ./fm.mds\n---\n@extends \"./base.mds\"\n";
+    let kinds = |as_base: bool| -> Vec<(String, String)> {
+        let records = js_sys::Array::from(&mds_wasm::scan_import_records(source, as_base).unwrap());
+        records
+            .iter()
+            .map(|r| (get_str(&r, "path"), get_str(&r, "kind")))
+            .collect()
+    };
+    let row = |path: &str, kind: &str| (path.to_owned(), kind.to_owned());
+    assert_eq!(
+        kinds(false),
+        [row("./base.mds", "extends"), row("./fm.mds", "frontmatter")]
+    );
+    assert_eq!(
+        kinds(true),
+        [row("./fm.mds", "frontmatter"), row("./base.mds", "extends")]
+    );
+}
+
+#[wasm_bindgen_test]
+fn scan_import_records_returns_error_for_malformed_source() {
+    for as_base in [false, true] {
+        let err = mds_wasm::scan_import_records("Hello {{name\n", as_base).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::syntax");
+    }
+}
+
+// ── moduleAliases (#414) ─────────────────────────────────────────────────────
+
+/// Options with `modules` and `moduleAliases` built from `(key, value)` pairs, so a
+/// key can be built at runtime.
+fn aliased_opts(modules: &[(&str, &str)], aliases: serde_json::Value) -> JsValue {
+    let modules: serde_json::Map<String, serde_json::Value> = modules
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), serde_json::Value::from(*v)))
+        .collect();
+    to_js_object(&serde_json::json!({ "modules": modules, "moduleAliases": aliases }))
+}
+
+/// An alias map of `(alias, value)` pairs.
+fn alias_map(pairs: &[(&str, serde_json::Value)]) -> serde_json::Value {
+    serde_json::Value::Object(
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect(),
+    )
+}
+
+/// `moduleAliases` lets an import reach a module by another key: compile, check and
+/// lint resolve it to the module it names, which the result names by its own key.
+#[wasm_bindgen_test]
+fn module_aliases_resolve_an_import_to_the_module_they_name() {
+    let source = "@import \"./Hi.mds\" as h\n@include h\n";
+    let opts = || {
+        aliased_opts(
+            &[("hi.mds", "Hi!\n")],
+            alias_map(&[("Hi.mds", "hi.mds".into())]),
+        )
+    };
+    let result = mds_wasm::compile(source, opts()).unwrap();
+    assert_eq!(get_str(&result, "output"), "Hi!\n");
+    let deps = js_sys::Array::from(&get_prop(&result, "dependencies"));
+    assert_eq!(deps.length(), 1);
+    assert_eq!(deps.get(0).as_string().as_deref(), Some("hi.mds"));
+    mds_wasm::check(source, opts()).unwrap();
+    mds_wasm::lint(source, opts()).unwrap();
+    // Control: without the alias the spelling is a key of its own, and names no module.
+    let err = mds_wasm::compile(
+        source,
+        modules_opts(&serde_json::json!({ "hi.mds": "Hi!\n" })),
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
+}
+
+/// A malformed alias map — or an alias or the module key it names that is not a
+/// module key, hostile ones included — is refused by compile, check and lint with
+/// `mds::invalid_options`, the key escaped: its escape text is shown and the raw
+/// character never is (PF-013). An alias that breaks a rule is named per key, as a
+/// value of the wrong type is (#414).
+#[wasm_bindgen_test]
+fn module_aliases_refuse_a_malformed_or_hostile_alias() {
+    let esc = char::from_u32(0x1b).expect("U+001B is a char");
+    let hostile = format!("a{esc}b.mds");
+    let shown = format!("a{}u001Bb.mds", '\\');
+    let invalid =
+        |alias: &str, reason: &str| format!("options.moduleAliases[\"{alias}\"]: {reason}");
+    let cases = [
+        (
+            serde_json::json!([]),
+            "options.moduleAliases must be a plain object, got array".to_owned(),
+        ),
+        (
+            alias_map(&[("A.mds", 1.into())]),
+            "options.moduleAliases[\"A.mds\"] must be a string, got number".to_owned(),
+        ),
+        (
+            alias_map(&[(&hostile, 1.into())]),
+            format!("options.moduleAliases[\"{shown}\"] must be a string, got number"),
+        ),
+        (
+            alias_map(&[(&hostile, "hi.mds".into())]),
+            invalid(&shown, "the alias contains forbidden character U+001B"),
+        ),
+        (
+            alias_map(&[("A.mds", hostile.clone().into())]),
+            invalid(
+                "A.mds",
+                &format!("its module key \"{shown}\" contains forbidden character U+001B"),
+            ),
+        ),
+        (
+            alias_map(&[("../hi.mds", "hi.mds".into())]),
+            invalid("../hi.mds", "the alias has a '..' segment"),
+        ),
+        (
+            alias_map(&[("A.mds", "gone.mds".into())]),
+            invalid("A.mds", "its module key \"gone.mds\" names no module"),
+        ),
+        (
+            alias_map(&[("hi.mds", "input.mds".into())]),
+            invalid("hi.mds", "the alias is a module key itself"),
+        ),
+    ];
+    let source = "@import \"./A.mds\" as a\n";
+    for (aliases, message) in cases {
+        let opts = || aliased_opts(&[("hi.mds", "Hi!\n")], aliases.clone());
+        for err in [
+            mds_wasm::compile(source, opts()).unwrap_err(),
+            mds_wasm::check(source, opts()).unwrap_err(),
+            mds_wasm::lint(source, opts()).unwrap_err(),
+        ] {
+            assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{message}");
+            assert_eq!(get_str(&err, "message"), message);
+            assert!(!get_str(&err, "message").contains(esc), "{message}");
+        }
+    }
+    // Control: an alias of the entry itself is a module key, and accepted.
+    let opts = aliased_opts(
+        &[("hi.mds", "Hi!\n")],
+        alias_map(&[("A.mds", "input.mds".into())]),
+    );
+    let err = mds_wasm::compile(source, opts).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::circular_import");
+}
+
+/// `moduleAliases` is bounded as `modules` is, as the option is read and before any
+/// alias is checked (#414): more than 65,536 aliases, or aliases and the module keys
+/// they name that together pass 10 MiB, is `mds::resource_limit`, worded like the
+/// `modules` refusals. A map at either bound compiles (the controls), and one past a
+/// bound is refused so even when every alias in it would be refused too.
+#[wasm_bindgen_test]
+fn module_aliases_are_bounded_like_modules() {
+    const COUNT: usize = 65_536;
+    const SIZE: usize = 10 * 1024 * 1024;
+    let source = "@import \"./Hi.mds\" as h\n@include h\n";
+    let opts = |aliases: &serde_json::Value| aliased_opts(&[("hi.mds", "Hi!\n")], aliases.clone());
+    // `Hi.mds` → `hi.mds`, which the source imports, and `n - 1` more aliases.
+    let many = |n: usize, target: &str| {
+        let mut aliases: serde_json::Map<String, serde_json::Value> = (1..n)
+            .map(|i| (format!("A{i}.mds"), target.into()))
+            .collect();
+        aliases.insert("Hi.mds".to_owned(), "hi.mds".into());
+        serde_json::Value::Object(aliases)
+    };
+    // `Hi.mds` → `hi.mds` (12 bytes), and one alias taking the rest of `total` bytes.
+    let sized = |total: usize, target: &str| {
+        let long = format!(
+            "{}.mds",
+            "x".repeat(total - 12 - target.len() - ".mds".len())
+        );
+        alias_map(&[("Hi.mds", "hi.mds".into()), (&long, target.into())])
+    };
+
+    for aliases in [many(COUNT, "hi.mds"), sized(SIZE, "hi.mds")] {
+        let result = mds_wasm::compile(source, opts(&aliases)).expect("at a bound");
+        assert_eq!(get_str(&result, "output"), "Hi!\n");
+    }
+    let too_many = format!(
+        "options.moduleAliases exceeds maximum alias count of {COUNT} ({} provided)",
+        COUNT + 1
+    );
+    let too_large = format!("options.moduleAliases aggregate size exceeds maximum of {SIZE} bytes");
+    for (aliases, message) in [
+        (many(COUNT + 1, "hi.mds"), &too_many),
+        (many(COUNT + 1, "gone.mds"), &too_many),
+        (sized(SIZE + 1, "hi.mds"), &too_large),
+        (sized(SIZE + 1, "gone.mds"), &too_large),
+    ] {
+        for err in [
+            mds_wasm::compile(source, opts(&aliases)).unwrap_err(),
+            mds_wasm::check(source, opts(&aliases)).unwrap_err(),
+            mds_wasm::lint(source, opts(&aliases)).unwrap_err(),
+        ] {
+            assert_eq!(get_str(&err, "code"), "mds::resource_limit", "{message}");
+            assert_eq!(get_str(&err, "message"), *message);
+        }
+    }
+}
+
+// ── preflightModule (#414) ───────────────────────────────────────────────────
+
+/// `preflightModule` returns a module's text, a leading byte-order mark kept, and
+/// throws the native backend's error — `mds::check_module_bytes`'s — for bytes it
+/// refuses (#414).
+#[wasm_bindgen_test]
+fn preflight_module_returns_the_text_or_the_native_error() {
+    assert_eq!(
+        mds_wasm::preflight_module(b"Hello!\n".to_vec(), "a.mds", "./a.mds").unwrap(),
+        "Hello!\n"
+    );
+    let bom = [&[0xef, 0xbb, 0xbf][..], b"Hi\n"].concat();
+    let expected_bom = format!("{}Hi\n", char::from_u32(0xfeff).unwrap());
+    assert_eq!(
+        mds_wasm::preflight_module(bom, "a.mds", "./a.mds").unwrap(),
+        expected_bom
+    );
+
+    let cases = [
+        (
+            vec![b'h', b'i', 0xff, b'\n'],
+            "mds::io",
+            "invalid UTF-8 in sub/bad.mds: invalid utf-8 sequence of 1 bytes from index 2",
+        ),
+        (
+            vec![b'h', b'i', b'\n', 0xe2, 0x82],
+            "mds::io",
+            "invalid UTF-8 in sub/bad.mds: incomplete utf-8 byte sequence from index 3",
+        ),
+    ];
+    for (bytes, code, message) in cases {
+        let err = mds_wasm::preflight_module(bytes, "sub/bad.mds", "./sub/bad.mds").unwrap_err();
+        assert_eq!(get_str(&err, "code"), code);
+        assert_eq!(get_str(&err, "message"), message);
+        assert!(
+            get_prop(&err, "help").is_undefined(),
+            "no help on {message}"
+        );
+    }
+
+    // The per-file cap: exactly 10 MiB passes, one byte more is refused.
+    let cap = 10 * 1024 * 1024;
+    assert_eq!(
+        mds_wasm::preflight_module(vec![b'x'; cap], "big.mds", "./big.mds")
+            .unwrap()
+            .len(),
+        cap
+    );
+    let err = mds_wasm::preflight_module(vec![b'x'; cap + 1], "big.mds", "./big.mds").unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_eq!(
+        get_str(&err, "message"),
+        format!(
+            "resource limit exceeded: file too large ({} bytes, max {cap} bytes): big.mds",
+            cap + 1
+        )
+    );
+}
+
+/// `preflightModule` refuses a file that is not an MDS file after its bytes pass, as the
+/// resolver does before it parses a module (#417): the extension of `display` (the
+/// on-disk spelling) is judged, and the error names `typed`, the path as typed.
+#[wasm_bindgen_test]
+fn preflight_module_refuses_a_non_mds_file_naming_it_as_typed() {
+    let help = "use .mds extension or add 'type: mds' to frontmatter";
+    for (display, typed, source) in [
+        ("doc.txt", "./sub/../doc.txt", "Hello!\n"),
+        ("plain.md", "/abs/plain.md", "Hello!\n"),
+        // Its import-like line is never the pre-scanner's to follow.
+        ("lure.txt", "lure.txt", "@import \"./missing.mds\" as m\n"),
+        // The path as typed only names the file: a `.mds` spelling of it admits nothing.
+        ("doc.txt", "./doc.mds", "Hello!\n"),
+    ] {
+        let err =
+            mds_wasm::preflight_module(source.as_bytes().to_vec(), display, typed).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::not_mds", "{typed}");
+        assert_eq!(
+            get_str(&err, "message"),
+            format!("not an MDS file: {typed}")
+        );
+        assert_eq!(get_str(&err, "help"), help);
+    }
+    // The typed path is escaped as it enters the message.
+    let hostile = format!("./a{}b.txt", char::from_u32(0x1b).unwrap());
+    let err = mds_wasm::preflight_module(b"hi\n".to_vec(), "ab.txt", &hostile).unwrap_err();
+    assert_eq!(
+        get_str(&err, "message"),
+        format!("not an MDS file: ./a{}u001Bb.txt", '\\')
+    );
+    // Bytes are checked first: invalid UTF-8 in a .txt file is the bytes error.
+    let err = mds_wasm::preflight_module(vec![0xff], "doc.txt", "doc.txt").unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::io");
+    // Controls: .mds, and .md declaring type: mds, pass — the extension judged on
+    // display, never on typed.
+    mds_wasm::preflight_module(b"hi\n".to_vec(), "Doc.mds", "./doc.txt").unwrap();
+    mds_wasm::preflight_module(b"---\ntype: mds\n---\nhi\n".to_vec(), "page.md", "page.md")
+        .unwrap();
 }
 
 #[wasm_bindgen_test]
@@ -1641,4 +2042,108 @@ fn wasm_lint_virtual_unknown_severity_value_throws_invalid_options() {
         code, "mds::invalid_options",
         "W-SEVER-2: lint_virtual unknown severity value must throw mds::invalid_options; got: {code}"
     );
+}
+
+/// `a`, ESC, `b`, LF, `c`, TAB, `d` — built with `char::from_u32` at runtime, never
+/// typed as live bytes (PF-018) — and how the WIRE escaper shows it: ESC and LF as
+/// the six-character escape text, TAB raw (#418).
+fn hostile_and_shown() -> (String, String) {
+    let ch = |cp: u32| char::from_u32(cp).expect("a valid scalar value");
+    let esc = |cp: u32| format!("\\u{cp:04X}");
+    let hostile: String = ['a', ch(0x1b), 'b', ch(0x0a), 'c', ch(0x09), 'd']
+        .iter()
+        .collect();
+    let shown = format!("a{}b{}c{}d", esc(0x1b), esc(0x0a), ch(0x09));
+    (hostile, shown)
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_rules_error_wire_escapes_rule_name_and_severity() {
+    // W-RULES-ESC (#418): a rule name or severity the `rules` error names is
+    // WIRE-escaped, in the wording mds-core gives every binding; a clean name's message
+    // is the control.
+    let (hostile, shown) = hostile_and_shown();
+    let valid = "expected \"off\", \"info\", \"warn\", or \"error\"";
+    let cases = [
+        (
+            serde_json::json!({ hostile.clone(): 1 }),
+            format!("options.rules[\"{shown}\"] must be a severity string, got number"),
+        ),
+        (
+            serde_json::json!({ "unused-variable": hostile.clone() }),
+            format!("options.rules[\"unused-variable\"]: unknown severity \"{shown}\"; {valid}"),
+        ),
+        (
+            serde_json::json!({ "unused-variable": 1 }),
+            "options.rules[\"unused-variable\"] must be a severity string, got number".to_string(),
+        ),
+    ];
+    for (rules, expected) in cases {
+        let opts = to_js_object(&serde_json::json!({ "rules": rules }));
+        let err = mds_wasm::lint("Hello!\n", opts).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{expected}");
+        assert_eq!(get_str(&err, "message"), expected);
+    }
+}
+
+#[wasm_bindgen_test]
+fn wasm_options_conversion_error_text_is_wire_escaped() {
+    // W-SERDE-ESC (#418): a value serde-wasm-bindgen cannot convert — a Symbol —
+    // is named in the conversion error it returns, description included, and each
+    // options field WASM converts that way wraps that text in its own message. The
+    // description must reach the message escaped: present in its shown form (the
+    // positive control, PF-013), and no raw ESC or LF anywhere in it.
+    let (hostile, shown) = hostile_and_shown();
+    let symbol = JsValue::symbol(Some(&hostile));
+    let object_with = |key: &str, value: &JsValue| {
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(&obj, &JsValue::from_str(key), value).expect("set a property");
+        JsValue::from(obj)
+    };
+    let cases = [
+        (
+            "invalid options.rules: ",
+            mds_wasm::lint("Hello!\n", object_with("rules", &object_with("a", &symbol))),
+        ),
+        (
+            "invalid options.vars: ",
+            mds_wasm::compile("Hello!\n", object_with("vars", &object_with("a", &symbol))),
+        ),
+        (
+            "invalid options.modules: ",
+            mds_wasm::compile(
+                "Hello!\n",
+                object_with("modules", &object_with("a.mds", &symbol)),
+            ),
+        ),
+        (
+            "invalid options.moduleAliases: ",
+            mds_wasm::compile(
+                "Hello!\n",
+                object_with("moduleAliases", &object_with("A.mds", &symbol)),
+            ),
+        ),
+        (
+            "invalid modules: ",
+            mds_wasm::lint_virtual(
+                object_with("main.mds", &symbol),
+                "main.mds",
+                JsValue::UNDEFINED,
+            ),
+        ),
+    ];
+    for (prefix, result) in cases {
+        let err = result.expect_err(prefix);
+        let message = get_str(&err, "message");
+        assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{message:?}");
+        assert!(message.starts_with(prefix), "{prefix}: {message:?}");
+        assert!(
+            message.contains(&shown),
+            "{prefix}: shown form missing: {message:?}"
+        );
+        assert!(
+            !message.chars().any(|c| c == '\u{1b}' || c == '\n'),
+            "{prefix}: raw ESC or LF in {message:?}"
+        );
+    }
 }

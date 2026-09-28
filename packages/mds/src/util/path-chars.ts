@@ -5,12 +5,15 @@
  * the Rust engine sees them, so it applies the rule the Rust resolver and
  * `NativeFs` apply: the same 80-codepoint class, classified in the same order,
  * refused with the same message text. Keep this module in lockstep with
- * `mds::is_forbidden_path_char` and `mds::escape_path_for_message`
+ * `mds::is_forbidden_path_char`, `mds::escape_path_for_message` and
+ * `mds::sanitize_control_chars_wire`
  * (crates/mds-core/src/lint/diagnostic.rs), `forbidden_char_message`
  * (crates/mds-core/src/fs.rs) and `import_path_violation`
  * (crates/mds-core/src/resolver.rs). `__test__/forbidden-path-chars.spec.mjs`
- * compares the two against the real engine on both backends; a change on one
- * side alone fails it.
+ * compares the two against the real engine on both backends, and
+ * `__test__/options-validation.spec.mjs` (U-OV-14, U-OV-31) compares the
+ * option-key check built on `sanitizeControlCharsWire` against napi; a change
+ * on one side alone fails them.
  *
  * Pure functions only — no I/O — so it is browser-safe.
  */
@@ -54,18 +57,38 @@ export function firstForbiddenChar(path: string): number | undefined {
   return undefined;
 }
 
+/** U+0009 CHARACTER TABULATION — the one forbidden codepoint WIRE mode leaves raw. */
+const TAB = 0x09;
+
+/** The six-character text a message shows for `cp`: backslash, `u`, four uppercase hex digits. */
+function escapeCodePoint(cp: number): string {
+  return '\\u' + hex4(cp);
+}
+
 /**
- * Escape every forbidden codepoint in `path` to the six-character text a
- * message shows for it (backslash, `u`, four uppercase hex digits) — mirrors
- * Rust `mds::escape_path_for_message`. The result carries none of the 80.
+ * Escape every hazardous codepoint in `s` to its six-character text — mirrors
+ * Rust `mds::sanitize_control_chars_wire`, the WIRE escaper for single-line
+ * values that are not paths, such as an option key (#418). Its class is the
+ * forbidden-path class minus TAB, which WIRE mode leaves raw: a tab cannot forge
+ * a line or move the cursor destructively.
  */
-export function escapePathForMessage(path: string): string {
+export function sanitizeControlCharsWire(s: string): string {
   let out = '';
-  for (const ch of path) {
+  for (const ch of s) {
     const cp = ch.codePointAt(0);
-    out += cp !== undefined && isForbiddenPathChar(cp) ? '\\u' + hex4(cp) : ch;
+    out += cp !== undefined && cp !== TAB && isForbiddenPathChar(cp) ? escapeCodePoint(cp) : ch;
   }
   return out;
+}
+
+/**
+ * Escape every forbidden codepoint in `path` to the six-character text a
+ * message shows for it — mirrors Rust `mds::escape_path_for_message`: the WIRE
+ * escape plus TAB, which a path may not carry either. The result carries none
+ * of the 80.
+ */
+export function escapePathForMessage(path: string): string {
+  return sanitizeControlCharsWire(path).replaceAll(String.fromCodePoint(TAB), escapeCodePoint(TAB));
 }
 
 /**

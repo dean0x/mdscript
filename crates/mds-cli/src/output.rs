@@ -15,7 +15,7 @@
 //! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
 //!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
-//! Single-file path helpers (`OutputKind`, `compile_to_content`, `compile_and_write`,
+//! Single-file path helpers (`OutputKind`, `compile_to_content`,
 //! `resolve_output_path_for_kind`) remain in `build.rs`; they are imported here when
 //! callers need both single-file and directory logic.
 
@@ -198,22 +198,13 @@ pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Re
 /// `path`), before that file's existence check.
 ///
 /// A value that is not valid UTF-8 is scanned lossily: every forbidden codepoint
-/// that is validly encoded survives the conversion.
+/// that is validly encoded survives the conversion. The scan and the message are
+/// [`mds::reject_forbidden_path`]'s, so the CLI refuses a path in mds-core's words.
 pub(crate) fn reject_forbidden_output_path(
     what: &str,
     value: &OsStr,
 ) -> std::result::Result<(), mds::MdsError> {
-    let text = value.to_string_lossy();
-    match text.chars().find(|&ch| mds::is_forbidden_path_char(ch)) {
-        Some(ch) => Err(mds::MdsError::Io {
-            message: format!(
-                "{what} contains forbidden character U+{:04X}: \"{}\"",
-                u32::from(ch),
-                mds::escape_path_for_message(&text)
-            ),
-        }),
-        None => Ok(()),
-    }
+    mds::reject_forbidden_path(what, Path::new(value), &value.to_string_lossy())
 }
 
 /// Refuse an output location whose RESOLVED form carries a forbidden path character
@@ -228,27 +219,23 @@ pub(crate) fn reject_forbidden_output_path(
 /// it up front beside the typed check, so a refused location is never created or
 /// written, and no later status line can show it.
 ///
-/// The message names `shown`, the value as typed, escaped by
-/// [`mds::escape_path_for_message`] — never the absolute resolved path.
+/// The message, `<what> resolved path contains forbidden character U+XXXX: "<typed>"`,
+/// names `typed`, the value as typed, escaped by [`mds::escape_path_for_message`] —
+/// never the absolute resolved path. The scan and the message are
+/// [`mds::reject_forbidden_path`]'s.
 pub(crate) fn reject_forbidden_resolved_output_path(
     what: &str,
     path: &Path,
-    shown: &OsStr,
+    typed: &OsStr,
 ) -> std::result::Result<(), mds::MdsError> {
     let Some(resolved) = resolve_existing_prefix(path) else {
         return Ok(());
     };
-    let resolved = resolved.to_string_lossy();
-    match resolved.chars().find(|&ch| mds::is_forbidden_path_char(ch)) {
-        Some(ch) => Err(mds::MdsError::Io {
-            message: format!(
-                "{what} resolved path contains forbidden character U+{:04X}: \"{}\"",
-                u32::from(ch),
-                mds::escape_path_for_message(&shown.to_string_lossy())
-            ),
-        }),
-        None => Ok(()),
-    }
+    mds::reject_forbidden_path(
+        &format!("{what} resolved path"),
+        &resolved,
+        &typed.to_string_lossy(),
+    )
 }
 
 /// The canonical form of the deepest existing ancestor of `path` (`path` itself when

@@ -14,7 +14,9 @@ import {
   errorShape,
   escapeText,
   findPythonForMarkdownScript,
+  loadEngines,
   rejectionOf,
+  requireEngines,
   thrownBy,
 } from './helpers.mjs';
 
@@ -570,9 +572,7 @@ describe('error shape', () => {
           await rejectionOf(native.compileFile(childPath, { sourceMap }), 'U-E-EXT napi'),
         );
         // The WASM compileFile path: pre-scan the modules, then compile the entry.
-        const { entryFilename, modules } = await buildModulesMap(childPath, (src) =>
-          wasmModule.scanImports(src),
-        );
+        const { entryFilename, modules } = await buildModulesMap(childPath, wasmModule);
         const entrySource = modules[entryFilename];
         delete modules[entryFilename];
         shapes[`wasm sourceMap=${sourceMap}`] = errorShape(
@@ -620,4 +620,215 @@ describe('error shape', () => {
       }
     }
   });
+
+  test('U-E-CAP: native and WASM report a loop crossing the output cap with the same coded error', async (t) => {
+    // #415, a guard with no RED claim: 100 passes of 1 MiB + 1 bytes cross the 50 MiB
+    // output cap on the 50th. The error is the same whether the cap is checked before
+    // each append or after the loop, so this pins cross-surface parity of the error,
+    // not where the loop stopped (mds-core pins that). Both engines are required in CI.
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-E-CAP')) return;
+    const source = '@for i in items:\n{{x}}\n@end\n';
+    const vars = { x: 'a'.repeat(1024 * 1024), items: Array.from({ length: 100 }, (_, i) => i) };
+
+    const native = errorShape(
+      thrownBy(() => engines.native.compile(source, { vars }), 'U-E-CAP native'),
+    );
+    const wasm = errorShape(thrownBy(() => engines.wasm.compile(source, { vars }), 'U-E-CAP wasm'));
+
+    // Non-vacuity (PF-013): the shared error is the output cap, not some other failure.
+    assert.deepEqual(native, {
+      code: 'mds::resource_limit',
+      message: 'resource limit exceeded: output exceeds maximum size of 52428800 bytes',
+      help: null,
+      span: null,
+    });
+    assert.deepEqual(wasm, native, 'U-E-CAP: native and WASM must throw identical errors');
+  });
+
+  test('U-E-SEV: napi, WASM and Python accept exactly the four severity spellings', async (t) => {
+    // #175, a PF-007 differential: every binding parses a `rules` severity through
+    // mds-core's one `Severity` parser. The four exact spellings configure the rule
+    // identically on all three; every other spelling is `mds::invalid_options` —
+    // including the escaped spelling (backslash, `u`, `0077`, then `arn`), which napi
+    // and WASM decoded into "warn" by parsing the value as a JSON string, while
+    // Python refused it. Every surface is required in CI; locally a missing one skips.
+    const engines = await loadEngines();
+    const python = findPythonForMarkdownScript();
+    if (!requireEngines(t, { ...engines, python }, 'U-E-SEV')) return;
+    const rule = 'unused-variable';
+    const modules = { 'main.mds': '---\nunused_key: value\n---\nHello!\n' };
+    const accepted = ['off', 'info', 'warn', 'error'];
+    const rejected = [escapeText(0x77) + 'arn', 'Warn', ' warn', 'warn ', ''];
+    const lintBoth = (sev) => {
+      const opts = { rules: { [rule]: sev } };
+      return {
+        napi: () => engines.native.lintVirtual(modules, 'main.mds', opts),
+        wasm: () => engines.wasm.lintVirtual(modules, 'main.mds', opts),
+      };
+    };
+    const py = pythonJson(
+      python,
+      [
+        'for sev in case["accepted"]:',
+        '    r = m.lint_virtual(case["modules"], "main.mds", rules={case["rule"]: sev})',
+        '    out.setdefault("accepted", []).append(r.to_dict())',
+        'for sev in case["rejected"]:',
+        '    try:',
+        '        m.lint_virtual(case["modules"], "main.mds", rules={case["rule"]: sev})',
+        '        out.setdefault("rejected", []).append(None)',
+        '    except m.MdsError as e:',
+        '        out.setdefault("rejected", []).append({"code": e.code, "message": e.message})',
+      ],
+      { rule, modules, accepted, rejected },
+      'U-E-SEV',
+    );
+
+    for (const [i, sev] of accepted.entries()) {
+      const { napi, wasm } = lintBoth(sev);
+      const native = JSON.parse(JSON.stringify(napi()));
+      // Non-vacuity (PF-013): the spelling configured the rule — no finding when
+      // `off`, one finding at exactly that severity otherwise.
+      const severities = native.files
+        .flatMap((f) => f.diagnostics)
+        .filter((d) => d.rule === rule)
+        .map((d) => d.severity);
+      assert.deepEqual(severities, sev === 'off' ? [] : [sev], `U-E-SEV "${sev}": napi`);
+      assert.deepEqual(JSON.parse(JSON.stringify(wasm())), native, `U-E-SEV "${sev}": WASM`);
+      assert.deepEqual(py.accepted[i], native, `U-E-SEV "${sev}": Python`);
+    }
+    for (const [i, sev] of rejected.entries()) {
+      const { napi, wasm } = lintBoth(sev);
+      const label = `U-E-SEV ${JSON.stringify(sev)}`;
+      const native = errorShape(thrownBy(napi, `${label} napi`));
+      assert.deepEqual(native, {
+        code: 'mds::invalid_options',
+        message:
+          `options.rules["${rule}"]: unknown severity "${sev}"; ` +
+          'expected "off", "info", "warn", or "error"',
+        help: null,
+        span: null,
+      });
+      assert.deepEqual(errorShape(thrownBy(wasm, `${label} wasm`)), native, `${label}: WASM`);
+      assert.equal(py.rejected[i]?.code, 'mds::invalid_options', `${label}: Python`);
+      // mds-core words it for every binding; Python names its map `rules` (#418).
+      assert.equal(`options.${py.rejected[i].message}`, native.message, `${label}: Python`);
+    }
+  });
+
+  test('U-E-RULES: napi, WASM and Python escape hostile rule names and severities identically', async (t) => {
+    // #418, a PF-007 differential: a `rules` key or severity a binding names in its
+    // options error is escaped with mds-core's WIRE escaper — ESC, LF, DEL, a C1
+    // control and a bidi override each become the six-character escape text, and TAB
+    // stays raw. mds-core words the error for all three, so Python's message is
+    // napi's with its map named `rules`, and WASM's is napi's; the quoted rule-name
+    // and severity segments are anchored to the escaper's output, and a clean name's
+    // whole message is pinned. Every surface is required in CI; locally a missing one
+    // skips.
+    const engines = await loadEngines();
+    const python = findPythonForMarkdownScript();
+    if (!requireEngines(t, { ...engines, python }, 'U-E-RULES')) return;
+    const TAB = 0x09;
+    const cps = [0x1b, 0x0a, 0x7f, 0x9b, 0x202e, TAB];
+    const hostile = 'r' + cps.map((cp) => String.fromCodePoint(cp) + 'x').join('');
+    const shown =
+      'r' + cps.map((cp) => (cp === TAB ? String.fromCodePoint(cp) : escapeText(cp)) + 'x').join('');
+    const rule = 'unused-variable';
+    const modules = { 'main.mds': 'Hello!\n' };
+    const expected = 'expected "off", "info", "warn", or "error"';
+    const cases = [
+      { name: 'hostile name, non-string value', rule: hostile, value: 1, ruleShown: shown },
+      { name: 'hostile name, unknown severity', rule: hostile, value: 'bogus', ruleShown: shown, sevShown: 'bogus' },
+      { name: 'hostile severity', rule, value: hostile, ruleShown: rule, sevShown: shown },
+      // Clean controls: the whole message, in the one wording all three bindings share.
+      {
+        name: 'clean name, non-string value',
+        rule,
+        value: 1,
+        ruleShown: rule,
+        napi: `options.rules["${rule}"] must be a severity string, got number`,
+        python: `rules["${rule}"] must be a severity string, got number`,
+      },
+      {
+        name: 'clean name, unknown severity',
+        rule,
+        value: 'bogus',
+        ruleShown: rule,
+        sevShown: 'bogus',
+        napi: `options.rules["${rule}"]: unknown severity "bogus"; ${expected}`,
+        python: `rules["${rule}"]: unknown severity "bogus"; ${expected}`,
+      },
+    ];
+    const py = pythonJson(
+      python,
+      [
+        'out["errors"] = []',
+        'for c in case["cases"]:',
+        '    try:',
+        '        m.lint_virtual(case["modules"], "main.mds", rules={c["rule"]: c["value"]})',
+        '        out["errors"].append(None)',
+        '    except m.MdsError as e:',
+        '        out["errors"].append({"code": e.code, "message": e.message})',
+      ],
+      { modules, cases: cases.map(({ rule: r, value }) => ({ rule: r, value })) },
+      'U-E-RULES',
+    );
+
+    for (const [i, c] of cases.entries()) {
+      const label = `U-E-RULES ${c.name}`;
+      const opts = { rules: { [c.rule]: c.value } };
+      const napi = errorShape(
+        thrownBy(() => engines.native.lintVirtual(modules, 'main.mds', opts), `${label} napi`),
+      );
+      const wasm = errorShape(
+        thrownBy(() => engines.wasm.lintVirtual(modules, 'main.mds', opts), `${label} wasm`),
+      );
+      assert.equal(napi.code, 'mds::invalid_options', `${label}: ${napi.message}`);
+      assert.deepEqual(wasm, napi, `${label}: WASM must match napi`);
+      assert.equal(py.errors[i]?.code, 'mds::invalid_options', `${label}: Python`);
+      assert.equal(`options.${py.errors[i].message}`, napi.message, `${label}: Python must match napi`);
+      // The shared value, anchored (PF-013): every surface names the rule and the
+      // severity exactly as the escaper shows them.
+      for (const [surface, message] of [['napi', napi.message], ['Python', py.errors[i].message]]) {
+        const at = `${label}: ${surface} ${JSON.stringify(message)}`;
+        assert.equal(ruleSegment(message), c.ruleShown, `${at} rule`);
+        assert.equal(severitySegment(message), c.sevShown, `${at} severity`);
+      }
+      if (c.napi !== undefined) {
+        assert.equal(napi.message, c.napi, `${label}: napi message`);
+        assert.equal(py.errors[i].message, c.python, `${label}: Python message`);
+      }
+    }
+  });
 });
+
+/** The rule name a binding's `rules` error quotes (`…rules["<name>"]…`), if any. */
+function ruleSegment(message) {
+  return /rules\["([\s\S]*?)"\]/.exec(message)?.[1];
+}
+
+/** The severity a binding's `rules` error quotes (`unknown severity "<value>";`), if any. */
+function severitySegment(message) {
+  return /unknown severity "([\s\S]*?)";/.exec(message)?.[1];
+}
+
+/**
+ * Run a Python snippet against `markdown_script` (imported as `m`) with `input`
+ * decoded from stdin as `case`; the snippet fills the dict `out`, which is returned
+ * parsed. The exchange is JSON both ways — UTF-8 in, ASCII out (`json.dumps`
+ * escapes every non-ASCII character) — so no platform newline or encoding
+ * translation can touch the values under test (PF-020).
+ */
+function pythonJson(python, body, input, label) {
+  const script = [
+    'import json, sys',
+    'import markdown_script as m',
+    'case = json.loads(sys.stdin.buffer.read().decode("utf-8"))',
+    'out = {}',
+    ...body,
+    'print(json.dumps(out))',
+  ].join('\n');
+  const py = spawnSync(python, ['-c', script], { input: JSON.stringify(input), encoding: 'utf-8' });
+  assert.equal(py.status, 0, `${label}: Python failed: ${py.stderr}`);
+  return JSON.parse(py.stdout);
+}

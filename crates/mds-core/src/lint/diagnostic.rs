@@ -74,6 +74,8 @@
 //! | `LintResult::to_canonical_json()` (this module) | WIRE | `message`, `help`, `files[].file` key, `fix_edits[].new_text` |
 //! | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings; *distinct method from `LintResult::to_canonical_json`, not a duplicate* |
 //! | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | `message`, `help`, `file` — construction-time, so typed getters read pre-sanitized data (PF-004) |
+//! | Binding `mds::invalid_options` messages (napi, WASM, Python) | WIRE | construction-time: the `rules` key and severity value a message names, and the text of a conversion error it wraps (#418) |
+//! | `format_unknown_keys_error()` (options.rs) | WIRE | construction-time: every unknown option key, in the single and plural forms — napi, WASM and `reject_unknown_json_keys`; `@mdscript/mds`'s `assertKnownKeys` mirrors it (#418) |
 //! | `--diff` preview output (mds-cli/src/output.rs) | neutralized, TTY-gated | source excerpts neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable. **`--check` alone emits no preview text** — only status lines, which are unconditionally sanitized via `safe_path`. |
 //!
 //! **Scope of the table.** It covers every path that carries *untrusted text* —
@@ -196,10 +198,11 @@ use crate::limits::MAX_DIAGNOSTICS;
 /// `Warn` renders as a warning; produces exit code 1 (warning-only run).
 /// `Error` renders as an error; produces exit code 2.
 ///
-/// Serialization: `"off"` / `"info"` / `"warn"` / `"error"` (closed enum — unknown
-/// severity VALUE strings fail loudly via serde deserialization error. Unknown rule
-/// NAMES emit a warning and lint continues; see `find_unknown_rule_names`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Serialization: `"off"` / `"info"` / `"warn"` / `"error"`. A closed enum: it
+/// deserializes through [`FromStr`](std::str::FromStr), the one severity parser, so
+/// any other value fails loudly with [`ParseSeverityError`]'s message (#175).
+/// Unknown rule NAMES emit a warning and lint continues; see `find_unknown_rule_names`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Rule is silenced — no diagnostic, no exit-code contribution.
@@ -212,14 +215,110 @@ pub enum Severity {
     Error,
 }
 
+impl Severity {
+    /// Every severity, in the order [`ParseSeverityError`] lists their spellings. A new
+    /// variant goes here too: `FromStr` accepts exactly the spellings of these.
+    pub(crate) const ALL: [Severity; 4] = [
+        Severity::Off,
+        Severity::Info,
+        Severity::Warn,
+        Severity::Error,
+    ];
+
+    /// The severity's one spelling: what `Display` prints, serde writes and `FromStr`
+    /// reads.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Severity::Off => "off",
+            Severity::Info => "info",
+            Severity::Warn => "warn",
+            Severity::Error => "error",
+        }
+    }
+}
+
 impl fmt::Display for Severity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Severity::Off => f.write_str("off"),
-            Severity::Info => f.write_str("info"),
-            Severity::Warn => f.write_str("warn"),
-            Severity::Error => f.write_str("error"),
+        f.write_str(self.as_str())
+    }
+}
+
+/// Deserializes a string through [`FromStr`](std::str::FromStr), so `mds.json` and
+/// the bindings accept exactly the same four spellings, and a value that is not a
+/// string is refused (#175).
+impl<'de> serde::Deserialize<'de> for Severity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spelling = <String as serde::Deserialize>::deserialize(deserializer)?;
+        spelling.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parses exactly the four spellings [`Display`](fmt::Display) prints — `"off"`,
+/// `"info"`, `"warn"`, `"error"` — and nothing else (#175).
+///
+/// The match is on the string as given: no case folding, no trimming, and no escape
+/// decoding. This is the one severity parser — the napi, WASM and Python bindings use
+/// it for a `rules` value, and `Severity`'s serde form (`mds.json`) goes through it —
+/// so a spelling one of them accepts, all of them accept.
+///
+/// # Examples
+///
+/// ```
+/// use mds::Severity;
+///
+/// assert_eq!("warn".parse::<Severity>(), Ok(Severity::Warn));
+/// assert!("Warn".parse::<Severity>().is_err());
+/// assert!(" warn".parse::<Severity>().is_err());
+/// ```
+impl std::str::FromStr for Severity {
+    type Err = ParseSeverityError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Severity::ALL
+            .into_iter()
+            .find(|severity| severity.as_str() == s)
+            .ok_or(ParseSeverityError)
+    }
+}
+
+/// The error [`Severity`]'s `FromStr` returns for any string other than its four
+/// spellings.
+///
+/// It carries no copy of the rejected input, so its message is safe to print as is;
+/// a binding that names the input in its own error escapes it there. Obtain one from
+/// `str::parse`; it cannot be constructed outside mds-core.
+///
+/// Its message lists every spelling `FromStr` accepts:
+/// `unknown severity; expected "off", "info", "warn", or "error"`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseSeverityError;
+
+impl fmt::Display for ParseSeverityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown severity; expected {SeveritySpellings}")
+    }
+}
+
+impl std::error::Error for ParseSeverityError {}
+
+/// Every spelling [`Severity`]'s `FromStr` accepts, as a severity error lists them:
+/// `"off", "info", "warn", or "error"`. [`ParseSeverityError`] and a binding's `rules`
+/// error ([`crate::parse_rule_severities`]) both list them with it.
+pub(crate) struct SeveritySpellings;
+
+impl fmt::Display for SeveritySpellings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let last = Severity::ALL.len() - 1;
+        for (i, severity) in Severity::ALL.into_iter().enumerate() {
+            let separator = match i {
+                0 => "",
+                _ if i == last => ", or ",
+                _ => ", ",
+            };
+            write!(f, "{separator}\"{severity}\"")?;
         }
+        Ok(())
     }
 }
 
@@ -2267,6 +2366,111 @@ mod tests {
             fix_edits: None,
         };
         assert_eq!(err.severity(), Some(miette::Severity::Error));
+    }
+
+    // ── #175: Severity::from_str ─────────────────────────────────────────────
+
+    #[test]
+    fn severity_parses_exactly_its_four_spellings() {
+        assert_eq!(Severity::ALL.len(), 4);
+        for sev in Severity::ALL {
+            // The accepted spelling is the one Display prints and serde writes — and the
+            // one the mds.json path (serde, from a decoded JSON string) reads back.
+            let spelling = sev.to_string();
+            assert_eq!(spelling.parse::<Severity>(), Ok(sev), "{spelling:?}");
+            let json = serde_json::Value::String(spelling);
+            assert_eq!(serde_json::to_value(sev).unwrap(), json);
+            assert_eq!(serde_json::from_value::<Severity>(json).unwrap(), sev);
+        }
+    }
+
+    /// The error lists every spelling `FromStr` accepts, in one wording (#175).
+    #[test]
+    fn parse_severity_error_lists_every_spelling() {
+        let message = ParseSeverityError.to_string();
+        assert_eq!(
+            message,
+            "unknown severity; expected \"off\", \"info\", \"warn\", or \"error\""
+        );
+        for sev in Severity::ALL {
+            assert!(message.contains(&format!("\"{sev}\"")), "{sev}: {message}");
+        }
+    }
+
+    /// `Severity`'s serde form is `FromStr`'s: an unknown spelling fails with
+    /// `ParseSeverityError`'s text, as `mds.json` shows it, and a value that is not a
+    /// string is refused — serde's derive also took `{"warn": null}` (#175).
+    #[test]
+    fn severity_deserializes_only_a_string_through_from_str() {
+        use std::collections::HashMap;
+        let config = serde_json::from_str::<HashMap<String, Severity>>(r#"{"x":"Warn"}"#);
+        assert_eq!(
+            config.map_err(|e| e.to_string()),
+            Err(format!("{ParseSeverityError} at line 1 column 12"))
+        );
+        // Control: the same document with a known spelling.
+        let config = serde_json::from_str::<HashMap<String, Severity>>(r#"{"x":"warn"}"#);
+        assert_eq!(
+            config.ok(),
+            Some(HashMap::from([("x".into(), Severity::Warn)]))
+        );
+
+        for value in [
+            serde_json::json!({ "warn": null }),
+            serde_json::json!(["warn"]),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(2),
+        ] {
+            assert!(
+                serde_json::from_value::<Severity>(value.clone()).is_err(),
+                "{value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn severity_rejects_every_other_spelling() {
+        // The escaped spelling: backslash, `u`, `0077`, then `arn`. Built at runtime —
+        // the edit tooling decodes a typed backslash-u sequence into a live byte (PF-018).
+        let escaped_warn = format!("{}u0077arn", '\\');
+        // Positive control (PF-013): a JSON decoder turns it into "warn" — which is how
+        // napi and WASM, parsing the value as a quoted JSON string, used to accept it.
+        assert_eq!(
+            serde_json::from_str::<Severity>(&format!("\"{escaped_warn}\"")).unwrap(),
+            Severity::Warn
+        );
+        let rejected = [
+            String::new(),
+            "Warn".to_string(),
+            "WARN".to_string(),
+            "Off".to_string(),
+            " warn".to_string(),
+            "warn ".to_string(),
+            "warn\n".to_string(),
+            "\twarn".to_string(),
+            "warn\0".to_string(),
+            "\"warn\"".to_string(),
+            "warning".to_string(),
+            "err".to_string(),
+            "verbose".to_string(),
+            escaped_warn,
+        ];
+        for s in &rejected {
+            assert_eq!(
+                s.parse::<Severity>(),
+                Err(ParseSeverityError),
+                "{s:?} must be rejected"
+            );
+            // The mds.json path (serde, from a decoded JSON string) refuses the same set,
+            // with the same message.
+            assert_eq!(
+                serde_json::from_value::<Severity>(serde_json::Value::String(s.clone()))
+                    .map_err(|e| e.to_string()),
+                Err(ParseSeverityError.to_string()),
+                "serde must agree with from_str on {s:?}"
+            );
+        }
     }
 
     // ── sanitized_for_render ──────────────────────────────────────────────────

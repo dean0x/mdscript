@@ -230,6 +230,40 @@ describe('compileFile', () => {
       process.chdir(originalCwd);
     }
   });
+
+  test('F-CF8: a non-MDS entry is named as typed, never by its resolved absolute path (#417)', () => {
+    // Every form differs from the canonical path: `sub/..` is built by hand, since
+    // path.join would normalize it away, and the temporary directory itself is not
+    // canonical on macOS (`/var/…` for `/private/var/…`).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-napi-notmds-'));
+    const originalCwd = process.cwd();
+    try {
+      fs.mkdirSync(path.join(dir, 'sub'));
+      fs.writeFileSync(path.join(dir, 'doc.txt'), 'Hello!\n');
+      fs.writeFileSync(path.join(dir, 'page.md'), '---\ntype: mds\n---\nHello!\n');
+      const dotted = (name) => [dir, 'sub', '..', name].join(path.sep);
+      const canonical = fs.realpathSync(path.join(dir, 'doc.txt'));
+      process.chdir(dir);
+      for (const typed of ['doc.txt', './sub/../doc.txt', dotted('doc.txt')]) {
+        assert.throws(
+          () => compileFile(typed),
+          (err) => {
+            assert.equal(err.code, 'mds::not_mds', `${typed}: ${err.message}`);
+            assert.equal(err.message, `not an MDS file: ${typed}`, typed);
+            assert.equal(err.help, "use .mds extension or add 'type: mds' to frontmatter", typed);
+            assert.ok(!err.message.includes(canonical), `${typed}: resolved path shown: ${err.message}`);
+            return true;
+          },
+        );
+        // Control: the same form naming a `type: mds` file compiles.
+        const control = typed.replace('doc.txt', 'page.md');
+        assert.equal(compileFile(control).output, 'Hello!\n', control);
+      }
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── Check tests ───────────────────────────────────────────────────────────────
@@ -1911,6 +1945,35 @@ describe('unknown rule name warning (AC-224 D8)', () => {
       'L-N-WARN-ESC: sanitized \\u001B literal must appear in lint_warnings[0]; got: ' +
         JSON.stringify(w0),
     );
+  });
+
+  // L-N-RULES-ESC (#418): a rule name or severity the `rules` error names is
+  // WIRE-escaped — ESC and LF as the six-character escape text, TAB raw — in the
+  // wording mds-core gives every binding; a clean name's message is the control.
+  // Hostile characters are built at runtime.
+  test('L-N-RULES-ESC: a hostile rule name and severity are escaped in the rules error', () => {
+    const ch = (cp) => String.fromCodePoint(cp);
+    const hostile = `a${ch(0x1b)}b${ch(0x0a)}c${ch(0x09)}d`;
+    const shown = `a${escapeText(0x1b)}b${escapeText(0x0a)}c${ch(0x09)}d`;
+    const valid = 'expected "off", "info", "warn", or "error"';
+    const cases = [
+      [{ [hostile]: 1 }, `options.rules["${shown}"] must be a severity string, got number`],
+      [
+        { 'unused-variable': hostile },
+        `options.rules["unused-variable"]: unknown severity "${shown}"; ${valid}`,
+      ],
+      [{ 'unused-variable': 1 }, 'options.rules["unused-variable"] must be a severity string, got number'],
+    ];
+    for (const [rules, expected] of cases) {
+      assert.throws(
+        () => lint('Hello!\n', { rules }),
+        (err) => {
+          assert.equal(err.code, 'mds::invalid_options', err.message);
+          assert.equal(err.message, expected);
+          return true;
+        },
+      );
+    }
   });
 });
 

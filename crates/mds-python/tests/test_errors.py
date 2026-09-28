@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
+from collections.abc import Callable
 
 import pytest
 
@@ -68,6 +70,32 @@ def test_e3_file_not_found() -> None:
     with pytest.raises(m.MdsError) as ei:
         m.compile_file("/no/such/mds/file.mds")
     assert ei.value.code == "mds::file_not_found"
+
+
+@pytest.mark.parametrize("form", ["name", "dotted", "absolute-dotted"])
+def test_e3_not_mds_names_typed_path(
+    form: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-MDS entry is named as typed, never by its resolved absolute path (#417)."""
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "doc.txt").write_text("Hello!\n")
+    (tmp_path / "page.md").write_text("---\ntype: mds\n---\nHello!\n")
+    monkeypatch.chdir(tmp_path)
+    # A str, not a pathlib.Path, which would drop the leading "./".
+    typed = {
+        "name": "{}",
+        "dotted": f".{os.sep}sub{os.sep}..{os.sep}{{}}",
+        "absolute-dotted": f"{tmp_path}{os.sep}sub{os.sep}..{os.sep}{{}}",
+    }[form]
+    entry = typed.format("doc.txt")
+    with pytest.raises(m.MdsError) as ei:
+        m.compile_file(entry)
+    assert ei.value.code == "mds::not_mds"
+    assert ei.value.message == f"not an MDS file: {entry}"
+    assert ei.value.help == "use .mds extension or add 'type: mds' to frontmatter"
+    assert str((tmp_path / "doc.txt").resolve()) not in ei.value.message
+    # Control: the same form naming a `type: mds` file compiles.
+    assert m.compile_file(typed.format("page.md")).output == "Hello!\n"
 
 
 def test_e3_circular_import_virtual() -> None:
@@ -584,3 +612,46 @@ def test_d3_extends_type_mismatch_spans_its_own_file(
     assert err.code == "mds::type_mismatch", f"expected type_mismatch, got: {err.code}"
     assert err.span is not None, "an inherited type_mismatch must carry a span"
     assert (err.span.offset, err.span.length, err.span.line, err.span.column) == expected
+
+
+# ── #418: conversion error text in an mds::invalid_options message ──────────────
+
+_UNCONVERTIBLE_NAME = "a" + chr(0x1B) + "b" + chr(0x0A) + "c" + chr(0x09) + "d"
+
+
+def _unconvertible() -> object:
+    """An instance of a class whose name carries ESC, LF and TAB (built with ``chr()``,
+    PF-018): no conversion accepts it, and each conversion error names its class."""
+    return type(_UNCONVERTIBLE_NAME, (), {})()
+
+
+@pytest.mark.parametrize(
+    "call,prefix",
+    [
+        (lambda v: m.compile("Hi\n", vars={"a": v}), "invalid vars: "),
+        (lambda v: m.compile_virtual({"main.mds": v}, "main.mds"), "invalid modules: "),
+        (lambda v: m.CompileResult(v), "invalid CompileResult state: "),
+        (lambda v: m.LintResult(v), "invalid LintResult state: "),
+        (lambda v: m.LintFileReport("main.mds", v), "diagnostics must be iterable: "),
+        (
+            lambda v: m.LintFileReport("main.mds", [v]),
+            "diagnostics must be a list of LintDiagnostic: ",
+        ),
+    ],
+    ids=["vars", "modules", "CompileResult", "LintResult", "iterable", "LintDiagnostic"],
+)
+def test_e14_conversion_error_text_is_wire_escaped(
+    call: Callable[[object], object], prefix: str
+) -> None:
+    """#418: every mds::invalid_options message that wraps a conversion error names the
+    unconvertible value's class escaped — ESC and LF as the six-character escape text,
+    TAB raw — as the ``rules`` wrapper does (test_lint.py). The shown form must be
+    present (the positive control, PF-013) and no raw ESC or LF may remain."""
+    shown = "a" + "\\u" + format(0x1B, "04X") + "b" + "\\u" + format(0x0A, "04X") + "c\td"
+    with pytest.raises(m.MdsError) as ei:
+        call(_unconvertible())
+    message = ei.value.message
+    assert ei.value.code == "mds::invalid_options", message
+    assert message.startswith(prefix), message
+    assert shown in message, f"shown form missing: {message!r}"
+    assert chr(0x1B) not in message and chr(0x0A) not in message, repr(message)

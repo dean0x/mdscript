@@ -69,17 +69,9 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
     }
 
     if input.is_dir() {
-        // Reject a symlinked directory root, matching build/check parity (commit aa0c538).
-        if input
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(miette::miette!(
-                "directory argument must not be a symlink: {}",
-                input.display()
-            ));
-        }
+        // #413: the one directory-argument check every directory-mode subcommand makes
+        // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
+        crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
         return run_fmt_directory(&input, flags);
     }
 

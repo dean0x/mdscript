@@ -3695,8 +3695,8 @@ fn r3_cross_file_error_keeps_own_files_display() {
 
 #[test]
 fn r3_sources_stay_map_relative_with_source_map_base() {
-    // ADR-005 byte-identity: sources[] emission reads MapBuilder.sources
-    // (canonical keys relativized at finalize), never display_names. With
+    // ADR-005 byte-identity: sources[] emission reads each registered Origin's
+    // canonical key (relativized after finalize), never its display. With
     // source_map_base set, the entries are exactly the pre-R3 map-relative
     // values. The CLI-level goldens (cli_source_map.rs SM-GOLD / SM-DET) pin
     // the end-to-end surface; this is the core-level pin with an explicit base.
@@ -3738,10 +3738,10 @@ fn r3_sources_stay_map_relative_with_source_map_base() {
 
 #[test]
 fn r3_map_mode_eval_diagnostic_display_is_root_relative() {
-    // Map-mode diagnostics derive their file label from MapBuilder.display_names
-    // (evaluate_with_map_seeded), not from the canonical sources keys. A
+    // Map-mode diagnostics derive their file label from the current source's
+    // Origin.display (evaluate_with_map_seeded), not from its canonical key. A
     // cross-type comparison errors at eval time — exactly the path that reads
-    // display_names — and must show the root-relative display.
+    // that display — and must show the root-relative display.
     let (_guard, root) = r3_project();
     let entry = root.join("sub").join("cond.mds");
     std::fs::write(&entry, "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n").unwrap();
@@ -3815,6 +3815,227 @@ fn r3_extends_errors_name_the_base_root_relative() {
             );
         }
     }
+}
+
+// ── #416: the source-map builder shares module sources ──────────────────────
+
+fn arc_origin(file: &str, display: &str, source: &str) -> Origin {
+    Origin {
+        file: Arc::from(file),
+        display: Arc::from(display),
+        source: Arc::from(source),
+    }
+}
+
+fn parse_nodes(source: &str) -> Vec<Node> {
+    let tokens = tokenize(source, "t.mds").expect("fixture must tokenize");
+    parse_with_ctx(&tokens, "t.mds", source)
+        .expect("fixture must parse")
+        .body
+}
+
+/// #416: after region-by-region evaluation every builder entry is the region
+/// origin that registered it, pointer-identical to that module's source — including
+/// when a later region carries another `Origin` value of an already-registered module
+/// (a clone, or a separate allocation of the same key).
+#[test]
+fn map_builder_shares_origin_arc_across_regions() {
+    let base = arc_origin("/p/base.mds", "base.mds", "one {{v}}\ntwo\n");
+    let child = arc_origin("/p/child.mds", "child.mds", "child {{v}}\n");
+    let base_clone = base.clone();
+    let base_copy = arc_origin("/p/base.mds", "base.mds", "one {{v}}\ntwo\n");
+    let base_nodes = parse_nodes(&base.source);
+    let child_nodes = parse_nodes(&child.source);
+    let regions: Vec<(&[Node], &Origin)> = vec![
+        (&base_nodes[..1], &base),
+        (&base_nodes[1..], &base),
+        (&child_nodes, &child),
+        (&base_nodes, &base_clone),
+        (&base_nodes, &base_copy),
+    ];
+    let mut scope = Scope::new();
+    scope.set_var("v", Value::String("V".to_string()));
+
+    let (output, map) = ModuleCache::evaluate_regions_with_map(
+        &regions,
+        &mut scope,
+        &mut vec![],
+        Some(crate::sourcemap::MapBuilder::new(base.clone())),
+    )
+    .expect("regions must evaluate");
+    let map = map.expect("the builder must be handed back");
+
+    assert_eq!(output, "one V\ntwo\nchild V\none V\ntwo\none V\ntwo\n");
+    assert_eq!(map.sources().len(), 2, "one entry per module key");
+    for (idx, expected) in [(0, &base), (1, &child)] {
+        let entry = map.sources().get(idx).expect("registered");
+        assert!(
+            Arc::ptr_eq(&entry.source, &expected.source),
+            "entry {idx}: source must be the module's own Arc"
+        );
+    }
+    // Control: the separate allocation is not pointer-equal to the stored entry.
+    assert!(!Arc::ptr_eq(&base_copy.source, &base.source));
+    assert!(
+        map.segments.iter().any(|s| s.src == 1),
+        "non-vacuity: the child region records against its own entry"
+    );
+}
+
+/// #416, the imported extending-module arm (#412): the map of an extending
+/// module reached through `@import` records its chain's own origins, so after an
+/// importer splices it every builder entry is pointer-identical to the source its
+/// module was loaded with — the root base, the intermediate and the leaf.
+#[test]
+fn map_builder_shares_origin_arc_across_an_imported_extending_splice() {
+    let mut cache = virtual_cache(&[
+        (
+            "a.mds",
+            "A-HEAD\n@block b1:\nA-ONE\n@end\n@block b2:\nA-TWO\n@end\n",
+        ),
+        ("b.mds", "@extends \"./a.mds\"\n@block b1:\nB-ONE\n@end\n"),
+        ("c.mds", "@extends \"./b.mds\"\n@block b2:\nC-TWO\n@end\n"),
+    ]);
+    cache.source_map_mode = true;
+    let leaf = cache
+        .resolve_key("c.mds", &HashMap::new(), &mut vec![])
+        .expect("the chain must resolve");
+    let fragment = leaf
+        .prompt_map
+        .clone()
+        .expect("an extending module with a non-empty prompt must carry a map");
+    let root = &cache
+        .modules
+        .get("a.mds")
+        .expect("root cached")
+        .skeleton_origin;
+    let chain = [
+        &leaf.skeleton_origin,
+        &leaf.effective_blocks["b1"].origin,
+        &leaf.effective_blocks["b2"].origin,
+    ];
+    assert!(
+        Arc::ptr_eq(&chain[0].source, &root.source),
+        "the chain's root origin is the one the cache loaded"
+    );
+
+    let main = arc_origin("main.mds", "main.mds", "@include c\n");
+    let mut importer = crate::sourcemap::MapBuilder::new(main.clone());
+    importer.splice_fragment(&fragment, 0);
+    let expected = [&main, chain[0], chain[1], chain[2]];
+    assert_eq!(
+        importer.sources().len(),
+        expected.len(),
+        "one entry per file"
+    );
+    for (idx, (entry, want)) in importer.sources().iter().zip(expected).enumerate() {
+        assert!(
+            Arc::ptr_eq(&entry.source, &want.source),
+            "entry {idx}: source must be the module's own Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&entry.display, &want.display),
+            "entry {idx}: display must be the module's own Arc"
+        );
+    }
+    let displays: Vec<&str> = importer.sources().iter().map(|o| &*o.display).collect();
+    assert_eq!(displays, ["main.mds", "a.mds", "b.mds", "c.mds"]);
+    // Control: an equal-content source in its own allocation is not pointer-equal.
+    assert!(!Arc::ptr_eq(&Arc::<str>::from(&*root.source), &root.source));
+}
+
+/// #412: an imported module keeps a map only when its `prompt` is exported and
+/// renders text — standalone and extending alike — while its body is evaluated either
+/// way (WARN-B reads a not-exported module's text). Observed on the module itself: an
+/// importer cannot tell, because it drops a not-exported map and splices nothing for an
+/// empty body. Each gate has a control that keeps its map.
+#[test]
+fn prompt_map_is_kept_only_for_an_exported_prompt_that_renders_text() {
+    let mut cache = virtual_cache(&[
+        ("lib.mds", "LIB\n"),
+        ("hidden.mds", "@define f():\nF\n@end\n@export f\nHIDDEN\n"),
+        ("defs.mds", "@define f():\nF\n@end\n"),
+        ("base.mds", "@block body:\nBASE\n@end\n"),
+        (
+            "child.mds",
+            "@extends \"./base.mds\"\n@block body:\nCHILD\n@end\n",
+        ),
+        (
+            "blank.mds",
+            "@extends \"./base.mds\"\n@block body:\n\n@end\n",
+        ),
+    ]);
+    cache.source_map_mode = true;
+    // (module, its prompt body, whether a map is kept)
+    let rows = [
+        ("lib.mds", Some("LIB\n"), true),
+        ("hidden.mds", Some("HIDDEN\n"), false),
+        ("defs.mds", None, false),
+        ("child.mds", Some("CHILD\n"), true),
+        ("blank.mds", None, false),
+    ];
+    for (key, body, mapped) in rows {
+        let module = cache
+            .resolve_key(key, &HashMap::new(), &mut vec![])
+            .unwrap_or_else(|err| panic!("{key} must resolve: {err}"));
+        assert_eq!(module.prompt_body.as_deref(), body, "{key}: evaluated body");
+        assert_eq!(module.prompt_map.is_some(), mapped, "{key}: map kept");
+    }
+}
+
+/// #416: a region whose module was first registered in the builder by an
+/// `@include` splice — a source of the included module's fragment — names that
+/// module's root-relative display path in a runtime diagnostic, never its canonical
+/// key, and the error is identical with and without a builder.
+#[test]
+fn region_first_registered_by_a_splice_names_its_display_path() {
+    let helper = arc_origin(
+        "/abs/proj/g5/b.mds",
+        "g5/b.mds",
+        "@if n == 5:\nfive\n@end\n",
+    );
+    let module = arc_origin("/abs/proj/g5/m.mds", "g5/m.mds", "{{b.helper()}}\n");
+    let root = arc_origin("/abs/proj/g5/a.mds", "g5/a.mds", "@block second:\n@end\n");
+
+    // The included module's own builder registered the helper file through an S8
+    // call, with that module's own Origin value of it.
+    let mut module_builder = crate::sourcemap::MapBuilder::new(module);
+    let helper_as_imported = arc_origin(&helper.file, &helper.display, &helper.source);
+    module_builder.switch_to(&helper_as_imported);
+    module_builder.push_segment(0, 0, 4);
+    let fragment = Arc::new(module_builder.into_fragment());
+
+    let mut importer = crate::sourcemap::MapBuilder::new(root);
+    importer.splice_fragment(&fragment, 0);
+    assert!(
+        importer.sources().iter().any(|o| *o.file == *helper.file),
+        "precondition: the splice registered the helper's key"
+    );
+    // Positive control (PF-013): the key is absolute, so the equality below fails if
+    // the key reaches the diagnostic.
+    assert!(helper.file.starts_with('/') && *helper.file != *helper.display);
+
+    let nodes = parse_nodes(&helper.source);
+    let regions: Vec<(&[Node], &Origin)> = vec![(&nodes, &helper)];
+    let [off, on] = [None, Some(importer)].map(|map| {
+        let mut scope = Scope::new();
+        scope.set_var("n", Value::String("hi".to_string()));
+        match ModuleCache::evaluate_regions_with_map(&regions, &mut scope, &mut vec![], map) {
+            Ok(_) => panic!("a cross-type comparison must fail"),
+            Err(err) => err,
+        }
+    });
+    assert_eq!(on.serialize().code, "mds::type_mismatch", "{on}");
+    assert_eq!(
+        on.source_name(),
+        Some("g5/b.mds"),
+        "the diagnostic must name the root-relative display, never the key"
+    );
+    assert_eq!(
+        off.serialize(),
+        on.serialize(),
+        "the error must not depend on source maps"
+    );
 }
 
 // ── #371: filesystem-root base dir ────────────────────────────────────────
@@ -4084,4 +4305,45 @@ fn source_map_root_safety_net_never_fails_a_compile() {
             );
         }
     }
+}
+
+// ── #417: check_module_type ───────────────────────────────────────────────
+
+/// `check_module_type` judges the extension on the resolved key and names the path
+/// as typed, escaped (#417). The escape is defence in depth — every built-in route
+/// refuses a forbidden character in the typed path first — so only this unit test
+/// can reach it.
+#[test]
+fn check_module_type_judges_the_key_and_names_the_typed_path_escaped() {
+    let check = |key: &str, typed: &str, source: &str| {
+        check_module_type(ModuleRef { key, typed }, source).map_err(|e| e.to_string())
+    };
+    let bs = '\\';
+    let hostile = format!("./a{}b\tc\u{202E}d.txt", '\x1b');
+    assert_eq!(
+        check("/abs/proj/doc.txt", &hostile, "Hi\n"),
+        Err(format!(
+            "not an MDS file: ./a{bs}u001Bb{bs}u0009c{bs}u202Ed.txt"
+        )),
+        "the path as typed, escaped — never the key"
+    );
+    // The extension is the key's, whatever the typed spelling says.
+    assert_eq!(
+        check("/abs/proj/doc.txt", "./doc.mds", ""),
+        Err("not an MDS file: ./doc.mds".to_string())
+    );
+    assert_eq!(check("/abs/proj/doc.mds", "./Doc.MDS", ""), Ok(()));
+    // Controls: an `.md` key passes only with `type: mds` in its frontmatter.
+    assert_eq!(
+        check(
+            "/abs/proj/page.md",
+            "./page.md",
+            "---\ntype: mds\n---\nHi\n"
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check("/abs/proj/page.md", "./page.md", "Hi\n"),
+        Err("not an MDS file: ./page.md".to_string())
+    );
 }

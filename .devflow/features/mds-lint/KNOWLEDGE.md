@@ -1,7 +1,7 @@
 ---
 feature: mds-lint
 name: mds lint — Static Analysis Engine and Tiered --fix
-description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, escape_path_for_message, preview_text_for, print_discipline, reverify_failure_reason, precheck, RegressionGate, Verdict, splice_edit, apply_per_edit, summarize_rejections, fallback_cap_rejected, FALLBACK_MAX_EDITS, check_if_block, check_primary, check_elseifs, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176, ADR-008, ResultSink, from_rules_checked, relative_display, write_bytes, PF-020, #309, emit-ordering."
+description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, escape_path_for_message, preview_text_for, print_discipline, reverify_failure_reason, precheck, RegressionGate, Verdict, splice_edit, apply_per_edit, summarize_rejections, fallback_cap_rejected, FALLBACK_MAX_EDITS, check_if_block, check_primary, check_elseifs, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176, ADR-008, ResultSink, from_rules_checked, relative_display, write_bytes, PF-020, #309, emit-ordering, Severity FromStr, ParseSeverityError, SeveritySpellings, parse_rule_severities, deserialize_lint_rules, sanitizeControlCharsWire, assertKnownKeys, format_unknown_keys_error, TOCTOU, read_module_file, resolve_path_intrinsic_keyed, #175, #418, #428, #414, #417, #413."
 category: domain-knowledge
 directories:
   - crates/mds-core/src/lint
@@ -11,7 +11,7 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-09-26
+updated: 2026-09-28
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
@@ -113,11 +113,74 @@ a rule from a newer release must not break an older binary). The CLI writes the 
 stderr (suppressed by `--quiet`); napi/WASM/Python return it in `lint_warnings`.
 The registry is `mds::KNOWN_LINT_RULES`, derived from each rule module's own `RULE` const;
 detection is `mds::find_unknown_rule_names`. (#224)  
-**Unknown severity VALUES** → hard parse error → exit 2 (closed enum, no sensible fallback).
+**Unknown severity VALUES** → refused by the one severity parser, `Severity`'s `FromStr` (see below); the config load fails loudly (closed enum, no sensible fallback).
 
 `LintConfig` lives in `mds-core` (not mds-cli). The CLI `LintCliConfig` from `build.rs` converts to it via `into_core_config()`.
 
 `LintConfig::from_rules` was **deleted** in PR #308 — it shipped deprecated-since-birth and was never published. All callers use `from_rules_checked`. This also removed the `#[expect(deprecated)]` scaffolding from `crates/mds-core/tests/api_surface.rs`.
+
+### Severity Parsing — One Parser for Every Surface (#175, #418, Wave 1.5)
+
+Before this wave, napi and WASM validated a `rules` severity by wrapping the caller's
+value in quotes and running it through `serde_json::from_str::<Severity>()`, which
+decodes JSON escape sequences first — so a value spelled with an escape (e.g. one
+letter written as backslash-u-0077) configured the rule as though it were the plain
+spelling. Python already rejected it. There is now exactly one parser, used
+everywhere:
+
+```rust
+// lint/diagnostic.rs — the one severity parser. No case folding, no trimming, no
+// escape decoding: match the string as given against the four spellings, or fail.
+impl std::str::FromStr for Severity {
+    type Err = ParseSeverityError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Severity::ALL
+            .into_iter()
+            .find(|severity| severity.as_str() == s)
+            .ok_or(ParseSeverityError)
+    }
+}
+```
+
+- `Severity::ALL` (`pub(crate)`, the four variants in message order) and
+  `SeveritySpellings` (a zero-sized `Display` helper, `pub(crate)`) are the one place
+  that spells the list `"off", "info", "warn", or "error"` — both `ParseSeverityError`
+  and `parse_rule_severities` (below) build their message from `SeveritySpellings`.
+- `Severity`'s `serde::Deserialize` is now hand-written — deserialize a JSON string,
+  then `.parse()` — instead of derived. This closes a serde quirk: a fieldless enum's
+  default externally-tagged derive ALSO accepts the variant-as-key map form
+  (`{"warn": null}`), which `mds.json` used to read as `warn` silently. That form is
+  now refused (`invalid type: map, expected a string`) — **BREAKING** for `mds.json`.
+- `mds::parse_rule_severities(rules: serde_json::Map<String, Value>, field: &str) ->
+  Result<HashMap<String, Severity>, String>` (in `options.rs`; `#[inline]` so each
+  binding compiles it at its own optimization level — inlined into mds-wasm's size-
+  optimized build, it measured ~3.2 KB smaller there than a non-inlined call into
+  mds-core built at opt-level 3) is the ONE reader for a whole `rules` map. napi's
+  `extract_rules_direct`, WASM's `extract_rules` and Python's `extract_rules` all call
+  it, and so does the CLI's `deserialize_lint_rules` for `mds.json`'s `lint.rules`
+  (`crates/mds-cli/src/build.rs`) — a `rules` value is read, and its error worded,
+  exactly once, not four times. `field` is the caller's own label, shown as given:
+  `"options.rules"` (napi, WASM), `"rules"` (Python's keyword argument), `"lint.rules"`
+  (CLI). Both its error messages WIRE-escape the rule name AND the value as the
+  message is built (`sanitize_control_chars_wire`, TAB left raw):
+  - `<field>["<name>"] must be a severity string, got <type>`
+  - `<field>["<name>"]: unknown severity "<value>"; expected "off", "info", "warn", or "error"`
+- **USER DECISION (2026-09-28): this wording is now IDENTICAL on napi, WASM and
+  Python**, superseding an earlier plan to keep each binding's own pre-existing
+  wording (napi/WASM used to end with `valid values are "off", "info", "warn",
+  "error"`; Python used to say `must be a string`). Only `<field>` still differs per
+  binding — each binding's own name for the option.
+- `mds.json`'s `lint.rules` reads through `deserialize_lint_rules`, which builds a
+  `serde_json::Map` and calls `parse_rule_severities(rules, "lint.rules")`, wrapped by
+  serde: `invalid mds.json at <path>: lint.rules["<name>"]: unknown severity "<value>";
+  expected "off", "info", "warn", or "error" at line <l> column <c>` — naming BOTH the
+  rule and the value, where serde's old `unknown variant` message named only the
+  value — or `lint.rules["<name>"] must be a severity string, got <type>`.
+- `ParseSeverityError` itself (what a bare `"x".parse::<Severity>()` returns, not what
+  `parse_rule_severities` returns) carries no copy of the rejected input: its message
+  is always `unknown severity; expected "off", "info", "warn", or "error"`, no value
+  shown. Only `parse_rule_severities`'s message names the value — it builds its own
+  string rather than delegating to `ParseSeverityError`'s `Display`.
 
 ## Technical Implementation Patterns
 
@@ -254,6 +317,8 @@ A config-load failure for a nested `mds.json` is a per-file error: it emits the 
 - Error code: `'mds::invalid_options'` (satisfies `isMdsError`).
 - Message format is byte-matched to the backend's `format_unknown_keys_error`.
 - `CheckOptions { vars? }` is a separate interface from `CompileOptions` (which also carries `sourceMap`, `sourcesContent`).
+- `assertKnownKeys` builds its quoted key text via `sanitizeControlCharsWire` (`packages/mds/src/util/path-chars.ts`) — the TS mirror of Rust's WIRE escaper (the forbidden-path class minus TAB, since a key is not a path): `unknown option key "<key>"` / `unknown option keys: "<key>", …`.
+- The two messages (`assertKnownKeys` and `mds::format_unknown_keys_error`) stay byte-identical for any key that is **valid Unicode**. The one documented exception: a lone UTF-16 surrogate. The TS side shows it as written; napi (`env.from_js_value`) receives it already replaced with U+FFFD before any Rust code runs, so the two sides diverge on that one input class (#418; confirmed by a 2,048-value differential probe over every scalar codepoint value).
 
 ### Python Surface
 
@@ -265,10 +330,12 @@ A config-load failure for a nested `mds.json` is a per-file error: it emits the 
 - `LintFileReport`: `#[pyclass(frozen)]` per-file findings group with `.file` and `.diagnostics`.
 - **`serde_json::Map` is `BTreeMap`** when `preserve_order` is not enabled (it is not enabled in this codebase). Keys serialize alphabetically by construction regardless of insertion order.
 - **Parity fixtures must use `write_bytes`, not `write_text`** (PF-020): `write_text` applies newline translation on Windows, breaking byte-equality comparisons with the canonical JSON emitted by `to_canonical_json()`.
+- `extract_rules` (the `rules` keyword-argument reader) calls `mds::parse_rule_severities(map, "rules")` — the same reader napi and WASM use (#418); it only wraps the resulting message via `options_error`.
+- The typed `LintDiagnostic(rule, severity, …)` constructor and the `LintResult(canonical)` reconstructor do **not** validate `severity` through `Severity::from_str` — it is stored as whatever string the caller (or an unpickle) supplies, including `"off"`, which no diagnostic ever legitimately carries. Deliberate for now (Phase 4 scrutinize judgment call): `severity` here is a stored result label, not a second parser converging on one behavior, and an untrusted pickle is already code execution. #430 tracks the broader question — state validation and `sanitize_lint_value` parity — across all Python result-class constructors (`LintDiagnostic`, `LintFileReport`, `LintResult`, `CompileResult`).
 
 ### WASM Surface
 
-`parse_check_options` in `crates/mds-wasm/src/lib.rs` uses a strict allow-list: `reject_unknown_wasm_keys(&obj, &["filename", "modules", "vars"])?;` — the `check()` export rejects any option key not in `[filename, modules, vars]`.
+`parse_check_options` in `crates/mds-wasm/src/lib.rs` uses a strict allow-list: `reject_unknown_wasm_keys(&obj, &["filename", "modules", "moduleAliases", "vars"])?;` — the `check()` export rejects any option key not in `[filename, modules, moduleAliases, vars]` (`moduleAliases` added by #414's virtual-filesystem aliasing; see `.devflow/features/source-map-security/KNOWLEDGE.md` for that feature). `extract_rules` (the `rules` option reader) calls `mds::parse_rule_severities(rules_map, "options.rules")` — the same reader napi and Python use (#418).
 
 ### Canonical JSON Wire Format
 
@@ -579,6 +646,12 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **`MdsError::Display` is explicitly unsanitized**: `e.to_string()` / `eprintln!("{e}")` may emit raw C0/DEL/C1 bytes. Use `e.display_sanitized()` for terminal output or `e.serialize().message` for JSON/binding output. In the CLI, `eprint_error` handles this; downstreams of the published crate should use `display_sanitized()`.
 
+**`mds::lint()` reads the check gate's resolved key, not the caller's typed path again** (#428): before, the check gate resolved and validated the entry, but the lint re-parse then re-opened the ORIGINAL typed path — a check-then-open window in which a symlink swap between the two could make the read see a different file than the one the gate validated. `ModuleCache::resolve_path_intrinsic_keyed` now returns the entry's resolved key alongside its warnings, and `lint()` opens `Path::new(&key)` through `fs::read_module_file` — every message still names `path_str` (the path as typed), never the canonical key. `load_vars_file_reporting_duplicates` was fixed the same way: it now reads the canonical path `NativeFs::check_symlink` returned instead of discarding it and reopening the typed path a second time.
+
+**`read_module_file`'s `cannot read <display>: <reason>` is now escaped too** (#428): only the size-cap and UTF-8 refusals escaped `display` before; the plain-open failure (missing file, not a regular file) interpolated it raw. All three now go through `crate::lint::escape_path_for_message`.
+
+**The ~30 KB WASM drop at #175's `FromStr` commit is a real removal, not codegen noise**: before, a binding validated a `rules` severity by quoting the value and running `serde_json::from_str::<Severity>()` — the ONLY use of serde_json's JSON-TEXT parser anywhere in the WASM binary (every other JSON value arrives through `serde-wasm-bindgen`). Routing through `FromStr` removed that parser entirely: `wasm-opt --metrics` on the before/after builds showed function count 917 → 881 and IR node count 335,046 → 327,526, confirming the ~30 KB delta rather than treating a single-commit local measurement as noise (PF-021).
+
 **napi build script is `build:native`, NOT `build`**: Running `npm run build -w @mdscript/mds-napi` silently does nothing useful. Use `npm run build:native -w @mdscript/mds-napi`.
 
 **`packages/mds` prefers the dev WASM artifact**: `packages/mds/src/backend/wasm.ts` resolves to `crates/mds-wasm/pkg/` (the `wasm-pack` dev output) rather than `packages/mds-wasm/dist/node/`. Rebuilding only the `packages/mds-wasm` npm package leaves a STALE backend active, and the cross-surface differential test fails with convincing-looking divergence that isn't a real bug. Always rebuild via `wasm-pack build crates/mds-wasm` when working on WASM output.
@@ -598,23 +671,25 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - **#180**: `LintOptions.basePath` vs `CompileOptions` asymmetry.
 - **#202**: Diagnostic ordering — within a file, the order of diagnostics across rules is currently arbitrary.
 - **#203**: `unused-import` span anchor — points to the full `@import` directive, not the specific unused name.
+- **#430**: Python result-class constructors (`LintDiagnostic`, `LintFileReport`, `LintResult`, `CompileResult`) don't validate or sanitize the state a caller (or an untrusted unpickle) hands them — `severity` is stored as any string, never parsed through `Severity::FromStr`. Deferred to v0.6.0.
 
 ## Key Files
 
 - `crates/mds-core/src/lint/mod.rs` — engine entry point; `lint_source()`, `run_rules()`, partial detection
 - `crates/mds-core/src/lint/tier.rs` — fix tier table (leaf module); `is_output_neutral(rule)`; `first_occurrence` helper
-- `crates/mds-core/src/lint/diagnostic.rs` — `LintDiagnostic`, `LintResult`, `to_canonical_json()` (WIRE: message/help/file key); `sanitize_control_chars` (HUMAN, `Cow`, `#[must_use]`, idempotent); `sanitize_control_chars_wire` (WIRE, new public API, shares one impl via `EscapeMode`); `neutralize_source_for_render` (byte-length-preserving: C0/DEL → `?`, C1+U+061C → NBSP, other 14 hazards → U+FFFD); `named_source_for_render` (new public API, the single `NamedSource` builder); `is_two_byte_format_hazard` / `is_three_byte_format_hazard`
+- `crates/mds-core/src/lint/diagnostic.rs` — `LintDiagnostic`, `LintResult`, `to_canonical_json()` (WIRE: message/help/file key); `sanitize_control_chars` (HUMAN, `Cow`, `#[must_use]`, idempotent); `sanitize_control_chars_wire` (WIRE, new public API, shares one impl via `EscapeMode`); `neutralize_source_for_render` (byte-length-preserving: C0/DEL → `?`, C1+U+061C → NBSP, other 14 hazards → U+FFFD); `named_source_for_render` (new public API, the single `NamedSource` builder); `is_two_byte_format_hazard` / `is_three_byte_format_hazard`; `Severity` (`FromStr` — the one severity parser, hand-written `Deserialize` routed through it, `ALL`, `as_str`), `ParseSeverityError`, `SeveritySpellings` (#175)
 - `crates/mds-core/src/error.rs` — `MdsError`: `serialize()` (WIRE message/help); `display_sanitized()` (HUMAN Display for TTY); raw `Display` documented as unsanitized; `at()` (uses `named_source_for_render` — inherited by all `*_at` constructors)
 - `crates/mds-core/src/lib.rs` — `CompileResult::to_canonical_json()` (WIRE warnings, distinct from `LintResult::to_canonical_json`); `emit_warnings()` (HUMAN for prose; identifiers WIRE at construction)
 - `crates/mds-core/src/lint/fix.rs` — `plan_fixes_with_options`, `diag_to_edits`, `ByteEdit`, `apply_plan_unchecked`, `splice_edit`, `dedup_contained_or_identical`, `apply_fixes_incremental` and its private helpers (`precheck`, `RegressionGate`, `Verdict`, `apply_one`, `apply_per_edit`, `summarize_rejections`, `fallback_cap_rejected`), `FALLBACK_MAX_EDITS`, `FixOutcome`; `reverify_failure_reason()` (WIRE; the only reason that embeds an `MdsError`)
 - `crates/mds-core/src/lint/rules/legacy_interpolation.rs` — Tier A token-based rule; atomic single TextEdit per finding; two-pass artifact for backslash-escape fixing
 - `crates/mds-core/src/lint/facts.rs` — `collect_facts()`, `AnalysisContext`, `DefineFact { name, offset, end_offset }`
 - `crates/mds-core/src/lint/config.rs` — `LintConfig` (lives in mds-core; CLI converts to it)
+- `crates/mds-core/src/options.rs` — `parse_rule_severities` (the one `rules`-map reader shared by napi, WASM, Python and the CLI's `mds.json` `lint.rules`), `format_unknown_keys_error`, `reject_unknown_json_keys` (#418)
 - `crates/mds-core/src/ast.rs` — `ElseifBranch { offset }`, `IfBlock { else_offset, end_offset }`, `ForBlock/DefineBlock { end_offset }`
 - `crates/mds-core/src/lint/rules/` — 10 rule modules + `structural_eq.rs`
 - `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`; the rule-name list lives in `mds::KNOWN_LINT_RULES`, not in this crate (#224)
 - `crates/mds-cli/src/output.rs` — `atomic_write_file`; `eprint_error` (single CLI stderr choke-point, wraps in `SanitizedReport`); `SanitizedReport` / `SanitizedNode` / `MAX_AUX_DEPTH`; `render_error_sanitized` (private, plain `format!("{report:?}")` on sanitized wrapper); `eprint_warning` (HUMAN, new); `safe_path` / `safe_file_display` (WIRE + `\t`, via `mds::escape_path_for_message`) / `safe_inline` (WIRE only); `preview_text_for` (TTY-gated source neutralization for `--diff`); `render_unified_diff` / `colorize_unified_diff`
-- `crates/mds-cli/src/build.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field
+- `crates/mds-cli/src/build.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field; `deserialize_lint_rules` (`mds.json` `lint.rules` via `mds::parse_rule_severities`, #175)
 - `crates/mds-cli/src/watch.rs` — all 11 error prints route through `eprint_error`; lifecycle status lines route through `safe_path` / `safe_inline` / `eprint_warning`
 - `crates/mds-cli/tests/print_discipline.rs` — CI-enforced lexical guard; SANITIZERS allowlist; `ALLOWED_UNSANITIZED` allowlist; `every_allowlist_entry_is_live` rot check
 - `crates/mds-cli/tests/security.rs` — T-ESC-MSG-1/2, T-ESC-RULE-1, T-ESC-FNAME-1/2, T-ESC-WALK-1
@@ -622,7 +697,8 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-napi/src/lib.rs` — `lint`, `lintFile`, `lintVirtual`; `extract_rules_direct`; `parse_lint_file_opts`
 - `crates/mds-python/src/lib.rs` — `LintDiagnostic` frozen pyclass; `LintResult::new()` calls `sanitize_lint_value()` (WIRE, construction-time — closes PF-004 parallel-path gap)
 - `packages/mds/src/types.ts` — `LintDiagnostic.fix_edits`; `CheckOptions { vars? }`
-- `packages/mds/src/util/options.ts` — `assertKnownKeys` (strict unknown-option rejection)
+- `packages/mds/src/util/options.ts` — `assertKnownKeys` (strict unknown-option rejection, keys WIRE-escaped via `sanitizeControlCharsWire`)
+- `packages/mds/src/util/path-chars.ts` — `sanitizeControlCharsWire`, `escapePathForMessage`, `isForbiddenPathChar` (the TS mirror of Rust's WIRE escape class, minus TAB)
 - `crates/mds-cli/tests/cli_lint.rs` — L-CLI-RESOURCE (exit-3), L-CLI-DIR2 (file-order determinism); T-5..T-9 ESC-injection anchors
 
 ## Related
@@ -638,9 +714,12 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - **ADR-002** (v0.4.0 whitespace contract, interior-verbatim): The `empty-block` rule's "whitespace-only-Text body" definition is directly downstream of this contract.
 - **ADR-003** (@extends FM emission): The `unused-variable` rule is suppressed on `@extends` children.
 - **PF-012** (span source-identity): For test attribution (B1 tests), `SerializedError` has no `file` field — use `MdsError::TypeMismatch { src, .. }` pattern-match.
+- **PF-021** (WASM size guard is toolchain-dependent): applied when attributing the ~30 KB drop at the `Severity::FromStr` commit to a real removal (function- and IR-node-count deltas measured on both sides) rather than treating a single local measurement as noise.
+- **PF-033** (a fix scoped to the one reported surface stays live on every sibling that serializes the same datum): this feature's own #417/#418 work is the pitfall's own third cited instance — `parse_rule_severities`, `check_module_type`/`ModuleRef`, and the WASM/Python conversion-error wrappers were each sink-censused across every binding, not fixed on the one surface that was reported first.
+- **PF-055** (the representation you validate must be byte-identical to the representation you open): `mds::lint()`'s #428 fix — reading the check gate's resolved key instead of re-opening the caller's typed path — applies this pitfall's general lesson to the lint re-parse.
 - `crates/mds-core/tests/api_surface.rs` — pins the public lint API signatures.
 - `.devflow/features/mds-fmt/KNOWLEDGE.md` — `mds fmt` knowledge base; `atomic_write_file` is shared between both subcommands via `output.rs`.
-- `.devflow/features/source-map-security/KNOWLEDGE.md` — source map path-containment choke-point.
+- `.devflow/features/source-map-security/KNOWLEDGE.md` — source map path-containment choke-point; also covers `moduleAliases`/`VirtualFs::with_aliases` (#414).
 
 ## `apply_fixes` removal (v0.5.0, #304)
 

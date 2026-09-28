@@ -14,6 +14,7 @@ use crate::evaluator::evaluate_messages_seeded;
 use crate::evaluator::evaluate_seeded;
 use crate::evaluator::evaluate_with_map;
 use crate::evaluator::evaluate_with_map_seeded;
+use crate::evaluator::push_capped;
 use crate::evaluator::EvalBudget;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
@@ -22,6 +23,7 @@ use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
 pub(crate) use crate::sourcemap::Origin;
+use crate::sourcemap::SourceIndex;
 use crate::validator;
 use crate::value::Value;
 
@@ -121,10 +123,11 @@ pub struct ResolvedModule {
     pub(crate) prompt_body: Option<String>,
     /// Pre-computed source-map fragment for this module's `prompt` output.
     ///
-    /// Populated by `process_module` when `ModuleCache::source_map_mode` is
+    /// Populated by `process_module` — and, for an extending module, by
+    /// `process_module_extends` (#412) — when `ModuleCache::source_map_mode` is
     /// true and the module exports a non-empty `prompt` (S6).  `None` for
-    /// skeleton entries, `@extends` modules (tracked as #114), and all
-    /// non-source-map compilations (zero-cost AC-PERF-01).
+    /// skeleton entries, for a module whose map passed the segment cap, and for
+    /// all non-source-map compilations (zero-cost AC-PERF-01).
     pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
     pub(crate) raw_frontmatter: Option<String>,
     pub(crate) has_explicit_exports: bool,
@@ -233,9 +236,10 @@ pub struct ModuleCache {
     /// so a separate `resolving_stack` is no longer needed.
     resolving: IndexSet<String>,
     /// Set to `true` by `process_module_intrinsic_opts` when `opts.source_map`
-    /// is enabled.  When true, `process_module` builds a
-    /// [`crate::sourcemap::FragmentMap`] alongside the prompt body for every
-    /// standalone module that exports a non-empty `prompt`.
+    /// is enabled.  When true, `process_module` and `process_module_extends`
+    /// build a [`crate::sourcemap::FragmentMap`] alongside the prompt body for
+    /// every imported module — standalone or extending — that exports a
+    /// non-empty `prompt`.
     ///
     /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
     /// for sub-modules (AC-PERF-01).
@@ -403,7 +407,11 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         let key = self.resolve_entry_key(path)?;
-        self.resolve_by_key(&key, runtime_vars, warnings)
+        let entry = ModuleRef {
+            key: &key,
+            typed: path,
+        };
+        self.resolve_by_key(entry, runtime_vars, warnings)
     }
 
     /// Resolve a module from a filesystem path string, dispatching on output shape.
@@ -419,8 +427,26 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
+        self.resolve_path_intrinsic_keyed(path, runtime_vars, warnings)
+            .map(|(output, _)| output)
+    }
+
+    /// [`Self::resolve_path_intrinsic`], also returning the entry's key — on [`NativeFs`]
+    /// its canonical path — for a caller that reads the entry again itself, so that it
+    /// re-reads the file this resolved and checked, never the path as typed (#428).
+    pub(crate) fn resolve_path_intrinsic_keyed(
+        &mut self,
+        path: &str,
+        runtime_vars: &HashMap<String, Value>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, String), MdsError> {
         let key = self.resolve_entry_key(path)?;
-        self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
+        let entry = ModuleRef {
+            key: &key,
+            typed: path,
+        };
+        let output = self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)?;
+        Ok((output, key))
     }
 
     /// Like [`Self::resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -433,19 +459,25 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         let key = self.resolve_entry_key(path)?;
-        self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
+        let entry = ModuleRef {
+            key: &key,
+            typed: path,
+        };
+        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
     }
 
     /// Resolve a module by its normalized key.
     ///
     /// This is the core resolution loop: cache check → depth check →
     /// cycle detection → read → validate type → process → cache insert.
+    /// `module.typed` only names the module when it is not an MDS file (#417).
     fn resolve_by_key(
         &mut self,
-        key: &str,
+        module: ModuleRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
+        let key = module.key;
         // Step 1: cache hit — return immediately without reading, UNLESS the cached
         // entry is a skeleton (resolved as an @extends base: collect-only, never
         // validated/evaluated standalone, prompt_body = None). A skeleton entry must
@@ -477,7 +509,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
 
         // Step 6: validate file type.
-        validate_file_type(key, &source)?;
+        check_module_type(module, &source)?;
 
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
@@ -526,7 +558,7 @@ impl ModuleCache {
     ///
     /// Validates the import path, resolves it via `FileSystem::normalize_in_dir`
     /// (directory-anchored — no sentinel-path coupling), then delegates to
-    /// [`ModuleCache::resolve_by_key`].
+    /// [`ModuleCache::resolve_by_key`], which names the module by `relative` as written.
     fn resolve_import_from(
         &mut self,
         base_dir: &str,
@@ -536,7 +568,11 @@ impl ModuleCache {
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         validate_import_path(relative)?;
         let key = self.fs.normalize_in_dir(base_dir, relative)?;
-        self.resolve_by_key(&key, runtime_vars, warnings)
+        let module = ModuleRef {
+            key: &key,
+            typed: relative,
+        };
+        self.resolve_by_key(module, runtime_vars, warnings)
     }
 
     /// Resolve an entry module by its key.
@@ -553,8 +589,12 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        let key = self.resolve_entry_key(key)?;
-        self.resolve_by_key(&key, runtime_vars, warnings)
+        let resolved = self.resolve_entry_key(key)?;
+        let entry = ModuleRef {
+            key: &resolved,
+            typed: key,
+        };
+        self.resolve_by_key(entry, runtime_vars, warnings)
     }
 
     /// Resolve a module from an in-memory source string.
@@ -613,7 +653,11 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         let key = self.resolve_entry_key(entry)?;
-        self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
+        let entry = ModuleRef {
+            key: &key,
+            typed: entry,
+        };
+        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
     }
 
     /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -626,7 +670,11 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         let key = self.resolve_entry_key(entry)?;
-        self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
+        let entry = ModuleRef {
+            key: &key,
+            typed: entry,
+        };
+        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
     }
 
     /// Resolve a module by its normalized key, dispatching on output shape.
@@ -638,11 +686,11 @@ impl ModuleCache {
     /// are evaluated only once.
     fn resolve_intrinsic_by_key(
         &mut self,
-        key: &str,
+        entry: ModuleRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        self.resolve_intrinsic_by_key_opts(key, runtime_vars, &Default::default(), warnings)
+        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, &Default::default(), warnings)
             .map(|(output, _)| output)
     }
 
@@ -650,11 +698,12 @@ impl ModuleCache {
     /// `(CompiledOutput, Option<SourceMap>)`.
     fn resolve_intrinsic_by_key_opts(
         &mut self,
-        key: &str,
+        entry: ModuleRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        let key = entry.key;
         // Cycle detection: if this key is already on the resolving stack it forms
         // a circular import that must be rejected.
         if self.resolving.contains(key) {
@@ -666,7 +715,7 @@ impl ModuleCache {
 
         let source = self.fs.read(key)?;
         let is_md = self.fs.is_markdown(key);
-        validate_file_type(key, &source)?;
+        check_module_type(entry, &source)?;
 
         self.resolving.insert(key.to_string());
 
@@ -743,14 +792,14 @@ impl ModuleCache {
     ///
     /// Each region is evaluated against its own [`Origin`] — the file its node
     /// offsets index into — so a span-bearing error names that file (#114). With a
-    /// builder, its `current_src` is switched to the region's source; without one,
+    /// builder, its current source is switched to the region's source; without one,
     /// the region's display path and source are passed directly. Never
     /// `origin.file`: that is the canonical key (absolute for `NativeFs`) and must
     /// not reach a diagnostic (R3 / CWE-209). Scope is shared across all regions
     /// (functions defined in earlier regions are visible to later ones).
     ///
-    /// PF-004: one [`EvalBudget`] covers every region, and the cumulative output
-    /// size is checked after each region, so each cap applies to the whole module
+    /// PF-004: one [`EvalBudget`] covers every region, and each region's output is
+    /// appended through the capped append, so each cap applies to the whole module
     /// evaluation rather than to each region.
     fn evaluate_regions_with_map(
         regions: &[(&[crate::ast::Node], &Origin)],
@@ -765,23 +814,28 @@ impl ModuleCache {
         // across ALL regions.  A fresh budget per region would give K regions an
         // independent 1 M budget each — CPU/DoS amplification ∝ region count.
         let mut budget = EvalBudget::default();
+        // The previous region's origin and source index: consecutive regions from one
+        // file (every between-block skeleton node) reuse the index without a lookup.
+        let mut previous: Option<(&Origin, SourceIndex)> = None;
 
         for (nodes, origin) in regions {
-            // Switch the builder's current_src to the source that owns this region.
+            // Switch the builder's current source to the one that owns this region —
+            // switched for every region, a reused index included, so no region relies
+            // on the one before it having restored it.
             if let Some(ref mut builder) = current_map {
-                let src_idx = builder.source_index(
-                    origin.file.as_ref(),
-                    origin.display.as_ref(),
-                    origin.source.as_ref(),
-                );
-                builder.current_src = src_idx;
+                let src_idx = match previous {
+                    Some((prev, idx)) if Arc::ptr_eq(&prev.file, &origin.file) => idx,
+                    _ => builder.register(origin),
+                };
+                builder.switch_to_index(src_idx);
+                previous = Some((origin, src_idx));
                 // Cursor must equal accumulated output length before entering each region.
                 // evaluate_with_map_seeded maintains this invariant internally, but after
                 // each region we push the raw output and the builder's cursor is correct.
             }
 
             let region_output = if let Some(builder) = current_map.take() {
-                // builder.current_src was set to origin's source index above;
+                // The builder's current source was switched to origin's above;
                 // evaluate_with_map_seeded derives file/source from it (issue #58).
                 let (region_out, returned_builder) =
                     evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut budget)?;
@@ -798,18 +852,31 @@ impl ModuleCache {
                 )?
             };
 
-            // PF-004: cumulative size guard — same limit as the per-node check.
-            let new_len = output.len() + region_output.len();
-            if new_len > crate::limits::MAX_OUTPUT_SIZE {
-                return Err(MdsError::resource_limit(format!(
-                    "output exceeds maximum size of {} bytes",
-                    crate::limits::MAX_OUTPUT_SIZE
-                )));
-            }
-            output.push_str(&region_output);
+            // PF-004: cumulative size guard — the same capped append as every other
+            // output buffer (#415).
+            push_capped(&mut output, &region_output)?;
         }
 
         Ok((output, current_map))
+    }
+
+    /// Evaluate an `@extends` chain's spliced regions: the terminal step the entry's
+    /// extends path (`process_module_intrinsic_opts`) and an imported extending module
+    /// (`process_module_extends`) share.
+    ///
+    /// With a `seed` — the chain's `skeleton_origin`, so a map lists the root base
+    /// first however the chain is reached — every region is recorded into a
+    /// [`crate::sourcemap::MapBuilder`] seeded with it; without one nothing is
+    /// recorded. The body is evaluated either way, all regions under one
+    /// [`EvalBudget`] ([`Self::evaluate_regions_with_map`]).
+    fn evaluate_extends_regions(
+        regions: &[(&[crate::ast::Node], &Origin)],
+        seed: Option<&Origin>,
+        scope: &mut crate::scope::Scope,
+        warnings: &mut Vec<String>,
+    ) -> Result<(String, Option<crate::sourcemap::MapBuilder>), MdsError> {
+        let builder = seed.map(|origin| crate::sourcemap::MapBuilder::new(origin.clone()));
+        Self::evaluate_regions_with_map(regions, scope, warnings, builder)
     }
 
     /// Messages-mode twin of [`Self::evaluate_regions_with_map`]: collect the
@@ -875,7 +942,7 @@ impl ModuleCache {
     /// [`crate::sourcemap::MapBuilder`] through the evaluator:
     ///
     /// - Standalone path: [`evaluate_with_map`] on `module.body`.
-    /// - `@extends` path: [`evaluate_regions_with_map`] over
+    /// - `@extends` path: [`Self::evaluate_extends_regions`] over
     ///   `spliced_regions(skeleton, effective_blocks, skeleton_origin)` so each
     ///   region's segments are attributed to the correct source file.
     ///
@@ -943,21 +1010,12 @@ impl ModuleCache {
                 ));
             }
 
-            // Seed builder with the skeleton's root file (source maps only).
-            let builder = opts.source_map.then(|| {
-                crate::sourcemap::MapBuilder::new(
-                    skeleton_origin.file.to_string(),
-                    skeleton_origin.display.to_string(),
-                    skeleton_origin.source.to_string(),
-                )
-            });
-            let (raw, maybe_builder) =
-                Self::evaluate_regions_with_map(&regions, &mut scope, warnings, builder)?;
+            // Seed the builder with the skeleton's root file (source maps only).
+            let seed = opts.source_map.then_some(&skeleton_origin);
+            let (body_raw, builder) =
+                Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            let (body_raw, map_out) = match maybe_builder {
-                Some(b) => apply_map_degradation(raw, b, opts, warnings),
-                None => (raw, None),
-            };
+            let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
 
             let body_clean = crate::clean_output(&body_raw);
             let body_clean_len = body_clean.len();
@@ -1018,16 +1076,16 @@ impl ModuleCache {
         }
 
         let (body_raw, map_out) = if opts.source_map {
-            // Builder seeds current_src=0 pointing to ctx.key / ctx.file_str / ctx.source;
+            // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
-            let builder = crate::sourcemap::MapBuilder::new(
-                ctx.key.to_string(),
-                ctx.file_str.to_string(),
-                ctx.source.to_string(),
-            );
+            let builder = crate::sourcemap::MapBuilder::new(Origin {
+                file: Arc::from(ctx.key),
+                display: Arc::from(ctx.file_str),
+                source: Arc::from(ctx.source),
+            });
             let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            apply_map_degradation(raw, returned, opts, warnings)
+            (raw, apply_map_degradation(returned, opts, warnings))
         } else {
             (
                 evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?,
@@ -1132,9 +1190,17 @@ impl ModuleCache {
         // Validate semantic correctness before evaluation
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
-        // Determine whether "prompt" is an available export for this module.
-        // Mirrors the `is_exported("prompt")` logic on `ResolvedModule`.
-        let prompt_exported = !has_explicit_exports || explicit_exports.contains("prompt");
+        // Whether "prompt" is an available export of this module (the rule
+        // `ResolvedModule::is_exported` applies).
+        let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
+
+        // Build Origin once for this module — Arc::clone'd into the source-map builder
+        // below and into each EffectiveBlock (P3), so every copy shares one source text.
+        let origin = Origin {
+            file: Arc::from(ctx.key),
+            display: Arc::from(ctx.file_str),
+            source: Arc::from(ctx.source),
+        };
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
@@ -1142,62 +1208,21 @@ impl ModuleCache {
         // single evaluate_with_map pass to collect both the body string and the
         // segment records in one traversal (no double-evaluation).  The resulting
         // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
-        // that imports this module, enabling @include splice attribution (S6).
-        let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
-            let builder = crate::sourcemap::MapBuilder::new(
-                ctx.key.to_string(),
-                ctx.file_str.to_string(),
-                ctx.source.to_string(),
-            );
-            // evaluate_with_map derives file/source from builder.current_src (issue #58).
+        // that imports this module, enabling @include splice attribution (S6). The body
+        // is evaluated either way: WARN-B needs it when `prompt` is not exported.
+        let (body_raw, builder) = if self.source_map_mode && prompt_exported {
+            let builder = crate::sourcemap::MapBuilder::new(origin.clone());
+            // evaluate_with_map derives file/source from the builder's current source
+            // (issue #58).
             let (body_raw, returned) =
                 evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
-            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
-
-            // RUST-3 / PF-004 observability: propagate the segment-cap drop flag from
-            // sub-module evaluation.  Without this check a >1M-segment imported module
-            // silently yields a partial FragmentMap (incorrect splice attributions) with
-            // no AC-PERF-03 warning.  Mirror the top-level degradation logic exactly.
-            let fmap = if returned.segments_dropped {
-                // The module filename is an untrusted identifier — WIRE, per the
-                // spec 7.5 per-field rule: a filename is never legitimately multi-line,
-                // and `emit_warnings` prints this string to stderr in HUMAN mode, where a
-                // raw `\n` would forge a standalone status line (CWE-117).
-                warnings.push(format!(
-                    "source map segment cap ({} segments) exceeded in imported module '{}'; \
-                     no source map will be generated",
-                    crate::limits::MAX_SOURCEMAP_SEGMENTS,
-                    crate::lint::sanitize_control_chars_wire(ctx.file_str),
-                ));
-                None
-            } else {
-                // Only keep the FragmentMap when the body is non-empty — an empty prompt
-                // has no segments worth recording.
-                body.as_ref().map(|_| {
-                    Arc::new(crate::sourcemap::FragmentMap {
-                        sources: returned
-                            .sources
-                            .iter()
-                            .zip(returned.sources_content.iter())
-                            .map(|(p, c)| (Arc::from(p.as_str()), Arc::from(c.as_str())))
-                            .collect(),
-                        segments: returned.segments,
-                    })
-                })
-            };
-            (body, fmap)
+            (body_raw, Some(returned))
         } else {
             let body_raw = evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?;
-            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
-            (body, None)
+            (body_raw, None)
         };
-
-        // Build Origin once for this module — Arc::clone'd into each EffectiveBlock (P3).
-        let origin = Origin {
-            file: Arc::from(ctx.key),
-            display: Arc::from(ctx.file_str),
-            source: Arc::from(ctx.source),
-        };
+        let (prompt_body, prompt_map) =
+            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         // Build effective_blocks first so module.body can be moved into the Arc below.
         let effective_blocks = seed_effective_blocks(&module.body, &block_names, &origin);
@@ -1327,9 +1352,9 @@ impl ModuleCache {
     ///
     /// Callers differ only in the terminal step (step 3e), which walks the skeleton's
     /// `spliced_regions` and evaluates each against its own origin:
-    /// - Cached text path: `validate` → `evaluate_regions_with_map`
+    /// - Cached text path: `validate` → `evaluate_extends_regions` (+ a FragmentMap)
     /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
-    ///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
+    ///   (Messages) or `evaluate_extends_regions` + clean/frontmatter (Markdown)
     ///
     /// Factoring here enforces that BOTH modes go through the same PF-004-safe
     /// `resolve_by_key_skeleton` path for the base, and share one copy of the
@@ -1355,8 +1380,12 @@ impl ModuleCache {
         // PF-004 (avoids PF-004): resolve through resolve_by_key_skeleton so cycle
         // detection, MAX_IMPORT_DEPTH, dependency tracking, and MAX_FILE_SIZE all apply.
         // This guard holds for BOTH text and messages modes — they share this path.
+        let base_ref = ModuleRef {
+            key: &base_key,
+            typed: &ext.path,
+        };
         let base = self
-            .resolve_by_key_skeleton(&base_key, ctx.runtime_vars, warnings)
+            .resolve_by_key_skeleton(base_ref, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // ── Step 3b: child-only-blocks check ─────────────────────────────────
@@ -1444,7 +1473,8 @@ impl ModuleCache {
     /// Evaluate an extending child template in text mode.
     ///
     /// Delegates the shared pipeline (steps 3a-3d) to `resolve_extends_components`,
-    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3e).
+    /// then runs `validate_extends_components` + a region-by-region evaluation (step 3e),
+    /// which in source-map mode also yields the module's FragmentMap (#412).
     ///
     /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
     /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
@@ -1482,19 +1512,23 @@ impl ModuleCache {
         } = components;
 
         // Base-skeleton nodes, base defaults and child overrides index into different
-        // files, so each region is evaluated against its own origin (#114). No
-        // MapBuilder: an extending module carries no FragmentMap (below).
+        // files, so each region is evaluated against its own origin (#114). In
+        // source-map mode the regions are recorded into a builder seeded with the
+        // chain's root, as for a direct compile of this file, and kept as the
+        // FragmentMap an importer's `@include` splices (#412) — under the same gate as
+        // a standalone module. The body is evaluated either way.
+        let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
         let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
-        let (prompt_body, _) =
-            Self::evaluate_regions_with_map(&regions, &mut scope, warnings, None)?;
-        let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
+        let seed = (self.source_map_mode && prompt_exported).then_some(&skeleton_origin);
+        let (body_raw, builder) =
+            Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
+        let (prompt_body, prompt_map) =
+            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         Ok(ResolvedModule {
             functions,
             prompt_body,
-            // An extending module builds no FragmentMap, so the text an `@include` of
-            // it contributes to a source-mapped importer carries no segments.
-            prompt_map: None,
+            prompt_map,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.
             raw_frontmatter: merged_frontmatter,
@@ -1518,10 +1552,11 @@ impl ModuleCache {
     /// same normalized key. The first resolution wins. See ResolvedModule doc comment for details.
     fn resolve_by_key_skeleton(
         &mut self,
-        key: &str,
+        module: ModuleRef<'_>,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
+        let key = module.key;
         // Cache hit — return immediately (full or skeleton entry, both are valid bases).
         if let Some(cached) = self.modules.get(key) {
             return Ok(Arc::clone(cached));
@@ -1542,7 +1577,7 @@ impl ModuleCache {
         // PF-004: read via FileSystem trait — NEVER std::fs.
         let source = self.fs.read(key)?;
         let is_md = self.fs.is_markdown(key);
-        validate_file_type(key, &source)?;
+        check_module_type(module, &source)?;
 
         self.resolving.insert(key.to_string());
 
@@ -1604,8 +1639,12 @@ impl ModuleCache {
             .fs
             .normalize_in_dir(ctx.base_dir, &ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+        let grandparent_ref = ModuleRef {
+            key: &grandparent_key,
+            typed: &ext.path,
+        };
         let grandparent = self
-            .resolve_by_key_skeleton(&grandparent_key, ctx.runtime_vars, warnings)
+            .resolve_by_key_skeleton(grandparent_ref, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // Child-only-blocks check for this intermediate base (3b).
@@ -2047,7 +2086,7 @@ impl ResolvedModule {
     /// When no explicit `@export` list is present every name is visible.
     /// When an explicit list exists only the listed names are visible.
     fn is_exported(&self, name: &str) -> bool {
-        !self.has_explicit_exports || self.explicit_exports.contains(name)
+        is_visible_export(self.has_explicit_exports, &self.explicit_exports, name)
     }
 
     /// Get a single export by name.
@@ -2129,9 +2168,9 @@ struct CollectedDefs {
 /// Steps 3a-3d (base resolution, child-only-blocks check, effective-blocks construction,
 /// and scope merge) are identical for text and messages modes. This struct carries those
 /// results so the two terminal steps differ only in how the spliced regions are evaluated:
-/// - Cached text path: `validator::validate` → `evaluate_regions_with_map`
+/// - Cached text path: `validator::validate` → `evaluate_extends_regions`
 /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_message_regions`
-///   (Messages) or `evaluate_regions_with_map` + clean/frontmatter (Markdown)
+///   (Messages) or `evaluate_extends_regions` + clean/frontmatter (Markdown)
 struct ExtendsComponents {
     /// Merged scope (base < child < runtime), with FM imports and functions loaded.
     scope: Scope,
@@ -2184,6 +2223,71 @@ struct ModuleCtx<'a> {
     runtime_vars: &'a HashMap<String, Value>,
 }
 
+/// Whether `name` is an available export of a module: every name when the module
+/// declares no `@export` list, only the listed names when it does.
+///
+/// The one export rule — [`ResolvedModule::is_exported`] applies it, and so does the
+/// `prompt` gate of both module paths (`process_module`, `process_module_extends`).
+fn is_visible_export(
+    has_explicit_exports: bool,
+    explicit_exports: &HashSet<String>,
+    name: &str,
+) -> bool {
+    !has_explicit_exports || explicit_exports.contains(name)
+}
+
+/// The [`crate::sourcemap::FragmentMap`] an imported module's importers splice, from
+/// the builder that recorded its `prompt` body — or `None`, when there is nothing
+/// correct to splice:
+///
+/// - The builder dropped a segment at the cap (AC-PERF-03): a partial map would
+///   misattribute, so none is kept and a warning says what that means for the
+///   importer — the text included from the module is left unmapped, while the rest of
+///   the importer's map is still produced.
+/// - The body is empty (`None`): an `@include` of the module adds no text (PF-034; the
+///   evaluator warns at the `@include`).
+///
+/// `display` names the module in the warning.
+fn fragment_map_from(
+    builder: crate::sourcemap::MapBuilder,
+    body: Option<&str>,
+    display: &str,
+    warnings: &mut Vec<String>,
+) -> Option<Arc<crate::sourcemap::FragmentMap>> {
+    if builder.segments_dropped {
+        // The module filename is an untrusted identifier — WIRE, per the spec 7.5
+        // per-field rule: a filename is never legitimately multi-line, and
+        // `emit_warnings` prints this string to stderr in HUMAN mode, where a raw `\n`
+        // would forge a standalone status line (CWE-117).
+        warnings.push(format!(
+            "source map segment cap ({} segments) exceeded in imported module '{}'; \
+             text included from it is left unmapped in the source map",
+            crate::limits::MAX_SOURCEMAP_SEGMENTS,
+            crate::lint::sanitize_control_chars_wire(display),
+        ));
+        return None;
+    }
+    body.map(|_| Arc::new(builder.into_fragment()))
+}
+
+/// The `(prompt_body, prompt_map)` `ResolvedModule` fields, from a module's evaluated
+/// body and — when source maps are on for it — the builder that recorded it.
+///
+/// Shared by both module paths (`process_module`, `process_module_extends`): an empty
+/// body clears to `None` either way, and the map is kept only when [`fragment_map_from`]
+/// finds one worth splicing.
+fn prompt_body_and_map(
+    body_raw: String,
+    builder: Option<crate::sourcemap::MapBuilder>,
+    display: &str,
+    warnings: &mut Vec<String>,
+) -> (Option<String>, Option<Arc<crate::sourcemap::FragmentMap>>) {
+    let prompt_body = (!body_raw.trim().is_empty()).then_some(body_raw);
+    let prompt_map =
+        builder.and_then(|b| fragment_map_from(b, prompt_body.as_deref(), display, warnings));
+    (prompt_body, prompt_map)
+}
+
 /// Apply AC-PERF-03 and AC-SEC-04 degradation checks to a completed builder.
 ///
 /// - AC-PERF-03: if the segment cap was hit, degrade to `None` (a partial map
@@ -2191,21 +2295,18 @@ struct ModuleCtx<'a> {
 /// - AC-SEC-04: if `sourcesContent` total bytes exceed the ceiling, set
 ///   `no_sources_content` so [`MapBuilder::finalize`] omits the array.
 /// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
-///
-/// Returns `(raw_body, Option<MapBuilder>)`.
 fn apply_map_degradation(
-    raw: String,
     mut builder: crate::sourcemap::MapBuilder,
     opts: &crate::sourcemap::CompileOptions,
     warnings: &mut Vec<String>,
-) -> (String, Option<crate::sourcemap::MapBuilder>) {
+) -> Option<crate::sourcemap::MapBuilder> {
     if builder.segments_dropped {
         warnings.push(format!(
             "source map segment cap ({} segments) exceeded; \
              no source map will be generated",
             crate::limits::MAX_SOURCEMAP_SEGMENTS,
         ));
-        return (raw, None);
+        return None;
     }
     let total_src_bytes = builder.sources_content_bytes();
     if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
@@ -2220,7 +2321,7 @@ fn apply_map_degradation(
     if !opts.include_sources_content {
         builder.no_sources_content = true;
     }
-    (raw, Some(builder))
+    Some(builder)
 }
 
 /// Return `true` when the AST body contains at least one `@message` block
@@ -2509,11 +2610,98 @@ fn validate_import_path(path: &str) -> Result<(), MdsError> {
     }
 }
 
-/// Validate that a file is a valid MDS file.
+/// A module named two ways: by the key the backend resolved it to, and by the path
+/// the caller typed to reach it (#417).
 ///
-/// Accepts the already-read source content to avoid double-reading for `.md` files.
-/// Uses the normalized key (string) rather than a Path.
-fn validate_file_type(key: &str, source: &str) -> Result<(), MdsError> {
+/// `key` is the identity every check, cache lookup and read uses — on
+/// [`crate::NativeFs`] the canonical absolute path, in its on-disk spelling.
+/// `typed` is the text that named the module: the entry path passed to the API, or
+/// the `@import`, `@export … from`, frontmatter `imports:` or `@extends` string as
+/// written in the template. `typed` only ever names the module in an error message,
+/// escaped as it enters it; nothing compares it with `key` (canonicalization
+/// re-spells a path, #408).
+///
+/// Built in two steps that each name their value, [`ModuleRef::keyed`] then
+/// [`ModuleKey::typed`], so the two strings are never paired by position: a key
+/// passed where the typed path goes is not a swap the compiler lets through.
+///
+/// # Examples
+///
+/// ```
+/// let module = mds::ModuleRef::keyed("/proj/doc.txt").typed("./doc.txt");
+/// assert_eq!((module.key, module.typed), ("/proj/doc.txt", "./doc.txt"));
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleRef<'a> {
+    /// The key the backend resolved the module to.
+    pub key: &'a str,
+    /// The path the caller typed to reach the module.
+    pub typed: &'a str,
+}
+
+impl<'a> ModuleRef<'a> {
+    /// The first step of a [`ModuleRef`]: the module's resolved key. The path the
+    /// caller typed is the second, [`ModuleKey::typed`].
+    pub fn keyed(key: &'a str) -> ModuleKey<'a> {
+        ModuleKey { key }
+    }
+}
+
+/// A module's resolved key, waiting for the path the caller typed to reach it: the
+/// first step of a [`ModuleRef`], from [`ModuleRef::keyed`].
+#[must_use = "a ModuleKey is only the first step: add the typed path with `typed`"]
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleKey<'a> {
+    key: &'a str,
+}
+
+impl<'a> ModuleKey<'a> {
+    /// The [`ModuleRef`] of this key, reached by the path `typed`.
+    pub fn typed(self, typed: &'a str) -> ModuleRef<'a> {
+        ModuleRef {
+            key: self.key,
+            typed,
+        }
+    }
+}
+
+/// Refuse a module that is not an MDS file, as the resolver refuses every module it
+/// reads: neither a `.mds` file nor a `.md` file whose frontmatter declares `type: mds`
+/// is [`MdsError::NotMdsFile`] (`mds::not_mds`).
+///
+/// The extension is judged on `module.key` — on [`crate::NativeFs`] the on-disk
+/// spelling, so `Doc.MDS` typed for `doc.mds` is an MDS file (#408); `source` is the
+/// module's text. The error names `module.typed`, the path as the caller typed it,
+/// escaped with [`crate::escape_path_for_message`] — never the resolved key, which on
+/// [`crate::NativeFs`] is an absolute path (#417).
+///
+/// This is the resolver's own check, run after a module is read and before it is
+/// parsed. `@mdscript/mds`'s WASM backend, whose JS pre-scanner reads each file itself,
+/// runs it through the `preflightModule` export in the same place, so a file that is
+/// not an MDS file is refused identically on both backends — and its import-like
+/// lines are never followed (#417).
+///
+/// # Errors
+///
+/// [`MdsError::NotMdsFile`] naming `module.typed`.
+///
+/// # Examples
+///
+/// ```
+/// use mds::ModuleRef;
+///
+/// mds::check_module_type(ModuleRef::keyed("/proj/doc.mds").typed("./doc.mds"), "Hello!\n")?;
+/// let page = ModuleRef::keyed("/proj/page.md").typed("page.md");
+/// mds::check_module_type(page, "---\ntype: mds\n---\nHi\n")?;
+///
+/// let doc = ModuleRef::keyed("/proj/doc.txt").typed("./doc.txt");
+/// let err = mds::check_module_type(doc, "Hello!\n").unwrap_err();
+/// assert_eq!(err.to_string(), "not an MDS file: ./doc.txt");
+/// # Ok::<(), mds::MdsError>(())
+/// ```
+pub fn check_module_type(module: ModuleRef<'_>, source: &str) -> Result<(), MdsError> {
+    let key = module.key;
     // Extract extension from the key string (split on '/' and '\\' for portability).
     let filename = key.rsplit(['/', '\\']).next().unwrap_or(key);
     // Guard against dotfiles: a filename that starts with '.' and contains no
@@ -2534,7 +2722,9 @@ fn validate_file_type(key: &str, source: &str) -> Result<(), MdsError> {
         return Ok(());
     }
 
-    Err(MdsError::not_mds_file(key.to_string()))
+    Err(MdsError::not_mds_file(
+        crate::lint::escape_path_for_message(module.typed).into_owned(),
+    ))
 }
 
 /// Return `true` if a frontmatter line declares `type: mds` at the top level.
@@ -2712,7 +2902,7 @@ fn parse_frontmatter_mapping(
 /// degrade gracefully rather than panic (ADR-005 — degrade rather than
 /// mis-attribute; consistent with the `is_char_boundary` guard in
 /// `build_type_mismatch` in evaluator.rs).
-fn line_len_at(source: &str, offset: usize) -> usize {
+pub(crate) fn line_len_at(source: &str, offset: usize) -> usize {
     if source.is_char_boundary(offset) {
         source[offset..]
             .find('\n')
