@@ -1000,22 +1000,24 @@ pub(crate) struct EntryPaths<'a> {
 /// The canonical path of the file `path` names, for comparing two paths as files, or
 /// `None` when not even its directory resolves.
 ///
-/// An existing file is canonicalized, which respells its name the way the volume stores
-/// it — so `PAGE.md` and `page.md` are one file on a case-insensitive volume (#408). A
-/// path that does not exist yet, or whose final component is a symlink, is its
-/// directory joined with its name: the symlink itself is the directory entry a write
-/// would replace, not the file it points to. That directory is resolved as
-/// [`write_output`] will leave it, created if it does not exist yet
-/// ([`resolve_dir_as_created`]).
+/// Its directory is resolved as [`write_output`] will leave it, created if it does not
+/// exist yet ([`resolve_dir_as_created`]), and its name is looked up there. An existing
+/// file is canonicalized, which respells its name the way the volume stores it — so
+/// `PAGE.md` and `page.md` are one file on a case-insensitive volume (#408), in a
+/// directory reached back out of one the write creates (`newdir/../PAGE.md`) as much as
+/// in one that exists. A name that does not exist yet, or is a symlink, is kept as it
+/// stands: the symlink itself is the directory entry a write would replace, not the
+/// file it points to.
 fn file_identity(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?;
-    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let file = resolve_dir_as_created(effective_parent(path))?.join(name);
+    let is_link = std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink());
     if !is_link {
-        if let Ok(canonical) = path.canonicalize() {
+        if let Ok(canonical) = file.canonicalize() {
             return Some(canonical);
         }
     }
-    resolve_dir_as_created(effective_parent(path)).map(|dir| dir.join(name))
+    Some(file)
 }
 
 /// The canonical path `dir` has once [`write_output`]'s `create_dir_all(dir)` has run,
@@ -2159,7 +2161,9 @@ mod tests {
     /// reach once `write_output` has created that directory. A created directory is a
     /// plain one, so a `..` after it leads back to its parent — the entry's directory
     /// here — while an existing component is followed as the write follows it, a
-    /// symlink included. Nothing is created by asking.
+    /// symlink included. The name is then looked up in the directory reached, so on a
+    /// case-insensitive volume a case variant of the entry's name is the entry there
+    /// too, however that directory was reached. Nothing is created by asking.
     #[test]
     fn file_identity_resolves_a_directory_the_write_creates() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2167,6 +2171,14 @@ mod tests {
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("page.md"), "x").unwrap();
         let page = root.join("page.md");
+        let case_insensitive = root.join("PAGE.md").exists();
+        // A case variant is the entry on a case-insensitive volume, another file on a
+        // case-sensitive one: each volume holds the variant to its own answer.
+        let variant = if case_insensitive {
+            page.clone()
+        } else {
+            root.join("PAGE.md")
+        };
 
         let rows = [
             ("page.md", page.clone()),
@@ -2180,6 +2192,9 @@ mod tests {
                 "sub/new/page.md",
                 root.join("sub").join("new").join("page.md"),
             ),
+            ("PAGE.md", variant.clone()),
+            ("newdir/../PAGE.md", variant.clone()),
+            ("a/b/../../PAGE.md", variant),
         ];
         // `dir.path()` is not canonical on macOS (`/var` → `/private/var`), so the
         // existing part of each path is canonicalized, not merely joined.

@@ -2381,6 +2381,15 @@ mod entry_overwrite {
         ];
         if case_insensitive {
             rows.push((vec!["build", "page.md", "-o", "PAGE.md"], "page.md"));
+            // A case variant, reached back out of a directory the write would create.
+            rows.push((
+                vec!["build", "page.md", "-o", "newdir/../PAGE.md"],
+                "page.md",
+            ));
+            rows.push((
+                vec!["build", "PAGE.md", "--out-dir", "newdir/.."],
+                "PAGE.md",
+            ));
         }
         if linked {
             rows.push((vec!["build", "page.md", "-o", "lnk/page.md"], "page.md"));

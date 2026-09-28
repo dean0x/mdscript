@@ -6026,22 +6026,27 @@ fn startup_refusal_exit(
 /// `mds watch` in file mode refuses at startup, exit 2, when the output it resolves is
 /// the entry file itself — the default route of a `type: mds` `.md` entry, `--out-dir`
 /// naming its directory, `-o` naming it, also through a `..` after a directory that
-/// does not exist yet — and writes nothing: the source stays byte-identical, and no
-/// directory is created. It used to write the compiled output over the source and keep
-/// watching a file that no longer declared `type: mds`.
+/// does not exist yet, and on a case-insensitive volume in another case — and writes
+/// nothing: the source stays byte-identical, and no directory is created. It used to
+/// write the compiled output over the source and keep watching a file that no longer
+/// declared `type: mds`.
 #[test]
 fn watch_refuses_at_startup_to_write_over_the_entry() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("page.md");
     std::fs::write(&src, TYPE_MDS_PAGE).unwrap();
 
-    for extra in [
-        &[][..],
+    let mut extras: Vec<&[&str]> = vec![
+        &[],
         &["--out-dir", "."],
         &["-o", "page.md"],
         &["-o", "newdir/../page.md"],
         &["--out-dir", "newdir/.."],
-    ] {
+    ];
+    if dir.path().join("PAGE.md").exists() {
+        extras.push(&["-o", "newdir/../PAGE.md"]);
+    }
+    for extra in extras {
         let label = format!("mds watch page.md {}", extra.join(" "));
         let (mut child, tap) = spawn_unsynchronized(
             mds_bin()
