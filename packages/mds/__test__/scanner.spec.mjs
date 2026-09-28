@@ -1964,23 +1964,23 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
 
   test('U-SM46: the read-ahead budget is charged the bytes a read took, not the size its fstat reported', async () => {
     await withNestedProject(async (proj) => {
-      // The entry imports m0 … m33. `m0` is 10,000 bytes; m1 … m32 are 2,000 bytes each
-      // and m33 one byte more, so a fstat of it tells it apart.
+      // The entry imports m0 … m33. `m0` is 10,000 bytes; m1 … m33 are 2,000 bytes each.
       const grownSize = 10_000;
       const size = 2_000;
-      const lastSize = size + 1;
       await writeFile(path.join(proj, 'm0.mds'), 'x'.repeat(grownSize));
       for (let i = 1; i <= 33; i++) {
-        await writeFile(path.join(proj, `m${i}.mds`), 'x'.repeat(i === 33 ? lastSize : size));
+        await writeFile(path.join(proj, `m${i}.mds`), 'x'.repeat(size));
       }
       const source = `${Array.from({ length: 34 }, (_, i) => `@import "./m${i}.mds" as m${i}`).join('\n')}\n`;
       const entry = path.join(proj, 'e.mds');
       await writeFile(entry, source);
       // The budget — the aggregate cap — takes the modules up to m32 with 500 bytes to
-      // spare, so the walk is refused at m33. m33 is read ahead once m0 has been walked:
-      // counted by what was read, m0 leaves m33 no room, and m33 is read by the walk.
+      // spare, so the walk is refused at m33. Counted by what was read, m0 leaves room for
+      // all of m1 … m33 but one: whichever reaches the budget last is declined, and the
+      // walk reads it. Which one that is — m32 or m33, say — is a race between their
+      // reads; that one is declined is not.
       const maxAggregateSize = Buffer.byteLength(source) + grownSize + 32 * size + 500;
-      assert.ok(Buffer.byteLength(source) + 500 < lastSize, 'm33 does not fit once m0 is counted whole');
+      assert.ok(Buffer.byteLength(source) + 500 < size, 'one of m1 … m33 does not fit once m0 is counted whole');
       const aggregateError = {
         code: 'mds::resource_limit',
         message: `resource limit exceeded: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
@@ -1992,28 +1992,30 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const FileHandle = Object.getPrototypeOf(probe);
       await probe.close();
       const realStat = FileHandle.stat;
-      // How many times a fstat saw m33 — twice when its read ahead is declined — and
+      // How many fstats the scan makes: one of each of the 35 files it opens, and one more
+      // of a module whose read ahead the budget declines, which the walk then reads — and
       // whether `m0` grows after its fstat: every fstat of it then reports one byte.
-      let lastStats = 0;
+      const files = 35;
+      let stats = 0;
       let grow = false;
       FileHandle.stat = async function stat(...args) {
-        const stats = await realStat.apply(this, args);
-        if (stats.size === lastSize) lastStats += 1;
-        if (grow && stats.size === grownSize) stats.size = 1;
-        return stats;
+        const fstat = await realStat.apply(this, args);
+        stats += 1;
+        if (grow && fstat.size === grownSize) fstat.size = 1;
+        return fstat;
       };
       try {
-        // Control (PF-013): m0's fstat is its size, m33 does not fit, and the walk reads
-        // it after a declined read ahead.
+        // Control (PF-013): m0's fstat is its size, so one module does not fit, and the
+        // walk reads it after a declined read ahead.
         const control = await rejectionOf(buildModulesMap(entry, scanImports, { maxAggregateSize }), 'control');
         assert.deepEqual(errorShape(control), aggregateError);
-        assert.equal(lastStats, 2, 'control: m33 is read by the walk');
+        assert.equal(stats, files + 1, 'control: one read ahead is declined and read by the walk');
 
-        lastStats = 0;
+        stats = 0;
         grow = true;
         const err = await rejectionOf(buildModulesMap(entry, scanImports, { maxAggregateSize }), 'grown');
         assert.deepEqual(errorShape(err), aggregateError);
-        assert.equal(lastStats, 2, 'm0 is charged the bytes read, so m33 is read by the walk');
+        assert.equal(stats, files + 1, 'm0 is charged the bytes read, so one read ahead is declined');
       } finally {
         FileHandle.stat = realStat;
       }
