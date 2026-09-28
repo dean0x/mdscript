@@ -3105,7 +3105,7 @@ mod tests {
         // `file not found: <import as written>` on every OS, as the WASM pre-scanner
         // reports it (#414). The directories are the canonical keys' parents the
         // resolver passes — verbatim (`\\?\`) paths on Windows, where joining collapses
-        // `..` lexically and so used to name, and open, the directory it leads to.
+        // `..` lexically and names the directory it leads to by its own name.
         let dir = TempDir::new().unwrap();
         let entry = make_temp_file(&dir, "main.mds", "hello");
         std::fs::create_dir(dir.path().join("sub")).unwrap();
