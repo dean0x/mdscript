@@ -2358,7 +2358,7 @@ fn name_set<const N: usize>(names: [&str; N]) -> std::collections::BTreeSet<Stri
     names.into_iter().map(String::from).collect()
 }
 
-/// #412 / AC-4 (TP-5): an `@include` of a three-level extending chain maps every
+/// #412: an `@include` of a three-level extending chain maps every
 /// included byte to the chain file that wrote it — root, intermediate or leaf — and
 /// the included lines map exactly as a direct compile of the leaf maps them, one line
 /// down.
@@ -2430,7 +2430,7 @@ fn include_of_extending_chain_attributes_each_byte() {
     );
 }
 
-/// #412 / AC-5 (TP-6) — a guard, no RED claim: output never depended on the map. An
+/// #412 — a guard, no RED claim: output never depended on the map. An
 /// importer's output is byte-identical with source maps on and off when it includes an
 /// extending chain, and holds the text of all three chain files.
 #[test]
@@ -2465,7 +2465,7 @@ fn empty_include_warning(alias: &str) -> String {
     )
 }
 
-/// #412 / AC-6 (TP-7) — a guard, no RED claim: 633e518 kept no map for any extending
+/// #412 — a guard, no RED claim: 633e518 kept no map for any extending
 /// module. An included module whose `prompt` adds no text contributes nothing to the
 /// importer's map, is still evaluated, and warns exactly as with source maps off. That
 /// the module keeps no map at all is not visible here — an importer drops a
@@ -2569,7 +2569,7 @@ const _: () = assert!(11 * SEGMENT_CAP_PASSES > MAX_SOURCEMAP_SEGMENTS);
 /// (without the importer) that defines it.
 type SegmentCapRow = (&'static str, &'static str, Vec<(&'static str, String)>);
 
-/// #412 / AC-7 (TP-8): an included module whose own map passes the segment cap —
+/// #412: an included module whose own map passes the segment cap —
 /// standalone or extending — gives a warning saying exactly what happens: the text it
 /// contributes is left unmapped and the importer's map is still produced. The same
 /// modules under the cap are mapped (control).
@@ -2707,7 +2707,7 @@ fn ceiling_chain(padding: usize) -> HashMap<String, String> {
     modules
 }
 
-/// #412 / AC-8 (TP-9): the importer's map now carries the included chain's files, so
+/// #412: the importer's map now carries the included chain's files, so
 /// the sourcesContent ceiling covers them — the first test of that ceiling. A chain
 /// whose files pass it drops `sourcesContent` from the importer's map with the ceiling
 /// warning and keeps every source and mapping; a small copy of the chain keeps
@@ -2757,7 +2757,7 @@ fn include_of_extending_chain_over_the_sources_content_ceiling_drops_sources_con
     }
 }
 
-/// #412 / AC-9 (TP-10, on disk): a runtime error in an `@extends` region whose file the
+/// #412 (on disk): a runtime error in an `@extends` region whose file the
 /// importer's map first registered through an `@include` splice names that file by its
 /// root-relative path, never its absolute one, identically with source maps on and off.
 ///

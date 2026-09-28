@@ -3882,7 +3882,7 @@ fn map_builder_shares_origin_arc_across_regions() {
     );
 }
 
-/// #416 / AC-1, the imported extending-module arm (#412): the map of an extending
+/// #416, the imported extending-module arm (#412): the map of an extending
 /// module reached through `@import` records its chain's own origins, so after an
 /// importer splices it every builder entry is pointer-identical to the source its
 /// module was loaded with — the root base, the intermediate and the leaf.
@@ -3944,7 +3944,7 @@ fn map_builder_shares_origin_arc_across_an_imported_extending_splice() {
     assert!(!Arc::ptr_eq(&Arc::<str>::from(&*root.source), &root.source));
 }
 
-/// #412 / AC-6: an imported module keeps a map only when its `prompt` is exported and
+/// #412: an imported module keeps a map only when its `prompt` is exported and
 /// renders text — standalone and extending alike — while its body is evaluated either
 /// way (WARN-B reads a not-exported module's text). Observed on the module itself: an
 /// importer cannot tell, because it drops a not-exported map and splices nothing for an

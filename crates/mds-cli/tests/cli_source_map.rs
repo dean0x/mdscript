@@ -930,7 +930,7 @@ fn sm17_include_multi_file_attribution() {
 
 // ── SM-18: an @include of an extending chain names relative sources (#412) ──
 
-/// #412 / AC-8 (TP-9, on disk): an importer in `src/` that `@include`s a three-level
+/// #412 (on disk): an importer in `src/` that `@include`s a three-level
 /// extending chain in `lib/`, built into `build/`, lists every chain file in its
 /// sidecar map with its text, each relative to the map and contained in the project —
 /// never an absolute path.
