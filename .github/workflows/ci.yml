@@ -208,6 +208,16 @@ jobs:
             #   CI-measured post-change: 846,467 bytes raw, 348,783 bytes gzipped
             #   (Binaryen v129, CI run 35990686937). Delta: +7,011 bytes (+0.84%).
             #   Guard NOT raised: 3,533 bytes (0.42%) headroom.
+            #   feat/v050-wave1.5-followups (2026-09-28, PR #426): #175 parses
+            #   Severity once in mds-core, dropping serde_json's text parser from the
+            #   WASM build (~-30 KB), then routes Severity's serde form through FromStr
+            #   (~-8.5 KB); the new preflightModule and scanImportRecords exports, the
+            #   moduleAliases option and the wave's other fixes add back ~29 KB.
+            #   Prior CI baseline: 837,705 bytes (v0.5.0 Wave 1, PR #419, logged no
+            #   entry; CI-measured at 633e518, CI run 36224501959).
+            #   CI-measured post-change: 828,326 bytes raw, 339,102 bytes gzipped
+            #   (Binaryen v129, CI run 36448495369). Delta: -9,379 bytes (-1.12%).
+            #   Guard NOT raised: 21,674 bytes (2.55%) headroom.
             if [ "$raw" -gt 850000 ]; then
               echo "::error::WASM binary exceeds 850,000 byte threshold: ${label} is ${raw} bytes"
               exit 1
