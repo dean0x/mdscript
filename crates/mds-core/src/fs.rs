@@ -425,11 +425,13 @@ fn file_too_large(size: u64, display: &str) -> MdsError {
 /// it by `display`, without ever holding more than one byte over
 /// [`crate::MAX_FILE_SIZE`] of it (#428): a file over the cap when it is opened is
 /// refused before a byte is read, with its size; one that grows past the cap while it
-/// is read — or that reports no size, like a FIFO — is read to one byte past the cap
-/// and refused. [`NativeFs::read`] and `mds::lint`'s re-read of its entry read a module
-/// through it.
+/// is read is read to one byte past the cap and refused. A module that is not a regular
+/// file — a directory, a FIFO, a device, a socket — is refused before it is opened, as
+/// `cannot read <display>: not a regular file`, the refusal `@mdscript/mds`'s WASM
+/// backend makes: opening a FIFO nobody writes to blocks. [`NativeFs::read`] and
+/// `mds::lint`'s re-read of its entry read a module through it.
 pub(crate) fn read_module_file(path: &Path, display: &str) -> Result<String, MdsError> {
-    let bytes = match read_capped(path, MAX_FILE_SIZE) {
+    let bytes = match read_regular_capped(path, MAX_FILE_SIZE) {
         Ok(Capped::Bytes(bytes)) => bytes,
         Ok(Capped::TooLarge(size)) => return Err(file_too_large(size, display)),
         Err(e) => return Err(MdsError::io(format!("cannot read {display}: {e}"))),
@@ -450,12 +452,39 @@ pub(crate) enum Capped {
 /// its end or to one byte past `cap`, whichever comes first. The size is taken from
 /// the opened file, so no other file can take its place between the two.
 pub(crate) fn read_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
+    read_opened_capped(file, size, cap)
+}
+
+/// [`read_capped`] for a regular file only: anything else fails with
+/// [`not_a_regular_file`], judged on `path` before it is opened — opening a FIFO nobody
+/// writes to blocks — and again on the opened file, which may have taken its place in
+/// between.
+fn read_regular_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_a_regular_file());
+    }
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(not_a_regular_file());
+    }
+    read_opened_capped(file, metadata.len(), cap)
+}
+
+/// Read the opened `file`, whose size taken from it is `size`, as [`read_capped`] reads.
+fn read_opened_capped(mut file: std::fs::File, size: u64, cap: u64) -> std::io::Result<Capped> {
     if size > cap {
         return Ok(Capped::TooLarge(size));
     }
     read_at_most(&mut file, cap.saturating_add(1), size).map(Capped::Bytes)
+}
+
+/// Why a module that is not a regular file is not read — the reason
+/// `@mdscript/mds`'s WASM backend gives for it too.
+fn not_a_regular_file() -> std::io::Error {
+    std::io::Error::other("not a regular file")
 }
 
 /// How many reads in a row may be interrupted before `read_at_most` gives up.
@@ -1130,9 +1159,10 @@ impl FileSystem for NativeFs {
         // Compute a display-safe (root-relative) path before any IO so errors
         // always show a relative path rather than the canonical absolute key (R3 / CWE-209).
         let display = self.display_of(path);
-        // The size is taken from the opened file, and the read itself stops one byte
-        // past the cap, so neither a file swapped nor one grown after the check is
-        // held in memory whole (#428).
+        // A module that is not a regular file is refused before it is opened; the size
+        // is taken from the opened file, and the read itself stops one byte past the
+        // cap, so neither a file swapped nor one grown after the check is held in
+        // memory whole (#428).
         read_module_file(path, &display)
     }
 
@@ -2273,6 +2303,81 @@ mod tests {
             err.to_string(),
             "invalid UTF-8 in bad.mds: invalid utf-8 sequence of 1 bytes from index 2"
         );
+    }
+
+    /// Resolve `entry` as the resolver resolves an entry, then read it on a thread of
+    /// its own: its display name, and its text or its error's code and message — or
+    /// "still blocked after 10 s" for a read that has not returned by then, which a
+    /// detached thread then unblocks by opening `entry` for writing, as a FIFO's writer
+    /// would. Nothing waits for either thread, so no read can hang the test.
+    fn read_bounded(entry: &Path) -> (String, Result<String, String>) {
+        let fs = std::sync::Arc::new(NativeFs::new());
+        let key = fs
+            .resolve_entry(&entry.display().to_string())
+            .expect("the entry resolves");
+        let display = fs.display_of(Path::new(&key));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::sync::Arc::clone(&fs);
+        std::thread::spawn(move || {
+            let read = reader.read(&key).map_err(|e| {
+                let code = code_of(&e).unwrap_or_default();
+                format!("{code}: {e}")
+            });
+            let _ = tx.send(read);
+        });
+        let outcome = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(read) => read,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let fifo = entry.to_path_buf();
+                std::thread::spawn(move || {
+                    drop(std::fs::OpenOptions::new().write(true).open(fifo));
+                });
+                Err("still blocked after 10 s".to_string())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the read panicked".to_string())
+            }
+        };
+        (display, outcome)
+    }
+
+    /// A module that is not a regular file is refused before it is opened, with the
+    /// refusal `@mdscript/mds`'s WASM backend makes (#428): opening a FIFO nobody writes
+    /// to blocked, a device reporting no size was read to one byte past the cap, and a
+    /// directory failed with the operating system's own text.
+    #[test]
+    fn native_read_refuses_a_module_that_is_not_a_regular_file_before_opening_it() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".mdsroot"), "").unwrap();
+        std::fs::write(dir.path().join("ok.mds"), "Hi\n").unwrap();
+        std::fs::create_dir(dir.path().join("dir.mds")).unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut refused = vec![dir.path().join("dir.mds")];
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo.mds");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "mkfifo {}", fifo.display());
+            refused.push(fifo);
+            refused.push(PathBuf::from("/dev/zero"));
+        }
+        let mut mismatches = Vec::new();
+        for entry in &refused {
+            let (display, outcome) = read_bounded(entry);
+            let expected = format!("mds::io: cannot read {display}: not a regular file");
+            if outcome.as_ref() != Err(&expected) {
+                mismatches.push(format!("{}: {outcome:?}", entry.display()));
+            }
+        }
+        // Control: a regular file is read, named as the others are.
+        let (display, outcome) = read_bounded(&dir.path().join("ok.mds"));
+        if (display.as_str(), outcome.as_deref()) != ("ok.mds", Ok("Hi\n")) {
+            mismatches.push(format!("ok.mds ({display}): {outcome:?}"));
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     // ── read_at_most: the bounded read (#428) ─────────────────────────────────

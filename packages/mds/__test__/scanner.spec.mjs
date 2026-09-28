@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, open, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -1152,17 +1153,50 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
       for (const [err, shown, label] of [[imported, './dir.mds', 'U-SM31 import'], [entry, 'dir.mds', 'U-SM31 entry']]) {
         assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
         assertNoHelp(err, label);
-        // A directory fails with the errno a read of it reports; on Windows its
-        // open fails first, with whatever errno libuv maps that to.
-        const prefix = `cannot read ${shown}: `;
-        if (process.platform === 'win32') {
-          assert.ok(err.message.startsWith(prefix), `${label}: ${err.message}`);
-          assert.match(err.message.slice(prefix.length), /^E[A-Z]+$/, label);
-        } else {
-          assert.equal(err.message, `${prefix}EISDIR`, label);
-        }
+        // Refused before it is opened, with native's reason, on every OS (#428).
+        assert.equal(err.message, `cannot read ${shown}: not a regular file`, label);
         assert.ok(!err.message.includes(canonicalProj), `${label}: no absolute path; got: ${err.message}`);
       }
+    });
+  });
+
+  test('U-SM31b: compileFile — both backends refuse a module that is not a regular file before opening it (#428)', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM31b')) return;
+    await withNestedProject(async (proj) => {
+      await mkdir(path.join(proj, 'dir.mds'));
+      await writeFile(path.join(proj, 'imp-dir.mds'), '@import "./dir.mds" as d\nhi\n');
+      await writeFile(path.join(proj, 'ok.mds'), 'OK\n');
+      // [entry, typed from the project directory; the path native names the module by,
+      // below the project root; the path the WASM backend names it by, as written].
+      // For an entry typed from the root the two are one, so the whole error is too.
+      const rows = [
+        ['dir.mds', 'dir.mds', 'dir.mds'],
+        ['imp-dir.mds', 'dir.mds', './dir.mds'],
+      ];
+      if (process.platform !== 'win32') {
+        // A FIFO nobody writes to: opening it blocked both backends.
+        execFileSync('mkfifo', [path.join(proj, 'fifo.mds')]);
+        await writeFile(path.join(proj, 'imp-fifo.mds'), '@import "./fifo.mds" as f\nhi\n');
+        rows.push(['fifo.mds', 'fifo.mds', 'fifo.mds'], ['imp-fifo.mds', 'fifo.mds', './fifo.mds']);
+      }
+      const files = [...rows.map(([entry]) => entry), 'ok.mds'];
+      const native = await compileFileOutcomes('native', files, { cwd: proj });
+      const wasm = await compileFileOutcomes('wasm', files, { cwd: proj });
+      const refusal = (shown) => ({ code: 'mds::io', message: `cannot read ${shown}: not a regular file`, help: null, span: null });
+      // Every row is judged before anything is asserted.
+      const mismatches = [];
+      const judge = (label, actual, expected) => {
+        if (!isDeepStrictEqual(actual, expected)) mismatches.push({ label, actual, expected });
+      };
+      for (const [i, [entry, nativeShown, wasmShown]] of rows.entries()) {
+        judge(`${entry} (native)`, native[i], refusal(nativeShown));
+        judge(`${entry} (wasm)`, wasm[i], refusal(wasmShown));
+      }
+      // Control: a regular file compiles on both.
+      judge('ok.mds (native)', native[rows.length], { output: 'OK\n' });
+      judge('ok.mds (wasm)', wasm[rows.length], { output: 'OK\n' });
+      assert.deepEqual(mismatches, []);
     });
   });
 

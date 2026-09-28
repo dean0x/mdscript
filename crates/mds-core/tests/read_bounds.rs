@@ -5,11 +5,13 @@
 //! module of any size was allocated first — the refusal text is the same either way,
 //! so this measures the resource the fix moves (applies PF-013): peak heap growth,
 //! under a counting global allocator. A file's size when it is opened decides a
-//! regular file over the cap before a byte is read; a file that grows past the cap,
-//! or reports no size at all — a FIFO fed more than the cap — is read to one byte
-//! past the cap and no further. The vars file, read the same way, is held to the same
-//! bound. The FIFOs are fed by a separate `dd` process, so nothing but the read
-//! allocates in this one while it is measured.
+//! regular file over the cap before a byte is read. A module that is not a regular
+//! file — a FIFO fed more than the cap — is refused before it is opened, so none of it
+//! is read; a vars file, which may be one (process substitution), reports no size and
+//! is read to one byte past the cap and no further. The `fs` unit tests pin, on every
+//! OS, the bounded read of a source that runs past its size hint. The FIFOs are fed by
+//! a separate `dd` process, so nothing but the read allocates in this one while it is
+//! measured.
 //!
 //! This binary holds exactly ONE `#[test]`: the allocator is process-wide, and a second
 //! test running on another thread would add its allocations to the measurement.
@@ -166,8 +168,8 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
         measured.push((case, outcome, peak));
     }
 
-    // A FIFO reports no size: only the bound on the read itself holds it — for a
-    // module and for a vars file.
+    // A FIFO reports no size: a module one is refused before it is opened, and only the
+    // bound on the read itself holds a vars one.
     #[cfg(unix)]
     {
         // 192 blocks of 64 KiB: the cap plus 2 MiB.
@@ -195,7 +197,10 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
         ("64 MiB file", Err(too_large(64 * 1024 * 1024, "far.mds"))),
         ("cap + 1 file", Err(too_large(CAP + 1, "over.mds"))),
         ("exactly the cap", Ok(CAP)),
-        ("FIFO fed cap + 2 MiB", Err(too_large(CAP + 1, "fifo.mds"))),
+        (
+            "FIFO fed cap + 2 MiB",
+            Err("cannot read fifo.mds: not a regular file".to_string()),
+        ),
         (
             "vars FIFO fed cap + 2 MiB",
             Err(format!(

@@ -298,15 +298,23 @@ function withImportContext(err: unknown, record: ImportRecord): unknown {
 /**
  * `mds::io` for a file that resolves but cannot be read — NativeFs's `cannot read
  * …` I/O error — naming `shown`, the path as written, and `reason`: an errno name
- * (`EACCES`), never Node's message, which names the resolved absolute path. Native
- * names its root-relative display path and the OS error text instead, so the two
- * agree on the code, not on the message.
+ * (`EACCES`) or `not a regular file`, never Node's message, which names the resolved
+ * absolute path. Native names its root-relative display path, and the OS error text
+ * where this names an errno, so the two agree on the code, not on the message.
  */
 function cannotReadError(shown: string, reason: string): PathError {
   return pathError(
     'mds::io',
     `cannot read ${escapePathForMessage(shown)}: ${escapePathForMessage(reason)}`,
   );
+}
+
+/**
+ * `cannotReadError` for a module that is not a regular file — a directory, device,
+ * FIFO or socket — with the reason NativeFs gives it: `not a regular file` (#428).
+ */
+function notRegularFileError(shown: string): PathError {
+  return cannotReadError(shown, 'not a regular file');
 }
 
 /** `cannotReadError` for a failed Node call, with its errno name as the reason. */
@@ -818,8 +826,10 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  *   directory reached through a symlink (`mds::io`);
  * - an import chain deeper than 64 modules (`mds::import`); more modules than the
  *   engine takes, the entry plus `maxModules` (`mds::resource_limit`);
- * - a module that is not a regular file or cannot be read (`mds::io`, `cannot read
- *   <path as written>: <errno name>`);
+ * - a module that is not a regular file — a directory, device, FIFO or socket —
+ *   before it is opened (`mds::io`, `cannot read <path as written>: not a regular
+ *   file`, #428), and one that cannot be read (`mds::io`, `cannot read <path as
+ *   written>: <errno name>`);
  * - a file over the engine's 10 MiB per-file cap (`mds::resource_limit`) or whose
  *   bytes are not valid UTF-8 (`mds::io`), then a file that is neither a `.mds` file
  *   nor a `.md` file declaring `type: mds` (`mds::not_mds`, `not an MDS file: <path as
@@ -866,8 +876,10 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  * 6. A module more than 256 directories below the project root is refused: the
  *    engine's key of it is capped at 256 segments, where native caps only the path
  *    as written.
- * 7. A `cannot read` message names the path as written and the errno name, where
- *    native names the root-relative path and the OS error text; the code agrees.
+ * 7. A `cannot read` message names the path as written, where native names the
+ *    root-relative path, and a file that cannot be read by its errno name, where
+ *    native gives the OS error text; the code agrees, and so does the reason for a
+ *    module that is not a regular file.
  * 8. Every module is read before the engine runs, so a refusal of a later import is
  *    reported before an error the engine raises at a point native reaches first: a
  *    compile error in a module native reads first, or a circular import native meets
@@ -1023,6 +1035,15 @@ export async function buildModulesMap(
     shown: string,
     admit?: (size: number) => boolean,
   ): Promise<ReadModule | undefined> {
+    // A module that is not a regular file is refused before it is opened, as NativeFs
+    // refuses it: opening a FIFO nobody writes to blocks (#428). A symlink is left to
+    // the open below, which refuses it without following it.
+    const before = await lstat(located.path).catch(() => {
+      throw fileNotFoundError(shown);
+    });
+    if (!before.isFile() && !before.isSymbolicLink()) {
+      throw notRegularFileError(shown);
+    }
     const handle = await openNoFollow(located.path, shown);
     try {
       // `openNoFollow` above already succeeded, so the file existed a moment ago; a
@@ -1044,11 +1065,10 @@ export async function buildModulesMap(
       if (linkStats.isSymbolicLink() || resolved !== located.resolved) {
         throw symlinkError(shown);
       }
-      // fstat on the opened fd: a module that is not a regular file (a directory,
-      // device, FIFO or socket) fails NativeFs's read step (`mds::io`); a directory
-      // is named by the errno reading it reports.
+      // Checked again on the opened fd, as NativeFs checks its opened file: another
+      // file may have taken the module's place since it was checked above.
       if (!stats.isFile()) {
-        throw cannotReadError(shown, stats.isDirectory() ? 'EISDIR' : 'not a regular file');
+        throw notRegularFileError(shown);
       }
       const display = keyOf(projectRoot, resolved);
       // Checked on the fstat size too, before a byte is read, so a file over the cap
