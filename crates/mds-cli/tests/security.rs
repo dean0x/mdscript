@@ -794,9 +794,9 @@ fn load_vars_file_rejects_symlinked_path() {
 //
 //   1. `MdsError` — `parser.rs` formats the raw alias into
 //      `invalid include alias: '{alias}'`.
-//   2. CLI-authored `miette::miette!()` — `build.rs`'s `load_config` formats the
-//      `serde_json` error into `invalid mds.json at {path}: {e}`, and serde's
-//      `unknown variant` message quotes the raw `mds.json` value.
+//   2. CLI-authored `miette::miette!()` — `build.rs`'s `auto_detect_mds_file` formats
+//      the raw names of the `.mds` files in the working directory into
+//      `multiple .mds files found: {names}`.
 //
 // Both render through `eprint_error`, the single CLI stderr choke-point.
 
@@ -852,44 +852,48 @@ fn build_mds_error_message_escapes_control_bytes() {
 }
 
 /// T-ESC-MSG-2 [security-11 / CWE-150 / PF-004 / #176]: a CLI-authored
-/// `miette::miette!()` error that interpolates attacker-controlled config text must
-/// reach stderr escaped too.
+/// `miette::miette!()` error that interpolates attacker-controlled text must reach
+/// stderr escaped too.
 ///
 /// This is the PF-004 sibling path: `miette!()` reports do **not** downcast to
 /// `MdsError` (see `exit_code`'s rustdoc), so a fix that only handled `MdsError`
 /// would leave this vector open while claiming the boundary was closed.
 ///
-/// The vector was once an `output_dir` holding `..` plus ESC, but since #265 that value
-/// is refused as an `MdsError` (`mds::io`) before any `miette!()` formats it — see
-/// `output_dir_in_mds_json_is_refused_at_load` in `forbidden_paths.rs`. An unknown lint
-/// severity still reaches a `miette!()` message with the raw value in it.
+/// No `mds.json` value reaches a `miette!()` message raw: a forbidden `output_dir` is
+/// refused as `mds::io` (#265, `output_dir_in_mds_json_is_refused_at_load` in
+/// `forbidden_paths.rs`), and an unknown lint severity's message names no value (#175,
+/// `mds_json_severity_goes_through_the_one_severity_parser` in `cli_build.rs`). So the
+/// vector is a file name: with no argument, `mds build` looks for the one `.mds` file
+/// in its working directory, and when there are several its error names them all, as
+/// they are on disk.
 #[test]
 fn build_cli_authored_error_message_escapes_control_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
-    // serde_json writes the ESC as a JSON escape, which decodes back to a raw ESC byte in
-    // the parsed config value; serde quotes it in its `unknown variant` error, which
-    // `load_config` formats into the message. Built at runtime (PF-018).
-    let config = serde_json::json!({
-        "lint": { "rules": { "unused-variable": format!("{}[31mBAD", '\x1b') } }
-    });
-    std::fs::write(dir.path().join("mds.json"), config.to_string()).unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    // RIGHT-TO-LEFT OVERRIDE (U+202E), and ESC where the OS allows it in a file name
+    // (Windows does not). Built at runtime (PF-018).
+    let hostile = if cfg!(windows) {
+        format!("BAD{}x.mds", '\u{202e}')
+    } else {
+        format!("{}[31mBAD{}x.mds", '\x1b', '\u{202e}')
+    };
+    std::fs::write(dir.path().join(&hostile), "Hello!\n").unwrap();
 
     let out = mds_bin()
         .arg("build")
-        .arg(dir.path())
+        .current_dir(dir.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
         .unwrap();
 
     // ── Non-vacuity: the CLI-authored error (exit 1, no `mds::` code) is the one
-    //    rendered, and it quotes the hostile value ────────────────────────────
+    //    rendered, and it names both files ────────────────────────────────────
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "got: {stderr}");
     assert!(
-        stderr.contains("invalid mds.json") && stderr.contains("unknown"),
-        "non-vacuity: the mds.json parse error must be the one rendered; got: {stderr}"
+        stderr.contains("multiple .mds files found") && stderr.contains("a.mds"),
+        "non-vacuity: the auto-detect error must be the one rendered; got: {stderr}"
     );
     assert!(
         !stderr.contains("mds::"),
@@ -903,9 +907,15 @@ fn build_cli_authored_error_message_escapes_control_bytes() {
     );
     assert_no_control_chars(&stderr, "mds build miette!() message");
     assert!(
-        stderr.contains("\\u001B"),
-        "ESC must be rendered as the \\u001B literal; got: {stderr}"
+        stderr.contains("\\u202E"),
+        "U+202E must be rendered as the \\u202E literal; got: {stderr}"
     );
+    if !cfg!(windows) {
+        assert!(
+            stderr.contains("\\u001B"),
+            "ESC must be rendered as the \\u001B literal; got: {stderr}"
+        );
+    }
 }
 
 // ── S14 / PF-004: the two boundaries the #176 alignment review found still open ──

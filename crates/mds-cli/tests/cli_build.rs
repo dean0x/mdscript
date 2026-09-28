@@ -1757,6 +1757,61 @@ fn fmt_unknown_lint_rule_in_mds_json_emits_no_warning() {
     );
 }
 
+/// #175: `mds.json`'s `lint.rules` values are read by the one severity parser the
+/// bindings use. An unknown spelling fails with its message, which names no value, so
+/// a hostile one is never echoed; a value that is not a string is refused. serde's
+/// derive quoted the value (`unknown variant ...`) and took `{"warn": null}` as `warn`.
+#[test]
+fn mds_json_severity_goes_through_the_one_severity_parser() {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect::<String>()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    // The escaped spelling — backslash, `u`, `0077`, `arn` — and an ESC-carrying value,
+    // built at runtime (PF-018).
+    let escaped_warn = format!("{}u0077arn", '\\');
+    let hostile = format!("{}[31mBAD", '\x1b');
+    let unknown = "invalid mds.json at ./mds.json: unknown severity; \
+                   expected \"off\", \"info\", \"warn\", or \"error\" at line 1 column";
+    let not_a_string = "invalid mds.json at ./mds.json: invalid type: map, expected a string";
+    let rows = [
+        // Control: a known spelling loads, and the build writes its output.
+        (serde_json::json!("warn"), None),
+        (serde_json::json!("Warn"), Some(unknown)),
+        (serde_json::json!(escaped_warn), Some(unknown)),
+        (serde_json::json!(hostile), Some(unknown)),
+        (serde_json::json!({ "warn": null }), Some(not_a_string)),
+    ];
+    for (value, expected) in rows {
+        let config = serde_json::json!({ "lint": { "rules": { "unused-variable": &value } } });
+        std::fs::write(dir.path().join("mds.json"), config.to_string()).unwrap();
+        let _ = std::fs::remove_file(dir.path().join("out.md"));
+        let out = mds_bin()
+            .args(["build", "a.mds", "-o", "out.md"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let Some(expected) = expected else {
+            assert!(out.status.success(), "{value}: got: {stderr}");
+            assert!(dir.path().join("out.md").is_file(), "{value}: no output");
+            continue;
+        };
+        assert_eq!(out.status.code(), Some(1), "{value}: got: {stderr}");
+        assert!(
+            squash(&stderr).contains(&squash(expected)),
+            "{value}: expected {expected:?}; got: {stderr}"
+        );
+        for echo in ["Warn", "u0077arn", "[31mBAD"] {
+            assert!(!stderr.contains(echo), "{value}: echoes {echo:?}: {stderr}");
+        }
+        assert!(!out.stderr.contains(&0x1Bu8), "{value}: raw ESC: {stderr}");
+    }
+}
+
 // ── Atomic build outputs (#227) ──────────────────────────────────────────────
 //
 // `mds build -o <file>` routes its write through `crate::output::atomic_write_file`

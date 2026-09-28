@@ -1808,9 +1808,13 @@ fn lint_types_exist() {
     let as_error: &dyn std::error::Error = &err;
     assert_eq!(
         as_error.to_string(),
-        "unknown severity; expected \"off\", \"info\", \"warn\" or \"error\""
+        "unknown severity; expected \"off\", \"info\", \"warn\", or \"error\""
     );
     assert_eq!(err, " info".parse::<Severity>().unwrap_err());
+    // Its serde form is the same parser: the same spellings, the same message.
+    let from_json = |value| serde_json::from_value::<Severity>(value).map_err(|e| e.to_string());
+    assert_eq!(from_json(serde_json::json!("info")), Ok(Severity::Info));
+    assert_eq!(from_json(serde_json::json!("Info")), Err(err.to_string()));
 
     // LintConfig has a `rules` field (HashMap<String, Severity>).
     let (config, _) = LintConfig::from_rules_checked(HashMap::from([(
