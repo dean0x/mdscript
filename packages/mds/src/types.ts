@@ -3,7 +3,9 @@
  * `sourceMap: true` is passed to a compile function.
  *
  * All bindings and the CLI produce compliant SMv3. The `file` key is absent
- * for binding results (caller-supplied entry identity is used as `sources[0]`);
+ * for binding results (the caller-supplied entry identity names the entry in
+ * `sources`: `sources[0]`, unless the entry `@extends` a base, whose chain root comes
+ * first);
  * the CLI writes the sidecar path. `sourcesContent` is present only when
  * `sourcesContent: true` was requested.
  *
@@ -12,7 +14,11 @@
 export interface SourceMapV3 {
   /** Always `3`. */
   version: 3;
-  /** Source file paths. Binding results use the caller-supplied entry identity. */
+  /**
+   * Source file paths. Binding results name the entry by the caller-supplied entry
+   * identity: `sources[0]`, unless the entry `@extends` a base, whose chain root comes
+   * first.
+   */
   sources: string[];
   /**
    * Original source text for each entry in `sources`, index-aligned.

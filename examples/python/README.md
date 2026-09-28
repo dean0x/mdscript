@@ -142,7 +142,8 @@ attribute `lr.lint_warnings` always returns a list (empty when clean).
 
 ## Source map notes
 
-- **`sources`** — string compiles report `["input.mds"]`. File compiles report
+- **`sources`** — a string compile names the source string `"input.mds"`: `sources[0]`,
+  unless the string `@extends` a base, whose chain root comes first. File compiles report
   paths relative to the project root (found via a `.git` / `.mdsroot` marker), or
   bare basenames when no marker is found above the file.
 - **`file` key** — absent for binding results (it names the *output* artifact,

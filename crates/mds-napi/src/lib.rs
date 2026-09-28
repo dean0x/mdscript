@@ -640,8 +640,9 @@ fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
 
 /// Compile an MDS template source string and return a structured result.
 ///
-/// For string-source compiles the `sources[0]` field in any generated source map is
-/// `"input.mds"`.
+/// For string-source compiles the source string is named `"input.mds"` in a generated
+/// source map's `sources` — `sources[0]`, unless the string `@extends` a base: then the
+/// chain's root base comes first.
 ///
 /// ## Arguments
 ///
