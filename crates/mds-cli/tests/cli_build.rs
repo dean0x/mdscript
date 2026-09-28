@@ -1538,12 +1538,11 @@ fn build_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
 // path; their absence assertions are structural, not D2(a).
 //
 // The build and fmt (dir) tests mechanically hold the AC-224-14 watch-path invariant:
-// `watch.rs:822` calls `load_config(...).unwrap_or(None)`.  Because `build` and
-// `mds fmt <DIR>` share the same `load_config` implementation, a passing build or
-// dir-fmt proves `load_config` returns `Ok` for configs with unknown rule names —
-// so `unwrap_or(None)` cannot collapse `output_dir` to `None` on account of an
-// unknown lint rule name alone.  Non-vacuity is secured by the positive-control
-// arms in each test (ADR-009 / PF-013).
+// `mds watch` loads `mds.json` once, at startup, with `load_config(...)?`.  Because
+// `build` and `mds fmt <DIR>` share the same `load_config` implementation, a passing
+// build or dir-fmt proves `load_config` returns `Ok` for configs with unknown rule
+// names — so an unknown lint rule name alone cannot stop `mds watch` from starting.
+// Non-vacuity is secured by the positive-control arms in each test (ADR-009 / PF-013).
 
 /// AC-224-14 / D2(a): `mds build` must NOT emit an unknown-rule warning even
 /// when `mds.json` names a lint rule that does not exist.

@@ -81,11 +81,17 @@ fn spawn_unsynchronized(cmd: &mut Command) -> (ChildGuard, StderrTap) {
     assert!(
         stdout_tap.is_none(),
         "this spawn piped stdout, and the harness has already drained it — the tap \
-         would be discarded here. Add a `spawn_unsynchronized_piped_stdout` wrapper \
-         mirroring `spawn_ready_piped_stdout` and use that instead; none exists yet \
-         because no unsynchronized test pipes stdout."
+         would be discarded here; use spawn_unsynchronized_piped_stdout instead"
     );
     (ChildGuard(child), tap)
+}
+
+/// [`spawn_unsynchronized`] for a command that set `.stdout(Stdio::piped())`; the
+/// drained stdout comes back as by [`spawn_ready_piped_stdout`].
+fn spawn_unsynchronized_piped_stdout(cmd: &mut Command) -> (ChildGuard, StderrTap, StdoutTap) {
+    let (child, tap, stdout_tap) = spawn_watch_unsynchronized(cmd);
+    let stdout_tap = stdout_tap.expect("caller must set .stdout(Stdio::piped())");
+    (ChildGuard(child), tap, stdout_tap)
 }
 
 /// Poll `path` until its content contains `needle`, or `timeout` elapses.
@@ -6258,6 +6264,230 @@ fn watch_refusal_is_not_preceded_by_the_extension_warning() {
     assert!(
         stderr.contains(warning),
         "control: the warning still announces a write that happens; stderr: {stderr}"
+    );
+    drop(child);
+}
+
+// ── An output route that fails at startup is refused ─────────────────────────
+
+/// An `mds.json` whose `build.output_dir` leaves its directory: the output route error
+/// file-mode resolution raises, which `mds build` refuses (`mds::io`, exit 2).
+const DOTDOT_OUTPUT_DIR: &str = r#"{"build":{"output_dir":"../x"}}"#;
+
+/// The refusal of [`DOTDOT_OUTPUT_DIR`], squashed (miette wraps long lines).
+fn dotdot_output_dir_refusal() -> String {
+    squash("mds::io × mds.json output_dir '../x' must not contain '..' components")
+}
+
+/// `mds watch` refuses at startup an output route that fails to resolve — `mds.json`
+/// `build.output_dir` with a `..` component — with the error `mds build` gives for the
+/// same route (`mds::io`, exit 2), reported once, and writes nothing: no file, no
+/// directory, no byte on stdout. In file mode it used to report the error once and then
+/// write every rebuild to stdout (`Recompiled <stdout>`); after a failed startup compile
+/// it did so without reporting the route error at all. A failed startup compile is still
+/// reported, and the route is refused after it. Directory mode already refused the route
+/// at startup; it is pinned here with the same error.
+#[test]
+fn watch_refuses_at_startup_an_output_route_that_fails() {
+    // (mode, input, source, whether the startup compile succeeds)
+    let rows = [
+        ("file mode", "page.mds", "Hello one\n", true),
+        (
+            "file mode, failed startup compile",
+            "page.mds",
+            "Hello {{name\n",
+            false,
+        ),
+        ("directory mode", ".", "Hello one\n", true),
+    ];
+    for (mode, input, source, compiles) in rows {
+        let label = format!("{mode}: mds watch {input}");
+        // `../x` resolves beside `proj`, in `top`, which holds nothing else.
+        let top = tempfile::tempdir().unwrap();
+        let proj = top.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        std::fs::write(proj.join("mds.json"), DOTDOT_OUTPUT_DIR).unwrap();
+        std::fs::write(proj.join("page.mds"), source).unwrap();
+
+        let (mut child, tap, stdout_tap) = spawn_unsynchronized_piped_stdout(
+            mds_bin()
+                .current_dir(&proj)
+                .args(["watch", input, "--debounce", "0"])
+                .stdout(Stdio::piped()),
+        );
+        let (code, stderr) = startup_refusal_exit(&mut child, tap, &label);
+        let stdout = stdout_tap.finish_text(&mut child);
+        assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+        assert_eq!(
+            count_occurrences(&squash(&stderr), &dotdot_output_dir_refusal()),
+            1,
+            "{label}: the refusal is reported, once; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Compiled to"),
+            "{label}: nothing is compiled to a file; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Recompiled"),
+            "{label}: no rebuild runs; stderr: {stderr}"
+        );
+        assert_eq!(stdout, "", "{label}: nothing is written to stdout");
+        let mut names: Vec<String> = std::fs::read_dir(&proj)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["mds.json", "page.mds"],
+            "{label}: nothing is written"
+        );
+        assert_eq!(
+            std::fs::read_dir(top.path()).unwrap().count(),
+            1,
+            "{label}: no output directory is created"
+        );
+
+        if compiles {
+            // Differential: `mds build` refuses the same route with the same error.
+            let build = mds_bin()
+                .current_dir(&proj)
+                .args(["build", input])
+                .output()
+                .unwrap();
+            let build_stderr = String::from_utf8_lossy(&build.stderr);
+            assert_eq!(
+                build.status.code(),
+                code,
+                "{label}: mds build {input} exits as watch does; stderr: {build_stderr}"
+            );
+            assert!(
+                squash(&build_stderr).contains(&dotdot_output_dir_refusal()),
+                "{label}: mds build {input} gives the same error; stderr: {build_stderr}"
+            );
+        } else {
+            // Control: the startup compile ran, and its failure is reported.
+            assert!(
+                stderr.contains("mds::syntax"),
+                "{label}: the compile error is reported; stderr: {stderr}"
+            );
+        }
+    }
+}
+
+/// Controls for [`watch_refuses_at_startup_an_output_route_that_fails`] — only a route
+/// that fails is refused:
+/// - a failed startup compile with a route that resolves is reported, watching
+///   continues, and the next rebuild writes the fixed source;
+/// - with the same `mds.json`, `-o <file>` and `--out-dir <dir>` route the output (the
+///   config's `output_dir` is not consulted), and the startup compile and a rebuild are
+///   written there;
+/// - with the same `mds.json`, `-o -` streams the startup output and a rebuild to stdout,
+///   as documented.
+#[test]
+fn watch_startup_route_refusal_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello {{name\n").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.mds", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
+    assert!(
+        stderr.contains("mds::syntax"),
+        "failed startup compile: the compile error is reported; stderr: {stderr}"
+    );
+    write_atomic(&src, "Hello fixed\n");
+    assert!(
+        wait_for_file_contains(&dir.path().join("page.md"), "Hello fixed", TIMEOUT),
+        "failed startup compile: the rebuild writes page.md; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "failed startup compile: watch keeps running"
+    );
+    drop(child);
+
+    for (flag, value, written) in [
+        ("-o", "out.md", "out.md"),
+        ("--out-dir", "out", "out/page.md"),
+    ] {
+        let label = format!("mds watch page.mds {flag} {value}");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mds.json"), DOTDOT_OUTPUT_DIR).unwrap();
+        let src = dir.path().join("page.mds");
+        std::fs::write(&src, "Hello one\n").unwrap();
+        let out = dir.path().join(written);
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "page.mds", flag, value, "--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out, "Hello one", TIMEOUT),
+            "{label}: startup writes {written}; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, "Hello two\n");
+        assert!(
+            wait_for_file_contains(&out, "Hello two", TIMEOUT),
+            "{label}: the rebuild writes {written}; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            !tap.text().contains("must not contain"),
+            "{label}: nothing is refused; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{label}: watch keeps running"
+        );
+        drop(child);
+    }
+
+    let label = "mds watch page.mds -o -";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mds.json"), DOTDOT_OUTPUT_DIR).unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let (mut child, tap, stdout_tap) = spawn_ready_piped_stdout(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.mds", "-o", "-", "--debounce", "0"])
+            .stdout(Stdio::piped()),
+    );
+    // `wait_for_stderr_contains_str` polls any pipe tap; this one is stdout.
+    let stdout = wait_for_stderr_contains_str(&stdout_tap, "Hello one", TIMEOUT);
+    assert!(
+        stdout.contains("Hello one"),
+        "{label}: startup streams to stdout; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, "Hello two\n");
+    let stdout = wait_for_stderr_contains_str(&stdout_tap, "Hello two", TIMEOUT);
+    assert!(
+        stdout.contains("Hello two"),
+        "{label}: the rebuild streams to stdout; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        !tap.text().contains("must not contain"),
+        "{label}: nothing is refused; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "{label}: watch keeps running"
+    );
+    assert!(
+        !dir.path().join("page.md").exists(),
+        "{label}: nothing is written next to the source"
     );
     drop(child);
 }

@@ -1142,13 +1142,13 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 ///   so startup does not compile twice).
 type WrittenEntry = (Option<PathBuf>, Vec<String>, String);
 
-/// Outcome of [`compile_and_write`]'s compile-route-write attempt, once its output has
-/// been admitted ([`admit_output`], #425).
+/// Outcome of [`compile_and_write`]'s compile-and-write attempt, for an output route every
+/// rebuild can use.
 enum CompileWriteOutcome {
     /// Compiled, routed and written.
     Written(WrittenEntry),
-    /// A failure — compile, route, or write — that `mds watch` reports and keeps
-    /// watching through.
+    /// A failure — compile or write — that `mds watch` reports and keeps watching
+    /// through.
     Failed(miette::Report),
 }
 
@@ -1156,10 +1156,12 @@ enum CompileWriteOutcome {
 /// kind and `entry.canonical`, and write — file mode's startup compile.
 ///
 /// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
-/// reports and keeps watching through: the compile, the output path, the write. The
-/// `Err` this function itself returns is reserved for an output path that is the entry
-/// file itself ([`admit_output`], #425), which ends `mds watch` at startup (exit 2):
-/// every rebuild would reuse that path.
+/// reports and keeps watching through: the compile, the write. The `Err` this function
+/// itself returns is an output route no rebuild can use, which ends `mds watch` at
+/// startup (exit 2), since every rebuild writes where startup resolved: a route that
+/// fails to resolve — `mds.json` `build.output_dir` with a `..` component, refused with
+/// the error `mds build` gives for it — or an output that is the entry file itself
+/// ([`admit_output`], #425).
 ///
 /// The output path is derived AFTER compiling (compile-then-route) so the kind
 /// (and thus extension: `.json` for messages, `.md` for markdown) is known before
@@ -1182,20 +1184,17 @@ fn compile_and_write(
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<CompileWriteOutcome> {
-    let routed = entry.compile(runtime_vars, quiet).and_then(|compiled| {
-        resolve_output_path_for_kind(
-            &Some(entry.canonical.clone()),
-            output,
-            out_dir,
-            config,
-            compiled.kind,
-        )
-        .map(|output_path| (compiled, output_path))
-    });
-    let (compiled, output_path) = match routed {
-        Ok(routed) => routed,
+    let compiled = match entry.compile(runtime_vars, quiet) {
+        Ok(compiled) => compiled,
         Err(e) => return Ok(CompileWriteOutcome::Failed(e)),
     };
+    let output_path = resolve_output_path_for_kind(
+        &Some(entry.canonical.clone()),
+        output,
+        out_dir,
+        config,
+        compiled.kind,
+    )?;
     admit_output(
         output_path.as_deref(),
         entry.paths(),
@@ -1220,12 +1219,6 @@ fn compile_and_write(
 /// rebuild — replaces the 6-7 individual constant args on `rebuild_file` and
 /// `liveness_probe_file`, removing the `#[allow(clippy::too_many_arguments)]`
 /// suppressions (issue #6 / zero-warnings policy).
-///
-/// `output_path` is the path resolved from the startup compile (intrinsic: kind
-/// derived from the first compile result). On each rebuild the same path is reused
-/// unless `-o` was specified explicitly, in which case that path is canonical.
-/// For the watch single-file case the path is stable across recompiles (the template
-/// kind cannot change without the template itself changing, which triggers a rebuild).
 struct FileCompileCtx {
     /// The watched entry, as typed and canonical ([`Watched::Entry`]).
     entry: WatchedPath,
@@ -1240,39 +1233,12 @@ struct FileCompileCtx {
     vars_path_typed: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
-    /// The `-o <path>` or `--out-dir` argument passed by the user, if any.
-    /// Kept here so `rebuild_file` can reuse the same path-derivation logic for
-    /// the dynamic path case (where output_path itself stays None until after compile).
-    output_arg: Option<String>,
-    out_dir: Option<PathBuf>,
+    /// Where every rebuild writes, resolved once at startup: from the startup compile's
+    /// kind (intrinsic extension), or the Markdown fallback of a failed startup compile.
+    /// `None` is stdout (`-o -`). A route that fails to resolve never gets here: it ends
+    /// `mds watch` at startup.
     output_path: Option<PathBuf>,
     quiet: bool,
-}
-
-impl FileCompileCtx {
-    /// The output path a rebuild that compiled to `kind` writes to.
-    ///
-    /// When startup resolved one (`output_path` is `Some`: a successful startup compile,
-    /// or the Markdown fallback of a failed one), it is reused. `None` means stdout
-    /// (`-o -`) or a startup that resolved no path at all, and the path is re-derived
-    /// from the kind and the flags. Project config is loaded lazily, only on that path.
-    /// It is looked up by the canonical entry, the file being watched: an error here is
-    /// swallowed, so no message ever names the path, and the canonical path holds no
-    /// symlink a retarget could move elsewhere (#417).
-    fn rebuild_output_path(&self, kind: OutputKind) -> Option<PathBuf> {
-        if self.output_path.is_some() {
-            return self.output_path.clone();
-        }
-        let config = load_config(&self.entry.canonical).unwrap_or(None);
-        resolve_output_path_for_kind(
-            &Some(self.entry.canonical.clone()),
-            &self.output_arg,
-            &self.out_dir,
-            &config,
-            kind,
-        )
-        .unwrap_or(None)
-    }
 }
 
 /// Mutable loop state for single-file watch mode.
@@ -1483,16 +1449,15 @@ fn rebuild_file(
     let runtime_vars = resolved.vars.take();
 
     let t0 = Instant::now();
-    // Compile, route and admit as one step, so a failure of any of the three is reported
-    // and settled the same way, and watching continues.
+    // Compile and admit as one step, so a failure of either is reported and settled the
+    // same way, and watching continues.
     let entry = &ctx.entry;
     let routed = entry.compile(runtime_vars, ctx.quiet).and_then(|compiled| {
-        // The output path from the compiled kind (intrinsic extension).
-        let output_path = ctx.rebuild_output_path(compiled.kind);
+        let output_path = ctx.output_path.clone();
         // #425: a rebuild never writes over the entry — reachable when a failed startup
         // compile left the Markdown default in place as the output path. No `-o`
-        // extension warning (no `output_arg`): startup printed it for the path every
-        // rebuild reuses, and an `-o <file>` always resolves at startup.
+        // extension warning (`&None`): startup printed it for the path every rebuild
+        // reuses.
         admit_output(
             output_path.as_deref(),
             entry.paths(),
@@ -1715,9 +1680,9 @@ fn run_watch_file(
     // Initial compile: returns (output_path, deps, content).
     // content is captured here so the baseline block below can reuse it without
     // recompiling (issue 3 — avoids a redundant second compile at startup).
-    // The outer `?` is an output path that is the entry file itself (#425): refused at
-    // startup, exit 2, before anything is written. Any other error is reported, and
-    // watching continues.
+    // The outer `?` is an output route no rebuild can use — one that fails to resolve, or
+    // the entry file itself (#425): refused at startup, exit 2, before anything is
+    // written. A compile or write error is reported, and watching continues.
     let startup = compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet)?;
     let (output_path, initial_deps, initial_content) = match startup {
         CompileWriteOutcome::Written(result) => result,
@@ -1728,15 +1693,16 @@ fn run_watch_file(
             // know where to watch. This path may not match a later successful compile if
             // the template has @message blocks, and every rebuild reuses it
             // (`FileCompileCtx.output_path`) — so it can be the entry itself, which
-            // `rebuild_file` refuses to write over (#425).
+            // `rebuild_file` refuses to write over (#425). A route that fails to resolve
+            // is refused here as after a successful compile (exit 2): no rebuild could
+            // write anywhere else.
             let fallback_path = resolve_output_path_for_kind(
                 &Some(entry.canonical.clone()),
                 &output,
                 &out_dir,
                 &config,
                 OutputKind::Markdown,
-            )
-            .unwrap_or(None);
+            )?;
             // Nothing is written now. Every rebuild reuses this path, and refuses and
             // reports one that is the entry (#425), so the refusal is dropped here:
             // admitting the fallback only decides whether the `-o` extension warning,
@@ -1871,8 +1837,6 @@ fn run_watch_file(
         vars_path_typed,
         static_set_vars,
         static_set_string_vars,
-        output_arg: output,
-        out_dir,
         output_path,
         quiet,
     };
