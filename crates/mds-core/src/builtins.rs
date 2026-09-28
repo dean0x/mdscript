@@ -759,7 +759,7 @@ mod tests {
         }
     }
 
-    /// #415 (AC-15): a result of exactly the cap is built; one byte more is refused
+    /// #415: a result of exactly the cap is built; one byte more is refused
     /// with the built-in's own `mds::builtin` error.
     #[test]
     fn replace_output_of_exactly_the_cap_succeeds_one_byte_more_fails() {

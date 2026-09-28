@@ -2017,7 +2017,7 @@ mod tests {
         (result, budget)
     }
 
-    /// TP-12 (AC-11): a `@for` whose output crosses the cap stops on the crossing pass.
+    /// #415: a `@for` whose output crosses the cap stops on the crossing pass.
     /// Checked only once the loop had finished, all `CAP_LOOP_LEN` passes ran first.
     #[test]
     fn for_loop_output_cap_stops_iterating() {
@@ -2030,7 +2030,7 @@ mod tests {
         );
     }
 
-    /// TP-15 (AC-13): every container that holds a crossing loop reports the same
+    /// #415: every container that holds a crossing loop reports the same
     /// error, and the loop stops on the crossing pass in each of them.
     #[test]
     fn for_loop_output_cap_stops_iterating_in_every_container() {
@@ -2082,7 +2082,7 @@ mod tests {
         );
     }
 
-    /// TP-15 (AC-13): with exactly `CAP_CROSSING_PASS` passes left in the budget, the
+    /// #415: with exactly `CAP_CROSSING_PASS` passes left in the budget, the
     /// output cap stops the loop on its last allowed pass; with one fewer, the
     /// iteration cap stops it first — on the same pass, before its body runs.
     #[test]
@@ -2112,7 +2112,7 @@ mod tests {
         assert_eq!(budget.iterations, MAX_TOTAL_ITERATIONS + 1);
     }
 
-    /// TP-13 (AC-12): a buffer grown through `push_capped` never reserves past the cap.
+    /// #415: a buffer grown through `push_capped` never reserves past the cap.
     /// Plain doubling from 32 MiB would reserve 64 MiB for a 33 MiB buffer.
     #[test]
     fn push_capped_growth_never_reserves_past_the_cap() {
@@ -2132,7 +2132,7 @@ mod tests {
         assert_eq!(out.len(), MAX_OUTPUT_SIZE);
     }
 
-    /// TP-13 (AC-12): at the cap, `push_capped` accepts an empty append and refuses one
+    /// #415: at the cap, `push_capped` accepts an empty append and refuses one
     /// more byte with the output-cap error, leaving the buffer unchanged.
     #[test]
     fn push_capped_refuses_past_the_cap_and_leaves_the_buffer_unchanged() {

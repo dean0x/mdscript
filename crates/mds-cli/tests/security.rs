@@ -437,7 +437,7 @@ fn exit_code_resource_limit() {
     );
 }
 
-/// #415 (AC-14, a guard — no RED claim): a `@for` whose output crosses the 50 MiB
+/// #415 (a guard, no RED claim): a `@for` whose output crosses the 50 MiB
 /// output cap exits 3 with the exact `mds::resource_limit` message and writes nothing.
 /// The code and message are the same whether the cap is checked before each append or
 /// after the loop, so this pins the CLI's reporting; where the loop stops is pinned in

@@ -1768,7 +1768,7 @@ fn assert_loop_stops_at_the_crossing_pass(
     );
 }
 
-/// TP-12 (AC-11): a `@for` whose output is exactly `MAX_OUTPUT_SIZE` compiles; one
+/// #415: a `@for` whose output is exactly `MAX_OUTPUT_SIZE` compiles; one
 /// byte more fails with the exact output-cap error, with source maps on and off.
 #[test]
 fn for_loop_output_of_exactly_the_cap_compiles_one_byte_more_fails() {
@@ -1815,7 +1815,7 @@ fn for_loop_output_of_exactly_the_cap_compiles_one_byte_more_fails() {
     }
 }
 
-/// TP-15 (AC-13): a crossing loop in a child's `@extends` override stops on the
+/// #415: a crossing loop in a child's `@extends` override stops on the
 /// crossing pass, source maps off; the warm-up in the base skeleton shares its budget.
 #[test]
 fn for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_maps_off() {
@@ -1825,8 +1825,9 @@ fn for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_maps_off() {
     });
 }
 
-/// TP-15 twin of `for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_maps_off`
-/// with source maps on.
+/// #415: the twin of
+/// `for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_maps_off` with
+/// source maps on.
 #[test]
 fn for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_source_map() {
     let modules = extends_chain(CROSSING_BASE, CROSSING_CHILD);
@@ -1840,7 +1841,7 @@ fn for_loop_output_cap_stops_at_the_crossing_pass_in_extends_region_source_map()
     });
 }
 
-/// TP-15 (AC-13): a crossing loop in an `@include`d module stops on the crossing pass;
+/// #415: a crossing loop in an `@include`d module stops on the crossing pass;
 /// the module is evaluated with its own budget, which its warm-up spends.
 #[test]
 fn for_loop_output_cap_stops_at_the_crossing_pass_in_included_module() {

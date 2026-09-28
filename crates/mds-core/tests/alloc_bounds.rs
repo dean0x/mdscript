@@ -126,7 +126,7 @@ fn error_message<T>(result: Result<T, MdsError>, context: &str) -> String {
 
 #[test]
 fn peak_heap_growth_stays_within_the_output_cap() {
-    // ── Loops (TP-14): a crossing loop holds at most the cap plus one pass ────────
+    // ── Loops (#415): a crossing loop holds at most the cap plus one pass ─────────
     //
     // A small array with a large pass body, so the loop's own copy of the array stays
     // small and the growth measured is the output being built.
@@ -174,7 +174,7 @@ fn peak_heap_growth_stays_within_the_output_cap() {
         );
     }
 
-    // ── replace() (TP-18): an over-cap result is refused before it is allocated ───
+    // ── replace() (#415): an over-cap result is refused before it is allocated ────
     //
     // `s` holds one single-byte match per MiB of result and `to` is 1 MiB, so 300
     // matches ask for a ~300 MiB result. The control's 40 matches give a 40 MiB result
