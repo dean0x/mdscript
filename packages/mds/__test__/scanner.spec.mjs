@@ -46,11 +46,11 @@ const FIXTURES = path.join(__dirname, 'fixtures');
 // `preflightModule` (#414); these tests pair it with the import scanner passed in.
 const { wasm: wasmEngine } = await loadEngines();
 
-function preflightModule(bytes, display, shown) {
+function preflightModule(bytes, display, typed) {
   if (wasmEngine === null) {
     throw new Error('buildModulesMap needs the WASM engine: build crates/mds-wasm/pkg first');
   }
-  return wasmEngine.preflightModule(bytes, display, shown);
+  return wasmEngine.preflightModule(bytes, display, typed);
 }
 
 /**
@@ -1827,9 +1827,9 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const seen = [];
       const engine = {
         scanImportRecords: importRecordsOf(scanImports),
-        preflightModule(bytes, display, shown) {
+        preflightModule(bytes, display, typed) {
           seen.push(bytes.length);
-          return preflightModule(bytes, display, shown);
+          return preflightModule(bytes, display, typed);
         },
       };
       const tooLarge = (n) => ({

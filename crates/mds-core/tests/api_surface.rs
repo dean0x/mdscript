@@ -118,14 +118,28 @@ fn check_module_bytes_function_exists() {
 
 /// #417: `check_module_type` — the resolver's not-an-MDS-file check, shared with the
 /// WASM backend's `preflightModule` — is callable via the crate root: it judges the
-/// key's extension and names the path as typed.
+/// key's extension and names the path as typed. It takes the two as one
+/// `#[non_exhaustive]` `ModuleRef`, built in two named steps — `ModuleRef::keyed`,
+/// then `ModuleKey::typed` — whose fields are readable.
 #[test]
 fn check_module_type_function_exists() {
-    let _: fn(&str, &str, &str) -> Result<(), MdsError> = mds::check_module_type;
-    mds::check_module_type("/p/Doc.mds", "./doc.mds", "hi\n").unwrap();
-    let err = mds::check_module_type("/p/doc.txt", "./sub/../doc.txt", "hi\n").unwrap_err();
+    let _: for<'a> fn(mds::ModuleRef<'a>, &str) -> Result<(), MdsError> = mds::check_module_type;
+    let _: fn(&'static str) -> mds::ModuleKey<'static> = mds::ModuleRef::keyed;
+    let _: fn(mds::ModuleKey<'static>, &'static str) -> mds::ModuleRef<'static> =
+        mds::ModuleKey::typed;
+
+    let module = mds::ModuleRef::keyed("/p/doc.txt").typed("./sub/../doc.txt");
+    let mds::ModuleRef { key, typed, .. } = module;
+    assert_eq!((key, typed), ("/p/doc.txt", "./sub/../doc.txt"));
+    let err = mds::check_module_type(module, "hi\n").unwrap_err();
     assert!(matches!(err, MdsError::NotMdsFile { .. }), "{err:?}");
     assert_eq!(err.to_string(), "not an MDS file: ./sub/../doc.txt");
+    // Control: the extension judged is the key's.
+    mds::check_module_type(
+        mds::ModuleRef::keyed("/p/Doc.mds").typed("./doc.txt"),
+        "hi\n",
+    )
+    .unwrap();
 }
 
 /// #414: `scan_import_records` and its `#[non_exhaustive]` `ImportRecord` /

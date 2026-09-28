@@ -1237,7 +1237,7 @@ struct FileCompileCtx {
     /// The `--vars` path exactly as the user typed it, uncanonicalized (#326, D4).
     /// Used for `RuntimeVarArgs.vars` so the vars-file duplicate-key warning displays
     /// (and reads) the as-typed path rather than its canonical form.
-    vars_path_raw: Option<PathBuf>,
+    vars_path_typed: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
     /// The `-o <path>` or `--out-dir` argument passed by the user, if any.
@@ -1469,7 +1469,7 @@ fn rebuild_file(
     // the "Recompiled" line — so the vars-file duplicate is re-reported exactly
     // once per OBSERVABLE rebuild (tests I16, I18, I20).
     let mut resolved = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_raw.clone(),
+        vars: ctx.vars_path_typed.clone(),
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
@@ -1595,11 +1595,11 @@ fn run_watch_file(
     // #326: keep the --vars argument as the user typed it, separately from the
     // canonicalized form below. `vars_path` (canonical) is used for everything that
     // must match notify's canonicalized event paths (dirs_to_watch, files_of_interest,
-    // event matching); `vars_path_raw` is used only for `RuntimeVarArgs.vars`, so the
+    // event matching); `vars_path_typed` is used only for `RuntimeVarArgs.vars`, so the
     // vars-file duplicate-key warning (D4: "{path} = the --vars arg as typed") displays
     // and reads through the same path the user gave — reading a valid, possibly
     // symlinked path is fine either way, only the DISPLAYED text differs.
-    let vars_path_raw = vars.clone();
+    let vars_path_typed = vars.clone();
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
@@ -1699,7 +1699,7 @@ fn run_watch_file(
     // For the default case (no explicit flag), the path depends on the output kind, which
     // is only known after compilation — so we compile first, then derive.
     let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path_raw.clone(),
+        vars: vars_path_typed.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
@@ -1868,7 +1868,7 @@ fn run_watch_file(
         entry,
         working_dir,
         vars_path,
-        vars_path_raw,
+        vars_path_typed,
         static_set_vars,
         static_set_string_vars,
         output_arg: output,
@@ -2229,7 +2229,7 @@ struct DirWatchCtx {
     /// The `--vars` path exactly as the user typed it, uncanonicalized (#326, D4).
     /// Used for `RuntimeVarArgs.vars` so the vars-file duplicate-key warning displays
     /// (and reads) the as-typed path rather than its canonical form.
-    vars_path_raw: Option<PathBuf>,
+    vars_path_typed: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
     output_base: OutputBase,
@@ -2428,7 +2428,7 @@ fn rebuild_dir_batch(
     ctx.working_dir.restore_if_recreated();
 
     let resolved = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_raw.clone(),
+        vars: ctx.vars_path_typed.clone(),
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
@@ -2585,8 +2585,8 @@ fn dir_watch_startup(
     // canonical absolute path (#413); the config directory it returns is canonical.
     let config = load_config(&watch_root.typed)?;
     // #326: keep the --vars argument as the user typed it (see FileCompileCtx's
-    // vars_path_raw doc for why) — `vars_path` below stays canonical for matching.
-    let vars_path_raw = vars.clone();
+    // vars_path_typed doc for why) — `vars_path` below stays canonical for matching.
+    let vars_path_typed = vars.clone();
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
@@ -2686,7 +2686,7 @@ fn dir_watch_startup(
     // Startup compile: compile all .mds files found under root.
     let all_files = collect_mds_files(root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
     let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path_raw.clone(),
+        vars: vars_path_typed.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
@@ -2815,7 +2815,7 @@ fn dir_watch_startup(
     // the mechanical guard on this.
     {
         let baseline_resolved = build_runtime_vars(RuntimeVarArgs {
-            vars: vars_path_raw.clone(),
+            vars: vars_path_typed.clone(),
             set_vars: static_set_vars.clone(),
             set_string_vars: static_set_string_vars.clone(),
         })?;
@@ -2919,7 +2919,7 @@ fn dir_watch_startup(
         root: watch_root,
         working_dir,
         vars_path,
-        vars_path_raw,
+        vars_path_typed,
         static_set_vars,
         static_set_string_vars,
         output_base,

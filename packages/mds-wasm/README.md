@@ -25,11 +25,11 @@ records: the directive each is written in (`"extends"`, `"frontmatter"`, `"impor
 `"export-from"`), a frontmatter import's index in its `imports:` list, and for `@extends` and
 `@import` the `span` a `mds::file_not_found` error for the path points at (the `@extends` base is
 recorded on its own, even when an import names it too) — and
-`preflightModule(bytes, display, shown)` — a module file's text from its bytes (a `Uint8Array`),
+`preflightModule(bytes, display, typed)` — a module file's text from its bytes (a `Uint8Array`),
 checked as the native backend checks every file it reads: over 10 MiB is `mds::resource_limit` and
 bytes that are not valid UTF-8 are `mds::io`, naming the file by `display` (its path below the project
 root); then a file that is neither `.mds` nor a `.md` declaring `type: mds` is `mds::not_mds`, naming
-it by `shown` (the path as typed).
+it by `typed` (the path as typed).
 
 ### Options
 

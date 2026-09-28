@@ -1,3 +1,6 @@
+// Naming in this file: `shown` is a path as the caller wrote it, raw until it enters a
+// message (the engine calls it `typed`); `display` is a path below the project root, in
+// its on-disk spelling.
 import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, parse, sep } from 'node:path';
@@ -568,9 +571,9 @@ export interface ScannerEngine {
    * (`mds::check_module_bytes`: the per-file cap, then UTF-8), then its type as the
    * resolver checks it before parsing (`mds::check_module_type`: `mds::not_mds`).
    * `display` is the file's path below the project root, in its on-disk spelling;
-   * `shown` is the path the caller typed to reach it, which a `not_mds` error names.
+   * `typed` is the path the caller typed to reach it, which a `not_mds` error names.
    */
-  preflightModule(bytes: Uint8Array, display: string, shown: string): string;
+  preflightModule(bytes: Uint8Array, display: string, typed: string): string;
 }
 
 export interface ModuleScannerOptions {
@@ -721,10 +724,11 @@ interface Located {
    */
   readonly key: string;
   /**
-   * The key the engine resolves the import to by name, before an alias maps it to
-   * `key` (#414); the entry's is `key`.
+   * The key the engine resolves the import to by name — an alias, in
+   * `VirtualFs::with_aliases`' terms — before the alias maps it to `key` (#414); the
+   * entry's is `key`.
    */
-  readonly typedKey: string;
+  readonly aliasKey: string;
   /** Its canonical directory joined with its name as written. */
   readonly path: string;
   /** Its canonical directory. */
@@ -980,10 +984,10 @@ export async function buildModulesMap(
     }
     // An import of `./` names the importing module's own directory, which NativeFs
     // opens and fails to read (`mds::io`); the engine has no key for it.
-    let typedKey = '';
+    let aliasKey = '';
     if (name !== undefined) {
-      typedKey = normalizeVirtualKey(importer.key, importPath);
-      await assertKeyMatchesDisk(importer.dir, importPath, typedKey);
+      aliasKey = normalizeVirtualKey(importer.key, importPath);
+      await assertKeyMatchesDisk(importer.dir, importPath, aliasKey);
     }
     // The parent directory canonicalized (its symlinks followed), the final
     // component joined as written — the pattern of NativeFs::check_symlink_named.
@@ -1004,7 +1008,7 @@ export async function buildModulesMap(
       throw hostileErr;
     }
     const key = name === undefined ? '' : keyOf(projectRoot, resolved);
-    return { key, typedKey, path, dir, resolved };
+    return { key, aliasKey, path, dir, resolved };
   }
 
   /**
@@ -1130,19 +1134,19 @@ export async function buildModulesMap(
 
   /**
    * Record that the engine resolves the import `shown` of a walked module, by name, to
-   * `located.typedKey`, so its alias names the module read: `located.key`. A key names
+   * `located.aliasKey`, so its alias names the module read: `located.key`. A key names
    * one file on disk; should it name another later in the scan, the file was replaced
    * meanwhile, refused as `readModule` refuses a replaced component.
    */
   function recordAlias(located: Located, shown: string): void {
-    if (located.typedKey === '' || located.typedKey === located.key) {
+    if (located.aliasKey === '' || located.aliasKey === located.key) {
       return;
     }
-    const known = aliases.get(located.typedKey);
+    const known = aliases.get(located.aliasKey);
     if (known !== undefined && known !== located.key) {
       throw symlinkError(shown);
     }
-    aliases.set(located.typedKey, located.key);
+    aliases.set(located.aliasKey, located.key);
   }
 
   /**
@@ -1230,7 +1234,7 @@ export async function buildModulesMap(
   }
 
   try {
-    const entryLocated = { key: entryFilename, typedKey: entryFilename, ...entry };
+    const entryLocated = { key: entryFilename, aliasKey: entryFilename, ...entry };
     await walk(entryLocated, entryPath, 0, undefined, false);
   } finally {
     walkFinished = true;

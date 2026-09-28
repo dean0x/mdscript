@@ -1137,7 +1137,7 @@ pub fn scan_import_records(source: &str) -> Result<JsValue, JsValue> {
 ///    not valid UTF-8 are `mds::io` (`invalid UTF-8 in <display>: <reason>`);
 /// 2. the file type, as the resolver checks it before it parses a module
 ///    ([`mds::check_module_type`], #417): neither a `.mds` file nor a `.md` file whose
-///    frontmatter declares `type: mds` is `mds::not_mds` (`not an MDS file: <shown>`).
+///    frontmatter declares `type: mds` is `mds::not_mds` (`not an MDS file: <typed>`).
 ///
 /// A leading byte-order mark is kept.
 ///
@@ -1146,7 +1146,7 @@ pub fn scan_import_records(source: &str) -> Result<JsValue, JsValue> {
 /// - `bytes`: the file's content.
 /// - `display`: the file's path below the project root, in its on-disk spelling. It
 ///    names the file in a bytes error, and its extension is the one judged.
-/// - `shown`: the path the caller typed to reach the file — the entry path as passed,
+/// - `typed`: the path the caller typed to reach the file — the entry path as passed,
 ///   or the import string as written — which a `not_mds` error names.
 ///
 /// Both names are escaped as they enter a message.
@@ -1164,14 +1164,15 @@ pub fn scan_import_records(source: &str) -> Result<JsValue, JsValue> {
 /// console.log(text); // "Hello!\n"
 /// ```
 #[wasm_bindgen(js_name = "preflightModule")]
-pub fn preflight_module(bytes: Vec<u8>, display: &str, shown: &str) -> Result<String, JsValue> {
+pub fn preflight_module(bytes: Vec<u8>, display: &str, typed: &str) -> Result<String, JsValue> {
     // Owned Strings required so the closure satisfies UnwindSafe.
     let display = display.to_string();
-    let shown = shown.to_string();
+    let typed = typed.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
         let source = mds::check_module_bytes(bytes, &display).map_err(mds_error_to_js)?;
-        mds::check_module_type(&display, &shown, &source).map_err(mds_error_to_js)?;
+        let module = mds::ModuleRef::keyed(&display).typed(&typed);
+        mds::check_module_type(module, &source).map_err(mds_error_to_js)?;
         Ok(source)
     }))
 }

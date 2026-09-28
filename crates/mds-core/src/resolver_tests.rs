@@ -4307,16 +4307,16 @@ fn source_map_root_safety_net_never_fails_a_compile() {
     }
 }
 
-// ── #417: validate_file_type ──────────────────────────────────────────────
+// ── #417: check_module_type ───────────────────────────────────────────────
 
-/// `validate_file_type` judges the extension on the resolved key and names the path
+/// `check_module_type` judges the extension on the resolved key and names the path
 /// as typed, escaped (#417). The escape is defence in depth — every built-in route
 /// refuses a forbidden character in the typed path first — so only this unit test
 /// can reach it.
 #[test]
-fn validate_file_type_judges_the_key_and_names_the_shown_path_escaped() {
-    let check = |key: &str, shown: &str, source: &str| {
-        validate_file_type(KeyRef { key, shown }, source).map_err(|e| e.to_string())
+fn check_module_type_judges_the_key_and_names_the_typed_path_escaped() {
+    let check = |key: &str, typed: &str, source: &str| {
+        check_module_type(ModuleRef { key, typed }, source).map_err(|e| e.to_string())
     };
     let bs = '\\';
     let hostile = format!("./a{}b\tc\u{202E}d.txt", '\x1b');
