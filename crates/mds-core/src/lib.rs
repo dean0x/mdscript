@@ -1461,14 +1461,15 @@ pub fn lint(
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
-    {
+    let (_, key) = {
         let mut cache = ModuleCache::new();
         let mut warnings = vec![];
-        cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
-    }
+        cache.resolve_path_intrinsic_keyed(path_str, &vars, &mut warnings)?
+    };
     // Read source for lint re-parse as NativeFs::read reads a module: at most one byte
-    // past the cap (#428), then its own post-read checks.
-    let source = fs::read_module_file(path, path_str)?;
+    // past the cap (#428), then its own post-read checks. It re-reads the key the gate
+    // checked — the canonical path — never the path as typed; messages name the latter.
+    let source = fs::read_module_file(Path::new(&key), path_str)?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1865,9 +1866,10 @@ pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsE
     let path_str = path_to_str(path)?;
     // PF-004: guard the vars-file path through the same symlink check that the
     // resolver applies to every imported file — avoids a raw read that bypasses
-    // the security gate. check_symlink returns the canonical path; we use the
+    // the security gate. check_symlink returns the canonical path, and that is the
+    // file read — the one checked, never the path as typed again (#428); we use the
     // original path for error messages (it names what the caller passed).
-    NativeFs::check_symlink(path).map_err(|e| match e {
+    let canonical = NativeFs::check_symlink(path).map_err(|e| match e {
         MdsError::ImportError { .. } => MdsError::import_error(format!(
             "symlinks are not allowed in vars file path: {path_str}"
         )),
@@ -1875,7 +1877,7 @@ pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsE
     })?;
     // Read at most one byte past the cap (#428): a file over it when it is opened is
     // never read, and one that grows past it while it is read is read no further.
-    let bytes = match fs::read_capped(path, MAX_FILE_SIZE)
+    let bytes = match fs::read_capped(&canonical, MAX_FILE_SIZE)
         .map_err(|e| MdsError::io(format!("cannot read vars file {path_str}: {e}")))?
     {
         fs::Capped::Bytes(bytes) if bytes.len() as u64 <= MAX_FILE_SIZE => bytes,

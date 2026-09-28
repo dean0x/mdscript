@@ -422,8 +422,8 @@ fn file_too_large(size: u64, display: &str) -> MdsError {
 }
 
 /// Read the module file at `path` and check it as [`check_module_bytes`] does, naming
-/// it by `display`, without ever holding more than one byte over
-/// [`crate::MAX_FILE_SIZE`] of it (#428): a file over the cap when it is opened is
+/// it by `display`, escaped in every refusal, without ever holding more than one byte
+/// over [`crate::MAX_FILE_SIZE`] of it (#428): a file over the cap when it is opened is
 /// refused before a byte is read, with its size; one that grows past the cap while it
 /// is read is read to one byte past the cap and refused. A module that is not a regular
 /// file — a directory, a FIFO, a device, a socket — is refused before it is opened, as
@@ -434,7 +434,12 @@ pub(crate) fn read_module_file(path: &Path, display: &str) -> Result<String, Mds
     let bytes = match read_regular_capped(path, MAX_FILE_SIZE) {
         Ok(Capped::Bytes(bytes)) => bytes,
         Ok(Capped::TooLarge(size)) => return Err(file_too_large(size, display)),
-        Err(e) => return Err(MdsError::io(format!("cannot read {display}: {e}"))),
+        Err(e) => {
+            return Err(MdsError::io(format!(
+                "cannot read {}: {e}",
+                crate::lint::escape_path_for_message(display)
+            )));
+        }
     };
     check_module_bytes(bytes, display)
 }
@@ -2303,6 +2308,33 @@ mod tests {
             err.to_string(),
             "invalid UTF-8 in bad.mds: invalid utf-8 sequence of 1 bytes from index 2"
         );
+    }
+
+    /// `cannot read` escapes the display it names, as the size and UTF-8 refusals do,
+    /// whether the file is missing or not a regular file; a clean one is unchanged.
+    #[test]
+    fn read_module_file_escapes_the_display_in_cannot_read() {
+        let dir = TempDir::new().unwrap();
+        let esc = char::from_u32(0x1b).unwrap();
+        let hostile = format!("a{esc}b.mds");
+        let missing = dir.path().join("missing.mds");
+        let gone = std::fs::metadata(&missing).unwrap_err().to_string();
+        let mut mismatches = Vec::new();
+        for (path, reason) in [
+            (missing, gone),
+            (dir.path().to_path_buf(), "not a regular file".to_string()),
+        ] {
+            for (display, named) in [
+                (hostile.as_str(), format!("a{}u001Bb.mds", '\\')),
+                ("clean.mds", "clean.mds".to_string()),
+            ] {
+                let got = read_module_file(&path, display).map_err(|e| e.to_string());
+                if got != Err(format!("cannot read {named}: {reason}")) {
+                    mismatches.push(format!("{display:?} at {}: {got:?}", path.display()));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     /// Resolve `entry` as the resolver resolves an entry, then read it on a thread of

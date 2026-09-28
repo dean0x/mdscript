@@ -1326,10 +1326,15 @@ preserves `\n`. Two construction sites produce such messages:
 
 - **CLI `miette::miette!()` messages**, which interpolate `mds.json` values and
   filesystem paths.
-- **`mds-core` `MdsError` message bodies**, which interpolate paths and `io::Error`
-  causes (`cannot read {path}: {e}`, `invalid UTF-8 in {path}: {e}` in
-  `crates/mds-core/src/fs.rs`) and template identifiers (`invalid import alias:
-  '{alias}'` in `parser_helpers.rs`).
+- **`mds-core` `MdsError` message bodies**, which interpolate `io::Error` causes — the
+  operating system's own text, `{e}` in `cannot resolve path {path}: {e}` in
+  `crates/mds-core/src/fs.rs` — and template identifiers (`invalid import alias:
+  '{alias}'` in `parser_helpers.rs`, `'{name}' is not exported from '{path}'` in
+  `resolver.rs`). The paths they name are checked first: an entry, import,
+  base-directory or vars-file path carrying a forbidden character of §4.6 — `\n`
+  among them — is refused, named escaped, before any other message can name it, and
+  the native backend's module-read refusals (`cannot read`, `invalid UTF-8 in`,
+  `file too large`) escape their path where they are built as well.
 
 Both are **known residuals, not closed boundaries**, and they are the same defect at two
 different construction sites. A hostile path or identifier containing `\n` survives into

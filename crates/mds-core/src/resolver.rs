@@ -426,12 +426,26 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
+        self.resolve_path_intrinsic_keyed(path, runtime_vars, warnings)
+            .map(|(output, _)| output)
+    }
+
+    /// [`Self::resolve_path_intrinsic`], also returning the entry's key — on [`NativeFs`]
+    /// its canonical path — for a caller that reads the entry again itself, so that it
+    /// re-reads the file this resolved and checked, never the path as typed (#428).
+    pub(crate) fn resolve_path_intrinsic_keyed(
+        &mut self,
+        path: &str,
+        runtime_vars: &HashMap<String, Value>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, String), MdsError> {
         let key = self.resolve_entry_key(path)?;
         let entry = KeyRef {
             key: &key,
             shown: path,
         };
-        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
+        let output = self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)?;
+        Ok((output, key))
     }
 
     /// Like [`Self::resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
