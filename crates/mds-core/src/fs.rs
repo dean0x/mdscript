@@ -55,7 +55,9 @@ const MAX_PATH_SEGMENTS: usize = 256;
 ///   returns `true`. The resolver never sees those paths, so this is the one check
 ///   it cannot make on the backend's behalf. [`NativeFs`] scans every canonical path
 ///   it resolves (`mds::io`); [`VirtualFs`] composes its keys only from entry keys,
-///   import strings and base directories the resolver has already checked.
+///   import strings and base directories the resolver has already checked, and from
+///   alias targets, each of which [`VirtualFs::with_aliases`] checks as a key an
+///   import can resolve to.
 /// - **Path traversal prevention**: `resolve_entry` and `normalize_in_dir` must
 ///   reject paths that escape the intended root (e.g., `../../../etc/passwd`).
 /// - **Direct calls**: `resolve_entry` and `normalize_in_dir` must refuse an empty
@@ -377,11 +379,12 @@ fn check_segment_count(path: &str) -> Result<(), MdsError> {
 /// template's first character.
 ///
 /// `display` names the file in both messages — [`NativeFs`] passes its path relative
-/// to the project root — escaped with [`crate::escape_path_for_message`]. This is the
-/// one implementation of these checks: [`NativeFs`] reads a module and calls it,
-/// `mds::lint` calls it when it re-reads its entry, and so does `@mdscript/mds`'s WASM
-/// backend, whose JS pre-scanner reads each file itself (`preflightModule`), so both
-/// backends refuse the same bytes with the same error (#414).
+/// to the project root — escaped with [`crate::escape_path_for_message`]. It is the
+/// one implementation of these checks for a module read as bytes: [`NativeFs`] reads a
+/// module and calls it, `mds::lint` calls it when it re-reads its entry, and so does
+/// `@mdscript/mds`'s WASM backend, whose JS pre-scanner reads each file itself
+/// (`preflightModule`), so both backends refuse the same bytes with the same error
+/// (#414). [`VirtualFs`] holds text, not bytes: its `read` keeps its own size check.
 ///
 /// # Errors
 ///

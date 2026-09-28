@@ -1556,11 +1556,12 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
     compile(Path::new(path), None)
 }
 
-/// Extract all import and re-export paths from an MDS source string.
+/// Extract the `@extends`, import and re-export paths of an MDS source string.
 ///
-/// Parses the source and walks the AST, collecting the `path` field from every
-/// import and re-export directive:
-/// - Frontmatter `imports:` key (alias, merge, and selective forms) — returned FIRST
+/// Parses the source and walks the AST, collecting the `path` field from the
+/// `@extends` directive and from every import and re-export directive:
+/// - `@extends "path"` → path — returned FIRST
+/// - Frontmatter `imports:` key (alias, merge, and selective forms) — then these
 /// - `@import "path" as alias` → path
 /// - `@import "path"` (merge) → path
 /// - `@import { names } from "path"` → path
@@ -1568,7 +1569,8 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 /// - `@export * from "path"` → path
 /// - `@export name` (named, no path) → skipped
 ///
-/// Frontmatter paths are inserted before body paths, matching resolution order.
+/// The `@extends` path comes first, then the frontmatter paths, then the body's, the
+/// order [`scan_import_records`] documents.
 /// Duplicate paths are deduplicated while preserving insertion order.
 /// Returns an error if the source has a syntax error.
 ///
