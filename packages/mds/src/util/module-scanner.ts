@@ -1053,9 +1053,11 @@ async function readModule(
  * directory — is listed in `aliases`, which the engine's `moduleAliases` option maps
  * to the module's key (#414).
  *
- * Every refusal is the error the native backend throws for the same input — its
- * code, its message and its `help` — naming the path as written, never a resolved
- * absolute path (#265, #408, #414):
+ * Except for the differences listed at the end, each refusal below is the error the
+ * native backend throws for the same input — its code, its message and its `help` —
+ * naming the path as written, never a resolved absolute path; a refusal of a file's
+ * bytes names the file by its path below the project root, as native does (#265,
+ * #408, #414):
  * - an entry path that is empty, contains NUL or carries a forbidden path character
  *   (`mds::io`), and an import string that is not `./`/`../`-relative, contains NUL
  *   or carries one (`mds::import`), before the filesystem is touched;
