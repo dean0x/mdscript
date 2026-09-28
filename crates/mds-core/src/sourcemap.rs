@@ -2022,7 +2022,7 @@ mod tests {
         assert!(b.sources.get(1).is_none(), "only the seed is registered");
     }
 
-    /// #416 / AC-1: every entry is the `Origin` that registered it, sharing that
+    /// #416: every entry is the `Origin` that registered it, sharing that
     /// module's `Arc`s — no source text is copied.
     #[test]
     fn map_builder_shares_origin_arc_with_every_registered_source() {
@@ -2058,7 +2058,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&entry.source, &copy.source));
     }
 
-    /// #416 / AC-2: `source_index` dedups through the key index — by key, not by
+    /// #416: `source_index` dedups through the key index — by key, not by
     /// pointer, display or content — with `"<source>"` and `"input.mds"` one key.
     #[test]
     fn map_builder_source_index_dedups_by_key() {
@@ -2124,9 +2124,9 @@ mod tests {
         assert_eq!(recorded, vec![(0, 1), (5, 0), (9, 1)]);
     }
 
-    /// #416 / AC-2: the remap cache lives in the builder — K splices of one fragment
+    /// #416: the remap cache lives in the builder — K splices of one fragment
     /// register its sources once and hold one cache entry — and a splice carries each
-    /// source's own display path (AC-9).
+    /// source's own display path.
     #[test]
     fn map_builder_remap_cache_holds_one_entry_per_fragment() {
         let m = origin("/p/m.mds", "m.mds", "m text");
@@ -2167,7 +2167,7 @@ mod tests {
         assert_eq!(b.sources.len(), 3);
     }
 
-    /// #416 / AC-2 (G10): once the segment cap has dropped a segment the map is
+    /// #416: once the segment cap has dropped a segment the map is
     /// discarded, so a later splice registers nothing and builds no remap.
     #[test]
     fn map_builder_remap_stops_once_the_segment_cap_has_dropped() {

@@ -2205,7 +2205,7 @@ const MANY_REGIONS_VALUE: &str = "V416";
 /// inside a fifth of it (debug profile).
 const MANY_REGIONS_BOUND: Duration = Duration::from_secs(10);
 
-/// #416 / AC-3: a source-mapped compile of a base with very many top-level skeleton
+/// #416: a source-mapped compile of a base with very many top-level skeleton
 /// nodes finishes under an absolute bound; the same chain with maps off is the control.
 ///
 /// The compile runs on its own thread and is awaited with `recv_timeout`, so a

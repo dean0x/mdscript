@@ -3035,7 +3035,7 @@ mod tests {
         }
     }
 
-    /// #416 / AC-1, AC-2: K `@include`s of one module — separate sites and a loop —
+    /// #416: K `@include`s of one module — separate sites and a loop —
     /// splice through one remap-cache entry in the builder, and every registered
     /// source is the `Origin` that registered it, sharing its `Arc`s.
     #[test]

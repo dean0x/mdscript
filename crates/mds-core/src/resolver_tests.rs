@@ -3834,7 +3834,7 @@ fn parse_nodes(source: &str) -> Vec<Node> {
         .body
 }
 
-/// #416 / AC-1: after region-by-region evaluation every builder entry is the region
+/// #416: after region-by-region evaluation every builder entry is the region
 /// origin that registered it, pointer-identical to that module's source — including
 /// when a later region carries another `Origin` value of an already-registered module
 /// (a clone, or a separate allocation of the same key).
@@ -3983,7 +3983,7 @@ fn prompt_map_is_kept_only_for_an_exported_prompt_that_renders_text() {
     }
 }
 
-/// #416 / AC-9 (G5): a region whose module was first registered in the builder by an
+/// #416: a region whose module was first registered in the builder by an
 /// `@include` splice — a source of the included module's fragment — names that
 /// module's root-relative display path in a runtime diagnostic, never its canonical
 /// key, and the error is identical with and without a builder.
