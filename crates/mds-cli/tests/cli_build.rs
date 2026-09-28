@@ -1774,16 +1774,22 @@ fn mds_json_severity_goes_through_the_one_severity_parser() {
     // built at runtime (PF-018).
     let escaped_warn = format!("{}u0077arn", '\\');
     let hostile = format!("{}[31mBAD", '\x1b');
-    let unknown = "invalid mds.json at ./mds.json: unknown severity; \
-                   expected \"off\", \"info\", \"warn\", or \"error\" at line 1 column";
-    let not_a_string = "invalid mds.json at ./mds.json: invalid type: map, expected a string";
+    // The config as the CLI names it: `./mds.json`, `.\mds.json` on Windows.
+    let config = std::path::Path::new(".").join("mds.json");
+    let config = config.display();
+    let unknown = format!(
+        "invalid mds.json at {config}: unknown severity; \
+         expected \"off\", \"info\", \"warn\", or \"error\" at line 1 column"
+    );
+    let not_a_string =
+        format!("invalid mds.json at {config}: invalid type: map, expected a string");
     let rows = [
         // Control: a known spelling loads, and the build writes its output.
         (serde_json::json!("warn"), None),
-        (serde_json::json!("Warn"), Some(unknown)),
-        (serde_json::json!(escaped_warn), Some(unknown)),
-        (serde_json::json!(hostile), Some(unknown)),
-        (serde_json::json!({ "warn": null }), Some(not_a_string)),
+        (serde_json::json!("Warn"), Some(&unknown)),
+        (serde_json::json!(escaped_warn), Some(&unknown)),
+        (serde_json::json!(hostile), Some(&unknown)),
+        (serde_json::json!({ "warn": null }), Some(&not_a_string)),
     ];
     for (value, expected) in rows {
         let config = serde_json::json!({ "lint": { "rules": { "unused-variable": &value } } });
