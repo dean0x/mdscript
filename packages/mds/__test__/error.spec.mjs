@@ -705,18 +705,14 @@ describe('error shape', () => {
         code: 'mds::invalid_options',
         message:
           `options.rules["${rule}"]: unknown severity "${sev}"; ` +
-          'valid values are "off", "info", "warn", "error"',
+          'expected "off", "info", "warn", or "error"',
         help: null,
         span: null,
       });
       assert.deepEqual(errorShape(thrownBy(wasm, `${label} wasm`)), native, `${label}: WASM`);
       assert.equal(py.rejected[i]?.code, 'mds::invalid_options', `${label}: Python`);
-      assert.ok(
-        py.rejected[i].message.startsWith(`rules["${rule}"]: unknown severity `),
-        `${label}: Python message: ${py.rejected[i].message}`,
-      );
-      // Python names the value as napi does, not as a Rust debug string (#418).
-      assert.equal(severitySegment(py.rejected[i].message), sev, `${label}: Python severity`);
+      // mds-core words it for every binding; Python names its map `rules` (#418).
+      assert.equal(`options.${py.rejected[i].message}`, native.message, `${label}: Python`);
     }
   });
 
@@ -724,9 +720,11 @@ describe('error shape', () => {
     // #418, a PF-007 differential: a `rules` key or severity a binding names in its
     // options error is escaped with mds-core's WIRE escaper — ESC, LF, DEL, a C1
     // control and a bidi override each become the six-character escape text, and TAB
-    // stays raw. Each binding keeps its own wording, so the surfaces are compared on
-    // the quoted rule-name and severity segments; a clean name's whole message is
-    // pinned as it was. Every surface is required in CI; locally a missing one skips.
+    // stays raw. mds-core words the error for all three, so Python's message is
+    // napi's with its map named `rules`, and WASM's is napi's; the quoted rule-name
+    // and severity segments are anchored to the escaper's output, and a clean name's
+    // whole message is pinned. Every surface is required in CI; locally a missing one
+    // skips.
     const engines = await loadEngines();
     const python = findPythonForMarkdownScript();
     if (!requireEngines(t, { ...engines, python }, 'U-E-RULES')) return;
@@ -737,7 +735,7 @@ describe('error shape', () => {
       'r' + cps.map((cp) => (cp === TAB ? String.fromCodePoint(cp) : escapeText(cp)) + 'x').join('');
     const rule = 'unused-variable';
     const modules = { 'main.mds': 'Hello!\n' };
-    const valid = '"off", "info", "warn", "error"';
+    const expected = 'expected "off", "info", "warn", or "error"';
     const cases = [
       { name: 'hostile name, non-string value', rule: hostile, value: 1, ruleShown: shown },
       { name: 'hostile name, unknown severity', rule: hostile, value: 'bogus', ruleShown: shown, sevShown: 'bogus' },
@@ -749,7 +747,7 @@ describe('error shape', () => {
         value: 1,
         ruleShown: rule,
         napi: `options.rules["${rule}"] must be a severity string, got number`,
-        python: `rules["${rule}"] must be a string, got number`,
+        python: `rules["${rule}"] must be a severity string, got number`,
       },
       {
         name: 'clean name, unknown severity',
@@ -757,8 +755,8 @@ describe('error shape', () => {
         value: 'bogus',
         ruleShown: rule,
         sevShown: 'bogus',
-        napi: `options.rules["${rule}"]: unknown severity "bogus"; valid values are ${valid}`,
-        python: `rules["${rule}"]: unknown severity "bogus"; expected "off", "info", "warn", or "error"`,
+        napi: `options.rules["${rule}"]: unknown severity "bogus"; ${expected}`,
+        python: `rules["${rule}"]: unknown severity "bogus"; ${expected}`,
       },
     ];
     const py = pythonJson(
@@ -788,6 +786,7 @@ describe('error shape', () => {
       assert.equal(napi.code, 'mds::invalid_options', `${label}: ${napi.message}`);
       assert.deepEqual(wasm, napi, `${label}: WASM must match napi`);
       assert.equal(py.errors[i]?.code, 'mds::invalid_options', `${label}: Python`);
+      assert.equal(`options.${py.errors[i].message}`, napi.message, `${label}: Python must match napi`);
       // The shared value, anchored (PF-013): every surface names the rule and the
       // severity exactly as the escaper shows them.
       for (const [surface, message] of [['napi', napi.message], ['Python', py.errors[i].message]]) {

@@ -1948,13 +1948,14 @@ describe('unknown rule name warning (AC-224 D8)', () => {
   });
 
   // L-N-RULES-ESC (#418, TP-28): a rule name or severity the `rules` error names is
-  // WIRE-escaped — ESC and LF as the six-character escape text, TAB raw — and a clean
-  // name's message is unchanged (the control). Hostile characters are built at runtime.
+  // WIRE-escaped — ESC and LF as the six-character escape text, TAB raw — in the
+  // wording mds-core gives every binding; a clean name's message is the control.
+  // Hostile characters are built at runtime.
   test('L-N-RULES-ESC: a hostile rule name and severity are escaped in the rules error', () => {
     const ch = (cp) => String.fromCodePoint(cp);
     const hostile = `a${ch(0x1b)}b${ch(0x0a)}c${ch(0x09)}d`;
     const shown = `a${escapeText(0x1b)}b${escapeText(0x0a)}c${ch(0x09)}d`;
-    const valid = 'valid values are "off", "info", "warn", "error"';
+    const valid = 'expected "off", "info", "warn", or "error"';
     const cases = [
       [{ [hostile]: 1 }, `options.rules["${shown}"] must be a severity string, got number`],
       [

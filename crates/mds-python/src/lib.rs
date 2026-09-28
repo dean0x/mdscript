@@ -1336,34 +1336,11 @@ fn extract_rules(
             ),
         ));
     };
-    let mut rules_map = HashMap::with_capacity(map.len());
-    // The rule name and severity are the caller's text, WIRE-escaped as each message is
-    // built in the `rules["<name>"]` form napi and WASM use (#418); TAB stays raw.
-    for (key, val) in map {
-        let serde_json::Value::String(s) = &val else {
-            return Err(options_error(
-                py,
-                &format!(
-                    "rules[\"{name}\"] must be a string, got {}",
-                    json_type_name(&val),
-                    name = mds::sanitize_control_chars_wire(&key),
-                ),
-            ));
-        };
-        // mds-core's one severity parser: the four exact spellings only (#175).
-        let severity: mds::Severity = s.parse().map_err(|_| {
-            options_error(
-                py,
-                &format!(
-                    "rules[\"{name}\"]: unknown severity \"{value}\"; \
-                     expected \"off\", \"info\", \"warn\", or \"error\"",
-                    name = mds::sanitize_control_chars_wire(&key),
-                    value = mds::sanitize_control_chars_wire(s),
-                ),
-            )
-        })?;
-        rules_map.insert(key, severity);
-    }
+    // mds-core parses every severity and words the error, the rule name and the value
+    // escaped, as it does for napi and WASM; the map is named `rules`, the keyword
+    // argument (#418).
+    let rules_map =
+        mds::parse_rule_severities(map, "rules").map_err(|message| options_error(py, &message))?;
     // D8: detect unknown rule names and build config in one step via
     // from_rules_checked. The return type structurally forces the caller
     // to handle the unknowns report — a fifth caller cannot accidentally

@@ -74,7 +74,7 @@ pub use lint::{
 };
 pub use options::{
     attach_lint_warnings, format_unknown_keys_error, json_type_name, parse_json_vars,
-    reject_unknown_json_keys, VarsError,
+    parse_rule_severities, reject_unknown_json_keys, VarsError,
 };
 pub use resolver::{check_module_type, ModuleCache, ModuleKey, ModuleRef};
 pub use source_path::relativize_source;

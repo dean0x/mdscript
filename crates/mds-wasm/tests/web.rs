@@ -1979,9 +1979,10 @@ fn hostile_and_shown() -> (String, String) {
 #[wasm_bindgen_test]
 fn wasm_lint_rules_error_wire_escapes_rule_name_and_severity() {
     // W-RULES-ESC (#418, TP-28): a rule name or severity the `rules` error names is
-    // WIRE-escaped; a clean name's message is unchanged (the control).
+    // WIRE-escaped, in the wording mds-core gives every binding; a clean name's message
+    // is the control.
     let (hostile, shown) = hostile_and_shown();
-    let valid = "valid values are \"off\", \"info\", \"warn\", \"error\"";
+    let valid = "expected \"off\", \"info\", \"warn\", or \"error\"";
     let cases = [
         (
             serde_json::json!({ hostile.clone(): 1 }),

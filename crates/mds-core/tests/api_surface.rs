@@ -1849,6 +1849,33 @@ fn lint_types_exist() {
     assert_eq!(from_json(serde_json::json!("info")), Ok(Severity::Info));
     assert_eq!(from_json(serde_json::json!("Info")), Err(err.to_string()));
 
+    // #418: a binding's `rules` map goes through one parser, which words both errors —
+    // the rule name and the value escaped, the field named as the binding passes it.
+    type Rules = serde_json::Map<String, serde_json::Value>;
+    type Severities = HashMap<String, Severity>;
+    let _: fn(Rules, &str) -> Result<Severities, String> = mds::parse_rule_severities;
+    let rules = |value| -> Rules {
+        serde_json::from_value(serde_json::json!({ "unused-variable": value })).unwrap()
+    };
+    assert_eq!(
+        mds::parse_rule_severities(rules(serde_json::json!("warn")), "options.rules"),
+        Ok(HashMap::from([(
+            "unused-variable".to_string(),
+            Severity::Warn
+        )]))
+    );
+    assert_eq!(
+        mds::parse_rule_severities(rules(serde_json::json!("Warn")), "rules"),
+        Err(format!(
+            "rules[\"unused-variable\"]: unknown severity \"Warn\"; {}",
+            &err.to_string()["unknown severity; ".len()..]
+        ))
+    );
+    assert_eq!(
+        mds::parse_rule_severities(rules(serde_json::json!(1)), "options.rules"),
+        Err("options.rules[\"unused-variable\"] must be a severity string, got number".to_string())
+    );
+
     // LintConfig has a `rules` field (HashMap<String, Severity>).
     let (config, _) = LintConfig::from_rules_checked(HashMap::from([(
         "unused-variable".to_string(),

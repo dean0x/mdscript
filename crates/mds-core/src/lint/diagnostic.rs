@@ -296,7 +296,19 @@ pub struct ParseSeverityError;
 
 impl fmt::Display for ParseSeverityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("unknown severity; expected ")?;
+        write!(f, "unknown severity; expected {SeveritySpellings}")
+    }
+}
+
+impl std::error::Error for ParseSeverityError {}
+
+/// Every spelling [`Severity`]'s `FromStr` accepts, as a severity error lists them:
+/// `"off", "info", "warn", or "error"`. [`ParseSeverityError`] and a binding's `rules`
+/// error ([`crate::parse_rule_severities`]) both list them with it.
+pub(crate) struct SeveritySpellings;
+
+impl fmt::Display for SeveritySpellings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let last = Severity::ALL.len() - 1;
         for (i, severity) in Severity::ALL.into_iter().enumerate() {
             let separator = match i {
@@ -309,8 +321,6 @@ impl fmt::Display for ParseSeverityError {
         Ok(())
     }
 }
-
-impl std::error::Error for ParseSeverityError {}
 
 // ── TextEdit ──────────────────────────────────────────────────────────────────
 

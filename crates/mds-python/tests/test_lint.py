@@ -675,17 +675,17 @@ def _hostile_and_shown() -> tuple[str, str]:
 
 def test_py_rules_error_wire_escapes_rule_name_and_severity() -> None:
     """#418 (TP-28): a rule name or severity the ``rules`` error names is WIRE-escaped,
-    in the ``rules["<name>"]`` form napi and WASM use rather than a Rust debug string;
-    a clean name's message is unchanged (the control)."""
+    in the wording mds-core gives napi and WASM too, the map named ``rules``; a clean
+    name's message is the control."""
     hostile, shown = _hostile_and_shown()
     expected = '"off", "info", "warn", or "error"'
     cases: list[tuple[dict[str, object], str]] = [
-        ({hostile: 1}, f'rules["{shown}"] must be a string, got number'),
+        ({hostile: 1}, f'rules["{shown}"] must be a severity string, got number'),
         (
             {"unused-variable": hostile},
             f'rules["unused-variable"]: unknown severity "{shown}"; expected {expected}',
         ),
-        ({"unused-variable": 1}, 'rules["unused-variable"] must be a string, got number'),
+        ({"unused-variable": 1}, 'rules["unused-variable"] must be a severity string, got number'),
     ]
     for rules, message in cases:
         with pytest.raises(m.MdsError) as ei:

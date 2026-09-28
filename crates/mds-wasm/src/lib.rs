@@ -558,28 +558,10 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
         )));
     };
 
-    let mut rules = std::collections::HashMap::new();
-    // The rule name and severity are the caller's text, WIRE-escaped as each message
-    // is built (#418); identifiers, not paths, so TAB stays raw.
-    for (key, val) in rules_map {
-        let serde_json::Value::String(s) = &val else {
-            return Err(options_error(&format!(
-                "options.rules[\"{name}\"] must be a severity string, got {}",
-                json_type_name(&val),
-                name = mds::sanitize_control_chars_wire(&key),
-            )));
-        };
-        // mds-core's one severity parser: the four exact spellings only (#175).
-        let severity: mds::Severity = s.parse().map_err(|_| {
-            options_error(&format!(
-                "options.rules[\"{name}\"]: unknown severity \"{value}\"; \
-                 valid values are \"off\", \"info\", \"warn\", \"error\"",
-                name = mds::sanitize_control_chars_wire(&key),
-                value = mds::sanitize_control_chars_wire(s),
-            ))
-        })?;
-        rules.insert(key, severity);
-    }
+    // mds-core parses every severity and words the error, the rule name and the value
+    // escaped, as it does for napi and Python (#418).
+    let rules = mds::parse_rule_severities(rules_map, "options.rules")
+        .map_err(|message| options_error(&message))?;
     // D8: detect unknown rule names and build config in one step via
     // from_rules_checked. The return type structurally forces the caller
     // to handle the unknowns report — a fifth caller cannot accidentally

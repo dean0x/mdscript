@@ -5,6 +5,7 @@
 //! 2. Validate and convert a JSON vars object into a `HashMap<String, Value>`.
 //! 3. Reject unknown option keys with a uniform error message.
 //! 4. Inject `lint_warnings` into the canonical-JSON result for unknown rule names.
+//! 5. Parse a `rules` map into per-rule severities — the Python binding too.
 //!
 //! Centralising these functions here eliminates identical copies that previously
 //! lived in `mds-wasm/src/lib.rs` and `mds-napi/src/lib.rs`, and ensures the
@@ -14,7 +15,8 @@
 use std::collections::HashMap;
 
 use crate::error::MdsError;
-use crate::lint::sanitize_control_chars_wire;
+use crate::lint::diagnostic::SeveritySpellings;
+use crate::lint::{sanitize_control_chars_wire, Severity};
 use crate::value::Value;
 
 // ── json_type_name ────────────────────────────────────────────────────────────
@@ -209,6 +211,82 @@ pub fn reject_unknown_json_keys(
     Err(format_unknown_keys_error(&unknowns, known))
 }
 
+// ── parse_rule_severities ─────────────────────────────────────────────────────
+
+/// Parse a `rules` map — rule name → severity spelling — into the severity each rule
+/// is set to.
+///
+/// The napi, WASM and Python bindings each convert the caller's `rules` value to a
+/// JSON object and call this, so every binding reads a severity, and words its error,
+/// the same way; each only wraps the message in its own error object (#418). Pass the
+/// result to [`crate::LintConfig::from_rules_checked`].
+///
+/// `field` names the map in a message as the caller of the binding writes it —
+/// `"options.rules"` on napi and WASM, `"rules"` for Python's keyword argument. It is
+/// the binding's own text, and is shown as given.
+///
+/// # Errors
+///
+/// The message for the first rule, in the map's key order, whose value is not one of
+/// [`Severity`]'s four spellings (its `FromStr`, the one severity parser):
+/// - `<field>["<name>"] must be a severity string, got <type>` for a value that is not
+///   a string, `<type>` as [`json_type_name`] names it;
+/// - `<field>["<name>"]: unknown severity "<value>"; expected "off", "info", "warn", or
+///   "error"` for any other string.
+///
+/// The rule name and the value are the caller's text, so each is WIRE-escaped with
+/// [`sanitize_control_chars_wire`] as the message is built: control characters, DEL
+/// and the bidi/format hazards become escape text, and TAB stays raw — a rule name is
+/// an identifier, not a path. A name and a value with none of those characters show
+/// unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use mds::{parse_rule_severities, Severity};
+/// use serde_json::{json, Map, Value};
+///
+/// let rules: Map<String, Value> = serde_json::from_value(json!({ "unused-variable": "off" }))?;
+/// let severities = parse_rule_severities(rules, "options.rules").unwrap();
+/// assert_eq!(severities["unused-variable"], Severity::Off);
+///
+/// let rules: Map<String, Value> = serde_json::from_value(json!({ "unused-variable": "Off" }))?;
+/// assert_eq!(
+///     parse_rule_severities(rules, "rules").unwrap_err(),
+///     "rules[\"unused-variable\"]: unknown severity \"Off\"; \
+///      expected \"off\", \"info\", \"warn\", or \"error\""
+/// );
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+// `#[inline]` so each binding compiles it at its own optimization level: mds-wasm is
+// built for size and mds-core at opt-level 3, and compiled in mds-core this function
+// measured about 3.2 KB larger in the WASM binary.
+#[inline]
+pub fn parse_rule_severities(
+    rules: serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<HashMap<String, Severity>, String> {
+    let mut severities = HashMap::with_capacity(rules.len());
+    for (name, value) in rules {
+        let serde_json::Value::String(spelling) = &value else {
+            return Err(format!(
+                "{field}[\"{}\"] must be a severity string, got {}",
+                sanitize_control_chars_wire(&name),
+                json_type_name(&value)
+            ));
+        };
+        let Ok(severity) = spelling.parse::<Severity>() else {
+            return Err(format!(
+                "{field}[\"{}\"]: unknown severity \"{}\"; expected {SeveritySpellings}",
+                sanitize_control_chars_wire(&name),
+                sanitize_control_chars_wire(spelling)
+            ));
+        };
+        severities.insert(name, severity);
+    }
+    Ok(severities)
+}
+
 // ── attach_lint_warnings ──────────────────────────────────────────────────────
 
 /// Inject `lint_warnings` into a canonical JSON result object when a warning is present.
@@ -257,6 +335,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::lint::ParseSeverityError;
 
     // ── json_type_name ────────────────────────────────────────────────────────
 
@@ -468,6 +547,131 @@ mod tests {
             reject_unknown_json_keys(&map, &["vars"]).unwrap_err(),
             format!("unknown option key \"{shown}\"; recognised keys are: vars")
         );
+    }
+
+    // ── #418: parse_rule_severities ───────────────────────────────────────────
+
+    /// A `rules` map of `(name, value)` pairs.
+    fn rules_of(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect()
+    }
+
+    /// How an unknown-severity message lists the four spellings.
+    const EXPECTED: &str = "expected \"off\", \"info\", \"warn\", or \"error\"";
+
+    #[test]
+    fn parse_rule_severities_reads_each_rule_at_its_severity() {
+        let rules = rules_of(&[
+            ("a", json!("off")),
+            ("b", json!("info")),
+            ("c", json!("warn")),
+            ("d", json!("error")),
+        ]);
+        assert_eq!(
+            parse_rule_severities(rules, "options.rules"),
+            Ok(HashMap::from([
+                ("a".to_owned(), Severity::Off),
+                ("b".to_owned(), Severity::Info),
+                ("c".to_owned(), Severity::Warn),
+                ("d".to_owned(), Severity::Error),
+            ]))
+        );
+        assert_eq!(
+            parse_rule_severities(serde_json::Map::new(), "rules"),
+            Ok(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn parse_rule_severities_names_the_rule_and_the_value_wire_escaped() {
+        let (hostile, shown) = hostile_key();
+        let cases = [
+            (
+                rules_of(&[(&hostile, json!(1))]),
+                "options.rules",
+                format!("options.rules[\"{shown}\"] must be a severity string, got number"),
+            ),
+            (
+                rules_of(&[(&hostile, json!("Warn"))]),
+                "rules",
+                format!("rules[\"{shown}\"]: unknown severity \"Warn\"; {EXPECTED}"),
+            ),
+            (
+                rules_of(&[("unused-variable", json!(hostile))]),
+                "options.rules",
+                format!(
+                    "options.rules[\"unused-variable\"]: unknown severity \"{shown}\"; {EXPECTED}"
+                ),
+            ),
+            // Clean controls: the whole message, nothing escaped, the field as given.
+            (
+                rules_of(&[("unused-variable", json!(null))]),
+                "rules",
+                "rules[\"unused-variable\"] must be a severity string, got null".to_owned(),
+            ),
+            (
+                rules_of(&[("unused-variable", json!("verbose"))]),
+                "options.rules",
+                format!(
+                    "options.rules[\"unused-variable\"]: unknown severity \"verbose\"; {EXPECTED}"
+                ),
+            ),
+        ];
+        for (rules, field, message) in cases {
+            assert_eq!(parse_rule_severities(rules, field), Err(message));
+        }
+    }
+
+    #[test]
+    fn parse_rule_severities_lists_the_spellings_parse_severity_error_lists() {
+        let message = parse_rule_severities(rules_of(&[("r", json!("x"))]), "rules").unwrap_err();
+        let list = ParseSeverityError.to_string();
+        let list = list
+            .strip_prefix("unknown severity; ")
+            .expect("ParseSeverityError's message");
+        assert!(message.ends_with(&format!("; {list}")), "{message:?}");
+    }
+
+    #[test]
+    fn parse_rule_severities_refuses_the_first_bad_rule_in_key_order() {
+        // `b` is refused: `a` and `c` are valid, and `d`, also bad, comes after it.
+        let rules = rules_of(&[
+            ("d", json!("x")),
+            ("c", json!("warn")),
+            ("b", json!(true)),
+            ("a", json!("off")),
+        ]);
+        assert_eq!(
+            parse_rule_severities(rules, "rules"),
+            Err("rules[\"b\"] must be a severity string, got boolean".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_rule_severities_leaves_only_tab_raw() {
+        // A name and a value holding every forbidden path character: WIRE escapes all
+        // but TAB.
+        let text: String = (0..=0xFFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|&c| crate::is_forbidden_path_char(c))
+            .collect();
+        assert_eq!(text.chars().count(), 80, "non-vacuity: the whole class");
+        for message in [
+            parse_rule_severities(rules_of(&[(&text, json!(0))]), "rules").unwrap_err(),
+            parse_rule_severities(rules_of(&[("r", json!(text.clone()))]), "rules").unwrap_err(),
+        ] {
+            let raw: Vec<char> = message
+                .chars()
+                .filter(|&c| crate::is_forbidden_path_char(c))
+                .collect();
+            assert!(
+                raw.iter().all(|&c| c == '\t') && !raw.is_empty(),
+                "{message:?}"
+            );
+        }
     }
 
     // ── VarsError Display / source ────────────────────────────────────────────
