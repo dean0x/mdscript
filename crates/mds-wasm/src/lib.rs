@@ -884,7 +884,7 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         let opts = parse_check_options(options)?;
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
         let fs = virtual_fs(modules, opts.module_aliases)?;
-        let ((), warnings) =
+        let warnings =
             mds::check_virtual_fs(fs, &opts.filename, opts.vars).map_err(mds_error_to_js)?;
 
         to_js(&CheckOutput { warnings })

@@ -170,8 +170,7 @@ fn virtual_fs_aliases_api_exists() {
         VirtualFs::with_aliases;
     let _: fn(VirtualFs, &str, Vars, mds::CompileOptions) -> Result<CompileResult, MdsError> =
         mds::compile_virtual_fs;
-    type Checked = Result<((), Vec<String>), MdsError>;
-    let _: fn(VirtualFs, &str, Vars) -> Checked = mds::check_virtual_fs;
+    let _: fn(VirtualFs, &str, Vars) -> Result<Vec<String>, MdsError> = mds::check_virtual_fs;
     let _: fn(VirtualFs, &str, Vars, &LintConfig) -> Result<LintResult, MdsError> =
         mds::lint_virtual_fs;
 
@@ -193,6 +192,26 @@ fn virtual_fs_aliases_api_exists() {
         .with_aliases(alias("gone.mds"))
         .unwrap_err();
     assert!(matches!(err, MdsError::Io { .. }), "{err:?}");
+
+    // `check_virtual_fs` returns its warnings — an `@include` of a module with no body
+    // text warns — and an empty list for a clean module.
+    let modules = HashMap::from([
+        (
+            "main.mds".to_string(),
+            "@import \"./fns.mds\" as fns\n@include fns\n".to_string(),
+        ),
+        ("fns.mds".to_string(), "@define f():\nF\n@end\n".to_string()),
+    ]);
+    let warnings = mds::check_virtual_fs(VirtualFs::new(modules), "main.mds", None).unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains("no body text")),
+        "{warnings:?}"
+    );
+    let clean = HashMap::from([("main.mds".to_string(), "Hi!\n".to_string())]);
+    assert_eq!(
+        mds::check_virtual_fs(VirtualFs::new(clean), "main.mds", None).unwrap(),
+        Vec::<String>::new()
+    );
 }
 
 /// #326: `VarsLoad` fields are readable from an external crate. `#[non_exhaustive]`

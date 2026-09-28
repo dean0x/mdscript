@@ -1344,11 +1344,11 @@ pub fn check_virtual_collecting_warnings(
     entry: &str,
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<((), Vec<String>), MdsError> {
-    check_virtual_fs(VirtualFs::new(modules), entry, runtime_vars)
+    check_virtual_fs(VirtualFs::new(modules), entry, runtime_vars).map(|warnings| ((), warnings))
 }
 
 /// Check (validate) a module from a [`VirtualFs`] — one built with
-/// [`VirtualFs::with_aliases`], say — and return any collected warnings without
+/// [`VirtualFs::with_aliases`], say — and return the warnings it collects, without
 /// rendering output.
 ///
 /// Like [`check_virtual_collecting_warnings`], whose module map is the filesystem.
@@ -1358,7 +1358,7 @@ pub fn check_virtual_collecting_warnings(
 /// ```rust
 /// use std::collections::HashMap;
 /// let modules = HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
-/// let ((), warnings) = mds::check_virtual_fs(mds::VirtualFs::new(modules), "main.mds", None)?;
+/// let warnings = mds::check_virtual_fs(mds::VirtualFs::new(modules), "main.mds", None)?;
 /// assert!(warnings.is_empty());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -1367,14 +1367,14 @@ pub fn check_virtual_fs(
     fs: VirtualFs,
     entry: &str,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<((), Vec<String>), MdsError> {
+) -> Result<Vec<String>, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::with_fs(Box::new(fs));
     let mut warnings = vec![];
     // Dispatch on output shape so a messages template's mixed-content check runs
     // during validation; the CompiledOutput itself is discarded.
     cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
-    Ok(((), warnings))
+    Ok(warnings)
 }
 
 // ── Lint entry points ─────────────────────────────────────────────────────────
@@ -1695,22 +1695,33 @@ pub fn scan_import_records(source: &str) -> Result<Vec<ImportRecord>, MdsError> 
     use indexmap::map::Entry;
     use indexmap::IndexMap;
 
+    /// Where an import path is written, which decides the context the resolver gives
+    /// an error that resolving it raises.
+    enum Placement {
+        /// A frontmatter `imports:` entry, at this index in the list.
+        Frontmatter(usize),
+        /// An `@extends` or `@import` directive, at this byte offset.
+        Directive(usize),
+        /// An `@export … from` directive, whose errors get no context.
+        Unplaced,
+    }
+
     let tokens = lexer::tokenize(source, "")?;
     let module = parser::parse_with_ctx(&tokens, "", source)?;
 
     // The @extends base FIRST — the base is the first dependency (spec §4.11) — on
-    // its own. Then path → (kind, frontmatter index, directive offset) for the
-    // imports: the first writing of a path is the one the resolver meets first.
+    // its own. Then path → (kind, placement) for the imports: the first writing of a
+    // path is the one the resolver meets first.
     let extends = module.extends.as_ref().map(|ext| {
         (
             ext.path.clone(),
-            (ImportKind::Extends, None, Some(ext.offset)),
+            (ImportKind::Extends, Placement::Directive(ext.offset)),
         )
     });
-    let mut found: IndexMap<String, (ImportKind, Option<usize>, Option<usize>)> = IndexMap::new();
-    let mut record = |path: &str, kind: ImportKind, index: Option<usize>, offset: Option<usize>| {
+    let mut found: IndexMap<String, (ImportKind, Placement)> = IndexMap::new();
+    let mut record = |path: &str, kind: ImportKind, placement: Placement| {
         if let Entry::Vacant(slot) = found.entry(path.to_owned()) {
-            slot.insert((kind, index, offset));
+            slot.insert((kind, placement));
         }
     };
 
@@ -1722,7 +1733,11 @@ pub fn scan_import_records(source: &str) -> Result<Vec<ImportRecord>, MdsError> 
         match resolver::parse_frontmatter_imports(&fm.raw) {
             Ok(fm_imports) => {
                 for (i, imp) in fm_imports.iter().enumerate() {
-                    record(imp.path(), ImportKind::Frontmatter, Some(i), None);
+                    record(
+                        imp.path(),
+                        ImportKind::Frontmatter,
+                        Placement::Frontmatter(i),
+                    );
                 }
             }
             Err(e @ MdsError::ResourceLimit { .. }) => return Err(e),
@@ -1736,11 +1751,11 @@ pub fn scan_import_records(source: &str) -> Result<Vec<ImportRecord>, MdsError> 
                 ast::ImportDirective::Alias { path, offset, .. }
                 | ast::ImportDirective::Merge { path, offset }
                 | ast::ImportDirective::Selective { path, offset, .. },
-            ) => record(path, ImportKind::Import, None, Some(*offset)),
+            ) => record(path, ImportKind::Import, Placement::Directive(*offset)),
             ast::Node::Export(
                 ast::ExportDirective::ReExport { path, .. }
                 | ast::ExportDirective::Wildcard { path, .. },
-            ) => record(path, ImportKind::ExportFrom, None, None),
+            ) => record(path, ImportKind::ExportFrom, Placement::Unplaced),
             _ => {}
         }
     }
@@ -1752,14 +1767,19 @@ pub fn scan_import_records(source: &str) -> Result<Vec<ImportRecord>, MdsError> 
     Ok(extends
         .into_iter()
         .chain(found)
-        .map(|(path, (kind, frontmatter_index, offset))| {
-            let span = offset.map(|offset| {
-                let span = SerializedSpan::new(offset, resolver::line_len_at(source, offset));
-                match positions.at(offset) {
-                    Some((line, column)) => span.with_line(line).with_column(column),
-                    None => span,
+        .map(|(path, (kind, placement))| {
+            let (frontmatter_index, span) = match placement {
+                Placement::Frontmatter(index) => (Some(index), None),
+                Placement::Directive(offset) => {
+                    let span = SerializedSpan::new(offset, resolver::line_len_at(source, offset));
+                    let span = match positions.at(offset) {
+                        Some((line, column)) => span.with_line(line).with_column(column),
+                        None => span,
+                    };
+                    (None, Some(span))
                 }
-            });
+                Placement::Unplaced => (None, None),
+            };
             ImportRecord {
                 path,
                 kind,
