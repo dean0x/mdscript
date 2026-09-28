@@ -12,6 +12,7 @@ import {
   importPathViolation,
   sanitizeControlCharsWire,
 } from './path-chars.js';
+import { slidingWindow } from './sliding-window.js';
 
 // O_NOFOLLOW prevents the kernel from following a symlink at the final path
 // component. Using it closes the TOCTOU window between lstat and open.
@@ -788,6 +789,196 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
 }
 
 /**
+ * Refuse an import whose module key names another directory than the one the
+ * native backend reads it from, in a project rooted at `projectRoot`.
+ *
+ * The WASM engine resolves an import by name, from the importing module's key.
+ * NativeFs resolves it on disk, from the importing module's canonical directory,
+ * where on POSIX the OS applies each `..` after the symbolic links before it. A
+ * module's key is its canonical path, so the two agree for every import except one
+ * that names a symlinked directory and leaves it through `..` (`./link/../x.mds`):
+ * its key names the directory beside the link, while the file on disk sits beside
+ * the link's target. Whichever file were stored under that key, the engine would
+ * compile a module the native backend never reads (#408). On Windows the OS applies
+ * each `..` lexically, before any link is followed, so the two always agree there.
+ */
+async function assertKeyMatchesDisk(
+  projectRoot: string,
+  importerDir: string,
+  importPath: string,
+  childKey: string,
+): Promise<void> {
+  // realpath() resolves each `..` as the OS does for NativeFs — after the links
+  // before it on POSIX, lexically on Windows — so this is the directory NativeFs
+  // reads from. A missing directory is file-not-found there.
+  const onDisk = await realpathParent(importerDir + sep + importPath, importPath);
+  // The directory the engine's key names. If it cannot be resolved at all, it
+  // is not the directory above, and the import is refused below.
+  let byName: string | undefined;
+  try {
+    byName = await realpath(dirname(join(projectRoot, ...childKey.split('/'))));
+  } catch {
+    byName = undefined;
+  }
+  if (byName !== onDisk) {
+    throw importError(
+      `import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "${escapePathForMessage(importPath)}"`,
+    );
+  }
+}
+
+/**
+ * Locate an import of `importer`, in the project rooted at `projectRoot`, as the native
+ * resolver does — `validate_import_path`, then NativeFs's `normalize_in_dir` — refusing
+ * it with native's error, except that containment in the project root is decided
+ * before the file is looked at (difference 1 in `buildModulesMap`'s list). The module
+ * is keyed by its canonical path, which a hostile character is looked for in: a
+ * spelling the engine resolves to another key is checked there too, never trusted
+ * from the key it was typed as (case folding and other respellings are lossy, #414).
+ */
+async function locateImport(projectRoot: string, importer: Located, importPath: string): Promise<Located> {
+  const stringErr = importPathError(importPath) ?? segmentCountError(importPath);
+  if (stringErr !== undefined) {
+    throw stringErr;
+  }
+  const { name } = nativeParentAndName(importPath);
+  // A path ending in `..` has no final name: NativeFs finds no file there.
+  if (name === '..') {
+    throw fileNotFoundError(importPath);
+  }
+  const childAbsolute = resolve(importer.dir, importPath);
+  // Security: containment in the project root — lexically, before anything outside
+  // the root is touched.
+  if (!isWithinRoot(projectRoot, childAbsolute)) {
+    throw escapesProjectError(importPath);
+  }
+  // An import of `./` names the importing module's own directory, which NativeFs
+  // opens and fails to read (`mds::io`); the engine has no key for it.
+  let aliasKey = '';
+  if (name !== undefined) {
+    aliasKey = normalizeVirtualKey(importer.key, importPath);
+    await assertKeyMatchesDisk(projectRoot, importer.dir, importPath, aliasKey);
+  }
+  // The parent directory canonicalized (its symlinks followed), the final
+  // component joined as written — the pattern of NativeFs::check_symlink_named.
+  const dir = await realpathParent(childAbsolute, importPath);
+  const path = join(dir, basename(childAbsolute));
+  // Security: containment on the canonical path, so a symlinked directory cannot
+  // lead outside the project root.
+  if (!isWithinRoot(projectRoot, path)) {
+    throw escapesProjectError(importPath);
+  }
+  await assertFileNotSymlink(path, importPath);
+  const resolved = await canonicalFile(path, dir, importPath);
+  // Security (#265): a directory the import never named, reached through a
+  // symlink, can carry a forbidden path character — and so can the on-disk name of
+  // a file the import spelled differently.
+  const hostileErr = resolvedPathError(resolved, importPath);
+  if (hostileErr !== undefined) {
+    throw hostileErr;
+  }
+  const key = name === undefined ? '' : keyOf(projectRoot, resolved);
+  return { key, aliasKey, path, dir, resolved };
+}
+
+/**
+ * Open a located module of the project rooted at `projectRoot` with O_NOFOLLOW and
+ * read it, as NativeFs's `read` does — `mds::io` when it cannot be read, `file too
+ * large` over the per-file cap — and check it with the `engine`. Given `admit`, it is
+ * read only when `admit` accepts its size, and `undefined` otherwise.
+ *
+ * O_NOFOLLOW makes open() fail with ELOOP when the final component was swapped for
+ * a symlink after it was located, so no link is followed between the check and the
+ * read. Where O_NOFOLLOW is unavailable (Windows) open() follows it, and `lstat` —
+ * which reports a junction as a symlink too — refuses it before a byte is read.
+ * Canonicalizing a non-symlink final component only respells its name; a canonical
+ * path other than the one it was located at — the one its key names — means the
+ * component was replaced meanwhile, by a link or another file — refused as NativeFs
+ * refuses a replaced component. The file type decides, never a comparison of the canonical
+ * path with the path as written: on a case-insensitive volume realpath returns the
+ * on-disk spelling, so `Entry.mds` for `entry.mds` differs from its canonical form
+ * without being a symlink (#408).
+ */
+async function readModule(
+  projectRoot: string,
+  engine: ScannerEngine,
+  located: Located,
+  shown: string,
+): Promise<ReadModule>;
+async function readModule(
+  projectRoot: string,
+  engine: ScannerEngine,
+  located: Located,
+  shown: string,
+  admit: (size: number) => boolean,
+): Promise<ReadModule | undefined>;
+async function readModule(
+  projectRoot: string,
+  engine: ScannerEngine,
+  located: Located,
+  shown: string,
+  admit?: (size: number) => boolean,
+): Promise<ReadModule | undefined> {
+  // A module that is not a regular file is refused before it is opened, as NativeFs
+  // refuses it: opening a FIFO nobody writes to blocks (#428). A symlink is left to
+  // the open below, which refuses it without following it.
+  const before = await lstat(located.path).catch(() => {
+    throw fileNotFoundError(shown);
+  });
+  if (!before.isFile() && !before.isSymbolicLink()) {
+    throw notRegularFileError(shown);
+  }
+  const handle = await openNoFollow(located.path, shown);
+  try {
+    // `openNoFollow` above already succeeded, so the file existed a moment ago; a
+    // failure here can only come from a concurrent change (TOCTOU). It is still
+    // reported as the engine would report it: `lstat`/`realpath` are NativeFs's
+    // stat and canonicalize steps (file-not-found), the fd-based `stat` is part of
+    // reading the file.
+    const [stats, linkStats, resolved] = await Promise.all([
+      handle.stat().catch((err: unknown) => {
+        throw readError(shown, err);
+      }),
+      lstat(located.path).catch(() => {
+        throw fileNotFoundError(shown);
+      }),
+      realpath(located.path).catch(() => {
+        throw fileNotFoundError(shown);
+      }),
+    ]);
+    if (linkStats.isSymbolicLink() || resolved !== located.resolved) {
+      throw symlinkError(shown);
+    }
+    // Checked again on the opened fd, as NativeFs checks its opened file: another
+    // file may have taken the module's place since it was checked above.
+    if (!stats.isFile()) {
+      throw notRegularFileError(shown);
+    }
+    const display = keyOf(projectRoot, resolved);
+    // Checked on the fstat size too, before a byte is read, so a file over the cap
+    // when it is opened is never read into memory; one that grows past it while it
+    // is read is read to one byte past the cap and no further (#428), and refused by
+    // the engine's own check below.
+    if (stats.size > MAX_FILE_SIZE) {
+      throw fileTooLargeError(stats.size, display);
+    }
+    if (admit !== undefined && !admit(stats.size)) {
+      return undefined;
+    }
+    const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, stats.size).catch((err: unknown) => {
+      throw readError(shown, err);
+    });
+    // The engine's own checks, in the native order — the per-file cap and UTF-8
+    // (#414), then the file type (#417) — decode it: it refuses exactly the files the
+    // native backend refuses, and a file that is not an MDS file is refused before
+    // any import-like line in it is followed.
+    return { resolved, size: bytes.length, content: engine.preflightModule(bytes, display, shown) };
+  } finally {
+    await closeModule(handle, shown);
+  }
+}
+
+/**
  * Recursively resolve an MDS file and all its imports into a flat modules map
  * suitable for passing to the WASM compile/check functions.
  *
@@ -926,185 +1117,6 @@ export async function buildModulesMap(
   let walkFinished = false;
 
   /**
-   * Refuse an import whose module key names another directory than the one the
-   * native backend reads it from.
-   *
-   * The WASM engine resolves an import by name, from the importing module's key.
-   * NativeFs resolves it on disk, from the importing module's canonical directory,
-   * where on POSIX the OS applies each `..` after the symbolic links before it. A
-   * module's key is its canonical path, so the two agree for every import except one
-   * that names a symlinked directory and leaves it through `..` (`./link/../x.mds`):
-   * its key names the directory beside the link, while the file on disk sits beside
-   * the link's target. Whichever file were stored under that key, the engine would
-   * compile a module the native backend never reads (#408). On Windows the OS applies
-   * each `..` lexically, before any link is followed, so the two always agree there.
-   */
-  async function assertKeyMatchesDisk(
-    importerDir: string,
-    importPath: string,
-    childKey: string,
-  ): Promise<void> {
-    // realpath() resolves each `..` as the OS does for NativeFs — after the links
-    // before it on POSIX, lexically on Windows — so this is the directory NativeFs
-    // reads from. A missing directory is file-not-found there.
-    const onDisk = await realpathParent(importerDir + sep + importPath, importPath);
-    // The directory the engine's key names. If it cannot be resolved at all, it
-    // is not the directory above, and the import is refused below.
-    let byName: string | undefined;
-    try {
-      byName = await realpath(dirname(join(projectRoot, ...childKey.split('/'))));
-    } catch {
-      byName = undefined;
-    }
-    if (byName !== onDisk) {
-      throw importError(
-        `import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "${escapePathForMessage(importPath)}"`,
-      );
-    }
-  }
-
-  /**
-   * Locate an import of `importer` as the native resolver does — `validate_import_path`,
-   * then NativeFs's `normalize_in_dir` — refusing it with native's error, except that
-   * containment in the project root is decided before the file is looked at
-   * (difference 1 above). The module is keyed by its canonical path, which a hostile
-   * character is looked for in: a spelling the engine resolves to another key is
-   * checked there too, never trusted from the key it was typed as (case folding and
-   * other respellings are lossy, #414).
-   */
-  async function locateImport(importer: Located, importPath: string): Promise<Located> {
-    const stringErr = importPathError(importPath) ?? segmentCountError(importPath);
-    if (stringErr !== undefined) {
-      throw stringErr;
-    }
-    const { name } = nativeParentAndName(importPath);
-    // A path ending in `..` has no final name: NativeFs finds no file there.
-    if (name === '..') {
-      throw fileNotFoundError(importPath);
-    }
-    const childAbsolute = resolve(importer.dir, importPath);
-    // Security: containment in the project root — lexically, before anything outside
-    // the root is touched.
-    if (!isWithinRoot(projectRoot, childAbsolute)) {
-      throw escapesProjectError(importPath);
-    }
-    // An import of `./` names the importing module's own directory, which NativeFs
-    // opens and fails to read (`mds::io`); the engine has no key for it.
-    let aliasKey = '';
-    if (name !== undefined) {
-      aliasKey = normalizeVirtualKey(importer.key, importPath);
-      await assertKeyMatchesDisk(importer.dir, importPath, aliasKey);
-    }
-    // The parent directory canonicalized (its symlinks followed), the final
-    // component joined as written — the pattern of NativeFs::check_symlink_named.
-    const dir = await realpathParent(childAbsolute, importPath);
-    const path = join(dir, basename(childAbsolute));
-    // Security: containment on the canonical path, so a symlinked directory cannot
-    // lead outside the project root.
-    if (!isWithinRoot(projectRoot, path)) {
-      throw escapesProjectError(importPath);
-    }
-    await assertFileNotSymlink(path, importPath);
-    const resolved = await canonicalFile(path, dir, importPath);
-    // Security (#265): a directory the import never named, reached through a
-    // symlink, can carry a forbidden path character — and so can the on-disk name of
-    // a file the import spelled differently.
-    const hostileErr = resolvedPathError(resolved, importPath);
-    if (hostileErr !== undefined) {
-      throw hostileErr;
-    }
-    const key = name === undefined ? '' : keyOf(projectRoot, resolved);
-    return { key, aliasKey, path, dir, resolved };
-  }
-
-  /**
-   * Open a located module with O_NOFOLLOW and read it, as NativeFs's `read` does:
-   * `mds::io` when it cannot be read, `file too large` over the per-file cap. Given
-   * `admit`, it is read only when `admit` accepts its size, and `undefined` otherwise.
-   *
-   * O_NOFOLLOW makes open() fail with ELOOP when the final component was swapped for
-   * a symlink after it was located, so no link is followed between the check and the
-   * read. Where O_NOFOLLOW is unavailable (Windows) open() follows it, and `lstat` —
-   * which reports a junction as a symlink too — refuses it before a byte is read.
-   * Canonicalizing a non-symlink final component only respells its name; a canonical
-   * path other than the one it was located at — the one its key names — means the
-   * component was replaced meanwhile, by a link or another file — refused as NativeFs
-   * refuses a replaced component. The file type decides, never a comparison of the canonical
-   * path with the path as written: on a case-insensitive volume realpath returns the
-   * on-disk spelling, so `Entry.mds` for `entry.mds` differs from its canonical form
-   * without being a symlink (#408).
-   */
-  async function readModule(located: Located, shown: string): Promise<ReadModule>;
-  async function readModule(
-    located: Located,
-    shown: string,
-    admit: (size: number) => boolean,
-  ): Promise<ReadModule | undefined>;
-  async function readModule(
-    located: Located,
-    shown: string,
-    admit?: (size: number) => boolean,
-  ): Promise<ReadModule | undefined> {
-    // A module that is not a regular file is refused before it is opened, as NativeFs
-    // refuses it: opening a FIFO nobody writes to blocks (#428). A symlink is left to
-    // the open below, which refuses it without following it.
-    const before = await lstat(located.path).catch(() => {
-      throw fileNotFoundError(shown);
-    });
-    if (!before.isFile() && !before.isSymbolicLink()) {
-      throw notRegularFileError(shown);
-    }
-    const handle = await openNoFollow(located.path, shown);
-    try {
-      // `openNoFollow` above already succeeded, so the file existed a moment ago; a
-      // failure here can only come from a concurrent change (TOCTOU). It is still
-      // reported as the engine would report it: `lstat`/`realpath` are NativeFs's
-      // stat and canonicalize steps (file-not-found), the fd-based `stat` is part of
-      // reading the file.
-      const [stats, linkStats, resolved] = await Promise.all([
-        handle.stat().catch((err: unknown) => {
-          throw readError(shown, err);
-        }),
-        lstat(located.path).catch(() => {
-          throw fileNotFoundError(shown);
-        }),
-        realpath(located.path).catch(() => {
-          throw fileNotFoundError(shown);
-        }),
-      ]);
-      if (linkStats.isSymbolicLink() || resolved !== located.resolved) {
-        throw symlinkError(shown);
-      }
-      // Checked again on the opened fd, as NativeFs checks its opened file: another
-      // file may have taken the module's place since it was checked above.
-      if (!stats.isFile()) {
-        throw notRegularFileError(shown);
-      }
-      const display = keyOf(projectRoot, resolved);
-      // Checked on the fstat size too, before a byte is read, so a file over the cap
-      // when it is opened is never read into memory; one that grows past it while it
-      // is read is read to one byte past the cap and no further (#428), and refused by
-      // the engine's own check below.
-      if (stats.size > MAX_FILE_SIZE) {
-        throw fileTooLargeError(stats.size, display);
-      }
-      if (admit !== undefined && !admit(stats.size)) {
-        return undefined;
-      }
-      const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, stats.size).catch((err: unknown) => {
-        throw readError(shown, err);
-      });
-      // The engine's own checks, in the native order — the per-file cap and UTF-8
-      // (#414), then the file type (#417) — decode it: it refuses exactly the files the
-      // native backend refuses, and a file that is not an MDS file is refused before
-      // any import-like line in it is followed.
-      return { resolved, size: bytes.length, content: engine.preflightModule(bytes, display, shown) };
-    } finally {
-      await closeModule(handle, shown);
-    }
-  }
-
-  /**
    * Locate an import and, when its module is new and the read-ahead budget allows,
    * read it — ahead of the walk, which checks the outcome in the native order. Never
    * rejects: every failure is settled for the walk to report when it gets there.
@@ -1113,7 +1125,7 @@ export async function buildModulesMap(
     if (walkFinished) {
       return { located: WALK_FINISHED, read: undefined };
     }
-    const located = await settle(locateImport(importer, importPath));
+    const located = await settle(locateImport(projectRoot, importer, importPath));
     if (!located.ok || walkFinished) {
       return { located, read: undefined };
     }
@@ -1123,7 +1135,7 @@ export async function buildModulesMap(
     }
     readAheadKeys.add(key);
     const read = await settle(
-      readModule(located.value, importPath, (size) => {
+      readModule(projectRoot, engine, located.value, importPath, (size) => {
         if (readAheadSize + size > maxAggregateSize) {
           return false;
         }
@@ -1156,12 +1168,31 @@ export async function buildModulesMap(
   }
 
   /**
+   * Admit a module `depth` imports below the entry to the walk, under the limits the
+   * native resolver applies before it reads one: the import depth, then the module
+   * count — native's, of the modules fully resolved, then the engine's, of the entry
+   * plus `maxModules` (difference 4 in the list above).
+   */
+  function admit(depth: number): void {
+    if (depth >= MAX_IMPORT_DEPTH) {
+      throw importDepthError();
+    }
+    if (completed.size >= maxModules) {
+      throw moduleCountError(maxModules, completed.size);
+    }
+    if (admitted > maxModules) {
+      throw moduleCountError(maxModules, admitted);
+    }
+    admitted += 1;
+  }
+
+  /**
    * Walk the located module, reached as `shown` `depth` imports below the entry, then
    * its imports in the order the native resolver resolves them — its `resolve_by_key`:
    * a module already resolved, or still resolving (a cycle, the engine's to report), is
-   * not read again, and the depth and module-count limits apply before the file is
-   * read. The engine lists its imports in the order the resolver resolves them for a
-   * module reached as the `@extends` base of another (`asBase`) or for itself. An error
+   * not read again, and the module is admitted (`admit`) before the file is read. The
+   * engine lists its imports in the order the resolver resolves them for a module
+   * reached as the `@extends` base of another (`asBase`) or for itself. An error
    * resolving an import is reported with the context the resolver adds to it
    * (`withImportContext`).
    */
@@ -1176,60 +1207,38 @@ export async function buildModulesMap(
     if (completed.has(key) || walking.has(key)) {
       return;
     }
-    if (depth >= MAX_IMPORT_DEPTH) {
-      throw importDepthError();
-    }
-    // Native refuses a module once `maxModules` others are fully resolved. The engine
-    // takes the entry plus `maxModules`, which also caps a graph whose modules are
-    // still resolving (difference 4 above).
-    if (completed.size >= maxModules) {
-      throw moduleCountError(maxModules, completed.size);
-    }
-    if (admitted > maxModules) {
-      throw moduleCountError(maxModules, admitted);
-    }
-    admitted += 1;
+    admit(depth);
 
     // A module no read-ahead read is read here, whatever its size: the per-file cap
     // bounds it.
     const read = readAheadOutcome === undefined
-      ? await readModule(located, shown)
+      ? await readModule(projectRoot, engine, located, shown)
       : unwrap(readAheadOutcome);
     // The WASM backend's own guard, checked in walk order once the module has passed
     // every check native makes on it — the per-file cap, UTF-8 and the file type — so
     // it never reports a module native refuses, whichever reads the read-ahead budget
-    // let run ahead of the walk (difference 2 above).
+    // let run ahead of the walk (difference 2 in the list above).
     aggregateSize += read.size;
     if (aggregateSize > maxAggregateSize) {
       throw resourceLimitError(`aggregate module size exceeds maximum of ${maxAggregateSize} bytes`);
     }
     modules[key] = read.content;
 
+    const records = engine.scanImportRecords(read.content, asBase);
+    walking.add(key);
     // The next MAX_IMPORTS_READ_AHEAD imports are read ahead of the walk; each one
     // walked starts the next.
-    const upcoming = engine.scanImportRecords(read.content, asBase).values();
-    const queued: Array<{ readonly record: ImportRecord; readonly ahead: Promise<ReadAhead> }> = [];
-    const refill = (): void => {
-      while (queued.length < MAX_IMPORTS_READ_AHEAD) {
-        const step = upcoming.next();
-        if (step.done === true) {
-          return;
-        }
-        const record = step.value;
-        queued.push({ record, ahead: limit(() => readAhead(located, record.path)) });
-      }
-    };
-    walking.add(key);
-    refill();
-    for (let item = queued.shift(); item !== undefined; item = queued.shift()) {
-      refill();
-      const { located: child, read: childRead } = await item.ahead;
+    const imports = slidingWindow(records, MAX_IMPORTS_READ_AHEAD, (record) =>
+      limit(() => readAhead(located, record.path)),
+    );
+    for (const [record, ahead] of imports) {
+      const { located: child, read: childRead } = await ahead;
       try {
         const next = unwrap(child);
-        recordAlias(next, item.record.path);
-        await walk(next, item.record.path, depth + 1, childRead, item.record.kind === 'extends');
+        recordAlias(next, record.path);
+        await walk(next, record.path, depth + 1, childRead, record.kind === 'extends');
       } catch (err) {
-        throw withImportContext(err, item.record);
+        throw withImportContext(err, record);
       }
     }
     walking.delete(key);

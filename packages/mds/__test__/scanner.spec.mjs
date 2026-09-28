@@ -39,6 +39,7 @@ const {
   buildModulesMap: buildModulesMapWith,
   findProjectRoot,
 } = await import('../dist/util/module-scanner.js');
+const { slidingWindow } = await import('../dist/util/sliding-window.js');
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -1868,6 +1869,65 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         FileHandle.stat = realStat;
       }
     });
+  });
+});
+
+describe('slidingWindow — the read-ahead window of the buildModulesMap walk (#414)', () => {
+  /** The integers 0 to n - 1. */
+  const range = (n) => Array.from({ length: n }, (_, i) => i);
+
+  /** A `start` that records every item it is called with and tags it. */
+  function recorder() {
+    const started = [];
+    const start = (item) => {
+      started.push(item);
+      return `started ${item}`;
+    };
+    return { started, start };
+  }
+
+  test('U-SW1: hands out every item in order with what its start returned, starting each once', () => {
+    const { started, start } = recorder();
+    const out = [...slidingWindow(range(7), 3, start)];
+    assert.deepEqual(out, range(7).map((i) => [i, `started ${i}`]));
+    assert.deepEqual(started, range(7));
+  });
+
+  test('U-SW2: when an item is handed out, the `size` items after it are started, and no more', () => {
+    for (const size of [1, 3, 32]) {
+      for (const n of [0, 1, size, size + 1, 3 * size + 2]) {
+        const { started, start } = recorder();
+        const seen = [];
+        for (const [item] of slidingWindow(range(n), size, start)) {
+          seen.push([item, started.length]);
+        }
+        const expected = range(n).map((i) => [i, Math.min(i + 1 + size, n)]);
+        assert.deepEqual(seen, expected, `size ${size}, ${n} items`);
+      }
+    }
+  });
+
+  test('U-SW3: nothing starts before the first item is asked for, and nothing more once the consumer stops', () => {
+    const { started, start } = recorder();
+    const handedOut = slidingWindow(range(10), 3, start);
+    assert.deepEqual(started, []);
+    for (const [item] of handedOut) {
+      if (item === 1) break;
+    }
+    // Item 1 was handed out with the 3 after it started; stopping closes the window.
+    assert.deepEqual(started, range(5));
+    assert.deepEqual([...handedOut], []);
+    assert.deepEqual(started, range(5));
+  });
+
+  test('U-SW4: a window of no positive integer size is refused before anything starts', () => {
+    for (const size of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const { started, start } = recorder();
+      assert.throws(() => [...slidingWindow(range(3), size, start)], RangeError, String(size));
+      assert.deepEqual(started, [], String(size));
+    }
+    // Control: a window of one hands out every item.
+    assert.deepEqual([...slidingWindow(range(3), 1, (i) => i)], [[0, 0], [1, 1], [2, 2]]);
   });
 });
 
