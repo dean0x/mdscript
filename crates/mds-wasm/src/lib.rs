@@ -1086,11 +1086,13 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
     }))
 }
 
-/// Extract the import paths of an MDS source string with their records: in
-/// [`scan_imports`]'s order, each with the directive it is written in and the context
+/// Extract the import paths of an MDS source string with their records: in the order
+/// the resolver resolves them, each with the directive it is written in and the context
 /// the resolver adds to an error that resolving it raises ([`mds::scan_import_records`],
-/// #414). The `@extends` base is recorded on its own, even when an import names the
-/// same path.
+/// #414). With `as_base` false — a module compiled for itself — that is
+/// [`scan_imports`]' order, the `@extends` base first; with `as_base` true — a module
+/// reached as the `@extends` base of another — the base comes after the imports. The
+/// `@extends` base is recorded on its own, even when an import names the same path.
 ///
 /// ## Returns
 ///
@@ -1108,19 +1110,24 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
 /// ## Example (JavaScript)
 ///
 /// ```js
-/// const [record] = scanImportRecords('@import "./a.mds" as a\n');
+/// const [record] = scanImportRecords('@import "./a.mds" as a\n', false);
 /// console.log(record.kind); // "import"
 /// console.log(record.span); // { offset: 0, length: 22, line: 1, column: 1 }
 /// ```
 #[wasm_bindgen(js_name = "scanImportRecords")]
-pub fn scan_import_records(source: &str) -> Result<JsValue, JsValue> {
+pub fn scan_import_records(source: &str, as_base: bool) -> Result<JsValue, JsValue> {
     check_source_size(source)?;
 
     // Owned String required so the closure satisfies UnwindSafe.
     let source = source.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
-        let records = mds::scan_import_records(&source).map_err(mds_error_to_js)?;
+        let resolve_as = if as_base {
+            mds::ResolveAs::Base
+        } else {
+            mds::ResolveAs::Standalone
+        };
+        let records = mds::scan_import_records(&source, resolve_as).map_err(mds_error_to_js)?;
         let array = js_sys::Array::new();
         for record in &records {
             let obj = js_sys::Object::new();

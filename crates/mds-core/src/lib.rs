@@ -1578,8 +1578,8 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 /// - `@export * from "path"` → path
 /// - `@export name` (named, no path) → skipped
 ///
-/// The `@extends` path comes first, then the frontmatter paths, then the body's, the
-/// order [`scan_import_records`] documents.
+/// The `@extends` path comes first, then the frontmatter paths, then the body's: the
+/// order [`scan_import_records`] gives a module [`ResolveAs::Standalone`].
 /// Duplicate paths are deduplicated while preserving insertion order.
 /// Returns an error if the source has a syntax error.
 ///
@@ -1599,7 +1599,7 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 /// ```
 #[must_use = "the extracted import paths should be used"]
 pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
-    let paths: indexmap::IndexSet<String> = scan_import_records(source)?
+    let paths: indexmap::IndexSet<String> = scan_import_records(source, ResolveAs::Standalone)?
         .into_iter()
         .map(|record| record.path)
         .collect();
@@ -1662,19 +1662,34 @@ pub struct ImportRecord {
     pub span: Option<SerializedSpan>,
 }
 
-/// Extract the import paths of an MDS source string, in the order the resolver
-/// resolves them, each with the directive it is written in and the context the
-/// resolver adds to an error that resolving it raises — [`scan_imports`], with each
-/// path's record.
+/// How the resolver reaches a module, which decides where [`scan_import_records`] lists
+/// the module's own `@extends` base among its imports.
 ///
-/// The records are in [`scan_imports`]'s order: the `@extends` base first, then the
-/// frontmatter `imports:` entries, then the body's `@import` and `@export … from`
-/// directives in source order. A path the frontmatter or body writes more than once is
+/// This enum is `#[non_exhaustive]`: new variants may be added in minor releases.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveAs {
+    /// Compiled for itself — an entry, or a module an import names: its `@extends`
+    /// base is resolved before its imports.
+    Standalone,
+    /// Reached as the `@extends` base of another template: its imports are resolved
+    /// before its own `@extends` base, as the resolver's skeleton pass resolves a base.
+    Base,
+}
+
+/// Extract the import paths of an MDS source string, in the order the resolver
+/// resolves them when it reaches the module `resolve_as`, each with the directive it is
+/// written in and the context the resolver adds to an error that resolving it raises —
+/// [`scan_imports`], with each path's record.
+///
+/// The imports are the frontmatter `imports:` entries, then the body's `@import` and
+/// `@export … from` directives in source order. The `@extends` base comes before them
+/// for [`ResolveAs::Standalone`] — [`scan_imports`]' order — and after them for
+/// [`ResolveAs::Base`]. A path the frontmatter or body writes more than once is
 /// recorded where it is first written. The `@extends` base is recorded on its own,
-/// even when an import names the same path: a template compiled as the base of
-/// another resolves its imports before its own `@extends`, and one compiled for
-/// itself after it, so the import's record is the one met first there. A record says
-/// how a failure to resolve its path is reported, in the resolver's own terms:
+/// even when an import names the same path: a module reached as a base meets the
+/// import's record first. A record says how a failure to resolve its path is reported,
+/// in the resolver's own terms:
 ///
 /// - `@extends` and `@import`: a `mds::file_not_found` error is given
 ///   [`ImportRecord::span`], the directive's line;
@@ -1694,15 +1709,27 @@ pub struct ImportRecord {
 /// # Examples
 ///
 /// ```
-/// let records = mds::scan_import_records("x\n@import \"./a.mds\" as a\n")?;
+/// use mds::{scan_import_records, ImportKind, ResolveAs};
+///
+/// let records = scan_import_records("x\n@import \"./a.mds\" as a\n", ResolveAs::Standalone)?;
 /// assert_eq!(records[0].path, "./a.mds");
-/// assert_eq!(records[0].kind, mds::ImportKind::Import);
+/// assert_eq!(records[0].kind, ImportKind::Import);
 /// let span = records[0].span.as_ref().expect("an @import records its span");
 /// assert_eq!((span.offset, span.length, span.line, span.column), (2, 22, Some(2), Some(1)));
+///
+/// let template = "@extends \"./base.mds\"\n@import \"./a.mds\" as a\n";
+/// let kinds = |resolve_as| -> Result<Vec<ImportKind>, mds::MdsError> {
+///     Ok(scan_import_records(template, resolve_as)?.iter().map(|r| r.kind).collect())
+/// };
+/// assert_eq!(kinds(ResolveAs::Standalone)?, [ImportKind::Extends, ImportKind::Import]);
+/// assert_eq!(kinds(ResolveAs::Base)?, [ImportKind::Import, ImportKind::Extends]);
 /// # Ok::<(), mds::MdsError>(())
 /// ```
 #[must_use = "the extracted import records should be used"]
-pub fn scan_import_records(source: &str) -> Result<Vec<ImportRecord>, MdsError> {
+pub fn scan_import_records(
+    source: &str,
+    resolve_as: ResolveAs,
+) -> Result<Vec<ImportRecord>, MdsError> {
     use indexmap::map::Entry;
     use indexmap::IndexMap;
 
@@ -1720,9 +1747,8 @@ pub fn scan_import_records(source: &str) -> Result<Vec<ImportRecord>, MdsError> 
     let tokens = lexer::tokenize(source, "")?;
     let module = parser::parse_with_ctx(&tokens, "", source)?;
 
-    // The @extends base FIRST — the base is the first dependency (spec §4.11) — on
-    // its own. Then path → (kind, placement) for the imports: the first writing of a
-    // path is the one the resolver meets first.
+    // The @extends base, recorded on its own. Then path → (kind, placement) for the
+    // imports: the first writing of a path is the one the resolver meets first.
     let extends = module.extends.as_ref().map(|ext| {
         (
             ext.path.clone(),
@@ -1771,13 +1797,22 @@ pub fn scan_import_records(source: &str) -> Result<Vec<ImportRecord>, MdsError> 
         }
     }
 
+    // Compiled for itself, a module's base is its first dependency (spec §4.11); reached
+    // as a base, its imports resolve first and its own base last (the skeleton pass).
+    let (first, last) = match resolve_as {
+        ResolveAs::Standalone => (extends, None),
+        ResolveAs::Base => (None, extends),
+    };
+
     // The span `attach_import_span` gives the directive: its whole line, with the line
-    // and column `MdsError::serialize` reports. Directive offsets only grow after the
-    // @extends base, so the cursor walks the source about once.
+    // and column `MdsError::serialize` reports. Directive offsets only grow along the
+    // imports, so the cursor starts over at most once — around the @extends base,
+    // wherever it is listed — and walks the source about twice at most.
     let mut positions = error::LineColumns::new(source);
-    Ok(extends
+    Ok(first
         .into_iter()
         .chain(found)
+        .chain(last)
         .map(|(path, (kind, placement))| {
             let (frontmatter_index, span) = match placement {
                 Placement::Frontmatter(index) => (Some(index), None),
@@ -2695,7 +2730,7 @@ mod tests {
 
     /// The record of `path` among `source`'s import records.
     fn record_of(source: &str, path: &str) -> ImportRecord {
-        scan_import_records(source)
+        scan_import_records(source, ResolveAs::Standalone)
             .expect("the source parses")
             .into_iter()
             .find(|r| r.path == path)
@@ -2782,7 +2817,7 @@ mod tests {
             .map(|(i, n)| format!("t\u{2014}{n}\n@import \"./{n}.mds\" as m{i}\n"))
             .collect::<String>()
             + "hi\n";
-        let records = scan_import_records(&source).expect("parses");
+        let records = scan_import_records(&source, ResolveAs::Standalone).expect("parses");
         assert_eq!(records.len(), names.len());
         for (missing, record) in names.iter().zip(&records) {
             // Every module but `missing` is present.
@@ -2804,21 +2839,36 @@ mod tests {
 
     /// A path the imports write more than once is recorded once, where it is first
     /// written — the writing the resolver meets first. The `@extends` base is recorded
-    /// on its own, before them, even when an import names it too; `scan_imports`
-    /// lists each path once, in the same order.
+    /// on its own, even when an import names it too: before the imports for a module
+    /// compiled for itself, after them for one reached as a base. `scan_imports` lists
+    /// each path once, in the standalone order.
     #[test]
     fn scan_import_records_keep_a_path_where_it_is_first_written() {
+        let kinds_of = |source: &str, resolve_as| -> Vec<(String, ImportKind)> {
+            scan_import_records(source, resolve_as)
+                .expect("parses")
+                .into_iter()
+                .map(|r| (r.path, r.kind))
+                .collect()
+        };
+        let row = |path: &str, kind| (path.to_owned(), kind);
+
         let source =
             "---\nimports:\n  - path: ./a.mds\n  - path: ./b.mds\n---\n@extends \"./b.mds\"\n";
-        let records = scan_import_records(source).expect("parses");
-        let kinds: Vec<(&str, ImportKind)> =
-            records.iter().map(|r| (r.path.as_str(), r.kind)).collect();
         assert_eq!(
-            kinds,
+            kinds_of(source, ResolveAs::Standalone),
             [
-                ("./b.mds", ImportKind::Extends),
-                ("./a.mds", ImportKind::Frontmatter),
-                ("./b.mds", ImportKind::Frontmatter),
+                row("./b.mds", ImportKind::Extends),
+                row("./a.mds", ImportKind::Frontmatter),
+                row("./b.mds", ImportKind::Frontmatter),
+            ]
+        );
+        assert_eq!(
+            kinds_of(source, ResolveAs::Base),
+            [
+                row("./a.mds", ImportKind::Frontmatter),
+                row("./b.mds", ImportKind::Frontmatter),
+                row("./b.mds", ImportKind::Extends),
             ]
         );
         assert_eq!(
@@ -2826,24 +2876,87 @@ mod tests {
             ["./b.mds".to_owned(), "./a.mds".to_owned()]
         );
 
+        // No `@extends`: both orders are the imports' own.
         let source = "---\nimports:\n  - path: ./a.mds\n---\n@import \"./a.mds\" as a\n@export x from \"./c.mds\"\n@import \"./c.mds\" as c\n";
-        let records = scan_import_records(source).expect("parses");
-        let kinds: Vec<(&str, ImportKind, Option<usize>)> = records
-            .iter()
-            .map(|r| (r.path.as_str(), r.kind, r.frontmatter_index))
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                ("./a.mds", ImportKind::Frontmatter, Some(0)),
-                ("./c.mds", ImportKind::ExportFrom, None),
-            ]
-        );
+        for resolve_as in [ResolveAs::Standalone, ResolveAs::Base] {
+            let records = scan_import_records(source, resolve_as).expect("parses");
+            let kinds: Vec<(&str, ImportKind, Option<usize>)> = records
+                .iter()
+                .map(|r| (r.path.as_str(), r.kind, r.frontmatter_index))
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    ("./a.mds", ImportKind::Frontmatter, Some(0)),
+                    ("./c.mds", ImportKind::ExportFrom, None),
+                ],
+                "{resolve_as:?}"
+            );
+            assert!(records.iter().all(|r| r.span.is_none()), "{records:?}");
+        }
         assert_eq!(
             scan_imports(source).expect("parses"),
             ["./a.mds".to_owned(), "./c.mds".to_owned()]
         );
-        assert!(records.iter().all(|r| r.span.is_none()), "{records:?}");
+    }
+
+    /// A template's records are in the order the resolver resolves its imports, whether
+    /// it is compiled for itself or reached as the `@extends` base of another: with the
+    /// modules of the records before one present and that one missing, the resolver's
+    /// error names that record's path, and no later one.
+    #[test]
+    fn scan_import_records_list_imports_in_the_order_the_resolver_resolves_them() {
+        let fm = "---\nimports:\n  - path: ./f.mds\n    as: f\n---\n";
+        // Compiled for itself, an extending template holds nothing but blocks besides its
+        // `@extends`: its base is resolved first, then its frontmatter imports.
+        let standalone = format!("{fm}@extends \"./x.mds\"\n");
+        // Reached as a base, its frontmatter and body imports are resolved before its own
+        // base.
+        let base = format!("{fm}@extends \"./x.mds\"\n@import \"./i.mds\" as i\n");
+        let rows = [
+            (ResolveAs::Standalone, standalone, None),
+            (ResolveAs::Base, base, Some("@extends \"./base.mds\"\n")),
+        ];
+        for (resolve_as, source, child) in rows {
+            let records = scan_import_records(&source, resolve_as).expect("parses");
+            let paths: Vec<&str> = records.iter().map(|r| r.path.as_str()).collect();
+            // The two orders differ in where the base falls; the loop below holds the
+            // resolver to each.
+            let expected: &[&str] = match resolve_as {
+                ResolveAs::Standalone => &["./x.mds", "./f.mds"],
+                ResolveAs::Base => &["./f.mds", "./i.mds", "./x.mds"],
+            };
+            assert_eq!(paths, expected, "{resolve_as:?}");
+            // Each module's key, which the resolver's error names it by.
+            let keys: Vec<&str> = paths.iter().map(|p| p.trim_start_matches("./")).collect();
+            for (k, missing) in keys.iter().enumerate() {
+                let mut modules: HashMap<String, String> = keys[..k]
+                    .iter()
+                    .map(|key| ((*key).to_owned(), "M\n".to_owned()))
+                    .collect();
+                modules.insert("base.mds".to_owned(), source.clone());
+                let entry = match child {
+                    Some(child) => {
+                        modules.insert("child.mds".to_owned(), child.to_owned());
+                        "child.mds"
+                    }
+                    None => "base.mds",
+                };
+                let err = compile_virtual_collecting_warnings(modules, entry, None)
+                    .expect_err("a module is missing")
+                    .serialize();
+                assert!(
+                    err.message.contains(missing),
+                    "{resolve_as:?} {missing}: {err:?}"
+                );
+                for later in &keys[k + 1..] {
+                    assert!(
+                        !err.message.contains(later),
+                        "{resolve_as:?} {missing}: {err:?}"
+                    );
+                }
+            }
+        }
     }
 
     // ── VirtualFs aliases through compile, check and lint (#414) ─────────────

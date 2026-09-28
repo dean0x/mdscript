@@ -562,9 +562,10 @@ export interface ImportRecord {
 export interface ScannerEngine {
   /**
    * The import paths a module's source names, in the order the resolver resolves them,
-   * each with its record.
+   * each with its record: a module reached as the `@extends` base of another (`asBase`)
+   * lists its own `@extends` after its imports, any other before them.
    */
-  scanImportRecords(source: string): ImportRecord[];
+  scanImportRecords(source: string, asBase: boolean): ImportRecord[];
   /**
    * A module file's text, checked as the native backend checks every file it reads,
    * or a throw of the native error: its bytes as NativeFs checks them
@@ -855,8 +856,8 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  * at most MAX_IMPORTS_READ_AHEAD of a module's imports and no more than
  * `maxAggregateSize` bytes read ahead of the walk — but checked in
  * the order the native resolver resolves them: depth first, each module's imports in
- * the order `scanImportRecords` lists them — a module reached as the `@extends` base of
- * another resolving its own `@extends` last — each step's checks in `resolve_by_key`'s
+ * the order `scanImportRecords` lists them for the way the module is reached — as the
+ * `@extends` base of another, or for itself — each step's checks in `resolve_by_key`'s
  * order. Of several faults, the one reported is the one the native backend reports.
  *
  * Differences from the native backend that remain (#414):
@@ -1159,10 +1160,10 @@ export async function buildModulesMap(
    * its imports in the order the native resolver resolves them — its `resolve_by_key`:
    * a module already resolved, or still resolving (a cycle, the engine's to report), is
    * not read again, and the depth and module-count limits apply before the file is
-   * read. A module reached as the `@extends` base of another (`asBase`) resolves its
-   * own `@extends` after its imports, as the resolver's skeleton pass does; any other,
-   * before them. An error resolving an import is reported with the context the
-   * resolver adds to it (`withImportContext`).
+   * read. The engine lists its imports in the order the resolver resolves them for a
+   * module reached as the `@extends` base of another (`asBase`) or for itself. An error
+   * resolving an import is reported with the context the resolver adds to it
+   * (`withImportContext`).
    */
   async function walk(
     located: Located,
@@ -1206,10 +1207,7 @@ export async function buildModulesMap(
 
     // The next MAX_IMPORTS_READ_AHEAD imports are read ahead of the walk; each one
     // walked starts the next.
-    const records = engine.scanImportRecords(read.content);
-    // The engine lists a module's `@extends` base first, on its own.
-    const inOrder = asBase && records[0]?.kind === 'extends' ? [...records.slice(1), records[0]] : records;
-    const upcoming = inOrder.values();
+    const upcoming = engine.scanImportRecords(read.content, asBase).values();
     const queued: Array<{ readonly record: ImportRecord; readonly ahead: Promise<ReadAhead> }> = [];
     const refill = (): void => {
       while (queued.length < MAX_IMPORTS_READ_AHEAD) {

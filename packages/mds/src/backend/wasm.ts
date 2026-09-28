@@ -55,11 +55,13 @@ export interface WasmModule {
   }): unknown;
   scanImports(source: string): string[];
   /**
-   * `scanImports`' paths, each with its record: the directive it is written in and the
-   * context the resolver adds to an error that resolving it raises
-   * (`mds::scan_import_records`).
+   * The import paths of `source`, each with its record: the directive it is written in
+   * and the context the resolver adds to an error that resolving it raises
+   * (`mds::scan_import_records`), in the order the resolver resolves them — with the
+   * `@extends` base after the imports for a module reached as the base of another
+   * (`asBase`), before them otherwise (`scanImports`' order).
    */
-  scanImportRecords(source: string): ImportRecord[];
+  scanImportRecords(source: string, asBase: boolean): ImportRecord[];
   /**
    * A module file's text, checked as the native backend checks every file it reads:
    * throws `mds::resource_limit` over 10 MiB and `mds::io` for invalid UTF-8, naming

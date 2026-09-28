@@ -637,7 +637,7 @@ fn scan_import_records_carry_the_errors_context() {
         "caf\u{e9}\n@import \"./missing.mds\" as m\n",
         "@export x from \"./exp.mds\"\n",
     );
-    let records = mds_wasm::scan_import_records(source).unwrap();
+    let records = mds_wasm::scan_import_records(source, false).unwrap();
     assert_eq!(js_array_len(&records), 3);
     let record = |i: u32| js_sys::Array::from(&records).get(i);
     let fields = |i: u32| {
@@ -680,10 +680,36 @@ fn scan_import_records_carry_the_errors_context() {
     assert_eq!(span[1].as_f64(), Some(28.0));
 }
 
+/// `asBase` places a template's `@extends` base where the resolver resolves it: before
+/// its imports for a template compiled for itself, after them for one reached as the
+/// base of another (#414).
+#[wasm_bindgen_test]
+fn scan_import_records_place_the_extends_base_as_the_resolver_resolves_it() {
+    let source = "---\nimports:\n  - path: ./fm.mds\n---\n@extends \"./base.mds\"\n";
+    let kinds = |as_base: bool| -> Vec<(String, String)> {
+        let records = js_sys::Array::from(&mds_wasm::scan_import_records(source, as_base).unwrap());
+        records
+            .iter()
+            .map(|r| (get_str(&r, "path"), get_str(&r, "kind")))
+            .collect()
+    };
+    let row = |path: &str, kind: &str| (path.to_owned(), kind.to_owned());
+    assert_eq!(
+        kinds(false),
+        [row("./base.mds", "extends"), row("./fm.mds", "frontmatter")]
+    );
+    assert_eq!(
+        kinds(true),
+        [row("./fm.mds", "frontmatter"), row("./base.mds", "extends")]
+    );
+}
+
 #[wasm_bindgen_test]
 fn scan_import_records_returns_error_for_malformed_source() {
-    let err = mds_wasm::scan_import_records("Hello {{name\n").unwrap_err();
-    assert_eq!(get_str(&err, "code"), "mds::syntax");
+    for as_base in [false, true] {
+        let err = mds_wasm::scan_import_records("Hello {{name\n", as_base).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::syntax");
+    }
 }
 
 // ── moduleAliases (#414) ─────────────────────────────────────────────────────

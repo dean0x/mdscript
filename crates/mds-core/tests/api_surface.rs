@@ -143,12 +143,21 @@ fn check_module_type_function_exists() {
 }
 
 /// #414: `scan_import_records` and its `#[non_exhaustive]` `ImportRecord` /
-/// `ImportKind` are reachable from the crate root: the fields are readable, and a
-/// match on the kind needs a wildcard arm, as a new kind may be added.
+/// `ImportKind` / `ResolveAs` are reachable from the crate root: the fields are
+/// readable, and a match on the kind or on `ResolveAs` needs a wildcard arm, as a new
+/// variant may be added.
 #[test]
 fn scan_import_records_function_exists() {
-    let _: fn(&str) -> Result<Vec<mds::ImportRecord>, MdsError> = mds::scan_import_records;
-    let records = mds::scan_import_records("@extends \"./base.mds\"\n").expect("the source parses");
+    let _: fn(&str, mds::ResolveAs) -> Result<Vec<mds::ImportRecord>, MdsError> =
+        mds::scan_import_records;
+    let name = |resolve_as| match resolve_as {
+        mds::ResolveAs::Standalone => "standalone",
+        mds::ResolveAs::Base => "base",
+        _ => "another way",
+    };
+    assert_eq!(name(mds::ResolveAs::Base), "base");
+    let records = mds::scan_import_records("@extends \"./base.mds\"\n", mds::ResolveAs::Standalone)
+        .expect("the source parses");
     let record: &mds::ImportRecord = &records[0];
     let _: &String = &record.path;
     let _: Option<usize> = record.frontmatter_index;
