@@ -1853,22 +1853,45 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const FileHandle = Object.getPrototypeOf(probe);
       await probe.close();
       const realStat = FileHandle.stat;
+      const realRead = FileHandle.read;
+      const realReadFile = FileHandle.readFile;
       FileHandle.stat = async function stat(...args) {
         const stats = await realStat.apply(this, args);
         stats.size = Math.min(stats.size, 100);
         return stats;
       };
+      // What the scanner itself reads: the bytes each open file gives it, and the largest
+      // buffer it reads into. A read of the whole file fails loudly.
+      const bytesRead = new Map();
+      let largestBuffer = 0;
+      FileHandle.read = async function read(buffer, ...rest) {
+        largestBuffer = Math.max(largestBuffer, buffer.length);
+        const result = await realRead.call(this, buffer, ...rest);
+        bytesRead.set(this, (bytesRead.get(this) ?? 0) + result.bytesRead);
+        return result;
+      };
+      FileHandle.readFile = async function readFile() {
+        throw new Error('U-SM43: the scanner read a whole file');
+      };
       try {
         for (const entry of [grown, main]) {
           seen.length = 0;
+          bytesRead.clear();
+          largestBuffer = 0;
           const err = await rejectionOf(buildModulesMapWith(entry, engine), `${entry} grown`);
           assert.deepEqual(errorShape(err), tooLarge(MAX_FILE_SIZE + 1), entry);
+          // It read the file to one byte past the cap and no further — seen through `read`
+          // (non-vacuity) — into no buffer larger than that.
+          assert.equal(Math.max(...bytesRead.values()), MAX_FILE_SIZE + 1, `${entry}: ${[...bytesRead.values()]}`);
+          assert.ok(largestBuffer > 0 && largestBuffer <= MAX_FILE_SIZE + 1, `${entry}: a buffer of ${largestBuffer} bytes`);
           // At most one byte past the cap reached the engine — and that much did
           // (non-vacuity): the read went on past the size it was told.
           assert.equal(Math.max(...seen), MAX_FILE_SIZE + 1, `${entry}: ${seen}`);
         }
       } finally {
         FileHandle.stat = realStat;
+        FileHandle.read = realRead;
+        FileHandle.readFile = realReadFile;
       }
     });
   });
