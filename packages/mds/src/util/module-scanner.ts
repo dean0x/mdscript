@@ -214,10 +214,11 @@ async function closeModule(handle: Awaited<ReturnType<typeof open>>, shown: stri
 type PathErrorCode = 'mds::import' | 'mds::io' | 'mds::file_not_found' | 'mds::resource_limit';
 
 /**
- * A path refusal carrying the code the Rust engine reports for the same input.
- * Each message is byte-identical to that engine error's message as the native
- * backend throws it, so the WASM backend's file operations fail exactly like
- * the native ones.
+ * A path refusal carrying the code the Rust engine reports for the same input, and that
+ * engine error's message as the native backend throws it, except where the differences
+ * listed in `buildModulesMap`'s documentation say otherwise: a `cannot read` message
+ * (`cannotReadError`) agrees with native on the code only, and some refusals — the
+ * aggregate-size guard among them — are the WASM backend's own.
  */
 type PathError = MdsError & { code: PathErrorCode };
 
@@ -1043,10 +1044,6 @@ async function readModule(
  * canonicalEntry)`. This mirrors the virtual key used in the `modules` map and
  * is the value that must be passed as the `filename` argument to
  * `build_modules()` / `check()` on the WASM side.
- *
- * Note: prior to this change `entryFilename` was the basename of the entry
- * file. Callers that relied on the basename form must be updated to use the
- * relative path.
  *
  * Every module is keyed by its canonical path below the project root — its on-disk
  * spelling, as the native backend keys a module by its canonical path — so the engine
