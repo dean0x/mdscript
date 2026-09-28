@@ -231,7 +231,7 @@ describe('compileFile', () => {
     }
   });
 
-  test('CF-NOTMDS: a non-MDS entry is named as typed, never by its resolved absolute path (#417)', () => {
+  test('F-CF8: a non-MDS entry is named as typed, never by its resolved absolute path (#417)', () => {
     // Every form differs from the canonical path: `sub/..` is built by hand, since
     // path.join would normalize it away, and the temporary directory itself is not
     // canonical on macOS (`/var/…` for `/private/var/…`).

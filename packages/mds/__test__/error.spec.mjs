@@ -740,7 +740,7 @@ describe('error shape', () => {
       { name: 'hostile name, non-string value', rule: hostile, value: 1, ruleShown: shown },
       { name: 'hostile name, unknown severity', rule: hostile, value: 'bogus', ruleShown: shown, sevShown: 'bogus' },
       { name: 'hostile severity', rule, value: hostile, ruleShown: rule, sevShown: shown },
-      // Clean controls: the whole message, byte-identical to what each binding said before.
+      // Clean controls: the whole message, in the one wording all three bindings share.
       {
         name: 'clean name, non-string value',
         rule,

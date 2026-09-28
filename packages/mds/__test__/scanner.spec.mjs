@@ -1522,60 +1522,6 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     assert.equal(existsSync(missing), false, 'nothing is written');
   });
 
-  test('U-SM39: the aggregate-size guard never pre-empts a refusal native makes of the module that crosses it', async (t) => {
-    const engines = await loadEngines();
-    if (!requireEngines(t, engines, 'U-SM39')) return;
-    await withNestedProject(async (proj) => {
-      const MiB = 1024 * 1024;
-      const text = (bytes) => 'x'.repeat(bytes);
-      const invalidUtf8 = (bytes) => Buffer.concat([Buffer.from(text(bytes - 1)), Buffer.from([0xff])]);
-      // Each project crosses the 10 MiB aggregate at its last module, `c`, which native
-      // refuses on its own. In `walk-*` the read-ahead budget is spent on `a`, so the
-      // walk reads `c` itself; in `race-*` `a` and `c` are read ahead side by side, and
-      // which of them the budget admits depends on which read gets there first.
-      const rows = [
-        // [label, name of c, content of c, native's refusal of c]
-        ['invalid UTF-8', 'c.mds', invalidUtf8, 'mds::io'],
-        ['not an MDS file', 'c.txt', text, 'mds::not_mds'],
-        // Control (PF-013): a valid `c` compiles on native, and crosses the guard here.
-        ['valid', 'c.mds', text, null],
-      ];
-      const entries = [];
-      for (const [label, name, content] of rows) {
-        const slug = label.replace(/\W+/g, '-');
-        const walkDir = path.join(proj, `walk-${slug}`);
-        await mkdir(walkDir);
-        await writeFile(path.join(walkDir, 'e.mds'), `@import "./a.mds" as a\nhi\n${text(MiB)}`);
-        await writeFile(path.join(walkDir, 'a.mds'), `@import "./${name}" as c\nA\n${text(8.5 * MiB)}`);
-        await writeFile(path.join(walkDir, name), content(Math.floor(1.6 * MiB)));
-        const raceDir = path.join(proj, `race-${slug}`);
-        await mkdir(raceDir);
-        await writeFile(path.join(raceDir, 'e.mds'), `@import "./a.mds" as a\n@import "./${name}" as c\nhi\n`);
-        await writeFile(path.join(raceDir, 'a.mds'), text(6 * MiB));
-        await writeFile(path.join(raceDir, name), content(6 * MiB));
-        entries.push(path.join(walkDir, 'e.mds'), path.join(raceDir, 'e.mds'));
-      }
-      const native = await compileFileOutcomes('native', entries);
-      const wasm = await compileFileOutcomes('wasm', entries);
-      for (const [r, [label, , , code]] of rows.entries()) {
-        for (const i of [2 * r, 2 * r + 1]) {
-          if (code === null) {
-            assert.equal(typeof native[i].output, 'string', `${label}: ${JSON.stringify(native[i]).slice(0, 200)}`);
-            assert.deepEqual(wasm[i], {
-              code: 'mds::resource_limit',
-              message: `resource limit exceeded: aggregate module size exceeds maximum of ${10 * MiB} bytes`,
-              help: null,
-              span: null,
-            }, `${label} ${entries[i]}`);
-          } else {
-            assert.equal(native[i].code, code, `${label}: ${JSON.stringify(native[i])}`);
-            assert.deepEqual(wasm[i], native[i], `${label} ${entries[i]}`);
-          }
-        }
-      }
-    });
-  });
-
   test('U-SM37: of several faults, both backends report the one native meets first — depth first, in import order', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM37')) return;
@@ -1661,6 +1607,60 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
           help: FILE_NOT_FOUND_HELP,
           span: { offset: first.length + 1, length: second.length, line: 2, column: 1 },
         }, entries[i]);
+      }
+    });
+  });
+
+  test('U-SM39: the aggregate-size guard never pre-empts a refusal native makes of the module that crosses it', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM39')) return;
+    await withNestedProject(async (proj) => {
+      const MiB = 1024 * 1024;
+      const text = (bytes) => 'x'.repeat(bytes);
+      const invalidUtf8 = (bytes) => Buffer.concat([Buffer.from(text(bytes - 1)), Buffer.from([0xff])]);
+      // Each project crosses the 10 MiB aggregate at its last module, `c`, which native
+      // refuses on its own. In `walk-*` the read-ahead budget is spent on `a`, so the
+      // walk reads `c` itself; in `race-*` `a` and `c` are read ahead side by side, and
+      // which of them the budget admits depends on which read gets there first.
+      const rows = [
+        // [label, name of c, content of c, native's refusal of c]
+        ['invalid UTF-8', 'c.mds', invalidUtf8, 'mds::io'],
+        ['not an MDS file', 'c.txt', text, 'mds::not_mds'],
+        // Control (PF-013): a valid `c` compiles on native, and crosses the guard here.
+        ['valid', 'c.mds', text, null],
+      ];
+      const entries = [];
+      for (const [label, name, content] of rows) {
+        const slug = label.replace(/\W+/g, '-');
+        const walkDir = path.join(proj, `walk-${slug}`);
+        await mkdir(walkDir);
+        await writeFile(path.join(walkDir, 'e.mds'), `@import "./a.mds" as a\nhi\n${text(MiB)}`);
+        await writeFile(path.join(walkDir, 'a.mds'), `@import "./${name}" as c\nA\n${text(8.5 * MiB)}`);
+        await writeFile(path.join(walkDir, name), content(Math.floor(1.6 * MiB)));
+        const raceDir = path.join(proj, `race-${slug}`);
+        await mkdir(raceDir);
+        await writeFile(path.join(raceDir, 'e.mds'), `@import "./a.mds" as a\n@import "./${name}" as c\nhi\n`);
+        await writeFile(path.join(raceDir, 'a.mds'), text(6 * MiB));
+        await writeFile(path.join(raceDir, name), content(6 * MiB));
+        entries.push(path.join(walkDir, 'e.mds'), path.join(raceDir, 'e.mds'));
+      }
+      const native = await compileFileOutcomes('native', entries);
+      const wasm = await compileFileOutcomes('wasm', entries);
+      for (const [r, [label, , , code]] of rows.entries()) {
+        for (const i of [2 * r, 2 * r + 1]) {
+          if (code === null) {
+            assert.equal(typeof native[i].output, 'string', `${label}: ${JSON.stringify(native[i]).slice(0, 200)}`);
+            assert.deepEqual(wasm[i], {
+              code: 'mds::resource_limit',
+              message: `resource limit exceeded: aggregate module size exceeds maximum of ${10 * MiB} bytes`,
+              help: null,
+              span: null,
+            }, `${label} ${entries[i]}`);
+          } else {
+            assert.equal(native[i].code, code, `${label}: ${JSON.stringify(native[i])}`);
+            assert.deepEqual(wasm[i], native[i], `${label} ${entries[i]}`);
+          }
+        }
       }
     });
   });

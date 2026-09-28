@@ -1,6 +1,6 @@
 /**
  * compileFile() tests for @mdscript/mds universal package.
- * Tests: U-CF1 through U-CF9, CF-NOTMDS
+ * Tests: U-CF1 through U-CF10
  */
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
@@ -110,10 +110,10 @@ describe('compileFile', () => {
 
   // The native backend only: U-WCF13 (wasm-compileFile.spec.mjs) holds the WASM
   // backend to the same error, named as typed.
-  test('CF-NOTMDS: a non-MDS entry is named as typed on the native backend (#417)', async (t) => {
+  test('U-CF10: a non-MDS entry is named as typed on the native backend (#417)', async (t) => {
     const engines = await loadEngines();
-    if (!requireEngines(t, { native: engines.native }, 'CF-NOTMDS')) return;
-    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-u-cf-notmds-'));
+    if (!requireEngines(t, { native: engines.native }, 'U-CF10')) return;
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-u-cf10-'));
     try {
       await mkdir(path.join(dir, 'sub'));
       await writeFile(path.join(dir, 'doc.txt'), 'Hello!\n');
