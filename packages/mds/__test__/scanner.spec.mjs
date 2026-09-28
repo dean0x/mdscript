@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, open, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
@@ -1868,6 +1868,58 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       } finally {
         FileHandle.stat = realStat;
       }
+    });
+  });
+
+  // Open files are counted through /dev/fd, which Windows lacks.
+  const noDevFd = process.platform === 'win32' && 'counts open files through /dev/fd';
+
+  test('U-SM44: a refused scan settles only once every read it started ahead of its walk has stopped', { skip: noDevFd }, async () => {
+    await withNestedProject(async (proj) => {
+      // The walk refuses the first import, `bad.mds` (invalid UTF-8), while the reads
+      // ahead of the walk of the 20 larger modules after it are still under way.
+      await writeFile(path.join(proj, 'bad.mds'), Buffer.concat([Buffer.from('x'.repeat(64)), Buffer.from([0xff, 0xfe])]));
+      const imports = ['./bad.mds'];
+      for (let i = 0; i < 20; i++) {
+        await writeFile(path.join(proj, `b${i}.mds`), `${'x'.repeat(480 * 1024)}\n`);
+        imports.push(`./b${i}.mds`);
+      }
+      const entry = path.join(proj, 'entry.mds');
+      await writeFile(entry, `${imports.map((p, i) => `@import "${p}" as m${i}`).join('\n')}\nhi\n`);
+      const openFiles = () => readdirSync('/dev/fd').length;
+      // The engine calls made after the scan has settled.
+      const late = [];
+      let settled = false;
+      const engine = {
+        scanImportRecords: importRecordsOf(scanImports),
+        preflightModule(bytes, display, typed) {
+          if (settled) late.push(display);
+          return preflightModule(bytes, display, typed);
+        },
+      };
+      const before = openFiles();
+      // Control (PF-013): the count sees a file held open.
+      const held = await open(entry);
+      assert.equal(openFiles(), before + 1);
+      await held.close();
+
+      const err = await rejectionOf(buildModulesMapWith(entry, engine), 'U-SM44');
+      settled = true;
+      const atSettle = openFiles();
+      // The walk's own refusal, never masked by the reads it waited for.
+      assert.deepEqual(errorShape(err), {
+        code: 'mds::io',
+        message: 'invalid UTF-8 in bad.mds: invalid utf-8 sequence of 1 bytes from index 64',
+        help: null,
+        span: null,
+      });
+      // A read that outlived the call shows itself before its file is closed again: wait
+      // for that — at once when nothing is left open — then look.
+      for (let i = 0; i < 100 && openFiles() > before; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(atSettle, before, 'every file the scan opened is closed when it settles');
+      assert.deepEqual(late, [], 'no engine call after the scan settled');
     });
   });
 });

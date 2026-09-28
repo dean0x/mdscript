@@ -1050,6 +1050,8 @@ async function readModule(
  * the order `scanImportRecords` lists them for the way the module is reached — as the
  * `@extends` base of another, or for itself — each step's checks in `resolve_by_key`'s
  * order. Of several faults, the one reported is the one the native backend reports.
+ * A scan settles only once every read it started has stopped, a refused scan too: none
+ * holds a file open, or calls into the engine, after it.
  *
  * Differences from the native backend that remain (#414):
  * 1. A MISSING module outside the project root — named lexically, or through a
@@ -1111,6 +1113,8 @@ export async function buildModulesMap(
   /** Keys a read-ahead has already read, or is reading. */
   const readAheadKeys = new Set<string>();
   const limit = concurrencyLimit(MAX_CONCURRENT_OPENS);
+  /** Every read-ahead started and not yet settled. */
+  const pending = new Set<Promise<ReadAhead>>();
   let admitted = 0;
   let aggregateSize = 0;
   let readAheadSize = 0;
@@ -1136,7 +1140,8 @@ export async function buildModulesMap(
     readAheadKeys.add(key);
     const read = await settle(
       readModule(projectRoot, engine, located.value, importPath, (size) => {
-        if (readAheadSize + size > maxAggregateSize) {
+        // Once the walk has finished, a read-ahead still under way reads nothing more.
+        if (walkFinished || readAheadSize + size > maxAggregateSize) {
           return false;
         }
         readAheadSize += size;
@@ -1148,6 +1153,20 @@ export async function buildModulesMap(
     }
     // A module the read-ahead budget left unread is read by the walk itself.
     return { located, read: read.value === undefined ? undefined : { ok: true, value: read.value } };
+  }
+
+  /**
+   * Start the read-ahead of the import `importPath` of `importer`, kept in `pending`
+   * until it settles.
+   */
+  function startReadAhead(importer: Located, importPath: string): Promise<ReadAhead> {
+    const ahead = limit(() => readAhead(importer, importPath));
+    pending.add(ahead);
+    const forget = (): void => {
+      pending.delete(ahead);
+    };
+    ahead.then(forget, forget);
+    return ahead;
   }
 
   /**
@@ -1229,7 +1248,7 @@ export async function buildModulesMap(
     // The next MAX_IMPORTS_READ_AHEAD imports are read ahead of the walk; each one
     // walked starts the next.
     const imports = slidingWindow(records, MAX_IMPORTS_READ_AHEAD, (record) =>
-      limit(() => readAhead(located, record.path)),
+      startReadAhead(located, record.path),
     );
     for (const [record, ahead] of imports) {
       const { located: child, read: childRead } = await ahead;
@@ -1249,7 +1268,11 @@ export async function buildModulesMap(
     const entryLocated = { key: entryFilename, aliasKey: entryFilename, ...entry };
     await walk(entryLocated, entryPath, 0, undefined, false);
   } finally {
+    // A walk that throws leaves read-aheads under way, holding open files and about to
+    // call into the engine. Each stops at its next step and is waited for, so none
+    // outlives this call; none rejects, so the walk's own error is the one thrown.
     walkFinished = true;
+    await Promise.allSettled(pending);
   }
 
   return { entryFilename, modules, aliases: Object.fromEntries(aliases) };
