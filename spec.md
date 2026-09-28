@@ -370,8 +370,14 @@ the CLI, the Rust API, and the file-path entry points of the napi and Python
 bindings). The in-memory backend (`VirtualFs`: `compile_virtual`, `check_virtual`,
 `lint_virtual`, and the WASM binding) has no symlinks and no host paths; the NUL-byte,
 forbidden-character, empty-path and segment-count rules apply to its entry keys and
-import paths alike, and the containment rule to its import paths. Each rule is a
-compilation error, reported with the code shown.
+import paths alike, and the containment rule to its import paths. A `VirtualFs` may
+also carry aliases (`VirtualFs::with_aliases`, and so `compile_virtual_fs`,
+`check_virtual_fs`, `lint_virtual_fs` and the WASM `moduleAliases` option): other
+keys an import may resolve to, each mapped to the key of the module it names, which
+becomes the key the import resolves to. Every alias and every key it names is
+checked as a key an import can resolve to, and the map is bounded (§5 `mds::io`,
+`mds::resource_limit`; #414). Each rule is a compilation error, reported with the
+code shown.
 
 | Constraint | Rule | Code and message |
 |---|---|---|

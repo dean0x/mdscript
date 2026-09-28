@@ -46,7 +46,14 @@ input. The compiler enforces several defense-in-depth controls:
   is a base directory passed to `ModuleCache::resolve_source*`. The check reads the
   file type of the final component itself (not following it), then requires its
   canonical path to lie in the canonical parent directory. Symbolic links in parent
-  directories are followed and the result is then subject to containment.
+  directories are followed and the result is then subject to containment. The CLI
+  checks the directory argument of `mds build`, `mds check`, `mds fmt`, `mds lint`
+  and `mds watch` by the same rule before it is walked, however it is typed (`link/`
+  and `link/.` included), and refuses a symlinked one, or the filesystem root, as
+  `mds::io`, exit 2 (#413). `mds watch` re-checks the path it watches before every
+  rebuild — the entry in file mode, the directory argument and each source below
+  it in directory mode — and refuses the rebuild once a symbolic link on that path
+  has been retargeted (#417, #413).
 - **Null-byte rejection**: paths containing NUL bytes are rejected at the API
   boundary rather than being passed to the OS.
 - **Forbidden path characters are refused at input, not only escaped on output**
@@ -82,6 +89,9 @@ input. The compiler enforces several defense-in-depth controls:
   temp file and renamed over the target after a final symlink re-check (`mds-cli/src/output.rs`,
   `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so a
   crash never leaves a truncated target and a symlinked output path is refused.
+  `mds build` and `mds watch` refuse an output that is the entry file itself —
+  however `-o`, `--out-dir`, `build.output_dir` or the default output name it —
+  before anything is written or any directory created (`mds::io`, exit 2, #425).
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 
