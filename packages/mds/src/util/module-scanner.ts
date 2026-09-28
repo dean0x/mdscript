@@ -749,6 +749,17 @@ interface ReadModule {
   readonly content: string;
 }
 
+/**
+ * The byte budget reads ahead of the walk draw on, counted in the bytes read: a file may
+ * change size between its fstat and its read.
+ */
+interface ReadBudget {
+  /** Whether a module whose fstat reports `size` bytes is read; if so, `size` is charged. */
+  admit(size: number): boolean;
+  /** Charge what a read took beyond the size admitted: negative when the file shrank. */
+  charge(bytes: number): void;
+}
+
 /** An import of a walked module: located, and read too when read ahead of the walk. */
 interface ReadAhead {
   readonly located: Settled<Located>;
@@ -801,13 +812,15 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
  * the link's target. Whichever file were stored under that key, the engine would
  * compile a module the native backend never reads (#408). On Windows the OS applies
  * each `..` lexically, before any link is followed, so the two always agree there.
+ *
+ * Returns that directory, canonical: the one the key names and NativeFs reads from.
  */
 async function assertKeyMatchesDisk(
   projectRoot: string,
   importerDir: string,
   importPath: string,
   childKey: string,
-): Promise<void> {
+): Promise<string> {
   // realpath() resolves each `..` as the OS does for NativeFs — after the links
   // before it on POSIX, lexically on Windows — so this is the directory NativeFs
   // reads from. A missing directory is file-not-found there.
@@ -825,6 +838,7 @@ async function assertKeyMatchesDisk(
       `import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "${escapePathForMessage(importPath)}"`,
     );
   }
+  return onDisk;
 }
 
 /**
@@ -852,16 +866,15 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
   if (!isWithinRoot(projectRoot, childAbsolute)) {
     throw escapesProjectError(importPath);
   }
-  // An import of `./` names the importing module's own directory, which NativeFs
-  // opens and fails to read (`mds::io`); the engine has no key for it.
-  let aliasKey = '';
-  if (name !== undefined) {
-    aliasKey = normalizeVirtualKey(importer.key, importPath);
-    await assertKeyMatchesDisk(projectRoot, importer.dir, importPath, aliasKey);
-  }
-  // The parent directory canonicalized (its symlinks followed), the final
-  // component joined as written — the pattern of NativeFs::check_symlink_named.
-  const dir = await realpathParent(childAbsolute, importPath);
+  // The parent directory canonicalized (its symlinks followed) — once, by the check
+  // that the key names it — and the final component joined as written: the pattern of
+  // NativeFs::check_symlink_named. An import of `./` names the importing module's own
+  // directory, which NativeFs opens and fails to read (`mds::io`); the engine has no
+  // key for it.
+  const aliasKey = name === undefined ? '' : normalizeVirtualKey(importer.key, importPath);
+  const dir = name === undefined
+    ? await realpathParent(childAbsolute, importPath)
+    : await assertKeyMatchesDisk(projectRoot, importer.dir, importPath, aliasKey);
   const path = join(dir, basename(childAbsolute));
   // Security: containment on the canonical path, so a symlinked directory cannot
   // lead outside the project root.
@@ -884,8 +897,9 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
 /**
  * Open a located module of the project rooted at `projectRoot` with O_NOFOLLOW and
  * read it, as NativeFs's `read` does — `mds::io` when it cannot be read, `file too
- * large` over the per-file cap — and check it with the `engine`. Given `admit`, it is
- * read only when `admit` accepts its size, and `undefined` otherwise.
+ * large` over the per-file cap — and check it with the `engine`. Given a `budget`, it is
+ * read only when the budget admits its size, and `undefined` otherwise; the budget is
+ * then charged what the read took beyond that size.
  *
  * O_NOFOLLOW makes open() fail with ELOOP when the final component was swapped for
  * a symlink after it was located, so no link is followed between the check and the
@@ -910,14 +924,14 @@ async function readModule(
   engine: ScannerEngine,
   located: Located,
   shown: string,
-  admit: (size: number) => boolean,
+  budget: ReadBudget,
 ): Promise<ReadModule | undefined>;
 async function readModule(
   projectRoot: string,
   engine: ScannerEngine,
   located: Located,
   shown: string,
-  admit?: (size: number) => boolean,
+  budget?: ReadBudget,
 ): Promise<ReadModule | undefined> {
   // A module that is not a regular file is refused before it is opened, as NativeFs
   // refuses it: opening a FIFO nobody writes to blocks (#428). A symlink is left to
@@ -962,12 +976,13 @@ async function readModule(
     if (stats.size > MAX_FILE_SIZE) {
       throw fileTooLargeError(stats.size, display);
     }
-    if (admit !== undefined && !admit(stats.size)) {
+    if (budget !== undefined && !budget.admit(stats.size)) {
       return undefined;
     }
     const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, stats.size).catch((err: unknown) => {
       throw readError(shown, err);
     });
+    budget?.charge(bytes.length - stats.size);
     // The engine's own checks, in the native order — the per-file cap and UTF-8
     // (#414), then the file type (#417) — decode it: it refuses exactly the files the
     // native backend refuses, and a file that is not an MDS file is refused before
@@ -1044,12 +1059,14 @@ async function readModule(
  * A project may be rooted at the filesystem root, as on native.
  *
  * Modules are read concurrently — at most MAX_CONCURRENT_OPENS files open at once,
- * at most MAX_IMPORTS_READ_AHEAD of a module's imports and no more than
- * `maxAggregateSize` bytes read ahead of the walk — but checked in
- * the order the native resolver resolves them: depth first, each module's imports in
- * the order `scanImportRecords` lists them for the way the module is reached — as the
- * `@extends` base of another, or for itself — each step's checks in `resolve_by_key`'s
- * order. Of several faults, the one reported is the one the native backend reports.
+ * at most MAX_IMPORTS_READ_AHEAD of a module's imports, and no more than
+ * `maxAggregateSize` bytes, counted as read, admitted ahead of the walk (a read that
+ * outgrows the size it was admitted for holds at most MAX_FILE_SIZE + 1 bytes more),
+ * each module read ahead at most once, whichever of its imports reaches it first — but
+ * checked in the order the native resolver resolves them: depth first, each module's
+ * imports in the order `scanImportRecords` lists them for the way the module is reached
+ * — as the `@extends` base of another, or for itself — each step's checks in
+ * `resolve_by_key`'s order. Of several faults, the one reported is the one the native backend reports.
  * A scan settles only once every read it started has stopped, a refused scan too: none
  * holds a file open, or calls into the engine, after it.
  *
@@ -1110,8 +1127,11 @@ export async function buildModulesMap(
   const completed = new Set<string>();
   /** Keys of modules being walked: the native resolver's stack of modules resolving. */
   const walking = new Set<string>();
-  /** Keys a read-ahead has already read, or is reading. */
-  const readAheadKeys = new Set<string>();
+  /**
+   * Each key a read-ahead has read, or is reading, and that read's outcome: at most one
+   * read-ahead per module, whichever walked module's imports reach it first.
+   */
+  const readAheadReads = new Map<string, Promise<Settled<ReadModule | undefined>>>();
   const limit = concurrencyLimit(MAX_CONCURRENT_OPENS);
   /** Every read-ahead started and not yet settled. */
   const pending = new Set<Promise<ReadAhead>>();
@@ -1119,6 +1139,26 @@ export async function buildModulesMap(
   let aggregateSize = 0;
   let readAheadSize = 0;
   let walkFinished = false;
+
+  /**
+   * The read-ahead budget: `maxAggregateSize` bytes, each module admitted by its fstat
+   * size and charged by the bytes read. Between the two, a read may take more than it
+   * was admitted for — up to the per-file cap plus one byte — so at most
+   * MAX_CONCURRENT_OPENS reads of MAX_FILE_SIZE + 1 bytes each are held beyond the
+   * budget. Once the walk has finished, a read-ahead still under way reads nothing more.
+   */
+  const readAheadBudget: ReadBudget = {
+    admit(size) {
+      if (walkFinished || readAheadSize + size > maxAggregateSize) {
+        return false;
+      }
+      readAheadSize += size;
+      return true;
+    },
+    charge(bytes) {
+      readAheadSize += bytes;
+    },
+  };
 
   /**
    * Locate an import and, when its module is new and the read-ahead budget allows,
@@ -1134,20 +1174,12 @@ export async function buildModulesMap(
       return { located, read: undefined };
     }
     const { key } = located.value;
-    if (completed.has(key) || walking.has(key) || readAheadKeys.has(key)) {
+    if (completed.has(key) || walking.has(key) || readAheadReads.has(key)) {
       return { located, read: undefined };
     }
-    readAheadKeys.add(key);
-    const read = await settle(
-      readModule(projectRoot, engine, located.value, importPath, (size) => {
-        // Once the walk has finished, a read-ahead still under way reads nothing more.
-        if (walkFinished || readAheadSize + size > maxAggregateSize) {
-          return false;
-        }
-        readAheadSize += size;
-        return true;
-      }),
-    );
+    const reading = settle(readModule(projectRoot, engine, located.value, importPath, readAheadBudget));
+    readAheadReads.set(key, reading);
+    const read = await reading;
     if (!read.ok) {
       return { located, read };
     }
@@ -1167,6 +1199,16 @@ export async function buildModulesMap(
     };
     ahead.then(forget, forget);
     return ahead;
+  }
+
+  /**
+   * The module `key` as a read ahead of the walk read it, when one did — reached through
+   * another module's imports. A read that failed, or that the budget declined, is left
+   * for the walk to make itself, so its error names the import the walk reached it by.
+   */
+  async function readAheadRead(key: string): Promise<ReadModule | undefined> {
+    const read = await readAheadReads.get(key);
+    return read?.ok === true ? read.value : undefined;
   }
 
   /**
@@ -1228,10 +1270,10 @@ export async function buildModulesMap(
     }
     admit(depth);
 
-    // A module no read-ahead read is read here, whatever its size: the per-file cap
-    // bounds it.
+    // A module its own import's read-ahead did not read is taken from the read-ahead of
+    // another import of it, or read here, whatever its size: the per-file cap bounds it.
     const read = readAheadOutcome === undefined
-      ? await readModule(projectRoot, engine, located, shown)
+      ? (await readAheadRead(key)) ?? (await readModule(projectRoot, engine, located, shown))
       : unwrap(readAheadOutcome);
     // The WASM backend's own guard, checked in walk order once the module has passed
     // every check native makes on it — the per-file cap, UTF-8 and the file type — so

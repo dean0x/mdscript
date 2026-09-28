@@ -11,7 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import fs, { existsSync, readdirSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { chmod, mkdtemp, mkdir, open, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
@@ -1920,6 +1921,130 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       }
       assert.equal(atSettle, before, 'every file the scan opened is closed when it settles');
       assert.deepEqual(late, [], 'no engine call after the scan settled');
+    });
+  });
+
+  test('U-SM45: a module two imports reach is read once; a failed read names the import the walk reached it by', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-SM45')) return;
+    await withNestedProject(async (proj) => {
+      // The layout/header diamond: the entry imports `layout.mds`, then `header.mds`,
+      // which `layout.mds` imports too.
+      await writeFile(path.join(proj, 'entry.mds'), '@import "./layout.mds" as l\n@import "./header.mds" as h\nhi\n');
+      await writeFile(path.join(proj, 'layout.mds'), '@import "./header.mds" as h\nLAYOUT\n');
+      await writeFile(path.join(proj, 'header.mds'), 'HEADER\n');
+      // How many times each module's bytes reach the engine.
+      const reads = {};
+      const engine = {
+        scanImportRecords: importRecordsOf(scanImports),
+        preflightModule(bytes, display, typed) {
+          reads[display] = (reads[display] ?? 0) + 1;
+          return preflightModule(bytes, display, typed);
+        },
+      };
+      const { modules } = await buildModulesMapWith(path.join(proj, 'entry.mds'), engine);
+      assert.deepEqual(Object.keys(modules).sort(), ['entry.mds', 'header.mds', 'layout.mds']);
+      assert.deepEqual(reads, { 'entry.mds': 1, 'layout.mds': 1, 'header.mds': 1 });
+
+      // The same diamond with a module native refuses, spelled differently by its two
+      // imports: the error names the import native meets first — `layout.mds`'s —
+      // whichever import's read ahead of the walk got to the file first.
+      await mkdir(path.join(proj, 'sub'));
+      await writeFile(path.join(proj, 'sub', 'layout.mds'), '@import "../header.txt" as h\nLAYOUT\n');
+      await writeFile(path.join(proj, 'header.txt'), 'HEADER\n');
+      const entry = path.join(proj, 'txt.mds');
+      await writeFile(entry, '@import "./sub/layout.mds" as l\n@import "./header.txt" as h\nhi\n');
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      assert.equal(native.code, 'mds::not_mds', JSON.stringify(native));
+      assert.equal(native.message, 'not an MDS file: ../header.txt');
+      assert.deepEqual(wasm, native);
+    });
+  });
+
+  test('U-SM46: the read-ahead budget is charged the bytes a read took, not the size its fstat reported', async () => {
+    await withNestedProject(async (proj) => {
+      // The entry imports m0 … m33. `m0` is 10,000 bytes; m1 … m32 are 2,000 bytes each
+      // and m33 one byte more, so a fstat of it tells it apart.
+      const grownSize = 10_000;
+      const size = 2_000;
+      const lastSize = size + 1;
+      await writeFile(path.join(proj, 'm0.mds'), 'x'.repeat(grownSize));
+      for (let i = 1; i <= 33; i++) {
+        await writeFile(path.join(proj, `m${i}.mds`), 'x'.repeat(i === 33 ? lastSize : size));
+      }
+      const source = `${Array.from({ length: 34 }, (_, i) => `@import "./m${i}.mds" as m${i}`).join('\n')}\n`;
+      const entry = path.join(proj, 'e.mds');
+      await writeFile(entry, source);
+      // The budget — the aggregate cap — takes the modules up to m32 with 500 bytes to
+      // spare, so the walk is refused at m33. m33 is read ahead once m0 has been walked:
+      // counted by what was read, m0 leaves m33 no room, and m33 is read by the walk.
+      const maxAggregateSize = Buffer.byteLength(source) + grownSize + 32 * size + 500;
+      assert.ok(Buffer.byteLength(source) + 500 < lastSize, 'm33 does not fit once m0 is counted whole');
+      const aggregateError = {
+        code: 'mds::resource_limit',
+        message: `resource limit exceeded: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
+        help: null,
+        span: null,
+      };
+
+      const probe = await open(entry);
+      const FileHandle = Object.getPrototypeOf(probe);
+      await probe.close();
+      const realStat = FileHandle.stat;
+      // How many times a fstat saw m33 — twice when its read ahead is declined — and
+      // whether `m0` grows after its fstat: every fstat of it then reports one byte.
+      let lastStats = 0;
+      let grow = false;
+      FileHandle.stat = async function stat(...args) {
+        const stats = await realStat.apply(this, args);
+        if (stats.size === lastSize) lastStats += 1;
+        if (grow && stats.size === grownSize) stats.size = 1;
+        return stats;
+      };
+      try {
+        // Control (PF-013): m0's fstat is its size, m33 does not fit, and the walk reads
+        // it after a declined read ahead.
+        const control = await rejectionOf(buildModulesMap(entry, scanImports, { maxAggregateSize }), 'control');
+        assert.deepEqual(errorShape(control), aggregateError);
+        assert.equal(lastStats, 2, 'control: m33 is read by the walk');
+
+        lastStats = 0;
+        grow = true;
+        const err = await rejectionOf(buildModulesMap(entry, scanImports, { maxAggregateSize }), 'grown');
+        assert.deepEqual(errorShape(err), aggregateError);
+        assert.equal(lastStats, 2, 'm0 is charged the bytes read, so m33 is read by the walk');
+      } finally {
+        FileHandle.stat = realStat;
+      }
+    });
+  });
+
+  test('U-SM47: locating an import canonicalizes its directory once', async () => {
+    await withNestedProject(async (proj) => {
+      await mkdir(path.join(proj, 'sub'));
+      await writeFile(path.join(proj, 'sub', 'x.mds'), 'X\n');
+      const entry = path.join(proj, 'e.mds');
+      await writeFile(entry, '@import "./sub/x.mds" as x\nhi\n');
+      const sub = path.join(await realpath(proj), 'sub');
+      // Every path the scan canonicalizes.
+      const calls = [];
+      const realRealpath = fs.promises.realpath;
+      fs.promises.realpath = function countedRealpath(p, ...rest) {
+        calls.push(String(p));
+        return realRealpath.call(this, p, ...rest);
+      };
+      syncBuiltinESMExports();
+      try {
+        const { modules } = await buildModulesMap(entry, scanImports);
+        assert.deepEqual(Object.keys(modules).sort(), ['e.mds', 'sub/x.mds']);
+      } finally {
+        fs.promises.realpath = realRealpath;
+        syncBuiltinESMExports();
+      }
+      // Control (PF-013): the scan's own calls are seen — the import's file among them.
+      assert.ok(calls.includes(path.join(sub, 'x.mds')), JSON.stringify(calls));
+      assert.equal(calls.filter((c) => c === sub).length, 1, JSON.stringify(calls));
     });
   });
 });
