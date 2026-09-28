@@ -64,7 +64,9 @@ export interface WasmModule {
    * A module file's text, checked as the native backend checks every file it reads:
    * throws `mds::resource_limit` over 10 MiB and `mds::io` for invalid UTF-8, naming
    * the file by `display` (`mds::check_module_bytes`), then `mds::not_mds` for a file
-   * that is not an MDS file, naming it by `typed` (`mds::check_module_type`).
+   * that is not an MDS file, naming it by `typed` (`mds::check_module_type`). The bytes
+   * are copied into WASM memory before any check, so the caller bounds them: the
+   * scanner reads at most `MAX_FILE_SIZE + 1` bytes of a file (#428).
    */
   preflightModule(bytes: Uint8Array, display: string, typed: string): string;
   default?: (input?: unknown) => Promise<void>;

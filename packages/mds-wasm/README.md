@@ -29,7 +29,8 @@ recorded on its own, even when an import names it too) — and
 checked as the native backend checks every file it reads: over 10 MiB is `mds::resource_limit` and
 bytes that are not valid UTF-8 are `mds::io`, naming the file by `display` (its path below the project
 root); then a file that is neither `.mds` nor a `.md` declaring `type: mds` is `mds::not_mds`, naming
-it by `typed` (the path as typed).
+it by `typed` (the path as typed). The bytes are copied into WebAssembly memory before any check
+runs, so a caller bounds what it passes: `@mdscript/mds` reads at most 10 MiB and one byte of a file.
 
 ### Options
 

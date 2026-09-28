@@ -1158,6 +1158,12 @@ pub fn scan_import_records(source: &str) -> Result<JsValue, JsValue> {
 ///
 /// A leading byte-order mark is kept.
 ///
+/// `bytes` is copied into this module's memory before any check runs, as wasm-bindgen
+/// copies every argument, so the 10 MiB check bounds what is accepted, not what a call
+/// costs: a caller bounds the bytes it passes. `@mdscript/mds` reads at most 10 MiB and
+/// one byte of a file — the one byte past the cap tells a file of exactly the cap from a
+/// larger one (#428).
+///
 /// ## Arguments
 ///
 /// - `bytes`: the file's content.
