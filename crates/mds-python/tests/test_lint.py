@@ -674,7 +674,7 @@ def _hostile_and_shown() -> tuple[str, str]:
 
 
 def test_py_rules_error_wire_escapes_rule_name_and_severity() -> None:
-    """#418 (TP-28): a rule name or severity the ``rules`` error names is WIRE-escaped,
+    """#418: a rule name or severity the ``rules`` error names is WIRE-escaped,
     in the wording mds-core gives napi and WASM too, the map named ``rules``; a clean
     name's message is the control."""
     hostile, shown = _hostile_and_shown()
@@ -695,7 +695,7 @@ def test_py_rules_error_wire_escapes_rule_name_and_severity() -> None:
 
 
 def test_py_rules_conversion_error_text_is_wire_escaped() -> None:
-    """#418 (TP-30): a ``rules`` value that cannot be converted — an instance of a class
+    """#418: a ``rules`` value that cannot be converted — an instance of a class
     whose name carries ESC, LF and TAB — is named in the conversion error by that class
     name, which must reach the message escaped: present in its shown form (the positive
     control, PF-013) and with no raw ESC or LF."""

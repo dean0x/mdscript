@@ -2059,7 +2059,7 @@ fn hostile_and_shown() -> (String, String) {
 
 #[wasm_bindgen_test]
 fn wasm_lint_rules_error_wire_escapes_rule_name_and_severity() {
-    // W-RULES-ESC (#418, TP-28): a rule name or severity the `rules` error names is
+    // W-RULES-ESC (#418): a rule name or severity the `rules` error names is
     // WIRE-escaped, in the wording mds-core gives every binding; a clean name's message
     // is the control.
     let (hostile, shown) = hostile_and_shown();
@@ -2088,7 +2088,7 @@ fn wasm_lint_rules_error_wire_escapes_rule_name_and_severity() {
 
 #[wasm_bindgen_test]
 fn wasm_options_conversion_error_text_is_wire_escaped() {
-    // W-SERDE-ESC (#418, TP-30): a value serde-wasm-bindgen cannot convert — a Symbol —
+    // W-SERDE-ESC (#418): a value serde-wasm-bindgen cannot convert — a Symbol —
     // is named in the conversion error it returns, description included, and each
     // options field WASM converts that way wraps that text in its own message. The
     // description must reach the message escaped: present in its shown form (the

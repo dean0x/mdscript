@@ -1947,7 +1947,7 @@ describe('unknown rule name warning (AC-224 D8)', () => {
     );
   });
 
-  // L-N-RULES-ESC (#418, TP-28): a rule name or severity the `rules` error names is
+  // L-N-RULES-ESC (#418): a rule name or severity the `rules` error names is
   // WIRE-escaped — ESC and LF as the six-character escape text, TAB raw — in the
   // wording mds-core gives every binding; a clean name's message is the control.
   // Hostile characters are built at runtime.
