@@ -32,7 +32,7 @@ pub(crate) struct MdsConfig {
     pub(crate) fmt: FmtConfig,
     /// Per-rule severity overrides for `mds lint` (AC-F-17).
     ///
-    /// Unknown severity VALUES fail config loading loudly (closed enum).
+    /// Unknown severity VALUES fail config loading loudly (see [`LintCliConfig`]).
     /// Unknown rule NAMES: only `mds lint` warns on stderr and continues — single-file
     /// mode via `load_lint_config`, directory mode via `LintDirCtx::config_for`.
     /// `mds build`, `check`, `fmt`, and `watch` load this field but do not emit the
@@ -46,16 +46,32 @@ pub(crate) struct MdsConfig {
 /// Mirrors the core `LintConfig` shape but lives in the CLI so it can be
 /// loaded alongside `BuildConfig` / `FmtConfig` as part of `MdsConfig`.
 ///
-/// Unknown severity VALUES (e.g. `"banana"`) cause a hard parse error (exit 2)
-/// because `Severity` is a closed enum with no sensible fallback. Unknown rule
-/// NAMES: only `mds lint` warns on stderr and continues — single-file mode via
+/// Unknown severity VALUES (e.g. `"banana"`) fail config loading (exit 1), because
+/// `Severity` is a closed enum with no sensible fallback. Unknown rule NAMES: only
+/// `mds lint` warns on stderr and continues — single-file mode via
 /// `load_lint_config`, directory mode via `LintDirCtx::config_for`. `mds build`,
 /// `check`, `fmt`, and `watch` deserialize this struct but do not emit the
 /// warning — an accepted asymmetry, not an oversight (see CHANGELOG).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct LintCliConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lint_rules")]
     pub(crate) rules: HashMap<String, mds::Severity>,
+}
+
+/// `lint.rules` read by [`mds::parse_rule_severities`], the reader the napi, WASM and
+/// Python bindings use for their `rules` option (#175, #418): a value that is not one
+/// of the four severity spellings fails with its error, which names the rule and the
+/// value — `lint.rules["<name>"]: unknown severity "<value>"; …`, or `lint.rules["<name>"]
+/// must be a severity string, got <type>` — each WIRE-escaped as the message is built.
+/// serde_json appends the line and column it had reached once the map was read.
+fn deserialize_lint_rules<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, mds::Severity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rules = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+    mds::parse_rule_severities(rules, "lint.rules").map_err(serde::de::Error::custom)
 }
 
 impl LintCliConfig {

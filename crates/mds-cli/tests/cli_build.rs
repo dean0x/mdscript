@@ -1757,10 +1757,13 @@ fn fmt_unknown_lint_rule_in_mds_json_emits_no_warning() {
     );
 }
 
-/// #175: `mds.json`'s `lint.rules` values are read by the one severity parser the
-/// bindings use. An unknown spelling fails with its message, which names no value, so
-/// a hostile one is never echoed; a value that is not a string is refused. serde's
-/// derive quoted the value (`unknown variant ...`) and took `{"warn": null}` as `warn`.
+/// #175: `mds.json`'s `lint.rules` map is read by the reader the bindings use for their
+/// `rules` option, `mds::parse_rule_severities`, so an unknown spelling fails with its
+/// error, which names the rule and the value as `lint.rules["<name>"]`, each escaped
+/// with the WIRE escaper as the message is built — a hostile one shows as escape text,
+/// never raw — and a value that is not a string is refused by its type. serde's derive
+/// named the value but not the rule (`unknown variant ...`) and took `{"warn": null}`
+/// as `warn`.
 #[test]
 fn mds_json_severity_goes_through_the_one_severity_parser() {
     let squash = |s: &str| {
@@ -1770,29 +1773,67 @@ fn mds_json_severity_goes_through_the_one_severity_parser() {
     };
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
-    // The escaped spelling — backslash, `u`, `0077`, `arn` — and an ESC-carrying value,
-    // built at runtime (PF-018).
+    // The escaped spelling — backslash, `u`, `0077`, `arn` — an ESC-carrying value and
+    // rule name, and ESC as the WIRE escaper shows it, all built at runtime (PF-018).
     let escaped_warn = format!("{}u0077arn", '\\');
     let hostile = format!("{}[31mBAD", '\x1b');
+    let hostile_rule = format!("r{}x", '\x1b');
+    let esc = format!("{}u001B", '\\');
     // The config as the CLI names it: `./mds.json`, `.\mds.json` on Windows.
     let config = std::path::Path::new(".").join("mds.json");
     let config = config.display();
-    let unknown = format!(
-        "invalid mds.json at {config}: unknown severity; \
-         expected \"off\", \"info\", \"warn\", or \"error\" at line 1 column"
-    );
-    let not_a_string =
-        format!("invalid mds.json at {config}: invalid type: map, expected a string");
+    let rule = "unused-variable";
+    let unknown = |name: &str, value: &str| {
+        format!(
+            "invalid mds.json at {config}: lint.rules[\"{name}\"]: unknown severity \
+             \"{value}\"; expected \"off\", \"info\", \"warn\", or \"error\" at line 1 column"
+        )
+    };
+    let not_a_string = |kind: &str| {
+        format!(
+            "invalid mds.json at {config}: lint.rules[\"{rule}\"] must be a severity \
+             string, got {kind} at line 1 column"
+        )
+    };
     let rows = [
         // Control: a known spelling loads, and the build writes its output.
-        (serde_json::json!("warn"), None),
-        (serde_json::json!("Warn"), Some(&unknown)),
-        (serde_json::json!(escaped_warn), Some(&unknown)),
-        (serde_json::json!(hostile), Some(&unknown)),
-        (serde_json::json!({ "warn": null }), Some(&not_a_string)),
+        (rule.to_string(), serde_json::json!("warn"), None),
+        (
+            rule.to_string(),
+            serde_json::json!("Warn"),
+            Some(unknown(rule, "Warn")),
+        ),
+        (
+            rule.to_string(),
+            serde_json::json!(escaped_warn),
+            Some(unknown(rule, &escaped_warn)),
+        ),
+        (
+            rule.to_string(),
+            serde_json::json!(hostile),
+            Some(unknown(rule, &format!("{esc}[31mBAD"))),
+        ),
+        (
+            hostile_rule,
+            serde_json::json!("bogus"),
+            Some(unknown(&format!("r{esc}x"), "bogus")),
+        ),
+        (
+            rule.to_string(),
+            serde_json::json!({ "warn": null }),
+            Some(not_a_string("object")),
+        ),
+        (
+            rule.to_string(),
+            serde_json::Value::Null,
+            Some(not_a_string("null")),
+        ),
     ];
-    for (value, expected) in rows {
-        let config = serde_json::json!({ "lint": { "rules": { "unused-variable": &value } } });
+    // Every row runs; the mismatches are reported together.
+    let mut mismatches = Vec::new();
+    for (name, value, expected) in rows {
+        let rules = serde_json::Map::from_iter([(name.clone(), value.clone())]);
+        let config = serde_json::json!({ "lint": { "rules": rules } });
         std::fs::write(dir.path().join("mds.json"), config.to_string()).unwrap();
         let _ = std::fs::remove_file(dir.path().join("out.md"));
         let out = mds_bin()
@@ -1801,21 +1842,24 @@ fn mds_json_severity_goes_through_the_one_severity_parser() {
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let row = format!("{name:?}: {value}");
         let Some(expected) = expected else {
-            assert!(out.status.success(), "{value}: got: {stderr}");
-            assert!(dir.path().join("out.md").is_file(), "{value}: no output");
+            if !out.status.success() || !dir.path().join("out.md").is_file() {
+                mismatches.push(format!("{row}: must build out.md; got: {stderr}"));
+            }
             continue;
         };
-        assert_eq!(out.status.code(), Some(1), "{value}: got: {stderr}");
-        assert!(
-            squash(&stderr).contains(&squash(expected)),
-            "{value}: expected {expected:?}; got: {stderr}"
-        );
-        for echo in ["Warn", "u0077arn", "[31mBAD"] {
-            assert!(!stderr.contains(echo), "{value}: echoes {echo:?}: {stderr}");
+        if out.status.code() != Some(1) || !squash(&stderr).contains(&squash(&expected)) {
+            mismatches.push(format!(
+                "{row}: expected exit 1 and {expected:?}; got {:?}: {stderr}",
+                out.status.code()
+            ));
         }
-        assert!(!out.stderr.contains(&0x1Bu8), "{value}: raw ESC: {stderr}");
+        if out.stderr.contains(&0x1Bu8) {
+            mismatches.push(format!("{row}: raw ESC: {stderr}"));
+        }
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 // ── Atomic build outputs (#227) ──────────────────────────────────────────────

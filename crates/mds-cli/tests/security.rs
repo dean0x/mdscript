@@ -861,7 +861,8 @@ fn build_mds_error_message_escapes_control_bytes() {
 ///
 /// No `mds.json` value reaches a `miette!()` message raw: a forbidden `output_dir` is
 /// refused as `mds::io` (#265, `output_dir_in_mds_json_is_refused_at_load` in
-/// `forbidden_paths.rs`), and an unknown lint severity's message names no value (#175,
+/// `forbidden_paths.rs`), and an unknown lint severity's message names the rule and the
+/// value WIRE-escaped as it is built (#175,
 /// `mds_json_severity_goes_through_the_one_severity_parser` in `cli_build.rs`). So the
 /// vector is a file name: with no argument, `mds build` looks for the one `.mds` file
 /// in its working directory, and when there are several its error names them all, as

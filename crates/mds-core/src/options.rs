@@ -218,12 +218,13 @@ pub fn reject_unknown_json_keys(
 ///
 /// The napi, WASM and Python bindings each convert the caller's `rules` value to a
 /// JSON object and call this, so every binding reads a severity, and words its error,
-/// the same way; each only wraps the message in its own error object (#418). Pass the
-/// result to [`crate::LintConfig::from_rules_checked`].
+/// the same way; each only wraps the message in its own error object (#418). The CLI
+/// reads `mds.json`'s `lint.rules` through it too (#175). Pass the result to
+/// [`crate::LintConfig::from_rules_checked`].
 ///
-/// `field` names the map in a message as the caller of the binding writes it —
-/// `"options.rules"` on napi and WASM, `"rules"` for Python's keyword argument. It is
-/// the binding's own text, and is shown as given.
+/// `field` names the map in a message as its author writes it — `"options.rules"` on
+/// napi and WASM, `"rules"` for Python's keyword argument, `"lint.rules"` in
+/// `mds.json`. It is the caller's own text, and is shown as given.
 ///
 /// # Errors
 ///
