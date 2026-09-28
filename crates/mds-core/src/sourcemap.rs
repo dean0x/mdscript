@@ -37,7 +37,7 @@
 //! **S6** — `@include` fragment splice carrying foreign source
 //! indices.  `splice_fragment` on `MapBuilder` inserts rebased
 //! `FragmentMap` segments from the included module using that
-//! module's own source index rather than `current_src`.
+//! module's own source index rather than the current source.
 //!
 //! **S7** — `Origin` provenance stamping.  An `Origin` value (file
 //! display name + raw source bytes) is built once per module that
@@ -53,8 +53,8 @@
 //!
 //! **S8** — fine-grained function-body descent; mutually exclusive
 //! with S3 on any given call.  When a `FunctionDef` carries an
-//! `Origin`, `invoke_function` switches `MapBuilder::current_src` to
-//! the defining file, records body nodes individually, and calls
+//! `Origin`, `invoke_function` switches the `MapBuilder`'s current source
+//! to the defining file, records body nodes individually, and calls
 //! `rebase_trim` to adjust the segments after `.trim()`.
 //!
 //! ## S5 is not Stage 5
@@ -660,7 +660,7 @@ pub(crate) struct RawSegment {
     /// Absolute byte offset of this segment's start in the compiled output
     /// (relative to the raw evaluator output, before `clean_output`).
     pub(crate) out: u32,
-    /// 0-based source index into [`MapBuilder::sources`].
+    /// 0-based source index into the builder's [`SourceTable`].
     pub(crate) src: u32,
     /// Byte offset of the corresponding token in the source file.
     pub(crate) src_off: u32,
@@ -737,6 +737,16 @@ impl SourceTable {
     }
 }
 
+/// The index of a source a [`MapBuilder`] has registered — what it records segments
+/// against.
+///
+/// Only the builder mints one, from an index its [`SourceTable`] returned, and the
+/// table is append-only, so an index names the same source for the builder's whole
+/// life. The builder's current source is always one of these: it changes only through
+/// [`MapBuilder::switch_to`] and [`MapBuilder::switch_to_index`], never by assignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceIndex(u32);
+
 // ---------------------------------------------------------------------------
 // MapBuilder — accumulates segments during evaluation
 // ---------------------------------------------------------------------------
@@ -759,7 +769,15 @@ impl SourceTable {
 /// individually mapped; the single `Interpolation` point for the call site
 /// in the parent output is already recorded.  When the function has an
 /// `Origin` (S8 path) suppression is skipped and the body is recorded
-/// directly with `current_src` switched to the definition file.
+/// directly with the current source switched to the definition file.
+///
+/// # Sources
+///
+/// The source table and the current source are private: sources are registered
+/// only through [`Self::register`], [`Self::switch_to`] and a splice, and the
+/// current source changes only through [`Self::switch_to`] and
+/// [`Self::switch_to_index`]. So the current source is always a registered one, and
+/// no code can replace the table under the remap cache's cached indices.
 pub(crate) struct MapBuilder {
     /// Accumulated raw segment records.
     pub(crate) segments: Vec<RawSegment>,
@@ -767,15 +785,15 @@ pub(crate) struct MapBuilder {
     pub(crate) cursor: u32,
     /// Suppression depth: >0 means we are inside a function body (S3 path).
     pub(crate) suppress: u32,
-    /// Index of the source file currently being recorded (0-based into `sources`).
-    pub(crate) current_src: u32,
+    /// The source currently being recorded.
+    current_src: SourceIndex,
     /// The registered sources, each the [`Origin`] that first registered its key.
     ///
     /// `Origin::file` becomes the Source Map v3 `sources[]` entry — it may be absolute;
     /// the caller relativizes it after [`Self::finalize`] (ADR-005). `Origin::display`
     /// is the root-relative path for diagnostics (R3 / CWE-209), and `Origin::source`
     /// resolves segment offsets and feeds `sourcesContent`.
-    pub(crate) sources: SourceTable,
+    sources: SourceTable,
     /// Local → global source indices for each [`FragmentMap`] spliced so far, keyed by
     /// the fragment's `Arc` pointer (S6 / AC-PERF-05). An `@include` of one module in a
     /// loop, or from several sites, registers the module's sources once.
@@ -814,11 +832,11 @@ fn rebased(seg: &RawSegment, remap: &[u32], base: u32) -> Option<RawSegment> {
 impl MapBuilder {
     /// Create a builder seeded with `origin` at source index 0.
     ///
-    /// Segments are recorded against the seed until [`Self::source_index`] switches
-    /// `current_src` to another source (an `@extends` region, an S8 function body).
+    /// Segments are recorded against the seed until [`Self::switch_to`] switches the
+    /// current source to another one (an `@extends` region, an S8 function body).
     pub(crate) fn new(origin: Origin) -> Self {
         let mut sources = SourceTable::default();
-        let current_src = sources.intern(&origin);
+        let current_src = SourceIndex(sources.intern(&origin));
         Self {
             segments: Vec::new(),
             cursor: 0,
@@ -850,12 +868,46 @@ impl MapBuilder {
     /// The source currently being recorded is recognised by pointer; any other is
     /// looked up by key in the [`SourceTable`], so a separate `Origin` of the same
     /// module resolves to the entry that registered it first.
-    pub(crate) fn source_index(&mut self, origin: &Origin) -> u32 {
-        let current = self.sources.get(self.current_src);
+    fn source_index(&mut self, origin: &Origin) -> u32 {
+        let current = self.sources.get(self.current_src.0);
         if current.is_some_and(|current| Arc::ptr_eq(&current.file, &origin.file)) {
-            return self.current_src;
+            return self.current_src.0;
         }
         self.sources.intern(origin)
+    }
+
+    /// The index of `origin`'s source, registering `origin` when its key is new,
+    /// without switching to it.
+    pub(crate) fn register(&mut self, origin: &Origin) -> SourceIndex {
+        SourceIndex(self.source_index(origin))
+    }
+
+    /// Record the following segments against `origin`'s source, registering `origin`
+    /// when its key is new, and return the source recorded against until now — what
+    /// [`Self::switch_to_index`] takes to restore it.
+    pub(crate) fn switch_to(&mut self, origin: &Origin) -> SourceIndex {
+        let next = self.register(origin);
+        std::mem::replace(&mut self.current_src, next)
+    }
+
+    /// Record the following segments against `index`: one this builder handed out,
+    /// from [`Self::register`] or [`Self::switch_to`].
+    pub(crate) fn switch_to_index(&mut self, index: SourceIndex) {
+        self.current_src = index;
+    }
+
+    /// The [`Origin`] of the source currently being recorded.
+    ///
+    /// `None` only for an index another builder handed out: every index this builder
+    /// hands out names one of its own sources.
+    pub(crate) fn current_origin(&self) -> Option<&Origin> {
+        self.sources.get(self.current_src.0)
+    }
+
+    /// The registered sources.
+    #[cfg(test)]
+    pub(crate) fn sources(&self) -> &SourceTable {
+        &self.sources
     }
 
     /// Total byte size of every registered source (the future `sourcesContent`).
@@ -876,7 +928,7 @@ impl MapBuilder {
     pub(crate) fn push_segment(&mut self, out: u32, src_off: u32, len: u32) {
         let segment = RawSegment {
             out,
-            src: self.current_src,
+            src: self.current_src.0,
             src_off,
             len,
         };
@@ -1946,7 +1998,7 @@ mod tests {
     fn fragment_of(sources: &[&Origin]) -> Arc<FragmentMap> {
         let mut b = MapBuilder::new(sources[0].clone());
         for (i, source) in sources.iter().enumerate() {
-            b.current_src = b.source_index(source);
+            b.switch_to(source);
             b.push_segment(10 * i as u32, i as u32, 1);
         }
         Arc::new(b.into_fragment())
@@ -1963,7 +2015,7 @@ mod tests {
             registered(&b),
             vec![("a.mds".into(), "a.mds".into(), "source".into())]
         );
-        assert_eq!(b.current_src, 0);
+        assert_eq!(b.current_src, SourceIndex(0));
         assert_eq!(b.cursor, 0);
         assert_eq!(b.suppress, 0);
         assert!(b.segments.is_empty());
@@ -2017,7 +2069,8 @@ mod tests {
         assert_eq!(b.source_index(&origin("b.mds", "other", "other")), 1);
         // The string-source sentinel and its map label are one key.
         assert_eq!(b.source_index(&origin("input.mds", "input.mds", "x")), 0);
-        b.current_src = 2;
+        b.switch_to(&origin("c.mds", "c.mds", "z"));
+        assert_eq!(b.current_src, SourceIndex(2));
         assert_eq!(b.source_index(&origin("<source>", "<source>", "y")), 0);
         assert_eq!(
             registered(&b),
@@ -2030,6 +2083,45 @@ mod tests {
         );
         let sm = b.finalize("", "", 0, None);
         assert_eq!(sm.sources, vec!["input.mds", "b.mds", "c.mds"]);
+    }
+
+    /// #416: the current source changes only through `switch_to`, which registers a
+    /// new key and returns the source it replaced, and `switch_to_index`, which takes
+    /// that index; segments record against whichever is current.
+    #[test]
+    fn map_builder_switch_to_returns_the_source_it_replaced() {
+        let a = origin("/p/a.mds", "a.mds", "text a");
+        let b_origin = origin("/p/b.mds", "b.mds", "text b");
+        let mut b = MapBuilder::new(a.clone());
+
+        let before_b = b.switch_to(&b_origin);
+        assert_eq!((before_b, b.current_src), (SourceIndex(0), SourceIndex(1)));
+        b.push_segment(0, 0, 1);
+        // Switching to the current source again registers nothing and changes nothing.
+        assert_eq!(b.switch_to(&b_origin), SourceIndex(1));
+        assert_eq!((b.current_src, b.sources().len()), (SourceIndex(1), 2));
+
+        b.switch_to_index(before_b);
+        let current = b.current_origin().expect("a registered source");
+        assert!(Arc::ptr_eq(&current.source, &a.source), "back on the seed");
+        // `register` hands out a new key's index without switching to it.
+        let c = b.register(&origin("/p/c.mds", "c.mds", "text c"));
+        assert_eq!((c, b.current_src), (SourceIndex(2), SourceIndex(0)));
+        b.push_segment(5, 0, 1);
+
+        // A separate allocation of a registered key switches to that key's entry.
+        let copy = origin("/p/b.mds", "other", "other");
+        assert_eq!(b.switch_to(&copy), SourceIndex(0));
+        let current = b.current_origin().expect("a registered source");
+        assert!(
+            Arc::ptr_eq(&current.source, &b_origin.source),
+            "first one wins"
+        );
+        assert_eq!(b.sources().len(), 3);
+        b.push_segment(9, 0, 1);
+
+        let recorded: Vec<(u32, u32)> = b.segments.iter().map(|s| (s.out, s.src)).collect();
+        assert_eq!(recorded, vec![(0, 1), (5, 0), (9, 1)]);
     }
 
     /// #416 / AC-2: the remap cache lives in the builder — K splices of one fragment

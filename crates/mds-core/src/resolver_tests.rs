@@ -3866,9 +3866,9 @@ fn map_builder_shares_origin_arc_across_regions() {
     let map = map.expect("the builder must be handed back");
 
     assert_eq!(output, "one V\ntwo\nchild V\none V\ntwo\none V\ntwo\n");
-    assert_eq!(map.sources.len(), 2, "one entry per module key");
+    assert_eq!(map.sources().len(), 2, "one entry per module key");
     for (idx, expected) in [(0, &base), (1, &child)] {
-        let entry = map.sources.get(idx).expect("registered");
+        let entry = map.sources().get(idx).expect("registered");
         assert!(
             Arc::ptr_eq(&entry.source, &expected.source),
             "entry {idx}: source must be the module's own Arc"
@@ -3923,8 +3923,12 @@ fn map_builder_shares_origin_arc_across_an_imported_extending_splice() {
     let mut importer = crate::sourcemap::MapBuilder::new(main.clone());
     importer.splice_fragment(&fragment, 0);
     let expected = [&main, chain[0], chain[1], chain[2]];
-    assert_eq!(importer.sources.len(), expected.len(), "one entry per file");
-    for (idx, (entry, want)) in importer.sources.iter().zip(expected).enumerate() {
+    assert_eq!(
+        importer.sources().len(),
+        expected.len(),
+        "one entry per file"
+    );
+    for (idx, (entry, want)) in importer.sources().iter().zip(expected).enumerate() {
         assert!(
             Arc::ptr_eq(&entry.source, &want.source),
             "entry {idx}: source must be the module's own Arc"
@@ -3934,7 +3938,7 @@ fn map_builder_shares_origin_arc_across_an_imported_extending_splice() {
             "entry {idx}: display must be the module's own Arc"
         );
     }
-    let displays: Vec<&str> = importer.sources.iter().map(|o| &*o.display).collect();
+    let displays: Vec<&str> = importer.sources().iter().map(|o| &*o.display).collect();
     assert_eq!(displays, ["main.mds", "a.mds", "b.mds", "c.mds"]);
     // Control: an equal-content source in its own allocation is not pointer-equal.
     assert!(!Arc::ptr_eq(&Arc::<str>::from(&*root.source), &root.source));
@@ -3997,14 +4001,14 @@ fn region_first_registered_by_a_splice_names_its_display_path() {
     // call, with that module's own Origin value of it.
     let mut module_builder = crate::sourcemap::MapBuilder::new(module);
     let helper_as_imported = arc_origin(&helper.file, &helper.display, &helper.source);
-    module_builder.current_src = module_builder.source_index(&helper_as_imported);
+    module_builder.switch_to(&helper_as_imported);
     module_builder.push_segment(0, 0, 4);
     let fragment = Arc::new(module_builder.into_fragment());
 
     let mut importer = crate::sourcemap::MapBuilder::new(root);
     importer.splice_fragment(&fragment, 0);
     assert!(
-        importer.sources.iter().any(|o| *o.file == *helper.file),
+        importer.sources().iter().any(|o| *o.file == *helper.file),
         "precondition: the splice registered the helper's key"
     );
     // Positive control (PF-013): the key is absolute, so the equality below fails if

@@ -23,6 +23,7 @@ use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
 pub(crate) use crate::sourcemap::Origin;
+use crate::sourcemap::SourceIndex;
 use crate::validator;
 use crate::value::Value;
 
@@ -791,7 +792,7 @@ impl ModuleCache {
     ///
     /// Each region is evaluated against its own [`Origin`] — the file its node
     /// offsets index into — so a span-bearing error names that file (#114). With a
-    /// builder, its `current_src` is switched to the region's source; without one,
+    /// builder, its current source is switched to the region's source; without one,
     /// the region's display path and source are passed directly. Never
     /// `origin.file`: that is the canonical key (absolute for `NativeFs`) and must
     /// not reach a diagnostic (R3 / CWE-209). Scope is shared across all regions
@@ -815,18 +816,18 @@ impl ModuleCache {
         let mut budget = EvalBudget::default();
         // The previous region's origin and source index: consecutive regions from one
         // file (every between-block skeleton node) reuse the index without a lookup.
-        let mut previous: Option<(&Origin, u32)> = None;
+        let mut previous: Option<(&Origin, SourceIndex)> = None;
 
         for (nodes, origin) in regions {
-            // Switch the builder's current_src to the source that owns this region —
-            // assigned for every region, a reused index included, so no region relies
-            // on the one before it having restored current_src.
+            // Switch the builder's current source to the one that owns this region —
+            // switched for every region, a reused index included, so no region relies
+            // on the one before it having restored it.
             if let Some(ref mut builder) = current_map {
                 let src_idx = match previous {
                     Some((prev, idx)) if Arc::ptr_eq(&prev.file, &origin.file) => idx,
-                    _ => builder.source_index(origin),
+                    _ => builder.register(origin),
                 };
-                builder.current_src = src_idx;
+                builder.switch_to_index(src_idx);
                 previous = Some((origin, src_idx));
                 // Cursor must equal accumulated output length before entering each region.
                 // evaluate_with_map_seeded maintains this invariant internally, but after
@@ -834,7 +835,7 @@ impl ModuleCache {
             }
 
             let region_output = if let Some(builder) = current_map.take() {
-                // builder.current_src was set to origin's source index above;
+                // The builder's current source was switched to origin's above;
                 // evaluate_with_map_seeded derives file/source from it (issue #58).
                 let (region_out, returned_builder) =
                     evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut budget)?;
@@ -1075,7 +1076,7 @@ impl ModuleCache {
         }
 
         let (body_raw, map_out) = if opts.source_map {
-            // Builder seeds current_src=0 pointing to ctx.key / ctx.file_str / ctx.source;
+            // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
             let builder = crate::sourcemap::MapBuilder::new(Origin {
                 file: Arc::from(ctx.key),
@@ -1211,7 +1212,8 @@ impl ModuleCache {
         // is evaluated either way: WARN-B needs it when `prompt` is not exported.
         let (body_raw, builder) = if self.source_map_mode && prompt_exported {
             let builder = crate::sourcemap::MapBuilder::new(origin.clone());
-            // evaluate_with_map derives file/source from builder.current_src (issue #58).
+            // evaluate_with_map derives file/source from the builder's current source
+            // (issue #58).
             let (body_raw, returned) =
                 evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             (body_raw, Some(returned))

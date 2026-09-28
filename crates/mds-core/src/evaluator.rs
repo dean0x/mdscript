@@ -157,8 +157,8 @@ pub(crate) fn evaluate_seeded(
 /// finalization stage.  The builder's `cursor` is guaranteed to equal
 /// `output.len() as u32` when this function returns.
 ///
-/// `file` and `source` for `EvalContext` diagnostic spans are derived from
-/// `builder.current_src` — single source of truth, no redundant parameter
+/// `file` and `source` for `EvalContext` diagnostic spans are derived from the
+/// builder's current source — single source of truth, no redundant parameter
 /// (avoids the dual-channel mis-attribution class fixed in c5a4d65; issue #58).
 ///
 /// Delegates to [`evaluate_with_map_seeded`] with a fresh [`EvalBudget`].
@@ -179,9 +179,9 @@ pub(crate) fn evaluate_with_map(
 /// (e.g. earlier `@extends` regions); `budget` holds the running totals when this
 /// returns, on success and on error alike.
 ///
-/// `file` and `source` for `EvalContext` diagnostic spans are derived from
-/// `builder.current_src` — the single source of truth.  Callers must update
-/// `builder.current_src` before each call (as `evaluate_regions_with_map` does)
+/// `file` and `source` for `EvalContext` diagnostic spans are derived from the
+/// builder's current source — the single source of truth.  Callers must switch
+/// it to the region's origin before each call (as `evaluate_regions_with_map` does)
 /// so that the derived values reflect the correct region origin (issue #58;
 /// avoids the dual-channel mis-attribution class fixed in c5a4d65).
 ///
@@ -189,9 +189,9 @@ pub(crate) fn evaluate_with_map(
 /// iteration cap across all spliced `@extends` regions (REL-1, applies PF-004).
 ///
 /// The `MapBuilder` is returned as a structured error rather than a panic if it
-/// disappears, and a `current_src` with no registered source is an internal error
-/// rather than an empty file context — aligns with PF-005 (don't rely on panic or a
-/// silent fallback for invariants).
+/// disappears, and a current source the builder has not registered (an index from
+/// another builder) is an internal error rather than an empty file context — aligns
+/// with PF-005 (don't rely on panic or a silent fallback for invariants).
 pub(crate) fn evaluate_with_map_seeded(
     nodes: &[Node],
     scope: &mut Scope,
@@ -208,15 +208,11 @@ pub(crate) fn evaluate_with_map_seeded(
     // R3 (CWE-209): `display` (root-relative, never absolute), not `file` (the
     // canonical key, may be absolute), so that file-backed compile error messages
     // show "src/a.mds" instead of "/proj/src/a.mds".
-    let origin = builder
-        .sources
-        .get(builder.current_src)
-        .cloned()
-        .ok_or_else(|| {
-            MdsError::syntax(
-                "internal: MapBuilder current_src names no registered source — compiler bug",
-            )
-        })?;
+    let origin = builder.current_origin().cloned().ok_or_else(|| {
+        MdsError::syntax(
+            "internal: MapBuilder current_src names no registered source — compiler bug",
+        )
+    })?;
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
         budget: *budget,
@@ -707,7 +703,7 @@ fn invoke_function(
     //     unconditionally since B1 dropped the source_map_mode gate, S7).
     //
     // On this path, instead of suppressing the body, we:
-    //  - Switch MapBuilder::current_src to the definition file.
+    //  - Switch the MapBuilder's current source to the definition file.
     //  - Evaluate the body without suppression so each leaf node pushes its own
     //    segment attributed to the definition file.
     //  - Run rebase_trim to drop segments in the trimmed-away leading/trailing
@@ -730,9 +726,7 @@ fn invoke_function(
                 // Snapshot pre-body state and register the definition file in one binding.
                 let sc = map.cursor;
                 let ss = map.segments.len();
-                let sr = map.current_src;
-                let def_src = map.source_index(origin);
-                map.current_src = def_src;
+                let sr = map.switch_to(origin);
                 (sc, ss, sr)
                 // map and origin borrows released here; ctx is usable below.
             } else {
@@ -750,7 +744,7 @@ fn invoke_function(
 
         // Restore source attribution for the outer scope.
         if let Some(ref mut map) = ctx.map {
-            map.current_src = saved_src;
+            map.switch_to_index(saved_src);
         }
         // B1: restore body_origin before `?` so LIFO is correct even on error paths.
         ctx.body_origin = prev_body_origin;
@@ -3031,7 +3025,7 @@ mod tests {
     ) -> crate::scope::NamespaceScope {
         let mut b = crate::sourcemap::MapBuilder::new(module.clone());
         b.push_segment(0, 0, 4);
-        b.current_src = b.source_index(helper);
+        b.switch_to(helper);
         b.push_segment(5, 0, 4);
         crate::scope::NamespaceScope {
             functions: std::collections::HashMap::new(),
@@ -3078,8 +3072,8 @@ mod tests {
             "every include splices both fragment segments"
         );
         let expected = [&main, &module, &helper];
-        assert_eq!(map.sources.len(), expected.len());
-        for (idx, (entry, want)) in map.sources.iter().zip(expected).enumerate() {
+        assert_eq!(map.sources().len(), expected.len());
+        for (idx, (entry, want)) in map.sources().iter().zip(expected).enumerate() {
             assert!(
                 Arc::ptr_eq(&entry.source, &want.source),
                 "entry {idx}: source must be the module's own Arc"
@@ -3091,8 +3085,9 @@ mod tests {
         }
     }
 
-    /// PF-005: a builder whose `current_src` names no registered source is an internal
-    /// error, not an evaluation with an empty file context.
+    /// PF-005: a builder whose current source names no registered source is an internal
+    /// error, not an evaluation with an empty file context. Only an index another
+    /// builder handed out can do that: every index a builder hands out is its own.
     #[test]
     fn evaluate_with_map_seeded_rejects_an_unregistered_current_src() {
         let body = parse_body("text\n");
@@ -3102,7 +3097,9 @@ mod tests {
             .expect("the seed must evaluate");
         assert_eq!(out, "text\n");
         builder = returned;
-        builder.current_src = 1;
+        let mut other = crate::sourcemap::MapBuilder::new(origin("a.mds", "a.mds", "a"));
+        let foreign = other.register(&origin("b.mds", "b.mds", "b"));
+        builder.switch_to_index(foreign);
         let Err(err) = evaluate_with_map(&body, &mut Scope::new(), &mut vec![], builder) else {
             panic!("an unregistered current_src must not evaluate");
         };

@@ -33,8 +33,8 @@ pub struct FunctionDef {
     /// Always populated by the resolver (unconditional since B1 dropped the
     /// `source_map_mode` gate — AC-PERF-01 relaxation for correctness).
     /// Carries the defining module's display path and raw source so that:
-    /// - `invoke_function` (S8 path) can switch `MapBuilder::current_src` to the
-    ///   definition file and attribute body-output segments there.
+    /// - `invoke_function` (S8 path) can switch the `MapBuilder`'s current source to
+    ///   the definition file and attribute body-output segments there.
     /// - `build_type_mismatch` can select the correct source when raising a
     ///   span-bearing error inside an imported `@define` body (PF-012).
     ///
