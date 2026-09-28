@@ -140,7 +140,9 @@ pub fn parse_json_vars(vars_value: serde_json::Value) -> Result<HashMap<String, 
 /// [`sanitize_control_chars_wire`] as the message is built (#418): control characters,
 /// DEL and the bidi/format hazards become escape text, and TAB stays raw. A clean key
 /// shows unchanged. `@mdscript/mds`'s own key check (`assertKnownKeys`) escapes
-/// identically, so the two messages stay byte-identical.
+/// identically, so the two messages stay byte-identical for any key that is valid
+/// Unicode: a lone surrogate reaches napi as U+FFFD, and `assertKnownKeys` shows it
+/// as is.
 ///
 /// # Panics
 ///
