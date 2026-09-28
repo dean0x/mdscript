@@ -10,16 +10,30 @@ import type {
   LintOptions,
   LintResult,
   MdsBaseBackend,
+  MdsErrorSpan,
 } from '../types.js';
-import type { ImportRecord } from '../util/module-scanner.js';
 import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
 import { forwardOpts } from '../util/options.js';
 
 /**
- * Shape of the WASM module exports (built with wasm-pack).
- * The WASM module exports compile, check, lint, lintVirtual, scanImports,
- * scanImportRecords and preflightModule. options shapes mirror the Rust
- * wasm-bindgen signatures.
+ * An import path of a module as the engine's `scanImportRecords` reports it: the path
+ * as written, the directive it is written in, and the context the resolver adds to an
+ * error that resolving it raises (#414).
+ */
+export interface ImportRecord {
+  readonly path: string;
+  readonly kind: 'extends' | 'frontmatter' | 'import' | 'export-from';
+  /** A frontmatter import's position in the `imports:` list: `(in frontmatter imports[<i>])`. */
+  readonly frontmatterIndex: number | null;
+  /** For `@extends` and `@import`, the span a `mds::file_not_found` error for the path carries. */
+  readonly span: MdsErrorSpan | null;
+}
+
+/**
+ * Shape of the WASM module exports (built with wasm-pack) that @mdscript/mds calls:
+ * compile, check, lint, lintVirtual, and scanImportRecords and preflightModule, the two
+ * the Node file pre-scanner calls. options shapes mirror the Rust wasm-bindgen
+ * signatures.
  *
  * Exported so callers can type-annotate pre-loaded modules passed to
  * createWasmBackend().
@@ -53,22 +67,23 @@ export interface WasmModule {
     vars?: Record<string, unknown>;
     rules?: Record<string, string>;
   }): unknown;
-  scanImports(source: string): string[];
   /**
    * The import paths of `source`, each with its record: the directive it is written in
    * and the context the resolver adds to an error that resolving it raises
    * (`mds::scan_import_records`), in the order the resolver resolves them — with the
    * `@extends` base after the imports for a module reached as the base of another
-   * (`asBase`), before them otherwise (`scanImports`' order).
+   * (`asBase`), before them otherwise.
    */
   scanImportRecords(source: string, asBase: boolean): ImportRecord[];
   /**
    * A module file's text, checked as the native backend checks every file it reads:
    * throws `mds::resource_limit` over 10 MiB and `mds::io` for invalid UTF-8, naming
    * the file by `display` (`mds::check_module_bytes`), then `mds::not_mds` for a file
-   * that is not an MDS file, naming it by `typed` (`mds::check_module_type`). The bytes
-   * are copied into WASM memory before any check, so the caller bounds them: the
-   * scanner reads at most `MAX_FILE_SIZE + 1` bytes of a file (#428).
+   * that is not an MDS file, naming it by `typed` (`mds::check_module_type`). `display`
+   * is the file's path below the project root, in its on-disk spelling; `typed` is the
+   * path the caller typed to reach it. The bytes are copied into WASM memory before any
+   * check, so the caller bounds them: the scanner reads at most `MAX_FILE_SIZE + 1` bytes
+   * of a file (#428).
    */
   preflightModule(bytes: Uint8Array, display: string, typed: string): string;
   default?: (input?: unknown) => Promise<void>;
@@ -123,7 +138,7 @@ export function _resetForTesting(failures = 0, browserFailuresCount = 0): void {
  *
  * Returns the loaded module on success, or null if the candidate is not found
  * (MODULE_NOT_FOUND). Throws if the loaded module does not match the expected
- * WasmModule shape (missing compile/check/scanImports). Re-throws unexpected
+ * WasmModule shape (a missing WASM_EXPORTS member). Re-throws unexpected
  * errors (OOM, corrupted WASM, init failures) so the caller can surface them
  * rather than silently discarding them.
  */

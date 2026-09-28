@@ -5,7 +5,8 @@ import { isUtf8 } from 'node:buffer';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, parse, sep } from 'node:path';
-import { isMdsError, type MdsError, type MdsErrorSpan } from '../types.js';
+import { isMdsError, type MdsError } from '../types.js';
+import type { ImportRecord, WasmModule } from '../backend/wasm.js';
 import {
   escapePathForMessage,
   firstForbiddenChar,
@@ -595,43 +596,13 @@ function resolvedPathError(resolved: string, shown: string): PathError | undefin
 }
 
 /**
- * An import path of a module as the engine's `scanImportRecords` reports it: the path
- * as written, the directive it is written in, and the context the resolver adds to an
- * error that resolving it raises (#414).
- */
-export interface ImportRecord {
-  readonly path: string;
-  readonly kind: 'extends' | 'frontmatter' | 'import' | 'export-from';
-  /** A frontmatter import's position in the `imports:` list: `(in frontmatter imports[<i>])`. */
-  readonly frontmatterIndex: number | null;
-  /** For `@extends` and `@import`, the span a `mds::file_not_found` error for the path carries. */
-  readonly span: MdsErrorSpan | null;
-}
-
-/**
  * The two WASM engine calls the scanner makes, the WASM module's own exports (#414):
  * listing a module's imports, and checking a file's bytes and type. What those two check
  * is the Rust engine's own code. The scanner's other checks — of paths, symlinks, the
  * project root and the limits, and the context an import's error gains — are TypeScript
  * mirrors of the native backend's, held to it by the native-vs-WASM differentials.
  */
-export interface ScannerEngine {
-  /**
-   * The import paths a module's source names, in the order the resolver resolves them,
-   * each with its record: a module reached as the `@extends` base of another (`asBase`)
-   * lists its own `@extends` after its imports, any other before them.
-   */
-  scanImportRecords(source: string, asBase: boolean): ImportRecord[];
-  /**
-   * A module file's text, checked as the native backend checks every file it reads,
-   * or a throw of the native error: its bytes as NativeFs checks them
-   * (`mds::check_module_bytes`: the per-file cap, then UTF-8), then its type as the
-   * resolver checks it before parsing (`mds::check_module_type`: `mds::not_mds`).
-   * `display` is the file's path below the project root, in its on-disk spelling;
-   * `typed` is the path the caller typed to reach it, which a `not_mds` error names.
-   */
-  preflightModule(bytes: Uint8Array, display: string, typed: string): string;
-}
+export type ScannerEngine = Pick<WasmModule, 'scanImportRecords' | 'preflightModule'>;
 
 export interface ModuleScannerOptions {
   /**

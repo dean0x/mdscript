@@ -1095,7 +1095,6 @@ describe('options-validation', () => {
       check:       (_src, _opts) => ({ warnings: [] }),
       lint:        (_src, _opts) => ({ version: 1, files: [], truncated: false }),
       lintVirtual: (_m, _e, _opts) => ({ version: 1, files: [], truncated: false }),
-      scanImports: (_src) => [],
     };
     const wasmBe = createWasmBackend(spyWasmModule);
 

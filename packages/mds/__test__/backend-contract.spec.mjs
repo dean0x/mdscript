@@ -36,8 +36,8 @@ describe('backend contract — method manifest', () => {
     );
   });
 
-  test('U-BC3: WASM_EXPORTS contains BASE_METHODS plus scanImports, lintVirtual, scanImportRecords and preflightModule', () => {
-    const expected = [...BASE_METHODS, 'scanImports', 'lintVirtual', 'scanImportRecords', 'preflightModule'].sort();
+  test('U-BC3: WASM_EXPORTS contains BASE_METHODS plus lintVirtual, scanImportRecords and preflightModule', () => {
+    const expected = [...BASE_METHODS, 'lintVirtual', 'scanImportRecords', 'preflightModule'].sort();
     assert.deepEqual([...WASM_EXPORTS].sort(), expected);
   });
 
@@ -425,7 +425,7 @@ describe('backend contract — O(1) array validation (AC-PERF-04)', () => {
 // ---------------------------------------------------------------------------
 
 describe('backend contract — parity: WASM backend exposes BASE_METHODS (AC-API-09)', () => {
-  // Build a minimal stub WasmModule that satisfies validateWasmShape.
+  // Build a minimal stub WasmModule for createWasmBackend, which calls only these.
   // Stubs return valid discriminated-union shapes.
   const validMarkdownResult = { kind: 'markdown', output: '', warnings: [], dependencies: [] };
   const validCheckResult = { warnings: [] };
@@ -436,7 +436,6 @@ describe('backend contract — parity: WASM backend exposes BASE_METHODS (AC-API
     check: () => validCheckResult,
     lint: () => validLintResult,
     lintVirtual: () => validLintResult,
-    scanImports: () => [],
   };
 
   const wasmBackend = createWasmBackend(stubWasmModule);
