@@ -494,6 +494,10 @@ pub fn wait_for_tap_count(tap: &PipeTap, needle: &str, n: usize, timeout: Durati
 pub const ORDER_MARKER_SOURCE: &str = "Order marker {{__order_marker__}}\n";
 
 /// The line of the diagnostic [`ORDER_MARKER_SOURCE`] produces, once per compile.
+///
+/// One edit can reach the watcher as several events, and each failed compile reports
+/// again, so this line can print several times for a single edit: wait for it, never
+/// count it.
 #[allow(dead_code)]
 pub const ORDER_MARKER_LINE: &str = "undefined variable '__order_marker__'";
 

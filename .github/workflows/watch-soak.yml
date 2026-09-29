@@ -89,9 +89,12 @@ jobs:
           TEST: ${{ inputs.test }}
         run: |
           set -euo pipefail
+          # A rejected value is printed with %q, on one line whatever it holds: echoed
+          # raw, a value with a newline could start a line of its own that the runner
+          # reads as a workflow command.
           case "$ITERATIONS" in
             ''|*[!0-9]*)
-              echo "::error::iterations must be a positive integer; got '$ITERATIONS'"
+              printf '::error::iterations must be a positive integer; got %q\n' "$ITERATIONS"
               exit 1
               ;;
           esac
@@ -101,7 +104,6 @@ jobs:
           fi
           echo "iterations validated: $ITERATIONS"
           # An allowlist, not a pattern: anything else fails here, before the build.
-          # %q prints the rejected value on one line, whatever it holds.
           case "$TEST" in
             cli_watch|cli_watch_cap|cli_watch_truncate)
               ;;
