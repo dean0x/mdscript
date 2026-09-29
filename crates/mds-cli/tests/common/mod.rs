@@ -25,6 +25,19 @@ pub fn mds_bin() -> std::process::Command {
     cmd
 }
 
+/// The write end of a pipe whose read end has already been dropped.
+///
+/// Handing this to a child as one of its standard streams makes every write the child
+/// makes to that stream fail with a broken pipe from the first byte on. The reader is
+/// dropped BEFORE the child is spawned: dropping `child.stdout` / `child.stderr` after
+/// the spawn instead races the child, since a short run can finish writing first.
+#[allow(dead_code)]
+pub fn closed_pipe() -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().expect("create a pipe");
+    drop(reader);
+    writer
+}
+
 /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
 ///
 /// Unix symlink creation needs no special privilege. On Windows it needs either

@@ -16,7 +16,7 @@
 //! - AC-CF-8: -q/--quiet suppresses status but never errors
 
 mod common;
-use common::{fixture, make_symlink, mds_bin};
+use common::{closed_pipe, fixture, make_symlink, mds_bin};
 
 use std::fs;
 use std::path::Path;
@@ -240,17 +240,6 @@ fn stdin_filter_mode_is_idempotent() {
     let twice = String::from_utf8(second.stdout).unwrap();
 
     assert_eq!(once, twice, "stdin filter mode must be idempotent");
-}
-
-/// The write end of a pipe whose read end is already gone.
-///
-/// The reader is dropped BEFORE the child is spawned, so the child's first write to
-/// this pipe fails with a broken pipe every time. Dropping `child.stdout` after the
-/// spawn instead races the child: a short run can finish writing first.
-fn closed_pipe() -> std::io::PipeWriter {
-    let (reader, writer) = std::io::pipe().expect("create a pipe");
-    drop(reader);
-    writer
 }
 
 /// `mds fmt -` into a pipe nobody reads keeps its verdict: exit 0, and nothing on stderr

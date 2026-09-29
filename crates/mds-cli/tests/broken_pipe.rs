@@ -40,14 +40,15 @@
 //!
 //! - An output that cannot be written: a directory at mode `0o555` (unix). Root ignores
 //!   the mode, so each such test first checks that it really cannot create a file there
-//!   and skips with a printed reason when it can.
+//!   and skips with a printed reason when it can. A source that cannot be read, in
+//!   directory mode: a file at mode `0o000` (unix), skipped the same way.
 //! - Stdin that cannot be read: a directory handle on unix (reading it fails with
 //!   "is a directory"), a write-only file handle on Windows. A write-only handle cannot
 //!   stand in on unix: the Rust runtime reads EBADF on a standard stream as end of input.
 //! - A stdout that fails for another reason: `/dev/full` (Linux only; ignored elsewhere).
 
 mod common;
-use common::mds_bin;
+use common::{closed_pipe, mds_bin};
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -61,16 +62,6 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often [`wait_bounded`] polls the child for exit.
 const POLL: Duration = Duration::from_millis(5);
-
-/// The write end of a pipe whose read end has already been dropped.
-///
-/// Handing this to a child as one of its standard streams makes every write the child
-/// makes to that stream fail with a broken pipe from the first byte on.
-fn closed_pipe() -> std::io::PipeWriter {
-    let (reader, writer) = std::io::pipe().expect("create a pipe");
-    drop(reader);
-    writer
-}
 
 /// One of the child's output streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,11 +206,12 @@ fn run_with(dir: &Path, args: &[&str], stdin: Input, stdout: Stdio, stderr: Stdi
 /// - `ok.mds` compiles; `bad.mds` does not (an unterminated `@if`).
 /// - `d/` holds one of each; `good/` holds two that compile, so a run that stops after
 ///   the first output shows up as a missing second one.
-/// - `messy.mds` and `m/messy.mds` lack the final newline `mds fmt` adds.
+/// - `messy.mds` and `m/messy.mds` lack the final newline `mds fmt` adds; so do both
+///   files in `two/`, so `mds fmt --diff two` writes two diffs.
 fn fixture_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
-    let files: [(&str, &str); 7] = [
+    let files: [(&str, &str); 9] = [
         ("ok.mds", "Hello\n"),
         ("bad.mds", "@if flag:\nunterminated\n"),
         ("d/ok.mds", "Hello\n"),
@@ -227,8 +219,10 @@ fn fixture_dir() -> tempfile::TempDir {
         ("good/a.mds", "A\n"),
         ("good/b.mds", "B\n"),
         ("messy.mds", "Hello"),
+        ("two/a.mds", "A"),
+        ("two/b.mds", "B"),
     ];
-    for dir_name in ["d", "good", "m"] {
+    for dir_name in ["d", "good", "m", "two"] {
         std::fs::create_dir(root.join(dir_name)).expect("create a fixture dir");
     }
     for (name, text) in files {
@@ -626,6 +620,44 @@ fn help_into_a_full_device_exits_2() {
     assert_stdout_failure_exits_2(&["--help"], "");
 }
 
+/// Two diffs into a full device: the failure is reported once, not once per file, and
+/// each file whose diff was lost counts as failed (#157).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
+fn fmt_diff_of_a_directory_into_a_full_device_reports_the_failure_once() {
+    // Control: into an open pipe both diffs arrive, so the run below loses two writes.
+    let open = run(fixture_dir().path(), &["fmt", "--diff", "two"], "", None);
+    assert_eq!(open.code, Some(0), "control; stderr: {:?}", open.stderr);
+    assert!(
+        open.stdout.contains("two/a.mds") && open.stdout.contains("two/b.mds"),
+        "control: both diffs must be written; stdout: {:?}",
+        open.stdout
+    );
+
+    let run = run_into_dev_full(&["fmt", "--diff", "two"], "");
+    assert_eq!(
+        run.code,
+        Some(2),
+        "`mds fmt --diff two` into /dev/full must exit 2; stderr: {:?}",
+        run.stderr
+    );
+    assert_eq!(
+        (
+            run.stderr.matches("mds::io").count(),
+            run.stderr.matches("cannot write to stdout").count()
+        ),
+        (1, 1),
+        "the stdout failure must be reported exactly once; stderr: {:?}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("0 would reformat, 0 unchanged, 2 failed"),
+        "both files whose diff was lost count as failed; stderr: {:?}",
+        run.stderr
+    );
+}
+
 // ── clap's own output: help, version and usage errors ────────────────────────
 
 #[test]
@@ -827,6 +859,153 @@ fn init_in_a_directory_it_cannot_write_exits_2() {
         !dir.path().join("ro/hello.mds").exists(),
         "nothing may be written"
     );
+}
+
+// ── A directory run whose file fails with an I/O or file-system error: exit 2 ─
+
+/// A fixture dir with `u/a.mds`, which compiles but lacks the final newline `mds fmt`
+/// adds, and `u/b.mds`, which the test's user cannot read (mode `0o000`). `None`, after
+/// printing why, when the mode does not stop the read — root ignores it.
+#[cfg(unix)]
+fn fixture_with_unreadable_source() -> Option<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = fixture_dir();
+    let u = dir.path().join("u");
+    std::fs::create_dir(&u).expect("create u");
+    std::fs::write(u.join("a.mds"), "A").expect("write u/a.mds");
+    let b = u.join("b.mds");
+    std::fs::write(&b, "B\n").expect("write u/b.mds");
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o000)).expect("chmod 0o000");
+    if std::fs::read(&b).is_ok() {
+        eprintln!(
+            "skipped: {} can be read at mode 0o000 (running as root?)",
+            b.display()
+        );
+        return None;
+    }
+    Some(dir)
+}
+
+/// Assert a directory run that could not read one of its sources: exit 2, the failure
+/// reported as `mds::io`, and `summary` on stderr — the other file was processed.
+#[cfg(unix)]
+fn assert_unreadable_source_exits_2(run: &Run, what: &str, summary: &str) {
+    assert_exit_and_code(run, what, 2, "mds::io");
+    assert!(
+        run.stderr.contains("b.mds"),
+        "`mds {what}` must name the file it could not read; stderr: {:?}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(summary),
+        "`mds {what}` must process the other file and count the failed one: {summary:?}; \
+         stderr: {:?}",
+        run.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_build_with_an_unreadable_source_exits_2() {
+    let Some(dir) = fixture_with_unreadable_source() else {
+        return;
+    };
+    let run = run_in(dir.path(), &["build", "u"]);
+    assert_unreadable_source_exits_2(&run, "build u", "1 built, 1 failed");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("u/a.md"))
+            .ok()
+            .as_deref(),
+        Some("A\n"),
+        "the source that can be read must still be built"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_check_with_an_unreadable_source_exits_2() {
+    let Some(dir) = fixture_with_unreadable_source() else {
+        return;
+    };
+    let run = run_in(dir.path(), &["check", "u"]);
+    assert_unreadable_source_exits_2(&run, "check u", "1 passed, 1 failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_fmt_with_an_unreadable_source_exits_2() {
+    let Some(dir) = fixture_with_unreadable_source() else {
+        return;
+    };
+    let run = run_in(dir.path(), &["fmt", "u"]);
+    assert_unreadable_source_exits_2(&run, "fmt u", "1 formatted, 0 unchanged, 1 failed");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("u/a.mds"))
+            .ok()
+            .as_deref(),
+        Some("A\n"),
+        "the source that can be read must still be formatted"
+    );
+}
+
+/// A directory build or check with a file that imports a file that does not exist
+/// exits 2, as that file given alone does: `mds::file_not_found` is in the I/O and
+/// file-system class (#157). Unlike the unreadable-source tests, this runs on every OS.
+#[test]
+fn a_directory_build_or_check_with_a_missing_import_exits_2() {
+    for (args, summary) in [
+        (&["build", "i"][..], "1 built, 1 failed"),
+        (&["check", "i"][..], "1 passed, 1 failed"),
+    ] {
+        let what = args.join(" ");
+        let dir = fixture_dir();
+        let i = dir.path().join("i");
+        std::fs::create_dir(&i).expect("create i");
+        std::fs::write(i.join("a.mds"), "@import \"./nope.mds\" as n\n\nHi\n")
+            .expect("write i/a.mds");
+        std::fs::write(i.join("b.mds"), "Ok\n").expect("write i/b.mds");
+        let run = run(dir.path(), args, "", None);
+        assert_exit_and_code(&run, &what, 2, "mds::file_not_found");
+        assert!(
+            run.stderr.contains(summary),
+            "`mds {what}` must process the other file and count the failed one: \
+             {summary:?}; stderr: {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// Control for the tests above: a directory run whose only failures are a
+/// template error and a file over the size cap still exits 1 — only an I/O or
+/// file-system failure lifts it to 2 (#157).
+#[test]
+fn a_directory_run_whose_failures_are_a_template_error_and_a_resource_limit_exits_1() {
+    let over_cap = "x".repeat(STDIN_CAP + 1);
+    for (args, summary) in [
+        (&["build", "t"][..], "1 built, 2 failed"),
+        (&["check", "t"][..], "1 passed, 2 failed"),
+        (&["fmt", "t"][..], "0 formatted, 1 unchanged, 2 failed"),
+    ] {
+        let what = args.join(" ");
+        let dir = fixture_dir();
+        let t = dir.path().join("t");
+        std::fs::create_dir(&t).expect("create t");
+        std::fs::write(t.join("ok.mds"), "Hello\n").expect("write t/ok.mds");
+        std::fs::write(t.join("bad.mds"), "@if flag:\nunterminated\n").expect("write t/bad.mds");
+        std::fs::write(t.join("big.mds"), &over_cap).expect("write t/big.mds");
+        let run = run(dir.path(), args, "", None);
+        assert_exit_and_code(&run, &what, 1, "mds::resource_limit");
+        assert!(
+            run.stderr.contains("mds::syntax") && !run.stderr.contains("mds::io"),
+            "`mds {what}` must report the template error and no I/O failure; stderr: {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains(summary),
+            "`mds {what}` must count both failures: {summary:?}; stderr: {:?}",
+            run.stderr
+        );
+    }
 }
 
 // ── Stdin that cannot be read, is not UTF-8, or is over the cap ──────────────

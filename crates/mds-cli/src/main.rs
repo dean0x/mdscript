@@ -339,7 +339,8 @@ fn run_check(
 /// Validate every non-partial `.mds` file under `dir`.
 ///
 /// Continue-on-error: a per-file error does not abort the run. Prints a summary and
-/// returns non-zero if any file fails (AC-FUNC-26).
+/// returns non-zero if any file fails (AC-FUNC-26): 2 when an I/O or file-system
+/// failure is among them, as for `mds build <dir>` (#157), else 1.
 fn run_check_directory(
     dir: &std::path::Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
@@ -407,8 +408,9 @@ fn run_check_directory(
             }
             Err(e) => {
                 // Route through the single render choke point (avoids PF-004 /
-                // architecture-6: hand-rolled sanitize_control_chars bypass).
-                output::eprint_error(e);
+                // architecture-6: hand-rolled sanitize_control_chars bypass); a source
+                // that cannot be read lifts the exit code to 2 (#157).
+                output::eprint_file_failure(e);
                 fail_count += 1;
             }
         }

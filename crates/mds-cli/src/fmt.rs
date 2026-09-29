@@ -20,9 +20,9 @@
 //!   summary), OR a format/parse error (`MdsError` non-io, including
 //!   `FormatterInvariant`) via `Err` -> `exit_code`
 //! - 2: file not found / not `.mds` / I/O / bad UTF-8 — a rewrite or a stdout write
-//!   that fails included, in directory mode too (#157); a closed stdout is not a
-//!   failure
-//! - 3: oversized source
+//!   that fails included, in directory mode too, where one such file makes the run
+//!   exit 2 (#157); a closed stdout is not a failure
+//! - 3: oversized source (in directory mode, a failed file that leaves the run at 1)
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +31,8 @@ use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, render_unified_diff, write_stdout, Durability,
+    atomic_write_file, collect_mds_files_detailed, render_unified_diff, stdout_failure,
+    write_stdout, Durability, StdoutOutcome,
 };
 
 pub(crate) struct FmtArgs {
@@ -217,8 +218,10 @@ enum FileOutcome {
 /// A diff-output failure other than a closed stdout, and a rewrite that fails, are
 /// returned as [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
 /// read and format errors are treated in the surrounding loop — and recorded as I/O
-/// failures, so the run exits at least 2. A closed stdout is not a failure: the diff
-/// has no reader, and the file's outcome stands (#157).
+/// failures, so the run exits at least 2; so is a read or format error in the I/O and
+/// file-system class. A failing stdout is reported once for the run; every file whose
+/// diff it lost counts as failed. A closed stdout is not a failure: the diff has no
+/// reader, and the file's outcome stands (#157).
 fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, quiet } = flags;
     let file_name = file.display().to_string();
@@ -227,7 +230,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         Err(e) => {
             // File path is embedded in the miette report; sanitize for ESC injection safety
             // (avoids PF-004 parallel-path gap — uses the shared render helper).
-            crate::output::eprint_error(e);
+            crate::output::eprint_file_failure(e);
             return FileOutcome::Failed;
         }
     };
@@ -238,16 +241,20 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         Err(e) => {
             // MdsError::Syntax embeds user-controlled source fragments that may contain
             // raw ESC bytes; file_name is threaded into the report by format_source_named.
-            crate::output::eprint_error(e);
+            crate::output::eprint_file_failure(e);
             return FileOutcome::Failed;
         }
     };
 
     if diff && result.changed {
         let rendered = render_unified_diff(&source, &result.formatted, &file_name);
-        if let Err(e) = write_stdout(rendered.as_bytes()).into_batch_result() {
-            crate::output::eprint_io_failure(e);
-            return FileOutcome::Failed;
+        match write_stdout(rendered.as_bytes()) {
+            StdoutOutcome::Written | StdoutOutcome::Closed => {}
+            StdoutOutcome::Failed(e) => {
+                crate::output::eprint_io_failure(stdout_failure(&e));
+                return FileOutcome::Failed;
+            }
+            StdoutOutcome::FailedAgain => return FileOutcome::Failed,
         }
     }
 
@@ -287,7 +294,8 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
 /// just as much a candidate for reformatting as any other file.
 ///
 /// Continue-on-error: a per-file failure does not abort the run. Non-zero
-/// exit when any file failed, or (under `--check`) when any file would change.
+/// exit when any file failed, or (under `--check`) when any file would change; 2 when an
+/// I/O or file-system failure was recorded (#157).
 fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     // Directory recursion depth cap, matching `run_build_directory` /
     // `run_check_directory` which also declare MAX_DEPTH as a function-local

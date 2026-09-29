@@ -775,7 +775,7 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
     })?;
     if bytes.len() as u64 > MAX_FILE_SIZE {
         return Err(MdsError::ResourceLimit {
-            message: "stdin input exceeds maximum size of 10 MB".to_owned(),
+            message: "stdin input exceeds maximum size of 10 MiB".to_owned(),
         });
     }
     String::from_utf8(bytes).map_err(|_| MdsError::Io {
@@ -1368,18 +1368,36 @@ pub(crate) fn apply_source_map_file_label(
 ///
 /// # Errors
 ///
-/// A sidecar that cannot be removed is `mds::io` (exit 2, #157).
+/// A map that cannot be read — so nothing is known of its content — and a sidecar that
+/// cannot be removed are `mds::io` (exit 2, #157).
 pub(crate) fn verify_then_delete_map(
     map_path: &Path,
     expected_basename: &str,
     quiet: bool,
 ) -> Result<(), MdsError> {
-    let Ok(metadata) = std::fs::metadata(map_path) else {
-        return Ok(());
+    let unreadable = |e: &std::io::Error| MdsError::Io {
+        message: format!(
+            "cannot read stale map {}: {}",
+            crate::output::safe_path(map_path),
+            crate::output::safe_inline(e)
+        ),
     };
-    let sidecar = metadata.is_file()
-        && std::fs::File::open(map_path)
-            .is_ok_and(|mut file| has_sidecar_head(&mut file, expected_basename));
+    let metadata = match std::fs::metadata(map_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(unreadable(&e)),
+    };
+    let sidecar = if metadata.is_file() {
+        match std::fs::File::open(map_path)
+            .and_then(|mut file| has_sidecar_head(&mut file, expected_basename))
+        {
+            Ok(sidecar) => sidecar,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(unreadable(&e)),
+        }
+    } else {
+        false
+    };
     if !sidecar {
         if !quiet {
             crate::output::ewriteln!(
@@ -1407,14 +1425,14 @@ pub(crate) fn verify_then_delete_map(
 /// `SourceMap::to_json` writes `version`, `file` and then `sources` in that order, with
 /// no whitespace, and a sidecar always carries the output's name as `file`, so a map it
 /// wrote always starts so; a map formatted by hand does not, even with the same fields.
-/// Only those bytes are read (#428).
-fn has_sidecar_head(reader: &mut impl Read, expected_basename: &str) -> bool {
+/// Only those bytes are read (#428); a read that fails is the error.
+fn has_sidecar_head(reader: &mut impl Read, expected_basename: &str) -> std::io::Result<bool> {
     let Ok(name) = serde_json::to_string(expected_basename) else {
-        return false;
+        return Ok(false);
     };
     let head = format!("{{\"version\":3,\"file\":{name},");
     let len = head.len() as u64;
-    mds::read_at_most(reader, len, len).is_ok_and(|bytes| bytes == head.as_bytes())
+    Ok(mds::read_at_most(reader, len, len)? == head.as_bytes())
 }
 
 /// Refuse `-o/--output` and `--out-dir` values carrying a forbidden path character
@@ -1817,9 +1835,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// **I/O failures (#157):** an output directory that cannot be created, an output or
 /// `.map` sidecar that cannot be written, and a stale sibling that cannot be removed are
 /// each reported as one `mds::io` error through [`crate::output::eprint_io_failure`],
-/// which records it for the exit code, so the run exits at least 2 while the other files
-/// are still built. The first three count their file as failed; a stale sibling does
-/// not, since its file was built. A template error alone still exits 1.
+/// which records it for the exit code, so the run exits 2 while the other files are
+/// still built. A compile that fails is reported through
+/// [`crate::output::eprint_file_failure`], which records it the same way when it is an
+/// I/O or file-system failure — a source that cannot be read, say. All but the stale
+/// sibling count their file as failed; its file was built. A run whose failures are
+/// only template errors or resource limits exits 1.
 ///
 /// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
 /// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
@@ -2062,8 +2083,9 @@ fn run_build_directory(
             }
             Err(e) => {
                 // Route through the single render choke point (avoids PF-004 /
-                // architecture-6: hand-rolled sanitize_control_chars bypass).
-                crate::output::eprint_error(e);
+                // architecture-6: hand-rolled sanitize_control_chars bypass); a source
+                // that cannot be read lifts the exit code to 2 (#157).
+                crate::output::eprint_file_failure(e);
                 fail_count += 1;
             }
         }
@@ -2903,7 +2925,7 @@ mod tests {
             at_cap.capacity()
         );
 
-        let over_cap = "resource limit exceeded: stdin input exceeds maximum size of 10 MB";
+        let over_cap = "resource limit exceeded: stdin input exceeds maximum size of 10 MiB";
         let over: miette::Report = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE + 1))
             .unwrap_err()
             .into();
@@ -2964,7 +2986,8 @@ mod tests {
             apply_source_map_file_label(&mut sm, Some(Path::new(name)), false);
             sm.to_json()
         };
-        let verdict = |bytes: &str, name: &str| has_sidecar_head(&mut bytes.as_bytes(), name);
+        let verdict =
+            |bytes: &str, name: &str| has_sidecar_head(&mut bytes.as_bytes(), name).unwrap();
 
         let mut mismatches = Vec::new();
         for name in ["out.md", "a \"quoted\" name.md", "caf\u{e9}.md"] {
@@ -2988,7 +3011,7 @@ mod tests {
         }
         let head = "{\"version\":3,\"file\":\"out.md\",".len() as u64;
         let mut large = Stream::sized(64 * 1024 * 1024);
-        if has_sidecar_head(&mut large, "out.md") || large.served > head {
+        if has_sidecar_head(&mut large, "out.md").unwrap() || large.served > head {
             mismatches.push(format!(
                 "64 MiB of x: read {} bytes; the head is {head}",
                 large.served
@@ -3036,5 +3059,41 @@ mod tests {
             map.exists(),
             "the sidecar that could not be removed is still there"
         );
+    }
+
+    /// #157: a stale `.map` that cannot be read is an `mds::io` error, not a "not a
+    /// tool-generated map" warning — nothing is known about its content. The control: a
+    /// readable map that is not a sidecar is left in place without an error.
+    ///
+    /// `#[cfg(unix)]`: the read failure comes from a `0o000`-mode file.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_map_that_cannot_be_read_is_an_io_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("out.md.map");
+
+        // Control: readable, not a sidecar — left in place, no error.
+        std::fs::write(&map, "{\"hand\":\"written\"}").unwrap();
+        assert!(verify_then_delete_map(&map, "out.md", true).is_ok());
+        assert!(map.exists(), "control: a hand-written map is left in place");
+
+        let sidecar = "{\"version\":3,\"file\":\"out.md\",\"sources\":[],\"mappings\":\"\"}";
+        std::fs::write(&map, sidecar).unwrap();
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&map).is_ok() {
+            eprintln!("skipped: a file can be read at mode 0o000 (running as root?)");
+            return;
+        }
+        let result = verify_then_delete_map(&map, "out.md", true);
+        match result {
+            Err(MdsError::Io { message }) => assert!(
+                message.starts_with("cannot read stale map ") && message.contains("out.md.map"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+        assert!(map.exists(), "a map that cannot be read is left in place");
     }
 }

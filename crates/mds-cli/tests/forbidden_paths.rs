@@ -126,6 +126,9 @@ fn assert_names_as_typed(text: &str, frame: Frame<'_>, shown: &str, resolved: &P
 //
 // Unix-only: a Windows file name cannot hold a C0 control, so the hostile file the
 // matrix needs cannot be created there.
+//
+// The refusal is `mds::io`, an I/O or file-system failure, so a directory build, check
+// or fmt that meets it exits 2 while its siblings are still processed (#157).
 
 #[cfg(unix)]
 mod walker {
@@ -149,7 +152,11 @@ mod walker {
     fn build_refuses_the_hostile_file_and_builds_its_sibling() {
         let (dir, shown) = tree();
         let (code, text) = run(dir.path(), &["build", ".", "--out-dir", "out"]);
-        assert_eq!(code, Some(1), "per-file failure exits 1; got: {text}");
+        assert_eq!(
+            code,
+            Some(2),
+            "an mds::io per-file failure exits 2; got: {text}"
+        );
         assert_refusal(&text, ESC, &shown, "build");
         assert!(is_line(&text, "1 built, 1 failed"), "got: {text}");
         let out = dir.path().join("out");
@@ -170,7 +177,7 @@ mod walker {
         std::fs::create_dir(&hostile).unwrap();
         std::fs::write(hostile.join("a.mds"), "A\n").unwrap();
         let (code, text) = run(dir.path(), &["build", ".", "--out-dir", "out"]);
-        assert_eq!(code, Some(1), "got: {text}");
+        assert_eq!(code, Some(2), "got: {text}");
         assert_refusal(
             &text,
             ESC,
@@ -185,7 +192,7 @@ mod walker {
     fn check_refuses_the_hostile_file_and_checks_its_sibling() {
         let (dir, shown) = tree();
         let (code, text) = run(dir.path(), &["check", "."]);
-        assert_eq!(code, Some(1), "got: {text}");
+        assert_eq!(code, Some(2), "got: {text}");
         assert_refusal(&text, ESC, &shown, "check");
         assert!(is_line(&text, "1 passed, 1 failed"), "got: {text}");
     }
@@ -196,7 +203,7 @@ mod walker {
         // The sibling needs a rewrite, so "formatted" proves it was processed.
         std::fs::write(dir.path().join("ok.mds"), "Hello!").unwrap();
         let (code, text) = run(dir.path(), &["fmt", "."]);
-        assert_eq!(code, Some(1), "got: {text}");
+        assert_eq!(code, Some(2), "got: {text}");
         assert_refusal(&text, ESC, &shown, "fmt");
         assert!(
             is_line(&text, "1 formatted, 0 unchanged, 1 failed"),
