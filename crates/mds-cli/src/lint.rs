@@ -66,7 +66,8 @@
 //!
 //! A closed stdout or stderr never changes the code. A stdout write that fails for
 //! another reason — the JSON report, a diff, the fixed source — is reported once as
-//! `mds::io`, and the funnel lifts the code to at least 2 (#157).
+//! `mds::io`, and the funnel lifts the code to at least 2; in directory mode a file whose
+//! diff it lost counts under "with errors" (#157).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -83,7 +84,7 @@ use crate::build::{
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_io_failure, eprint_warning,
     relabel_stdin_error, render_unified_diff, safe_file_display, safe_inline, safe_path,
-    write_stdout, Durability, STDIN_DISPLAY_LABEL,
+    stdout_failure, write_stdout, Durability, StdoutOutcome, STDIN_DISPLAY_LABEL,
 };
 
 // AC-224-15: No local rule-name list. The single source of truth is
@@ -421,17 +422,26 @@ fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<S
 
 // ── stdout write ──────────────────────────────────────────────────────────────
 
-/// Write lint's product — a JSON document, a diff, the fixed source — to stdout (#157).
+/// Write lint's product — a JSON document, a diff, the fixed source — to stdout, and
+/// return whether a failing stdout lost it (#157).
 ///
 /// [`write_stdout`] writes and flushes it, so a fixed source without a final `\n` is
 /// never left in a buffer when the run exits. A closed stdout keeps the verdict: the
-/// reader is gone, as with `mds lint --fix - | head -n1`, and nothing more is written.
-/// The first failure for any other reason is reported as one `mds::io` error naming
-/// stdout and recorded, so the exit funnel ends the run with at least 2; a repeat of it
-/// was already reported and recorded. Either way the run goes on to its verdict.
-fn emit_stdout(text: &str) {
-    if let Err(e) = write_stdout(text.as_bytes()).into_batch_result() {
-        eprint_io_failure(e);
+/// reader is gone, as with `mds lint --fix - | head -n1`, nothing more is written, and
+/// nothing is lost (`false`). The first failure for any other reason is reported as one
+/// `mds::io` error naming stdout and recorded, so the exit funnel ends the run with at
+/// least 2; a repeat of it was already reported and recorded. Either failure returns
+/// `true`: a directory run counts the file whose diff it lost under "with errors", as it
+/// counts a file whose rewrite fails and as `mds fmt <dir>` counts it failed. Every other
+/// caller goes on to its verdict, which the recorded failure already lifts.
+fn emit_stdout(text: &str) -> bool {
+    match write_stdout(text.as_bytes()) {
+        StdoutOutcome::Written | StdoutOutcome::Closed => false,
+        StdoutOutcome::Failed(e) => {
+            eprint_io_failure(stdout_failure(&e));
+            true
+        }
+        StdoutOutcome::FailedAgain => true,
     }
 }
 
@@ -1362,7 +1372,9 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
 /// "With errors" covers both error-severity lint findings AND per-file analysis failures
 /// (read error, config error, lint call failure) — the same conflation `mds build`'s
 /// "failed" bucket makes (D3-a).  "Resource-limited" counts files where `mds::lint`
-/// returned `MdsError::ResourceLimit` — distinct from lint findings.
+/// returned `MdsError::ResourceLimit` — distinct from lint findings.  A file whose own
+/// output failed also counts "with errors": a `--fix` rewrite that fails, or a diff a
+/// failing stdout lost (#157) — as `mds fmt <dir>` counts either one failed.
 ///
 /// **Summary / quiet contract (AD-216-6):** the summary is suppressed under `--quiet`
 /// unless at least one file is in the `error` or `resource-limited` bucket.  Warn-only
@@ -1810,16 +1822,24 @@ fn lint_one_file_accumulating(
                 ref residual,
             } => {
                 *any_would_fix = true;
-                if diff {
+                let diff_lost = if diff {
                     let label = safe_path(file);
                     let diff_str = render_unified_diff(&source, fixed, &label);
-                    emit_stdout(&diff_str);
-                }
+                    emit_stdout(&diff_str)
+                } else {
+                    false
+                };
                 // PF-004: parity with lint_one_file_human — same quiet gate, same text.
                 if check && !quiet {
                     crate::output::ewriteln!("Would fix: {}", safe_path(file));
                 }
-                tally_from_result(residual)
+                // A diff a failing stdout lost counts the file under "with errors", as in
+                // lint_one_file_human (#157).
+                if diff_lost {
+                    FileTally::Error
+                } else {
+                    tally_from_result(residual)
+                }
             }
             PreviewOutcome::Rejected(ref reason) => {
                 // D4 (AD-216-11): status message — suppress under --quiet.
@@ -2009,15 +2029,23 @@ fn lint_one_file_human(
                 ref residual,
             } => {
                 *any_would_fix = true;
-                if diff {
+                let diff_lost = if diff {
                     let label = safe_path(file);
                     let diff_str = render_unified_diff(&source, fixed, &label);
-                    emit_stdout(&diff_str);
-                }
+                    emit_stdout(&diff_str)
+                } else {
+                    false
+                };
                 if check && !quiet {
                     crate::output::ewriteln!("Would fix: {}", safe_path(file));
                 }
-                tally_from_result(residual)
+                // A diff a failing stdout lost counts the file under "with errors", as a
+                // rewrite that fails does (#157).
+                if diff_lost {
+                    FileTally::Error
+                } else {
+                    tally_from_result(residual)
+                }
             }
             PreviewOutcome::Rejected(ref reason) => {
                 if !quiet {

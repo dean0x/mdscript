@@ -45,14 +45,16 @@
 //! - Stdin that cannot be read: a directory handle on unix (reading it fails with
 //!   "is a directory"), a write-only file handle on Windows. A write-only handle cannot
 //!   stand in on unix: the Rust runtime reads EBADF on a standard stream as end of input.
-//! - A stdout that fails for another reason: `/dev/full` (Linux only; ignored elsewhere).
+//! - A stdout that fails for another reason: `/dev/full` on Linux ("no space left on
+//!   device"), and on every unix a regular file the child may not grow — its file-size
+//!   limit is 0 and it ignores SIGXFSZ, so each write fails with "file too large".
 
 mod common;
 use common::{closed_pipe, mds_bin};
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -161,8 +163,19 @@ fn run(dir: &Path, args: &[&str], stdin: &str, closed: Option<Stream>) -> Run {
 
 /// Run `mds <args>` in `dir` with the given stdin, stdout and stderr.
 fn run_with(dir: &Path, args: &[&str], stdin: Input, stdout: Stdio, stderr: Stdio) -> Run {
+    run_command(mds_bin(), dir, args, stdin, stdout, stderr)
+}
+
+/// [`run_with`] on an `mds` command the caller has already prepared.
+fn run_command(
+    mut cmd: Command,
+    dir: &Path,
+    args: &[&str],
+    stdin: Input,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Run {
     let what = args.join(" ");
-    let mut cmd = mds_bin();
     cmd.args(args)
         .current_dir(dir)
         .stdout(stdout)
@@ -710,7 +723,32 @@ fn lint_fix_diff_with_stdout_closed_exits_1() {
     });
 }
 
-// ── A stdout that fails for another reason (Linux: /dev/full) ────────────────
+/// Two diffs into a closed stdout: neither file is counted as failed — stderr, the
+/// summary line included, is the open run's byte for byte (#157).
+#[test]
+fn lint_fix_diff_of_a_directory_with_stdout_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--fix", "--diff", "fixes"],
+        stdin: "",
+        verdict: 1,
+        closed: Stream::Stdout,
+        open_contains: "+++ fixes/b.mds\n",
+    });
+}
+
+/// The `--format json` directory emitter is a separate one; the same holds for it.
+#[test]
+fn lint_json_fix_diff_of_a_directory_with_stdout_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--format", "json", "--fix", "--diff", "fixes"],
+        stdin: "",
+        verdict: 1,
+        closed: Stream::Stdout,
+        open_contains: "+++ fixes/b.mds\n",
+    });
+}
+
+// ── A stdout that fails for another reason than a closed pipe ────────────────
 
 /// Run `mds <args>` in a fresh fixture dir with stdout on `/dev/full`, where every write
 /// fails with "no space left on device" — a failure that is not a closed pipe, so it is
@@ -770,65 +808,93 @@ fn help_into_a_full_device_exits_2() {
     assert_stdout_failure_exits_2(&["--help"], "");
 }
 
-/// Two diffs into a full device: the failure is reported once, not once per file, and
-/// each file whose diff was lost counts as failed (#157).
-#[test]
-#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
-fn fmt_diff_of_a_directory_into_a_full_device_reports_the_failure_once() {
-    // Control: into an open pipe both diffs arrive, so the run below loses two writes.
-    let open = run(fixture_dir().path(), &["fmt", "--diff", "two"], "", None);
-    assert_eq!(open.code, Some(0), "control; stderr: {:?}", open.stderr);
-    assert!(
-        open.stdout.contains("two/a.mds") && open.stdout.contains("two/b.mds"),
-        "control: both diffs must be written; stdout: {:?}",
-        open.stdout
-    );
+/// Run `mds <args>` in `dir` with stdout on a regular file the child may not grow: its
+/// file-size limit is 0 and it ignores SIGXFSZ, so every write to stdout fails with
+/// "file too large" (EFBIG) — a failure that is not a closed pipe, on every unix, where
+/// `/dev/full` is Linux only. Stderr stays a pipe, which the limit does not cover (#157).
+#[cfg(unix)]
+fn run_into_a_file_it_may_not_grow_in(dir: &Path, args: &[&str], stdin: &str) -> Run {
+    use std::os::unix::process::CommandExt as _;
 
-    let run = run_into_dev_full(&["fmt", "--diff", "two"], "");
-    assert_eq!(
-        run.code,
-        Some(2),
-        "`mds fmt --diff two` into /dev/full must exit 2; stderr: {:?}",
-        run.stderr
-    );
-    assert_eq!(
-        (
-            run.stderr.matches("mds::io").count(),
-            run.stderr.matches("cannot write to stdout").count()
-        ),
-        (1, 1),
-        "the stdout failure must be reported exactly once; stderr: {:?}",
-        run.stderr
-    );
-    assert!(
-        run.stderr
-            .contains("0 would reformat, 0 unchanged, 2 failed"),
-        "both files whose diff was lost count as failed; stderr: {:?}",
-        run.stderr
-    );
+    let out = tempfile::tempfile().expect("create the stdout file");
+    let mut cmd = mds_bin();
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `signal` is on POSIX's async-signal-safe list, and
+    // `setrlimit` is a thin wrapper around its system call that takes no lock and
+    // allocates nothing. The closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            let no_growth = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &no_growth) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    run_command(
+        cmd,
+        dir,
+        args,
+        Input::Bytes(stdin.as_bytes().to_vec()),
+        Stdio::from(out),
+        Stdio::piped(),
+    )
 }
 
-/// A `mds lint` run whose stdout fails for another reason than a closed pipe.
+/// Run `mds <args>` in `dir`, feeding `stdin`, with stdout failing for another reason
+/// than a closed pipe.
+type FailingStdout = fn(&Path, &[&str], &str) -> Run;
+
+/// Every way this platform has to fail stdout for another reason than a closed pipe, by
+/// name: `/dev/full` on Linux and a file the child may not grow on every unix; none
+/// elsewhere, where the rows that use them are ignored.
+fn failing_stdouts() -> Vec<(&'static str, FailingStdout)> {
+    [
+        #[cfg(target_os = "linux")]
+        ("/dev/full", run_into_dev_full_in as FailingStdout),
+        #[cfg(unix)]
+        (
+            "a file it may not grow",
+            run_into_a_file_it_may_not_grow_in as FailingStdout,
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// An `mds` run whose stdout fails for another reason than a closed pipe.
 struct FullRow {
     args: &'static [&'static str],
     stdin: &'static str,
     /// The exit code with stdout on an open pipe.
     verdict: i32,
-    /// What the open run prints on stdout: the writes the full device loses.
+    /// What the open run prints on stdout: the writes a failing stdout loses.
     open_contains: &'static [&'static str],
     /// Run on each fresh fixture dir before `mds` is.
     prepare: fn(&Path),
 }
 
-/// Run `row` into an open pipe, then with stdout on `/dev/full` (#157).
+/// Run `row` into an open pipe, then with stdout failing in each of the platform's
+/// [`failing_stdouts`] (#157).
 ///
 /// The open run is the control: it must exit with the row's verdict, report nothing
-/// about stdout, and print every `open_contains` text there — so the full device really
-/// loses those writes. The full-device run must exit `max(verdict, 2)` and report the
+/// about stdout, and print every `open_contains` text there — so a failing stdout really
+/// loses those writes. Each failing run must exit `max(verdict, 2)` and report the
 /// failure exactly once, as one `mds::io` error naming stdout, however many writes it
-/// lost. Returns the open run.
-fn assert_a_full_stdout_lifts_the_verdict(row: &FullRow) -> Run {
+/// lost. Returns the open run and the failing runs.
+fn assert_a_failing_stdout_lifts_the_verdict(row: &FullRow) -> (Run, Vec<Run>) {
     let what = row.args.join(" ");
+    let ways = failing_stdouts();
+    assert!(
+        !ways.is_empty(),
+        "no way to fail stdout on this platform: ignore the row here"
+    );
 
     let open_dir = fixture_dir();
     (row.prepare)(open_dir.path());
@@ -847,35 +913,39 @@ fn assert_a_full_stdout_lifts_the_verdict(row: &FullRow) -> Run {
     for text in row.open_contains {
         assert!(
             open.stdout.contains(text),
-            "control: `mds {what}` must print {text:?} on stdout, or the full device would \
+            "control: `mds {what}` must print {text:?} on stdout, or a failing stdout would \
              lose nothing; stdout: {:?}",
             open.stdout
         );
     }
 
-    let full_dir = fixture_dir();
-    (row.prepare)(full_dir.path());
-    let full = run_into_dev_full_in(full_dir.path(), row.args, row.stdin);
     let want = row.verdict.max(2);
-    assert_eq!(
-        full.code,
-        Some(want),
-        "`mds {what}` into /dev/full must exit {want}, its verdict {} lifted to at least 2; \
-         stderr: {:?}",
-        row.verdict,
-        full.stderr
-    );
-    assert_eq!(
-        (
-            full.stderr.matches("mds::io").count(),
-            full.stderr.matches("cannot write to stdout").count()
-        ),
-        (1, 1),
-        "`mds {what}` into /dev/full must report the failure exactly once, as one mds::io \
-         error naming stdout; stderr: {:?}",
-        full.stderr
-    );
-    open
+    let mut failing = Vec::with_capacity(ways.len());
+    for (how, run_failing) in ways {
+        let dir = fixture_dir();
+        (row.prepare)(dir.path());
+        let run = run_failing(dir.path(), row.args, row.stdin);
+        assert_eq!(
+            run.code,
+            Some(want),
+            "`mds {what}` into {how} must exit {want}, its verdict {} lifted to at least 2; \
+             stderr: {:?}",
+            row.verdict,
+            run.stderr
+        );
+        assert_eq!(
+            (
+                run.stderr.matches("mds::io").count(),
+                run.stderr.matches("cannot write to stdout").count()
+            ),
+            (1, 1),
+            "`mds {what}` into {how} must report the failure exactly once, as one mds::io \
+             error naming stdout; stderr: {:?}",
+            run.stderr
+        );
+        failing.push(run);
+    }
+    (open, failing)
 }
 
 /// Write `big.mds`, one byte over the 10 MiB source cap.
@@ -883,12 +953,12 @@ fn write_an_oversized_source(dir: &Path) {
     std::fs::write(dir.join("big.mds"), vec![b'x'; STDIN_CAP + 1]).expect("write big.mds");
 }
 
-/// A clean JSON report into a full device exits 2, not 0: the lost report is the run's
-/// only output (#157).
+/// A clean JSON report into a failing stdout exits 2, not 0: the lost report is the
+/// run's only output (#157).
 #[test]
-#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
-fn lint_json_on_a_clean_file_into_a_full_device_exits_2() {
-    assert_a_full_stdout_lifts_the_verdict(&FullRow {
+#[cfg_attr(not(unix), ignore = "needs /dev/full or a file-size limit (unix)")]
+fn lint_json_on_a_clean_file_into_a_failing_stdout_exits_2() {
+    assert_a_failing_stdout_lifts_the_verdict(&FullRow {
         args: &["lint", "--format", "json", "ok.mds"],
         stdin: "",
         verdict: 0,
@@ -898,9 +968,9 @@ fn lint_json_on_a_clean_file_into_a_full_device_exits_2() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
-fn lint_json_on_a_clean_directory_into_a_full_device_exits_2() {
-    assert_a_full_stdout_lifts_the_verdict(&FullRow {
+#[cfg_attr(not(unix), ignore = "needs /dev/full or a file-size limit (unix)")]
+fn lint_json_on_a_clean_directory_into_a_failing_stdout_exits_2() {
+    assert_a_failing_stdout_lifts_the_verdict(&FullRow {
         args: &["lint", "--format", "json", "good"],
         stdin: "",
         verdict: 0,
@@ -912,9 +982,9 @@ fn lint_json_on_a_clean_directory_into_a_full_device_exits_2() {
 /// The fixed source has no final newline, so it waits in stdout's buffer and only the
 /// flush fails.
 #[test]
-#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
-fn lint_fix_of_stdin_without_a_final_newline_into_a_full_device_exits_2() {
-    let open = assert_a_full_stdout_lifts_the_verdict(&FullRow {
+#[cfg_attr(not(unix), ignore = "needs /dev/full or a file-size limit (unix)")]
+fn lint_fix_of_stdin_without_a_final_newline_into_a_failing_stdout_exits_2() {
+    let (open, _) = assert_a_failing_stdout_lifts_the_verdict(&FullRow {
         args: &["lint", "--fix", "-"],
         stdin: "Hello",
         verdict: 0,
@@ -929,9 +999,9 @@ fn lint_fix_of_stdin_without_a_final_newline_into_a_full_device_exits_2() {
 
 /// A resource limit keeps its 3 when the report of it is lost as well.
 #[test]
-#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
-fn lint_json_on_a_file_over_the_size_limit_into_a_full_device_exits_3() {
-    assert_a_full_stdout_lifts_the_verdict(&FullRow {
+#[cfg_attr(not(unix), ignore = "needs /dev/full or a file-size limit (unix)")]
+fn lint_json_on_a_file_over_the_size_limit_into_a_failing_stdout_exits_3() {
+    assert_a_failing_stdout_lifts_the_verdict(&FullRow {
         args: &["lint", "--format", "json", "big.mds"],
         stdin: "",
         verdict: 3,
@@ -940,18 +1010,81 @@ fn lint_json_on_a_file_over_the_size_limit_into_a_full_device_exits_3() {
     });
 }
 
-/// Two diffs into a full device: the failure is reported once, not once per file, and
-/// the run still exits at least 2 after the second, unreported one (#157).
+/// Run `row`, a directory run whose files each write a diff, as
+/// [`assert_a_failing_stdout_lifts_the_verdict`] does, and check its summary line on
+/// stderr: `open_summary` with every diff written, `lost_summary` once a failing stdout
+/// has lost them all.
+///
+/// One rule for `mds fmt <dir>` and `mds lint <dir>` (#157): a file whose own diff a
+/// failing stdout lost counts as failed — `N failed` for `mds fmt`, `with errors` for
+/// `mds lint` — as a file whose rewrite fails does, while the failure is reported once
+/// for the run. A closed stdout loses nothing: its rows above keep the open run's
+/// summary.
+fn assert_each_lost_diff_counts_as_failed(row: &FullRow, open_summary: &str, lost_summary: &str) {
+    let what = row.args.join(" ");
+    let (open, failing) = assert_a_failing_stdout_lifts_the_verdict(row);
+    assert!(
+        open.stderr.contains(open_summary),
+        "control: `mds {what}` into an open pipe must print {open_summary:?}; stderr: {:?}",
+        open.stderr
+    );
+    for run in &failing {
+        assert!(
+            run.stderr.contains(lost_summary),
+            "`mds {what}` must count each file whose diff a failing stdout lost as failed, \
+             {lost_summary:?}; stderr: {:?}",
+            run.stderr
+        );
+    }
+}
+
 #[test]
-#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
-fn lint_fix_diff_of_a_directory_into_a_full_device_reports_the_failure_once() {
-    assert_a_full_stdout_lifts_the_verdict(&FullRow {
-        args: &["lint", "--fix", "--diff", "fixes"],
-        stdin: "",
-        verdict: 1,
-        open_contains: &["+++ fixes/a.mds\n", "+++ fixes/b.mds\n"],
-        prepare: |_| {},
-    });
+#[cfg_attr(not(unix), ignore = "needs /dev/full or a file-size limit (unix)")]
+fn fmt_diff_of_a_directory_into_a_failing_stdout_counts_each_lost_diff_as_failed() {
+    assert_each_lost_diff_counts_as_failed(
+        &FullRow {
+            args: &["fmt", "--diff", "two"],
+            stdin: "",
+            verdict: 0,
+            open_contains: &["+++ two/a.mds\n", "+++ two/b.mds\n"],
+            prepare: |_| {},
+        },
+        "2 would reformat, 0 unchanged, 0 failed\n",
+        "0 would reformat, 0 unchanged, 2 failed\n",
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "needs /dev/full or a file-size limit (unix)")]
+fn lint_fix_diff_of_a_directory_into_a_failing_stdout_counts_each_lost_diff_under_errors() {
+    assert_each_lost_diff_counts_as_failed(
+        &FullRow {
+            args: &["lint", "--fix", "--diff", "fixes"],
+            stdin: "",
+            verdict: 1,
+            open_contains: &["+++ fixes/a.mds\n", "+++ fixes/b.mds\n"],
+            prepare: |_| {},
+        },
+        "2 clean, 0 with warnings, 0 with errors, 0 resource-limited\n",
+        "0 clean, 0 with warnings, 2 with errors, 0 resource-limited\n",
+    );
+}
+
+/// The `--format json` directory emitter is a separate one; the same rule holds for it.
+#[test]
+#[cfg_attr(not(unix), ignore = "needs /dev/full or a file-size limit (unix)")]
+fn lint_json_fix_diff_of_a_directory_into_a_failing_stdout_counts_each_lost_diff_under_errors() {
+    assert_each_lost_diff_counts_as_failed(
+        &FullRow {
+            args: &["lint", "--format", "json", "--fix", "--diff", "fixes"],
+            stdin: "",
+            verdict: 1,
+            open_contains: &["+++ fixes/a.mds\n", "+++ fixes/b.mds\n", "\"version\":1}\n"],
+            prepare: |_| {},
+        },
+        "2 clean, 0 with warnings, 0 with errors, 0 resource-limited\n",
+        "0 clean, 0 with warnings, 2 with errors, 0 resource-limited\n",
+    );
 }
 
 // ── clap's own output: help, version and usage errors ────────────────────────

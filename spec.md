@@ -986,7 +986,7 @@ or `mds init` filename containing a forbidden path character, are `mds::io` (exi
 instead.
 
 **Streams and I/O failures on the CLI (#157).** Under `mds build`, `mds check`,
-`mds fmt` and `mds init`, and for clap's own help, version and usage output:
+`mds fmt`, `mds init` and `mds lint`, and for clap's own help, version and usage output:
 
 - A closed stdout or stderr — the pipe's reader is gone — never changes the exit code.
   With stdout closed, the run writes nothing more to stdout and finishes; with stderr
@@ -999,8 +999,11 @@ instead.
   writes it fails — and stdin that cannot be read or is not valid UTF-8. In directory
   mode the other files are still processed, and the run exits 2 when any file's failure
   is in the exit-2 class, a source that cannot be read included (§7.2
-  continue-on-error). The `mds.json` errors above are not in this list. `mds lint`
-  reports a failed `--fix` rewrite and a stdin read failure as `mds::io` too.
+  continue-on-error); a file whose `--diff` output a failing stdout lost counts as
+  failed — `with errors` under `mds lint` (§7.5) — as a file whose rewrite fails does.
+  The `mds.json` errors above are not in this list. A `mds lint --fix` rewrite that
+  fails is in it; it is reported as `mds::io` except in a directory run under
+  `--format human`, which prints `error writing <path>: …` instead.
 - Stdin over the 10 MiB cap is `mds::resource_limit`, exit 3, under `build`, `check`,
   `fmt` and `lint`; exactly 10 MiB is accepted.
 - On Unix the Rust runtime treats EBADF on a standard stream — a descriptor that is
@@ -1185,8 +1188,11 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
   - "Clean" — no findings.
   - "With warnings" — warning-severity findings only.
   - "With errors" — error-severity lint findings **or** a per-file analysis failure
-    (source read, config load, or lint call failure). These two populations are
-    deliberately merged, matching the way `mds build`'s "failed" count merges them.
+    (source read, config load, or lint call failure) **or** a failure of the file's own
+    output: a `--fix` rewrite that fails, or a `--fix --diff` diff lost to a stdout that
+    fails other than by a closed pipe (§5 "Streams and I/O failures"; `mds fmt <dir>`
+    counts such a file as failed, §7.4). These populations are deliberately merged,
+    matching the way `mds build`'s "failed" count merges them.
   - "Resource-limited" — files where `mds::lint` returned `MdsError::ResourceLimit`
     (for example, exceeding `MAX_BLOCKS_PER_MODULE`). These are counted here, never
     under "with errors".
@@ -1543,7 +1549,7 @@ A closed stdout or stderr pipe never changes any of these codes (§5 "Streams an
 |------|---------|
 | `0` | Clean — no warning- or error-severity findings |
 | `1` | Warning-severity findings only (no errors) |
-| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8); also a `--fix` rewrite that fails and stdin that cannot be read or is not valid UTF-8, each `mds::io` (#157) |
+| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8); also an I/O failure (#157): a `--fix` rewrite that fails, a stdout write that fails other than by a closed pipe — which lifts a clean or warning-only run to 2 — and stdin that cannot be read or is not valid UTF-8, each `mds::io` except a rewrite failure in a directory run under `--format human` (`error writing <path>: …`) |
 | `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2) |
 
 The code-by-code classification behind these tables is the "Error Codes" registry in §5.
