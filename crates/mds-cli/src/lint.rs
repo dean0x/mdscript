@@ -54,7 +54,7 @@
 //! The two anchors differ, but both are safe: neither surface ever shows an
 //! absolute path (basename fallback outside the root).
 //!
-//! # Exit codes (via direct `std::process::exit`, NEVER via `exit_code()`)
+//! # Exit codes (through the exit funnel `crate::output::exit`, NEVER via `exit_code()`)
 //!
 //! - 0: clean (no Warn/Error findings)
 //! - 1: warning-severity findings only, no errors
@@ -63,10 +63,13 @@
 //! - 3: ResourceLimit
 //!
 //! With `--fix`, residual post-fix findings determine the exit code.
+//!
+//! A closed stdout or stderr never changes the code. A stdout write that fails for
+//! another reason — the JSON report, a diff, the fixed source — is reported once as
+//! `mds::io`, and the funnel lifts the code to at least 2 (#157).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -78,9 +81,9 @@ use crate::build::{
     read_stdin, resolve_input, RuntimeVarArgs,
 };
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
+    atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_io_failure, eprint_warning,
     relabel_stdin_error, render_unified_diff, safe_file_display, safe_inline, safe_path,
-    Durability, STDIN_DISPLAY_LABEL,
+    write_stdout, Durability, STDIN_DISPLAY_LABEL,
 };
 
 // AC-224-15: No local rule-name list. The single source of truth is
@@ -119,9 +122,9 @@ struct LintFlags {
     format: LintFormat,
 }
 
-/// Entry point for `mds lint`. Always returns `Ok(())`; exits are via
-/// `std::process::exit()` for lint-specific codes, or via the outer `run()`
-/// error handler for setup failures (which also exit 2 via this function's catch).
+/// Entry point for `mds lint`. Always returns `Ok(())`; every other exit goes through
+/// the exit funnel `crate::output::exit()` — a lint-specific code, or 2 for a setup
+/// failure, through this function's catch.
 pub(crate) fn run_lint(args: LintArgs) -> Result<()> {
     match do_lint(args) {
         Ok(()) => Ok(()),
@@ -129,7 +132,7 @@ pub(crate) fn run_lint(args: LintArgs) -> Result<()> {
             // Route through the single render choke point (avoids PF-004 /
             // architecture-6: hand-rolled sanitize_control_chars bypass).
             eprint_error(e);
-            std::process::exit(2);
+            crate::output::exit(2);
         }
     }
 }
@@ -175,7 +178,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
             // in run_lint's catch.
             if let Some(mds_err @ MdsError::VarConflict { .. }) = e.downcast_ref::<MdsError>() {
                 emit_analysis_failure_json_or_stderr(mds_err, format, None);
-                std::process::exit(1);
+                crate::output::exit(1);
             }
             return Err(e);
         }
@@ -190,11 +193,11 @@ fn do_lint(args: LintArgs) -> Result<()> {
     // it stays a plain stderr usage message. All other top-level analysis failures route
     // through emit_analysis_failure_json_or_stderr when --format json is active.
     if fix && format == LintFormat::Json && input == Path::new("-") {
-        eprintln!(
+        crate::output::ewriteln!(
             "error: --fix --format json with stdin input is not supported; \
              use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output"
         );
-        std::process::exit(2);
+        crate::output::exit(2);
     }
 
     // Stdin mode.
@@ -212,7 +215,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
             Ok(_) => run_lint_directory(&input, flags, runtime_vars),
             Err(mds_err) => {
                 emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-                std::process::exit(2);
+                crate::output::exit(2);
             }
         };
     }
@@ -224,7 +227,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
     // correct error envelope (L-CLI-JSON4 / AC-F-14). Do NOT use `?` here.
     if let Err(mds_err) = ensure_existing_mds_file(&input) {
         emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-        std::process::exit(mds_error_exit_code(&mds_err));
+        crate::output::exit(mds_error_exit_code(&mds_err));
     }
     run_lint_file(&input, flags, runtime_vars)
 }
@@ -418,25 +421,18 @@ fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<S
 
 // ── stdout write ──────────────────────────────────────────────────────────────
 
-/// Write `s` to stdout, treating a broken pipe as a clean early exit rather
-/// than an error — matches Unix filter conventions (e.g. `mds lint --fix - | head
-/// -n1` closing the pipe early must not surface as a crash or failure).
-/// Flushes explicitly so a fixed source not ending in `\n` is never silently
-/// truncated before the `std::process::exit` that may follow immediately.
-fn write_stdout(s: &str) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    if let Err(e) = stdout.write_all(s.as_bytes()) {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
-        }
-        return Err(miette::miette!("cannot write to stdout: {e}"));
+/// Write lint's product — a JSON document, a diff, the fixed source — to stdout (#157).
+///
+/// [`write_stdout`] writes and flushes it, so a fixed source without a final `\n` is
+/// never left in a buffer when the run exits. A closed stdout keeps the verdict: the
+/// reader is gone, as with `mds lint --fix - | head -n1`, and nothing more is written.
+/// The first failure for any other reason is reported as one `mds::io` error naming
+/// stdout and recorded, so the exit funnel ends the run with at least 2; a repeat of it
+/// was already reported and recorded. Either way the run goes on to its verdict.
+fn emit_stdout(text: &str) {
+    if let Err(e) = write_stdout(text.as_bytes()).into_batch_result() {
+        eprint_io_failure(e);
     }
-    if let Err(e) = stdout.flush() {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(miette::miette!("cannot flush stdout: {e}"));
-        }
-    }
-    Ok(())
 }
 
 // ── Human diagnostic rendering ────────────────────────────────────────────────
@@ -524,7 +520,7 @@ fn mds_error_exit_code(err: &MdsError) -> i32 {
 fn exit_by_severity(result: &mds::LintResult) {
     let exit = result_exit_code(result);
     if exit != 0 {
-        std::process::exit(exit);
+        crate::output::exit(exit);
     }
 }
 
@@ -873,7 +869,7 @@ fn run_lint_stdin(
             // for EVERY stdin failure path — a future error variant routed here that
             // does carry a source inherits the sentinel instead of needing a new call.
             emit_analysis_failure_json_or_stderr(&mds_err, format, Some(&source));
-            std::process::exit(2);
+            crate::output::exit(2);
         }
     };
 
@@ -882,7 +878,7 @@ fn run_lint_stdin(
         Err(e) => {
             // AD-211-5: relabel <source> → <stdin> in the rendered failure envelope.
             emit_analysis_failure_json_or_stderr(&e, format, Some(&source));
-            std::process::exit(mds_error_exit_code(&e));
+            crate::output::exit(mds_error_exit_code(&e));
         }
     };
 
@@ -899,7 +895,7 @@ fn run_lint_stdin(
     // PF-004: stdin is a separate emitter from file/directory mode; the cap notice
     // must reach this path too (avoids the #43/#173 divergence class).
     if result.truncated && fix && !quiet {
-        eprintln!(
+        crate::output::ewriteln!(
             "diagnostic cap ({}) reached; further findings were suppressed — \
              re-run --fix to continue",
             mds::MAX_DIAGNOSTICS
@@ -938,17 +934,17 @@ fn run_lint_stdin(
                 } => {
                     if diff {
                         let diff_str = render_unified_diff(&source, fixed, STDIN_DISPLAY_LABEL);
-                        let _ = write_stdout(&diff_str);
+                        emit_stdout(&diff_str);
                     }
                     if check && !quiet {
-                        eprintln!("Would fix: {STDIN_DISPLAY_LABEL}");
+                        crate::output::ewriteln!("Would fix: {STDIN_DISPLAY_LABEL}");
                     }
                     emit_result(format, &result, quiet, named_source);
-                    std::process::exit(preview_exit_code(residual));
+                    crate::output::exit(preview_exit_code(residual));
                 }
                 PreviewOutcome::Rejected(ref reason) => {
                     if !quiet {
-                        eprintln!("fix rejected: {}", safe_inline(reason));
+                        crate::output::ewriteln!("fix rejected: {}", safe_inline(reason));
                     }
                 }
                 PreviewOutcome::NothingToFix => {}
@@ -981,7 +977,7 @@ fn run_lint_stdin(
                 total_count,
             } => {
                 if !quiet {
-                    eprintln!(
+                    crate::output::ewriteln!(
                         "Partially fixed: {STDIN_DISPLAY_LABEL} ({applied_count} of {total_count} fixes applied)"
                     );
                 }
@@ -997,7 +993,7 @@ fn run_lint_stdin(
                 // class).  Exit code is unaffected; error-severity residual diagnostics
                 // still print through `render_result_human`.
                 if !quiet {
-                    eprintln!("fix rejected: {}", safe_inline(&reason));
+                    crate::output::ewriteln!("fix rejected: {}", safe_inline(&reason));
                 }
                 (source, original)
             }
@@ -1007,7 +1003,7 @@ fn run_lint_stdin(
         // AD-211-1: use STDIN_DISPLAY_LABEL so source frame header reads "<stdin>".
         let named_source = (STDIN_DISPLAY_LABEL, output_src.as_str());
         render_result_human(&diag_result, quiet, named_source);
-        let _ = write_stdout(&output_src);
+        emit_stdout(&output_src);
         exit_by_severity(&diag_result);
         return Ok(());
     }
@@ -1049,7 +1045,7 @@ fn run_lint_file(
                 message: format!("{e}"),
             };
             emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-            std::process::exit(2);
+            crate::output::exit(2);
         }
     };
     // File read failure (not found, symlink, I/O) → JSON envelope in --format json mode (AC-F-14).
@@ -1057,7 +1053,7 @@ fn run_lint_file(
         Ok(s) => s,
         Err(e) => {
             emit_analysis_failure_json_or_stderr(&e, format, None);
-            std::process::exit(mds_error_exit_code(&e));
+            crate::output::exit(mds_error_exit_code(&e));
         }
     };
     let filename = path
@@ -1069,7 +1065,7 @@ fn run_lint_file(
         Ok(r) => r,
         Err(e) => {
             emit_analysis_failure_json_or_stderr(&e, format, None);
-            std::process::exit(mds_error_exit_code(&e));
+            crate::output::exit(mds_error_exit_code(&e));
         }
     };
     // Remap the basename-only `file` label that mds::lint() sets → the display
@@ -1087,7 +1083,7 @@ fn run_lint_file(
     // always print").  PF-004: single-file mode is a separate emitter from directory
     // mode; gating only the directory copy would re-create the #43/#173 divergence.
     if result.truncated && fix && !quiet {
-        eprintln!(
+        crate::output::ewriteln!(
             "diagnostic cap ({}) reached; further findings were suppressed — \
              re-run --fix to continue",
             mds::MAX_DIAGNOSTICS
@@ -1109,7 +1105,7 @@ fn run_lint_file(
                 emit_result(format, &residual, quiet, named_source);
                 atomic_write_file(path, &new_source, Durability::Fsync)?;
                 if !quiet {
-                    eprintln!("Fixed: {}", safe_path(path));
+                    crate::output::ewriteln!("Fixed: {}", safe_path(path));
                 }
                 exit_by_severity(&residual);
             }
@@ -1124,7 +1120,7 @@ fn run_lint_file(
                 // Print status AFTER write succeeds so "Partially fixed:" never
                 // precedes "error writing" for a file that was never modified.
                 if !quiet {
-                    eprintln!(
+                    crate::output::ewriteln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         safe_path(path)
                     );
@@ -1137,7 +1133,7 @@ fn run_lint_file(
                 // directory-mode emitters.  PF-004: single-file mode is a separate
                 // emitter and must honour the same gate.
                 if !quiet {
-                    eprintln!("fix rejected: {}", safe_inline(&reason));
+                    crate::output::ewriteln!("fix rejected: {}", safe_inline(&reason));
                 }
                 emit_result(format, &original, quiet, named_source);
                 exit_by_severity(&original);
@@ -1145,7 +1141,7 @@ fn run_lint_file(
             FixFileOutcome::NothingToFix { original } => {
                 emit_result(format, &original, quiet, named_source);
                 if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
-                    eprintln!("Clean: {}", safe_file_display(filename));
+                    crate::output::ewriteln!("Clean: {}", safe_file_display(filename));
                 }
                 exit_by_severity(&original);
             }
@@ -1170,22 +1166,22 @@ fn run_lint_file(
                 if diff {
                     let label = safe_path(path);
                     let diff_str = render_unified_diff(&source, fixed, &label);
-                    let _ = write_stdout(&diff_str);
+                    emit_stdout(&diff_str);
                 }
                 if check && !quiet {
-                    eprintln!("Would fix: {}", safe_path(path));
+                    crate::output::ewriteln!("Would fix: {}", safe_path(path));
                 }
                 // AC-F-14 emit-before-exit: emit the (pre-fix) result BEFORE the
                 // exit so consumers always receive parseable output regardless of
                 // exit code.  Mirrors directory mode, which emits the envelope
                 // before its preview-floor exit.
                 emit_result(format, &result, quiet, named_source);
-                std::process::exit(preview_exit_code(residual));
+                crate::output::exit(preview_exit_code(residual));
             }
             PreviewOutcome::Rejected(ref reason) => {
                 // Surface the rejection reason so --fix --check is as honest as --fix.
                 if !quiet {
-                    eprintln!("fix rejected: {}", safe_inline(reason));
+                    crate::output::ewriteln!("fix rejected: {}", safe_inline(reason));
                 }
             }
             PreviewOutcome::NothingToFix => {}
@@ -1200,7 +1196,7 @@ fn run_lint_file(
     // ── Report-only mode (no --fix) ───────────────────────────────────────────
     emit_result(format, &result, quiet, named_source);
     if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
-        eprintln!("Clean: {}", safe_file_display(filename));
+        crate::output::ewriteln!("Clean: {}", safe_file_display(filename));
     }
     exit_by_severity(&result);
     Ok(())
@@ -1416,21 +1412,21 @@ fn run_lint_directory(
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
             // Exit 2: usage error consistent with lint's exit-code table.
-            eprintln!(
+            crate::output::ewriteln!(
                 "{} .mds file(s) found but all are under default-excluded directories \
                  (hidden dirs, node_modules); nothing was linted",
                 walk.excluded_by_default
             );
-            std::process::exit(2);
+            crate::output::exit(2);
         }
         // #204: an empty tree is "nothing to lint", not success (mirrors build.rs).
         // Emitted even under --quiet.  Exit 2 is lint's usage-error code (module doc),
         // matching the all-excluded arm above; build/check/fmt use 1.
-        eprintln!(
+        crate::output::ewriteln!(
             "no .mds files found in {}; nothing was linted",
             safe_path(dir)
         );
-        std::process::exit(2);
+        crate::output::exit(2);
     }
 
     // #217: compute every display key BEFORE the sort, so a path that cannot be
@@ -1450,7 +1446,7 @@ fn run_lint_directory(
             Ok(display) => keyed.push((p, display)),
             Err(e) => {
                 emit_analysis_failure_json_or_stderr(&e, format, None);
-                std::process::exit(mds_error_exit_code(&e));
+                crate::output::exit(mds_error_exit_code(&e));
             }
         }
     }
@@ -1562,7 +1558,7 @@ fn run_lint_directory(
             "files": json_files,
             "truncated": any_truncated,
         });
-        let _ = write_stdout(&format!(
+        emit_stdout(&format!(
             "{}\n",
             serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
         ));
@@ -1587,7 +1583,7 @@ fn run_lint_directory(
     // modes (warn-only vs error vs resource-limit) not captured by a single "failed"
     // count.  The format is pinned by spec §7.5 and tests.
     if !quiet || error_file_count > 0 || limit_file_count > 0 {
-        eprintln!(
+        crate::output::ewriteln!(
             "{clean_count} clean, {warn_file_count} with warnings, \
              {error_file_count} with errors, {limit_file_count} resource-limited"
         );
@@ -1606,7 +1602,7 @@ fn run_lint_directory(
         exit = exit.max(1);
     }
     if exit != 0 {
-        std::process::exit(exit);
+        crate::output::exit(exit);
     }
     Ok(())
 }
@@ -1687,7 +1683,7 @@ fn lint_one_file_accumulating(
         // D4 (AD-216-11): this is a status message, not an error — suppress
         // under --quiet (main.rs:30 "Suppress status and diagnostic output").
         if fix && !quiet {
-            eprintln!(
+            crate::output::ewriteln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
                 safe_path(file),
@@ -1737,7 +1733,7 @@ fn lint_one_file_accumulating(
                 accumulate_result_json(&residual, json_files);
                 // PF-004: parity with lint_one_file_human — same quiet gate, same text.
                 if !quiet {
-                    eprintln!("Fixed: {}", safe_path(file));
+                    crate::output::ewriteln!("Fixed: {}", safe_path(file));
                 }
                 tally_from_result(&residual)
             }
@@ -1759,7 +1755,7 @@ fn lint_one_file_accumulating(
                 accumulate_result_json(&residual, json_files);
                 // Unified message + quiet guard (#173).
                 if !quiet {
-                    eprintln!(
+                    crate::output::ewriteln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         safe_path(file)
                     );
@@ -1772,7 +1768,7 @@ fn lint_one_file_accumulating(
                 // --quiet (main.rs:30).  The residual lint findings (and the exit code)
                 // are unaffected: this message describes the --fix attempt, not the findings.
                 if !quiet {
-                    eprintln!(
+                    crate::output::ewriteln!(
                         "{}: fix rejected: {}",
                         safe_path(file),
                         safe_inline(&reason)
@@ -1817,18 +1813,22 @@ fn lint_one_file_accumulating(
                 if diff {
                     let label = safe_path(file);
                     let diff_str = render_unified_diff(&source, fixed, &label);
-                    let _ = write_stdout(&diff_str);
+                    emit_stdout(&diff_str);
                 }
                 // PF-004: parity with lint_one_file_human — same quiet gate, same text.
                 if check && !quiet {
-                    eprintln!("Would fix: {}", safe_path(file));
+                    crate::output::ewriteln!("Would fix: {}", safe_path(file));
                 }
                 tally_from_result(residual)
             }
             PreviewOutcome::Rejected(ref reason) => {
                 // D4 (AD-216-11): status message — suppress under --quiet.
                 if !quiet {
-                    eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
+                    crate::output::ewriteln!(
+                        "{}: fix rejected: {}",
+                        safe_path(file),
+                        safe_inline(reason)
+                    );
                 }
                 tally_from_result(&result)
             }
@@ -1908,7 +1908,7 @@ fn lint_one_file_human(
         // D4 (AD-216-11): this is a status message, not an error — suppress
         // under --quiet (main.rs:30 "Suppress status and diagnostic output").
         if fix && !quiet {
-            eprintln!(
+            crate::output::ewriteln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
                 safe_path(file),
@@ -1933,11 +1933,15 @@ fn lint_one_file_human(
             } => {
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
-                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
+                    crate::output::ewriteln!(
+                        "error writing {}: {}",
+                        safe_path(file),
+                        safe_inline(&e)
+                    );
                     return FileTally::Error;
                 }
                 if !quiet {
-                    eprintln!("Fixed: {}", safe_path(file));
+                    crate::output::ewriteln!("Fixed: {}", safe_path(file));
                 }
                 tally_from_result(&residual)
             }
@@ -1949,14 +1953,18 @@ fn lint_one_file_human(
             } => {
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
-                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
+                    crate::output::ewriteln!(
+                        "error writing {}: {}",
+                        safe_path(file),
+                        safe_inline(&e)
+                    );
                     return FileTally::Error;
                 }
                 // Print status AFTER write succeeds so "Partially fixed:" never
                 // precedes "error writing" for a file that was never modified.
                 // Unified message + quiet guard (#173).
                 if !quiet {
-                    eprintln!(
+                    crate::output::ewriteln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         safe_path(file)
                     );
@@ -1968,7 +1976,7 @@ fn lint_one_file_human(
                 // gate fired, the original diagnostics remain unmodified.  Suppress under
                 // --quiet (main.rs:30).
                 if !quiet {
-                    eprintln!(
+                    crate::output::ewriteln!(
                         "{}: fix rejected: {}",
                         safe_path(file),
                         safe_inline(&reason)
@@ -2004,16 +2012,20 @@ fn lint_one_file_human(
                 if diff {
                     let label = safe_path(file);
                     let diff_str = render_unified_diff(&source, fixed, &label);
-                    let _ = write_stdout(&diff_str);
+                    emit_stdout(&diff_str);
                 }
                 if check && !quiet {
-                    eprintln!("Would fix: {}", safe_path(file));
+                    crate::output::ewriteln!("Would fix: {}", safe_path(file));
                 }
                 tally_from_result(residual)
             }
             PreviewOutcome::Rejected(ref reason) => {
                 if !quiet {
-                    eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
+                    crate::output::ewriteln!(
+                        "{}: fix rejected: {}",
+                        safe_path(file),
+                        safe_inline(reason)
+                    );
                 }
                 tally_from_result(&result)
             }
@@ -2040,7 +2052,7 @@ fn emit_result(
 ) {
     if format == LintFormat::Json {
         let json = result.to_canonical_json();
-        let _ = write_stdout(&format!(
+        emit_stdout(&format!(
             "{}\n",
             serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
         ));
@@ -2086,7 +2098,7 @@ fn emit_analysis_failure_json_or_stderr(
             "version": 1,
             "error": e.serialize()
         });
-        let _ = write_stdout(&format!(
+        emit_stdout(&format!(
             "{}\n",
             serde_json::to_string(&envelope).expect("canonical lint JSON is always serializable")
         ));

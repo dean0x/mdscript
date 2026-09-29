@@ -201,17 +201,28 @@ fn run_with(dir: &Path, args: &[&str], stdin: Input, stdout: Stdio, stderr: Stdi
     }
 }
 
+/// A template `mds lint` warns about (an unused frontmatter key), exit 1.
+const LINT_WARN_SOURCE: &str =
+    "---\ngreeting: Hello\nunused_key: never referenced in the body\n---\n\n{{greeting}}, world!\n";
+
+/// A template `mds lint --fix` fixes to `Hello\n` (a branch that can never be taken).
+const LINT_FIXABLE_SOURCE: &str = "@if \"x\" == \"y\":\nhidden\n@end\nHello\n";
+
 /// A fresh working directory holding every fixture a row may name.
 ///
-/// - `ok.mds` compiles; `bad.mds` does not (an unterminated `@if`).
+/// - `ok.mds` compiles, and `mds lint` finds nothing in it; `bad.mds` does not compile
+///   (an unterminated `@if`).
 /// - `d/` holds one of each; `good/` holds two that compile, so a run that stops after
 ///   the first output shows up as a missing second one.
 /// - `messy.mds` and `m/messy.mds` lack the final newline `mds fmt` adds; so do both
 ///   files in `two/`, so `mds fmt --diff two` writes two diffs.
+/// - `warn.mds` and `lints/` (a clean file and a warning one) lint with warnings, exit 1;
+///   `fix.mds` and both files in `fixes/` hold a fix, so `mds lint --fix --diff fixes`
+///   writes two diffs.
 fn fixture_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
-    let files: [(&str, &str); 9] = [
+    let files: [(&str, &str); 15] = [
         ("ok.mds", "Hello\n"),
         ("bad.mds", "@if flag:\nunterminated\n"),
         ("d/ok.mds", "Hello\n"),
@@ -221,8 +232,14 @@ fn fixture_dir() -> tempfile::TempDir {
         ("messy.mds", "Hello"),
         ("two/a.mds", "A"),
         ("two/b.mds", "B"),
+        ("warn.mds", LINT_WARN_SOURCE),
+        ("fix.mds", LINT_FIXABLE_SOURCE),
+        ("lints/ok.mds", "Hello\n"),
+        ("lints/warn.mds", LINT_WARN_SOURCE),
+        ("fixes/a.mds", LINT_FIXABLE_SOURCE),
+        ("fixes/b.mds", LINT_FIXABLE_SOURCE),
     ];
-    for dir_name in ["d", "good", "m", "two"] {
+    for dir_name in ["d", "good", "m", "two", "lints", "fixes"] {
         std::fs::create_dir(root.join(dir_name)).expect("create a fixture dir");
     }
     for (name, text) in files {
@@ -565,19 +582,152 @@ fn fmt_check_diff_on_a_directory_with_stdout_closed_exits_1() {
     });
 }
 
+// ── lint ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn lint_a_file_with_warnings_and_stderr_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "warn.mds"],
+        stdin: "",
+        verdict: 1,
+        closed: Stream::Stderr,
+        open_contains: "[unused-variable]",
+    });
+}
+
+#[test]
+fn lint_a_clean_file_with_stderr_closed_exits_0() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "ok.mds"],
+        stdin: "",
+        verdict: 0,
+        closed: Stream::Stderr,
+        open_contains: "Clean: ok.mds\n",
+    });
+}
+
+#[test]
+fn lint_a_directory_with_warnings_and_stderr_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "lints"],
+        stdin: "",
+        verdict: 1,
+        closed: Stream::Stderr,
+        open_contains: "1 clean, 1 with warnings, 0 with errors, 0 resource-limited\n",
+    });
+}
+
+#[test]
+fn lint_stdin_with_warnings_and_stderr_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "-"],
+        stdin: LINT_WARN_SOURCE,
+        verdict: 1,
+        closed: Stream::Stderr,
+        open_contains: "[unused-variable]",
+    });
+}
+
+#[test]
+fn lint_fix_check_of_stdin_with_stderr_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--fix", "--check", "-"],
+        stdin: LINT_FIXABLE_SOURCE,
+        verdict: 1,
+        closed: Stream::Stderr,
+        open_contains: "Would fix: <stdin>\n",
+    });
+}
+
+#[test]
+fn lint_fix_of_a_file_with_stderr_closed_exits_0_and_rewrites_it() {
+    let files = assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--fix", "fix.mds"],
+        stdin: "",
+        verdict: 0,
+        closed: Stream::Stderr,
+        open_contains: "Fixed: fix.mds\n",
+    });
+    assert_eq!(
+        written(&files, "fix.mds"),
+        Some(&b"Hello\n"[..]),
+        "`mds lint --fix fix.mds` with stderr closed must still rewrite the file"
+    );
+}
+
+#[test]
+fn lint_json_on_a_file_with_stdout_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--format", "json", "warn.mds"],
+        stdin: "",
+        verdict: 1,
+        closed: Stream::Stdout,
+        open_contains: "\"file\":\"warn.mds\"",
+    });
+}
+
+#[test]
+fn lint_json_on_a_directory_with_stdout_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--format", "json", "lints"],
+        stdin: "",
+        verdict: 1,
+        closed: Stream::Stdout,
+        open_contains: "\"file\":\"warn.mds\"",
+    });
+}
+
+#[test]
+fn lint_json_on_stdin_with_stdout_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--format", "json", "-"],
+        stdin: LINT_WARN_SOURCE,
+        verdict: 1,
+        closed: Stream::Stdout,
+        open_contains: "\"file\":\"<stdin>\"",
+    });
+}
+
+#[test]
+fn lint_fix_of_stdin_with_stdout_closed_exits_0() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--fix", "-"],
+        stdin: LINT_FIXABLE_SOURCE,
+        verdict: 0,
+        closed: Stream::Stdout,
+        open_contains: "Hello\n",
+    });
+}
+
+#[test]
+fn lint_fix_diff_with_stdout_closed_exits_1() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["lint", "--fix", "--diff", "fix.mds"],
+        stdin: "",
+        verdict: 1,
+        closed: Stream::Stdout,
+        open_contains: "+++ fix.mds\n",
+    });
+}
+
 // ── A stdout that fails for another reason (Linux: /dev/full) ────────────────
 
-/// Run `mds <args>` with stdout on `/dev/full`, where every write fails with "no space
-/// left on device" — a failure that is not a closed pipe, so it is reported as
-/// `mds::io` and the run exits at least 2 (#157).
+/// Run `mds <args>` in a fresh fixture dir with stdout on `/dev/full`, where every write
+/// fails with "no space left on device" — a failure that is not a closed pipe, so it is
+/// reported as `mds::io` and the run exits at least 2 (#157).
 fn run_into_dev_full(args: &[&str], stdin: &str) -> Run {
     let dir = fixture_dir();
+    run_into_dev_full_in(dir.path(), args, stdin)
+}
+
+/// [`run_into_dev_full`] in `dir`.
+fn run_into_dev_full_in(dir: &Path, args: &[&str], stdin: &str) -> Run {
     let full = std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/full")
         .expect("open /dev/full");
     run_with(
-        dir.path(),
+        dir,
         args,
         Input::Bytes(stdin.as_bytes().to_vec()),
         Stdio::from(full),
@@ -656,6 +806,152 @@ fn fmt_diff_of_a_directory_into_a_full_device_reports_the_failure_once() {
         "both files whose diff was lost count as failed; stderr: {:?}",
         run.stderr
     );
+}
+
+/// A `mds lint` run whose stdout fails for another reason than a closed pipe.
+struct FullRow {
+    args: &'static [&'static str],
+    stdin: &'static str,
+    /// The exit code with stdout on an open pipe.
+    verdict: i32,
+    /// What the open run prints on stdout: the writes the full device loses.
+    open_contains: &'static [&'static str],
+    /// Run on each fresh fixture dir before `mds` is.
+    prepare: fn(&Path),
+}
+
+/// Run `row` into an open pipe, then with stdout on `/dev/full` (#157).
+///
+/// The open run is the control: it must exit with the row's verdict, report nothing
+/// about stdout, and print every `open_contains` text there — so the full device really
+/// loses those writes. The full-device run must exit `max(verdict, 2)` and report the
+/// failure exactly once, as one `mds::io` error naming stdout, however many writes it
+/// lost. Returns the open run.
+fn assert_a_full_stdout_lifts_the_verdict(row: &FullRow) -> Run {
+    let what = row.args.join(" ");
+
+    let open_dir = fixture_dir();
+    (row.prepare)(open_dir.path());
+    let open = run(open_dir.path(), row.args, row.stdin, None);
+    assert_eq!(
+        open.code,
+        Some(row.verdict),
+        "control: `mds {what}` into an open pipe must exit with its verdict; stderr: {:?}",
+        open.stderr
+    );
+    assert!(
+        !open.stderr.contains("cannot write to stdout"),
+        "control: `mds {what}` into an open pipe must not report stdout; stderr: {:?}",
+        open.stderr
+    );
+    for text in row.open_contains {
+        assert!(
+            open.stdout.contains(text),
+            "control: `mds {what}` must print {text:?} on stdout, or the full device would \
+             lose nothing; stdout: {:?}",
+            open.stdout
+        );
+    }
+
+    let full_dir = fixture_dir();
+    (row.prepare)(full_dir.path());
+    let full = run_into_dev_full_in(full_dir.path(), row.args, row.stdin);
+    let want = row.verdict.max(2);
+    assert_eq!(
+        full.code,
+        Some(want),
+        "`mds {what}` into /dev/full must exit {want}, its verdict {} lifted to at least 2; \
+         stderr: {:?}",
+        row.verdict,
+        full.stderr
+    );
+    assert_eq!(
+        (
+            full.stderr.matches("mds::io").count(),
+            full.stderr.matches("cannot write to stdout").count()
+        ),
+        (1, 1),
+        "`mds {what}` into /dev/full must report the failure exactly once, as one mds::io \
+         error naming stdout; stderr: {:?}",
+        full.stderr
+    );
+    open
+}
+
+/// Write `big.mds`, one byte over the 10 MiB source cap.
+fn write_an_oversized_source(dir: &Path) {
+    std::fs::write(dir.join("big.mds"), vec![b'x'; STDIN_CAP + 1]).expect("write big.mds");
+}
+
+/// A clean JSON report into a full device exits 2, not 0: the lost report is the run's
+/// only output (#157).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
+fn lint_json_on_a_clean_file_into_a_full_device_exits_2() {
+    assert_a_full_stdout_lifts_the_verdict(&FullRow {
+        args: &["lint", "--format", "json", "ok.mds"],
+        stdin: "",
+        verdict: 0,
+        open_contains: &["{\"files\":[],\"truncated\":false,\"version\":1}\n"],
+        prepare: |_| {},
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
+fn lint_json_on_a_clean_directory_into_a_full_device_exits_2() {
+    assert_a_full_stdout_lifts_the_verdict(&FullRow {
+        args: &["lint", "--format", "json", "good"],
+        stdin: "",
+        verdict: 0,
+        open_contains: &["{\"files\":[],\"truncated\":false,\"version\":1}\n"],
+        prepare: |_| {},
+    });
+}
+
+/// The fixed source has no final newline, so it waits in stdout's buffer and only the
+/// flush fails.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
+fn lint_fix_of_stdin_without_a_final_newline_into_a_full_device_exits_2() {
+    let open = assert_a_full_stdout_lifts_the_verdict(&FullRow {
+        args: &["lint", "--fix", "-"],
+        stdin: "Hello",
+        verdict: 0,
+        open_contains: &["Hello"],
+        prepare: |_| {},
+    });
+    assert_eq!(
+        open.stdout, "Hello",
+        "control: the source must be written back without a final newline"
+    );
+}
+
+/// A resource limit keeps its 3 when the report of it is lost as well.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
+fn lint_json_on_a_file_over_the_size_limit_into_a_full_device_exits_3() {
+    assert_a_full_stdout_lifts_the_verdict(&FullRow {
+        args: &["lint", "--format", "json", "big.mds"],
+        stdin: "",
+        verdict: 3,
+        open_contains: &["\"code\":\"mds::resource_limit\""],
+        prepare: write_an_oversized_source,
+    });
+}
+
+/// Two diffs into a full device: the failure is reported once, not once per file, and
+/// the run still exits at least 2 after the second, unreported one (#157).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
+fn lint_fix_diff_of_a_directory_into_a_full_device_reports_the_failure_once() {
+    assert_a_full_stdout_lifts_the_verdict(&FullRow {
+        args: &["lint", "--fix", "--diff", "fixes"],
+        stdin: "",
+        verdict: 1,
+        open_contains: &["+++ fixes/a.mds\n", "+++ fixes/b.mds\n"],
+        prepare: |_| {},
+    });
 }
 
 // ── clap's own output: help, version and usage errors ────────────────────────
