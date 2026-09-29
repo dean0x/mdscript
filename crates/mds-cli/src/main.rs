@@ -265,8 +265,8 @@ fn exit_after_clap_output(err: &clap::Error) -> ! {
     let printed = err
         .print()
         .and_then(|()| std::io::Write::flush(&mut std::io::stdout()));
-    match printed {
-        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+    if let Err(e) = printed {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
             if err.use_stderr() {
                 // stderr itself failed, so there is nowhere to report it.
                 output::note_io_failure();
@@ -274,7 +274,6 @@ fn exit_after_clap_output(err: &clap::Error) -> ! {
                 output::eprint_io_failure(output::stdout_failure(&e));
             }
         }
-        Ok(()) | Err(_) => {}
     }
     output::exit(err.exit_code())
 }
