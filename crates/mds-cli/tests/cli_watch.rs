@@ -1558,6 +1558,142 @@ fn watch_debounce_single_rebuild_from_burst() {
     );
 }
 
+/// Env var naming a file a skipping test appends one line to (#397).
+///
+/// A skip is an early return, which libtest counts as a pass, and libtest shows no
+/// stderr of a passing test — so without this file a skip is invisible in a CI log.
+/// The watch soak workflow sets it per iteration and tallies skipped iterations
+/// separately from passed ones.
+const SKIP_LOG_ENV: &str = "MDS_TEST_SKIP_LOG";
+
+/// Report that `test` skipped, where a passing run cannot hide it: on stderr, as one
+/// line appended to the file [`SKIP_LOG_ENV`] names, and — under GitHub Actions — as a
+/// warning in the job summary.
+///
+/// # Panics
+/// Panics if [`SKIP_LOG_ENV`] is set and the line cannot be appended: whoever set it is
+/// counting skips, and a skip it cannot see would read as a pass.
+fn record_skip(test: &str, reason: &str) {
+    use std::io::Write as _;
+    eprintln!("{test}: {reason}");
+    if let Some(path) = std::env::var_os(SKIP_LOG_ENV) {
+        let path = std::path::PathBuf::from(path);
+        let appended = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .and_then(|mut log| writeln!(log, "{test}: {reason}"));
+        if let Err(e) = appended {
+            panic!(
+                "{SKIP_LOG_ENV}={}: cannot record the skip: {e}",
+                path.display()
+            );
+        }
+    }
+    // Best effort: the job summary is a convenience, the skip log is the record.
+    if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut summary) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(summary_path)
+        {
+            let _ = writeln!(summary, ":warning: {test} skipped: {reason}");
+        }
+    }
+}
+
+/// The writer thread's record of one attempt of the cap test.
+struct WriterTrace {
+    /// When the writer started.
+    started: Instant,
+    /// When each write completed, in order (at most the writer's 2000 iterations).
+    writes: Vec<Instant>,
+}
+
+/// Where one attempt's write cadence went (#397): the gaps between completed writes —
+/// the first measured from the writer's start, as the precondition has always measured
+/// it — and where the first rebuild fell among them.
+///
+/// `max_gap` is the metric the harness precondition judges. It spans the whole stream,
+/// while only the gaps before the first rebuild can let a quiet period end on its own;
+/// `max_gap_before_rebuild` records that part separately, so a skip says which of the
+/// two the runner actually failed.
+struct GapBreakdown {
+    writes: usize,
+    span: Duration,
+    max_gap: Duration,
+    median_gap: Duration,
+    p99_gap: Duration,
+    gaps_at_or_over_window: usize,
+    /// When the stderr poll first saw a rebuild, after the writer started (up to one
+    /// poll late); `None` when no rebuild was seen within the poll's bound.
+    rebuild_seen_after: Option<Duration>,
+    /// The largest gap that ended before the rebuild was seen.
+    max_gap_before_rebuild: Option<Duration>,
+}
+
+impl GapBreakdown {
+    fn of(trace: &WriterTrace, rebuild_seen: Option<Instant>, window: Duration) -> Self {
+        let mut previous = trace.started;
+        let mut gaps: Vec<(Instant, Duration)> = Vec::with_capacity(trace.writes.len());
+        for &at in &trace.writes {
+            gaps.push((at, at.duration_since(previous)));
+            previous = at;
+        }
+        let mut sorted: Vec<Duration> = gaps.iter().map(|&(_, gap)| gap).collect();
+        sorted.sort_unstable();
+        let rank = |per_mille: usize| -> Duration {
+            sorted
+                .get((sorted.len().saturating_sub(1) * per_mille) / 1000)
+                .copied()
+                .unwrap_or_default()
+        };
+        GapBreakdown {
+            writes: trace.writes.len(),
+            span: trace
+                .writes
+                .last()
+                .map_or(Duration::ZERO, |&last| last.duration_since(trace.started)),
+            max_gap: sorted.last().copied().unwrap_or_default(),
+            median_gap: rank(500),
+            p99_gap: rank(990),
+            gaps_at_or_over_window: sorted.iter().filter(|&&gap| gap >= window).count(),
+            rebuild_seen_after: rebuild_seen.map(|at| at.duration_since(trace.started)),
+            max_gap_before_rebuild: rebuild_seen.map(|seen| {
+                gaps.iter()
+                    .filter(|&&(at, _)| at <= seen)
+                    .map(|&(_, gap)| gap)
+                    .max()
+                    .unwrap_or_default()
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for GapBreakdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} writes over {:?}; gaps: max {:?}, median {:?}, p99 {:?}, {} at or over the \
+             window; ",
+            self.writes,
+            self.span,
+            self.max_gap,
+            self.median_gap,
+            self.p99_gap,
+            self.gaps_at_or_over_window
+        )?;
+        match (self.rebuild_seen_after, self.max_gap_before_rebuild) {
+            (Some(after), Some(gap)) => write!(
+                f,
+                "first rebuild seen {after:?} after the writer started, largest gap \
+                 before it {gap:?}"
+            ),
+            _ => write!(f, "no rebuild seen"),
+        }
+    }
+}
+
 /// The cap rebuilds a file that is never left alone (#379).
 ///
 /// A quiet period that can always be extended is unbounded: a writer that never
@@ -1577,13 +1713,17 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
     // bounded number of times, gated ONLY on that precondition — every behaviour
     // assertion below still fails hard on the first conclusive attempt, so a real
     // regression is never retried or skipped away. If the cadence is still
-    // unsustainable after every attempt, the test SKIPS (prints a `SKIPPED
-    // (inconclusive harness)` line and, when running under GitHub Actions, appends a
-    // warning to the job summary) rather than failing the required check — see #397,
-    // which tracks root-causing the cadence problem on loaded runners.
+    // unsustainable after every attempt, the test SKIPS rather than failing the
+    // required check: it prints a `SKIPPED (inconclusive harness)` line, appends it to
+    // the file `MDS_TEST_SKIP_LOG` names (the watch soak counts those), and under
+    // GitHub Actions adds a warning to the job summary — see #397, which tracks
+    // root-causing the cadence problem on loaded runners. Every attempt logs its gap
+    // breakdown on stderr, so a failing run shows the cadence of each one.
+    const TEST: &str = "watch_debounce_cap_rebuilds_while_writes_never_stop";
     const MAX_ATTEMPTS: u32 = 6;
     const WINDOW: Duration = Duration::from_millis(200);
 
+    let mut max_gaps: Vec<Duration> = Vec::with_capacity(MAX_ATTEMPTS as usize);
     for attempt in 1..=MAX_ATTEMPTS {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("hot.mds");
@@ -1613,9 +1753,9 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
         let writer_flag = std::sync::Arc::clone(&writing);
         let writer_src = src.clone();
         let writer = std::thread::spawn(move || {
-            let stop_at = Instant::now() + Duration::from_secs(3);
-            let mut max_gap = Duration::ZERO;
-            let mut last = Instant::now();
+            let started = Instant::now();
+            let stop_at = started + Duration::from_secs(3);
+            let mut writes = Vec::with_capacity(2_000);
             // Doubly bounded: <= 3s of wall clock AND <= 2000 iterations.
             for i in 1..=2_000u32 {
                 if Instant::now() >= stop_at {
@@ -1625,24 +1765,28 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
                     &writer_src,
                     format!("---\nname: v{i}\n---\nHot {{{{name}}}}!\n"),
                 );
-                let now = Instant::now();
-                max_gap = max_gap.max(now.duration_since(last));
-                last = now;
+                writes.push(Instant::now());
                 std::thread::sleep(Duration::from_millis(5));
             }
             writer_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-            max_gap
+            WriterTrace { started, writes }
         });
 
         // The cap is 2s; allow the compile that follows it to land inside the bound.
         // Non-panicking on purpose: "no rebuild by then" is decided below, after the
         // harness precondition, so an inconclusive attempt is retried rather than failed.
-        let _ = poll_tap_until(&stderr_tap, Duration::from_millis(3500), |text| {
+        let rebuild_seen = poll_tap_until(&stderr_tap, Duration::from_millis(3500), |text| {
             text.contains("Recompiled ")
-        });
+        })
+        .ok()
+        .map(|_| Instant::now());
         let rebuilt_while_writing = writing.load(std::sync::atomic::Ordering::SeqCst);
 
-        let max_gap = writer.join().expect("writer thread panicked");
+        let trace = writer.join().expect("writer thread panicked");
+        let breakdown = GapBreakdown::of(&trace, rebuild_seen, WINDOW);
+        eprintln!("{TEST}: attempt {attempt}/{MAX_ATTEMPTS}: {breakdown}");
+        let max_gap = breakdown.max_gap;
+        max_gaps.push(max_gap);
 
         // Harness precondition, checked before any behaviour assertion: if the writer
         // thread could not sustain a sub-window cadence, this run cannot tell a cap
@@ -1656,24 +1800,16 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
             // Every attempt was inconclusive: the runner is too loaded to exercise the
             // cap deterministically. Skip rather than fail the required check — no
             // product behaviour was ever exercised — and leave a trail so this shows up
-            // in the run summary instead of silently vanishing. See #397.
-            eprintln!(
-                "SKIPPED (inconclusive harness): writer gap {max_gap:?} >= {WINDOW:?} on \
-                 all {MAX_ATTEMPTS} attempts"
+            // in the run summary and the soak's tally instead of silently vanishing.
+            // See #397.
+            record_skip(
+                TEST,
+                &format!(
+                    "SKIPPED (inconclusive harness): writer gap {max_gap:?} >= {WINDOW:?} on \
+                     all {MAX_ATTEMPTS} attempts (largest gap per attempt: {max_gaps:?}); \
+                     last attempt: {breakdown}"
+                ),
             );
-            if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
-                use std::io::Write as _;
-                if let Ok(mut summary) = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(summary_path)
-                {
-                    let _ = writeln!(
-                        summary,
-                        ":warning: watch cap test skipped — runner could not sustain cadence"
-                    );
-                }
-            }
             return;
         }
 

@@ -17,16 +17,27 @@ name: Watch soak (manual)
 # the quantity of interest is a RATE. "Failed at iteration 3" cannot distinguish
 # 1/20 from 20/20, and the before/after control this instrument exists to serve
 # (PF-027 resolution 6) needs both numbers.
+#
+# The `test` input picks the watch test binary, from an allowlist (#397). A test
+# that skips -- an early return, which cargo test counts as a pass and whose stderr
+# it never shows -- appends one line to the file named by MDS_TEST_SKIP_LOG, which
+# this workflow sets per iteration. An iteration that passed but logged a skip is
+# tallied as SKIPPED, separately from passed and failed; the tally is proved on a
+# planted skip line before anything is built.
 
 on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: 'How many times to run the cli_watch suite (1-200)'
+        description: 'How many times to run the chosen test binary (1-200)'
         type: string
         default: '20'
+      test:
+        description: 'Which watch test binary to soak: cli_watch, cli_watch_cap or cli_watch_truncate'
+        type: string
+        default: 'cli_watch'
       filter:
-        description: 'Optional cargo-test name filter (empty = the whole suite)'
+        description: 'Optional cargo-test name filter (empty = the whole binary)'
         type: string
         default: ''
 
@@ -72,9 +83,10 @@ jobs:
           # Per-leg key (PF-041): the two legs build different feature sets.
           key: watch-soak-${{ matrix.label }}
 
-      - name: Validate the iterations input
+      - name: Validate the inputs
         env:
           ITERATIONS: ${{ inputs.iterations }}
+          TEST: ${{ inputs.test }}
         run: |
           set -euo pipefail
           case "$ITERATIONS" in
@@ -88,6 +100,95 @@ jobs:
             exit 1
           fi
           echo "iterations validated: $ITERATIONS"
+          # An allowlist, not a pattern: anything else fails here, before the build.
+          # %q prints the rejected value on one line, whatever it holds.
+          case "$TEST" in
+            cli_watch|cli_watch_cap|cli_watch_truncate)
+              ;;
+            *)
+              printf '::error::test must be one of cli_watch, cli_watch_cap, cli_watch_truncate; got %q\n' "$TEST"
+              exit 1
+              ;;
+          esac
+          if [ ! -f "crates/mds-cli/tests/$TEST.rs" ]; then
+            echo "::error::test $TEST is allowlisted but crates/mds-cli/tests/$TEST.rs does not exist at this ref"
+            exit 1
+          fi
+          echo "test validated: $TEST"
+
+      # One definition of the per-iteration tally, sourced by the self-check and by
+      # the soak, so the self-check proves the code that does the counting.
+      - name: Write the per-iteration tally
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/soak-tally.sh" <<'TALLY'
+          # Per-iteration tally of the watch soak. Source it; do not run it.
+          pass=0
+          fail=0
+          skipped=0
+          skip_lines=0
+          failed_iters=""
+          skipped_iters=""
+          last_class=""
+
+          # record_iteration ITERATION EXIT_CODE SKIP_LOG
+          # FAIL when the test binary failed, whatever it logged; otherwise SKIP when
+          # SKIP_LOG holds at least one line; otherwise PASS. Sets last_class. Call it
+          # directly, never in a command substitution: the counters must survive.
+          record_iteration() {
+            local iter="$1" code="$2" skip_log="$3" lines=0
+            if [ -f "$skip_log" ]; then
+              lines=$(grep -c '' "$skip_log" || true)
+            fi
+            skip_lines=$((skip_lines + lines))
+            if [ "$code" -ne 0 ]; then
+              fail=$((fail + 1))
+              failed_iters="$failed_iters $iter"
+              last_class=FAIL
+            elif [ "$lines" -gt 0 ]; then
+              skipped=$((skipped + 1))
+              skipped_iters="$skipped_iters $iter"
+              last_class=SKIP
+            else
+              pass=$((pass + 1))
+              last_class=PASS
+            fi
+          }
+          TALLY
+          echo "tally written to $RUNNER_TEMP/soak-tally.sh"
+
+      - name: Self-check the tally on a planted skip line
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/soak-tally.sh"
+          dir="$RUNNER_TEMP/tally-self-check"
+          mkdir -p "$dir"
+          planted="$dir/planted.log"
+          printf 'planted_test: SKIPPED (planted by the tally self-check)\n' > "$planted"
+
+          # expect ITERATION CLASS PASS FAIL SKIPPED SKIP_LINES
+          expect() {
+            if [ "$last_class" != "$2" ] || [ "$pass" -ne "$3" ] || [ "$fail" -ne "$4" ] \
+              || [ "$skipped" -ne "$5" ] || [ "$skip_lines" -ne "$6" ]; then
+              echo "::error::tally self-check, iteration $1: got class=$last_class pass=$pass fail=$fail skipped=$skipped skip_lines=$skip_lines; want class=$2 pass=$3 fail=$4 skipped=$5 skip_lines=$6"
+              exit 1
+            fi
+          }
+
+          # The planted line, on a binary that passed: one SKIP, not a pass.
+          record_iteration 1 0 "$planted"
+          expect 1 SKIP 0 0 1 1
+          # No skip log at all: a pass.
+          record_iteration 2 0 "$dir/absent.log"
+          expect 2 PASS 1 0 1 1
+          # A failing binary that also logged a skip: a failure.
+          record_iteration 3 101 "$planted"
+          expect 3 FAIL 1 1 1 2
+          if [ "$skipped_iters" != " 1" ] || [ "$failed_iters" != " 3" ]; then
+            echo "::error::tally self-check: iteration lists '$skipped_iters' / '$failed_iters'"
+            exit 1
+          fi
+          echo "tally self-check passed: the planted skip line counted as one skipped iteration"
 
       # Compile once so the loop measures the SUITE and not rustc.
       - name: Build the test binary once
@@ -106,6 +207,7 @@ jobs:
         id: soak
         env:
           ITERATIONS: ${{ inputs.iterations }}
+          TEST: ${{ inputs.test }}
           FILTER: ${{ inputs.filter }}
           FEATURE: ${{ matrix.feature }}
           LABEL: ${{ matrix.label }}
@@ -113,10 +215,11 @@ jobs:
           # -e is DELIBERATELY omitted: a non-zero `cargo test` is the DATA this
           # step collects, not an error that should abort it. -u and pipefail stay.
           set -uo pipefail
+          . "$RUNNER_TEMP/soak-tally.sh"
 
           mkdir -p soak
 
-          args=(test -p mds-cli --test cli_watch)
+          args=(test -p mds-cli --test "$TEST")
           if [ -n "$FEATURE" ]; then
             args+=(--features "$FEATURE")
           fi
@@ -125,38 +228,49 @@ jobs:
           fi
           echo "command: cargo ${args[*]}"
 
-          pass=0
-          fail=0
-          failed_iters=""
           i=1
           while [ "$i" -le "$ITERATIONS" ]; do
-            log="soak/iter-$(printf '%03d' "$i").log"
-            if cargo "${args[@]}" > "$log" 2>&1; then
-              pass=$((pass + 1))
-              rm -f "$log"
-              printf 'iter %3d PASS\n' "$i"
-            else
-              fail=$((fail + 1))
-              failed_iters="$failed_iters $i"
-              printf 'iter %3d FAIL\n' "$i"
-              echo "::warning title=watch-soak::iteration $i failed on leg $LABEL"
-              # Surface the discriminator inline (PF-026: the panic's file:line, not
-              # the test's name, is the diagnosis).
-              grep -E 'panicked at|\.\.\. FAILED|test result: FAILED' "$log" || true
-            fi
+            tag=$(printf '%03d' "$i")
+            log="soak/iter-$tag.log"
+            # Absolute: cargo test runs the binary from the crate directory.
+            skip_log="$PWD/soak/skips-iter-$tag.log"
+            MDS_TEST_SKIP_LOG="$skip_log" cargo "${args[@]}" > "$log" 2>&1
+            record_iteration "$i" "$?" "$skip_log"
+            case "$last_class" in
+              PASS)
+                rm -f "$log"
+                printf 'iter %3d PASS\n' "$i"
+                ;;
+              SKIP)
+                printf 'iter %3d SKIP\n' "$i"
+                echo "::warning title=watch-soak::iteration $i skipped on leg $LABEL"
+                cat "$skip_log"
+                ;;
+              FAIL)
+                printf 'iter %3d FAIL\n' "$i"
+                echo "::warning title=watch-soak::iteration $i failed on leg $LABEL"
+                # Surface the discriminator inline: the panic's file:line, not the
+                # test's name, is the diagnosis.
+                grep -E 'panicked at|\.\.\. FAILED|test result: FAILED' "$log" || true
+                ;;
+            esac
             i=$((i + 1))
           done
 
           # The summary file is ALWAYS written, so the artifact is never empty (PF-016).
           {
-            echo "leg:        $LABEL"
-            echo "ref:        $GITHUB_REF"
-            echo "sha:        $GITHUB_SHA"
-            echo "command:    cargo ${args[*]}"
-            echo "iterations: $ITERATIONS"
-            echo "passed:     $pass"
-            echo "failed:     $fail"
-            echo "failed at: $failed_iters"
+            echo "leg:         $LABEL"
+            echo "ref:         $GITHUB_REF"
+            echo "sha:         $GITHUB_SHA"
+            echo "test:        $TEST"
+            echo "command:     cargo ${args[*]}"
+            echo "iterations:  $ITERATIONS"
+            echo "passed:      $pass"
+            echo "failed:      $fail"
+            echo "skipped:     $skipped"
+            echo "skip lines:  $skip_lines"
+            echo "failed at:  $failed_iters"
+            echo "skipped at: $skipped_iters"
           } > soak/summary.txt
           cat soak/summary.txt
 
@@ -167,12 +281,17 @@ jobs:
             echo "| --- | --- |"
             echo "| ref | \`$GITHUB_REF\` |"
             echo "| sha | \`$GITHUB_SHA\` |"
+            echo "| test | \`$TEST\` |"
             echo "| command | \`cargo ${args[*]}\` |"
             echo "| iterations | $ITERATIONS |"
             echo "| passed | $pass |"
             echo "| **failed** | **$fail** |"
+            echo "| **skipped** | **$skipped** |"
             if [ "$fail" -gt 0 ]; then
               echo "| failing iterations |$failed_iters |"
+            fi
+            if [ "$skipped" -gt 0 ]; then
+              echo "| skipped iterations |$skipped_iters |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -180,7 +299,10 @@ jobs:
             echo "::error::$fail of $ITERATIONS iterations failed on leg $LABEL"
             exit 1
           fi
-          echo "clean soak: $pass/$ITERATIONS passed on leg $LABEL"
+          if [ "$skipped" -gt 0 ]; then
+            echo "::warning title=watch-soak::$skipped of $ITERATIONS iterations skipped on leg $LABEL"
+          fi
+          echo "soak done: $pass passed, $skipped skipped, of $ITERATIONS on leg $LABEL"
 
       - name: Upload failing logs and the tally
         if: always()
