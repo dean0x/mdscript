@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::process;
 
 use clap::{Parser, Subcommand};
 use miette::Result;
@@ -240,16 +239,19 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
-    let result = run(cli);
-    if let Err(e) = result {
-        // Route through the single render choke point (avoids PF-004 /
-        // architecture-6: hand-rolled sanitize_control_chars bypass). Every subcommand's
-        // error propagates here; guarding here makes the protection hold by construction
-        // for any future error path, not just the ones we remember to sanitize individually.
-        let code = exit_code(&e);
-        output::eprint_error(e);
-        process::exit(code);
-    }
+    let verdict = match run(cli) {
+        Ok(()) => 0,
+        Err(e) => {
+            // Route through the single render choke point, never a hand-rolled
+            // sanitize_control_chars. Every subcommand's error propagates here; guarding
+            // here makes the protection hold by construction for any future error path,
+            // not just the ones we remember to sanitize individually.
+            let code = exit_code(&e);
+            output::eprint_error(e);
+            code
+        }
+    };
+    output::exit(verdict)
 }
 
 fn run_check(
@@ -295,7 +297,7 @@ fn run_check(
                 output::eprint_warning(w);
             }
             // AD-211-3: one definition of the sentinel, shared with lint/build/fmt.
-            eprintln!("OK: {STDIN_DISPLAY_LABEL}");
+            output::ewriteln!("OK: {STDIN_DISPLAY_LABEL}");
         }
     } else {
         let ((), warnings) =
@@ -304,7 +306,7 @@ fn run_check(
             for w in &warnings {
                 output::eprint_warning(w);
             }
-            eprintln!("OK: {}", output::safe_path(&input));
+            output::ewriteln!("OK: {}", output::safe_path(&input));
         }
     }
     Ok(())
@@ -329,21 +331,21 @@ fn run_check_directory(
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
-            eprintln!(
+            output::ewriteln!(
                 "{} .mds file(s) found but all are under default-excluded directories \
                  (hidden dirs, node_modules); nothing was checked",
                 walk.excluded_by_default
             );
-            std::process::exit(1);
+            output::exit(1);
         }
         // #204: an empty tree is "nothing to check", not success (mirrors build.rs).
         // Emitted even under --quiet and exit 1, the same "nothing was done" code
         // build and fmt use.
-        eprintln!(
+        output::ewriteln!(
             "no .mds files found in {}; nothing was checked",
             output::safe_path(dir)
         );
-        std::process::exit(1);
+        output::exit(1);
     }
 
     // #387: a tree whose only .mds files are partials is "nothing to check" too. The
@@ -353,12 +355,12 @@ fn run_check_directory(
     // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
     // behaviour; `mds watch <dir>` still starts.
     if let Some(partials_only_count) = output::partials_only(&files) {
-        eprintln!(
+        output::ewriteln!(
             "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
              nothing was checked",
             output::safe_path(dir)
         );
-        std::process::exit(1);
+        output::exit(1);
     }
 
     let mut ok_count: usize = 0;
@@ -389,11 +391,11 @@ fn run_check_directory(
     }
 
     if !quiet || fail_count > 0 {
-        eprintln!("{ok_count} passed, {fail_count} failed");
+        output::ewriteln!("{ok_count} passed, {fail_count} failed");
     }
 
     if fail_count > 0 {
-        std::process::exit(1);
+        output::exit(1);
     }
     Ok(())
 }
@@ -438,7 +440,7 @@ Your items:
     // reproduces.
     output::atomic_write_file(&filename, starter, output::Durability::RenameOnly)?;
     if !quiet {
-        eprintln!(
+        output::ewriteln!(
             "Created {}\n  Try: mds build {}",
             output::safe_path(&filename),
             output::safe_path(&filename)
@@ -500,11 +502,11 @@ fn run(cli: Cli) -> Result<()> {
                 "human" => lint::LintFormat::Human,
                 "json" => lint::LintFormat::Json,
                 other => {
-                    eprintln!(
+                    output::ewriteln!(
                         "error: unknown --format value '{}'; expected 'human' or 'json'",
                         output::safe_inline(other)
                     );
-                    std::process::exit(2);
+                    output::exit(2);
                 }
             };
             lint::run_lint(lint::LintArgs {

@@ -26,8 +26,13 @@
 //! # Scope — what this guard does and does not cover
 //!
 //! **Covered:**
-//! - `println!` / `eprintln!` / `print!` / `eprint!` in `crates/mds-cli/src/**`, for the
-//!   union of their inline captures (`{name}`) and their positional arguments.
+//! - `println!` / `eprintln!` / `print!` / `eprint!` in `crates/mds-cli/src/**`, and the
+//!   CLI's own stderr writer macros `ewriteln!` / `ewrite!` (`output.rs`, #157), for the
+//!   union of their inline captures (`{name}`) and their positional arguments. The guard
+//!   matches a macro by name, so a stderr writer is covered only while it is listed in
+//!   [`PRINT_MACROS`]: every site that moves to an unlisted writer leaves the guard.
+//!   [`SITE_FLOORS`] fails when a listed file's site count drops, which is how such a
+//!   move shows up.
 //! - `write!` / `writeln!` whose first argument names a terminal stream — `std::io::stderr()`,
 //!   `io::stdout()`, or a local whose `let` initialiser names one. The crate contains no
 //!   such call today; the rule is here so that the first one cannot arrive unnoticed.
@@ -68,9 +73,9 @@
 //!   than emitted as a bare status line, so it is a weaker surface than the ones above; it
 //!   is a known residual, not a closed one. Both halves of that residual are disclosed in
 //!   spec §7.5 and in the boundary table in `crates/mds-core/src/lint/diagnostic.rs`.
-//! - `write!` / `writeln!` into an in-memory `String`, and stdout writes via
-//!   `crate::build::write_stdout`. Compiled template output is the command's *product*
-//!   and must stay byte-faithful.
+//! - `write!` / `writeln!` into an in-memory `String`, and stdout writes through a
+//!   `write_stdout` byte sink. Compiled template output is the command's *product* and
+//!   must stay byte-faithful.
 //! - `crates/mds-core/**` warning *producers*. Core does not print except through
 //!   `emit_warnings`, which escapes in HUMAN mode; the identifiers its warning producers
 //!   interpolate are WIRE-escaped at construction instead. This guard is lexical and
@@ -136,9 +141,10 @@
 //!
 //! # The escape helpers are not special-cased
 //!
-//! `eprint_error` and `eprint_warning` are the two functions that actually write to the
-//! stream, and neither gets a blanket exemption. `eprint_error` passes with no allowlist
-//! entry at all: its single interpolated argument *is* `render_error_sanitized(report)`.
+//! `eprint_error` and `eprint_warning` are the two functions that write a whole
+//! diagnostic to the stream (each through one `ewriteln!`), and neither gets a blanket
+//! exemption. `eprint_error` passes with no allowlist entry at all: its single
+//! interpolated argument *is* `render_error_sanitized(report)`.
 //! `eprint_warning` passes via one narrow, written-out allowlist entry, because its
 //! argument is HUMAN-escaped prose — and HUMAN mode is deliberately *not* in
 //! [`SANITIZERS`], since it preserves `\n` and so cannot make an identifier safe.
@@ -149,14 +155,16 @@
 //!   reports the exact expression from a synthetic violation;
 //!   [`the_guard_follows_a_hoisted_format_binding`] proves the same for a message hoisted
 //!   into a local, [`the_guard_reports_an_untraceable_helper_argument`] for one it
-//!   cannot resolve at all, and [`the_guard_refuses_to_resolve_a_non_let_binder`] for one
-//!   whose name is shadowed by a `for` / parameter / closure binder.
+//!   cannot resolve at all, [`the_guard_refuses_to_resolve_a_non_let_binder`] for one
+//!   whose name is shadowed by a `for` / parameter / closure binder, and
+//!   [`the_guard_scans_the_stderr_writer_macros`] for `ewriteln!` / `ewrite!`.
 //! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`] proves the real
 //!   sources are clean.
 //! - **Non-vacuity:** the same test asserts the scanner actually found the crate's
-//!   modules, its print sites, its interpolations, its `let` bindings, the non-`let`
-//!   binders that poison a name, and its calls into the sanitizing print helpers, so it
-//!   cannot pass because the parser silently returned nothing.
+//!   modules, its print sites (crate-wide, and per file for the files in
+//!   [`SITE_FLOORS`]), its interpolations, its `let` bindings, the non-`let` binders that
+//!   poison a name, and its calls into the sanitizing print helpers, so it cannot pass
+//!   because the parser silently returned nothing.
 //! - **Allowlist rot:** [`every_allowlist_entry_is_live`] fails if an entry in either
 //!   allowlist stops matching anything, so exemptions cannot outlive the code that
 //!   needed them.
@@ -165,8 +173,29 @@ use std::path::{Path, PathBuf};
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-/// Macros that write directly to a terminal stream.
-const PRINT_MACROS: &[&str] = &["eprintln!", "println!", "eprint!", "print!"];
+/// Macros that write directly to a terminal stream: std's four, and the CLI's
+/// non-panicking stderr writer (`output.rs`, #157).
+///
+/// A stderr writer missing from this list is invisible to every check in this file.
+const PRINT_MACROS: &[&str] = &[
+    "eprintln!",
+    "println!",
+    "eprint!",
+    "print!",
+    "ewriteln!",
+    "ewrite!",
+];
+
+/// Minimum print-site count per file, for the files whose prints go through the stderr
+/// writer macros.
+///
+/// The crate-wide floor in [`cli_print_sites_sanitize_every_interpolated_value`] cannot
+/// see one file's sites leave the guard: a file whose prints move to a writer macro that
+/// [`PRINT_MACROS`] does not list drops out of the scan while the crate-wide count still
+/// clears its floor. A per-file floor fails instead. Each floor is the file's site count
+/// when its prints moved to the writer; lowering one is a decision made in the commit
+/// that removes the print, never a side effect.
+const SITE_FLOORS: &[(&str, usize)] = &[("main.rs", 11), ("output.rs", 7)];
 
 /// Macros that write to whatever sink they are handed. Scanned only when that sink is a
 /// terminal stream (see `is_stream_target`) — a `write!` into an in-memory `String` is
@@ -458,6 +487,7 @@ fn cli_print_sites_sanitize_every_interpolated_value() {
     let mut total_bindings = 0usize;
     let mut total_non_let = 0usize;
     let mut total_helper_calls = 0usize;
+    let mut sites_per_file: Vec<(String, usize)> = Vec::new();
 
     for file in &files {
         let name = file_key(file);
@@ -466,7 +496,9 @@ fn cli_print_sites_sanitize_every_interpolated_value() {
         total_bindings += collect_let_bindings(&masked).len();
         total_non_let += collect_non_let_binders(&masked).len();
         total_helper_calls += find_invocations(&masked, SANITIZING_PRINT_HELPERS).len();
-        for site in collect_sites(&src) {
+        let sites = collect_sites(&src);
+        sites_per_file.push((name.clone(), sites.len()));
+        for site in sites {
             total_sites += 1;
             for expr in &site.exprs {
                 total_exprs += 1;
@@ -491,6 +523,19 @@ fn cli_print_sites_sanitize_every_interpolated_value() {
         total_sites >= 80,
         "non-vacuity: expected at least 80 print sites across mds-cli/src, found {total_sites}"
     );
+    for (file, floor) in SITE_FLOORS {
+        let found = sites_per_file
+            .iter()
+            .find(|(name, _)| name == file)
+            .map(|(_, n)| *n);
+        assert!(
+            found.is_some_and(|n| n >= *floor),
+            "non-vacuity: expected at least {floor} print sites in {file}, found {found:?}. \
+             Either its prints moved to a writer PRINT_MACROS does not list (list it), or a \
+             print was removed (lower SITE_FLOORS in the same commit). All files: \
+             {sites_per_file:?}"
+        );
+    }
     assert!(
         total_exprs >= 60,
         "non-vacuity: expected at least 60 interpolated expressions, found {total_exprs}"
@@ -834,6 +879,56 @@ fn the_guard_refuses_to_resolve_a_non_let_binder() {
         )
         .is_empty(),
         "a purely `let`-bound safe local must still be accepted"
+    );
+}
+
+#[test]
+fn the_guard_scans_the_stderr_writer_macros() {
+    // `ewriteln!` / `ewrite!` are the CLI's stderr writer (#157). Every site that uses
+    // them is a print site exactly like `eprintln!`, bare or path-qualified.
+    let src = r#"
+        fn f(path: &Path, e: &str) {
+            output::ewriteln!("warning: {}", path.display());
+            crate::output::ewrite!("{e}");
+            ewriteln!("Clean: {}", safe_path(path));
+            ewriteln!("Stopped watching.");
+        }
+    "#;
+    let sites = collect_sites(src);
+    let kinds: Vec<&str> = sites.iter().map(|s| s.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["ewriteln!", "ewrite!", "ewriteln!", "ewriteln!"],
+        "every writer invocation must be a site; got {sites:?}"
+    );
+    assert_eq!(sites[0].exprs, vec!["path.display()".to_string()]);
+    assert_eq!(sites[1].exprs, vec!["e".to_string()]);
+    for expr in sites[0].exprs.iter().chain(&sites[1].exprs) {
+        assert!(
+            !is_sanitizer_call(expr),
+            "`{expr}` must be reported, not accepted"
+        );
+    }
+    assert_eq!(sites[2].exprs, vec!["safe_path(path)".to_string()]);
+    assert!(
+        is_sanitizer_call(&sites[2].exprs[0]),
+        "a WIRE-escaped writer site must pass"
+    );
+    assert!(sites[3].exprs.is_empty(), "a literal interpolates nothing");
+
+    // The macros' own definitions and re-exports are not call sites.
+    let definition = r#"
+        macro_rules! ewriteln {
+            ($($arg:tt)+) => {
+                $crate::output::write_stderr_fmt(::std::format_args!($($arg)+))
+            };
+        }
+        pub(crate) use ewriteln;
+    "#;
+    assert!(
+        collect_sites(definition).is_empty(),
+        "a macro definition is not a print site; got {:?}",
+        collect_sites(definition)
     );
 }
 

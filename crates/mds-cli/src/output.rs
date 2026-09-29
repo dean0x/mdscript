@@ -6,6 +6,10 @@
 //!   path resolution used by watch and build-directory.
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
+//! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr writer, which
+//!   never panics — a closed pipe or a failed write becomes sticky [`OutputState`]
+//!   instead (#157). [`write_stdout`] writes a command's product and reports a
+//!   [`StdoutOutcome`]; [`exit`] ends the process through [`final_exit_code`].
 //! - [`eprint_error`]: the single CLI stderr choke-point — escapes every report's
 //!   message, help, and label text before miette renders it (CWE-150 / PF-014).
 //! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`,
@@ -23,10 +27,219 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use miette::Result;
 
 use crate::build::{MdsConfig, OutputKind};
+
+// ── Streams and the exit funnel (#157) ───────────────────────────────────────
+
+/// `eprint!` for the CLI: write to stderr through [`write_stderr_fmt`], which never
+/// panics.
+///
+/// `tests/print_discipline.rs` lists this macro and `ewriteln!` beside the std print
+/// macros and scans their arguments the same way. A stderr writer the guard does not
+/// list would take every site that uses it out of the guard.
+#[expect(
+    unused_macros,
+    reason = "`ewrite!` has no caller until the watch conversion (#157)"
+)]
+macro_rules! ewrite {
+    ($($arg:tt)*) => {
+        $crate::output::write_stderr_fmt(::std::format_args!($($arg)*))
+    };
+}
+
+/// `eprintln!` for the CLI: `ewrite!` plus a trailing newline.
+macro_rules! ewriteln {
+    () => {
+        $crate::output::write_stderr_fmt(::std::format_args!("\n"))
+    };
+    ($($arg:tt)+) => {
+        $crate::output::write_stderr_fmt(::std::format_args!(
+            "{}\n",
+            ::std::format_args!($($arg)+)
+        ))
+    };
+}
+
+#[expect(
+    unused_imports,
+    reason = "`ewrite!` has no caller until the watch conversion (#157)"
+)]
+pub(crate) use ewrite;
+pub(crate) use ewriteln;
+
+/// Sticky facts about the CLI's output streams, read when the process exits.
+///
+/// Each fact is one bit, set with `fetch_or` and never cleared, so a fact recorded on
+/// any thread is still there at exit. Functions that decide something from these facts
+/// take `&OutputState`, so a unit test builds its own instead of sharing the process's
+/// [`OUTPUT_STATE`] with every other test in the binary.
+///
+/// Adding a fact is adding one bit and its two accessors.
+pub(crate) struct OutputState {
+    bits: AtomicU8,
+}
+
+impl OutputState {
+    /// A stderr write hit a closed pipe: the reader is gone.
+    const STDERR_CLOSED: u8 = 1 << 0;
+    /// An output write failed for any reason other than a closed pipe.
+    const IO_FAILED: u8 = 1 << 1;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            bits: AtomicU8::new(0),
+        }
+    }
+
+    fn set(&self, bit: u8) {
+        self.bits.fetch_or(bit, Ordering::AcqRel);
+    }
+
+    fn has(&self, bit: u8) -> bool {
+        self.bits.load(Ordering::Acquire) & bit != 0
+    }
+
+    /// Record that stderr's reader is gone. Later stderr writes are dropped.
+    pub(crate) fn note_stderr_closed(&self) {
+        self.set(Self::STDERR_CLOSED);
+    }
+
+    /// Record an output failure that is not a closed pipe.
+    pub(crate) fn note_io_failure(&self) {
+        self.set(Self::IO_FAILED);
+    }
+
+    pub(crate) fn stderr_closed(&self) -> bool {
+        self.has(Self::STDERR_CLOSED)
+    }
+
+    pub(crate) fn io_failed(&self) -> bool {
+        self.has(Self::IO_FAILED)
+    }
+}
+
+/// The process's own [`OutputState`], used by the process-boundary functions
+/// [`write_stderr_fmt`] and [`exit`].
+static OUTPUT_STATE: OutputState = OutputState::new();
+
+/// The body of `ewrite!` / `ewriteln!`: write `args` to stderr, never panicking.
+///
+/// std's `eprintln!` panics when the write fails, which ends the run with exit 101.
+/// Here instead:
+///
+/// - A closed pipe (the reader is gone) records [`OutputState::note_stderr_closed`];
+///   this write and every later stderr write are dropped, and the exit code does not
+///   change.
+/// - Any other write error records [`OutputState::note_io_failure`], which
+///   [`final_exit_code`] turns into an exit of at least 2. Later writes are still
+///   attempted.
+pub(crate) fn write_stderr_fmt(args: std::fmt::Arguments<'_>) {
+    write_stderr_to(&OUTPUT_STATE, &mut std::io::stderr().lock(), args);
+}
+
+/// [`write_stderr_fmt`] against any sink and state.
+///
+/// The text is rendered first and written with one `write_all`, then flushed. A
+/// `Display` that fails ends the text where it failed: that is a bug in the impl, not an
+/// output failure, so it records nothing.
+fn write_stderr_to<W: std::io::Write + ?Sized>(
+    state: &OutputState,
+    sink: &mut W,
+    args: std::fmt::Arguments<'_>,
+) {
+    if state.stderr_closed() {
+        return;
+    }
+    let mut text = String::new();
+    let _ = std::fmt::Write::write_fmt(&mut text, args);
+    match sink.write_all(text.as_bytes()).and_then(|()| sink.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => state.note_stderr_closed(),
+        Err(_) => state.note_io_failure(),
+    }
+}
+
+/// What happened to one [`write_stdout`] call.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "its first callers come with the build and fmt conversion (#157)"
+    )
+)]
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum StdoutOutcome {
+    /// Every byte was written and flushed.
+    Written,
+    /// The reader is gone (a closed pipe): stop writing stdout, keep the verdict.
+    Closed,
+    /// Any other failure: the caller reports it as `mds::io`.
+    Failed(std::io::Error),
+}
+
+/// Write a command's product — compiled output, a diff, a JSON report — to stdout and
+/// flush it. [`StdoutOutcome::Written`] only when both the write and the flush succeed.
+#[expect(
+    dead_code,
+    reason = "its first callers come with the build and fmt conversion (#157)"
+)]
+pub(crate) fn write_stdout(bytes: &[u8]) -> StdoutOutcome {
+    write_stdout_to(&mut std::io::stdout().lock(), bytes)
+}
+
+/// [`write_stdout`] against any sink.
+fn write_stdout_to<W: std::io::Write + ?Sized>(sink: &mut W, bytes: &[u8]) -> StdoutOutcome {
+    match sink.write_all(bytes).and_then(|()| sink.flush()) {
+        Ok(()) => StdoutOutcome::Written,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => StdoutOutcome::Closed,
+        Err(e) => StdoutOutcome::Failed(e),
+    }
+}
+
+/// Which rule [`final_exit_code`] applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitPolicy {
+    /// A run that ends on its own — build, check, fmt, lint, init, and a watch session
+    /// that never went live: an output failure lifts the exit code to at least 2.
+    Batch,
+    /// A watch session after it went live: its per-rebuild failures were reported as
+    /// they happened, and they do not change the exit code.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "its first caller is the watch conversion (#157)")
+    )]
+    WatchSession,
+}
+
+/// The lowest exit code a batch run with an output failure ends with.
+const IO_FAILURE_EXIT: i32 = 2;
+
+/// The code a run whose verdict is `verdict` exits with, given what happened to its
+/// output.
+///
+/// A closed stdout or stderr pipe never changes it. Under [`ExitPolicy::Batch`], any
+/// other output failure lifts it to `max(verdict, 2)` — a resource limit keeps its 3.
+/// [`ExitPolicy::WatchSession`] returns `verdict` unchanged.
+#[must_use]
+pub(crate) fn final_exit_code(verdict: i32, state: &OutputState, policy: ExitPolicy) -> i32 {
+    match policy {
+        ExitPolicy::Batch if state.io_failed() => verdict.max(IO_FAILURE_EXIT),
+        ExitPolicy::Batch | ExitPolicy::WatchSession => verdict,
+    }
+}
+
+/// End the process: the CLI's exit funnel.
+///
+/// Exits with [`final_exit_code`] of `verdict` under [`ExitPolicy::Batch`], so an
+/// output failure recorded anywhere in the run is honoured on the way out.
+pub(crate) fn exit(verdict: i32) -> ! {
+    std::process::exit(final_exit_code(verdict, &OUTPUT_STATE, ExitPolicy::Batch))
+}
 
 // ── Stdin display sentinel ────────────────────────────────────────────────────
 
@@ -954,15 +1167,21 @@ pub(crate) use mds::neutralize_source_for_render;
 
 /// A terminal-safe view of a [`miette::Report`], built **before** rendering.
 ///
-/// Overrides every prose surface the frame can render — the `Display` message, the
-/// `help` text, each [`miette::LabeledSpan`]'s label, and the whole auxiliary
-/// diagnostic graph (`source` cause chain, `related`, `diagnostic_source`) — with
-/// [`mds::sanitize_control_chars`]-escaped copies (HUMAN mode, so `\n` and `\t` survive
-/// and multi-line frames stay readable).  Everything the frame's geometry depends on —
-/// `code`, `severity`, `url`, `source_code`, and each label's byte span — is delegated
-/// to the inner report untouched, so the byte-length-preserving neutralization already
-/// applied to source excerpts (via `mds::named_source_for_render`) keeps every span
-/// offset and caret column exact.
+/// Overrides every text surface the frame can render — the `Display` message, the
+/// `code`, the `help` and `url` text, each [`miette::LabeledSpan`]'s label, and the
+/// whole auxiliary diagnostic graph (`source` cause chain, `related`,
+/// `diagnostic_source`) — with [`mds::sanitize_control_chars`]-escaped copies (HUMAN
+/// mode, so `\n` and `\t` survive and multi-line frames stay readable).  Everything the
+/// frame's geometry depends on — `severity`, `source_code`, and each label's byte span —
+/// is delegated to the inner report untouched, so the byte-length-preserving
+/// neutralization already applied to source excerpts (via `mds::named_source_for_render`)
+/// keeps every span offset and caret column exact.
+///
+/// Every copy is rendered at construction without panicking (#157): a surface whose
+/// `Display` fails is dropped, or — for a message, which is never optional — replaced
+/// by a fixed placeholder. miette then formats owned strings for all of those surfaces;
+/// what it still reads through the inner report is the source excerpt, and a read that
+/// fails there is handled by [`render_error_sanitized`].
 ///
 /// # Why this is the PF-014-correct boundary
 ///
@@ -1004,7 +1223,9 @@ pub(crate) use mds::neutralize_source_for_render;
 struct SanitizedReport {
     inner: miette::Report,
     message: String,
+    code: Option<String>,
     help: Option<String>,
+    url: Option<String>,
     source: Option<SanitizedNode>,
     related: Vec<SanitizedNode>,
     diagnostic_source: Option<SanitizedNode>,
@@ -1042,9 +1263,35 @@ struct SanitizedNode {
     diagnostic_source: Option<Box<SanitizedNode>>,
 }
 
+/// Placeholder for a message whose own `Display` failed (#157).
+const UNFORMATTABLE: &str = "(this text could not be formatted)";
+
+/// Render `d` into a `String` without panicking: `None` when its `Display` fails.
+///
+/// `to_string()` and `format!` panic when an impl returns `fmt::Error`, and a report's
+/// text comes from `Display` impls this crate does not control.
+fn display_text<T: std::fmt::Display + ?Sized>(d: &T) -> Option<String> {
+    let mut text = String::new();
+    std::fmt::Write::write_fmt(&mut text, format_args!("{d}")).ok()?;
+    Some(text)
+}
+
 /// Escape one optional `Display` surface to an owned `String`.
+///
+/// A surface whose `Display` fails is dropped: code, help and url are optional, so the
+/// frame renders without it.
 fn escape_display(d: Option<Box<dyn std::fmt::Display + '_>>) -> Option<String> {
-    d.map(|v| mds::sanitize_control_chars(&v.to_string()).into_owned())
+    d.and_then(|v| display_text(&*v))
+        .map(|text| mds::sanitize_control_chars(&text).into_owned())
+}
+
+/// Escape a message, or [`UNFORMATTABLE`] when its `Display` fails — a message is never
+/// optional, so its place says why it is empty.
+fn escape_message<T: std::fmt::Display + ?Sized>(d: &T) -> String {
+    display_text(d).map_or_else(
+        || UNFORMATTABLE.to_owned(),
+        |text| mds::sanitize_control_chars(&text).into_owned(),
+    )
 }
 
 /// Escape a `Diagnostic`'s label text, keeping each byte span verbatim.
@@ -1074,7 +1321,7 @@ impl SanitizedNode {
     /// Build from a `Diagnostic` node (used for `related` / `diagnostic_source`).
     fn from_diagnostic(d: &dyn miette::Diagnostic, depth: usize) -> Self {
         Self {
-            message: mds::sanitize_control_chars(&d.to_string()).into_owned(),
+            message: escape_message(d),
             help: escape_display(d.help()),
             code: escape_display(d.code()),
             url: escape_display(d.url()),
@@ -1090,7 +1337,7 @@ impl SanitizedNode {
     /// expose no `Diagnostic` data — only a `Display` message and a further `source()`).
     fn from_error(e: &(dyn std::error::Error + 'static), depth: usize) -> Self {
         Self {
-            message: mds::sanitize_control_chars(&e.to_string()).into_owned(),
+            message: escape_message(e),
             help: None,
             code: None,
             url: None,
@@ -1209,8 +1456,10 @@ fn related_iter(
 
 impl SanitizedReport {
     fn new(inner: miette::Report) -> Self {
-        let message = mds::sanitize_control_chars(&inner.to_string()).into_owned();
+        let message = escape_message(&inner);
+        let code = escape_display(inner.code());
         let help = escape_display(inner.help());
+        let url = escape_display(inner.url());
         let source = SanitizedNode::chain_from_error(std::error::Error::source(&*inner), 0)
             .map(|boxed| *boxed);
         let related = SanitizedNode::related_from(inner.as_ref(), 0);
@@ -1220,7 +1469,9 @@ impl SanitizedReport {
         Self {
             inner,
             message,
+            code,
             help,
+            url,
             source,
             related,
             diagnostic_source,
@@ -1257,7 +1508,7 @@ impl std::error::Error for SanitizedReport {
 
 impl miette::Diagnostic for SanitizedReport {
     fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.inner.code()
+        boxed_str(self.code.as_deref())
     }
 
     fn severity(&self) -> Option<miette::Severity> {
@@ -1269,7 +1520,7 @@ impl miette::Diagnostic for SanitizedReport {
     }
 
     fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.inner.url()
+        boxed_str(self.url.as_deref())
     }
 
     fn source_code(&self) -> Option<&dyn miette::SourceCode> {
@@ -1311,6 +1562,11 @@ fn sanitize_report(report: miette::Report) -> miette::Report {
 /// The rendered frame itself is never post-processed (PF-014); all escaping happens
 /// in [`sanitize_report`], before miette sees the values.
 ///
+/// Never panics (#157). The frame is rendered through `fmt::Write`, which reports a
+/// formatting failure as `fmt::Error` where `format!` would panic; when miette's render
+/// fails part-way — a source excerpt that cannot be read, say — the partial frame is
+/// discarded and [`plain_text_fallback`] renders the report instead.
+///
 /// Note: idempotency is a property of [`mds::sanitize_control_chars`] (calling it
 /// twice on already-sanitized input is a no-op), not of this function (each call
 /// re-renders the `Report` from scratch).  That idempotency is what lets
@@ -1318,7 +1574,35 @@ fn sanitize_report(report: miette::Report) -> miette::Report {
 /// neutralizes the source excerpt and filename, which this boundary cannot do.
 fn render_error_sanitized(report: miette::Report) -> String {
     let report = sanitize_report(report);
-    format!("{report:?}")
+    let mut rendered = String::new();
+    match std::fmt::Write::write_fmt(&mut rendered, format_args!("{report:?}")) {
+        Ok(()) => rendered,
+        Err(std::fmt::Error) => plain_text_fallback(report.as_ref()),
+    }
+}
+
+/// The plain-text form of a report whose frame miette could not render: its code, its
+/// message and its help, each escaped, laid out like miette's frame without the source
+/// excerpt. A surface whose `Display` fails is left out, as in [`SanitizedReport`].
+fn plain_text_fallback(d: &dyn miette::Diagnostic) -> String {
+    let mut out = String::new();
+    if let Some(code) = d.code().and_then(|c| display_text(&*c)) {
+        out.push_str(&mds::sanitize_control_chars_wire(&code));
+        out.push_str("\n\n");
+    }
+    push_frame_block(&mut out, "  \u{00d7} ", &escape_message(d));
+    if let Some(help) = escape_display(d.help()) {
+        push_frame_block(&mut out, "  help: ", &help);
+    }
+    out
+}
+
+/// Push `lead` and `text`, continuing each further line of `text` under miette's
+/// U+2502 rule, then end the line.
+fn push_frame_block(out: &mut String, lead: &str, text: &str) {
+    out.push_str(lead);
+    out.push_str(&text.replace('\n', "\n  \u{2502} "));
+    out.push('\n');
 }
 
 /// Render a miette `Report` to stderr — the single choke-point for all CLI error
@@ -1344,10 +1628,12 @@ fn render_error_sanitized(report: miette::Report) -> String {
 /// miette's own ANSI SGR styling is passed through untouched — carets and box-drawing
 /// survive intact.
 ///
+/// Writes through `ewriteln!`, so a closed or failing stderr never panics (#157).
+///
 /// Note: status-line path display (`Clean:`, `Fixed:`, etc.) is handled by the
 /// separate [`safe_path`] helper, not by this function.
 pub(crate) fn eprint_error(report: miette::Report) {
-    eprintln!("{}", render_error_sanitized(report));
+    ewriteln!("{}", render_error_sanitized(report));
 }
 
 /// Print a CLI warning to stderr with HUMAN-mode escaping applied to the whole line
@@ -1392,8 +1678,10 @@ pub(crate) fn eprint_error(report: miette::Report) {
 /// escape helpers, and which applies the same rule to `format!` invocations nested
 /// inside `eprint_warning` calls. `watch.rs`'s lifecycle status lines — previously
 /// carved out as a pre-existing gap — are in scope and now routed like everything else.
+///
+/// Writes through `ewriteln!`, so a closed or failing stderr never panics (#157).
 pub(crate) fn eprint_warning(w: &str) {
-    eprintln!("{}", mds::sanitize_control_chars(w));
+    ewriteln!("{}", mds::sanitize_control_chars(w));
 }
 
 /// Neutralize hostile control bytes in source text for `--diff` preview output.
@@ -3140,5 +3428,440 @@ mod tests {
             err.contains("x.md"),
             "error must name the target; got {err}"
         );
+    }
+
+    // ── render_error_sanitized never panics on a failing Display (#157) ─────────
+
+    /// The six-character escape `sanitize_control_chars` writes for ESC, built at runtime
+    /// so no escape sequence is written into this source.
+    fn escaped_esc() -> String {
+        format!("{}u001B", '\\')
+    }
+
+    /// A `Display` that always fails, standing in for a buggy third-party impl.
+    struct Unformattable;
+
+    impl std::fmt::Display for Unformattable {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+
+    /// Source text that serves a label's surrounding context but fails the exact-span
+    /// read miette makes next, so miette's own render returns `fmt::Error` part-way
+    /// through the frame.
+    #[derive(Debug)]
+    struct FailsNarrowReads(String);
+
+    impl miette::SourceCode for FailsNarrowReads {
+        fn read_span<'a>(
+            &'a self,
+            span: &miette::SourceSpan,
+            context_lines_before: usize,
+            context_lines_after: usize,
+        ) -> std::result::Result<Box<dyn miette::SpanContents<'a> + 'a>, miette::MietteError>
+        {
+            if context_lines_before == 0 && context_lines_after == 0 {
+                return Err(miette::MietteError::OutOfBounds);
+            }
+            miette::SourceCode::read_span(&self.0, span, context_lines_before, context_lines_after)
+        }
+    }
+
+    /// A cause whose message cannot be formatted.
+    #[derive(Debug)]
+    struct UnformattableCause;
+
+    impl std::fmt::Display for UnformattableCause {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+
+    impl std::error::Error for UnformattableCause {}
+
+    /// A diagnostic whose surfaces fail to format one at a time, as each test asks.
+    #[derive(Debug, Default)]
+    struct Probe {
+        message: String,
+        message_fails: bool,
+        code_fails: bool,
+        help_fails: bool,
+        cause: Option<UnformattableCause>,
+        source: Option<FailsNarrowReads>,
+    }
+
+    impl std::fmt::Display for Probe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if self.message_fails {
+                return Err(std::fmt::Error);
+            }
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Probe {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause
+                .as_ref()
+                .map(|c| c as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    impl miette::Diagnostic for Probe {
+        fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+            if self.code_fails {
+                Some(Box::new(Unformattable))
+            } else {
+                Some(Box::new("mds::probe"))
+            }
+        }
+
+        fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+            if self.help_fails {
+                Some(Box::new(Unformattable))
+            } else {
+                Some(Box::new("probe help"))
+            }
+        }
+
+        fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+            self.source.as_ref().map(|s| s as &dyn miette::SourceCode)
+        }
+
+        fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+            self.source.as_ref()?;
+            Some(Box::new(std::iter::once(
+                miette::LabeledSpan::new_primary_with_span(Some("here".to_string()), (0, 5)),
+            )))
+        }
+    }
+
+    /// A report whose own message cannot be formatted still renders — its code and help
+    /// in the usual frame, a fixed placeholder where the message would be.
+    #[test]
+    fn a_report_whose_message_cannot_be_formatted_renders_a_placeholder() {
+        let rendered = render_error_sanitized(miette::Report::new(Probe {
+            message_fails: true,
+            ..Probe::default()
+        }));
+
+        assert!(
+            rendered.contains("mds::probe") && rendered.contains("probe help"),
+            "the rest of the frame must render; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("could not be formatted"),
+            "the message's place must say it could not be formatted; got {rendered:?}"
+        );
+    }
+
+    /// A code, help or cause whose `Display` fails costs only that surface: the message
+    /// still renders, escaped, in the usual frame.
+    #[test]
+    fn a_report_whose_code_help_or_cause_cannot_be_formatted_keeps_its_message() {
+        let rendered = render_error_sanitized(miette::Report::new(Probe {
+            message: format!("cannot write fo{}[2Jo.mds", '\x1b'),
+            code_fails: true,
+            help_fails: true,
+            cause: Some(UnformattableCause),
+            ..Probe::default()
+        }));
+
+        assert!(
+            rendered.contains("cannot write fo") && rendered.contains(&escaped_esc()),
+            "the message must render, with ESC escaped; got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\x1b'),
+            "no raw ESC may reach the rendered text; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("could not be formatted"),
+            "the unformattable cause must leave a placeholder, not vanish; got {rendered:?}"
+        );
+    }
+
+    /// When miette's own render fails part-way (here: a source read fails after the
+    /// frame has started), the whole frame is replaced by escaped plain text — never a
+    /// panic, never half a frame.
+    #[test]
+    fn a_render_failure_falls_back_to_escaped_plain_text() {
+        let rendered = render_error_sanitized(miette::Report::new(Probe {
+            message: format!("cannot write fo{}[2Jo.mds\nsecond line", '\x1b'),
+            source: Some(FailsNarrowReads("Hello world\n".to_string())),
+            ..Probe::default()
+        }));
+
+        let esc = escaped_esc();
+        let want = format!(
+            "mds::probe\n\n  \u{00d7} cannot write fo{esc}[2Jo.mds\n  \u{2502} second line\n  help: probe help\n"
+        );
+        assert_eq!(
+            rendered, want,
+            "a failed render must fall back to the plain-text form, escaped"
+        );
+    }
+
+    // ── The stderr writer, the stdout outcome and the exit code (#157) ──────────
+
+    /// What a [`Sink`]'s `write` does.
+    #[derive(Clone, Copy)]
+    enum OnWrite {
+        Accept,
+        Fail(std::io::ErrorKind),
+        /// Accept nothing: `write` returns `Ok(0)`, which `write_all` reports as
+        /// `WriteZero`.
+        Zero,
+    }
+
+    /// An in-memory stream whose `write` and `flush` fail as a test asks, counting the
+    /// `write` calls so a dropped write can be told apart from a failed one.
+    struct Sink {
+        on_write: OnWrite,
+        flush_fails: Option<std::io::ErrorKind>,
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Sink {
+        fn new(on_write: OnWrite) -> Self {
+            Self {
+                on_write,
+                flush_fails: None,
+                writes: 0,
+                bytes: Vec::new(),
+            }
+        }
+
+        fn failing_flush(kind: std::io::ErrorKind) -> Self {
+            Self {
+                flush_fails: Some(kind),
+                ..Self::new(OnWrite::Accept)
+            }
+        }
+    }
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            match self.on_write {
+                OnWrite::Accept => {
+                    self.bytes.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                OnWrite::Fail(kind) => Err(std::io::Error::from(kind)),
+                OnWrite::Zero => Ok(0),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self.flush_fails {
+                Some(kind) => Err(std::io::Error::from(kind)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn stderr_writer_writes_the_whole_text_and_records_nothing() {
+        let state = OutputState::new();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_stderr_to(&state, &mut sink, format_args!("OK: {}\n", "x.mds"));
+
+        assert_eq!(sink.bytes, b"OK: x.mds\n");
+        assert_eq!(sink.writes, 1, "the rendered text goes out in one write");
+        assert!(!state.stderr_closed() && !state.io_failed());
+    }
+
+    #[test]
+    fn stderr_writer_treats_a_closed_pipe_as_sticky_and_drops_later_writes() {
+        let state = OutputState::new();
+        let mut closed = Sink::new(OnWrite::Fail(std::io::ErrorKind::BrokenPipe));
+        write_stderr_to(&state, &mut closed, format_args!("first\n"));
+        assert!(state.stderr_closed(), "a closed pipe must be recorded");
+        assert!(!state.io_failed(), "a closed pipe is not an I/O failure");
+
+        let mut later = Sink::new(OnWrite::Accept);
+        write_stderr_to(&state, &mut later, format_args!("second\n"));
+        assert_eq!(
+            later.writes, 0,
+            "every write after the pipe closed must be dropped"
+        );
+    }
+
+    #[test]
+    fn stderr_writer_records_any_other_failure_and_keeps_writing() {
+        let state = OutputState::new();
+        let mut full = Sink::new(OnWrite::Fail(std::io::ErrorKind::StorageFull));
+        write_stderr_to(&state, &mut full, format_args!("first\n"));
+        assert!(state.io_failed(), "a non-pipe failure must be recorded");
+        assert!(!state.stderr_closed(), "a full disk is not a closed pipe");
+
+        let mut later = Sink::new(OnWrite::Accept);
+        write_stderr_to(&state, &mut later, format_args!("second\n"));
+        assert_eq!(
+            later.bytes, b"second\n",
+            "an I/O failure must not stop later writes"
+        );
+        assert!(state.io_failed(), "the failure stays recorded");
+    }
+
+    #[test]
+    fn stderr_writer_counts_a_short_write_and_a_failed_flush() {
+        let short = OutputState::new();
+        write_stderr_to(&short, &mut Sink::new(OnWrite::Zero), format_args!("x\n"));
+        assert!(short.io_failed() && !short.stderr_closed());
+
+        let flush_full = OutputState::new();
+        let mut sink = Sink::failing_flush(std::io::ErrorKind::StorageFull);
+        write_stderr_to(&flush_full, &mut sink, format_args!("x\n"));
+        assert!(flush_full.io_failed() && !flush_full.stderr_closed());
+
+        let flush_closed = OutputState::new();
+        let mut sink = Sink::failing_flush(std::io::ErrorKind::BrokenPipe);
+        write_stderr_to(&flush_closed, &mut sink, format_args!("x\n"));
+        assert!(flush_closed.stderr_closed() && !flush_closed.io_failed());
+    }
+
+    #[test]
+    fn stderr_writer_survives_a_display_that_fails() {
+        let state = OutputState::new();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_stderr_to(
+            &state,
+            &mut sink,
+            format_args!("before {} after\n", Unformattable),
+        );
+
+        assert_eq!(
+            sink.bytes, b"before ",
+            "the text ends where the Display failed"
+        );
+        assert!(
+            !state.stderr_closed() && !state.io_failed(),
+            "a formatting bug is not an output failure"
+        );
+    }
+
+    #[test]
+    fn write_stdout_is_written_only_when_the_write_and_the_flush_succeed() {
+        let mut ok = Sink::new(OnWrite::Accept);
+        assert!(matches!(
+            write_stdout_to(&mut ok, b"compiled\n"),
+            StdoutOutcome::Written
+        ));
+        assert_eq!(ok.bytes, b"compiled\n");
+
+        let cases = [
+            (
+                "write hits a closed pipe",
+                Sink::new(OnWrite::Fail(std::io::ErrorKind::BrokenPipe)),
+                None,
+            ),
+            (
+                "flush hits a closed pipe",
+                Sink::failing_flush(std::io::ErrorKind::BrokenPipe),
+                None,
+            ),
+            (
+                "write fails",
+                Sink::new(OnWrite::Fail(std::io::ErrorKind::StorageFull)),
+                Some(std::io::ErrorKind::StorageFull),
+            ),
+            (
+                "write is short",
+                Sink::new(OnWrite::Zero),
+                Some(std::io::ErrorKind::WriteZero),
+            ),
+            (
+                "flush fails",
+                Sink::failing_flush(std::io::ErrorKind::StorageFull),
+                Some(std::io::ErrorKind::StorageFull),
+            ),
+        ];
+        for (what, mut sink, failed_kind) in cases {
+            let outcome = write_stdout_to(&mut sink, b"compiled\n");
+            match (failed_kind, &outcome) {
+                (None, StdoutOutcome::Closed) => {}
+                (Some(want), StdoutOutcome::Failed(e)) if e.kind() == want => {}
+                _ => panic!("{what}: want Closed or Failed({failed_kind:?}); got {outcome:?}"),
+            }
+        }
+    }
+
+    /// Every combination of verdict, recorded facts and policy that matters, with the
+    /// code each one must exit with — written out, not recomputed.
+    #[test]
+    fn final_exit_code_table() {
+        struct Case {
+            verdict: i32,
+            closed: bool,
+            failed: bool,
+            policy: ExitPolicy,
+            want: i32,
+        }
+        const fn case(
+            verdict: i32,
+            closed: bool,
+            failed: bool,
+            policy: ExitPolicy,
+            want: i32,
+        ) -> Case {
+            Case {
+                verdict,
+                closed,
+                failed,
+                policy,
+                want,
+            }
+        }
+        use ExitPolicy::{Batch, WatchSession};
+        let cases = [
+            // Nothing recorded: the verdict stands.
+            case(0, false, false, Batch, 0),
+            case(1, false, false, Batch, 1),
+            case(2, false, false, Batch, 2),
+            case(3, false, false, Batch, 3),
+            case(101, false, false, Batch, 101),
+            // A closed pipe never changes the code.
+            case(0, true, false, Batch, 0),
+            case(1, true, false, Batch, 1),
+            case(3, true, false, Batch, 3),
+            // Any other failure lifts a batch run to at least 2.
+            case(0, false, true, Batch, 2),
+            case(1, false, true, Batch, 2),
+            case(2, false, true, Batch, 2),
+            case(3, false, true, Batch, 3),
+            case(101, false, true, Batch, 101),
+            case(0, true, true, Batch, 2),
+            case(1, true, true, Batch, 2),
+            // A live watch session keeps its verdict whatever was recorded.
+            case(0, false, false, WatchSession, 0),
+            case(1, false, false, WatchSession, 1),
+            case(0, true, false, WatchSession, 0),
+            case(0, false, true, WatchSession, 0),
+            case(1, false, true, WatchSession, 1),
+            case(3, false, true, WatchSession, 3),
+            case(0, true, true, WatchSession, 0),
+        ];
+        for c in cases {
+            let state = OutputState::new();
+            if c.closed {
+                state.note_stderr_closed();
+            }
+            if c.failed {
+                state.note_io_failure();
+            }
+            assert_eq!(
+                final_exit_code(c.verdict, &state, c.policy),
+                c.want,
+                "verdict {} closed={} failed={} {:?}",
+                c.verdict,
+                c.closed,
+                c.failed,
+                c.policy
+            );
+        }
     }
 }
