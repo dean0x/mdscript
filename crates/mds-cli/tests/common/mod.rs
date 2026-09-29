@@ -1,9 +1,10 @@
 use std::io::Read;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
 pub fn fixture(name: &str) -> PathBuf {
@@ -154,9 +155,9 @@ pub fn dup_vars_file_omitted(n: usize, path: &Path) -> String {
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
 ///
-/// Same body as the private `count_occurrences` in `warnings.rs` / `cli_watch.rs` —
-/// those files import only the two render helpers above (E0255 otherwise) and keep
-/// their own private copy of this one.
+/// Same body as the private `count_occurrences` in `warnings.rs` — that file imports
+/// only the two render helpers above (E0255 otherwise) and keeps its own private copy
+/// of this one.
 #[allow(dead_code)]
 pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     let mut count = 0;
@@ -282,6 +283,7 @@ impl ChildGuard {
 
     /// Reap an already-exiting child. `Child::wait` caches its status, so calling this
     /// and then letting `Drop` run is safe.
+    #[track_caller]
     pub fn wait_status(&mut self) -> std::process::ExitStatus {
         self.0.wait().expect("wait failed")
     }
@@ -367,7 +369,12 @@ impl PipeTap {
 }
 
 /// Spawn a background thread that drains `reader` into a fresh [`PipeTap`].
-fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
+///
+/// The spawn helpers below call it with a child's pipe; the wait self-tests in
+/// `cli_watch.rs` call it with an in-memory reader, so they exercise the waits without
+/// a process.
+#[allow(dead_code)]
+pub fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = buf.clone();
     let handle = std::thread::spawn(move || {
@@ -389,6 +396,106 @@ fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
         drain: Arc::new(Mutex::new(Some(handle))),
     }
 }
+
+// ── Pipe-tap waits ───────────────────────────────────────────────────────────
+
+/// How often the pipe-tap waits sample their tap.
+const TAP_POLL: Duration = Duration::from_millis(20);
+
+/// Poll `tap` until `done` holds for its text, or `timeout` elapses. Never panics.
+///
+/// `Ok` carries the text that satisfied `done`; `Err` carries the last text seen when
+/// the time ran out. This is for the one caller that treats an unmet condition as
+/// data rather than as a failure — the watch cap test, which must tell "no rebuild
+/// yet" apart from a broken harness. Every other wait goes through [`wait_for_tap`] or
+/// [`wait_for_tap_count`], which fail at the caller.
+#[allow(dead_code)]
+pub fn poll_tap_until(
+    tap: &PipeTap,
+    timeout: Duration,
+    done: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    // Bounded by `timeout`: at most timeout / TAP_POLL iterations, and the text is
+    // tested once more after the deadline passes, so a condition met on the last
+    // sample still counts.
+    loop {
+        let text = tap.text();
+        if done(&text) {
+            return Ok(text);
+        }
+        if Instant::now() >= deadline {
+            return Err(text);
+        }
+        std::thread::sleep(TAP_POLL);
+    }
+}
+
+/// Wait until `tap` holds `needle`, and return everything it holds at that moment.
+///
+/// PANICS on timeout. The message opens with the CALLER's `file:line:column` and ends
+/// with what the tap actually held, so a missing line is reported where the test waited
+/// for it, as the precondition that never happened — never as a later assertion about
+/// text that was simply incomplete. A wait that returned the text on timeout let the
+/// caller's own assertion report the shortfall as if it were a final answer.
+///
+/// A tap samples a live pipe: text returned here is complete only up to `needle`.
+/// A count over it needs an ordered anchor — a line the child writes AFTER everything
+/// being counted — or [`PipeTap::finish_text`] once such an anchor has been seen.
+#[track_caller]
+#[allow(dead_code)]
+pub fn wait_for_tap(tap: &PipeTap, needle: &str, timeout: Duration) -> String {
+    match poll_tap_until(tap, timeout, |text| text.contains(needle)) {
+        Ok(text) => text,
+        Err(seen) => panic!(
+            "wait_for_tap at {}: {needle:?} did not appear within {timeout:?}; \
+             the tap held:\n{seen}",
+            Location::caller()
+        ),
+    }
+}
+
+/// Wait until `tap` holds at least `n` occurrences of `needle`, and return everything
+/// it holds at that moment.
+///
+/// PANICS on timeout, naming the caller's `file:line:column` and the count it saw.
+///
+/// Why a count and not "contains": a stderr line the watcher emits AFTER the output
+/// write has no ordering relationship with the output file the test waited on.
+/// Dir-mode emits the duplicate-vars-key warning after the write (watch.rs
+/// `handle_fs_event_dir`), so a snapshot taken the instant `wait_for_file_contains`
+/// returns can legitimately be one warning short — or, if the previous rebuild's
+/// warning has not been sampled yet, one long. Waiting for the expected count first
+/// turns the assertion that follows into a genuine over-count check instead of a race.
+#[track_caller]
+#[allow(dead_code)]
+pub fn wait_for_tap_count(tap: &PipeTap, needle: &str, n: usize, timeout: Duration) -> String {
+    match poll_tap_until(tap, timeout, |text| count_occurrences(text, needle) >= n) {
+        Ok(text) => text,
+        Err(seen) => panic!(
+            "wait_for_tap_count at {}: expected at least {n} occurrences of {needle:?} \
+             within {timeout:?}; saw {}; the tap held:\n{seen}",
+            Location::caller(),
+            count_occurrences(&seen, needle)
+        ),
+    }
+}
+
+/// A source whose compile always fails with one `mds::undefined_var` diagnostic
+/// carrying [`ORDER_MARKER_LINE`]. Diagnostics survive `--quiet`.
+///
+/// Writing it to a watched source makes an ORDERED ANCHOR on stderr. The watch loop
+/// handles one event at a time and finishes a rebuild — its `Recompiled` line, its
+/// post-write warnings — before it takes the next event, so once the marker's
+/// diagnostic is on the tap, everything earlier rebuilds wrote is on it too. A count
+/// or an absence taken at that point is exact rather than a sample of a live pipe.
+/// The failed compile writes no output, so the output file keeps what it held.
+#[allow(dead_code)]
+pub const ORDER_MARKER_SOURCE: &str = "Order marker {{__order_marker__}}\n";
+
+/// The line of the diagnostic [`ORDER_MARKER_SOURCE`] produces, once per compile.
+#[allow(dead_code)]
+pub const ORDER_MARKER_LINE: &str = "undefined variable '__order_marker__'";
 
 /// Spawn a `mds watch` command and drain its stderr, WITHOUT waiting for readiness.
 ///
