@@ -212,10 +212,10 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
-    ("build.rs", 30),
+    ("build.rs", 27),
     ("fmt.rs", 11),
     ("main.rs", 11),
-    ("output.rs", 7),
+    ("output.rs", 6),
 ];
 
 /// The function the stderr writer macros expand to (`output.rs`, #157).

@@ -2124,14 +2124,15 @@ fn build_o_write_failure_preserves_existing_output_no_temp_residue() {
     let _ = std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755));
 
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
-        Some(0),
-        "a build into a read-only directory must fail; stderr: {stderr}"
+        Some(2),
+        "a build into a read-only directory is an I/O failure, exit 2 (#157); \
+         stderr: {stderr}"
     );
     assert!(
-        stderr.contains("out.md"),
-        "the error must name the target file; got: {stderr:?}"
+        stderr.contains("mds::io") && stderr.contains("out.md"),
+        "the error must be mds::io and name the target file; got: {stderr:?}"
     );
     assert_eq!(
         std::fs::read_to_string(&out).unwrap(),
@@ -2414,12 +2415,12 @@ mod entry_overwrite {
         }
 
         // A symlink AT the output path is the directory entry a write would replace, not
-        // the entry it points to: the write's own symlink refusal answers it (exit 1),
-        // and the entry is untouched either way.
+        // the entry it points to: the write's own symlink refusal answers it (`mds::io`,
+        // exit 2), and the entry is untouched either way.
         if make_symlink(&root.join("page.md"), &root.join("page_link.md")) {
             let before = snapshot(root);
             let (code, _, stderr) = run_in(root, &["build", "page.md", "-o", "page_link.md"]);
-            assert_eq!(code, Some(1), "-o page_link.md: stderr: {stderr}");
+            assert_eq!(code, Some(2), "-o page_link.md: stderr: {stderr}");
             assert!(
                 stderr.contains("refusing to replace a symlink")
                     && !stderr.contains("overwrite the entry"),

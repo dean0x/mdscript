@@ -942,7 +942,8 @@ breaking change.
 "Exit" is the CLI exit class (§7.9) for `mds build`, `mds check`, `mds fmt` and
 `mds watch` startup — 1 template or content error, 2 I/O or file-system error,
 3 resource limit — followed by the `mds lint` code, which reports analysis failures
-as 2 except for the two carve-outs shown.
+as 2 except for the two carve-outs shown. The CLI's own stream and I/O failures are
+described below the table.
 
 | Code | Meaning | Raised by | Exit | Surfaces |
 |---|---|---|---|---|
@@ -958,8 +959,8 @@ as 2 except for the two carve-outs shown.
 | `mds::import` | An `@import` the resolver refuses: not `./`/`../`-relative, empty, NUL byte, a forbidden path character, symlinked final component, escapes the project root, or another import-directive violation (§4.6 "Filesystem constraints"); on `@mdscript/mds`'s WASM backend also, on POSIX, an import whose own path names a symlinked directory and leaves it through `..` (`./link/../x.mds`), which its by-name virtual filesystem would resolve to a different file than the native backend reads (Windows applies `..` lexically before it follows a link, so there both backends read the same file) | resolver, `NativeFs`, `VirtualFs`, `@mdscript/mds` WASM-backend pre-scanner | 1 / 2 | all |
 | `mds::name_collision` | A merge import or definition redefines a name already in scope | resolver | 1 / 2 | all |
 | `mds::not_mds` | An entry file, or the target of an `@import`, `@export … from`, frontmatter import or `@extends`, is not an MDS file (neither a `.mds` file nor a `.md` file whose frontmatter declares `type: mds`). The message names the path as the caller typed it — the entry path as passed, or the string as written in the template — escaped, never the resolved absolute path (#417) | resolver; `mds fmt`/`mds lint` file-argument check; `@mdscript/mds`'s WASM-backend pre-scanner, through the resolver's own check (`preflightModule`) | 2 / 2 | all |
-| `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; an entry path or virtual entry key that is empty or contains a NUL byte; an entry path, entry key, base directory or resolved canonical path carrying a forbidden path character (§4.6); a `VirtualFs::with_aliases` alias refused — the alias, or the module key it names, not a normalized module key, the alias a module key itself, or the module key naming no module (`module alias "<alias>": <reason>`, #414); on the CLI also a `--vars` file that is a symlink, a directory argument that is a symlink or the filesystem root (#413), an output path that is the entry file itself (#425), a `-o`/`--out-dir`/`build.output_dir`/`mds init` path carrying a forbidden path character (for `-o`/`--out-dir`/`build.output_dir`, as written or as resolved), a `build.output_dir` containing `..`, a `lint --fix` rewrite refused by the compile-equivalence check, and an `mds watch` file-mode rebuild refused because the entry's path as typed now leads to a different file than the one being watched (a symlinked directory on it retargeted: `watched entry now resolves to a different file: "<path>"; restart mds watch to follow it`, #417), or a directory-mode rebuild refused because the directory argument, or a source below it, as typed now leads to a different directory or file than the one being watched (`watched directory now resolves to a different directory: "<dir>"; restart mds watch to follow it`, `watched file now resolves to a different file: "<dir>/<path below it>"; restart mds watch to follow it`; §7.2, #413) | `mds-core` API boundary, resolver, `NativeFs`, `VirtualFs`, CLI, `@mdscript/mds` WASM-backend pre-scanner | 2 / 2 | all |
-| `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`); bindings also raise it before compilation for oversized sources, module and alias maps, and their counts (as `VirtualFs::with_aliases` does for an alias map); `@mdscript/mds`'s WASM-backend pre-scanner raises the native error for a path over the segment cap, a file over the size cap and a module over the module count, and one of its own for modules that together pass 10 MiB | evaluator, resolver, `VirtualFs`, bindings, `@mdscript/mds` WASM-backend pre-scanner | 3 / 3 | all |
+| `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; an entry path or virtual entry key that is empty or contains a NUL byte; an entry path, entry key, base directory or resolved canonical path carrying a forbidden path character (§4.6); a `VirtualFs::with_aliases` alias refused — the alias, or the module key it names, not a normalized module key, the alias a module key itself, or the module key naming no module (`module alias "<alias>": <reason>`, #414); on the CLI also a `--vars` file that is a symlink, a directory argument that is a symlink or the filesystem root (#413), an output path that is the entry file itself (#425), a `-o`/`--out-dir`/`build.output_dir`/`mds init` path carrying a forbidden path character (for `-o`/`--out-dir`/`build.output_dir`, as written or as resolved), a `build.output_dir` containing `..`, a `lint --fix` rewrite refused by the compile-equivalence check, the stream and I/O failures listed below the table (#157), and an `mds watch` file-mode rebuild refused because the entry's path as typed now leads to a different file than the one being watched (a symlinked directory on it retargeted: `watched entry now resolves to a different file: "<path>"; restart mds watch to follow it`, #417), or a directory-mode rebuild refused because the directory argument, or a source below it, as typed now leads to a different directory or file than the one being watched (`watched directory now resolves to a different directory: "<dir>"; restart mds watch to follow it`, `watched file now resolves to a different file: "<dir>/<path below it>"; restart mds watch to follow it`; §7.2, #413) | `mds-core` API boundary, resolver, `NativeFs`, `VirtualFs`, CLI, `@mdscript/mds` WASM-backend pre-scanner | 2 / 2 | all |
+| `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`), CLI stdin over 10 MiB included; bindings also raise it before compilation for oversized sources, module and alias maps, and their counts (as `VirtualFs::with_aliases` does for an alias map); `@mdscript/mds`'s WASM-backend pre-scanner raises the native error for a path over the segment cap, a file over the size cap and a module over the module count, and one of its own for modules that together pass 10 MiB | evaluator, resolver, `VirtualFs`, bindings, `@mdscript/mds` WASM-backend pre-scanner | 3 / 3 | all |
 | `mds::yaml` | Frontmatter YAML the parser itself refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1) | resolver | 1 / 2 | all |
 | `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites | `mds-core` vars API | 1 / 2 | Rust, CLI |
 | `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
@@ -978,11 +979,32 @@ as 2 except for the two carve-outs shown.
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
 
 CLI-authored errors that are not `MdsError`s — an unreadable, oversized or malformed
-`mds.json`, `mds init` refusing a `..` path, a failed stdout write — carry no `mds::`
-code; they exit 1 under `build`/`check`/`fmt` and 2 under `lint`. A `build.output_dir`
+`mds.json`, `mds init` refusing a `..` path — carry no `mds::` code; they exit 1 under
+`build`/`check`/`fmt` and 2 under `lint`. A `build.output_dir`
 containing a `..` component or a forbidden path character, and a `-o`/`--out-dir` value
 or `mds init` filename containing a forbidden path character, are `mds::io` (exit 2)
-instead. A panic on the CLI is
+instead.
+
+**Streams and I/O failures on the CLI (#157).** Under `mds build`, `mds check`,
+`mds fmt` and `mds init`, and for clap's own help, version and usage output:
+
+- A closed stdout or stderr — the pipe's reader is gone — never changes the exit code.
+  With stdout closed, the run writes nothing more to stdout and finishes; with stderr
+  closed, it drops its diagnostics and still writes every output.
+- Every other I/O failure is `mds::io` and exits at least 2 (a resource limit keeps its
+  3): an output, `.map` sidecar or starter file that cannot be written, a symlink at
+  the destination refused, an output directory that cannot be created, a stale sibling
+  or sidecar that cannot be removed, a stdout write that fails for any other reason
+  than a closed pipe, and stdin that cannot be read or is not valid UTF-8. In directory
+  mode the other files are still processed and the run exits 2. `mds lint` reports a
+  failed `--fix` rewrite and a stdin read failure as `mds::io` too.
+- Stdin over the 10 MiB cap is `mds::resource_limit`, exit 3, under `build`, `check`,
+  `fmt` and `lint`; exactly 10 MiB is accepted.
+- On Unix the Rust runtime treats EBADF on a standard stream — a descriptor that is
+  not open for the direction used — as success: a write to it is dropped, and a read
+  from it is end of input. Such a stream is therefore not reported as a failure.
+
+A panic on the CLI is
 not converted into an error object: it is a Rust panic with exit code 101. The
 `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
 `MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised
@@ -1041,11 +1063,11 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - Output extension per file is intrinsic (`.md` or `.json`).
 - With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source. A source that is not under the build root (not reachable for a walked tree; defence in depth) is written flat as `<out>/<stem>.<ext>` with a warning naming both paths; the warning is not suppressed by `--quiet`.
 - `-o` is rejected for a directory input.
-- Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
+- Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; exit 1 when any file failed, and 2 once an I/O failure was among them — an output or `.map` sidecar that could not be written, or an output directory that could not be created, each reported as `mds::io` and counted as failed (§5 "Streams and I/O failures", #157). Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
 - A file whose path below the directory argument carries a forbidden path character (§4.6) — in its own name or in a subdirectory of the walk — is still collected, and fails on its own (`mds::io`, the name shown escaped) while its siblings are processed; `mds check`, `mds fmt`, `mds lint` and `mds watch` in directory mode do the same, each with its own per-file failure exit code, and `mds watch` keeps running.
 - When the directory contains no `.mds` files at all, exits 1 with `no .mds files found in <dir>; nothing was built` on stderr — emitted even under `--quiet`, like the all-excluded diagnostic — so an empty tree cannot pass a CI gate silently. (Changed in v0.4.3; previously exited 0.) `mds watch <dir>` is unaffected: it starts on an empty tree and compiles files created later.
 - When the directory contains `.mds` files but every one of them is a `_`-prefixed partial, exits 1 with `<n> .mds file(s) found in <dir> but all are _-prefixed partials; nothing was built` on stderr — emitted even under `--quiet`, the same bypass as the two diagnostics above. (Changed in v0.4.3; previously `0 built, 0 failed`, exit 0.) `mds fmt <dir>` and `mds lint <dir>` are unaffected: they format and lint partials, so a partials-only tree is real work for them. `mds watch <dir>` is unaffected: it still starts.
-- **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
+- **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically. A sibling that cannot be removed is an error, not a warning: it is reported as `mds::io` and the run exits 2, though the file itself was built and is not counted as failed (#157).
 - stdin (`mds build -`) with `--out-dir`: the fallback output name is `output.md` (markdown) or `output.json` (messages).
 
 **Options:**
@@ -1061,7 +1083,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--no-source-map` | Disable source-map generation. Overrides `build.source_map = true` in `mds.json`. Conflicts with `--source-map`. |
 | `--inline` | Embed the source map as a data-URI comment in the compiled output instead of a sidecar. Requires `--source-map`. |
 | `--embed-sources` | Embed source file contents in `sourcesContent[]`. Ships full source text — use with care. Requires `--source-map`. |
-| `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (Two warning-severity notices — the directory-depth warning and the stale-sibling-unlink failure warning — are emitted regardless of `--quiet`.) |
+| `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (The directory-depth warning is emitted regardless of `--quiet`. A stale sibling or sidecar that cannot be removed is an error, and `--quiet` never suppresses an error.) |
 
 **Output path resolution** (precedence order, highest first):
 
@@ -1078,7 +1100,7 @@ A route that fails to resolve — route 5 with a `build.output_dir` containing `
 
 Whichever route resolves it, an output that is the entry file itself is refused before anything is written or any directory created — `mds::io`, exit 2, `output would overwrite the entry file: "<entry>"; write it elsewhere with -o <file> or --out-dir <dir>`, the entry named as typed (#425) — and without the `-o` extension-mismatch warning, which announces a write. The two paths are compared as the files they name, canonical with canonical, so another spelling of the entry — through `..`, a case variant on a case-insensitive volume, or a symlinked directory leading back to it — is the entry too. An output whose directory does not exist yet is resolved as the write will create it: a created directory is a plain one, so `-o newdir/../page.md` is `page.md`, and a symlink after the `..` is followed; a symlink at the output path itself is refused by the write (below), and a hard link to the entry is another name the write replaces by rename, so it is written and the entry keeps its content. Route 6 reaches the entry for a `.md` entry that declares `type: mds` and compiles to Markdown, as do routes 4 and 5 naming the entry's directory; route 2 can name any entry. `mds watch` in file mode refuses the same output at startup (exit 2) and, on a rebuild, reports the refusal and keeps watching. Directory mode compiles only `.mds` files, whose outputs are `.md` or `.json`, so no output there is its own entry.
 
-**Output writing.** Compiled outputs and `.map` sidecars written by `mds build` and `mds watch`, `.mds` sources rewritten by `mds fmt` and `mds lint --fix`, and the starter file written by `mds init`, are written to a temporary file in the target's directory and then renamed over the target, after a final symlink re-check of the target: a crash, kill or full disk never leaves a truncated file behind, and a destination path that is a symlink is refused. Because the output is created as a sibling temporary file and renamed into place, the destination must be a regular-file path inside a writable directory: device files such as `/dev/null` and FIFOs are not supported as `-o` targets (write to stdout instead). Source rewrites (`fmt`, `lint --fix`) are additionally fsynced before the rename; compiled outputs and sidecars rely on the rename alone — they are regenerable, and an unconditional fsync made directory-mode startup several times slower on macOS. Because the rename gives the target a new inode, a pre-existing target's hard links (other links keep the old content), ACLs, extended attributes, and owner/group are not preserved; permission bits are preserved on Unix. This is enforced for the CLI's write sites by `crates/mds-cli/tests/write_funnel.rs`.
+**Output writing.** Compiled outputs and `.map` sidecars written by `mds build` and `mds watch`, `.mds` sources rewritten by `mds fmt` and `mds lint --fix`, and the starter file written by `mds init`, are written to a temporary file in the target's directory and then renamed over the target, after a final symlink re-check of the target: a crash, kill or full disk never leaves a truncated file behind, and a destination path that is a symlink is refused. Because the output is created as a sibling temporary file and renamed into place, the destination must be a regular-file path inside a writable directory: device files such as `/dev/null` and FIFOs are not supported as `-o` targets (write to stdout instead). Source rewrites (`fmt`, `lint --fix`) are additionally fsynced before the rename; compiled outputs and sidecars rely on the rename alone — they are regenerable, and an unconditional fsync made directory-mode startup several times slower on macOS. Because the rename gives the target a new inode, a pre-existing target's hard links (other links keep the old content), ACLs, extended attributes, and owner/group are not preserved; permission bits are preserved on Unix. This is enforced for the CLI's write sites by `crates/mds-cli/tests/write_funnel.rs`. A write that fails, a symlink refused at the destination, an output directory that cannot be created, and a stale `.map` sidecar that cannot be removed are `mds::io`, exit 2 (#157). Output to stdout (`-o -`, or stdin input with no `-o`) is written and flushed at once: a reader that has gone away (a closed pipe) ends it without an error and the exit code stands; any other stdout failure is `mds::io`, exit 2.
 
 ### 7.3 `mds check`
 
@@ -1105,6 +1127,8 @@ mds fmt template.mds --diff               # Print unified diff without writing
 Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside frontmatter and code fences), strips trailing whitespace on directive lines, and ensures exactly one trailing newline. An empty or whitespace-only source formats to 0 bytes (an empty output file). Interior blank lines and blank-line structure within frontmatter and code fences are left verbatim (blank-line collapsing was removed in v0.4.0 to preserve the interior-verbatim whitespace contract). Body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of `@message`/`@define` bodies are left untouched.
 
 Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template. The base directory the gate compiles against (the file's directory; the working directory for stdin) is resolved first, as `mds check` resolves it: one that is refused (§4.6) or cannot be resolved fails `mds fmt` with that error (`mds::io`, exit 2).
+
+A rewrite that fails is `mds::io`, exit 2; in directory mode the other files are still formatted, the file counts as failed, and the run exits 2. `--diff` output and stdin filter-mode output follow §5 "Streams and I/O failures": into a closed pipe they end without an error and the exit code stands (`--check` still exits 1 when a file would change), and any other stdout failure is `mds::io`, exit 2 (#157).
 
 | Option | Description |
 |--------|-------------|
@@ -1459,7 +1483,7 @@ mds init my-prompt.mds                     # Creates my-prompt.mds
 mds init my-prompt.mds --force             # Overwrite if file already exists
 ```
 
-Creates a compilable starter template. Path traversal (e.g. `../escaped.mds`) is rejected. A filename carrying a forbidden path character (§4.6) is refused before anything is written (`mds::io`, exit 2). The file is written through the replace-by-rename primitive of §7.2 "Output writing": a symlink at the target — live or dangling — is refused (exit 1, `cannot write <path>: refusing to replace a symlink`) rather than written through; `--force` replaces a regular file atomically, preserving its permission bits.
+Creates a compilable starter template. Path traversal (e.g. `../escaped.mds`) is rejected. A filename carrying a forbidden path character (§4.6) is refused before anything is written (`mds::io`, exit 2). The file is written through the replace-by-rename primitive of §7.2 "Output writing": a symlink at the target — live or dangling — is refused (`mds::io`, exit 2, `cannot write <path>: refusing to replace a symlink`) rather than written through, and a write that fails is `mds::io`, exit 2 (#157); `--force` replaces a regular file atomically, preserving its permission bits.
 
 ### 7.7 Auto-Detection
 
@@ -1504,9 +1528,11 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials), and a run in which any file failed, whatever that file's error (§7.2 continue-on-error) |
-| `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8, a path carrying a forbidden path character — §4.6); also an output location (`-o`, `--out-dir`, `build.output_dir`) or `mds init` filename carrying one, a `build.output_dir` containing `..`, a directory argument that is a symlink or the filesystem root (§7.2), and an output that is the entry file itself (§7.2) |
-| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, or frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels) |
+| `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials), and a run in which any file failed with an error other than an I/O failure (§7.2 continue-on-error) |
+| `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8, a path carrying a forbidden path character — §4.6); also an output location (`-o`, `--out-dir`, `build.output_dir`) or `mds init` filename carrying one, a `build.output_dir` containing `..`, a directory argument that is a symlink or the filesystem root (§7.2), and an output that is the entry file itself (§7.2). Every CLI I/O failure is `mds::io`, exit 2, in directory mode too, where the other files are still processed: an output, `.map` sidecar or starter file that cannot be written (a symlink at the destination included), an output directory that cannot be created, a stale sibling or sidecar that cannot be removed, a stdout write that fails other than by a closed pipe, and stdin that cannot be read or is not valid UTF-8 (§5 "Streams and I/O failures", #157). (Changed in v0.5.0: these exited 1, and a stale sibling or sidecar that could not be removed only warned.) |
+| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels, or stdin over 10 MiB — changed in v0.5.0; previously exit 1) |
+
+A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").
 
 **`mds lint`** (see §7.5 for per-code meaning):
 
@@ -1514,8 +1540,8 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 |------|---------|
 | `0` | Clean — no warning- or error-severity findings |
 | `1` | Warning-severity findings only (no errors) |
-| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8) |
-| `3` | Resource limit exceeded |
+| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8); also a `--fix` rewrite that fails and stdin that cannot be read or is not valid UTF-8, each `mds::io` (#157) |
+| `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2) |
 
 The code-by-code classification behind these tables is the "Error Codes" registry in §5.
 

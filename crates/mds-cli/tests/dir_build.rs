@@ -1508,22 +1508,19 @@ fn dir_build_write_failure_preserves_existing_outputs() {
     let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o755));
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
-        Some(0),
-        "a dir build into a read-only output dir must fail; stderr: {stderr}"
+        Some(2),
+        "a dir build into a read-only output dir is an I/O failure, exit 2 (#157); \
+         stderr: {stderr}"
     );
     assert!(
-        stderr.contains("0 built"),
-        "the summary must report nothing built; got: {stderr}"
+        stderr.contains("0 built, 2 failed"),
+        "the summary must report both failures; got: {stderr}"
     );
     assert!(
-        stderr.contains("failed"),
-        "the summary must report the failures; got: {stderr}"
-    );
-    assert!(
-        stderr.contains("error:"),
-        "each failure must be reported on stderr; got: {stderr}"
+        stderr.matches("mds::io").count() == 2,
+        "each failure must be reported as mds::io on stderr; got: {stderr}"
     );
     assert!(
         stderr.contains("a.md"),
@@ -1569,10 +1566,10 @@ fn dir_build_source_map_sidecar_symlink_target_rejected() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
-        Some(0),
-        "a symlinked sidecar must fail the dir build; stderr: {stderr}"
+        Some(2),
+        "a symlinked sidecar is a failed write, exit 2 (#157); stderr: {stderr}"
     );
     assert!(
         out.join("page.md").is_file(),
@@ -1590,6 +1587,129 @@ fn dir_build_source_map_sidecar_symlink_target_rejected() {
         fs::read_to_string(&real).unwrap(),
         "OLD",
         "the symlink target must not be written through"
+    );
+}
+
+// ── #157: an I/O failure lifts a directory build's exit to 2 ─────────────────
+
+/// A directory build with one template error exits 1; add one output directory that
+/// cannot be created and it exits 2 — an I/O failure, `mds::io` — while the files that
+/// can be built are still built (#157).
+///
+/// `#[cfg(unix)]`: the mkdir failure comes from a `0o555`-mode out-dir, which Windows'
+/// read-only attribute does not reproduce.
+#[cfg(unix)]
+#[test]
+fn dir_build_with_a_template_error_and_a_failed_mkdir_exits_2() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let src = tempfile::tempdir().unwrap();
+    create_bad_mds(src.path(), "a.mds");
+    create_plain_mds(src.path(), "c.mds");
+    fs::create_dir_all(src.path().join("sub/deep")).unwrap();
+    create_plain_mds(&src.path().join("sub/deep"), "b.mds");
+
+    // Control: the template error alone exits 1, and the other two are built.
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    let control = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: a template error alone must exit 1; stderr: {control_stderr}"
+    );
+    assert!(
+        out.join("sub/deep/b.md").is_file() && out.join("c.md").is_file(),
+        "control: the files that compile must be built; stderr: {control_stderr}"
+    );
+
+    // `out/sub` exists but nothing can be created in it, so `out/sub/deep` cannot be
+    // made; `out` itself stays writable, so `c.md` is still built.
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    let blocked = out.join("sub");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::create_dir(blocked.join("probe")).is_ok() {
+        let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+        eprintln!("skipped: a directory can be created at mode 0o555 (running as root?)");
+        return;
+    }
+    let output = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a template error plus a failed mkdir must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("cannot create output directory"),
+        "the mkdir failure must be reported as mds::io; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 built, 2 failed"),
+        "the summary must count the template error and the mkdir failure; stderr: {stderr}"
+    );
+    assert!(
+        out.join("c.md").is_file(),
+        "the file whose directory exists must still be built"
+    );
+}
+
+/// A stale sibling that cannot be removed is an error, not a warning: the run exits 2
+/// (`mds::io`) though every output was written (#157).
+///
+/// The stale `x.md` left by a Markdown build is replaced here by a non-empty directory
+/// of that name, which no `remove_file` can remove — on every OS, as any user.
+#[test]
+fn dir_build_stale_sibling_that_cannot_be_removed_exits_2() {
+    let src = tempfile::tempdir().unwrap();
+    create_messages_mds(src.path(), "x.mds");
+
+    // Control: a stale regular `x.md` is removed, exit 0.
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("x.md"), "stale").unwrap();
+    let control = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "control: a removable stale sibling must not fail the build; stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(
+        !out.join("x.md").exists() && out.join("x.json").is_file(),
+        "control: the stale x.md is removed and x.json written"
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    fs::create_dir_all(out.join("x.md")).unwrap();
+    fs::write(out.join("x.md").join("keep"), "keep").unwrap();
+    let output = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a stale sibling that cannot be removed must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("could not remove stale output"),
+        "the failed removal must be reported as mds::io; stderr: {stderr}"
+    );
+    assert!(
+        out.join("x.json").is_file(),
+        "the output itself must still be written"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("x.md").join("keep")).unwrap(),
+        "keep",
+        "nothing under the stale path may be touched"
     );
 }
 

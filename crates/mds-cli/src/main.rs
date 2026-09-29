@@ -237,7 +237,10 @@ enum Commands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => exit_after_clap_output(&err),
+    };
 
     let verdict = match run(cli) {
         Ok(()) => 0,
@@ -252,6 +255,28 @@ fn main() {
         }
     };
     output::exit(verdict)
+}
+
+/// Print clap's help, version or usage error and end the run with clap's exit code — 0
+/// for help and version, 2 for a usage error — under the rule every other output
+/// follows (#157): a closed pipe changes nothing; any other failed write exits at least
+/// 2, a failed stdout write reported on stderr as `mds::io`.
+fn exit_after_clap_output(err: &clap::Error) -> ! {
+    let printed = err
+        .print()
+        .and_then(|()| std::io::Write::flush(&mut std::io::stdout()));
+    match printed {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            if err.use_stderr() {
+                // stderr itself failed, so there is nowhere to report it.
+                output::note_io_failure();
+            } else {
+                output::eprint_io_failure(output::stdout_failure(&e));
+            }
+        }
+        Ok(()) | Err(_) => {}
+    }
+    output::exit(err.exit_code())
 }
 
 fn run_check(

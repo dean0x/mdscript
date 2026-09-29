@@ -134,9 +134,17 @@ Exit codes:
   0   Success (or clean Ctrl+C in watch mode; or a clean `fmt --check` / `fmt --diff` preview)
   1   Template error (syntax, undefined variable, arity mismatch), or `fmt --check` found a
       file that would change
-  2   I/O error (file not found, not an MDS file), or invalid CLI argument (clap parse error)
-  3   Resource limit exceeded
+  2   I/O error (file not found, not an MDS file, an output that cannot be written, an
+      output directory that cannot be created, a stale output that cannot be removed,
+      stdin that cannot be read or is not UTF-8), or invalid CLI argument (clap parse error)
+  3   Resource limit exceeded (stdin over 10 MiB included)
 ```
+
+A closed pipe never changes the exit code of `mds build`, `mds check`, `mds fmt` or `mds init`:
+`mds build page.mds -o - | head -n 1` exits 0 once `head` has read its line, and a closed stderr
+leaves every output written. Any other I/O failure is an `mds::io` error and exits at least 2,
+also in directory mode, where the other files are still processed. `mds lint` exits 2 for an I/O
+failure as before, now with the `mds::io` code on a failed `--fix` rewrite.
 
 **Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary (`N built, N failed`; `N passed, N failed` for `check`) is printed on a successful run or when any file fails; the exit code is non-zero if any file fails. Under `--quiet`, the summary is suppressed on a fully-successful run but is always emitted when any file fails, so the non-zero exit is never unexplained. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) also exits non-zero (`1`) with `no .mds files found in <dir>; nothing was built` (`…checked` for `check`), likewise even under `--quiet` — an empty tree is treated as a misconfiguration, not a success. (Changed in v0.4.3; previously exited 0.) A directory whose `.mds` files are all `_`-prefixed partials is treated the same way — `build`/`check` exit `1` with `<n> .mds file(s) found in <dir> but all are _-prefixed partials; nothing was built` (`…checked`), even under `--quiet`, while `mds fmt` and `mds lint` are unaffected since they format and lint partials. (Changed in v0.4.3; previously `0 built, 0 failed`, exit 0.) `mds watch <dir>` is the exception: it starts on an empty tree and compiles files created later. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
 

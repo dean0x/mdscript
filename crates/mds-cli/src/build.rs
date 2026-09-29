@@ -755,7 +755,7 @@ pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
 /// anchors `None` at the working directory itself, and a refusal of it (a forbidden
 /// path character, #265) then names it `"."` — the caller typed no path, so no
 /// message shows the absolute one.
-pub(crate) fn read_stdin() -> Result<String> {
+pub(crate) fn read_stdin() -> Result<String, MdsError> {
     read_stdin_from(&mut std::io::stdin().lock())
 }
 
@@ -764,14 +764,23 @@ pub(crate) fn read_stdin() -> Result<String> {
 /// mds-core reads a module file. More than the cap is refused before the bytes are
 /// checked as UTF-8; bytes that are not UTF-8 keep the message `read_to_string` gave
 /// them.
-fn read_stdin_from(reader: &mut impl Read) -> Result<String> {
-    let bytes = mds::read_at_most(reader, MAX_FILE_SIZE + 1, 0)
-        .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
+///
+/// # Errors
+///
+/// More than the cap is `mds::resource_limit` (exit 3), as a file over the same cap is;
+/// a read that fails and bytes that are not UTF-8 are `mds::io` (exit 2) (#157).
+fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
+    let bytes = mds::read_at_most(reader, MAX_FILE_SIZE + 1, 0).map_err(|e| MdsError::Io {
+        message: format!("cannot read stdin: {}", crate::output::safe_inline(&e)),
+    })?;
     if bytes.len() as u64 > MAX_FILE_SIZE {
-        return Err(miette::miette!("stdin input exceeds maximum size of 10 MB"));
+        return Err(MdsError::ResourceLimit {
+            message: "stdin input exceeds maximum size of 10 MB".to_owned(),
+        });
     }
-    String::from_utf8(bytes)
-        .map_err(|_| miette::miette!("cannot read stdin: stream did not contain valid UTF-8"))
+    String::from_utf8(bytes).map_err(|_| MdsError::Io {
+        message: "cannot read stdin: stream did not contain valid UTF-8".to_owned(),
+    })
 }
 
 /// Write compiled output to a file or stdout.
@@ -808,12 +817,7 @@ pub(crate) fn write_output(
         Some(path) => {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        miette::miette!(
-                            "cannot create output directory {}: {e}",
-                            crate::output::safe_path(parent)
-                        )
-                    })?;
+                    std::fs::create_dir_all(parent).map_err(|e| output_dir_failure(parent, &e))?;
                 }
             }
             // #227: temp-file + fsync + rename, so a failed or interrupted build leaves
@@ -828,6 +832,17 @@ pub(crate) fn write_output(
         None => crate::output::write_stdout(compiled.as_bytes()).into_batch_result()?,
     }
     Ok(())
+}
+
+/// The `mds::io` error for an output directory that cannot be created (#157).
+fn output_dir_failure(dir: &Path, e: &std::io::Error) -> MdsError {
+    MdsError::Io {
+        message: format!(
+            "cannot create output directory {}: {}",
+            crate::output::safe_path(dir),
+            crate::output::safe_inline(e)
+        ),
+    }
 }
 
 /// Scan the current directory for `.mds` files.
@@ -1350,9 +1365,17 @@ pub(crate) fn apply_source_map_file_label(
 /// in place with a warning (unless `quiet`): one that is not a regular file is never
 /// opened — opening a FIFO with no writer blocks — and a regular file is recognised by
 /// its first bytes alone ([`has_sidecar_head`]), so none is read whole (#428).
-pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, quiet: bool) {
+///
+/// # Errors
+///
+/// A sidecar that cannot be removed is `mds::io` (exit 2, #157).
+pub(crate) fn verify_then_delete_map(
+    map_path: &Path,
+    expected_basename: &str,
+    quiet: bool,
+) -> Result<(), MdsError> {
     let Ok(metadata) = std::fs::metadata(map_path) else {
-        return;
+        return Ok(());
     };
     let sidecar = metadata.is_file()
         && std::fs::File::open(map_path)
@@ -1364,19 +1387,19 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
                 crate::output::safe_path(map_path)
             );
         }
-        return;
+        return Ok(());
     }
-    if let Err(e) = std::fs::remove_file(map_path) {
-        if !quiet {
-            crate::output::ewriteln!(
-                "warning: could not remove stale map {}: {}",
-                crate::output::safe_path(map_path),
-                crate::output::safe_inline(&e)
-            );
-        }
-    } else if !quiet {
+    std::fs::remove_file(map_path).map_err(|e| MdsError::Io {
+        message: format!(
+            "could not remove stale map {}: {}",
+            crate::output::safe_path(map_path),
+            crate::output::safe_inline(&e)
+        ),
+    })?;
+    if !quiet {
         crate::output::ewriteln!("Removed stale map {}", crate::output::safe_path(map_path));
     }
+    Ok(())
 }
 
 /// Whether `reader` starts with the bytes every sidecar mds writes for the output named
@@ -1691,7 +1714,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                verify_then_delete_map(&map_path, &basename, quiet);
+                verify_then_delete_map(&map_path, &basename, quiet)?;
             }
         } else {
             // Sidecar: write output byte-identical to no-flag build (ADR-002).
@@ -1757,7 +1780,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                verify_then_delete_map(&map_path, &basename, quiet);
+                verify_then_delete_map(&map_path, &basename, quiet)?;
             }
         }
     }
@@ -1791,14 +1814,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// so a partials-only tree is real work for them, not "nothing to do".
 /// `mds watch <dir>` deliberately does NOT error on any of the three.
 ///
-/// **Documented limitation (AC-Q05):** two warning writers reachable from this
-/// function do not accept a `quiet` parameter — `output.rs::collect_mds_files_inner`
-/// (depth-limit warning, fires on trees deeper than MAX_DEPTH=64) and
-/// `output.rs::probe_and_remove_stale` (stale-unlink failure warning).  Both emit
-/// to stderr regardless of `--quiet`.  The normative documentation (spec.md §7.2
-/// and README) uses the form "no output on a successful build" rather than "no output
-/// under any condition" (PF-015); the global `--quiet` flag description at `main.rs:30`
-/// uses a briefer phrasing that does not enumerate this limitation explicitly.
+/// **I/O failures (#157):** an output directory that cannot be created, an output or
+/// `.map` sidecar that cannot be written, and a stale sibling that cannot be removed are
+/// each reported as one `mds::io` error through [`crate::output::eprint_io_failure`],
+/// which records it for the exit code, so the run exits at least 2 while the other files
+/// are still built. The first three count their file as failed; a stale sibling does
+/// not, since its file was built. A template error alone still exits 1.
 ///
 /// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
 /// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
@@ -1933,11 +1954,7 @@ fn run_build_directory(
                 if let Some(parent) = out_path.parent() {
                     if !parent.as_os_str().is_empty() {
                         if let Err(e) = std::fs::create_dir_all(parent) {
-                            crate::output::ewriteln!(
-                                "error: cannot create output directory {}: {}",
-                                crate::output::safe_path(parent),
-                                crate::output::safe_inline(&e)
-                            );
+                            crate::output::eprint_io_failure(output_dir_failure(parent, &e));
                             fail_count += 1;
                             continue;
                         }
@@ -1997,10 +2014,7 @@ fn run_build_directory(
                                 ) {
                                     // The primitive's message already names the path —
                                     // re-prefixing it would print the path twice (#227).
-                                    crate::output::ewriteln!(
-                                        "error: {}",
-                                        crate::output::safe_inline(&e)
-                                    );
+                                    crate::output::eprint_io_failure(e);
                                     fail_count += 1;
                                     continue;
                                 }
@@ -2031,13 +2045,17 @@ fn run_build_directory(
                         let safe_to_delete = matches!(output_base, OutputBase::Dir(_))
                             || written_this_run.contains(&stale_path);
                         if safe_to_delete {
-                            probe_and_remove_stale(&base_no_ext, compiled.kind);
+                            // The output itself was built, so the file is not counted as
+                            // failed; the failed removal still lifts the exit code (#157).
+                            if let Err(e) = probe_and_remove_stale(&base_no_ext, compiled.kind) {
+                                crate::output::eprint_io_failure(e);
+                            }
                         }
                         ok_count += 1;
                     }
                     Err(e) => {
                         // The primitive's message already names the path (#227).
-                        crate::output::ewriteln!("error: {}", crate::output::safe_inline(&e));
+                        crate::output::eprint_io_failure(e);
                         fail_count += 1;
                     }
                 }
@@ -2054,7 +2072,8 @@ fn run_build_directory(
     // AD-216-1: mirror the gate used by `mds check` (main.rs) and `mds fmt` (fmt.rs):
     // suppress the summary under --quiet when every file succeeded, so a quiet CI job
     // produces no output on a clean run.  AD-216-2: exit codes are untouched — a
-    // --quiet build with failures still exits 1 with the summary explaining why.
+    // --quiet build with failures still exits non-zero with the summary explaining why
+    // (1, or 2 once an I/O failure was recorded — the exit funnel applies it, #157).
     // R5: the empty clause appears ONLY when empty_count > 0 — the historical
     // `{ok} built, {fail} failed` form is byte-identical otherwise (no golden
     // churn).  The suppression gate itself is unchanged (AD-216-1): empty
@@ -2867,8 +2886,9 @@ mod tests {
     /// #428: stdin is read into a buffer that never holds more than the per-file cap
     /// plus one byte — a buffer only grows, so its final capacity is the most it ever
     /// held — and never past that byte: exactly the cap is accepted, one byte more is
-    /// refused, and an endless stream is read to one byte past the cap. Bytes that are
-    /// not UTF-8 keep their message.
+    /// refused, and an endless stream is read to one byte past the cap. #157: more than
+    /// the cap is `mds::resource_limit` (exit 3); bytes that are not UTF-8 and a read
+    /// that fails are `mds::io` (exit 2).
     #[test]
     fn read_stdin_holds_at_most_the_cap_plus_one_byte() {
         let at_cap = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE)).unwrap();
@@ -2883,23 +2903,44 @@ mod tests {
             at_cap.capacity()
         );
 
-        let over = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE + 1)).unwrap_err();
+        let over_cap = "resource limit exceeded: stdin input exceeds maximum size of 10 MB";
+        let over: miette::Report = read_stdin_from(&mut Stream::sized(MAX_FILE_SIZE + 1))
+            .unwrap_err()
+            .into();
         assert_eq!(
-            over.to_string(),
-            "stdin input exceeds maximum size of 10 MB"
+            (exit_code(&over), over.to_string()),
+            (3, over_cap.to_owned())
         );
 
         let mut endless = Stream::endless();
-        let err = read_stdin_from(&mut endless).unwrap_err();
-        assert_eq!(err.to_string(), "stdin input exceeds maximum size of 10 MB");
+        let err: miette::Report = read_stdin_from(&mut endless).unwrap_err().into();
+        assert_eq!((exit_code(&err), err.to_string()), (3, over_cap.to_owned()));
         assert_eq!(endless.served, MAX_FILE_SIZE + 1, "read no further");
 
-        let err = read_stdin_from(&mut &b"ok \xff"[..]).unwrap_err();
+        let err: miette::Report = read_stdin_from(&mut &b"ok \xff"[..]).unwrap_err().into();
         assert_eq!(
-            err.to_string(),
-            "cannot read stdin: stream did not contain valid UTF-8"
+            (exit_code(&err), err.to_string()),
+            (
+                2,
+                "cannot read stdin: stream did not contain valid UTF-8".to_owned()
+            )
+        );
+
+        let err: miette::Report = read_stdin_from(&mut Unreadable).unwrap_err().into();
+        assert_eq!(
+            (exit_code(&err), err.to_string()),
+            (2, "cannot read stdin: stream broke".to_owned())
         );
         assert_eq!(read_stdin_from(&mut &b"Hello!\n"[..]).unwrap(), "Hello!\n");
+    }
+
+    /// A reader whose every read fails.
+    struct Unreadable;
+
+    impl Read for Unreadable {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stream broke"))
+        }
     }
 
     /// #428: the stale-map check reads only the bytes a sidecar mds wrote starts with —
@@ -2954,5 +2995,46 @@ mod tests {
             ));
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// #157: a stale sidecar that cannot be removed is an `mds::io` error, not a
+    /// warning; the control removes the same sidecar from a writable directory.
+    ///
+    /// `#[cfg(unix)]`: the unlink failure comes from a `0o555`-mode directory, which
+    /// Windows' read-only attribute does not reproduce.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_map_that_cannot_be_removed_is_an_io_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("out.md.map");
+        let sidecar = "{\"version\":3,\"file\":\"out.md\",\"sources\":[],\"mappings\":\"\"}";
+
+        // Control: a writable directory, and the sidecar is removed.
+        std::fs::write(&map, sidecar).unwrap();
+        assert!(verify_then_delete_map(&map, "out.md", true).is_ok());
+        assert!(!map.exists(), "control: the stale sidecar must be removed");
+
+        std::fs::write(&map, sidecar).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = std::fs::write(dir.path().join("probe"), b"");
+        let result = verify_then_delete_map(&map, "out.md", true);
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
+        if probe.is_ok() {
+            eprintln!("skipped: a file can be created at mode 0o555 (running as root?)");
+            return;
+        }
+        match result {
+            Err(MdsError::Io { message }) => assert!(
+                message.starts_with("could not remove stale map "),
+                "unexpected message: {message}"
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+        assert!(
+            map.exists(),
+            "the sidecar that could not be removed is still there"
+        );
     }
 }

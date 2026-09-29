@@ -2135,7 +2135,11 @@ fn compile_one_source(
                         // return value tells us whether this tool wrote the stale path.
                         let tool_wrote_stale = state.last_written.remove(&stale_path).is_some();
                         if tool_wrote_stale {
-                            probe_and_remove_stale(&base_no_ext, compiled.kind);
+                            // A rebuild's failure never changes how the session exits, so
+                            // this one stays the warning it was (#157).
+                            if let Err(e) = probe_and_remove_stale(&base_no_ext, compiled.kind) {
+                                eprint_warning(&format!("warning: {}", safe_inline(&e)));
+                            }
                         }
 
                         state.record_success(

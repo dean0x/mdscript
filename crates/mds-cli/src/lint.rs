@@ -848,7 +848,16 @@ fn run_lint_stdin(
         format,
     } = flags;
 
-    let source = read_stdin()?;
+    let source = match read_stdin() {
+        Ok(source) => source,
+        Err(e) => {
+            // #157: stdin over the cap is `mds::resource_limit` (exit 3), one that cannot
+            // be read or is not UTF-8 `mds::io` (exit 2) — as for every other command.
+            let code = mds_error_exit_code(&e);
+            eprint_error(e.into());
+            crate::output::exit(code);
+        }
+    };
     // The working directory, as the caller did not type it: `"."` anchors at it and is
     // what a refusal of it shows (see `read_stdin`).
     let cwd = Path::new(".");

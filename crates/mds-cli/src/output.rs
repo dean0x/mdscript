@@ -87,7 +87,8 @@ pub(crate) struct OutputState {
 impl OutputState {
     /// A stderr write hit a closed pipe: the reader is gone.
     const STDERR_CLOSED: u8 = 1 << 0;
-    /// An output write failed for any reason other than a closed pipe.
+    /// An output operation — a write, a flush, a directory creation, a delete — failed
+    /// for any reason other than a closed pipe.
     const IO_FAILED: u8 = 1 << 1;
 
     pub(crate) const fn new() -> Self {
@@ -109,7 +110,7 @@ impl OutputState {
         self.set(Self::STDERR_CLOSED);
     }
 
-    /// Record an output failure that is not a closed pipe.
+    /// Record an output operation that failed for a reason other than a closed pipe.
     pub(crate) fn note_io_failure(&self) {
         self.set(Self::IO_FAILED);
     }
@@ -124,8 +125,27 @@ impl OutputState {
 }
 
 /// The process's own [`OutputState`], used by the process-boundary functions
-/// [`write_stderr_fmt`] and [`exit`].
+/// [`write_stderr_fmt`], [`note_io_failure`] and [`exit`].
 static OUTPUT_STATE: OutputState = OutputState::new();
+
+/// Record, for the exit code, that an output operation of this run failed for a reason
+/// other than a closed pipe: [`exit`] then ends the run with at least 2 (#157).
+///
+/// For a run that reports a failure and carries on — a directory build or `mds fmt
+/// <dir>` counting the file as failed — and so never returns the error to `main`. A run
+/// that returns the `mds::io` error reaches the same exit code through `exit_code`
+/// instead. `mds watch` never calls it: a rebuild's failure is reported as it happens
+/// and does not change how the session exits.
+pub(crate) fn note_io_failure() {
+    OUTPUT_STATE.note_io_failure();
+}
+
+/// Report an I/O failure of a run that carries on past it — a directory build, `mds fmt
+/// <dir>` — as one `mds::io` error, and record it for the exit code (#157).
+pub(crate) fn eprint_io_failure(e: mds::MdsError) {
+    note_io_failure();
+    eprint_error(miette::Report::new(e));
+}
 
 /// The body of `ewrite!` / `ewriteln!`: write `args` to stderr, never panicking.
 ///
@@ -186,10 +206,16 @@ impl StdoutOutcome {
     pub(crate) fn into_batch_result(self) -> std::result::Result<(), mds::MdsError> {
         match self {
             Self::Written | Self::Closed => Ok(()),
-            Self::Failed(e) => Err(mds::MdsError::Io {
-                message: format!("cannot write to stdout: {}", safe_inline(&e)),
-            }),
+            Self::Failed(e) => Err(stdout_failure(&e)),
         }
+    }
+}
+
+/// The `mds::io` error for a stdout write that failed for a reason other than a closed
+/// pipe (#157).
+pub(crate) fn stdout_failure(e: &std::io::Error) -> mds::MdsError {
+    mds::MdsError::Io {
+        message: format!("cannot write to stdout: {}", safe_inline(e)),
     }
 }
 
@@ -901,9 +927,10 @@ pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
 /// Called after writing a compiled output to clean up a stale sibling from a previous
 /// format flip (e.g. a file that used to emit `x.md` but now emits `x.json`).
 ///
-/// If neither sibling exists the function is a no-op. If the wrong-extension file
-/// exists it is deleted; errors are soft-warned (non-fatal: the stale file stays,
-/// which is an annoyance, not a correctness issue).
+/// If neither sibling exists the function is a no-op, and a removal that succeeds is
+/// silent: stale cleanup is a housekeeping detail. A wrong-extension file that exists but
+/// cannot be removed is an `mds::io` error the caller reports (#157); nothing is printed
+/// here.
 ///
 /// `base_path` must be the path WITHOUT extension (e.g. `/out/foo` for a source
 /// `foo.mds`). The function constructs `base_path.with_extension("md")` and
@@ -911,26 +938,24 @@ pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
 ///
 /// AC-FUNC-23 (watch format-flip) and the equivalent dir-build stale-cleanup both
 /// call this function so the probe-and-unlink logic is shared.
-pub(crate) fn probe_and_remove_stale(base_no_ext: &Path, kind: OutputKind) {
+pub(crate) fn probe_and_remove_stale(
+    base_no_ext: &Path,
+    kind: OutputKind,
+) -> std::result::Result<(), mds::MdsError> {
     let stale_ext = kind.stale_extension();
     let stale_path = base_no_ext.with_extension(stale_ext);
-    if stale_path.exists() {
-        match std::fs::remove_file(&stale_path) {
-            Ok(()) => {
-                // non-loud: stale cleanup is a housekeeping detail, not an action the
-                // user normally needs to know about (mirrors watch "Removed …" style).
-            }
-            Err(e) => {
-                // Same shape as the depth-limit warning above: the path is walker-derived
-                // and the `io::Error` Display embeds a path of its own, so both are WIRE.
-                eprint_warning(&format!(
-                    "warning: could not remove stale output {}: {}",
-                    safe_path(&stale_path),
-                    safe_inline(&e)
-                ));
-            }
-        }
+    if !stale_path.exists() {
+        return Ok(());
     }
+    // The path is walker-derived and the `io::Error` Display embeds a path of its own,
+    // so both are WIRE-escaped as the message is built.
+    std::fs::remove_file(&stale_path).map_err(|e| mds::MdsError::Io {
+        message: format!(
+            "could not remove stale output {}: {}",
+            safe_path(&stale_path),
+            safe_inline(&e)
+        ),
+    })
 }
 
 /// Where a `Dir(_)`-mode source landed.
@@ -1069,7 +1094,15 @@ pub(crate) enum Durability {
 /// would require truncate-in-place and forfeit crash safety); ACL/xattr/
 /// owner-group preservation is not planned — MDS only rewrites its own outputs
 /// and `.mds` sources.
-pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durability) -> Result<()> {
+///
+/// # Errors
+///
+/// Every failure is `mds::io` (exit 2, #157), its message naming the target.
+pub(crate) fn atomic_write_file(
+    path: &Path,
+    content: &str,
+    durability: Durability,
+) -> std::result::Result<(), mds::MdsError> {
     use mds::{effective_parent, NativeFs};
 
     // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
@@ -1080,6 +1113,7 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
     // rewrite, so its own error text must show the conventional form too, not a
     // Windows verbatim prefix. Computed once and reused below.
     let shown = mds::display_native_path(path);
+    let io_error = |message: String| mds::MdsError::Io { message };
 
     // #227: `mds build` targets may not exist yet. Probe with lstat, which never
     // follows a symlink: `Ok` means something is there (a regular file, or a
@@ -1089,19 +1123,19 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
     let existing = match path.symlink_metadata() {
         Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(miette::miette!("cannot stat {}: {e}", shown.display())),
+        Err(e) => return Err(io_error(format!("cannot stat {}: {e}", shown.display()))),
     };
 
     if let Some(m) = &existing {
         if m.file_type().is_symlink() {
-            return Err(miette::miette!(
+            return Err(io_error(format!(
                 "cannot write {}: refusing to replace a symlink",
                 shown.display()
-            ));
+            )));
         }
         // Re-check for symlink right before writing (TOCTOU guard).
         NativeFs::check_symlink(path)
-            .map_err(|e| miette::miette!("cannot write {}: {e}", shown.display()))?;
+            .map_err(|e| io_error(format!("cannot write {}: {e}", shown.display())))?;
     }
 
     // Mode to restore on Unix. The lstat result of a non-symlink IS the file's
@@ -1126,9 +1160,12 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
         use std::os::unix::fs::PermissionsExt as _;
         builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    let mut tmp = builder
-        .tempfile_in(parent)
-        .map_err(|e| miette::miette!("cannot create temp file for {}: {e}", shown.display()))?;
+    let mut tmp = builder.tempfile_in(parent).map_err(|e| {
+        io_error(format!(
+            "cannot create temp file for {}: {e}",
+            shown.display()
+        ))
+    })?;
 
     // Restore original permissions before writing; mask off file-type bits
     // (high bits of st_mode) so only the permission bits reach from_mode.
@@ -1137,15 +1174,15 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode & 0o7777))
             .map_err(|e| {
-                miette::miette!(
+                io_error(format!(
                     "cannot set permissions on temp file for {}: {e}",
                     shown.display()
-                )
+                ))
             })?;
     }
 
     tmp.write_all(content.as_bytes())
-        .map_err(|e| miette::miette!("cannot write {}: {e}", shown.display()))?;
+        .map_err(|e| io_error(format!("cannot write {}: {e}", shown.display())))?;
 
     // sync_all() flushes data + metadata to storage (flush() is a no-op on
     // unbuffered File and provides no crash durability guarantee). Skipped for
@@ -1153,12 +1190,16 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durabili
     if durability == Durability::Fsync {
         tmp.as_file()
             .sync_all()
-            .map_err(|e| miette::miette!("cannot fsync {}: {e}", shown.display()))?;
+            .map_err(|e| io_error(format!("cannot fsync {}: {e}", shown.display())))?;
     }
 
     // persist() atomically renames the temp file to the target path.
-    tmp.persist(path)
-        .map_err(|e| miette::miette!("cannot rename temp file to {}: {e}", shown.display()))?;
+    tmp.persist(path).map_err(|e| {
+        io_error(format!(
+            "cannot rename temp file to {}: {e}",
+            shown.display()
+        ))
+    })?;
 
     Ok(())
 }
@@ -3250,8 +3291,12 @@ mod tests {
         }
 
         let err = atomic_write_file(&link, "NEW", Durability::Fsync)
-            .expect_err("writing through a symlink must be refused")
-            .to_string();
+            .expect_err("writing through a symlink must be refused");
+        assert!(
+            matches!(err, mds::MdsError::Io { .. }),
+            "a refused write is mds::io, exit 2 (#157); got {err:?}"
+        );
+        let err = err.to_string();
         assert!(
             err.contains("symlink"),
             "expected a symlink refusal; got {err}"

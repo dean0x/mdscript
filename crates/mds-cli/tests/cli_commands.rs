@@ -181,12 +181,12 @@ fn init_force_symlink_target_refused_plain_path_created() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(
         refused.status.code(),
-        Some(1),
-        "init --force onto a symlink must exit 1; stderr: {stderr}"
+        Some(2),
+        "init --force onto a symlink is a refused write, exit 2 (#157); stderr: {stderr}"
     );
     assert!(
-        stderr.contains("refusing to replace a symlink"),
-        "the refusal must say why; got: {stderr}"
+        stderr.contains("mds::io") && stderr.contains("refusing to replace a symlink"),
+        "the refusal must be mds::io and say why; got: {stderr}"
     );
     assert_eq!(
         std::fs::read_to_string(&real).unwrap(),
@@ -241,12 +241,12 @@ fn init_dangling_symlink_refused_without_force() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(
         refused.status.code(),
-        Some(1),
-        "init onto a dangling symlink must exit 1; stderr: {stderr}"
+        Some(2),
+        "init onto a dangling symlink is a refused write, exit 2 (#157); stderr: {stderr}"
     );
     assert!(
-        stderr.contains("refusing to replace a symlink"),
-        "the refusal must say why; got: {stderr}"
+        stderr.contains("mds::io") && stderr.contains("refusing to replace a symlink"),
+        "the refusal must be mds::io and say why; got: {stderr}"
     );
     assert_eq!(
         victim.symlink_metadata().unwrap_err().kind(),

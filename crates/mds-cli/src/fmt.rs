@@ -19,7 +19,9 @@
 //! - 1: `--check` found something that would change (after printing the
 //!   summary), OR a format/parse error (`MdsError` non-io, including
 //!   `FormatterInvariant`) via `Err` -> `exit_code`
-//! - 2: file not found / not `.mds` / I/O / bad UTF-8
+//! - 2: file not found / not `.mds` / I/O / bad UTF-8 — a rewrite or a stdout write
+//!   that fails included, in directory mode too (#157); a closed stdout is not a
+//!   failure
 //! - 3: oversized source
 
 use std::path::{Path, PathBuf};
@@ -212,10 +214,11 @@ enum FileOutcome {
 /// All per-file error and status lines are printed as side effects so the
 /// directory loop only needs to tally the returned [`FileOutcome`].
 ///
-/// A diff-output failure other than a closed stdout is returned as
-/// [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
-/// read and format errors are treated in the surrounding loop. A closed stdout is not a
-/// failure: the diff has no reader, and the file's outcome stands (#157).
+/// A diff-output failure other than a closed stdout, and a rewrite that fails, are
+/// returned as [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
+/// read and format errors are treated in the surrounding loop — and recorded as I/O
+/// failures, so the run exits at least 2. A closed stdout is not a failure: the diff
+/// has no reader, and the file's outcome stands (#157).
 fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, quiet } = flags;
     let file_name = file.display().to_string();
@@ -243,7 +246,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     if diff && result.changed {
         let rendered = render_unified_diff(&source, &result.formatted, &file_name);
         if let Err(e) = write_stdout(rendered.as_bytes()).into_batch_result() {
-            crate::output::eprint_error(e.into());
+            crate::output::eprint_io_failure(e);
             return FileOutcome::Failed;
         }
     }
@@ -269,7 +272,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
                 FileOutcome::Formatted
             }
             Err(e) => {
-                crate::output::eprint_error(e);
+                crate::output::eprint_io_failure(e);
                 FileOutcome::Failed
             }
         }

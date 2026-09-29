@@ -1,6 +1,12 @@
-//! A closed output stream never changes an `mds` exit code (#157).
+//! How a stream or I/O failure sets an `mds` exit code (#157):
 //!
-//! # The vector
+//! - A closed stdout or stderr never changes the exit code.
+//! - Any other I/O failure — a stdout that fails for another reason, an output file or
+//!   directory that cannot be written, stdin that cannot be read or is not UTF-8 — is
+//!   one `mds::io` error, and the run exits at least 2.
+//! - Stdin over the 10 MiB cap is `mds::resource_limit`, exit 3; exactly the cap passes.
+//!
+//! # The closed-stream vector
 //!
 //! A pipe whose read end is already gone: [`closed_pipe`] drops the reader BEFORE the
 //! child is spawned, so no process holds it and the child's first write to that stream
@@ -29,6 +35,16 @@
 //! pass whether or not the command panicked; a panic shows up here as `Some(101)`.
 //! With stdout closed, stderr stays open and must match the open run's byte for byte,
 //! so a panic or an error report about the closed pipe fails the row as well.
+//!
+//! # The other failures
+//!
+//! - An output that cannot be written: a directory at mode `0o555` (unix). Root ignores
+//!   the mode, so each such test first checks that it really cannot create a file there
+//!   and skips with a printed reason when it can.
+//! - Stdin that cannot be read: a directory handle on unix (reading it fails with
+//!   "is a directory"), a write-only file handle on Windows. A write-only handle cannot
+//!   stand in on unix: the Rust runtime reads EBADF on a standard stream as end of input.
+//! - A stdout that fails for another reason: `/dev/full` (Linux only; ignored elsewhere).
 
 mod common;
 use common::mds_bin;
@@ -124,6 +140,14 @@ fn wait_bounded(child: &mut Child, what: &str) -> Option<i32> {
     }
 }
 
+/// What the child reads on stdin.
+enum Input {
+    /// These bytes, written into a pipe.
+    Bytes(Vec<u8>),
+    /// This handle, as it is.
+    Handle(Stdio),
+}
+
 /// Run `mds <args>` in `dir`, feeding `stdin`, with the stream `closed` (if any) a closed
 /// pipe from the start.
 fn run(dir: &Path, args: &[&str], stdin: &str, closed: Option<Stream>) -> Run {
@@ -135,32 +159,50 @@ fn run(dir: &Path, args: &[&str], stdin: &str, closed: Option<Stream>) -> Run {
         Some(Stream::Stderr) => Stdio::from(closed_pipe()),
         _ => Stdio::piped(),
     };
-    run_with(dir, args, stdin, stdout, stderr)
+    run_with(
+        dir,
+        args,
+        Input::Bytes(stdin.as_bytes().to_vec()),
+        stdout,
+        stderr,
+    )
 }
 
-/// Run `mds <args>` in `dir`, feeding `stdin`, with the given stdout and stderr.
-fn run_with(dir: &Path, args: &[&str], stdin: &str, stdout: Stdio, stderr: Stdio) -> Run {
+/// Run `mds <args>` in `dir` with the given stdin, stdout and stderr.
+fn run_with(dir: &Path, args: &[&str], stdin: Input, stdout: Stdio, stderr: Stdio) -> Run {
     let what = args.join(" ");
     let mut cmd = mds_bin();
     cmd.args(args)
         .current_dir(dir)
-        .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(stderr);
+    let bytes = match stdin {
+        Input::Bytes(bytes) => {
+            cmd.stdin(Stdio::piped());
+            Some(bytes)
+        }
+        Input::Handle(handle) => {
+            cmd.stdin(handle);
+            None
+        }
+    };
     let mut child = cmd.spawn().expect("spawn mds");
 
     // A child that exits without reading stdin closes it first; on Linux that makes
     // this write fail with a broken pipe, which says nothing about the child.
-    let mut child_stdin = child.stdin.take().expect("stdin is piped");
-    let input = stdin.as_bytes().to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = child_stdin.write_all(&input);
+    let writer = bytes.map(|bytes| {
+        let mut child_stdin = child.stdin.take().expect("stdin is piped");
+        std::thread::spawn(move || {
+            let _ = child_stdin.write_all(&bytes);
+        })
     });
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
 
     let code = wait_bounded(&mut child, &what);
-    writer.join().expect("stdin writer thread");
+    if let Some(writer) = writer {
+        writer.join().expect("stdin writer thread");
+    }
     Run {
         code,
         stdout: joined(out),
@@ -533,16 +575,20 @@ fn fmt_check_diff_on_a_directory_with_stdout_closed_exits_1() {
 
 /// Run `mds <args>` with stdout on `/dev/full`, where every write fails with "no space
 /// left on device" — a failure that is not a closed pipe, so it is reported as
-/// `mds::io` and the run exits at least 2 (#157). The directory handle, the other
-/// vector a unix host has, is no use for stdout: the Rust runtime swallows the EBADF a
-/// write to a read-only standard stream gets.
+/// `mds::io` and the run exits at least 2 (#157).
 fn run_into_dev_full(args: &[&str], stdin: &str) -> Run {
     let dir = fixture_dir();
     let full = std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/full")
         .expect("open /dev/full");
-    run_with(dir.path(), args, stdin, Stdio::from(full), Stdio::piped())
+    run_with(
+        dir.path(),
+        args,
+        Input::Bytes(stdin.as_bytes().to_vec()),
+        Stdio::from(full),
+        Stdio::piped(),
+    )
 }
 
 fn assert_stdout_failure_exits_2(args: &[&str], stdin: &str) {
@@ -572,4 +618,322 @@ fn build_to_stdout_into_a_full_device_exits_2() {
 #[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
 fn fmt_stdin_into_a_full_device_exits_2() {
     assert_stdout_failure_exits_2(&["fmt", "-"], "Hello");
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "/dev/full exists only on Linux")]
+fn help_into_a_full_device_exits_2() {
+    assert_stdout_failure_exits_2(&["--help"], "");
+}
+
+// ── clap's own output: help, version and usage errors ────────────────────────
+
+#[test]
+fn help_with_stdout_closed_exits_0() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["--help"],
+        stdin: "",
+        verdict: 0,
+        closed: Stream::Stdout,
+        open_contains: "Usage: mds",
+    });
+}
+
+#[test]
+fn version_with_stdout_closed_exits_0() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["--version"],
+        stdin: "",
+        verdict: 0,
+        closed: Stream::Stdout,
+        open_contains: "mds ",
+    });
+}
+
+#[test]
+fn a_usage_error_with_stderr_closed_exits_2() {
+    assert_closing_keeps_the_verdict(&Row {
+        args: &["build", "--no-such-flag"],
+        stdin: "",
+        verdict: 2,
+        closed: Stream::Stderr,
+        open_contains: "unexpected argument",
+    });
+}
+
+// ── An output that cannot be written: mds::io, exit 2 ────────────────────────
+
+/// Assert that `run` exited `code` and reported the error code `mds_code` on stderr.
+fn assert_exit_and_code(run: &Run, what: &str, code: i32, mds_code: &str) {
+    assert_eq!(
+        run.code,
+        Some(code),
+        "`mds {what}` must exit {code}; stderr: {:?}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(mds_code),
+        "`mds {what}` must report {mds_code}; stderr: {:?}",
+        run.stderr
+    );
+}
+
+/// A directory the test's user cannot create files in (mode `0o555`), made writable
+/// again on drop so the tempdir can be removed.
+#[cfg(unix)]
+struct ReadOnlyDir(PathBuf);
+
+#[cfg(unix)]
+impl ReadOnlyDir {
+    /// `None` when a file can still be created in `path` at mode `0o555` — root ignores
+    /// the mode — after printing why the caller skips.
+    fn new(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod 0o555");
+        let guard = Self(path.to_path_buf());
+        let probe = path.join(".write-probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            eprintln!(
+                "skipped: a file can be created in {} at mode 0o555 (running as root?)",
+                path.display()
+            );
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A fixture dir with `ro/` holding `files`, made read-only. `None` when the mode does
+/// not stop writes (see [`ReadOnlyDir::new`]).
+#[cfg(unix)]
+fn fixture_with_read_only_dir(files: &[(&str, &str)]) -> Option<(tempfile::TempDir, ReadOnlyDir)> {
+    let dir = fixture_dir();
+    let ro = dir.path().join("ro");
+    std::fs::create_dir(&ro).expect("create ro");
+    for (name, text) in files {
+        std::fs::write(ro.join(name), text).expect("write a file in ro");
+    }
+    let guard = ReadOnlyDir::new(&ro)?;
+    Some((dir, guard))
+}
+
+/// Run `mds <args>` in `dir` with open pipes and no stdin.
+#[cfg(unix)]
+fn run_in(dir: &Path, args: &[&str]) -> Run {
+    run(dir, args, "", None)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_build_whose_output_cannot_be_written_exits_2() {
+    let Some((dir, _ro)) = fixture_with_read_only_dir(&[]) else {
+        return;
+    };
+    let run = run_in(dir.path(), &["build", "ok.mds", "-o", "ro/out.md"]);
+    assert_exit_and_code(&run, "build ok.mds -o ro/out.md", 2, "mds::io");
+    assert!(
+        !dir.path().join("ro/out.md").exists(),
+        "nothing may be written"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_build_with_one_unwritable_output_exits_2_and_writes_the_others() {
+    let dir = fixture_dir();
+    let w = dir.path().join("w");
+    std::fs::create_dir_all(w.join("ro")).expect("create w/ro");
+    std::fs::write(w.join("a.mds"), "A\n").expect("write w/a.mds");
+    std::fs::write(w.join("ro/b.mds"), "B\n").expect("write w/ro/b.mds");
+    let Some(_ro) = ReadOnlyDir::new(&w.join("ro")) else {
+        return;
+    };
+    let run = run_in(dir.path(), &["build", "w"]);
+    assert_exit_and_code(&run, "build w", 2, "mds::io");
+    assert!(
+        run.stderr.contains("1 built, 1 failed"),
+        "the summary must count the write failure; stderr: {:?}",
+        run.stderr
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.join("a.md")).ok().as_deref(),
+        Some("A\n"),
+        "the output that can be written must still be written"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_of_a_file_it_cannot_rewrite_exits_2() {
+    let Some((dir, _ro)) = fixture_with_read_only_dir(&[("messy.mds", "Hello")]) else {
+        return;
+    };
+    let run = run_in(dir.path(), &["fmt", "ro/messy.mds"]);
+    assert_exit_and_code(&run, "fmt ro/messy.mds", 2, "mds::io");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("ro/messy.mds"))
+            .ok()
+            .as_deref(),
+        Some("Hello"),
+        "the file must be left as it was"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_of_a_directory_with_a_file_it_cannot_rewrite_exits_2() {
+    let Some((dir, _ro)) = fixture_with_read_only_dir(&[("messy.mds", "Hello")]) else {
+        return;
+    };
+    let run = run_in(dir.path(), &["fmt", "ro"]);
+    assert_exit_and_code(&run, "fmt ro", 2, "mds::io");
+    assert!(
+        run.stderr.contains("0 formatted, 0 unchanged, 1 failed"),
+        "the summary must count the write failure; stderr: {:?}",
+        run.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_fix_of_a_file_it_cannot_rewrite_exits_2_with_the_io_code() {
+    let fixable = "@if \"x\" == \"y\":\nhidden\n@end\nHello\n";
+    let Some((dir, _ro)) = fixture_with_read_only_dir(&[("fix.mds", fixable)]) else {
+        return;
+    };
+    let run = run_in(dir.path(), &["lint", "--fix", "ro/fix.mds"]);
+    assert_exit_and_code(&run, "lint --fix ro/fix.mds", 2, "mds::io");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_in_a_directory_it_cannot_write_exits_2() {
+    let Some((dir, _ro)) = fixture_with_read_only_dir(&[]) else {
+        return;
+    };
+    let run = run_in(dir.path(), &["init", "ro/hello.mds"]);
+    assert_exit_and_code(&run, "init ro/hello.mds", 2, "mds::io");
+    assert!(
+        !dir.path().join("ro/hello.mds").exists(),
+        "nothing may be written"
+    );
+}
+
+// ── Stdin that cannot be read, is not UTF-8, or is over the cap ──────────────
+
+/// The four subcommands that read a source from stdin.
+const STDIN_COMMANDS: [&[&str]; 4] = [
+    &["build", "-"],
+    &["check", "-"],
+    &["fmt", "-"],
+    &["lint", "-"],
+];
+
+/// A stdin handle every read of fails: a directory on unix, a write-only file on
+/// Windows. Kept alive by the returned tempdir.
+fn unreadable_stdin() -> (tempfile::TempDir, Stdio) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    let handle = std::fs::File::open(dir.path()).expect("open a directory handle");
+    #[cfg(windows)]
+    let handle = std::fs::File::create(dir.path().join("stdin")).expect("create a write-only file");
+    (dir, Stdio::from(handle))
+}
+
+#[test]
+fn stdin_that_cannot_be_read_exits_2() {
+    for args in STDIN_COMMANDS {
+        let what = args.join(" ");
+        let dir = fixture_dir();
+        let (_keep, stdin) = unreadable_stdin();
+        let run = run_with(
+            dir.path(),
+            args,
+            Input::Handle(stdin),
+            Stdio::piped(),
+            Stdio::piped(),
+        );
+        assert_exit_and_code(&run, &what, 2, "mds::io");
+        assert!(
+            run.stderr.contains("cannot read stdin"),
+            "`mds {what}` must say stdin could not be read; stderr: {:?}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn stdin_that_is_not_utf8_exits_2() {
+    for args in STDIN_COMMANDS {
+        let what = args.join(" ");
+        let dir = fixture_dir();
+        let run = run_with(
+            dir.path(),
+            args,
+            Input::Bytes(b"Hello \xff\n".to_vec()),
+            Stdio::piped(),
+            Stdio::piped(),
+        );
+        assert_exit_and_code(&run, &what, 2, "mds::io");
+        assert!(
+            run.stderr.contains("valid UTF-8"),
+            "`mds {what}` must say stdin was not UTF-8; stderr: {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// The per-source cap stdin is read against: 10 MiB.
+const STDIN_CAP: usize = 10 * 1024 * 1024;
+
+#[test]
+fn stdin_over_the_cap_exits_3() {
+    let lint_json: &[&str] = &["lint", "--format", "json", "-"];
+    for args in STDIN_COMMANDS.into_iter().chain([lint_json]) {
+        let what = args.join(" ");
+        let dir = fixture_dir();
+        let run = run_with(
+            dir.path(),
+            args,
+            Input::Bytes(vec![b'x'; STDIN_CAP + 1]),
+            Stdio::piped(),
+            Stdio::piped(),
+        );
+        assert_exit_and_code(&run, &what, 3, "mds::resource_limit");
+    }
+}
+
+/// The source ends in a newline, so `mds fmt` has nothing to change and the run tests
+/// the size gate alone.
+#[test]
+fn stdin_of_exactly_the_cap_passes_the_size_gate() {
+    let mut at_cap = vec![b'x'; STDIN_CAP - 1];
+    at_cap.push(b'\n');
+    for args in STDIN_COMMANDS {
+        let what = args.join(" ");
+        let dir = fixture_dir();
+        let run = run_with(
+            dir.path(),
+            args,
+            Input::Bytes(at_cap.clone()),
+            Stdio::piped(),
+            Stdio::piped(),
+        );
+        assert_eq!(
+            run.code,
+            Some(0),
+            "`mds {what}` must accept exactly the cap; stderr: {:?}",
+            run.stderr
+        );
+    }
 }
