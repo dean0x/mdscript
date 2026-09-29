@@ -33,6 +33,13 @@
 //!   [`PRINT_MACROS`]: every site that moves to an unlisted writer leaves the guard.
 //!   [`SITE_FLOORS`] fails when a listed file's site count drops, which is how such a
 //!   move shows up.
+//! - **Every mention of `write_stderr_fmt`**, the function the writer macros expand to.
+//!   Its argument is a `format_args!`, which is not a print site, so a direct call would
+//!   reach stderr with nothing it interpolates scanned — and so would every site of a new
+//!   macro built on it under a name [`PRINT_MACROS`] does not list.
+//!   [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`] fails on any mention
+//!   outside its `fn` definition and the bodies of the `macro_rules!` definitions
+//!   [`PRINT_MACROS`] names, a renamed `use` of it included.
 //! - `write!` / `writeln!` whose first argument names a terminal stream — `std::io::stderr()`,
 //!   `io::stdout()`, or a local whose `let` initialiser names one. The crate contains no
 //!   such call today; the rule is here so that the first one cannot arrive unnoticed.
@@ -132,6 +139,11 @@
 //!    resolved that way, and `for label in rules { eprint_warning(label) }` in `lint.rs`
 //!    passed the guard because the file's three unrelated `let label = safe_path(…)`
 //!    bindings were all safe.
+//! 6. **Print macros are matched by the name they are invoked under.** Renaming one on
+//!    import — `use crate::output::ewriteln as say;`, or `use std::eprintln as say;` —
+//!    takes every `say!(…)` site out of the scan, the same shape as limit 1 for
+//!    sanitizers. Renaming the writer *function* on import is caught: it is a mention of
+//!    `write_stderr_fmt` outside the writer macros.
 //!
 //! Every one of these requires writing code that looks wrong on purpose. The bar this
 //! guard is built to meet is **accidental** reintroduction — the four times #176 was
@@ -156,10 +168,14 @@
 //!   [`the_guard_follows_a_hoisted_format_binding`] proves the same for a message hoisted
 //!   into a local, [`the_guard_reports_an_untraceable_helper_argument`] for one it
 //!   cannot resolve at all, [`the_guard_refuses_to_resolve_a_non_let_binder`] for one
-//!   whose name is shadowed by a `for` / parameter / closure binder, and
-//!   [`the_guard_scans_the_stderr_writer_macros`] for `ewriteln!` / `ewrite!`.
-//! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`] proves the real
-//!   sources are clean.
+//!   whose name is shadowed by a `for` / parameter / closure binder,
+//!   [`the_guard_scans_the_stderr_writer_macros`] for `ewriteln!` / `ewrite!`, and
+//!   [`the_writer_fn_guard_flags_direct_calls_aliases_and_unlisted_macros`] for a direct
+//!   call to the writer function, a renamed import of it and a macro built on it under
+//!   an unlisted name.
+//! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`] and
+//!   [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`] prove the real sources
+//!   are clean.
 //! - **Non-vacuity:** the same test asserts the scanner actually found the crate's
 //!   modules, its print sites (crate-wide, and per file for the files in
 //!   [`SITE_FLOORS`]), its interpolations, its `let` bindings, the non-`let` binders that
@@ -196,6 +212,14 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[("main.rs", 11), ("output.rs", 7)];
+
+/// The function the stderr writer macros expand to (`output.rs`, #157).
+///
+/// Its argument is a `format_args!`, which is not a print site, so a direct call would
+/// write to stderr with nothing it interpolates scanned. It may be named only at its
+/// definition and inside the bodies of the macros in [`PRINT_MACROS`] — see
+/// [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`].
+const STDERR_WRITER_FN: &str = "write_stderr_fmt";
 
 /// Macros that write to whatever sink they are handed. Scanned only when that sink is a
 /// terminal stream (see `is_stream_target`) — a `write!` into an in-memory `String` is
@@ -623,6 +647,47 @@ fn every_allowlist_entry_is_live() {
     }
 }
 
+/// The writer macros are print sites because the guard knows their names. The function
+/// they expand to is not: a direct call to it, or a macro built on it under a name
+/// [`PRINT_MACROS`] does not list, writes to stderr with nothing it interpolates scanned.
+/// So the function may be named only at its definition and inside the writer macros.
+#[test]
+fn the_stderr_writer_fn_is_called_only_by_the_writer_macros() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stray: Vec<String> = Vec::new();
+    let mut allowed_in_output_rs = 0usize;
+    for file in rust_files(&src_dir) {
+        let name = file_key(&file);
+        let src = std::fs::read_to_string(&file).expect("mds-cli source must be readable");
+        let mentions = writer_fn_mentions(&src);
+        if name == "output.rs" {
+            allowed_in_output_rs += mentions.allowed;
+        }
+        stray.extend(
+            mentions
+                .stray
+                .into_iter()
+                .map(|line| format!("  {name}:{line}")),
+        );
+    }
+
+    // Non-vacuity: the scan found the definition and the `ewrite!` / `ewriteln!` bodies,
+    // so an empty `stray` means it looked where the writer lives.
+    assert!(
+        allowed_in_output_rs >= 3,
+        "non-vacuity: expected `{STDERR_WRITER_FN}`'s definition and the writer macros' \
+         bodies in output.rs (at least 3 mentions), found {allowed_in_output_rs}"
+    );
+    assert!(
+        stray.is_empty(),
+        "print-discipline violation: `{STDERR_WRITER_FN}` is named outside its definition \
+         and the bodies of the writer macros in {PRINT_MACROS:?}:\n{}\n\n\
+         Write through `ewriteln!` / `ewrite!` so every interpolated value is scanned; a \
+         new stderr writer macro goes into PRINT_MACROS.",
+        stray.join("\n")
+    );
+}
+
 // ── Scanner self-tests (PF-013 positive / negative / robustness) ──────────────
 
 #[test]
@@ -929,6 +994,72 @@ fn the_guard_scans_the_stderr_writer_macros() {
         collect_sites(definition).is_empty(),
         "a macro definition is not a print site; got {:?}",
         collect_sites(definition)
+    );
+}
+
+#[test]
+fn the_writer_fn_guard_flags_direct_calls_aliases_and_unlisted_macros() {
+    // Accepted: the definition and the bodies of macros PRINT_MACROS lists.
+    let writer = r#"
+        macro_rules! ewrite {
+            ($($arg:tt)*) => {
+                $crate::output::write_stderr_fmt(::std::format_args!($($arg)*))
+            };
+        }
+        macro_rules! ewriteln {
+            () => {
+                $crate::output::write_stderr_fmt(::std::format_args!("\n"))
+            };
+        }
+        pub(crate) fn write_stderr_fmt(args: std::fmt::Arguments<'_>) {
+            write_stderr_to(&OUTPUT_STATE, &mut std::io::stderr().lock(), args);
+        }
+    "#;
+    assert_eq!(
+        writer_fn_mentions(writer),
+        WriterFnMentions {
+            stray: Vec::new(),
+            allowed: 3
+        },
+        "the definition and both writer macro bodies must be accepted"
+    );
+
+    // Reported: a direct call, a renamed import, and a macro built on it whose name
+    // PRINT_MACROS does not list — each on its own line.
+    let bypasses = r#"
+        fn f(path: &Path) {
+            output::write_stderr_fmt(format_args!("{}\n", path.display()));
+        }
+        use crate::output::write_stderr_fmt as say;
+        macro_rules! ewarn {
+            ($($arg:tt)*) => {
+                $crate::output::write_stderr_fmt(::std::format_args!($($arg)*))
+            };
+        }
+    "#;
+    assert_eq!(
+        writer_fn_mentions(bypasses),
+        WriterFnMentions {
+            stray: vec![3, 5, 8],
+            allowed: 0
+        },
+        "a direct call, a renamed import and an unlisted macro must each be reported"
+    );
+
+    // Neither: a comment, a doc link, a string, and a longer identifier.
+    let prose = r#"
+        // Never call write_stderr_fmt directly.
+        /// See [`write_stderr_fmt`].
+        fn g() -> &'static str { "write_stderr_fmt(" }
+        fn write_stderr_fmt_len() -> usize { 0 }
+    "#;
+    assert_eq!(
+        writer_fn_mentions(prose),
+        WriterFnMentions {
+            stray: Vec::new(),
+            allowed: 0
+        },
+        "comments, strings and other identifiers are not mentions"
     );
 }
 
@@ -1624,6 +1755,90 @@ fn find_invocations(text: &str, names: &[&str]) -> Vec<Invocation> {
     out
 }
 
+/// Where [`STDERR_WRITER_FN`] is named in one source file.
+#[derive(Debug, PartialEq, Eq)]
+struct WriterFnMentions {
+    /// 1-based line of every mention outside its definition and the writer macros'
+    /// bodies: a direct call, a `use` of it, a macro built on it under an unlisted name.
+    stray: Vec<usize>,
+    /// Mentions at its `fn` definition or inside the body of a `macro_rules!` named in
+    /// [`PRINT_MACROS`].
+    allowed: usize,
+}
+
+/// Find every mention of [`STDERR_WRITER_FN`] in `src` as a whole identifier, outside
+/// comments and literals, and sort it into [`WriterFnMentions`].
+fn writer_fn_mentions(src: &str) -> WriterFnMentions {
+    let masked = mask_comments(src);
+    let b = masked.as_bytes();
+    let bodies = writer_macro_bodies(&masked);
+    let name = STDERR_WRITER_FN.as_bytes();
+    let mut mentions = WriterFnMentions {
+        stray: Vec::new(),
+        allowed: 0,
+    };
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(&masked, b, i) {
+            i = next;
+            continue;
+        }
+        let end = i + name.len();
+        let is_mention = b[i..].starts_with(name)
+            && !prev_is_ident(b, i)
+            && !b
+                .get(end)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+        if !is_mention {
+            i += 1;
+            continue;
+        }
+        if is_fn_definition(&masked, i) || bodies.iter().any(|body| body.contains(&i)) {
+            mentions.allowed += 1;
+        } else {
+            mentions.stray.push(masked[..i].matches('\n').count() + 1);
+        }
+        i = end;
+    }
+    mentions
+}
+
+/// Byte ranges of the bodies of every `macro_rules!` definition in `masked` whose name is
+/// in [`PRINT_MACROS`]. A macro of any other name is not scanned at its call sites, so its
+/// body gets no range.
+fn writer_macro_bodies(masked: &str) -> Vec<std::ops::RangeInclusive<usize>> {
+    const MACRO_RULES: &str = "macro_rules!";
+    let b = masked.as_bytes();
+    let mut bodies = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(masked, b, i) {
+            i = next;
+            continue;
+        }
+        if !b[i..].starts_with(MACRO_RULES.as_bytes()) || prev_is_ident(b, i) {
+            i += 1;
+            continue;
+        }
+        let name_start = skip_ws(b, i + MACRO_RULES.len());
+        let mut name_end = name_start;
+        while name_end < b.len() && (b[name_end].is_ascii_alphanumeric() || b[name_end] == b'_') {
+            name_end += 1;
+        }
+        let open = skip_ws(b, name_end);
+        let Some(close) = matching_delim(masked, b, open) else {
+            i = name_end;
+            continue;
+        };
+        let invoked_as = format!("{}!", &masked[name_start..name_end]);
+        if PRINT_MACROS.contains(&invoked_as.as_str()) {
+            bodies.push(open..=close);
+        }
+        i = close + 1;
+    }
+    bodies
+}
+
 /// Union of a format invocation's inline captures and its positional arguments.
 fn interpolated_exprs(body: &str) -> Vec<String> {
     let trimmed = body.trim_start();
@@ -1897,6 +2112,18 @@ fn is_fn_definition(text: &str, i: usize) -> bool {
 
 /// Index of the `)` matching the `(` at `open`.
 fn matching_paren(src: &str, b: &[u8], open: usize) -> Option<usize> {
+    matching_delim(src, b, open)
+}
+
+/// Index of the delimiter closing the `(`, `[` or `{` at `open`; `None` when `open`
+/// holds none of them or it is never closed.
+fn matching_delim(src: &str, b: &[u8], open: usize) -> Option<usize> {
+    let (open_byte, close_byte) = match b.get(open)? {
+        b'(' => (b'(', b')'),
+        b'[' => (b'[', b']'),
+        b'{' => (b'{', b'}'),
+        _ => return None,
+    };
     let mut depth = 0i32;
     let mut i = open;
     while i < b.len() {
@@ -1904,15 +2131,13 @@ fn matching_paren(src: &str, b: &[u8], open: usize) -> Option<usize> {
             i = next;
             continue;
         }
-        match b[i] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
+        if b[i] == open_byte {
+            depth += 1;
+        } else if b[i] == close_byte {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
             }
-            _ => {}
         }
         i += 1;
     }

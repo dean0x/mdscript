@@ -6,12 +6,13 @@
 //!   path resolution used by watch and build-directory.
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
-//! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr writer, which
-//!   never panics — a closed pipe or a failed write becomes sticky [`OutputState`]
+//! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr choke point,
+//!   which never panics — a closed pipe or a failed write becomes sticky [`OutputState`]
 //!   instead (#157). [`write_stdout`] writes a command's product and reports a
 //!   [`StdoutOutcome`]; [`exit`] ends the process through [`final_exit_code`].
-//! - [`eprint_error`]: the single CLI stderr choke-point — escapes every report's
-//!   message, help, and label text before miette renders it (CWE-150 / PF-014).
+//! - [`eprint_error`]: the CLI's error-report choke point — escapes every report's
+//!   message, help, and label text before miette renders it (CWE-150), then writes the
+//!   frame through `ewriteln!`.
 //! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`,
 //!   and — since #227 — by every `build` / `watch` output and `.map` sidecar. The
 //!   [`Durability`] argument says whether the bytes are fsynced before the rename;
@@ -2896,7 +2897,7 @@ mod tests {
 
     // ── eprint_warning: the CLI warning sanitization boundary (CWE-150 / PF-004 / #176) ──
     //
-    // eprint_warning is a thin wrapper around mds::sanitize_control_chars + eprintln!.
+    // eprint_warning is a thin wrapper around mds::sanitize_control_chars + ewriteln!.
     // The tests below exercise the transformation directly (the pure function that the
     // wrapper applies) to keep assertions deterministic without capturing stderr.
     //
@@ -2951,7 +2952,7 @@ mod tests {
             "MAX_SOURCEMAP_SEGMENTS exceeded in imported module 'lib{}[2Jbar.mds'",
             '\u{1b}'
         );
-        // This is exactly what eprint_warning applies before calling eprintln!.
+        // This is exactly what eprint_warning applies before calling ewriteln!.
         let result = mds::sanitize_control_chars(&hostile);
 
         // Non-vacuity: the plain-text content is preserved.
