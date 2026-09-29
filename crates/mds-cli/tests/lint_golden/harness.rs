@@ -7,6 +7,11 @@
 //! stderr and the fixture source file's bytes afterwards, then compared with the
 //! golden the cell maps to.
 //!
+//! A directory cell lints the relative directory `d` and records the state of every
+//! file under the fixture directory instead of one source file. It is run twice, the
+//! fixture files created in opposite orders, and both normalized runs must be
+//! identical before they are compared with the golden.
+//!
 //! The goldens pin what `mds lint` prints today, including output that is known to be
 //! wrong: a later commit that changes lint output regenerates them and names the
 //! changed cell ids in its message.
@@ -94,6 +99,22 @@ pub struct Golden {
     pub stdout: Stream,
     pub stderr: Stream,
     pub file: FileAfter,
+    /// Temporary-directory spellings replaced by `$TMP` (the path-leak count).
+    pub tmp_paths: u32,
+    /// Atomic-write temp file names replaced by `.mds-tmp-RANDOM.tmp`.
+    pub tmp_names: u32,
+}
+
+/// One deduplicated golden of a directory cell: a [`Golden`] whose single file record
+/// is replaced by one record per file under the fixture directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirGolden {
+    pub exit: i32,
+    pub stdout: Stream,
+    pub stderr: Stream,
+    /// Every file under the fixture directory after the run, by `/`-separated path
+    /// relative to it, sorted. A file the fixture did not hold would be `Changed`.
+    pub files: &'static [(&'static str, FileAfter)],
     /// Temporary-directory spellings replaced by `$TMP` (the path-leak count).
     pub tmp_paths: u32,
     /// Atomic-write temp file names replaced by `.mds-tmp-RANDOM.tmp`.
@@ -442,6 +463,253 @@ pub fn active_cells() -> Vec<Cell> {
     all_cells().into_iter().filter(Cell::active).collect()
 }
 
+// ── The directory matrix ─────────────────────────────────────────────────────
+
+/// The directory every directory cell lints, relative to the fixture directory (the
+/// cell's cwd).
+pub const DIR_ARG: &str = "d";
+
+/// A file the directory walk does not collect (it is not a `.mds` file).
+pub const NOTES_TEXT: &str = "notes\n";
+
+/// What a directory cell lints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirFixture {
+    /// An outcome fixture's source (and `mds.json`) inside `d/`. For write-fail, `d/`
+    /// is read-only and also holds an unreadable `.mds` file and an unlistable
+    /// subdirectory holding one.
+    Outcome(Fixture),
+    /// `d/` holds no file.
+    Empty,
+    /// `d/` holds one `.mds` file, under `node_modules/`, which the walk skips.
+    AllExcluded,
+    /// Files with every outcome (clean, warning, fixable error, partial fix, analysis
+    /// failure, over the size limit), a nested `mds.json` raising a warning to an error
+    /// and a nested malformed one, names whose byte order differs from both
+    /// path-component and case-insensitive order, and entries the walk skips (a hidden
+    /// directory, `node_modules`, a non-`.mds` file).
+    Mixed,
+}
+
+impl DirFixture {
+    /// Every directory fixture: the 13 outcome fixtures, then the directory-only ones.
+    pub fn all() -> Vec<DirFixture> {
+        Fixture::ALL
+            .iter()
+            .map(|&f| DirFixture::Outcome(f))
+            .chain([
+                DirFixture::Empty,
+                DirFixture::AllExcluded,
+                DirFixture::Mixed,
+            ])
+            .collect()
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DirFixture::Outcome(f) => f.name(),
+            DirFixture::Empty => "empty",
+            DirFixture::AllExcluded => "all-excluded",
+            DirFixture::Mixed => "mixed",
+        }
+    }
+
+    /// Cells for this fixture exist on Unix only.
+    pub fn unix_only(self) -> bool {
+        match self {
+            DirFixture::Outcome(f) => f.unix_only(),
+            DirFixture::Empty | DirFixture::AllExcluded | DirFixture::Mixed => false,
+        }
+    }
+
+    /// The files (and permission changes) the fixture directory holds.
+    pub fn layout(self) -> DirLayout {
+        let files = |entries: &[(&str, &'static str)]| -> Vec<(String, &'static str)> {
+            entries
+                .iter()
+                .map(|&(path, contents)| (path.to_string(), contents))
+                .collect()
+        };
+        match self {
+            DirFixture::Outcome(Fixture::WriteFail) => DirLayout {
+                dirs: Vec::new(),
+                files: files(&[
+                    ("d/unreadable.mds", FIXED_SOURCE),
+                    ("d/unreadable/y.mds", FIXED_SOURCE),
+                    ("d/x.mds", FIXED_SOURCE),
+                ]),
+                locks: vec![
+                    Lock::UnreadableFile("d/unreadable.mds"),
+                    Lock::UnlistableDir("d/unreadable"),
+                    Lock::ReadOnlyDir("d"),
+                ],
+            },
+            DirFixture::Outcome(fixture) => {
+                let mut entries = vec![(
+                    format!("{DIR_ARG}/{}", fixture.file_name()),
+                    fixture.source(),
+                )];
+                if let Some(config) = fixture.config() {
+                    entries.push((format!("{DIR_ARG}/mds.json"), config));
+                }
+                DirLayout {
+                    dirs: Vec::new(),
+                    files: entries,
+                    locks: Vec::new(),
+                }
+            }
+            DirFixture::Empty => DirLayout {
+                dirs: vec![DIR_ARG],
+                files: Vec::new(),
+                locks: Vec::new(),
+            },
+            DirFixture::AllExcluded => DirLayout {
+                dirs: Vec::new(),
+                files: files(&[("d/node_modules/a.mds", WARN_SOURCE)]),
+                locks: Vec::new(),
+            },
+            DirFixture::Mixed => DirLayout {
+                dirs: Vec::new(),
+                files: files(&[
+                    ("d/B.mds", PARTIAL_SOURCE),
+                    ("d/_unterminated.mds", ANALYSIS_FAIL_SOURCE),
+                    ("d/a.mds", CLEAN_SOURCE),
+                    ("d/api-utils.mds", WARN_SOURCE),
+                    ("d/api/x.mds", FIXED_SOURCE),
+                    ("d/big.mds", limit_source()),
+                    ("d/strict/mds.json", ERROR_CONFIG),
+                    ("d/strict/w.mds", WARN_SOURCE),
+                    ("d/sub/mds.json", BROKEN_CONFIG),
+                    ("d/sub/z.mds", CLEAN_SOURCE),
+                    ("d/.hidden/h.mds", WARN_SOURCE),
+                    ("d/node_modules/n.mds", WARN_SOURCE),
+                    ("d/notes.txt", NOTES_TEXT),
+                ]),
+                locks: Vec::new(),
+            },
+        }
+    }
+}
+
+/// A directory fixture's contents. Paths are relative to the fixture directory and
+/// `/`-separated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirLayout {
+    /// Directories that exist even when no file lies in them.
+    pub dirs: Vec<&'static str>,
+    /// Files and their contents (parent directories are created as needed).
+    pub files: Vec<(String, &'static str)>,
+    /// Permission changes made, in order, for the run and reverted afterwards (Unix).
+    pub locks: Vec<Lock>,
+}
+
+/// A permission change a directory run makes (Unix only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lock {
+    /// 0o555 on a directory: its entries can be listed and read, not created.
+    ReadOnlyDir(&'static str),
+    /// 0o000 on a file: it is listed, but cannot be read.
+    UnreadableFile(&'static str),
+    /// 0o000 on a directory: it cannot be listed.
+    UnlistableDir(&'static str),
+}
+
+impl Lock {
+    pub fn path(self) -> &'static str {
+        match self {
+            Lock::ReadOnlyDir(p) | Lock::UnreadableFile(p) | Lock::UnlistableDir(p) => p,
+        }
+    }
+}
+
+/// One directory cell: `mds lint … d` with cwd = the fixture directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirCell {
+    pub format: Format,
+    pub quiet: Quiet,
+    pub fix: FixMode,
+    pub fixture: DirFixture,
+}
+
+impl DirCell {
+    /// `dir/format/quiet/fix-mode/fixture`, e.g. `dir/json/loud/fix/mixed`.
+    pub fn id(&self) -> String {
+        format!(
+            "dir/{}/{}/{}/{}",
+            self.format.name(),
+            self.quiet.name(),
+            self.fix.name(),
+            self.fixture.name()
+        )
+    }
+
+    /// Whether the cell runs on this platform.
+    pub fn active(&self) -> bool {
+        cfg!(unix) || !self.fixture.unix_only()
+    }
+
+    fn args(&self) -> Vec<&'static str> {
+        let mut args = vec!["lint"];
+        args.extend_from_slice(self.format.args());
+        args.extend_from_slice(self.quiet.args());
+        args.extend_from_slice(self.fix.args());
+        args.push(DIR_ARG);
+        args
+    }
+}
+
+/// The cells of one directory fixture, in table order.
+pub fn dir_group_cells(fixture: DirFixture) -> Vec<DirCell> {
+    let mut cells = Vec::with_capacity(20);
+    for format in Format::ALL {
+        for quiet in Quiet::ALL {
+            for fix in FixMode::ALL {
+                cells.push(DirCell {
+                    format,
+                    quiet,
+                    fix,
+                    fixture,
+                });
+            }
+        }
+    }
+    cells
+}
+
+/// Every directory cell, on every platform, in table order.
+pub fn all_dir_cells() -> Vec<DirCell> {
+    DirFixture::all()
+        .into_iter()
+        .flat_map(dir_group_cells)
+        .collect()
+}
+
+/// The directory cells that run on this platform.
+pub fn active_dir_cells() -> Vec<DirCell> {
+    all_dir_cells()
+        .into_iter()
+        .filter(DirCell::active)
+        .collect()
+}
+
+/// Every cell id of the whole matrix (stdin, file and directory), on every platform.
+pub fn all_cell_ids() -> Vec<String> {
+    all_cells()
+        .iter()
+        .map(Cell::id)
+        .chain(all_dir_cells().iter().map(DirCell::id))
+        .collect()
+}
+
+/// The ids of the cells that run on this platform.
+pub fn active_cell_ids() -> Vec<String> {
+    active_cells()
+        .iter()
+        .map(Cell::id)
+        .chain(active_dir_cells().iter().map(DirCell::id))
+        .collect()
+}
+
 // ── Running a cell ───────────────────────────────────────────────────────────
 
 /// What one run recorded, after normalization.
@@ -468,6 +736,28 @@ pub enum Skip {
     /// The read-only directory does not stop file creation (euid 0, or a filesystem
     /// that ignores mode bits), so the write-failure precondition cannot be built.
     ReadOnlyDirIsWritable,
+    /// A 0o000 file can still be read, or a 0o000 directory listed (euid 0, or a
+    /// filesystem that ignores mode bits), so the unreadable-entry precondition cannot
+    /// be built.
+    UnreadableIsReadable,
+}
+
+impl Skip {
+    /// The reason printed when a cell is skipped.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Skip::ReadOnlyDirIsWritable => {
+                "a 0o555 directory accepts new files here (running as euid 0, or the \
+                 filesystem ignores mode bits), so the write-failure precondition cannot \
+                 be built"
+            }
+            Skip::UnreadableIsReadable => {
+                "a 0o000 file or directory can still be read here (running as euid 0, or \
+                 the filesystem ignores mode bits), so the unreadable-entry precondition \
+                 cannot be built"
+            }
+        }
+    }
 }
 
 /// A fresh fixture directory.
@@ -513,21 +803,41 @@ pub fn run_cell(cell: &Cell) -> Result<Observed, Skip> {
         Err(e) => panic!("{}: cannot read the source back: {e}", cell.id()),
     };
 
-    let normalizer = Normalizer::for_dir(dir.path());
-    let (stdout, out_paths, out_names) = normalizer.apply(&utf8(cell, "stdout", stdout));
-    let (stderr, err_paths, err_names) = normalizer.apply(&utf8(cell, "stderr", stderr));
+    let streams = NormalizedStreams::of(&cell.id(), dir.path(), stdout, stderr);
     Ok(Observed {
         exit,
-        stdout,
-        stderr,
+        stdout: streams.stdout,
+        stderr: streams.stderr,
         file,
-        tmp_paths: out_paths + err_paths,
-        tmp_names: out_names + err_names,
+        tmp_paths: streams.tmp_paths,
+        tmp_names: streams.tmp_names,
     })
 }
 
-fn utf8(cell: &Cell, label: &str, bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes).unwrap_or_else(|_| panic!("{}: {label} is not UTF-8", cell.id()))
+/// A run's stdout and stderr after normalization, with the replacement counts.
+struct NormalizedStreams {
+    stdout: String,
+    stderr: String,
+    tmp_paths: u32,
+    tmp_names: u32,
+}
+
+impl NormalizedStreams {
+    fn of(id: &str, dir: &Path, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        let normalizer = Normalizer::for_dir(dir);
+        let (stdout, out_paths, out_names) = normalizer.apply(&utf8(id, "stdout", stdout));
+        let (stderr, err_paths, err_names) = normalizer.apply(&utf8(id, "stderr", stderr));
+        NormalizedStreams {
+            stdout,
+            stderr,
+            tmp_paths: out_paths + err_paths,
+            tmp_names: out_names + err_names,
+        }
+    }
+}
+
+fn utf8(id: &str, label: &str, bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|_| panic!("{id}: {label} is not UTF-8"))
 }
 
 /// The write-failure fixture's directory is made read-only for the run and writable
@@ -575,6 +885,255 @@ impl Drop for ReadOnlyDir {
         if let Some(dir) = self.dir.take() {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
+// ── Running a directory cell ─────────────────────────────────────────────────
+
+/// What one directory run recorded, after normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirObserved {
+    pub exit: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// Every file under the fixture directory, by `/`-separated relative path, sorted.
+    pub files: Vec<(String, ObservedFile)>,
+    pub tmp_paths: u32,
+    pub tmp_names: u32,
+}
+
+/// The order a directory run creates its fixture files in. A cell runs once in each
+/// order, so output that followed the order a directory lists its entries in would
+/// differ between the two runs on a filesystem that lists them in creation order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    Forward,
+    Reverse,
+}
+
+/// Whether a directory run makes its fixture's permission changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locking {
+    Applied,
+    Unlocked,
+}
+
+/// Why a directory cell has no observation to compare.
+#[derive(Debug)]
+pub enum DirFailure {
+    Skipped(Skip),
+    /// The two runs recorded different things; the message says where.
+    Nondeterministic(String),
+}
+
+/// Run a directory cell twice, creating the fixture files in opposite orders; both
+/// normalized runs must be identical.
+pub fn run_dir_cell(cell: &DirCell) -> Result<DirObserved, DirFailure> {
+    let id = cell.id();
+    let args = cell.args();
+    let run = |order| {
+        run_dir(cell.fixture, &id, &args, order, Locking::Applied).map_err(DirFailure::Skipped)
+    };
+    let first = run(Order::Forward)?;
+    let second = run(Order::Reverse)?;
+    compare_runs(&id, &first, &second).map_err(DirFailure::Nondeterministic)?;
+    Ok(first)
+}
+
+/// Run `mds <args>` once in a fresh fixture directory holding `fixture`'s layout.
+/// `id` names the run in failure messages.
+pub fn run_dir(
+    fixture: DirFixture,
+    id: &str,
+    args: &[&str],
+    order: Order,
+    locking: Locking,
+) -> Result<DirObserved, Skip> {
+    let dir = fixture_dir();
+    let layout = fixture.layout();
+    build_layout(dir.path(), &layout, order);
+    let locks = match locking {
+        Locking::Applied => DirLocks::apply(dir.path(), &layout.locks)?,
+        Locking::Unlocked => DirLocks::none(),
+    };
+
+    let (exit, stdout, stderr) = run_mds(id, dir.path(), args, None);
+
+    drop(locks);
+    let files = record_files(id, dir.path(), &layout);
+    let streams = NormalizedStreams::of(id, dir.path(), stdout, stderr);
+    Ok(DirObserved {
+        exit,
+        stdout: streams.stdout,
+        stderr: streams.stderr,
+        files,
+        tmp_paths: streams.tmp_paths,
+        tmp_names: streams.tmp_names,
+    })
+}
+
+fn build_layout(root: &Path, layout: &DirLayout, order: Order) {
+    for dir in &layout.dirs {
+        std::fs::create_dir_all(root.join(dir)).expect("create fixture directory");
+    }
+    let mut files: Vec<&(String, &'static str)> = layout.files.iter().collect();
+    if order == Order::Reverse {
+        files.reverse();
+    }
+    for (path, contents) in files {
+        let path = root.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture directory");
+        }
+        std::fs::write(&path, contents).expect("write fixture file");
+    }
+}
+
+/// A fixture tree is at most this deep ...
+const RECORD_MAX_DEPTH: usize = 8;
+/// ... and holds at most this many files after a run.
+const RECORD_MAX_FILES: usize = 64;
+
+/// The state of every file under `root` (and of every layout file that is gone),
+/// sorted by relative path.
+fn record_files(id: &str, root: &Path, layout: &DirLayout) -> Vec<(String, ObservedFile)> {
+    let mut names = Vec::new();
+    list_files(root, "", 0, &mut names);
+    for (path, _) in &layout.files {
+        if !names.contains(path) {
+            names.push(path.clone());
+        }
+    }
+    names.sort_unstable();
+    names
+        .into_iter()
+        .map(|name| {
+            let fixture = layout
+                .files
+                .iter()
+                .find(|(path, _)| *path == name)
+                .map(|(_, contents)| contents.as_bytes());
+            let state = match std::fs::read(root.join(&name)) {
+                Ok(bytes) if Some(bytes.as_slice()) == fixture => ObservedFile::Unchanged,
+                Ok(bytes) => ObservedFile::Changed(
+                    String::from_utf8(bytes)
+                        .unwrap_or_else(|_| panic!("{id}: {name} is not UTF-8 after the run")),
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => ObservedFile::Missing,
+                Err(e) => panic!("{id}: cannot read {name} back: {e}"),
+            };
+            (name, state)
+        })
+        .collect()
+}
+
+/// Every non-directory entry under `dir`, as `/`-joined paths below `prefix`.
+fn list_files(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
+    assert!(
+        depth <= RECORD_MAX_DEPTH,
+        "fixture tree deeper than {RECORD_MAX_DEPTH} levels at {}",
+        dir.display()
+    );
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("list {}: {e}", dir.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| panic!("list {}: {e}", dir.display()));
+        let name = entry
+            .file_name()
+            .into_string()
+            .unwrap_or_else(|n| panic!("non-UTF-8 name {n:?} in {}", dir.display()));
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|e| panic!("file type of {path}: {e}"));
+        if file_type.is_dir() {
+            list_files(&entry.path(), &path, depth + 1, out);
+        } else {
+            out.push(path);
+            assert!(
+                out.len() <= RECORD_MAX_FILES,
+                "more than {RECORD_MAX_FILES} files in a fixture tree"
+            );
+        }
+    }
+}
+
+/// A directory run's permission changes, reverted on drop (in reverse order) so a
+/// failing assertion never leaves an undeletable tempdir.
+struct DirLocks {
+    #[cfg(unix)]
+    restore: Vec<(PathBuf, u32)>,
+}
+
+impl DirLocks {
+    fn none() -> Self {
+        DirLocks {
+            #[cfg(unix)]
+            restore: Vec::new(),
+        }
+    }
+
+    /// Make every change, then probe that each one holds.
+    #[cfg(unix)]
+    fn apply(root: &Path, locks: &[Lock]) -> Result<Self, Skip> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut guard = DirLocks::none();
+        for lock in locks {
+            let path = root.join(lock.path());
+            let (mode, restore) = match lock {
+                Lock::ReadOnlyDir(_) => (0o555, 0o755),
+                Lock::UnreadableFile(_) => (0o000, 0o644),
+                Lock::UnlistableDir(_) => (0o000, 0o755),
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .unwrap_or_else(|e| panic!("chmod {:o} {}: {e}", mode, path.display()));
+            guard.restore.push((path, restore));
+        }
+        for lock in locks {
+            let path = root.join(lock.path());
+            match lock {
+                Lock::ReadOnlyDir(_) => {
+                    let probe = path.join("write-probe");
+                    if std::fs::File::create(&probe).is_ok() {
+                        let _ = std::fs::remove_file(&probe);
+                        return Err(Skip::ReadOnlyDirIsWritable);
+                    }
+                }
+                Lock::UnreadableFile(_) => {
+                    if std::fs::read(&path).is_ok() {
+                        return Err(Skip::UnreadableIsReadable);
+                    }
+                }
+                Lock::UnlistableDir(_) => {
+                    if std::fs::read_dir(&path).is_ok() {
+                        return Err(Skip::UnreadableIsReadable);
+                    }
+                }
+            }
+        }
+        Ok(guard)
+    }
+
+    #[cfg(not(unix))]
+    fn apply(_root: &Path, locks: &[Lock]) -> Result<Self, Skip> {
+        assert!(
+            locks.is_empty(),
+            "permission changes {locks:?} reached a non-unix run"
+        );
+        Ok(DirLocks::none())
+    }
+}
+
+impl Drop for DirLocks {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for (path, mode) in self.restore.drain(..).rev() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
         }
     }
 }
@@ -858,49 +1417,218 @@ const DIFF_LINE_CHARS: usize = 160;
 /// Compare an observation with its golden. The error names the cell and the part that
 /// differs, with lengths and the first differing line ±3 lines — never a whole stream.
 pub fn compare(cell_id: &str, golden: &Golden, obs: &Observed) -> Result<(), String> {
+    let mut problems = output_problems(
+        &ExpectedOutputs {
+            exit: golden.exit,
+            stdout: &golden.stdout,
+            stderr: &golden.stderr,
+            tmp_paths: golden.tmp_paths,
+            tmp_names: golden.tmp_names,
+        },
+        &ObservedOutputs {
+            exit: obs.exit,
+            stdout: &obs.stdout,
+            stderr: &obs.stderr,
+            tmp_paths: obs.tmp_paths,
+            tmp_names: obs.tmp_names,
+        },
+    );
+    problems.extend(file_problem("file", &golden.file, &obs.file));
+    problems_to_result(cell_id, problems)
+}
+
+/// Compare a directory observation with its golden: as [`compare`], with one record
+/// per file. A differing set of files is reported by name.
+pub fn compare_dir(cell_id: &str, golden: &DirGolden, obs: &DirObserved) -> Result<(), String> {
+    let mut problems = output_problems(
+        &ExpectedOutputs {
+            exit: golden.exit,
+            stdout: &golden.stdout,
+            stderr: &golden.stderr,
+            tmp_paths: golden.tmp_paths,
+            tmp_names: golden.tmp_names,
+        },
+        &ObservedOutputs {
+            exit: obs.exit,
+            stdout: &obs.stdout,
+            stderr: &obs.stderr,
+            tmp_paths: obs.tmp_paths,
+            tmp_names: obs.tmp_names,
+        },
+    );
+    let expected: Vec<&str> = golden.files.iter().map(|(name, _)| *name).collect();
+    let actual: Vec<&str> = obs.files.iter().map(|(name, _)| name.as_str()).collect();
+    if expected == actual {
+        for ((name, want), (_, got)) in golden.files.iter().zip(&obs.files) {
+            problems.extend(file_problem(&format!("file {name}"), want, got));
+        }
+    } else {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|n| !actual.contains(n))
+            .copied()
+            .collect();
+        let unexpected: Vec<&str> = actual
+            .iter()
+            .filter(|n| !expected.contains(n))
+            .copied()
+            .collect();
+        problems.push(format!(
+            "files: expected {} files, actual {}; missing [{}]; unexpected [{}]",
+            expected.len(),
+            actual.len(),
+            name_list(&missing),
+            name_list(&unexpected)
+        ));
+    }
+    problems_to_result(cell_id, problems)
+}
+
+/// The two runs of one directory cell must record the same thing. The error names
+/// the cell and each differing part, bounded like [`compare`]'s (the first run is
+/// shown as "expected").
+pub fn compare_runs(
+    cell_id: &str,
+    first: &DirObserved,
+    second: &DirObserved,
+) -> Result<(), String> {
+    if first == second {
+        return Ok(());
+    }
     let mut problems = Vec::new();
-    if golden.exit != obs.exit {
+    for (label, a, b) in [
+        ("exit", first.exit.to_string(), second.exit.to_string()),
+        (
+            "$TMP replacements",
+            first.tmp_paths.to_string(),
+            second.tmp_paths.to_string(),
+        ),
+        (
+            "temp-name replacements",
+            first.tmp_names.to_string(),
+            second.tmp_names.to_string(),
+        ),
+    ] {
+        if a != b {
+            problems.push(format!("{label}: first run {a}, second run {b}"));
+        }
+    }
+    for (label, a, b) in [
+        ("stdout", &first.stdout, &second.stdout),
+        ("stderr", &first.stderr, &second.stderr),
+    ] {
+        if a != b {
+            problems.push(format!(
+                "{label}: first run {} bytes, second run {} bytes; {}",
+                a.len(),
+                b.len(),
+                first_difference(a, b)
+            ));
+        }
+    }
+    if first.files != second.files {
+        problems.push(
+            match first.files.iter().zip(&second.files).find(|(a, b)| a != b) {
+                Some(((a, fa), (b, fb))) => format!(
+                    "files: first run {a} {}, second run {b} {}",
+                    observed_file_kind(fa),
+                    observed_file_kind(fb)
+                ),
+                None => format!(
+                    "files: first run {} files, second run {}",
+                    first.files.len(),
+                    second.files.len()
+                ),
+            },
+        );
+    }
+    Err(format!(
+        "cell {cell_id}: the two runs differ:\n  {}",
+        problems.join("\n  ")
+    ))
+}
+
+/// The parts of a golden every cell records besides its file record(s).
+struct ExpectedOutputs<'a> {
+    exit: i32,
+    stdout: &'a Stream,
+    stderr: &'a Stream,
+    tmp_paths: u32,
+    tmp_names: u32,
+}
+
+/// The observed twin of [`ExpectedOutputs`].
+struct ObservedOutputs<'a> {
+    exit: i32,
+    stdout: &'a str,
+    stderr: &'a str,
+    tmp_paths: u32,
+    tmp_names: u32,
+}
+
+fn output_problems(expected: &ExpectedOutputs<'_>, actual: &ObservedOutputs<'_>) -> Vec<String> {
+    let mut problems = Vec::new();
+    if expected.exit != actual.exit {
         problems.push(format!(
             "exit: expected {}, actual {}",
-            golden.exit, obs.exit
+            expected.exit, actual.exit
         ));
     }
-    if golden.tmp_paths != obs.tmp_paths {
+    if expected.tmp_paths != actual.tmp_paths {
         problems.push(format!(
             "$TMP replacements: expected {}, actual {}",
-            golden.tmp_paths, obs.tmp_paths
+            expected.tmp_paths, actual.tmp_paths
         ));
     }
-    if golden.tmp_names != obs.tmp_names {
+    if expected.tmp_names != actual.tmp_names {
         problems.push(format!(
             "temp-name replacements: expected {}, actual {}",
-            golden.tmp_names, obs.tmp_names
+            expected.tmp_names, actual.tmp_names
         ));
     }
-    if let Err(e) = compare_stream("stdout", &golden.stdout, &obs.stdout) {
+    if let Err(e) = compare_stream("stdout", expected.stdout, actual.stdout) {
         problems.push(e);
     }
-    if let Err(e) = compare_stream("stderr", &golden.stderr, &obs.stderr) {
+    if let Err(e) = compare_stream("stderr", expected.stderr, actual.stderr) {
         problems.push(e);
     }
-    match (&golden.file, &obs.file) {
+    problems
+}
+
+/// One file record against its golden; `label` names the file in the message.
+fn file_problem(label: &str, expected: &FileAfter, actual: &ObservedFile) -> Option<String> {
+    match (expected, actual) {
         (FileAfter::Unchanged, ObservedFile::Unchanged)
-        | (FileAfter::Missing, ObservedFile::Missing) => {}
+        | (FileAfter::Missing, ObservedFile::Missing) => None,
         (FileAfter::Changed(expected), ObservedFile::Changed(actual)) => {
-            if let Err(e) = compare_stream("file", expected, actual) {
-                problems.push(e);
-            }
+            compare_stream(label, expected, actual).err()
         }
-        (expected, actual) => problems.push(format!(
-            "file: expected {}, actual {}",
+        (expected, actual) => Some(format!(
+            "{label}: expected {}, actual {}",
             file_kind(expected),
             observed_file_kind(actual)
         )),
     }
+}
+
+fn problems_to_result(cell_id: &str, problems: Vec<String>) -> Result<(), String> {
     if problems.is_empty() {
         Ok(())
     } else {
         Err(format!("cell {cell_id}:\n  {}", problems.join("\n  ")))
+    }
+}
+
+/// At most this many file names are listed in one failure message.
+const MAX_LISTED_NAMES: usize = 16;
+
+fn name_list(names: &[&str]) -> String {
+    let shown: Vec<&str> = names.iter().take(MAX_LISTED_NAMES).copied().collect();
+    let hidden = names.len() - shown.len();
+    if hidden == 0 {
+        shown.join(", ")
+    } else {
+        format!("{}, and {hidden} more", shown.join(", "))
     }
 }
 
@@ -1017,15 +1745,40 @@ pub fn check_group(input: Input, fixture: Fixture, goldens: &[Golden], cells: &[
                     failures.push(e);
                 }
             }
-            Err(Skip::ReadOnlyDirIsWritable) => {
-                eprintln!(
-                    "skipping {id}: a 0o555 directory accepts new files here (running as \
-                     euid 0, or the filesystem ignores mode bits), so the write-failure \
-                     precondition cannot be built"
-                );
-            }
+            Err(skip) => eprintln!("skipping {id}: {}", skip.reason()),
         }
     }
+    report_failures(&failures, total);
+}
+
+/// Run every active cell of one directory fixture twice, then against its golden.
+pub fn check_dir_group(fixture: DirFixture, goldens: &[DirGolden], cells: &[(&str, u16)]) {
+    let mut failures = Vec::new();
+    let mut total = 0usize;
+    for cell in dir_group_cells(fixture) {
+        if !cell.active() {
+            continue;
+        }
+        let id = cell.id();
+        let golden = lookup(&id, goldens, cells);
+        match run_dir_cell(&cell) {
+            Ok(obs) => {
+                total += 1;
+                if let Err(e) = compare_dir(&id, golden, &obs) {
+                    failures.push(e);
+                }
+            }
+            Err(DirFailure::Nondeterministic(e)) => {
+                total += 1;
+                failures.push(e);
+            }
+            Err(DirFailure::Skipped(skip)) => eprintln!("skipping {id}: {}", skip.reason()),
+        }
+    }
+    report_failures(&failures, total);
+}
+
+fn report_failures(failures: &[String], total: usize) {
     if !failures.is_empty() {
         let shown: Vec<&str> = failures
             .iter()
@@ -1042,7 +1795,7 @@ pub fn check_group(input: Input, fixture: Fixture, goldens: &[Golden], cells: &[
 }
 
 /// The golden a cell id maps to (the table is checked separately for completeness).
-pub fn lookup<'g>(id: &str, goldens: &'g [Golden], cells: &[(&str, u16)]) -> &'g Golden {
+pub fn lookup<'g, G>(id: &str, goldens: &'g [G], cells: &[(&str, u16)]) -> &'g G {
     let index = cells
         .iter()
         .find(|(cell, _)| *cell == id)
@@ -1082,39 +1835,99 @@ fn stored_len(text: &str) -> usize {
 /// Strings are written with Rust's `Debug` escaping, so every literal is a single line
 /// and every control character is a braced escape.
 pub fn render_data_module(title: &str, cells: &[Cell]) -> (String, GenerationSummary) {
+    let rendered = cells.iter().map(|cell| {
+        let obs = run_cell(cell).unwrap_or_else(|skip| {
+            panic!(
+                "{}: the generator needs a run where permissions hold: {}",
+                cell.id(),
+                skip.reason()
+            )
+        });
+        Rendered {
+            id: cell.id(),
+            literal: golden_literal(&obs),
+            stored: stored_len(&obs.stdout) + stored_len(&obs.stderr) + file_stored_len(&obs.file),
+            tmp_paths: obs.tmp_paths,
+            tmp_names: obs.tmp_names,
+        }
+    });
+    render_module(title, "Golden", rendered)
+}
+
+/// As [`render_data_module`], for directory cells: each cell is run twice and the
+/// generator stops at the first cell whose two runs differ.
+pub fn render_dir_module(title: &str, cells: &[DirCell]) -> (String, GenerationSummary) {
+    let rendered = cells.iter().map(|cell| {
+        let obs = match run_dir_cell(cell) {
+            Ok(obs) => obs,
+            Err(DirFailure::Skipped(skip)) => panic!(
+                "{}: the generator needs a run where permissions hold: {}",
+                cell.id(),
+                skip.reason()
+            ),
+            Err(DirFailure::Nondeterministic(e)) => panic!("{e}"),
+        };
+        Rendered {
+            id: cell.id(),
+            literal: dir_golden_literal(&obs),
+            stored: stored_len(&obs.stdout)
+                + stored_len(&obs.stderr)
+                + obs
+                    .files
+                    .iter()
+                    .map(|(name, file)| name.len() + file_stored_len(file))
+                    .sum::<usize>(),
+            tmp_paths: obs.tmp_paths,
+            tmp_names: obs.tmp_names,
+        }
+    });
+    render_module(title, "DirGolden", rendered)
+}
+
+/// One cell's golden literal, ready for [`render_module`].
+struct Rendered {
+    id: String,
+    literal: String,
+    /// Bytes of golden text the literal stores.
+    stored: usize,
+    tmp_paths: u32,
+    tmp_names: u32,
+}
+
+/// Deduplicate the cells' goldens and render the module: a `GOLDENS` table of
+/// `golden_type` literals and a `CELLS` table mapping each cell id to its golden.
+fn render_module(
+    title: &str,
+    golden_type: &str,
+    rendered: impl Iterator<Item = Rendered>,
+) -> (String, GenerationSummary) {
     let mut goldens: Vec<String> = Vec::new();
     let mut table: Vec<(String, usize)> = Vec::new();
-    let mut summary = GenerationSummary {
-        cells: cells.len(),
-        ..GenerationSummary::default()
-    };
-    for cell in cells {
-        let obs = match run_cell(cell) {
-            Ok(obs) => obs,
-            Err(Skip::ReadOnlyDirIsWritable) => panic!(
-                "{}: the generator needs a non-root run where a 0o555 directory refuses \
-                 new files",
-                cell.id()
-            ),
-        };
-        summary.tmp_paths += u64::from(obs.tmp_paths);
-        summary.tmp_names += u64::from(obs.tmp_names);
-        let literal = golden_literal(&obs);
-        let index = match goldens.iter().position(|g| *g == literal) {
+    let mut summary = GenerationSummary::default();
+    for cell in rendered {
+        summary.cells += 1;
+        summary.tmp_paths += u64::from(cell.tmp_paths);
+        summary.tmp_names += u64::from(cell.tmp_names);
+        let index = match goldens.iter().position(|g| *g == cell.literal) {
             Some(i) => i,
             None => {
-                summary.data_bytes += stored_len(&obs.stdout)
-                    + stored_len(&obs.stderr)
-                    + match &obs.file {
-                        ObservedFile::Changed(t) => stored_len(t),
-                        ObservedFile::Unchanged | ObservedFile::Missing => 0,
-                    };
-                goldens.push(literal);
+                summary.data_bytes += cell.stored;
+                goldens.push(cell.literal);
                 goldens.len() - 1
             }
         };
-        table.push((cell.id(), index));
+        table.push((cell.id, index));
     }
+    // Import only what the literals use (an unused import is a warning).
+    let mut imports = vec![golden_type, "Stream"];
+    if goldens.iter().any(|g| g.contains("Stream::Digest(")) {
+        imports.push("Digest");
+    }
+    if goldens.iter().any(|g| g.contains("FileAfter::")) {
+        imports.push("FileAfter");
+    }
+    imports.sort_unstable();
+
     let mut out = String::new();
     let _ = writeln!(out, "//! Generated `mds lint` goldens (#309): {title}.");
     out.push_str(
@@ -1123,10 +1936,12 @@ pub fn render_data_module(title: &str, cells: &[Cell]) -> (String, GenerationSum
          //! `MDS_GOLDEN_PRINT=1 cargo nextest run -p mds-cli --test lint_golden \
          golden_print_mode --no-capture`,\n\
          //! copy the module printed between the BEGIN/END markers into this file, and name\n\
-         //! every cell whose golden changed in the commit message.\n\n\
-         use super::harness::{Digest, FileAfter, Golden, Stream};\n\n\
-         #[rustfmt::skip]\n\
-         pub const GOLDENS: &[Golden] = &[\n",
+         //! every cell whose golden changed in the commit message.\n\n",
+    );
+    let _ = writeln!(out, "use super::harness::{{{}}};\n", imports.join(", "));
+    let _ = writeln!(
+        out,
+        "#[rustfmt::skip]\npub const GOLDENS: &[{golden_type}] = &["
     );
     for (i, g) in goldens.iter().enumerate() {
         let _ = writeln!(out, "    /* {i} */ {g},");
@@ -1140,20 +1955,48 @@ pub fn render_data_module(title: &str, cells: &[Cell]) -> (String, GenerationSum
     (out, summary)
 }
 
+fn file_stored_len(file: &ObservedFile) -> usize {
+    match file {
+        ObservedFile::Changed(t) => stored_len(t),
+        ObservedFile::Unchanged | ObservedFile::Missing => 0,
+    }
+}
+
 fn golden_literal(obs: &Observed) -> String {
-    let file = match &obs.file {
-        ObservedFile::Unchanged => "FileAfter::Unchanged".to_string(),
-        ObservedFile::Missing => "FileAfter::Missing".to_string(),
-        ObservedFile::Changed(t) => format!("FileAfter::Changed({})", stream_literal(t)),
-    };
     format!(
-        "Golden {{ exit: {}, stdout: {}, stderr: {}, file: {file}, tmp_paths: {}, tmp_names: {} }}",
+        "Golden {{ exit: {}, stdout: {}, stderr: {}, file: {}, tmp_paths: {}, tmp_names: {} }}",
         obs.exit,
         stream_literal(&obs.stdout),
         stream_literal(&obs.stderr),
+        file_after_literal(&obs.file),
         obs.tmp_paths,
         obs.tmp_names
     )
+}
+
+fn dir_golden_literal(obs: &DirObserved) -> String {
+    let files: Vec<String> = obs
+        .files
+        .iter()
+        .map(|(name, file)| format!("({name:?}, {})", file_after_literal(file)))
+        .collect();
+    format!(
+        "DirGolden {{ exit: {}, stdout: {}, stderr: {}, files: &[{}], tmp_paths: {}, tmp_names: {} }}",
+        obs.exit,
+        stream_literal(&obs.stdout),
+        stream_literal(&obs.stderr),
+        files.join(", "),
+        obs.tmp_paths,
+        obs.tmp_names
+    )
+}
+
+fn file_after_literal(file: &ObservedFile) -> String {
+    match file {
+        ObservedFile::Unchanged => "FileAfter::Unchanged".to_string(),
+        ObservedFile::Missing => "FileAfter::Missing".to_string(),
+        ObservedFile::Changed(t) => format!("FileAfter::Changed({})", stream_literal(t)),
+    }
 }
 
 fn stream_literal(text: &str) -> String {
@@ -1180,41 +2023,72 @@ pub fn print_module(name: &str, module: &str, summary: &GenerationSummary) {
 
 /// Bytes of golden text: inline streams, digest heads/tails and changed file bytes.
 pub fn golden_data_bytes(goldens: &[Golden]) -> usize {
-    fn stream(s: &Stream) -> usize {
-        match s {
-            Stream::Text(t) => t.len(),
-            Stream::Digest(d) => d.head.len() + d.tail.len(),
-        }
-    }
+    goldens
+        .iter()
+        .map(|g| stream_bytes(&g.stdout) + stream_bytes(&g.stderr) + file_bytes(&g.file))
+        .sum()
+}
+
+/// As [`golden_data_bytes`], for directory goldens; file names count too.
+pub fn dir_golden_data_bytes(goldens: &[DirGolden]) -> usize {
     goldens
         .iter()
         .map(|g| {
-            stream(&g.stdout)
-                + stream(&g.stderr)
-                + match &g.file {
-                    FileAfter::Changed(s) => stream(s),
-                    FileAfter::Unchanged | FileAfter::Missing => 0,
-                }
+            stream_bytes(&g.stdout)
+                + stream_bytes(&g.stderr)
+                + g.files
+                    .iter()
+                    .map(|(name, file)| name.len() + file_bytes(file))
+                    .sum::<usize>()
         })
         .sum()
 }
 
+fn stream_bytes(s: &Stream) -> usize {
+    match s {
+        Stream::Text(t) => t.len(),
+        Stream::Digest(d) => d.head.len() + d.tail.len(),
+    }
+}
+
+fn file_bytes(f: &FileAfter) -> usize {
+    match f {
+        FileAfter::Changed(s) => stream_bytes(s),
+        FileAfter::Unchanged | FileAfter::Missing => 0,
+    }
+}
+
 /// Every stored string of a golden (inline streams, digest heads/tails, file bytes).
 pub fn golden_strings(g: &Golden) -> Vec<&'static str> {
-    fn stream(s: &Stream, out: &mut Vec<&'static str>) {
-        match s {
-            Stream::Text(t) => out.push(t),
-            Stream::Digest(d) => {
-                out.push(d.head);
-                out.push(d.tail);
-            }
-        }
-    }
     let mut out = Vec::new();
-    stream(&g.stdout, &mut out);
-    stream(&g.stderr, &mut out);
+    push_stream_strings(&g.stdout, &mut out);
+    push_stream_strings(&g.stderr, &mut out);
     if let FileAfter::Changed(s) = &g.file {
-        stream(s, &mut out);
+        push_stream_strings(s, &mut out);
     }
     out
+}
+
+/// Every stored string of a directory golden, file names included.
+pub fn dir_golden_strings(g: &DirGolden) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    push_stream_strings(&g.stdout, &mut out);
+    push_stream_strings(&g.stderr, &mut out);
+    for (name, file) in g.files {
+        out.push(name);
+        if let FileAfter::Changed(s) = file {
+            push_stream_strings(s, &mut out);
+        }
+    }
+    out
+}
+
+fn push_stream_strings(s: &Stream, out: &mut Vec<&'static str>) {
+    match s {
+        Stream::Text(t) => out.push(t),
+        Stream::Digest(d) => {
+            out.push(d.head);
+            out.push(d.tail);
+        }
+    }
 }
