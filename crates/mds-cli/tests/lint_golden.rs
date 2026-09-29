@@ -690,6 +690,24 @@ fn normalizer_rewrites_every_tempdir_spelling() {
     assert_eq!(count, 1);
 }
 
+#[test]
+fn ancestor_config_finds_an_mds_json_above_a_directory_only() {
+    // `fixture_dir` itself refuses a directory with an `mds.json` above it.
+    let outer = harness::fixture_dir();
+    let inner = outer.path().join("inner");
+    std::fs::create_dir(&inner).expect("create inner dir");
+    // A directory's own mds.json belongs to its fixture and is not reported ...
+    std::fs::write(inner.join("mds.json"), "{}").expect("write inner mds.json");
+    assert_eq!(harness::ancestor_config(&inner), None);
+    // ... one in the directory above is (positive control).
+    std::fs::write(outer.path().join("mds.json"), "{}").expect("write outer mds.json");
+    let canonical_outer = std::fs::canonicalize(outer.path()).expect("canonicalize");
+    assert_eq!(
+        harness::ancestor_config(&inner),
+        Some(canonical_outer.join("mds.json"))
+    );
+}
+
 // ── Fixture markers (checked against the tool, not the goldens) ──────────────
 
 fn report_json(fixture: Fixture) -> (i32, serde_json::Value) {
@@ -853,7 +871,7 @@ fn fixture_markers_hold() {
             assert_eq!(obs.file, ObservedFile::Unchanged, "write-fail");
             assert_ne!(obs.exit, 0, "write-fail");
         }
-        Err(skip) => eprintln!("skipping the write-fail marker: {skip:?}"),
+        Err(skip) => harness::announce_skip("the write-fail marker", skip.reason()),
     }
 }
 
@@ -865,7 +883,7 @@ fn dir_run(fixture: DirFixture, args: &[&str], locking: Locking) -> Option<DirOb
     match harness::run_dir(fixture, &id, args, Order::Forward, locking) {
         Ok(obs) => Some(obs),
         Err(skip) => {
-            eprintln!("skipping {id}: {}", skip.reason());
+            harness::announce_skip(&id, skip.reason());
             None
         }
     }

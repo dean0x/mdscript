@@ -779,13 +779,37 @@ impl Skip {
 /// `/` boundaries, so a long, machine-specific temp root (macOS's
 /// `/private/var/folders/…/T`) would move the line breaks from machine to machine. A
 /// path under `/tmp` (`/private/tmp` on macOS) is short enough never to wrap.
+///
+/// `mds lint` applies the nearest `mds.json` above its input, so one in a directory
+/// above the fixture directory (a stray `/tmp/mds.json`, say) would change every cell
+/// and, during generation, every golden. That stops the run and names the file.
 pub fn fixture_dir() -> tempfile::TempDir {
     let dir = if cfg!(unix) {
         tempfile::Builder::new().tempdir_in("/tmp")
     } else {
         tempfile::tempdir()
     };
-    dir.expect("create fixture tempdir")
+    let dir = dir.expect("create fixture tempdir");
+    if let Some(config) = ancestor_config(dir.path()) {
+        panic!(
+            "{} lies above the fixture directory and would apply to every lint golden \
+             cell; move it away and rerun",
+            config.display()
+        );
+    }
+    dir
+}
+
+/// The first `mds.json` file in a directory strictly above `dir`, looked up on the
+/// canonical path as `mds lint` does. `dir`'s own `mds.json` is not reported.
+pub fn ancestor_config(dir: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(dir)
+        .unwrap_or_else(|e| panic!("canonicalize {}: {e}", dir.display()));
+    canonical
+        .ancestors()
+        .skip(1)
+        .map(|ancestor| ancestor.join("mds.json"))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Run one cell in a fresh fixture directory.
@@ -1756,6 +1780,7 @@ const MAX_REPORTED_FAILURES: usize = 5;
 pub fn check_group(input: Input, fixture: Fixture, goldens: &[Golden], cells: &[(&str, u16)]) {
     let mut failures = Vec::new();
     let mut total = 0usize;
+    let mut skipped: Vec<&'static str> = Vec::new();
     for cell in group_cells(input, fixture) {
         if !cell.active() {
             continue;
@@ -1769,16 +1794,18 @@ pub fn check_group(input: Input, fixture: Fixture, goldens: &[Golden], cells: &[
                     failures.push(e);
                 }
             }
-            Err(skip) => eprintln!("skipping {id}: {}", skip.reason()),
+            Err(skip) => skipped.push(skip.reason()),
         }
     }
-    report_failures(&failures, total);
+    let group = format!("{}/*/*/*/{}", input.name(), fixture.name());
+    finish_group(&group, &failures, total, &skipped);
 }
 
 /// Run every active cell of one directory fixture twice, then against its golden.
 pub fn check_dir_group(fixture: DirFixture, goldens: &[DirGolden], cells: &[(&str, u16)]) {
     let mut failures = Vec::new();
     let mut total = 0usize;
+    let mut skipped: Vec<&'static str> = Vec::new();
     for cell in dir_group_cells(fixture) {
         if !cell.active() {
             continue;
@@ -1796,10 +1823,48 @@ pub fn check_dir_group(fixture: DirFixture, goldens: &[DirGolden], cells: &[(&st
                 total += 1;
                 failures.push(e);
             }
-            Err(DirFailure::Skipped(skip)) => eprintln!("skipping {id}: {}", skip.reason()),
+            Err(DirFailure::Skipped(skip)) => skipped.push(skip.reason()),
         }
     }
-    report_failures(&failures, total);
+    let group = format!("dir/*/*/*/{}", fixture.name());
+    finish_group(&group, &failures, total, &skipped);
+}
+
+/// End a group: a group in which no cell ran or was skipped fails (its cells are
+/// filtered out on this platform, which a green test would hide), skipped cells are
+/// announced with [`announce_skip`], and any differing cell fails the group.
+fn finish_group(group: &str, failures: &[String], compared: usize, skipped: &[&'static str]) {
+    assert!(
+        compared + skipped.len() > 0,
+        "{group}: no cell of this group runs on this platform"
+    );
+    if let Some(reason) = skipped.first() {
+        announce_skip(
+            &format!(
+                "{} of the {} cells {group}",
+                skipped.len(),
+                compared + skipped.len()
+            ),
+            reason,
+        );
+    }
+    report_failures(failures, compared);
+}
+
+/// Announce a skip where a passing run cannot hide it: a `SKIPPED` line on stderr and,
+/// under GitHub Actions, a warning in the job summary (as `cli_watch.rs` does). A
+/// skipped cell is never counted as compared. The summary write is best effort.
+pub fn announce_skip(what: &str, reason: &str) {
+    eprintln!("SKIPPED {what}: {reason}");
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut summary) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            let _ = writeln!(summary, ":warning: lint goldens: skipped {what}: {reason}");
+        }
+    }
 }
 
 fn report_failures(failures: &[String], total: usize) {
