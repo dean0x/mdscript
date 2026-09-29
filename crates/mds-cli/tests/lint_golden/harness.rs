@@ -397,16 +397,47 @@ pub struct Cell {
     pub fixture: Fixture,
 }
 
+/// `format/quiet/fix-mode/fixture`, the id suffix shared by `Cell::id` and `DirCell::id`.
+fn variant_id(format: Format, quiet: Quiet, fix: FixMode, fixture: &str) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        format.name(),
+        quiet.name(),
+        fix.name(),
+        fixture
+    )
+}
+
+/// The `lint` args common to `Cell` and `DirCell`: format, quiet and fix-mode flags.
+fn lint_args(format: Format, quiet: Quiet, fix: FixMode) -> Vec<&'static str> {
+    let mut args = vec!["lint"];
+    args.extend_from_slice(format.args());
+    args.extend_from_slice(quiet.args());
+    args.extend_from_slice(fix.args());
+    args
+}
+
+/// Every (format, quiet, fix mode) combination, in table order (20 total). Shared by
+/// `group_cells` and `dir_group_cells`.
+fn variant_combinations() -> Vec<(Format, Quiet, FixMode)> {
+    let mut out = Vec::with_capacity(20);
+    for format in Format::ALL {
+        for quiet in Quiet::ALL {
+            for fix in FixMode::ALL {
+                out.push((format, quiet, fix));
+            }
+        }
+    }
+    out
+}
+
 impl Cell {
     /// `input/format/quiet/fix-mode/fixture`, e.g. `file/json/loud/fix-check/partial`.
     pub fn id(&self) -> String {
         format!(
-            "{}/{}/{}/{}/{}",
+            "{}/{}",
             self.input.name(),
-            self.format.name(),
-            self.quiet.name(),
-            self.fix.name(),
-            self.fixture.name()
+            variant_id(self.format, self.quiet, self.fix, self.fixture.name())
         )
     }
 
@@ -416,10 +447,7 @@ impl Cell {
     }
 
     fn args(&self) -> Vec<&'static str> {
-        let mut args = vec!["lint"];
-        args.extend_from_slice(self.format.args());
-        args.extend_from_slice(self.quiet.args());
-        args.extend_from_slice(self.fix.args());
+        let mut args = lint_args(self.format, self.quiet, self.fix);
         args.push(match self.input {
             Input::Stdin => "-",
             Input::File => self.fixture.file_name(),
@@ -430,21 +458,16 @@ impl Cell {
 
 /// The cells of one (input, fixture) group, in table order.
 pub fn group_cells(input: Input, fixture: Fixture) -> Vec<Cell> {
-    let mut cells = Vec::with_capacity(20);
-    for format in Format::ALL {
-        for quiet in Quiet::ALL {
-            for fix in FixMode::ALL {
-                cells.push(Cell {
-                    input,
-                    format,
-                    quiet,
-                    fix,
-                    fixture,
-                });
-            }
-        }
-    }
-    cells
+    variant_combinations()
+        .into_iter()
+        .map(|(format, quiet, fix)| Cell {
+            input,
+            format,
+            quiet,
+            fix,
+            fixture,
+        })
+        .collect()
 }
 
 /// Every stdin and single-file cell, on every platform, in table order.
@@ -635,11 +658,8 @@ impl DirCell {
     /// `dir/format/quiet/fix-mode/fixture`, e.g. `dir/json/loud/fix/mixed`.
     pub fn id(&self) -> String {
         format!(
-            "dir/{}/{}/{}/{}",
-            self.format.name(),
-            self.quiet.name(),
-            self.fix.name(),
-            self.fixture.name()
+            "dir/{}",
+            variant_id(self.format, self.quiet, self.fix, self.fixture.name())
         )
     }
 
@@ -649,10 +669,7 @@ impl DirCell {
     }
 
     fn args(&self) -> Vec<&'static str> {
-        let mut args = vec!["lint"];
-        args.extend_from_slice(self.format.args());
-        args.extend_from_slice(self.quiet.args());
-        args.extend_from_slice(self.fix.args());
+        let mut args = lint_args(self.format, self.quiet, self.fix);
         args.push(DIR_ARG);
         args
     }
@@ -660,20 +677,15 @@ impl DirCell {
 
 /// The cells of one directory fixture, in table order.
 pub fn dir_group_cells(fixture: DirFixture) -> Vec<DirCell> {
-    let mut cells = Vec::with_capacity(20);
-    for format in Format::ALL {
-        for quiet in Quiet::ALL {
-            for fix in FixMode::ALL {
-                cells.push(DirCell {
-                    format,
-                    quiet,
-                    fix,
-                    fixture,
-                });
-            }
-        }
-    }
-    cells
+    variant_combinations()
+        .into_iter()
+        .map(|(format, quiet, fix)| DirCell {
+            format,
+            quiet,
+            fix,
+            fixture,
+        })
+        .collect()
 }
 
 /// Every directory cell, on every platform, in table order.
@@ -1417,22 +1429,7 @@ const DIFF_LINE_CHARS: usize = 160;
 /// Compare an observation with its golden. The error names the cell and the part that
 /// differs, with lengths and the first differing line ±3 lines — never a whole stream.
 pub fn compare(cell_id: &str, golden: &Golden, obs: &Observed) -> Result<(), String> {
-    let mut problems = output_problems(
-        &ExpectedOutputs {
-            exit: golden.exit,
-            stdout: &golden.stdout,
-            stderr: &golden.stderr,
-            tmp_paths: golden.tmp_paths,
-            tmp_names: golden.tmp_names,
-        },
-        &ObservedOutputs {
-            exit: obs.exit,
-            stdout: &obs.stdout,
-            stderr: &obs.stderr,
-            tmp_paths: obs.tmp_paths,
-            tmp_names: obs.tmp_names,
-        },
-    );
+    let mut problems = output_problems(&expected_outputs(golden), &observed_outputs(obs));
     problems.extend(file_problem("file", &golden.file, &obs.file));
     problems_to_result(cell_id, problems)
 }
@@ -1440,22 +1437,7 @@ pub fn compare(cell_id: &str, golden: &Golden, obs: &Observed) -> Result<(), Str
 /// Compare a directory observation with its golden: as [`compare`], with one record
 /// per file. A differing set of files is reported by name.
 pub fn compare_dir(cell_id: &str, golden: &DirGolden, obs: &DirObserved) -> Result<(), String> {
-    let mut problems = output_problems(
-        &ExpectedOutputs {
-            exit: golden.exit,
-            stdout: &golden.stdout,
-            stderr: &golden.stderr,
-            tmp_paths: golden.tmp_paths,
-            tmp_names: golden.tmp_names,
-        },
-        &ObservedOutputs {
-            exit: obs.exit,
-            stdout: &obs.stdout,
-            stderr: &obs.stderr,
-            tmp_paths: obs.tmp_paths,
-            tmp_names: obs.tmp_names,
-        },
-    );
+    let mut problems = output_problems(&dir_expected_outputs(golden), &dir_observed_outputs(obs));
     let expected: Vec<&str> = golden.files.iter().map(|(name, _)| *name).collect();
     let actual: Vec<&str> = obs.files.iter().map(|(name, _)| name.as_str()).collect();
     if expected == actual {
@@ -1564,6 +1546,48 @@ struct ObservedOutputs<'a> {
     stderr: &'a str,
     tmp_paths: u32,
     tmp_names: u32,
+}
+
+fn expected_outputs(golden: &Golden) -> ExpectedOutputs<'_> {
+    ExpectedOutputs {
+        exit: golden.exit,
+        stdout: &golden.stdout,
+        stderr: &golden.stderr,
+        tmp_paths: golden.tmp_paths,
+        tmp_names: golden.tmp_names,
+    }
+}
+
+/// As [`expected_outputs`], for a directory golden.
+fn dir_expected_outputs(golden: &DirGolden) -> ExpectedOutputs<'_> {
+    ExpectedOutputs {
+        exit: golden.exit,
+        stdout: &golden.stdout,
+        stderr: &golden.stderr,
+        tmp_paths: golden.tmp_paths,
+        tmp_names: golden.tmp_names,
+    }
+}
+
+fn observed_outputs(obs: &Observed) -> ObservedOutputs<'_> {
+    ObservedOutputs {
+        exit: obs.exit,
+        stdout: &obs.stdout,
+        stderr: &obs.stderr,
+        tmp_paths: obs.tmp_paths,
+        tmp_names: obs.tmp_names,
+    }
+}
+
+/// As [`observed_outputs`], for a directory observation.
+fn dir_observed_outputs(obs: &DirObserved) -> ObservedOutputs<'_> {
+    ObservedOutputs {
+        exit: obs.exit,
+        stdout: &obs.stdout,
+        stderr: &obs.stderr,
+        tmp_paths: obs.tmp_paths,
+        tmp_names: obs.tmp_names,
+    }
 }
 
 fn output_problems(expected: &ExpectedOutputs<'_>, actual: &ObservedOutputs<'_>) -> Vec<String> {
