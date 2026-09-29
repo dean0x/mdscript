@@ -22,7 +22,6 @@
 //! - 2: file not found / not `.mds` / I/O / bad UTF-8
 //! - 3: oversized source
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use mds::effective_parent;
@@ -30,7 +29,7 @@ use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, render_unified_diff, Durability,
+    atomic_write_file, collect_mds_files_detailed, render_unified_diff, write_stdout, Durability,
 };
 
 pub(crate) struct FmtArgs {
@@ -59,7 +58,7 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
 
     let (input, auto_detected) = resolve_input(input, "fmt")?;
     if auto_detected && !quiet {
-        eprintln!("Formatting {}", crate::output::safe_path(&input));
+        crate::output::ewriteln!("Formatting {}", crate::output::safe_path(&input));
     }
 
     let flags = FmtFlags { check, diff, quiet };
@@ -124,22 +123,21 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
     // `None` is the working directory, shown as "." (see `read_stdin`).
     let result = format_source_named(&source, None, STDIN_DISPLAY_LABEL)?;
 
+    // A closed stdout is not an error here: the reader is gone, and the verdict below
+    // still stands (#157).
     if diff {
-        print_diff(&render_unified_diff(
-            &source,
-            &result.formatted,
-            STDIN_DISPLAY_LABEL,
-        ))?;
+        let rendered = render_unified_diff(&source, &result.formatted, STDIN_DISPLAY_LABEL);
+        write_stdout(rendered.as_bytes()).into_batch_result()?;
     } else if !check {
         // Plain filter mode: formatted content is the output.
-        write_stdout(&result.formatted)?;
+        write_stdout(result.formatted.as_bytes()).into_batch_result()?;
     }
 
     if check && result.changed {
         if !quiet {
-            eprintln!("Would reformat: {STDIN_DISPLAY_LABEL}");
+            crate::output::ewriteln!("Would reformat: {STDIN_DISPLAY_LABEL}");
         }
-        std::process::exit(1);
+        crate::output::exit(1);
     }
     Ok(())
 }
@@ -159,7 +157,8 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
 
     if diff && result.changed {
         let label = crate::output::safe_path(path);
-        print_diff(&render_unified_diff(&source, &result.formatted, &label))?;
+        let rendered = render_unified_diff(&source, &result.formatted, &label);
+        write_stdout(rendered.as_bytes()).into_batch_result()?;
     }
 
     let read_only = check || diff;
@@ -170,10 +169,10 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
             // commit c5aa086 — both write paths now share the same helper).
             atomic_write_file(path, &result.formatted, Durability::Fsync)?;
             if !quiet {
-                eprintln!("Formatted: {}", crate::output::safe_path(path));
+                crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
             }
         } else if !quiet {
-            eprintln!("Unchanged: {}", crate::output::safe_path(path));
+            crate::output::ewriteln!("Unchanged: {}", crate::output::safe_path(path));
         }
         return Ok(());
     }
@@ -181,12 +180,12 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     if check {
         if result.changed {
             if !quiet {
-                eprintln!("Would reformat: {}", crate::output::safe_path(path));
+                crate::output::ewriteln!("Would reformat: {}", crate::output::safe_path(path));
             }
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         if !quiet {
-            eprintln!("Unchanged: {}", crate::output::safe_path(path));
+            crate::output::ewriteln!("Unchanged: {}", crate::output::safe_path(path));
         }
     }
     Ok(())
@@ -213,9 +212,10 @@ enum FileOutcome {
 /// All per-file error and status lines are printed as side effects so the
 /// directory loop only needs to tally the returned [`FileOutcome`].
 ///
-/// A diff-output failure (non-broken-pipe stdout error) is returned as
+/// A diff-output failure other than a closed stdout is returned as
 /// [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
-/// read and format errors are treated in the surrounding loop.
+/// read and format errors are treated in the surrounding loop. A closed stdout is not a
+/// failure: the diff has no reader, and the file's outcome stands (#157).
 fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, quiet } = flags;
     let file_name = file.display().to_string();
@@ -241,9 +241,9 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     };
 
     if diff && result.changed {
-        let label = file_name.clone();
-        if let Err(e) = print_diff(&render_unified_diff(&source, &result.formatted, &label)) {
-            crate::output::eprint_error(e);
+        let rendered = render_unified_diff(&source, &result.formatted, &file_name);
+        if let Err(e) = write_stdout(rendered.as_bytes()).into_batch_result() {
+            crate::output::eprint_error(e.into());
             return FileOutcome::Failed;
         }
     }
@@ -264,7 +264,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         match atomic_write_file(file, &result.formatted, Durability::Fsync) {
             Ok(()) => {
                 if !quiet {
-                    eprintln!("Formatted: {}", crate::output::safe_path(file));
+                    crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(file));
                 }
                 FileOutcome::Formatted
             }
@@ -302,21 +302,21 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
-            eprintln!(
+            crate::output::ewriteln!(
                 "{} .mds file(s) found but all are under default-excluded directories \
                  (hidden dirs, node_modules); nothing was formatted",
                 walk.excluded_by_default
             );
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         // #204: an empty tree is "nothing to format", not success (mirrors build.rs).
         // Emitted even under --quiet and exit 1.  This arm sits BEFORE the `read_only`
         // split below, so `--check` and `--diff` behave identically on an empty tree.
-        eprintln!(
+        crate::output::ewriteln!(
             "no .mds files found in {}; nothing was formatted",
             crate::output::safe_path(dir)
         );
-        std::process::exit(1);
+        crate::output::exit(1);
     }
 
     let read_only = flags.check || flags.diff;
@@ -340,46 +340,20 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
         // the single-file --check path (which is fully silent under --quiet,
         // exiting 1 with no message when a file would change).
         if !flags.quiet || fail_count > 0 {
-            eprintln!(
+            crate::output::ewriteln!(
                 "{changed_count} would reformat, {unchanged_count} unchanged, {fail_count} failed"
             );
         }
     } else if !flags.quiet || fail_count > 0 {
-        eprintln!("{changed_count} formatted, {unchanged_count} unchanged, {fail_count} failed");
+        crate::output::ewriteln!(
+            "{changed_count} formatted, {unchanged_count} unchanged, {fail_count} failed"
+        );
     }
 
     if fail_count > 0 || (flags.check && changed_count > 0) {
-        std::process::exit(1);
+        crate::output::exit(1);
     }
     Ok(())
-}
-
-// ── stdout writing (broken-pipe-safe) ────────────────────────────────────────
-
-/// Write `s` to stdout, treating a broken pipe as a clean early exit rather
-/// than an error — matches Unix filter conventions (e.g. `mds fmt - | head
-/// -n1` closing the pipe early must not surface as a crash or failure).
-fn write_stdout(s: &str) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    if let Err(e) = stdout.write_all(s.as_bytes()) {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
-        }
-        return Err(miette::miette!("cannot write to stdout: {e}"));
-    }
-    if let Err(e) = stdout.flush() {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(miette::miette!("cannot flush stdout: {e}"));
-        }
-    }
-    Ok(())
-}
-
-fn print_diff(rendered: &str) -> Result<()> {
-    if rendered.is_empty() {
-        return Ok(());
-    }
-    write_stdout(rendered)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

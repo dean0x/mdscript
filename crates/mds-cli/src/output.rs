@@ -165,13 +165,6 @@ fn write_stderr_to<W: std::io::Write + ?Sized>(
 }
 
 /// What happened to one [`write_stdout`] call.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "its first callers come with the build and fmt conversion (#157)"
-    )
-)]
 #[must_use]
 #[derive(Debug)]
 pub(crate) enum StdoutOutcome {
@@ -183,12 +176,25 @@ pub(crate) enum StdoutOutcome {
     Failed(std::io::Error),
 }
 
+impl StdoutOutcome {
+    /// What a run that ends on its own — build, fmt — makes of the outcome.
+    ///
+    /// A closed pipe is not an error: the reader is gone, so stdout gets nothing more
+    /// and the run keeps its verdict. Any other failure is `mds::io`, naming stdout
+    /// (#157). Nothing is recorded here; an `Err` reaches the exit code through the
+    /// caller.
+    pub(crate) fn into_batch_result(self) -> std::result::Result<(), mds::MdsError> {
+        match self {
+            Self::Written | Self::Closed => Ok(()),
+            Self::Failed(e) => Err(mds::MdsError::Io {
+                message: format!("cannot write to stdout: {}", safe_inline(&e)),
+            }),
+        }
+    }
+}
+
 /// Write a command's product — compiled output, a diff, a JSON report — to stdout and
 /// flush it. [`StdoutOutcome::Written`] only when both the write and the flush succeed.
-#[expect(
-    dead_code,
-    reason = "its first callers come with the build and fmt conversion (#157)"
-)]
 pub(crate) fn write_stdout(bytes: &[u8]) -> StdoutOutcome {
     write_stdout_to(&mut std::io::stdout().lock(), bytes)
 }
@@ -3788,6 +3794,26 @@ mod tests {
                 (Some(want), StdoutOutcome::Failed(e)) if e.kind() == want => {}
                 _ => panic!("{what}: want Closed or Failed({failed_kind:?}); got {outcome:?}"),
             }
+        }
+    }
+
+    /// A batch run keeps going past a closed stdout, and reports any other stdout
+    /// failure as one `mds::io` error naming stdout (#157).
+    #[test]
+    fn a_batch_run_ignores_a_closed_stdout_and_reports_any_other_failure() {
+        assert!(StdoutOutcome::Written.into_batch_result().is_ok());
+        assert!(StdoutOutcome::Closed.into_batch_result().is_ok());
+
+        let failed = StdoutOutcome::Failed(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left",
+        ))
+        .into_batch_result();
+        match failed {
+            Err(mds::MdsError::Io { message }) => {
+                assert_eq!(message, "cannot write to stdout: no space left");
+            }
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
         }
     }
 

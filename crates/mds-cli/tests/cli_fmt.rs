@@ -242,32 +242,70 @@ fn stdin_filter_mode_is_idempotent() {
     assert_eq!(once, twice, "stdin filter mode must be idempotent");
 }
 
+/// The write end of a pipe whose read end is already gone.
+///
+/// The reader is dropped BEFORE the child is spawned, so the child's first write to
+/// this pipe fails with a broken pipe every time. Dropping `child.stdout` after the
+/// spawn instead races the child: a short run can finish writing first.
+fn closed_pipe() -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().expect("create a pipe");
+    drop(reader);
+    writer
+}
+
+/// `mds fmt -` into a pipe nobody reads keeps its verdict: exit 0, and nothing on stderr
+/// that the same run into an open pipe does not print (#157).
+///
+/// #157 proposed `mds fmt --check . | head -n 1` as the check for this. That pipeline
+/// cannot fail: `--check` reports on stderr and writes nothing to stdout. The filter
+/// mode below does write stdout, and `tests/broken_pipe.rs` closes stdout or stderr
+/// under every other `fmt` mode.
 #[test]
-fn stdin_into_closed_pipe_does_not_panic() {
-    // Piping into `true` closes the read end almost immediately; writing the
-    // formatted result to stdout must handle a broken pipe gracefully.
+fn stdin_into_a_closed_pipe_exits_0_and_an_open_pipe_gets_the_formatted_text() {
     use std::io::Write;
+    let input = read_fixture("fmt_unformatted.mds");
+
+    // Control: into an open pipe the reformatted text arrives on stdout, so the closed
+    // run below really loses a write.
+    let open = fmt_stdin(&input, &[]);
+    let open_stderr = String::from_utf8_lossy(&open.stderr).into_owned();
+    assert_eq!(
+        open.status.code(),
+        Some(0),
+        "control: `mds fmt -` into an open pipe must exit 0; stderr: {open_stderr}"
+    );
+    let formatted = String::from_utf8(open.stdout).unwrap();
+    assert!(
+        !formatted.is_empty() && formatted != input && !formatted.contains('\r'),
+        "control: `mds fmt -` must write the reformatted text to stdout; got {formatted:?}"
+    );
+
     let mut child = mds_bin()
         .arg("fmt")
         .arg("-")
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(closed_pipe()))
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-
-    // Drop stdout immediately to force a broken pipe on write.
-    drop(child.stdout.take());
-
-    let big_input = read_fixture("fmt_unformatted.mds").repeat(1000);
-    // Ignore write errors -- the point is the CHILD process must not panic.
-    let _ = child.stdin.take().unwrap().write_all(big_input.as_bytes());
-
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("panicked"),
-        "must not panic on broken pipe, got stderr: {stderr}"
+    // A child that exits before reading all of stdin closes it; that write error says
+    // nothing about the child.
+    let mut child_stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        let _ = child_stdin.write_all(input.as_bytes());
+    });
+    let closed = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    let closed_stderr = String::from_utf8_lossy(&closed.stderr);
+    assert_eq!(
+        closed.status.code(),
+        Some(0),
+        "`mds fmt -` into a closed pipe must exit 0, not a panic (101) or a signal (None); \
+         stderr: {closed_stderr}"
+    );
+    assert_eq!(
+        closed_stderr, open_stderr,
+        "`mds fmt -` into a closed pipe must print nothing the open run does not"
     );
 }
 

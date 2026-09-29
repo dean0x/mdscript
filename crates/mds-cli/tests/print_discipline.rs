@@ -121,7 +121,7 @@
 //! 2. **Allowlist entries are anti-rot, not anti-reuse.** They are keyed by `(file,
 //!    expression)` with no macro or stream constraint, so [`every_allowlist_entry_is_live`]
 //!    catches an entry that stops matching, but a *new* variable that reuses an exempted
-//!    name in the same file (`compiled`, `ok_count`, `max_depth`) inherits the exemption
+//!    name in the same file (`empty_count`, `ok_count`, `max_depth`) inherits the exemption
 //!    silently. The names were chosen to be specific for that reason.
 //! 3. **The binding trace is one hop, within one file.** A local initialised from another
 //!    local is not followed; it is reported instead. Because bindings are matched by name
@@ -211,7 +211,12 @@ const PRINT_MACROS: &[&str] = &[
 /// clears its floor. A per-file floor fails instead. Each floor is the file's site count
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
-const SITE_FLOORS: &[(&str, usize)] = &[("main.rs", 11), ("output.rs", 7)];
+const SITE_FLOORS: &[(&str, usize)] = &[
+    ("build.rs", 30),
+    ("fmt.rs", 11),
+    ("main.rs", 11),
+    ("output.rs", 7),
+];
 
 /// The function the stderr writer macros expand to (`output.rs`, #157).
 ///
@@ -273,16 +278,6 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
          newlines would break multi-line warning bodies. Values interpolated INTO that \
          prose are WIRE-escaped by the caller — which this guard checks separately, by \
          scanning the `format!`s nested inside `eprint_warning` calls.",
-    ),
-    // ── The compiled artefact itself ─────────────────────────────────────────
-    (
-        "build.rs",
-        "compiled",
-        "`print!(\"{compiled}\")` writes the compiled template to STDOUT. This is the \
-         command's product, not a diagnostic: `mds build -o - > out.md` must reproduce \
-         the artefact byte for byte, so escaping it would corrupt every redirect. \
-         Terminal-hazard bytes here originate in the user's own template and are the \
-         same bytes `mds build -o file.md` would write to disk.",
     ),
     // ── `&'static str` labels — no runtime data reaches these ────────────────
     (

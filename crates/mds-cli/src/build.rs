@@ -419,7 +419,7 @@ fn warn_output_extension_mismatch(output: &Option<String>, kind: OutputKind, qui
             // The escape call is repeated rather than bound to a local so it is visible
             // at each interpolation — the print-discipline guard reads call sites, not
             // bindings.
-            eprintln!(
+            crate::output::ewriteln!(
                 "warning: output path '{}' has extension '.{}' but compiled \
                  output is {}; writing to '{}' anyway",
                 crate::output::safe_inline(o),
@@ -779,7 +779,9 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String> {
 /// When `output_path` is `Some(path)`, creates any missing parent directories,
 /// writes the compiled string, and prints `"Compiled to {path}"` to stderr
 /// unless `quiet` or `announce` is false.  When `output_path` is `None`,
-/// prints the compiled string to stdout with no trailing newline. This is where a
+/// writes the compiled string to stdout with no trailing newline: a closed stdout is
+/// not an error (the reader is gone, so nothing more is written and the run keeps its
+/// verdict), any other stdout failure is `mds::io` (#157). This is where a
 /// single-file output's directory is created — [`resolve_output_path_for_kind`] creates
 /// nothing — so an output refused before the write leaves no directory behind (#425).
 ///
@@ -790,7 +792,8 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String> {
 /// The file write goes through [`crate::output::atomic_write_file`] (#227): a crash or
 /// write error mid-way never leaves a truncated artifact — the previous output, if any,
 /// survives until the rename — and a symlink at the output path is refused. The parent
-/// directory is created first. The stdout arm is unchanged (streaming).
+/// directory is created first. The stdout arm writes and flushes the whole output at
+/// once ([`crate::output::write_stdout`]).
 ///
 /// Compiled artifacts are written with [`crate::output::Durability::RenameOnly`]: they
 /// are derived files a rebuild reproduces, and `F_FULLFSYNC` per artifact tripled a
@@ -819,19 +822,10 @@ pub(crate) fn write_output(
             // primitive deliberately does not create directories.
             crate::output::atomic_write_file(&path, compiled, Durability::RenameOnly)?;
             if !quiet && announce {
-                eprintln!("Compiled to {}", crate::output::safe_path(&path));
+                crate::output::ewriteln!("Compiled to {}", crate::output::safe_path(&path));
             }
         }
-        None => {
-            use std::io::Write as _;
-            print!("{compiled}");
-            // Flush stdout so pipe consumers receive the content immediately.
-            // This is a no-op when stdout is a file; on pipes it ensures the
-            // bytes are not held in the libc/Rust buffer until the process exits.
-            std::io::stdout()
-                .flush()
-                .map_err(|e| miette::miette!("cannot flush stdout: {e}"))?;
-        }
+        None => crate::output::write_stdout(compiled.as_bytes()).into_batch_result()?,
     }
     Ok(())
 }
@@ -1365,7 +1359,7 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
             .is_ok_and(|mut file| has_sidecar_head(&mut file, expected_basename));
     if !sidecar {
         if !quiet {
-            eprintln!(
+            crate::output::ewriteln!(
                 "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
                 crate::output::safe_path(map_path)
             );
@@ -1374,14 +1368,14 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
     }
     if let Err(e) = std::fs::remove_file(map_path) {
         if !quiet {
-            eprintln!(
+            crate::output::ewriteln!(
                 "warning: could not remove stale map {}: {}",
                 crate::output::safe_path(map_path),
                 crate::output::safe_inline(&e)
             );
         }
     } else if !quiet {
-        eprintln!("Removed stale map {}", crate::output::safe_path(map_path));
+        crate::output::ewriteln!("Removed stale map {}", crate::output::safe_path(map_path));
     }
 }
 
@@ -1452,7 +1446,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     // When auto-detected, print a "Building {path}" banner so users know which file was selected.
     let (input, auto_detected) = resolve_input(input, "build")?;
     if auto_detected && !quiet {
-        eprintln!("Building {}", crate::output::safe_path(&input));
+        crate::output::ewriteln!("Building {}", crate::output::safe_path(&input));
     }
 
     // Directory mode: compile every non-partial .mds file in the tree.
@@ -1483,7 +1477,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
         // C3/D6: embed_sources without source_map is a no-op (applies PF-004 — all paths).
         if use_embed_sources && !use_source_map && !quiet {
-            eprintln!(
+            crate::output::ewriteln!(
                 "warning: embed_sources has no effect without source maps; \
                  set build.source_map=true or pass --source-map"
             );
@@ -1510,7 +1504,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
         // why their output contains no sourcesContent (applies PF-004 — both paths checked).
         if use_embed_sources && !use_source_map && !quiet {
-            eprintln!(
+            crate::output::ewriteln!(
                 "warning: embed_sources has no effect without source maps; \
                  set build.source_map=true or pass --source-map"
             );
@@ -1518,7 +1512,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
         // AC-SEC-02: warn when shipping full source text in a distributable artifact.
         if use_embed_sources && inline && !quiet {
-            eprintln!(
+            crate::output::ewriteln!(
                 "warning: --embed-sources with --inline ships full source text in the output \
                  (AC-SEC-02)"
             );
@@ -1600,7 +1594,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 Durability::RenameOnly,
                             )?;
                             if !quiet {
-                                eprintln!(
+                                crate::output::ewriteln!(
                                     "Source map written to {}",
                                     crate::output::safe_path(&map_path)
                                 );
@@ -1634,7 +1628,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
     // why their output contains no sourcesContent (applies PF-004 — both paths checked).
     if use_embed_sources && !use_source_map && !quiet {
-        eprintln!(
+        crate::output::ewriteln!(
             "warning: embed_sources has no effect without source maps; \
              set build.source_map=true or pass --source-map"
         );
@@ -1642,7 +1636,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
     // AC-SEC-02: warn when shipping full source text in a distributable artifact.
     if use_embed_sources && inline && !quiet {
-        eprintln!(
+        crate::output::ewriteln!(
             "warning: --embed-sources with --inline ships full source text in the output \
              (AC-SEC-02)"
         );
@@ -1722,7 +1716,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             .as_ref()
                             .map(|(_, p)| p.display().to_string())
                             .unwrap_or_else(|| "mds.json".to_owned());
-                        eprintln!(
+                        crate::output::ewriteln!(
                             "warning: source_map in {} has no effect when writing to \
                              stdout (sidecar requires -o <file> or --out-dir); use --inline to \
                              embed the map, or --no-source-map to silence this warning",
@@ -1742,7 +1736,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             Durability::RenameOnly,
                         )?;
                         if !quiet {
-                            eprintln!(
+                            crate::output::ewriteln!(
                                 "Source map written to {}",
                                 crate::output::safe_path(&map_path)
                             );
@@ -1789,7 +1783,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// (every candidate sits under a default-excluded directory), `no .mds files found
 /// in <dir>; nothing was built` (a genuinely empty tree), and the partials-only
 /// count diagnostic (#387 — the tree is non-empty but every candidate is a
-/// `_`-prefixed partial). All three call `process::exit` directly: no `MdsError`
+/// `_`-prefixed partial). All three exit through [`crate::output::exit`]: no `MdsError`
 /// variant exists for "nothing to do" and `exit_code` must not grow one for a
 /// non-error class.
 /// `mds check` mirrors all three with exit 1; `mds fmt` (exit 1) and `mds lint`
@@ -1857,12 +1851,12 @@ fn run_build_directory(
             // diagnostic even under --quiet (avoids a silent CI green pass — avoids
             // PF-004 enforcement gap where the limit is real on one path and absent
             // on another).
-            eprintln!(
+            crate::output::ewriteln!(
                 "{} .mds file(s) found but all are under default-excluded directories \
                  (hidden dirs, node_modules); nothing was built",
                 walk.excluded_by_default
             );
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         // #204: an empty tree is "nothing to build", not success.  Same shape as the
         // all-excluded arm above — emitted even under --quiet (a silent green pass on
@@ -1870,11 +1864,11 @@ fn run_build_directory(
         // closes) and exit 1, the build/check/fmt "nothing was done" code (spec §7.9).
         // `mds watch <dir>` deliberately still starts on an empty tree: a file created
         // later is a valid flow there.
-        eprintln!(
+        crate::output::ewriteln!(
             "no .mds files found in {}; nothing was built",
             crate::output::safe_path(dir)
         );
-        std::process::exit(1);
+        crate::output::exit(1);
     }
 
     // #387: a tree whose only .mds files are partials is "nothing to build" too. The
@@ -1884,12 +1878,12 @@ fn run_build_directory(
     // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
     // behaviour; `mds watch <dir>` still starts.
     if let Some(partials_only_count) = crate::output::partials_only(&files) {
-        eprintln!(
+        crate::output::ewriteln!(
             "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
              nothing was built",
             crate::output::safe_path(dir)
         );
-        std::process::exit(1);
+        crate::output::exit(1);
     }
 
     let mut ok_count: usize = 0;
@@ -1939,7 +1933,7 @@ fn run_build_directory(
                 if let Some(parent) = out_path.parent() {
                     if !parent.as_os_str().is_empty() {
                         if let Err(e) = std::fs::create_dir_all(parent) {
-                            eprintln!(
+                            crate::output::ewriteln!(
                                 "error: cannot create output directory {}: {}",
                                 crate::output::safe_path(parent),
                                 crate::output::safe_inline(&e)
@@ -1984,7 +1978,10 @@ fn run_build_directory(
                             empty_count += 1;
                         }
                         if !quiet {
-                            eprintln!("Compiled to {}", crate::output::safe_path(&out_path));
+                            crate::output::ewriteln!(
+                                "Compiled to {}",
+                                crate::output::safe_path(&out_path)
+                            );
                         }
                         written_this_run.insert(out_path.clone());
 
@@ -2000,12 +1997,15 @@ fn run_build_directory(
                                 ) {
                                     // The primitive's message already names the path —
                                     // re-prefixing it would print the path twice (#227).
-                                    eprintln!("error: {}", crate::output::safe_inline(&e));
+                                    crate::output::ewriteln!(
+                                        "error: {}",
+                                        crate::output::safe_inline(&e)
+                                    );
                                     fail_count += 1;
                                     continue;
                                 }
                                 if !quiet {
-                                    eprintln!(
+                                    crate::output::ewriteln!(
                                         "Source map written to {}",
                                         crate::output::safe_path(&map_path)
                                     );
@@ -2037,7 +2037,7 @@ fn run_build_directory(
                     }
                     Err(e) => {
                         // The primitive's message already names the path (#227).
-                        eprintln!("error: {}", crate::output::safe_inline(&e));
+                        crate::output::ewriteln!("error: {}", crate::output::safe_inline(&e));
                         fail_count += 1;
                     }
                 }
@@ -2062,14 +2062,14 @@ fn run_build_directory(
     // through --quiet.
     if !quiet || fail_count > 0 {
         if empty_count > 0 {
-            eprintln!("{ok_count} built ({empty_count} empty), {fail_count} failed");
+            crate::output::ewriteln!("{ok_count} built ({empty_count} empty), {fail_count} failed");
         } else {
-            eprintln!("{ok_count} built, {fail_count} failed");
+            crate::output::ewriteln!("{ok_count} built, {fail_count} failed");
         }
     }
 
     if fail_count > 0 {
-        std::process::exit(1);
+        crate::output::exit(1);
     }
     Ok(())
 }
