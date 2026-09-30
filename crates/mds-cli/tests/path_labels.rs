@@ -1,7 +1,9 @@
-//! Every path `mds build`, `mds check` and `mds lint` name is the path as typed, or the
-//! part below a directory the user named, as typed — the directory argument, `--out-dir`,
-//! or the directory `mds.json` was reached by — never a canonical or absolute spelling
-//! the user did not type (#390).
+//! The lines of `mds build`, `mds check` and `mds lint` pinned here name a path as typed,
+//! or as the part below a directory the user named, as typed — the directory argument,
+//! `--out-dir`, or the directory `mds.json` was reached by — never by a canonical or
+//! absolute spelling the user did not type (#390). The text of an I/O error raised while
+//! writing below a directory build's `--out-dir` is not among them: it still names the
+//! canonical path.
 //!
 //! Each run starts in a scratch directory with relative arguments, so the scratch
 //! directory's own absolute path has no business in any output: [`leak`] looks for it in
@@ -9,10 +11,14 @@
 //! is about was printed, so no test passes on a run that printed nothing.
 //!
 //! An expected path is written with `/` and printed through [`native`], so it names the
-//! path in the platform's separator, exactly as `mds` prints it.
+//! path in the platform's separator, exactly as `mds` prints it. A path argument is typed
+//! through [`typed_args`] the same way: `mds` prints a typed path exactly as typed, so an
+//! argument typed with `/` keeps it on Windows while the components `mds` joins to it
+//! take `\`.
 
 mod common;
 
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -41,8 +47,14 @@ fn put(root: &Path, rel: &str, contents: &str) -> PathBuf {
     path
 }
 
+/// `args` as a user of this platform types them: each `/` in the platform's separator.
+/// No flag or value in these tests other than a path carries a `/`.
+fn typed_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| native(arg)).collect()
+}
+
 /// `mds <args>` in `cwd`, stdin empty.
-fn run(cwd: &Path, args: &[&str]) -> Output {
+fn run(cwd: &Path, args: &[impl AsRef<OsStr>]) -> Output {
     mds_bin()
         .current_dir(cwd)
         .args(args)
@@ -52,7 +64,7 @@ fn run(cwd: &Path, args: &[&str]) -> Output {
 }
 
 /// `mds <args>` in `cwd`, with `input` on stdin.
-fn run_with_stdin(cwd: &Path, args: &[&str], input: &'static str) -> Output {
+fn run_with_stdin(cwd: &Path, args: &[impl AsRef<OsStr>], input: &'static str) -> Output {
     let mut child = mds_bin()
         .current_dir(cwd)
         .args(args)
@@ -367,7 +379,7 @@ fn a_config_output_dir_is_named_through_the_directory_mds_json_was_reached_by() 
         ),
     ];
     for (args, expected, written) in cases {
-        let out = run(&proj, args);
+        let out = run(&proj, &typed_args(args));
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{args:?}: stderr: {stderr}");
         assert_eq!(stderr, expected, "{args:?}");
@@ -446,7 +458,7 @@ fn the_config_source_map_warning_names_mds_json_as_reached() {
             "Deep\n",
         ),
     ] {
-        let out = run(&proj, &args);
+        let out = run(&proj, &typed_args(&args));
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{args:?}: stderr: {stderr}");
         assert_eq!(
@@ -485,7 +497,7 @@ fn clean_names_a_file_argument_as_typed() {
         "---\ngreeting: Hello\n---\n\n{{greeting}}, world!\n",
     );
 
-    let out = run(dir.path(), &["lint", "sub/page.mds"]);
+    let out = run(dir.path(), &typed_args(&["lint", "sub/page.mds"]));
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
     assert_eq!(stderr, format!("Clean: {}\n", native("sub/page.mds")));
@@ -506,7 +518,7 @@ fn clean_names_a_file_argument_as_typed() {
     );
 }
 
-// ── Every build, check and lint surface ──────────────────────────────────────
+// ── The build, check and lint runs listed in `ROWS` ──────────────────────────
 
 /// One run of the sweep below: where it runs, what it runs, what it reads on stdin, its
 /// exit code, and a line it must print — proof that the sink the absence check looks at
@@ -683,11 +695,11 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// Every build, check and lint surface, run from the scratch directory with relative
-/// arguments, names no spelling of the scratch directory on stdout or stderr — and
-/// printed the line that shows its sink ran.
+/// Each build, check and lint run in [`ROWS`], run from the scratch directory with
+/// relative arguments, names no spelling of the scratch directory on stdout or stderr —
+/// and printed the line that shows its sink ran.
 #[test]
-fn no_build_check_or_lint_run_with_relative_arguments_names_the_working_directory() {
+fn no_listed_build_check_or_lint_run_names_the_working_directory() {
     let dir = scratch();
     let root = dir.path();
     put(root, "x.mds", "Hello\n");
@@ -717,12 +729,13 @@ fn no_build_check_or_lint_run_with_relative_arguments_names_the_working_director
 
     for row in ROWS {
         let cwd = root.join(row.cwd);
+        let args = typed_args(row.args);
         let out = match row.stdin {
-            Some(input) => run_with_stdin(&cwd, row.args, input),
-            None => run(&cwd, row.args),
+            Some(input) => run_with_stdin(&cwd, &args, input),
+            None => run(&cwd, &args),
         };
         let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
-        let label = format!("(in {}) mds {}", row.cwd, row.args.join(" "));
+        let label = format!("(in {}) mds {}", row.cwd, args.join(" "));
         assert_eq!(
             out.status.code(),
             Some(row.exit),

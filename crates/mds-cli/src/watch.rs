@@ -3748,14 +3748,18 @@ mod tests {
         assert_eq!(result.path, PathBuf::from("/out/foo.md"));
     }
 
-    // resolve_output_base: --out-dir takes precedence.
+    // resolve_output_base: --out-dir takes precedence over mds.json's build.output_dir.
+    // The out-dir is absolute on every host (a rooted `/my/out` is not, on Windows) and
+    // does not exist, so it resolves to itself and is shown as typed.
     #[test]
     fn resolve_output_base_outdir_wins() {
-        let d = PathBuf::from("/my/out");
-        let result = resolve_output_base(Some(&d), &None).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("out");
+        let result = resolve_output_base(Some(&d), &project_config("dist")).unwrap();
         assert!(
-            matches!(result, OutputBase::Dir { ref canonical, .. } if canonical == &d),
-            "expected Dir(/my/out), got {result:?}"
+            matches!(result, OutputBase::Dir { ref canonical, ref shown }
+                if canonical == &d && shown == &d),
+            "expected Dir({d:?}), got {result:?}"
         );
     }
 

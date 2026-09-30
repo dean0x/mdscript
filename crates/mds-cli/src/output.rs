@@ -1039,8 +1039,8 @@ pub(crate) enum OutputBase {
         /// containment check (`starts_with`) compares.
         canonical: PathBuf,
         /// The same directory as the user named it: `--out-dir` as typed, or `mds.json`
-        /// `build.output_dir` below the directory `mds.json` was reached by. The only form
-        /// a message names an output by.
+        /// `build.output_dir` below the directory `mds.json` was reached by. The form a
+        /// status line names an output by.
         shown: PathBuf,
     },
     NextToSource,
@@ -1053,8 +1053,9 @@ pub(crate) enum OutputBase {
 /// `path` is where the bytes go. `shown` is the same file as the user named it: the path
 /// as typed, or the part below a directory they named — the directory argument,
 /// `--out-dir`, or the directory `mds.json` was reached by — joined to that directory as
-/// typed. A message names the file by `shown` alone, so display never resolves a path
-/// again.
+/// typed. A status line, and a message the caller writes itself, names the file by
+/// `shown` alone, so display never resolves a path again; the text of an I/O error that
+/// [`atomic_write_file`] raises for `path` still names `path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteTarget {
     pub(crate) path: PathBuf,
@@ -1534,7 +1535,7 @@ pub(crate) fn probe_and_remove_stale(
     })
 }
 
-/// Where a `Dir(_)`-mode source landed.
+/// Where a `Dir`-mode source landed.
 ///
 /// `Flattened` is the `strip_prefix` failure arm: contained by construction (the join
 /// argument is always a relative `OsStr`) but it abandons the subtree mirror, so two
@@ -1558,7 +1559,7 @@ impl MirroredStem {
     }
 }
 
-/// Compute the `Dir(_)`-mode extension-less output stem for `source`, classified by
+/// Compute the `Dir`-mode extension-less output stem for `source`, classified by
 /// whether the subtree mirror survived.
 ///
 /// Single source of truth for both [`output_base_no_ext`] (the silent probe oracle) and
@@ -2671,7 +2672,7 @@ mod tests {
         None
     }
 
-    /// #217: the `Dir(_)` oracles must be able to say WHICH arm produced a stem — the
+    /// #217: the `Dir`-mode oracles must be able to say WHICH arm produced a stem — the
     /// subtree mirror, or the out-of-root flatten that drops the subtree and lets two
     /// sources with the same file name collide.
     ///
@@ -5185,13 +5186,13 @@ mod tests {
     /// Where the working directory is gone, [`current_dir`] fails in exactly the words,
     /// and with the code, mds-core gives a string compile that needs it (#390) — core's
     /// function is private, so its words are taken from `mds::check_str_with` with no
-    /// base directory — and [`canonicalize_out_dir`] refuses a relative out-dir with that
-    /// error instead of anchoring it at `"."`.
+    /// base directory — and [`canonicalize_out_dir`], and [`resolve_output_base`] through
+    /// it, refuse a relative out-dir with that error instead of anchoring it at `"."`.
     ///
     /// The test removes its own working directory, which is the whole process's, so it
     /// runs as a child: this test binary, this one test. Controls: the child really ran
     /// it (the harness reports it passed); an absolute out-dir needs no working
-    /// directory; and where it exists, [`current_dir`] is it.
+    /// directory, in either function; and where it exists, [`current_dir`] is it.
     ///
     /// Unix-only: Windows cannot remove a directory that is a process's working directory.
     #[cfg(unix)]
@@ -5228,10 +5229,31 @@ mod tests {
             let absolute = dir.path().join("out");
             assert_eq!(
                 canonicalize_out_dir(Some(&absolute)).expect("an absolute out-dir resolves"),
-                Some(absolute),
+                Some(absolute.clone()),
                 "control: an absolute out-dir needs no working directory"
             );
             assert_eq!(canonicalize_out_dir(None).expect("no out-dir"), None);
+
+            // `resolve_output_base` is where a directory run resolves its out-dir: it
+            // refuses a relative one in the same words, and never falls back to a
+            // default route or to a base anchored at `"."`.
+            let refused = resolve_output_base(Some(&PathBuf::from("out")), &None)
+                .expect_err("a relative out-dir is refused, not resolved");
+            assert_eq!(refused.to_string(), ours.to_string());
+            assert!(
+                matches!(
+                    refused.downcast_ref::<mds::MdsError>(),
+                    Some(mds::MdsError::Io { .. })
+                ),
+                "mds::io: {refused:?}"
+            );
+            match resolve_output_base(Some(&absolute), &None).expect("an absolute out-dir") {
+                OutputBase::Dir { canonical, shown } => {
+                    assert_eq!(canonical, absolute, "control: resolved without one");
+                    assert_eq!(shown, absolute, "control: shown as typed");
+                }
+                other => panic!("control: want Dir; got {other:?}"),
+            }
             return;
         }
         assert_eq!(
