@@ -36,10 +36,13 @@
 
 mod common;
 use common::{
-    count_occurrences, dup_vars_file_warning, make_symlink, mds_bin, poll_tap_until,
-    spawn_watch_ready, spawn_watch_unsynchronized, tap_reader, wait_for_tap, wait_for_tap_count,
-    write_atomic, ChildGuard, StderrTap, StdoutTap, ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
+    closed_pipe, count_occurrences, dup_vars_file_warning, make_symlink, mds_bin, poll_tap_until,
+    spawn_watch_ready, spawn_watch_ready_stderr_untapped, spawn_watch_unsynchronized, tap_reader,
+    wait_for_tap, wait_for_tap_count, write_atomic, ChildGuard, StderrTap, StdoutTap,
+    ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
 };
+#[cfg(unix)]
+use common::{full_file, limit_file_growth};
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -4866,16 +4869,12 @@ fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
     );
 }
 
-/// Bounded wait for a child that has already been signalled.
+/// Bounded wait for a child that is expected to exit: signalled, or ending its session
+/// on its own.
 ///
-/// A **bound, not a synchroniser**: a signalled child exits in milliseconds, and one
-/// that has not exited by the deadline is the defect the caller is asserting against.
-/// `what` names the arm so the panic is self-describing.
-///
-/// `#[cfg(unix)]`: a helper, not a test — its only caller,
-/// `watch_readiness_handshake_makes_ctrl_c_exit_deterministic`, is itself
-/// `#[cfg(unix)]` because it signals SIGINT, which has no Windows analogue (#147).
-#[cfg(unix)]
+/// A **bound, not a synchroniser**: such a child exits in milliseconds, and one that
+/// has not exited by the deadline is the defect the caller is asserting against. `what`
+/// names the arm so the panic is self-describing.
 #[track_caller]
 fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
@@ -6782,4 +6781,506 @@ fn watch_startup_route_refusal_controls() {
         "{label}: nothing is written next to the source"
     );
     drop(child);
+}
+
+// ── Streams: a gone stdout reader, a closed stderr, a failing write (#157) ──────
+//
+// A closed pipe — its reader gone — never changes how `mds watch` exits. With `-o -`,
+// stdout IS the session's product, so a gone reader ends the session: one
+// `Stopped watching (stdout closed).` line, exit 0. A closed stderr only loses the
+// status lines, so the session keeps watching. Any other output failure during a live
+// session is reported (where stderr still works) and never changes the Ctrl+C exit.
+
+/// The line a session ends with when `-o -` finds stdout's reader gone.
+const STOPPED_STDOUT_CLOSED: &str = "Stopped watching (stdout closed).\n";
+
+/// Upper bound for a watcher expected to exit — at startup, after a rebuild, or after a
+/// signal. A **failure bound**: it exits in milliseconds, and one still running at the
+/// deadline is the defect the caller asserts against.
+const SESSION_END_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Send SIGINT (Ctrl+C) to the watcher.
+///
+/// `#[cfg(unix)]`: SIGINT via `libc::kill` has no Windows analogue (#147).
+#[cfg(unix)]
+fn interrupt(guard: &ChildGuard) {
+    // SAFETY: `kill` takes no pointer; the pid is our own live child's.
+    unsafe {
+        libc::kill(guard.id() as libc::pid_t, libc::SIGINT);
+    }
+}
+
+/// `mds watch -o -` whose stdout reader is gone before it starts: the startup write finds
+/// the pipe closed, so the session prints `Stopped watching (stdout closed).` as its
+/// last line and exits 0; `--quiet` silences the line (#157).
+///
+/// The reader is dropped before the spawn ([`closed_pipe`]), so the first stdout write
+/// fails whatever the timing. Control: with an open pipe the same command writes the
+/// compiled output to stdout and keeps watching, so the closed arm really loses a write.
+#[test]
+fn watch_to_stdout_whose_reader_is_gone_stops_and_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let src = src.to_str().unwrap();
+    let loud = ["watch", src, "-o", "-", "--debounce", "0"];
+    let quiet = ["watch", src, "-o", "-", "--debounce", "0", "-q"];
+
+    // Control: an open pipe gets the output, and the session goes on.
+    let (mut open, _open_tap, open_stdout) =
+        spawn_ready_piped_stdout(mds_bin().args(loud).stdout(Stdio::piped()));
+    wait_for_tap(&open_stdout, "Hello one", TIMEOUT);
+    assert!(
+        open.0.try_wait().unwrap().is_none(),
+        "control: with an open pipe the session keeps watching"
+    );
+    drop(open);
+
+    let (mut closed, tap) =
+        spawn_unsynchronized(mds_bin().args(loud).stdout(Stdio::from(closed_pipe())));
+    let status = wait_bounded(
+        &mut closed,
+        SESSION_END_TIMEOUT,
+        "watch -o - with no reader",
+    );
+    let stderr = tap.finish_text(&mut closed);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a gone stdout reader ends the session with exit 0; stderr: {stderr:?}"
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines.len() == 2 && lines[0].starts_with("Watching "),
+        "the session prints `Watching …` and then exactly the stop line; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        format!("{}\n", lines[1]),
+        STOPPED_STDOUT_CLOSED,
+        "the last line names the closed stdout; stderr: {stderr:?}"
+    );
+
+    // `--quiet` silences the line; the loud arm above is its positive control.
+    let (mut quiet_run, quiet_tap) =
+        spawn_unsynchronized(mds_bin().args(quiet).stdout(Stdio::from(closed_pipe())));
+    let status = wait_bounded(
+        &mut quiet_run,
+        SESSION_END_TIMEOUT,
+        "watch -o - -q with no reader",
+    );
+    let stderr = quiet_tap.finish_text(&mut quiet_run);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "--quiet: a gone stdout reader ends the session with exit 0; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "--quiet prints nothing when stdout's reader is gone"
+    );
+}
+
+/// `mds watch -o -` whose reader goes away after the first output: the next rebuild's
+/// write finds the pipe closed, and the session ends with the same line and exit 0 —
+/// never `Recompiled`, since nothing was written (#157).
+///
+/// The test owns the pipe's only reader: it reads the startup output, which the watcher
+/// writes before it signals readiness, and then drops the reader before the edit.
+#[test]
+fn watch_to_stdout_stops_when_its_reader_goes_away_and_exits_0() {
+    use std::io::Read as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    let (mut guard, tap) = spawn_ready(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"])
+            .stdout(Stdio::from(writer)),
+    );
+
+    // Read the startup output on a helper thread, so the wait is bounded; the thread
+    // hands the reader back so the test decides when it goes.
+    let first_output = b"Hello one\n";
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut first = vec![0u8; first_output.len()];
+        let read = reader.read_exact(&mut first).map(|()| first);
+        let _ = tx.send((read, reader));
+    });
+    let (read, reader) = rx
+        .recv_timeout(TIMEOUT)
+        .expect("the startup output must reach the pipe");
+    assert_eq!(
+        read.expect("read the startup output"),
+        first_output,
+        "control: the session writes its output to stdout"
+    );
+    drop(reader);
+
+    write_atomic(&src, "Hello two\n");
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "watch -o - after its reader went away",
+    );
+    let stderr = tap.finish_text(&mut guard);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a reader that goes away ends the session with exit 0; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.ends_with(STOPPED_STDOUT_CLOSED)
+            && count_occurrences(&stderr, STOPPED_STDOUT_CLOSED) == 1,
+        "the session ends with exactly one stop line; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("Watching ") && !stderr.contains("Recompiled"),
+        "a write the closed pipe lost is not a rebuild; stderr: {stderr:?}"
+    );
+}
+
+/// `mds watch` with stderr closed from the start reaches readiness, rebuilds its output
+/// on an edit and keeps running; on unix it exits 0 at Ctrl+C (#157). File mode and
+/// directory mode.
+///
+/// A closed stderr cannot be read back, so each mode first runs the same session with
+/// stderr open, as the control: it writes there at every step — `Watching`,
+/// `Recompiled`, and on unix `Stopped watching.` — so every one of those writes is lost
+/// in the closed arm.
+#[test]
+fn watch_with_stderr_closed_keeps_watching() {
+    for mode in ["file", "directory"] {
+        for closed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("page.mds");
+            std::fs::write(&src, "Hello one\n").unwrap();
+            let out = dir.path().join("page.md");
+            let mut cmd = mds_bin();
+            if mode == "file" {
+                cmd.args(["watch", src.to_str().unwrap()]);
+            } else {
+                cmd.args(["watch", dir.path().to_str().unwrap()]);
+            }
+            cmd.args(["--debounce", "0"]).stdout(Stdio::null());
+            let what = format!(
+                "{mode} mode, stderr {}",
+                if closed { "closed" } else { "open" }
+            );
+
+            let (mut guard, tap) = if closed {
+                cmd.stderr(Stdio::from(closed_pipe()));
+                let (child, _no_stdout) = spawn_watch_ready_stderr_untapped(&mut cmd);
+                (ChildGuard(child), None)
+            } else {
+                let (guard, tap) = spawn_ready(&mut cmd);
+                (guard, Some(tap))
+            };
+
+            assert!(
+                wait_for_file_contains(&out, "Hello one", TIMEOUT),
+                "{what}: the startup compile writes the output"
+            );
+            write_atomic(&src, "Hello two\n");
+            assert!(
+                wait_for_file_contains(&out, "Hello two", TIMEOUT),
+                "{what}: an edit rebuilds the output"
+            );
+            if let Some(tap) = &tap {
+                wait_for_tap(tap, "Recompiled ", TIMEOUT);
+                assert!(
+                    tap.text().starts_with("Watching "),
+                    "control ({what}): the session writes its status lines to stderr"
+                );
+            }
+            assert!(
+                guard.0.try_wait().unwrap().is_none(),
+                "{what}: the session keeps watching"
+            );
+
+            #[cfg(unix)]
+            {
+                interrupt(&guard);
+                let status = wait_bounded(&mut guard, SESSION_END_TIMEOUT, &what);
+                assert_eq!(status.code(), Some(0), "{what}: Ctrl+C exits 0");
+                if let Some(tap) = tap {
+                    let stderr = tap.finish_text(&mut guard);
+                    assert!(
+                        stderr.ends_with("Stopped watching.\n"),
+                        "control ({what}): Ctrl+C prints the stop line; stderr: {stderr:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `mds watch -o -` into a stdout that fails other than by a closed pipe: the failure is
+/// reported once, as `mds::io` naming stdout, the session keeps watching, and a save of
+/// the same text writes it again — the lost write never became the content baseline
+/// that makes a rebuild of unchanged output skip its write. At Ctrl+C it exits 0 (#157).
+///
+/// Vector: stdout is a regular file already as long as the child's file-size limit and
+/// open at its end, so every write fails with "file too large" until the test empties
+/// the file and moves the shared offset back ([`full_file`], [`limit_file_growth`]).
+///
+/// 1. The startup write fails: reported once, and the session goes on.
+/// 2. An edit fails again: no second report, and no `Recompiled`. The edited entry
+///    `@include`s an empty module, whose warning shows on stderr that it was compiled.
+/// 3. The test makes room and saves the SAME text again: the write lands.
+#[cfg(unix)]
+#[test]
+fn watch_to_a_failing_stdout_reports_once_and_retries_the_same_content() {
+    const LIMIT: usize = 64;
+    const FINAL_MARKER_SOURCE: &str = "Final marker {{__final_marker__}}\n";
+    const FINAL_MARKER_LINE: &str = "undefined variable '__final_marker__'";
+    let include_warning = "@include of 'e' produced empty output";
+    let edited = "@import \"./empty.mds\" as e\n@include e\nHello two\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("empty.mds"), "").unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    // Outside the watched directory, so the output's own writes raise no events there.
+    let stdout_dir = tempfile::tempdir().unwrap();
+    let stdout_path = stdout_dir.path().join("stdout");
+
+    let mut cmd = mds_bin();
+    cmd.args([
+        "watch",
+        src.to_str().unwrap(),
+        "-o",
+        "-",
+        "--debounce",
+        "0",
+        // No idle tick: its first-tick recompile would write on its own schedule.
+        "--poll-interval",
+        "0",
+    ]);
+    let stdout_file = full_file(&stdout_path, LIMIT);
+    // Shares the child's stdout offset: step 3 moves it back.
+    let mut stdout_offset = stdout_file.try_clone().unwrap();
+    cmd.stdout(Stdio::from(stdout_file));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let (mut guard, tap) = spawn_ready(&mut cmd);
+
+    // 1. The startup write failed, and was reported, before readiness.
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: the vector fails every write, so the startup output never landed"
+    );
+    wait_for_tap(&tap, "cannot write to stdout", TIMEOUT);
+
+    // 2. A new text fails to write again. The marker orders the tap: every rebuild of
+    //    the edit finished before the marker's compile.
+    write_atomic(&src, edited);
+    wait_for_tap(&tap, include_warning, TIMEOUT);
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    let seen = wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&seen, "Recompiled"),
+        0,
+        "a write stdout lost is not a rebuild; stderr:\n{seen}"
+    );
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: no write reached the file"
+    );
+
+    // 3. Room in the file again; save the same text.
+    {
+        use std::io::Seek as _;
+        stdout_offset.set_len(0).unwrap();
+        stdout_offset.seek(std::io::SeekFrom::Start(0)).unwrap();
+    }
+    write_atomic(&src, edited);
+    let retried = poll_tap_until(&tap, TIMEOUT, |text| text.contains("Recompiled <stdout>"));
+    assert!(
+        retried.is_ok(),
+        "a save of the text whose write stdout lost must write it again; stderr:\n{}",
+        tap.text()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&stdout_path).unwrap(),
+        "Hello two\n",
+        "the retried write reached stdout"
+    );
+
+    write_atomic(&src, FINAL_MARKER_SOURCE);
+    let seen = wait_for_tap(&tap, FINAL_MARKER_LINE, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&seen, "cannot write to stdout"),
+        1,
+        "a stdout failure is reported once however many writes it fails; stderr:\n{seen}"
+    );
+    assert!(
+        seen.contains("mds::io") && seen.contains("File too large"),
+        "the report is `mds::io` with the cause; stderr:\n{seen}"
+    );
+    assert_eq!(
+        count_occurrences(&seen, "Recompiled"),
+        1,
+        "exactly the retried write is a rebuild; stderr:\n{seen}"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C after a stdout failure",
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a stdout failure during the session does not change the Ctrl+C exit"
+    );
+}
+
+/// A rebuild whose output file cannot be written, in a live session, is reported and
+/// does not change the Ctrl+C exit: 0 (#157).
+///
+/// Vector: the output path is replaced by a non-empty directory, which no write can
+/// rename a file over — no permissions involved, so it holds under root too.
+#[cfg(unix)]
+#[test]
+fn watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("page.md");
+
+    let (mut guard, tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello one", TIMEOUT),
+        "the startup compile writes the output"
+    );
+
+    std::fs::remove_file(&out).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("keep"), "a directory where the output was\n").unwrap();
+    write_atomic(&src, "Hello two\n");
+    let seen = wait_for_tap(&tap, "mds::io", TIMEOUT);
+    assert!(
+        !seen.contains("Recompiled"),
+        "the failed write is reported, not announced; stderr:\n{seen}"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C after a failed write",
+    );
+    let stderr = tap.finish_text(&mut guard);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a failed rebuild write does not change the Ctrl+C exit; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.ends_with("Stopped watching.\n"),
+        "the session ends as any Ctrl+C does; stderr: {stderr:?}"
+    );
+}
+
+/// stderr on a file the child may not grow: every stderr write fails other than by a
+/// closed pipe. That makes a batch run exit at least 2; a live watch session keeps
+/// watching and, at Ctrl+C, exits 0 — output failures during a session never change how
+/// it ends (#157).
+///
+/// Controls: the same stderr lifts `mds check` to exit 2, so the vector really records
+/// an output failure; and the same session with stderr open prints its status lines,
+/// so the failing arm really loses writes.
+#[cfg(unix)]
+#[test]
+fn watch_with_a_failing_stderr_keeps_watching_and_exits_0_at_ctrl_c() {
+    const LIMIT: usize = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let stderr_dir = tempfile::tempdir().unwrap();
+    let args = ["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"];
+
+    // Control 1: a batch run with this stderr exits 2.
+    let check_stderr = stderr_dir.path().join("check-stderr");
+    let mut check = mds_bin();
+    check
+        .args(["check", src.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(full_file(&check_stderr, LIMIT)));
+    limit_file_growth(&mut check, LIMIT as libc::rlim_t);
+    let mut check = ChildGuard(check.spawn().unwrap());
+    let status = wait_bounded(&mut check, SESSION_END_TIMEOUT, "mds check");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "control: a stderr that fails other than by a closed pipe lifts `mds check` to 2"
+    );
+
+    // Control 2: with stderr open the session writes its status lines.
+    let (open, open_tap, open_stdout) =
+        spawn_ready_piped_stdout(mds_bin().args(args).stdout(Stdio::piped()));
+    wait_for_tap(&open_stdout, "Hello one", TIMEOUT);
+    write_atomic(&src, "Hello two\n");
+    wait_for_tap(&open_stdout, "Hello two", TIMEOUT);
+    let seen = wait_for_tap(&open_tap, "Recompiled <stdout>", TIMEOUT);
+    assert!(
+        seen.starts_with("Watching "),
+        "control: the session writes its status lines to stderr; stderr: {seen:?}"
+    );
+    drop(open);
+    std::fs::write(&src, "Hello one\n").unwrap();
+
+    // The failing arm.
+    let stderr_path = stderr_dir.path().join("watch-stderr");
+    let mut cmd = mds_bin();
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(full_file(&stderr_path, LIMIT)));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let (child, stdout_tap) = spawn_watch_ready_stderr_untapped(&mut cmd);
+    let mut guard = ChildGuard(child);
+    let stdout_tap = stdout_tap.expect("stdout is piped");
+    wait_for_tap(&stdout_tap, "Hello one", TIMEOUT);
+    write_atomic(&src, "Hello two\n");
+    wait_for_tap(&stdout_tap, "Hello two", TIMEOUT);
+    assert!(
+        guard.0.try_wait().unwrap().is_none(),
+        "the session keeps watching with a failing stderr"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C with a failing stderr",
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a failing stderr during the session does not change the Ctrl+C exit"
+    );
+    assert_eq!(
+        std::fs::read(&stderr_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: every stderr write failed"
+    );
 }

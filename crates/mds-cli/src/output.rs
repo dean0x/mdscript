@@ -43,10 +43,6 @@ use crate::build::{MdsConfig, OutputKind};
 /// `tests/print_discipline.rs` lists this macro and `ewriteln!` beside the std print
 /// macros and scans their arguments the same way. A stderr writer the guard does not
 /// list would take every site that uses it out of the guard.
-#[expect(
-    unused_macros,
-    reason = "`ewrite!` has no caller until the watch conversion (#157)"
-)]
 macro_rules! ewrite {
     ($($arg:tt)*) => {
         $crate::output::write_stderr_fmt(::std::format_args!($($arg)*))
@@ -66,10 +62,6 @@ macro_rules! ewriteln {
     };
 }
 
-#[expect(
-    unused_imports,
-    reason = "`ewrite!` has no caller until the watch conversion (#157)"
-)]
 pub(crate) use ewrite;
 pub(crate) use ewriteln;
 
@@ -95,6 +87,9 @@ impl OutputState {
     const STDOUT_CLOSED: u8 = 1 << 2;
     /// A stdout write failed for a reason other than a closed pipe.
     const STDOUT_FAILED: u8 = 1 << 3;
+    /// A `mds watch` session went live: from then on its output failures do not change
+    /// the exit code ([`ExitPolicy::WatchSession`]).
+    const WATCH_LIVE: u8 = 1 << 4;
 
     pub(crate) const fn new() -> Self {
         Self {
@@ -143,10 +138,27 @@ impl OutputState {
     pub(crate) fn stdout_closed(&self) -> bool {
         self.has(Self::STDOUT_CLOSED)
     }
+
+    /// Record that a `mds watch` session went live.
+    pub(crate) fn note_watch_live(&self) {
+        self.set(Self::WATCH_LIVE);
+    }
+
+    /// The rule [`final_exit_code`] applies when the process exits:
+    /// [`ExitPolicy::WatchSession`] once a watch session went live,
+    /// [`ExitPolicy::Batch`] for every other run.
+    pub(crate) fn exit_policy(&self) -> ExitPolicy {
+        if self.has(Self::WATCH_LIVE) {
+            ExitPolicy::WatchSession
+        } else {
+            ExitPolicy::Batch
+        }
+    }
 }
 
 /// The process's own [`OutputState`], used by the process-boundary functions
-/// [`write_stderr_fmt`], [`write_stdout`], [`note_io_failure`] and [`exit`].
+/// [`write_stderr_fmt`], [`write_stdout`], [`note_io_failure`],
+/// [`note_watch_session_live`] and [`exit`].
 static OUTPUT_STATE: OutputState = OutputState::new();
 
 /// Record, for the exit code, that an output operation of this run failed for a reason
@@ -156,9 +168,18 @@ static OUTPUT_STATE: OutputState = OutputState::new();
 /// <dir>` counting the file as failed — and so never returns the error to `main`. A run
 /// that returns the `mds::io` error reaches the same exit code through `exit_code`
 /// instead. `mds watch` never calls it: a rebuild's failure is reported as it happens
-/// and does not change how the session exits.
+/// and does not change how the session exits ([`note_watch_session_live`]).
 pub(crate) fn note_io_failure() {
     OUTPUT_STATE.note_io_failure();
+}
+
+/// Record that this `mds watch` session is live — every watch armed, every baseline
+/// captured (#157). From here on [`exit`] applies [`ExitPolicy::WatchSession`]: a
+/// rebuild's output failure, reported as it happened, and a stderr that fails other
+/// than by a closed pipe no longer change the exit code. Until then — a session that
+/// ends at startup — the batch rule applies.
+pub(crate) fn note_watch_session_live() {
+    OUTPUT_STATE.note_watch_live();
 }
 
 /// Report an I/O failure of a run that carries on past it — a directory build, `mds fmt
@@ -243,6 +264,9 @@ impl StdoutOutcome {
     /// and the run keeps its verdict. The first other failure is `mds::io`, naming
     /// stdout; a repeat of it was already reported (#157). Nothing is recorded here; an
     /// `Err` reaches the exit code through the caller.
+    ///
+    /// `mds watch -o -` reads the outcome itself instead: a closed pipe ends its session,
+    /// and neither it nor a repeated failure is a write it may remember as done.
     pub(crate) fn into_batch_result(self) -> std::result::Result<(), mds::MdsError> {
         match self {
             Self::Written | Self::Closed | Self::FailedAgain => Ok(()),
@@ -301,12 +325,8 @@ pub(crate) enum ExitPolicy {
     /// A run that ends on its own — build, check, fmt, lint, init, and a watch session
     /// that never went live: an output failure lifts the exit code to at least 2.
     Batch,
-    /// A watch session after it went live: its per-rebuild failures were reported as
-    /// they happened, and they do not change the exit code.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "its first caller is the watch conversion (#157)")
-    )]
+    /// A watch session after it went live ([`note_watch_session_live`]): its per-rebuild
+    /// failures were reported as they happened, and they do not change the exit code.
     WatchSession,
 }
 
@@ -329,10 +349,15 @@ pub(crate) fn final_exit_code(verdict: i32, state: &OutputState, policy: ExitPol
 
 /// End the process: the CLI's exit funnel.
 ///
-/// Exits with [`final_exit_code`] of `verdict` under [`ExitPolicy::Batch`], so an
-/// output failure recorded anywhere in the run is honoured on the way out.
+/// Exits with [`final_exit_code`] of `verdict` under the policy the run's state records
+/// ([`OutputState::exit_policy`]): [`ExitPolicy::Batch`], so an output failure recorded
+/// anywhere in the run is honoured on the way out — unless a watch session went live.
 pub(crate) fn exit(verdict: i32) -> ! {
-    std::process::exit(final_exit_code(verdict, &OUTPUT_STATE, ExitPolicy::Batch))
+    std::process::exit(final_exit_code(
+        verdict,
+        &OUTPUT_STATE,
+        OUTPUT_STATE.exit_policy(),
+    ))
 }
 
 // ── Stdin display sentinel ────────────────────────────────────────────────────
@@ -4074,5 +4099,38 @@ mod tests {
                 c.policy
             );
         }
+    }
+
+    /// A run exits under the batch rule until a watch session goes live, and under the
+    /// session rule from then on — whenever its output failure was recorded (#157).
+    #[test]
+    fn the_session_rule_applies_only_once_a_watch_session_is_live() {
+        let state = OutputState::new();
+        assert_eq!(
+            state.exit_policy(),
+            ExitPolicy::Batch,
+            "a fresh run is a batch"
+        );
+        state.note_io_failure();
+        assert_eq!(
+            final_exit_code(0, &state, state.exit_policy()),
+            2,
+            "before a session goes live, an output failure lifts the exit code"
+        );
+
+        state.note_watch_live();
+        assert_eq!(state.exit_policy(), ExitPolicy::WatchSession);
+        assert_eq!(
+            final_exit_code(0, &state, state.exit_policy()),
+            0,
+            "a live session keeps its verdict, the failure recorded before it included"
+        );
+        state.note_io_failure();
+        state.note_watch_live();
+        assert_eq!(
+            final_exit_code(1, &state, state.exit_policy()),
+            1,
+            "going live is sticky, and a failure recorded after it changes nothing"
+        );
     }
 }

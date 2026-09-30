@@ -574,45 +574,149 @@ pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap, Optio
 /// slow machine.
 #[allow(dead_code)]
 pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutTap>) {
-    // A private directory per spawn: the suite runs at full parallelism, so a shared
-    // path would let one watcher's marker satisfy another's wait. Dropped — and so
-    // deleted — when this function returns, by which point the marker has been read.
-    let ready_dir = tempfile::tempdir().expect("failed to create readiness tempdir");
-    let ready_path = ready_dir.path().join("watch-ready");
-    assert!(
-        ready_path.is_absolute(),
-        "MDS_TEST_READY must be absolute; mds watch ignores relative values"
-    );
-
+    let ready = ReadyFile::new();
     let (mut child, tap, stdout_tap) =
-        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", &ready_path));
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", ready.path()));
+    ready.wait(&mut child, || tap.text());
+    (child, tap, stdout_tap)
+}
 
-    // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
-    let deadline = std::time::Instant::now() + READY_TIMEOUT;
-    loop {
-        if std::fs::read(&ready_path).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
-            return (child, tap, stdout_tap);
-        }
-        // Check liveness before the deadline so a watcher that failed at startup is
-        // reported as "exited", not as "timed out".
-        if let Ok(Some(status)) = child.try_wait() {
-            let seen = tap.text();
-            panic!(
-                "mds watch exited with {status:?} before signalling readiness; \
-                 stderr was:\n{seen}"
-            );
-        }
-        if std::time::Instant::now() >= deadline {
-            let seen = tap.text();
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "mds watch did not signal readiness within {READY_TIMEOUT:?}; \
-                 stderr so far was:\n{seen}"
-            );
-        }
-        std::thread::sleep(READY_POLL);
+/// [`spawn_watch_ready`] for a command whose stderr the caller has set to something
+/// that needs no draining — a closed pipe, a file — which is left alone here.
+///
+/// A piped stdout is still drained, and its tap returned, as [`spawn_watch_ready`]
+/// does. With nothing tapping stderr, a watcher that ends at startup is reported by its
+/// exit status alone.
+#[allow(dead_code)]
+pub fn spawn_watch_ready_stderr_untapped(cmd: &mut Command) -> (Child, Option<StdoutTap>) {
+    let ready = ReadyFile::new();
+    let mut child = cmd
+        .env("MDS_TEST_READY", ready.path())
+        .spawn()
+        .expect("failed to spawn mds watch");
+    let stdout_tap = child.stdout.take().map(tap_reader);
+    ready.wait(&mut child, || "(stderr is not tapped)".to_string());
+    (child, stdout_tap)
+}
+
+/// The file one spawned watcher creates when it is live (`MDS_TEST_READY`).
+struct ReadyFile {
+    /// A private directory per spawn: the suite runs at full parallelism, so a shared
+    /// path would let one watcher's marker satisfy another's wait. Dropped — and so
+    /// deleted — with this value, by which point the marker has been read.
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl ReadyFile {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("failed to create readiness tempdir");
+        let path = dir.path().join("watch-ready");
+        assert!(
+            path.is_absolute(),
+            "MDS_TEST_READY must be absolute; mds watch ignores relative values"
+        );
+        Self { _dir: dir, path }
     }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Block until `child` has created the marker. `stderr` reports what the child has
+    /// printed so far, for the panic messages.
+    ///
+    /// # Panics
+    /// Panics if the child exits first, or if [`READY_TIMEOUT`] passes (the child is
+    /// killed and reaped first).
+    fn wait(&self, child: &mut Child, stderr: impl Fn() -> String) {
+        // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
+        let deadline = std::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            if std::fs::read(&self.path).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
+                return;
+            }
+            // Check liveness before the deadline so a watcher that failed at startup is
+            // reported as "exited", not as "timed out".
+            if let Ok(Some(status)) = child.try_wait() {
+                let seen = stderr();
+                panic!(
+                    "mds watch exited with {status:?} before signalling readiness; \
+                     stderr was:\n{seen}"
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                let seen = stderr();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "mds watch did not signal readiness within {READY_TIMEOUT:?}; \
+                     stderr so far was:\n{seen}"
+                );
+            }
+            std::thread::sleep(READY_POLL);
+        }
+    }
+}
+
+// ── A stream that fails other than by a closed pipe (#157) ───────────────────
+
+/// Make the child `cmd` spawns unable to grow a file past `limit` bytes: its file-size
+/// limit is `limit` and it ignores SIGXFSZ, so a write past the limit fails with "file
+/// too large" (EFBIG) instead of killing the child.
+///
+/// A stream on a regular file the child may not grow then fails every write for a
+/// reason other than a closed pipe — on every unix, where `/dev/full` is Linux only.
+/// Pipes are not files, so the limit leaves a piped stream alone; every file the child
+/// writes itself (outputs, the readiness marker) is limited too.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn limit_file_growth(cmd: &mut Command, limit: libc::rlim_t) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `signal` is on POSIX's async-signal-safe list, and
+    // `setrlimit` is a thin wrapper around its system call that takes no lock and
+    // allocates nothing. The closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            let growth = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &growth) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// A regular file of exactly `len` bytes, open for writing at its end, to hand to a
+/// child as a stream: under [`limit_file_growth`] with `len` as the limit, every write
+/// the child makes to it fails with "file too large".
+///
+/// Not opened for appending: macOS checks the limit against the descriptor's offset,
+/// and an appending descriptor sits at 0 until its first write, so a write shorter than
+/// the limit would get through. The offset is shared with every copy of the descriptor
+/// — the child's stream and a `try_clone` the test keeps — so the test makes room again
+/// by shortening the file and moving that clone's offset back (#157).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn full_file(path: &Path, len: usize) -> std::fs::File {
+    use std::io::{Seek as _, SeekFrom};
+
+    std::fs::write(path, vec![b'#'; len]).expect("fill the stream file");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open the stream file");
+    file.seek(SeekFrom::End(0))
+        .expect("move to the end of the stream file");
+    file
 }
 
 /// Assert that `s` contains no raw C0 (excluding `\t` and `\n`), DEL, C1, bidi

@@ -45,6 +45,11 @@
 //! - All status / warnings / errors → stderr (pipe-safe).
 //! - `--quiet` suppresses status + warnings but NOT compile errors.
 //! - Exit 0 on clean Ctrl+C; non-zero only on startup failure.
+//! - Streams (#157): with `-o -`, stdout's reader going away ends the session —
+//!   `Stopped watching (stdout closed).`, exit 0 — since nothing can receive its output
+//!   any more; a closed stderr only loses the status lines. Once live ([`go_live`]), a
+//!   rebuild's output failure is reported where it can be and never changes the exit
+//!   code. Every status line goes through the CLI's stderr writer, which never panics.
 //! - Compile errors during watching never terminate the watcher.
 //! - All loops have fixed upper bounds (reconcile rule / reliability.md): the idle tick
 //!   against an absolute deadline, and the debounce window against an absolute cap
@@ -59,6 +64,7 @@
 //!   idle cost is O(1) in tree size.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -76,7 +82,8 @@ use crate::build::{
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
     is_within_default_excluded_dir, output_base_no_ext, output_path_for, probe_and_remove_stale,
-    resolve_output_base, safe_inline, safe_path, OutputBase,
+    resolve_output_base, safe_inline, safe_path, stdout_failure, write_stdout, OutputBase,
+    StdoutOutcome,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -432,7 +439,7 @@ pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<Pat
 pub(crate) fn clear_terminal() {
     use std::io::IsTerminal;
     if std::io::stderr().is_terminal() {
-        eprint!("\x1b[2J\x1b[3J\x1b[H");
+        crate::output::ewrite!("\x1b[2J\x1b[3J\x1b[H");
     }
 }
 
@@ -469,13 +476,43 @@ pub(crate) fn resync_watches(
 
 // ── Small shared helpers ──────────────────────────────────────────────────────
 
-/// Emit "Stopped watching." to stderr (unless quiet).
+/// Why a watch session stops, which its last status line names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopReason {
+    /// Ctrl+C — or the event channel closing, which ends the loop the same way.
+    Interrupted,
+    /// `-o -` and stdout's reader is gone: nothing can receive the output any more
+    /// (#157).
+    StdoutClosed,
+}
+
+/// Emit the session's last status line to stderr (unless quiet): `Stopped watching.`, or
+/// `Stopped watching (stdout closed).` when `-o -` lost its reader.
 ///
-/// Called at every Ctrl+C exit point in both watch loops.
-fn stop_watching(quiet: bool) {
-    if !quiet {
-        eprintln!("Stopped watching.");
+/// Called at every point where a watch session ends without an error: Ctrl+C in both
+/// watch loops, and a gone stdout reader in file mode, at startup or on a rebuild. Each
+/// such session exits 0.
+fn stop_watching(quiet: bool, why: StopReason) {
+    if quiet {
+        return;
     }
+    match why {
+        StopReason::Interrupted => crate::output::ewriteln!("Stopped watching."),
+        StopReason::StdoutClosed => {
+            crate::output::ewriteln!("Stopped watching (stdout closed).");
+        }
+    }
+}
+
+/// The session is live: every watched directory is armed and every baseline captured.
+///
+/// From here on a rebuild's output failure is reported as it happens and never changes
+/// how the session exits: the exit funnel applies its watch-session rule (#157). Only
+/// then is the readiness marker written, so a test that sees the marker sees a live
+/// session.
+fn go_live() {
+    crate::output::note_watch_session_live();
+    emit_ready_marker();
 }
 
 /// Test-only delay injected right after the startup output is published.
@@ -1147,16 +1184,70 @@ type WrittenEntry = (Option<PathBuf>, Vec<String>, String);
 enum CompileWriteOutcome {
     /// Compiled, routed and written.
     Written(WrittenEntry),
-    /// A failure — compile or write — that `mds watch` reports and keeps watching
-    /// through.
-    Failed(miette::Report),
+    /// A failure — compile or write — that `mds watch` keeps watching through. `Some` is
+    /// the failure to report; `None` a repeat of a stdout failure already reported
+    /// ([`OutputWrite::Failed`]).
+    Failed(Option<miette::Report>),
+    /// `-o -` and stdout's reader is gone: `mds watch` stops (#157).
+    StdoutClosed,
+}
+
+/// What one write of a watch session's output did (#157).
+#[derive(Debug)]
+#[must_use]
+enum OutputWrite {
+    /// Written in full.
+    Written,
+    /// Not written. `Some` is the failure to report: an output file that could not be
+    /// written, or the session's first stdout failure (`mds::io`, naming stdout). `None`
+    /// is a repeat of that stdout failure, which is not reported again. Either way the
+    /// content-dedup map must not record the content, so the next rebuild writes again
+    /// even when its output has not changed.
+    Failed(Option<miette::Report>),
+    /// `-o -` and stdout's reader is gone: the session ends.
+    StdoutClosed,
+}
+
+impl OutputWrite {
+    /// The session's reading of one `-o -` write.
+    ///
+    /// Not [`StdoutOutcome::into_batch_result`]: a batch run takes a closed pipe and a
+    /// repeated failure for success and finishes, but a session must stop on the first
+    /// and must not record the second as written.
+    fn from_stdout(outcome: StdoutOutcome) -> Self {
+        match outcome {
+            StdoutOutcome::Written => Self::Written,
+            StdoutOutcome::Closed => Self::StdoutClosed,
+            StdoutOutcome::Failed(e) => Self::Failed(Some(miette::Report::new(stdout_failure(&e)))),
+            StdoutOutcome::FailedAgain => Self::Failed(None),
+        }
+    }
+}
+
+/// Write `content` where the session writes: the output file, through [`write_output`]
+/// (`announce` prints its `Compiled to` line), or stdout for `-o -` (`output_path` is
+/// `None`).
+fn write_session_output(
+    output_path: Option<PathBuf>,
+    content: &str,
+    quiet: bool,
+    announce: bool,
+) -> OutputWrite {
+    match output_path {
+        Some(path) => match write_output(Some(path), content, quiet, announce) {
+            Ok(()) => OutputWrite::Written,
+            Err(e) => OutputWrite::Failed(Some(e)),
+        },
+        None => OutputWrite::from_stdout(write_stdout(content.as_bytes())),
+    }
 }
 
 /// Compile `entry` ([`WatchedPath::compile`]), derive the output path from the compiled
 /// kind and `entry.canonical`, and write — file mode's startup compile.
 ///
 /// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
-/// reports and keeps watching through: the compile, the write. The `Err` this function
+/// reports and keeps watching through: the compile, the write; `StdoutClosed` ends the
+/// session before it goes live, with exit 0 (#157). The `Err` this function
 /// itself returns is an output route no rebuild can use, which ends `mds watch` at
 /// startup (exit 2), since every rebuild writes where startup resolved: a route that
 /// fails to resolve — `mds.json` `build.output_dir` with a `..` component, refused with
@@ -1186,7 +1277,7 @@ fn compile_and_write(
 ) -> Result<CompileWriteOutcome> {
     let compiled = match entry.compile(runtime_vars, quiet) {
         Ok(compiled) => compiled,
-        Err(e) => return Ok(CompileWriteOutcome::Failed(e)),
+        Err(e) => return Ok(CompileWriteOutcome::Failed(Some(e))),
     };
     let output_path = resolve_output_path_for_kind(
         &Some(entry.canonical.clone()),
@@ -1204,11 +1295,12 @@ fn compile_and_write(
     )
     .map_err(miette::Error::from)?;
     Ok(
-        match write_output(output_path.clone(), &compiled.content, quiet, true) {
-            Ok(()) => {
+        match write_session_output(output_path.clone(), &compiled.content, quiet, true) {
+            OutputWrite::Written => {
                 CompileWriteOutcome::Written((output_path, compiled.dependencies, compiled.content))
             }
-            Err(e) => CompileWriteOutcome::Failed(e),
+            OutputWrite::Failed(e) => CompileWriteOutcome::Failed(e),
+            OutputWrite::StdoutClosed => CompileWriteOutcome::StdoutClosed,
         },
     )
 }
@@ -1407,18 +1499,24 @@ fn handle_fs_event_file(
 /// `ctx` holds compile-time constants; `state` holds all mutable loop state;
 /// `watcher` is passed separately (non-Clone, distinct lifecycle role).
 ///
+/// Returns `Break` when the session must stop: `-o -` found stdout's reader gone
+/// (#157). Every other outcome, failures included, keeps watching.
+///
 /// # Invariants preserved
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output.
 /// - PF-004: all reads go through `compile_to_content`.
 /// - Error-settle: every failure — the vars file, the compile, the output route or its
-///   #425 refusal, the write — goes through [`settle_after_error`].
+///   #425 refusal, the write — goes through [`settle_after_error`], except a repeated
+///   stdout failure, which was reported already.
+/// - `last_written` records only content that was written, so a rebuild after a failed
+///   write writes again even when its output has not changed (#157).
 /// - A recreated working directory is restored before anything is read
 ///   ([`WorkingDir::restore_if_recreated`]).
 fn rebuild_file(
     ctx: &FileCompileCtx,
     watcher: &mut RecommendedWatcher,
     state: &mut FileWatchState,
-) {
+) -> ControlFlow<StopReason> {
     ctx.working_dir.restore_if_recreated();
 
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
@@ -1440,7 +1538,10 @@ fn rebuild_file(
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
         Ok(v) => v,
-        Err(e) => return settle_after_error(state, e),
+        Err(e) => {
+            settle_after_error(state, e);
+            return ControlFlow::Continue(());
+        }
     };
     // Move the map out instead of cloning it: `compile_to_content` takes
     // `runtime_vars` by value, and the emitter below only ever reads
@@ -1470,7 +1571,10 @@ fn rebuild_file(
     });
     let (compiled, output_path) = match routed {
         Ok(routed) => routed,
-        Err(e) => return settle_after_error(state, e),
+        Err(e) => {
+            settle_after_error(state, e);
+            return ControlFlow::Continue(());
+        }
     };
 
     // The content-dedup key, and the name the "Recompiled" line shows.
@@ -1511,14 +1615,14 @@ fn rebuild_file(
     state.last_mtimes = snapshot_state(&state.foi);
 
     if !content_changed {
-        return;
+        return ControlFlow::Continue(());
     }
-    match write_output(output_path, &compiled.content, ctx.quiet, false) {
-        Ok(()) => {
+    match write_session_output(output_path, &compiled.content, ctx.quiet, false) {
+        OutputWrite::Written => {
             let elapsed = t0.elapsed().as_millis();
             let dep_count = compiled.dependencies.len();
             if !ctx.quiet {
-                eprintln!(
+                crate::output::ewriteln!(
                     "Recompiled {} ({} deps) in {}ms",
                     safe_inline(&output_key),
                     dep_count,
@@ -1527,13 +1631,19 @@ fn rebuild_file(
             }
             state.last_written.insert(output_key, compiled.content);
         }
-        Err(e) => settle_after_error(state, e),
+        // Not written: `last_written` keeps what was last written, so the next rebuild
+        // writes again even when its output has not changed.
+        OutputWrite::Failed(Some(e)) => settle_after_error(state, e),
+        OutputWrite::Failed(None) => {}
+        OutputWrite::StdoutClosed => return ControlFlow::Break(StopReason::StdoutClosed),
     }
+    ControlFlow::Continue(())
 }
 
 /// Report a failed file-mode rebuild and settle: snapshot the files of interest, so the
 /// tick gate does not re-fire on the same unchanged files (AC-R7/W6). Watching
-/// continues. Every failure [`rebuild_file`] meets ends here.
+/// continues. Every failure [`rebuild_file`] meets ends here, except a repeated stdout
+/// failure, which is not reported again (#157).
 fn settle_after_error(state: &mut FileWatchState, e: miette::Report) {
     eprint_error(e);
     state.last_mtimes = snapshot_state(&state.foi);
@@ -1574,7 +1684,7 @@ fn run_watch_file(
     let static_set_string_vars = set_string_vars;
 
     if !quiet {
-        eprintln!("Watching {}", safe_path(&entry.canonical));
+        crate::output::ewriteln!("Watching {}", safe_path(&entry.canonical));
     }
 
     // ── Arm before publish (startup race) ─────────────────────────────────────
@@ -1686,9 +1796,18 @@ fn run_watch_file(
     let startup = compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet)?;
     let (output_path, initial_deps, initial_content) = match startup {
         CompileWriteOutcome::Written(result) => result,
+        // stdout's reader is gone before the session went live: it stops here, and its
+        // verdict is 0 — a closed pipe never changes the exit code (#157).
+        CompileWriteOutcome::StdoutClosed => {
+            stop_watching(quiet, StopReason::StdoutClosed);
+            return Ok(());
+        }
         CompileWriteOutcome::Failed(e) => {
-            // Initial compile error: print and continue watching (entry dir still watched).
-            eprint_error(e);
+            // Initial compile or write error: print and continue watching (entry dir
+            // still watched).
+            if let Some(e) = e {
+                eprint_error(e);
+            }
             // Fall back: resolve output path with Markdown kind as a placeholder so we
             // know where to watch. This path may not match a later successful compile if
             // the template has @message blocks, and every rebuild reuses it
@@ -1857,36 +1976,38 @@ fn run_watch_file(
     });
 
     // Every dir is armed and every baseline captured — the watch is now live.
-    emit_ready_marker();
+    go_live();
 
     // ── Watch loop ────────────────────────────────────────────────────────────
     // The outer loop processes one event batch at a time and is bounded:
-    // it terminates on Interrupt, Disconnected, or when tick probe fires.
+    // it terminates on Interrupt, Disconnected, or a rebuild that finds stdout's
+    // reader gone.
     let mut clock = TickClock::new(tick);
-    loop {
-        match clock.recv_next(&rx) {
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+    let why = loop {
+        let next = match clock.recv_next(&rx) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => break StopReason::Interrupted,
             Ok(None) => {
                 // Idle tick — run liveness probe (reconcile rule).
                 if liveness_probe_file(&ctx, &mut watcher, &mut state) {
-                    rebuild_file(&ctx, &mut watcher, &mut state);
+                    rebuild_file(&ctx, &mut watcher, &mut state)
+                } else {
+                    ControlFlow::Continue(())
                 }
-                continue;
             }
             Ok(Some(msg)) => match handle_fs_event_file(msg, &state.foi, &rx, debounce_ms, clear) {
-                FileEventAction::Skip => continue,
-                FileEventAction::Stop => {
-                    stop_watching(ctx.quiet);
-                    return Ok(());
-                }
+                FileEventAction::Skip => ControlFlow::Continue(()),
+                FileEventAction::Stop => ControlFlow::Break(StopReason::Interrupted),
                 FileEventAction::Rebuild => rebuild_file(&ctx, &mut watcher, &mut state),
             },
             // Unreachable: recv_timeout returns Ok(None) for Timeout, not an Err.
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => ControlFlow::Continue(()),
+        };
+        if let ControlFlow::Break(why) = next {
+            break why;
         }
-    }
+    };
 
-    stop_watching(ctx.quiet);
+    stop_watching(ctx.quiet, why);
     Ok(())
 }
 
@@ -2106,7 +2227,7 @@ fn compile_one_source(
                         let elapsed = t0.elapsed().as_millis();
                         let dep_count = compiled.dependencies.len();
                         if !quiet {
-                            eprintln!(
+                            crate::output::ewriteln!(
                                 "Recompiled {} ({} deps) in {}ms",
                                 safe_path(&out),
                                 dep_count,
@@ -2576,7 +2697,7 @@ fn dir_watch_startup(
     };
 
     if !quiet {
-        eprintln!("Watching directory {}", safe_path(root));
+        crate::output::ewriteln!("Watching directory {}", safe_path(root));
     }
 
     // Additionally watch the vars file's parent if it is outside root.
@@ -2913,7 +3034,7 @@ fn dir_watch_startup(
     });
 
     // Root, external dep dirs and the vars dir are all armed — the watch is live.
-    emit_ready_marker();
+    go_live();
 
     Ok(DirStartup {
         watcher,
@@ -2966,7 +3087,7 @@ fn run_watch_dir(
             Ok(Some(msg)) => match handle_fs_event_dir(msg, &ctx, &rx, &mut state) {
                 DirEventOutcome::Skip | DirEventOutcome::Done => {}
                 DirEventOutcome::Stop => {
-                    stop_watching(ctx.quiet);
+                    stop_watching(ctx.quiet, StopReason::Interrupted);
                     return Ok(());
                 }
             },
@@ -2974,7 +3095,7 @@ fn run_watch_dir(
         }
     }
 
-    stop_watching(ctx.quiet);
+    stop_watching(ctx.quiet, StopReason::Interrupted);
     Ok(())
 }
 
@@ -3057,7 +3178,10 @@ fn process_dir_batch_vars_changed(
                 match std::fs::remove_file(&out) {
                     Ok(()) => {
                         if !quiet {
-                            eprintln!("Removed {} (source deleted)", safe_path(&out));
+                            crate::output::ewriteln!(
+                                "Removed {} (source deleted)",
+                                safe_path(&out)
+                            );
                         }
                     }
                     Err(e) => {
@@ -3221,7 +3345,10 @@ fn process_dir_batch_incremental(
                 match std::fs::remove_file(&out) {
                     Ok(()) => {
                         if !quiet {
-                            eprintln!("Removed {} (source deleted)", safe_path(&out));
+                            crate::output::ewriteln!(
+                                "Removed {} (source deleted)",
+                                safe_path(&out)
+                            );
                         }
                     }
                     Err(e) => {
@@ -4632,7 +4759,10 @@ mod tests {
         let (_written_path, deps, _content) =
             match compile_and_write(&watched, &Some(out_str), &None, &None, None, true).unwrap() {
                 CompileWriteOutcome::Written(result) => result,
-                CompileWriteOutcome::Failed(e) => panic!("compile_and_write failed: {e}"),
+                CompileWriteOutcome::Failed(e) => panic!("compile_and_write failed: {e:?}"),
+                CompileWriteOutcome::StdoutClosed => {
+                    panic!("compile_and_write writes a file here, never stdout")
+                }
             };
         // The entry's compile output should list helper as a dependency.
         assert!(out.exists(), "output file should be created");
@@ -4784,5 +4914,36 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// A session reads each `-o -` outcome itself (#157): a closed pipe stops it, the
+    /// first other failure is reported as `mds::io` naming stdout, and a repeat of it is
+    /// not written and not reported — where a batch run takes both a closed pipe and a
+    /// repeat for success.
+    #[test]
+    fn a_session_reads_each_stdout_outcome_for_itself() {
+        assert!(matches!(
+            OutputWrite::from_stdout(StdoutOutcome::Written),
+            OutputWrite::Written
+        ));
+        assert!(matches!(
+            OutputWrite::from_stdout(StdoutOutcome::Closed),
+            OutputWrite::StdoutClosed
+        ));
+        assert!(matches!(
+            OutputWrite::from_stdout(StdoutOutcome::FailedAgain),
+            OutputWrite::Failed(None)
+        ));
+        let failed = std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left");
+        match OutputWrite::from_stdout(StdoutOutcome::Failed(failed)) {
+            OutputWrite::Failed(Some(report)) => {
+                assert_eq!(report.to_string(), "cannot write to stdout: no space left");
+                assert_eq!(
+                    report.code().map(|c| c.to_string()).as_deref(),
+                    Some("mds::io")
+                );
+            }
+            other => panic!("want Failed(Some(mds::io)); got {other:?}"),
+        }
     }
 }

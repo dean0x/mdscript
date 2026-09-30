@@ -814,29 +814,9 @@ fn help_into_a_full_device_exits_2() {
 /// `/dev/full` is Linux only. Stderr stays a pipe, which the limit does not cover (#157).
 #[cfg(unix)]
 fn run_into_a_file_it_may_not_grow_in(dir: &Path, args: &[&str], stdin: &str) -> Run {
-    use std::os::unix::process::CommandExt as _;
-
     let out = tempfile::tempfile().expect("create the stdout file");
     let mut cmd = mds_bin();
-    // SAFETY: the closure runs in the forked child just before `exec`, where only
-    // async-signal-safe work is sound: `signal` is on POSIX's async-signal-safe list, and
-    // `setrlimit` is a thin wrapper around its system call that takes no lock and
-    // allocates nothing. The closure touches none of the parent's state.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
-                return Err(std::io::Error::last_os_error());
-            }
-            let no_growth = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &no_growth) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    common::limit_file_growth(&mut cmd, 0);
     run_command(
         cmd,
         dir,

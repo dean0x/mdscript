@@ -216,6 +216,7 @@ const SITE_FLOORS: &[(&str, usize)] = &[
     ("fmt.rs", 11),
     ("main.rs", 11),
     ("output.rs", 6),
+    ("watch.rs", 18),
 ];
 
 /// The function the stderr writer macros expand to (`output.rs`, #157).
