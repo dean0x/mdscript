@@ -844,10 +844,17 @@ fn no_raw_print_macro_outside_the_writer() {
         writer_calls += find_invocations(&mask_comments(src), &["ewriteln!", "ewrite!"]).len();
     }
 
-    // Non-vacuity: the scan read the code the CLI prints from.
+    // Non-vacuity only: the scan found the registered writer macros at all, so the ban
+    // below cannot pass by reading nothing (a broken module walk, a masking bug, a
+    // renamed macro). It is not a coverage count. Which files print through the writer
+    // is guarded file by file, by `SITE_FLOORS` in
+    // `cli_print_sites_sanitize_every_interpolated_value`, with `lint.rs` in
+    // `FLOORS_PENDING` until its status lines move to the result sinks. So this number
+    // sits well under the crate's real count, and a refactor that removes duplicated
+    // print sites must never have to keep them to satisfy it.
     assert!(
-        writer_calls >= 80,
-        "non-vacuity: expected at least 80 `ewriteln!` / `ewrite!` calls across \
+        writer_calls >= 60,
+        "non-vacuity: expected at least 60 `ewriteln!` / `ewrite!` calls across \
          mds-cli/src, found {writer_calls}"
     );
     assert!(
