@@ -66,6 +66,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -84,7 +85,7 @@ use crate::output::{
     canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
     is_within_default_excluded_dir, output_base_no_ext, output_path_for, probe_and_remove_stale,
     resolve_output_base, safe_inline, safe_path, stdout_failure, write_stdout, OutputBase,
-    StdoutOutcome,
+    Panicked, StdoutOutcome,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -1019,19 +1020,27 @@ impl WatchedPath {
     /// Compile the entry, or a source, by its typed path once
     /// [`ensure_unmoved`](Self::ensure_unmoved) has confirmed that it still leads to the
     /// file being watched. `mds watch` writes no source maps, so the compile takes the
-    /// default options.
+    /// default options. A panic in the compile is caught: the session goes on (#389).
     fn compile(
         &self,
         runtime_vars: Option<HashMap<String, mds::Value>>,
         quiet: bool,
-    ) -> Result<CompileOutput> {
+    ) -> std::result::Result<CompileOutput, CompileFailure> {
         self.ensure_unmoved().map_err(miette::Error::from)?;
-        compile_to_content(
+        let compiled = crate::output::catch_compile(
             &self.typed,
-            runtime_vars,
-            quiet,
-            mds::CompileOptions::default(),
-        )
+            AssertUnwindSafe(|| {
+                compile_to_content(
+                    &self.typed,
+                    runtime_vars,
+                    quiet,
+                    mds::CompileOptions::default(),
+                )
+            }),
+        );
+        compiled
+            .map_err(|Panicked| CompileFailure::Panicked)?
+            .map_err(CompileFailure::from)
     }
 
     /// The path `src` (a walked or graph-key path under the root's `canonical`) is
@@ -1062,9 +1071,17 @@ impl WatchedPath {
         src: &Path,
         runtime_vars: Option<HashMap<String, mds::Value>>,
         quiet: bool,
-    ) -> Result<CompileOutput> {
+    ) -> std::result::Result<CompileOutput, CompileFailure> {
         if !src.starts_with(&self.canonical) {
-            return compile_to_content(src, runtime_vars, quiet, mds::CompileOptions::default());
+            let compiled = crate::output::catch_compile(
+                src,
+                AssertUnwindSafe(|| {
+                    compile_to_content(src, runtime_vars, quiet, mds::CompileOptions::default())
+                }),
+            );
+            return compiled
+                .map_err(|Panicked| CompileFailure::Panicked)?
+                .map_err(CompileFailure::from);
         }
         self.ensure_unmoved().map_err(miette::Error::from)?;
         WatchedPath {
@@ -1073,6 +1090,41 @@ impl WatchedPath {
             what: Watched::Source,
         }
         .compile(runtime_vars, quiet)
+    }
+}
+
+/// Why a watch compile gave no output. Either way the file counts as failed, and the
+/// session keeps watching.
+#[derive(Debug)]
+enum CompileFailure {
+    /// The compile's error, or the refusal of a path that no longer leads to the watched
+    /// file — still to be reported.
+    Error(miette::Report),
+    /// The compile panicked. The panic hook has reported it, and the session exits 101
+    /// when it stops (#389).
+    Panicked,
+}
+
+impl CompileFailure {
+    /// The error to report: none for a panic, which the panic hook reported.
+    fn unreported(self) -> Option<miette::Report> {
+        match self {
+            Self::Error(e) => Some(e),
+            Self::Panicked => None,
+        }
+    }
+
+    /// Report the failure, unless the panic hook has.
+    fn report(self) {
+        if let Some(e) = self.unreported() {
+            eprint_error(e);
+        }
+    }
+}
+
+impl From<miette::Report> for CompileFailure {
+    fn from(e: miette::Report) -> Self {
+        Self::Error(e)
     }
 }
 
@@ -1185,7 +1237,8 @@ enum CompileWriteOutcome {
     /// Compiled, routed and written.
     Written(WrittenEntry),
     /// A failure — compile or write — that `mds watch` keeps watching through. `Some` is
-    /// the failure to report; `None` a repeat of a stdout failure already reported
+    /// the failure to report; `None` one reported already: a compile that panicked, which
+    /// the panic hook reported (#389), or a repeat of a stdout failure
     /// ([`OutputWrite::Failed`]).
     Failed(Option<miette::Report>),
     /// `-o -` and stdout's reader is gone: `mds watch` stops (#157).
@@ -1278,7 +1331,7 @@ fn compile_and_write(
 ) -> Result<CompileWriteOutcome> {
     let compiled = match entry.compile(runtime_vars, quiet) {
         Ok(compiled) => compiled,
-        Err(e) => return Ok(CompileWriteOutcome::Failed(Some(e))),
+        Err(failure) => return Ok(CompileWriteOutcome::Failed(failure.unreported())),
     };
     let output_path = resolve_output_path_for_kind(
         &Some(entry.canonical.clone()),
@@ -1507,8 +1560,10 @@ fn handle_fs_event_file(
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output.
 /// - PF-004: all reads go through `compile_to_content`.
 /// - Error-settle: every failure — the vars file, the compile, the output route or its
-///   #425 refusal, the write — goes through [`settle_after_error`], except a repeated
-///   stdout failure, which was reported already.
+///   #425 refusal, the write — goes through [`settle_after_error`] or, for the compile and
+///   the route, [`settle_after_failure`], except a repeated stdout failure, which was
+///   reported already. A compile that panicked is settled the same way; the panic hook
+///   was its report (#389).
 /// - `last_written` records only content that was written, so a rebuild after a failed
 ///   write writes again even when its output has not changed (#157).
 /// - A recreated working directory is restored before anything is read
@@ -1572,8 +1627,8 @@ fn rebuild_file(
     });
     let (compiled, output_path) = match routed {
         Ok(routed) => routed,
-        Err(e) => {
-            settle_after_error(state, e);
+        Err(failure) => {
+            settle_after_failure(state, failure);
             return ControlFlow::Continue(());
         }
     };
@@ -1646,7 +1701,13 @@ fn rebuild_file(
 /// continues. Every failure [`rebuild_file`] meets ends here, except a repeated stdout
 /// failure, which is not reported again (#157).
 fn settle_after_error(state: &mut FileWatchState, e: miette::Report) {
-    eprint_error(e);
+    settle_after_failure(state, CompileFailure::Error(e));
+}
+
+/// [`settle_after_error`] for a failed compile, which the panic hook has reported when it
+/// panicked (#389): settled the same way, reported once.
+fn settle_after_failure(state: &mut FileWatchState, failure: CompileFailure) {
+    failure.report();
     state.last_mtimes = snapshot_state(&state.foi);
 }
 
@@ -1738,6 +1799,7 @@ fn run_watch_file(
     let tx_fs = tx.clone();
     let mut watcher = RecommendedWatcher::new(
         move |res| {
+            crate::output::panic_in_handler("notify");
             let _ = tx_fs.send(Msg::Fs(res));
         },
         notify::Config::default(),
@@ -1973,6 +2035,7 @@ fn run_watch_file(
     // handler: arming the watcher only needs `tx`, which is cloned here just as well.
     let tx_ctrlc = tx.clone();
     let _ = ctrlc::set_handler(move || {
+        crate::output::panic_in_handler("ctrlc");
         let _ = tx_ctrlc.send(Msg::Interrupt);
     });
 
@@ -2285,8 +2348,8 @@ fn compile_one_source(
                 false
             }
         }
-        Err(e) => {
-            eprint_error(e);
+        Err(failure) => {
+            failure.report();
             state.record_error(src);
             false
         }
@@ -2745,6 +2808,7 @@ fn dir_watch_startup(
     let tx_fs = tx.clone();
     let mut watcher = RecommendedWatcher::new(
         move |res| {
+            crate::output::panic_in_handler("notify");
             let _ = tx_fs.send(Msg::Fs(res));
         },
         notify::Config::default(),
@@ -2867,8 +2931,8 @@ fn dir_watch_startup(
                     }
                 }
             }
-            Err(e) => {
-                eprint_error(e);
+            Err(failure) => {
+                failure.report();
                 state.forward_deps.insert(key.clone(), vec![]);
                 state.errored.insert(key.clone());
                 state.known_files.insert(key);
@@ -3031,6 +3095,7 @@ fn dir_watch_startup(
     // the remaining outputs and exits 0. Nothing above needs the handler.
     let tx_ctrlc = tx.clone();
     let _ = ctrlc::set_handler(move || {
+        crate::output::panic_in_handler("ctrlc");
         let _ = tx_ctrlc.send(Msg::Interrupt);
     });
 
@@ -3322,8 +3387,8 @@ fn process_dir_batch_incremental(
                     state.forward_deps.insert(src.clone(), dep_paths);
                     state.errored.remove(src);
                 }
-                Err(e) => {
-                    eprint_error(e);
+                Err(failure) => {
+                    failure.report();
                     state.errored.insert(src.clone());
                 }
             }
@@ -4810,7 +4875,11 @@ mod tests {
             }
             .compile(None, true)
             .map(|compiled| compiled.content)
-            .map_err(|e| e.to_string())
+            .map_err(|failure| {
+                failure
+                    .unreported()
+                    .map_or_else(|| "a panic".to_string(), |e| e.to_string())
+            })
         };
 
         let here = mds::NativeFs::check_symlink(&typed).unwrap();

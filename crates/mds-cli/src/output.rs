@@ -13,7 +13,8 @@
 //!   process through [`final_exit_code`].
 //! - [`install_panic_hook`] / [`catch_panic`]: a panic prints one fixed
 //!   internal-compiler-error text — never the panic's message or location — and the run
-//!   exits 101 (#389).
+//!   exits 101 (#389). [`catch_compile`] catches a panic in one file's compile, so a
+//!   directory run or a watch session goes on without that file.
 //! - [`eprint_error`]: the CLI's error-report choke point — escapes every report's
 //!   message, help, and label text before miette renders it (CWE-150), then writes the
 //!   frame through `ewriteln!`.
@@ -410,7 +411,8 @@ pub(crate) fn exit(verdict: i32) -> ! {
 // machine's absolute paths. The run then exits 101. `main` runs the whole command
 // inside `catch_panic`, so a panic on its thread unwinds — running the destructors that
 // remove temporary files — to the exit funnel; a panic nothing catches, on a helper
-// thread for one, ends the process at once through `exit_after_panic`.
+// thread for one, ends the process at once through `exit_after_panic`. A batch runs
+// each file's compile inside `catch_compile`, so a panic there fails that file alone.
 
 /// What the CLI prints when it panics: that it failed, and where to report it. Nothing
 /// about the panic itself.
@@ -546,6 +548,31 @@ pub(crate) fn catch_panic<T>(
     })
 }
 
+/// Run one file's compile — `compile` — catching a panic in it, so a batch goes on
+/// without that file: a directory run of `mds build`, `check`, `fmt` or `lint`, and every
+/// compile of an `mds watch` session (#389).
+///
+/// The panic hook has printed the text and recorded the panic, so the run exits 101
+/// whatever it does next. On `Err`, the caller counts the file as failed and prints
+/// nothing more about it.
+///
+/// `compile` is the compile call alone. A panic abandons it part-way, so nothing in it
+/// may write or delete a file or change state the batch goes on to use: what it
+/// abandons is then only its own. The caller wraps it in `AssertUnwindSafe`, which says
+/// just that; `tests/panic_hook.rs` pins every call site's closure to one compile call.
+///
+/// `label` is the file being compiled. A debug build's test trigger panics here when
+/// `MDS_TEST_PANIC` is `compile:` followed by the label's file stem.
+pub(crate) fn catch_compile<T>(
+    label: &Path,
+    compile: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> std::result::Result<T, Panicked> {
+    catch_panic(move || {
+        panic_on_compile(label);
+        compile()
+    })
+}
+
 /// What [`dispose_payload`] did with a caught panic's payload.
 #[derive(Debug, PartialEq, Eq)]
 enum Disposal {
@@ -624,19 +651,29 @@ fn write_panic_detail<W: std::io::Write + ?Sized>(
 /// panic hook (`tests/panic_hook.rs`). A release build has none of it.
 #[cfg(debug_assertions)]
 mod panic_trigger {
-    /// The variable that asks for a panic, and where: `main` in the command's dispatch,
-    /// `thread` in a thread the dispatch starts and waits for.
+    use std::path::Path;
+
+    /// The variable that asks for a panic, and where:
+    /// - `main`: in the command's dispatch;
+    /// - `thread`: in a thread the dispatch starts and waits for;
+    /// - `compile:<stem>`: in [`catch_compile`](super::catch_compile), compiling a file
+    ///   whose file stem is `<stem>`;
+    /// - `notify` / `ctrlc`: in `mds watch`'s file-event callback / Ctrl-C handler, each
+    ///   on a thread of its own.
     const VARIABLE: &str = "MDS_TEST_PANIC";
 
     /// A word the payload carries, for a test to look for.
     pub(super) const SENTINEL: &str = "mds-test-panic-payload";
 
-    /// Panic as `MDS_TEST_PANIC` asks, if it asks. The dispatch calls it first.
+    /// What `MDS_TEST_PANIC` asks for, when it is set to text.
+    fn requested() -> Option<String> {
+        std::env::var_os(VARIABLE).and_then(|value| value.into_string().ok())
+    }
+
+    /// Panic as `MDS_TEST_PANIC` asks, if it asks for `main` or `thread`. The dispatch
+    /// calls it first.
     pub(crate) fn panic_on_request() {
-        match std::env::var_os(VARIABLE)
-            .as_deref()
-            .and_then(std::ffi::OsStr::to_str)
-        {
+        match requested().as_deref() {
             Some("main") => std::panic::panic_any(payload()),
             Some("thread") => {
                 // A thread's panic that does not end the process leaves the dispatch to
@@ -644,6 +681,30 @@ mod panic_trigger {
                 let _ = std::thread::spawn(|| std::panic::panic_any(payload())).join();
             }
             _ => {}
+        }
+    }
+
+    /// Panic when `MDS_TEST_PANIC` is `compile:` followed by `label`'s file stem.
+    /// [`catch_compile`](super::catch_compile) calls it inside its catch.
+    pub(crate) fn panic_on_compile(label: &Path) {
+        let Some(stem) = label.file_stem().and_then(std::ffi::OsStr::to_str) else {
+            return;
+        };
+        let wanted = requested();
+        if wanted
+            .as_deref()
+            .and_then(|value| value.strip_prefix("compile:"))
+            == Some(stem)
+        {
+            std::panic::panic_any(payload());
+        }
+    }
+
+    /// Panic when `MDS_TEST_PANIC` is `handler`, the name of the handler that calls it:
+    /// `notify` or `ctrlc`.
+    pub(crate) fn panic_in_handler(handler: &str) {
+        if requested().as_deref() == Some(handler) {
+            std::panic::panic_any(payload());
         }
     }
 
@@ -657,11 +718,21 @@ mod panic_trigger {
 }
 
 #[cfg(debug_assertions)]
-pub(crate) use panic_trigger::panic_on_request;
+use panic_trigger::panic_on_compile;
+#[cfg(debug_assertions)]
+pub(crate) use panic_trigger::{panic_in_handler, panic_on_request};
 
-/// A release build's `MDS_TEST_PANIC` trigger: nothing (#389).
+/// A release build's `MDS_TEST_PANIC` trigger in the dispatch: nothing (#389).
 #[cfg(not(debug_assertions))]
 pub(crate) fn panic_on_request() {}
+
+/// A release build's `MDS_TEST_PANIC` trigger in [`catch_compile`]: nothing (#389).
+#[cfg(not(debug_assertions))]
+fn panic_on_compile(_label: &Path) {}
+
+/// A release build's `MDS_TEST_PANIC` trigger in a watch handler: nothing (#389).
+#[cfg(not(debug_assertions))]
+pub(crate) fn panic_in_handler(_handler: &str) {}
 
 // ── Stdin display sentinel ────────────────────────────────────────────────────
 

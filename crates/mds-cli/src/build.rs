@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use crate::output::Durability;
@@ -1966,8 +1967,13 @@ fn run_build_directory(
             .with_source_map_base(Some(source_map_base));
 
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
-        match compile_to_content(file, runtime_vars.clone(), quiet, opts) {
-            Ok(mut compiled) => {
+        // A panic in it fails this file alone, and the batch goes on (#389).
+        let compiled = crate::output::catch_compile(
+            file,
+            AssertUnwindSafe(|| compile_to_content(file, runtime_vars.clone(), quiet, opts)),
+        );
+        match compiled {
+            Ok(Ok(mut compiled)) => {
                 let ext = compiled.kind.extension();
                 let out_path = output_path_for(file, dir, &output_base, ext);
 
@@ -2081,13 +2087,15 @@ fn run_build_directory(
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // Route through the single render choke point (avoids PF-004 /
                 // architecture-6: hand-rolled sanitize_control_chars bypass); a source
                 // that cannot be read lifts the exit code to 2 (#157).
                 crate::output::eprint_file_failure(e);
                 fail_count += 1;
             }
+            // The panic hook reported it, and the run will exit 101.
+            Err(crate::output::Panicked) => fail_count += 1,
         }
     }
 

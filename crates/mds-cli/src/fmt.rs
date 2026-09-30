@@ -24,6 +24,7 @@
 //!   exit 2 (#157); a closed stdout is not a failure
 //! - 3: oversized source (in directory mode, a failed file that leaves the run at 1)
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use mds::effective_parent;
@@ -31,8 +32,8 @@ use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, render_unified_diff, stdout_failure,
-    write_stdout, Durability, StdoutOutcome,
+    atomic_write_file, catch_compile, collect_mds_files_detailed, render_unified_diff,
+    stdout_failure, write_stdout, Durability, Panicked, StdoutOutcome,
 };
 
 pub(crate) struct FmtArgs {
@@ -206,7 +207,8 @@ enum FileOutcome {
     WouldChange,
     /// `--check` / `--diff` mode: the file is already formatted.
     NoChange,
-    /// Any per-file error (read, format, diff-output, or write).
+    /// Any per-file error (read, format, diff-output, or write), or a panic in the
+    /// formatter, which the panic hook reported (#389).
     Failed,
 }
 
@@ -236,14 +238,21 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     };
     // effective_parent maps "" (bare filename) to "." — avoids PF-006, applies ADR-001.
     let base_dir = Some(effective_parent(file));
-    let result = match format_source_named(&source, base_dir, &file_name) {
-        Ok(r) => r,
-        Err(e) => {
+    // A panic in the formatter fails this file alone, and the batch goes on (#389).
+    let formatted = catch_compile(
+        file,
+        AssertUnwindSafe(|| format_source_named(&source, base_dir, &file_name)),
+    );
+    let result = match formatted {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             // MdsError::Syntax embeds user-controlled source fragments that may contain
             // raw ESC bytes; file_name is threaded into the report by format_source_named.
             crate::output::eprint_file_failure(e);
             return FileOutcome::Failed;
         }
+        // The panic hook reported it, and the run will exit 101.
+        Err(Panicked) => return FileOutcome::Failed,
     };
 
     if diff && result.changed {

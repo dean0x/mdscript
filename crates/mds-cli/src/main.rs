@@ -1,3 +1,4 @@
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -410,10 +411,13 @@ fn run_check_directory(
         if is_partial(file) {
             continue;
         }
-        match mds::check_collecting_warnings(file, runtime_vars.clone())
-            .map_err(miette::Error::from)
-        {
-            Ok(((), warnings)) => {
+        // A panic in the check fails this file alone, and the batch goes on (#389).
+        let checked = output::catch_compile(
+            file,
+            AssertUnwindSafe(|| mds::check_collecting_warnings(file, runtime_vars.clone())),
+        );
+        match checked {
+            Ok(Ok(((), warnings))) => {
                 if !quiet {
                     for w in &warnings {
                         output::eprint_warning(w);
@@ -421,13 +425,15 @@ fn run_check_directory(
                 }
                 ok_count += 1;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // Route through the single render choke point (avoids PF-004 /
                 // architecture-6: hand-rolled sanitize_control_chars bypass); a source
                 // that cannot be read lifts the exit code to 2 (#157).
-                output::eprint_file_failure(e);
+                output::eprint_file_failure(miette::Error::from(e));
                 fail_count += 1;
             }
+            // The panic hook reported it, and the run will exit 101.
+            Err(output::Panicked) => fail_count += 1,
         }
     }
 

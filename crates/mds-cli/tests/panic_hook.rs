@@ -10,9 +10,12 @@
 //!
 //! A debug build of `mds` panics on purpose when `MDS_TEST_PANIC` asks it to: `main`
 //! panics in the command's dispatch, `thread` in a thread the dispatch starts and waits
-//! for. The payload carries a sentinel word, a raw ESC and the absolute path of the
-//! working directory — a fresh temporary directory in every test here — so a test can
-//! tell that none of it reached stderr. A release build compiles the trigger out
+//! for, `compile:<stem>` in the compile of a file with that file stem — one file of a
+//! directory run or a watch session, which goes on without it — and `notify` / `ctrlc`
+//! in `mds watch`'s file-event callback / Ctrl-C handler, each on a thread of its own.
+//! The payload carries a sentinel word, a raw ESC and the absolute path of the working
+//! directory — a fresh temporary directory in every test here — so a test can tell that
+//! none of it reached stderr. A release build compiles the trigger out
 //! (`the_trigger_is_compiled_only_into_debug_builds`).
 //!
 //! # `RUST_BACKTRACE`
@@ -99,8 +102,20 @@ fn fixture() -> tempfile::TempDir {
 /// Run `mds check ok.mds` in `dir`, asking for a panic at `panic_at` (none for `None`),
 /// with `RUST_BACKTRACE` as `backtrace` says and stderr as `stderr` says.
 fn run_mds(dir: &Path, panic_at: Option<&str>, backtrace: Backtrace, stderr: Stderr) -> Run {
+    run_args(dir, &["check", "ok.mds"], panic_at, backtrace, stderr)
+}
+
+/// Run `mds <args>` in `dir`, asking for a panic at `panic_at` (none for `None`), with
+/// `RUST_BACKTRACE` as `backtrace` says and stderr as `stderr` says.
+fn run_args(
+    dir: &Path,
+    args: &[&str],
+    panic_at: Option<&str>,
+    backtrace: Backtrace,
+    stderr: Stderr,
+) -> Run {
     let mut cmd = mds_bin();
-    cmd.args(["check", "ok.mds"])
+    cmd.args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
@@ -210,6 +225,11 @@ fn a_panic_with_stderr_closed_exits_101_not_by_a_signal() {
 mod default_output {
     use super::*;
     use crate::common::count_occurrences;
+    #[cfg(unix)]
+    use crate::common::{
+        spawn_watch_ready, spawn_watch_unsynchronized, wait_for_tap_count, write_atomic,
+        ChildGuard, PipeTap,
+    };
 
     /// The first line of the backtrace `RUST_BACKTRACE` adds.
     const BACKTRACE_HEADER: &str = "stack backtrace:\n";
@@ -391,6 +411,774 @@ mod default_output {
         assert_shows_none(&run.stderr, &payload_needles(dir.path()), "a thread panic");
         assert_shows_none(&run.stderr, &location_needles(), "a thread panic");
     }
+
+    // ── A batch goes on past a file whose compile panics ──────────────────────
+    //
+    // Directory runs of `mds build`, `check`, `fmt` and `lint` over `d/a.mds`, `d/b.mds`
+    // and `d/c.mds`, with the trigger panicking in `b.mds`'s compile, format or analysis.
+
+    /// A working directory holding `d/a.mds`, `d/b.mds` and `d/c.mds`, each `source(name)`.
+    fn batch(source: impl Fn(&str) -> String) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().join("d");
+        std::fs::create_dir(&d).expect("create d");
+        for name in ["a", "b", "c"] {
+            std::fs::write(d.join(format!("{name}.mds")), source(name)).expect("write a source");
+        }
+        dir
+    }
+
+    /// `mds <args>` in `dir`, panicking in `b.mds` when `panic` is set.
+    fn run_batch(dir: &Path, args: &[&str], panic: bool) -> Run {
+        let panic_at = panic.then_some("compile:b");
+        run_args(dir, args, panic_at, Backtrace::Unset, Stderr::Piped)
+    }
+
+    /// The text of `path`.
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// What a batch run with one panic shows of it: exit 101, the text exactly once, and
+    /// nothing of the payload on either stream.
+    fn assert_one_panic(run: &Run, dir: &Path, what: &str) {
+        assert_eq!(
+            run.code,
+            Some(101),
+            "{what}: a panic in one file makes the run exit 101; stderr:\n{}",
+            run.stderr
+        );
+        assert_eq!(
+            count_occurrences(&run.stderr, ICE_TEXT),
+            1,
+            "{what}: the text is printed once, for the one panic; stderr:\n{}",
+            run.stderr
+        );
+        assert_shows_none(&run.stderr, &payload_needles(dir), what);
+        assert_shows_none(&run.stdout, &payload_needles(dir), what);
+    }
+
+    /// The lines of `stderr` that are neither a line of the text nor a line starting with
+    /// one of `status`: what is left to report a panic a second time.
+    fn other_lines<'a>(stderr: &'a str, status: &[&str]) -> Vec<&'a str> {
+        let ice: Vec<&str> = ICE_TEXT.lines().collect();
+        stderr
+            .lines()
+            .filter(|line| !ice.contains(line) && !status.iter().any(|s| line.starts_with(s)))
+            .collect()
+    }
+
+    /// A source with one warning: a frontmatter key its body never uses.
+    fn warned(name: &str) -> String {
+        format!("---\nunused: 1\n---\nHello {name}\n")
+    }
+
+    /// `mds build <dir>` goes on past a file whose compile panics (#389): the other two are
+    /// compiled and written, the one that panicked is not and counts as failed, and the text
+    /// is the panic's one report.
+    ///
+    /// Control: without the trigger all three are written.
+    #[test]
+    fn a_directory_build_goes_on_past_a_file_whose_compile_panics() {
+        let control_dir = batch(|name| format!("Hello {name}\n"));
+        let control = run_batch(control_dir.path(), &["build", "d"], false);
+        assert_eq!(
+            control.code,
+            Some(0),
+            "control: stderr:\n{}",
+            control.stderr
+        );
+        assert!(
+            control.stderr.ends_with("3 built, 0 failed\n"),
+            "control: stderr:\n{}",
+            control.stderr
+        );
+        for name in ["a", "b", "c"] {
+            let output = control_dir.path().join("d").join(format!("{name}.md"));
+            assert_eq!(read(&output), format!("Hello {name}\n"), "control");
+        }
+
+        let dir = batch(|name| format!("Hello {name}\n"));
+        let run = run_batch(dir.path(), &["build", "d"], true);
+        assert_one_panic(&run, dir.path(), "build");
+        let d = dir.path().join("d");
+        for name in ["a", "c"] {
+            assert_eq!(
+                read(&d.join(format!("{name}.md"))),
+                format!("Hello {name}\n"),
+                "the other files are compiled and written"
+            );
+        }
+        assert!(
+            !d.join("b.md").exists(),
+            "the file whose compile panicked is not written"
+        );
+        let compiled = run
+            .stderr
+            .lines()
+            .filter(|line| line.starts_with("Compiled to "))
+            .count();
+        assert_eq!(compiled, 2, "stderr:\n{}", run.stderr);
+        assert_eq!(
+            other_lines(&run.stderr, &["Compiled to "]),
+            ["2 built, 1 failed"],
+            "the file counts as failed, and nothing but the text reports the panic"
+        );
+    }
+
+    /// `mds check <dir>` goes on past a file whose check panics (#389): the other two are
+    /// checked, the one that panicked counts as failed, and the text is the panic's one
+    /// report.
+    ///
+    /// Control: without the trigger all three pass.
+    #[test]
+    fn a_directory_check_goes_on_past_a_file_whose_check_panics() {
+        let dir = batch(|name| format!("Hello {name}\n"));
+        let control = run_batch(dir.path(), &["check", "d"], false);
+        assert_eq!(
+            (control.code, control.stderr.as_str()),
+            (Some(0), "3 passed, 0 failed\n"),
+            "control"
+        );
+
+        let run = run_batch(dir.path(), &["check", "d"], true);
+        assert_one_panic(&run, dir.path(), "check");
+        assert_eq!(
+            run.stderr,
+            format!("{ICE_TEXT}2 passed, 1 failed\n"),
+            "the other files are checked, the file counts as failed, and nothing but the \
+             text reports the panic"
+        );
+    }
+
+    /// `mds fmt <dir>` goes on past a file whose format panics (#389): the other two are
+    /// rewritten, the one that panicked is left as it was and counts as failed, and the
+    /// text is the panic's one report.
+    ///
+    /// Control: without the trigger all three are rewritten.
+    #[test]
+    fn a_directory_fmt_goes_on_past_a_file_whose_format_panics() {
+        let unformatted = |name: &str| format!("Hello {name}\r\n");
+        let control_dir = batch(unformatted);
+        let control = run_batch(control_dir.path(), &["fmt", "d"], false);
+        assert_eq!(
+            control.code,
+            Some(0),
+            "control: stderr:\n{}",
+            control.stderr
+        );
+        assert!(
+            control
+                .stderr
+                .ends_with("3 formatted, 0 unchanged, 0 failed\n"),
+            "control: stderr:\n{}",
+            control.stderr
+        );
+        for name in ["a", "b", "c"] {
+            let source = control_dir.path().join("d").join(format!("{name}.mds"));
+            assert_eq!(read(&source), format!("Hello {name}\n"), "control");
+        }
+
+        let dir = batch(unformatted);
+        let run = run_batch(dir.path(), &["fmt", "d"], true);
+        assert_one_panic(&run, dir.path(), "fmt");
+        let d = dir.path().join("d");
+        for name in ["a", "c"] {
+            assert_eq!(
+                read(&d.join(format!("{name}.mds"))),
+                format!("Hello {name}\n"),
+                "the other files are formatted"
+            );
+        }
+        assert_eq!(
+            read(&d.join("b.mds")),
+            unformatted("b"),
+            "the file whose format panicked is left as it was"
+        );
+        assert_eq!(
+            other_lines(&run.stderr, &["Formatted: "]),
+            ["2 formatted, 0 unchanged, 1 failed"],
+            "the file counts as failed, and nothing but the text reports the panic"
+        );
+    }
+
+    /// `mds lint <dir>` goes on past a file whose analysis panics (#389): the other two are
+    /// linted and show their findings, the one that panicked counts under "with errors",
+    /// and nothing names it — the text is the panic's one report.
+    ///
+    /// Control: without the trigger each file's warning is shown, naming its file.
+    #[test]
+    fn a_directory_lint_goes_on_past_a_file_whose_analysis_panics() {
+        let dir = batch(warned);
+        let control = run_batch(dir.path(), &["lint", "d"], false);
+        assert_eq!(
+            control.code,
+            Some(1),
+            "control: stderr:\n{}",
+            control.stderr
+        );
+        assert!(
+            control
+                .stderr
+                .ends_with("0 clean, 3 with warnings, 0 with errors, 0 resource-limited\n"),
+            "control: stderr:\n{}",
+            control.stderr
+        );
+        for name in ["a.mds", "b.mds", "c.mds"] {
+            assert!(
+                control.stderr.contains(name),
+                "control: a finding's frame names {name}; stderr:\n{}",
+                control.stderr
+            );
+        }
+
+        let run = run_batch(dir.path(), &["lint", "d"], true);
+        assert_one_panic(&run, dir.path(), "lint");
+        assert!(
+            run.stderr
+                .ends_with("0 clean, 2 with warnings, 1 with errors, 0 resource-limited\n"),
+            "the file counts under \"with errors\"; stderr:\n{}",
+            run.stderr
+        );
+        for name in ["a.mds", "c.mds"] {
+            assert!(
+                run.stderr.contains(name),
+                "the other files are linted; stderr:\n{}",
+                run.stderr
+            );
+        }
+        for needle in ["b.mds", "mds::internal"] {
+            assert!(
+                !run.stderr.contains(needle),
+                "nothing but the text reports the panic: {needle:?}; stderr:\n{}",
+                run.stderr
+            );
+        }
+    }
+
+    /// `mds lint --format json <dir>` records a file whose analysis panicked as an internal
+    /// error, in the one document the run prints, and counts it under "with errors" (#389):
+    /// `{"file": …, "error": {"code": "mds::internal", "message": "internal compiler
+    /// error", …}}` — nothing of the panic itself. The other two files are linted.
+    ///
+    /// Control: without the trigger each file's entry holds its warning.
+    #[test]
+    fn a_directory_lint_json_records_a_file_whose_analysis_panics_as_an_internal_error() {
+        let dir = batch(warned);
+        let args = ["lint", "--format", "json", "d"];
+        let control = run_batch(dir.path(), &args, false);
+        assert_eq!(
+            (control.code, control.stderr.as_str()),
+            (
+                Some(1),
+                "0 clean, 3 with warnings, 0 with errors, 0 resource-limited\n"
+            ),
+            "control"
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&control.stdout).expect("control: stdout is one document");
+        let files = document["files"].as_array().expect("control: files[]");
+        assert_eq!(files.len(), 3, "control: {document}");
+        for (entry, name) in files.iter().zip(["a.mds", "b.mds", "c.mds"]) {
+            assert_eq!(entry["file"], name, "control: {document}");
+            assert_eq!(
+                entry["diagnostics"][0]["rule"], "unused-variable",
+                "control: {document}"
+            );
+        }
+
+        let run = run_batch(dir.path(), &args, true);
+        assert_one_panic(&run, dir.path(), "lint --format json");
+        assert_eq!(
+            run.stderr,
+            format!("{ICE_TEXT}0 clean, 2 with warnings, 1 with errors, 0 resource-limited\n"),
+            "the file counts under \"with errors\", and stderr reports the panic only with \
+             the text"
+        );
+        assert_eq!(
+            run.stdout.lines().count(),
+            1,
+            "one document; stdout:\n{}",
+            run.stdout
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&run.stdout).expect("stdout is one document");
+        assert_eq!(document["version"], 1, "{document}");
+        assert_eq!(document["truncated"], false, "{document}");
+        let files = document["files"].as_array().expect("files[]");
+        assert_eq!(files.len(), 3, "an entry per file: {document}");
+        assert_eq!(
+            files[1],
+            serde_json::json!({
+                "file": "b.mds",
+                "error": {
+                    "code": "mds::internal",
+                    "message": "internal compiler error",
+                    "help": null,
+                    "span": null,
+                },
+            }),
+            "the file whose analysis panicked is an internal error: {document}"
+        );
+        for (entry, name) in [(&files[0], "a.mds"), (&files[2], "c.mds")] {
+            assert_eq!(entry["file"], name, "{document}");
+            assert_eq!(
+                entry["diagnostics"][0]["rule"], "unused-variable",
+                "the other files are linted: {document}"
+            );
+        }
+    }
+
+    /// `mds lint --fix`'s fix pipeline lints its candidate again, inside a catch (#389): a
+    /// panic there leaves the file as it was and the run exits 101. Under `--format json`
+    /// the run's one document is the error document with the internal error; in human
+    /// output the text is the panic's one report. A file argument reaches the pipeline's
+    /// catch: its own lint is not caught, and the trigger fires only in a catch.
+    ///
+    /// Control: without the trigger the fix is written.
+    #[test]
+    fn a_panic_in_the_fix_pipeline_leaves_the_file_as_it_was_and_reports_only_the_text() {
+        const FIXABLE: &str = "@if \"a\" == \"a\":\n@end\n\nHello\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("x.mds");
+        std::fs::write(&source, FIXABLE).expect("write x.mds");
+        let control = run_args(
+            dir.path(),
+            &["lint", "--fix", "x.mds"],
+            None,
+            Backtrace::Unset,
+            Stderr::Piped,
+        );
+        assert_eq!(
+            (control.code, control.stderr.as_str()),
+            (Some(0), "Fixed: x.mds\n"),
+            "control"
+        );
+        assert_eq!(read(&source), "\nHello\n", "control: the fix is written");
+
+        for format in ["json", "human"] {
+            std::fs::write(&source, FIXABLE).expect("write x.mds");
+            let run = run_args(
+                dir.path(),
+                &["lint", "--fix", "--format", format, "x.mds"],
+                Some("compile:x"),
+                Backtrace::Unset,
+                Stderr::Piped,
+            );
+            assert_one_panic(&run, dir.path(), format);
+            assert_eq!(
+                run.stderr, ICE_TEXT,
+                "{format}: the text is the panic's one report"
+            );
+            assert_eq!(
+                read(&source),
+                FIXABLE,
+                "{format}: the file is left as it was"
+            );
+            let expected = match format {
+                "json" => concat!(
+                    "{\"error\":{\"code\":\"mds::internal\",\"help\":null,",
+                    "\"message\":\"internal compiler error\",\"span\":null},\"version\":1}\n"
+                ),
+                _ => "",
+            };
+            assert_eq!(run.stdout, expected, "{format}: stdout");
+        }
+    }
+
+    // ── A watch session goes on past a compile that panics ────────────────────
+
+    /// Failure bound for one step of a watch session: going live, or what an edit leads
+    /// to. A step takes milliseconds.
+    #[cfg(unix)]
+    const WATCH_STEP: Duration = Duration::from_secs(20);
+
+    /// `mds watch --quiet --poll-interval 0 <args>` in `dir`, asking for a panic at
+    /// `panic_at`, once it is live. `--quiet` leaves the panic's text the only thing on
+    /// stderr, and without an idle tick only an edit starts a rebuild.
+    #[cfg(unix)]
+    fn watch_live(dir: &Path, args: &[&str], panic_at: Option<&str>) -> (ChildGuard, PipeTap) {
+        let mut cmd = watch_command(dir, args, panic_at);
+        cmd.env_remove(RUST_BACKTRACE);
+        let (child, stderr, _) = spawn_watch_ready(&mut cmd);
+        (ChildGuard(child), stderr)
+    }
+
+    /// [`watch_live`]'s session, not waited for: `ready` is the file it creates once it is
+    /// live.
+    #[cfg(unix)]
+    fn watch_starting(
+        dir: &Path,
+        args: &[&str],
+        panic_at: Option<&str>,
+        ready: &Path,
+    ) -> (ChildGuard, PipeTap) {
+        let mut cmd = watch_command(dir, args, panic_at);
+        cmd.env_remove(RUST_BACKTRACE).env("MDS_TEST_READY", ready);
+        let (child, stderr, _) = spawn_watch_unsynchronized(&mut cmd);
+        (ChildGuard(child), stderr)
+    }
+
+    /// The `mds watch` command [`watch_live`] and [`watch_starting`] spawn.
+    #[cfg(unix)]
+    fn watch_command(dir: &Path, args: &[&str], panic_at: Option<&str>) -> std::process::Command {
+        let mut cmd = mds_bin();
+        cmd.args(["watch", "--quiet", "--poll-interval", "0"])
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        match panic_at {
+            Some(at) => cmd.env(TRIGGER, at),
+            None => cmd.env_remove(TRIGGER),
+        };
+        cmd
+    }
+
+    /// Ctrl-C the session, and return its exit code. Panics when it has not ended within
+    /// [`WATCH_STEP`].
+    #[cfg(unix)]
+    fn interrupt(session: &mut ChildGuard) -> Option<i32> {
+        let pid = libc::pid_t::try_from(session.id()).expect("a pid fits pid_t");
+        // SAFETY: `kill` only sends a signal, to the child this test spawned and has not
+        // reaped, so the pid names no other process.
+        let sent = unsafe { libc::kill(pid, libc::SIGINT) };
+        assert_eq!(sent, 0, "send SIGINT to the session");
+        exit_code_within(session, WATCH_STEP)
+    }
+
+    /// The session's exit code once it ends, within `bound`; panics when it has not.
+    #[cfg(unix)]
+    fn exit_code_within(session: &mut ChildGuard, bound: Duration) -> Option<i32> {
+        let deadline = Instant::now() + bound;
+        loop {
+            if let Some(status) = session.0.try_wait().expect("poll the session") {
+                return status.code();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the session did not end within {bound:?}"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Whether the session is still running.
+    #[cfg(unix)]
+    fn running(session: &mut ChildGuard) -> bool {
+        session.0.try_wait().expect("poll the session").is_none()
+    }
+
+    /// Wait until `path` holds `text`, within [`WATCH_STEP`].
+    #[cfg(unix)]
+    fn wait_for_file(path: &Path, text: &str) -> bool {
+        let deadline = Instant::now() + WATCH_STEP;
+        loop {
+            if std::fs::read_to_string(path).is_ok_and(|now| now == text) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// A quiet session's whole stderr after `panics` or more panics: the text, once per
+    /// panic, and nothing else.
+    #[cfg(unix)]
+    fn assert_only_the_text(stderr: &str, panics: usize, what: &str) {
+        let printed = count_occurrences(stderr, ICE_TEXT);
+        assert!(
+            printed >= panics,
+            "{what}: the text for each of at least {panics} panics; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            ICE_TEXT.repeat(printed),
+            "{what}: the text once per panic, and nothing else"
+        );
+    }
+
+    /// `mds watch <file>` whose compile panics goes on watching (#389): the startup compile
+    /// prints the text, an edit starts a rebuild that prints it again, the session stays
+    /// live, and it exits 101 when stopped. No output is written, and nothing but the text
+    /// reports a panic.
+    ///
+    /// Control: without the trigger the session writes the output, rebuilds it on the edit
+    /// and exits 0 when stopped.
+    #[cfg(unix)]
+    #[test]
+    fn a_watched_file_whose_compile_panics_is_watched_on_and_the_session_exits_101() {
+        let control_dir = tempfile::tempdir().expect("tempdir");
+        let source = control_dir.path().join("x.mds");
+        std::fs::write(&source, "Hello\n").expect("write x.mds");
+        let (mut control, stderr) = watch_live(control_dir.path(), &["x.mds"], None);
+        let output = control_dir.path().join("x.md");
+        assert!(wait_for_file(&output, "Hello\n"), "control: the output");
+        write_atomic(&source, "Hello again\n");
+        assert!(
+            wait_for_file(&output, "Hello again\n"),
+            "control: the edit rebuilds"
+        );
+        assert_eq!(interrupt(&mut control), Some(0), "control: exit 0");
+        assert_eq!(stderr.finish_text(&mut control), "", "control: --quiet");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("x.mds");
+        std::fs::write(&source, "Hello\n").expect("write x.mds");
+        let (mut session, stderr) = watch_live(dir.path(), &["x.mds"], Some("compile:x"));
+        let before = count_occurrences(
+            &wait_for_tap_count(&stderr, ICE_TEXT, 1, WATCH_STEP),
+            ICE_TEXT,
+        );
+        write_atomic(&source, "Hello again\n");
+        wait_for_tap_count(&stderr, ICE_TEXT, before + 1, WATCH_STEP);
+        assert!(
+            running(&mut session),
+            "a compile that panics does not end the session"
+        );
+        assert_eq!(
+            interrupt(&mut session),
+            Some(101),
+            "stopped, a session that caught a panic exits 101"
+        );
+        assert_only_the_text(&stderr.finish_text(&mut session), before + 1, "file");
+        assert!(
+            !dir.path().join("x.md").exists(),
+            "a compile that panicked writes no output"
+        );
+    }
+
+    /// `mds watch <dir>` goes on past a source whose compile panics (#389): the startup
+    /// writes the other source's output, an edit to it rebuilds it, the session stays live,
+    /// and it exits 101 when stopped. Nothing but the text reports a panic.
+    ///
+    /// Control: without the trigger both outputs are written, the edit rebuilds, and the
+    /// session exits 0 when stopped.
+    #[cfg(unix)]
+    #[test]
+    fn a_watched_directory_goes_on_past_a_source_whose_compile_panics_and_exits_101() {
+        let sources = || {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let d = dir.path().join("d");
+            std::fs::create_dir(&d).expect("create d");
+            for name in ["a", "b"] {
+                std::fs::write(d.join(format!("{name}.mds")), format!("Hello {name}\n"))
+                    .expect("write a source");
+            }
+            dir
+        };
+
+        let control_dir = sources();
+        let d = control_dir.path().join("d");
+        let (mut control, stderr) = watch_live(control_dir.path(), &["d"], None);
+        for name in ["a", "b"] {
+            assert!(
+                wait_for_file(&d.join(format!("{name}.md")), &format!("Hello {name}\n")),
+                "control: {name}.md"
+            );
+        }
+        write_atomic(&d.join("b.mds"), "Hello again b\n");
+        assert!(
+            wait_for_file(&d.join("b.md"), "Hello again b\n"),
+            "control: the edit rebuilds"
+        );
+        assert_eq!(interrupt(&mut control), Some(0), "control: exit 0");
+        assert_eq!(stderr.finish_text(&mut control), "", "control: --quiet");
+
+        let dir = sources();
+        let d = dir.path().join("d");
+        let (mut session, stderr) = watch_live(dir.path(), &["d"], Some("compile:a"));
+        wait_for_tap_count(&stderr, ICE_TEXT, 1, WATCH_STEP);
+        assert!(
+            wait_for_file(&d.join("b.md"), "Hello b\n"),
+            "the startup compiles the other source"
+        );
+        write_atomic(&d.join("b.mds"), "Hello again b\n");
+        assert!(
+            wait_for_file(&d.join("b.md"), "Hello again b\n"),
+            "an edit after the panic rebuilds"
+        );
+        assert!(
+            running(&mut session),
+            "a compile that panics does not end the session"
+        );
+        assert_eq!(
+            interrupt(&mut session),
+            Some(101),
+            "stopped, a session that caught a panic exits 101"
+        );
+        assert_only_the_text(&stderr.finish_text(&mut session), 1, "directory");
+        assert!(
+            !d.join("a.md").exists(),
+            "a compile that panicked writes no output"
+        );
+    }
+
+    // ── A panic on a watch session's own threads ends it at once ──────────────
+
+    /// How `mds watch` is started for a thread-trigger test: on a file, or on a directory.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum Watched {
+        File,
+        Directory,
+    }
+
+    /// A working directory for a [`Watched`] session: `x.mds`, or `d/x.mds`.
+    #[cfg(unix)]
+    struct WatchFixture {
+        dir: tempfile::TempDir,
+        watched: Watched,
+    }
+
+    #[cfg(unix)]
+    impl WatchFixture {
+        fn new(watched: Watched) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fixture = Self { dir, watched };
+            if let Some(parent) = fixture.source().parent() {
+                std::fs::create_dir_all(parent).expect("create the source's directory");
+            }
+            std::fs::write(fixture.source(), "Hello\n").expect("write the source");
+            fixture
+        }
+
+        fn dir(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// What `mds watch` is given.
+        fn args(&self) -> &'static [&'static str] {
+            match self.watched {
+                Watched::File => &["x.mds"],
+                Watched::Directory => &["d"],
+            }
+        }
+
+        fn source(&self) -> PathBuf {
+            match self.watched {
+                Watched::File => self.dir().join("x.mds"),
+                Watched::Directory => self.dir().join("d").join("x.mds"),
+            }
+        }
+
+        fn output_file(&self) -> PathBuf {
+            self.source().with_extension("md")
+        }
+    }
+
+    /// A panic in `mds watch`'s Ctrl-C handler, which runs on a thread of its own, ends the
+    /// session at once (#389): the text once and exit 101 — not the 0 of a session Ctrl-C
+    /// stopped — within [`PANIC_EXIT_BOUND`].
+    ///
+    /// Control: without the trigger Ctrl-C stops the session with 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_in_the_watch_ctrl_c_handler_ends_the_session_with_101() {
+        for watched in [Watched::File, Watched::Directory] {
+            let fixture = WatchFixture::new(watched);
+            let (mut control, stderr) = watch_live(fixture.dir(), fixture.args(), None);
+            assert_eq!(interrupt(&mut control), Some(0), "control ({watched:?})");
+            assert_eq!(
+                stderr.finish_text(&mut control),
+                "",
+                "control ({watched:?})"
+            );
+
+            let (mut session, stderr) = watch_live(fixture.dir(), fixture.args(), Some("ctrlc"));
+            let started = Instant::now();
+            assert_eq!(
+                interrupt(&mut session),
+                Some(101),
+                "{watched:?}: a panic in the Ctrl-C handler ends the session with 101"
+            );
+            assert!(
+                started.elapsed() < PANIC_EXIT_BOUND,
+                "{watched:?}: at once; it took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                stderr.finish_text(&mut session),
+                ICE_TEXT,
+                "{watched:?}: the text, once"
+            );
+        }
+    }
+
+    /// A panic in `mds watch`'s file-event callback, which runs on notify's thread, ends the
+    /// session at once (#389): the text once and exit 101, within [`PANIC_EXIT_BOUND`] of
+    /// the event. Without that the thread would die alone, and the session would watch on
+    /// without its events. The session's own startup write can be the first event;
+    /// otherwise an edit is.
+    ///
+    /// Control: without the trigger an edit reaches the callback and rebuilds.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_in_the_watch_file_event_callback_ends_the_session_with_101() {
+        for watched in [Watched::File, Watched::Directory] {
+            let fixture = WatchFixture::new(watched);
+            let (mut control, stderr) = watch_live(fixture.dir(), fixture.args(), None);
+            assert!(
+                wait_for_file(&fixture.output_file(), "Hello\n"),
+                "control ({watched:?})"
+            );
+            write_atomic(&fixture.source(), "Hello again\n");
+            assert!(
+                wait_for_file(&fixture.output_file(), "Hello again\n"),
+                "control ({watched:?}): the edit reaches the callback"
+            );
+            assert_eq!(interrupt(&mut control), Some(0), "control ({watched:?})");
+            assert_eq!(
+                stderr.finish_text(&mut control),
+                "",
+                "control ({watched:?})"
+            );
+
+            let fixture = WatchFixture::new(watched);
+            let ready_dir = tempfile::tempdir().expect("tempdir");
+            let ready = ready_dir.path().join("watch-ready");
+            let (mut session, stderr) =
+                watch_starting(fixture.dir(), fixture.args(), Some("notify"), &ready);
+            let deadline = Instant::now() + WATCH_STEP;
+            let mut since = Instant::now();
+            let mut edited = false;
+            let code = loop {
+                if let Some(status) = session.0.try_wait().expect("poll the session") {
+                    break status.code();
+                }
+                if !edited && ready.exists() {
+                    write_atomic(&fixture.source(), "Hello again\n");
+                    since = Instant::now();
+                    edited = true;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{watched:?}: a panic in the file-event callback must end the session; \
+                     it was still running after {WATCH_STEP:?} (edited: {edited}); \
+                     stderr:\n{}",
+                    stderr.text()
+                );
+                std::thread::sleep(POLL);
+            };
+            assert!(
+                since.elapsed() < PANIC_EXIT_BOUND,
+                "{watched:?}: at once; it took {:?}",
+                since.elapsed()
+            );
+            assert_eq!(
+                code,
+                Some(101),
+                "{watched:?}: a panic in the file-event callback ends the session with 101"
+            );
+            assert_eq!(
+                stderr.finish_text(&mut session),
+                ICE_TEXT,
+                "{watched:?}: the text, once"
+            );
+        }
+    }
 }
 
 /// With the never-shipped `debug-panics` feature: the panic's message and location follow
@@ -442,7 +1230,8 @@ mod with_debug_panics {
 // ── Lexical pins ──────────────────────────────────────────────────────────────
 
 /// Every run here sets or removes `RUST_BACKTRACE`: the function holding a `.spawn(` /
-/// `.output(` / `.status(` call also calls `env(RUST_BACKTRACE, …)` or
+/// `.output(` / `.status(` call, or a call of a shared helper that spawns `mds watch`
+/// ([`SPAWN_HELPERS`]), also calls `env(RUST_BACKTRACE, …)` or
 /// `env_remove(RUST_BACKTRACE)` in code, not in a comment. CI sets `RUST_BACKTRACE=1`
 /// globally, which would otherwise flip every arm that expects no backtrace.
 #[test]
@@ -473,7 +1262,29 @@ fn every_run_sets_or_removes_rust_backtrace() {
         runs_without_rust_backtrace(removed).stray,
         Vec::<usize>::new()
     );
+    for helper in SPAWN_HELPERS {
+        let bare = format!("fn f() {{\n    let _ = {helper}&mut cmd);\n}}\n");
+        assert_eq!(
+            runs_without_rust_backtrace(&bare).stray,
+            vec![2],
+            "a bare `{helper}` must be reported"
+        );
+        let removed = format!(
+            "fn f() {{\n    cmd.env_remove(RUST_BACKTRACE);\n    let _ = {helper}&mut cmd);\n}}\n"
+        );
+        assert_eq!(
+            runs_without_rust_backtrace(&removed).stray,
+            Vec::<usize>::new()
+        );
+    }
 }
+
+/// The helpers of `tests/common` that spawn `mds watch`, as a call starts.
+const SPAWN_HELPERS: &[&str] = &[
+    "spawn_watch_ready(",
+    "spawn_watch_unsynchronized(",
+    "spawn_watch_ready_stderr_untapped(",
+];
 
 /// The panic hook — `on_panic` in `src/output.rs` — records the panic before anything
 /// else, then writes one constant and nothing about the panic: exactly one `write_all`,
@@ -646,11 +1457,13 @@ fn the_hook_writes_one_constant_and_nothing_about_the_panic() {
 
 /// The trigger compiles only into a debug build: every mention of `MDS_TEST_PANIC` and
 /// every `panic_any` in the crate sit inside `mod panic_trigger`, whose attributes hold
-/// `#[cfg(debug_assertions)]`; a release build's `panic_on_request` does nothing. The
-/// payload the module builds carries the sentinel these tests look for.
+/// `#[cfg(debug_assertions)]`; each of its functions ([`TRIGGER_FNS`]) has a release
+/// build's stub that does nothing. The payload the module builds carries the sentinel
+/// these tests look for.
 ///
-/// Controls: the module without its `cfg`, a mention outside it, and a release stub that
-/// does something are each reported.
+/// Controls: the module without its `cfg`, a mention outside it, a release stub that does
+/// something, for the dispatch's trigger and for the compile's, and a trigger function
+/// without a release stub are each reported.
 #[test]
 fn the_trigger_is_compiled_only_into_debug_builds() {
     let output = read_source("src/output.rs");
@@ -711,6 +1524,154 @@ fn the_trigger_is_compiled_only_into_debug_builds() {
     assert!(
         !trigger_findings(&busy_stub).is_empty(),
         "a release stub that does anything must be reported"
+    );
+    let busy_compile_stub = with(
+        "fn panic_on_compile(_label: &Path) {}",
+        "fn panic_on_compile(_label: &Path) {\n    let _ = 1;\n}",
+    );
+    assert!(
+        !trigger_findings(&busy_compile_stub).is_empty(),
+        "a compile trigger's release stub that does anything must be reported"
+    );
+    let no_stub = with("pub(crate) fn panic_in_handler(_handler: &str) {}", "");
+    assert!(
+        !trigger_findings(&no_stub).is_empty(),
+        "a trigger function without a release stub must be reported"
+    );
+}
+
+/// A panic in one file's compile fails that file alone (#389), so each per-file catch — a
+/// `catch_compile` call — wraps that compile and nothing else: its closure is
+/// `AssertUnwindSafe(|| <one call>)`, the call is one of [`COMPILE_CALLS`], and no
+/// argument of it writes, deletes or changes state. A panic abandons the closure part-way,
+/// so only what the closure holds is left unfinished. The catches sit where
+/// [`COMPILE_CATCHES`] lists them, one per compile of a batch, and `catch_panic`, which
+/// catches around anything, only where [`PANIC_CATCHES`] lists it.
+///
+/// The check is lexical: it sees the call a closure makes, not what that call does.
+///
+/// Controls, each planted into the real sources and reported for its own reason: a state
+/// change beside the compile, a write in its place, an argument that changes state, a
+/// mutable borrow, a call chained onto the compile, a closure not wrapped in
+/// `AssertUnwindSafe`, a catch gone from a listed place, one in an unlisted place and a
+/// `catch_panic` outside its places.
+#[test]
+fn each_catch_wraps_one_compile_call_and_nothing_else() {
+    let sources = crate_sources();
+    let found = catch_findings(&sources);
+    assert!(
+        found.is_empty(),
+        "each catch must wrap one compile call and nothing else:\n{}",
+        found.join("\n")
+    );
+
+    let replaced = |file: &str, from: &str, to: &str| -> Vec<(String, String)> {
+        let mut planted = sources.to_vec();
+        let (_, text) = planted
+            .iter_mut()
+            .find(|(name, _)| name == file)
+            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
+        let changed = text.replacen(from, to, 1);
+        assert_ne!(&changed, text, "precondition: {file} holds {from:?}");
+        *text = changed;
+        planted
+    };
+    let appended = |file: &str, body: &str| -> Vec<(String, String)> {
+        let mut planted = sources.to_vec();
+        let (_, text) = planted
+            .iter_mut()
+            .find(|(name, _)| name == file)
+            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
+        text.push_str(&format!("\nfn planted(src: &Path) {{\n    {body}\n}}\n"));
+        planted
+    };
+    let plants = [
+        (
+            replaced(
+                "build.rs",
+                "AssertUnwindSafe(|| compile_to_content(file, runtime_vars.clone(), quiet, opts))",
+                "AssertUnwindSafe(|| { fail_count += 1; compile_to_content(file, \
+                 runtime_vars.clone(), quiet, opts) })",
+            ),
+            "more than one call",
+            "a state change beside the compile",
+        ),
+        (
+            replaced(
+                "fmt.rs",
+                "AssertUnwindSafe(|| format_source_named(&source, base_dir, &file_name))",
+                "AssertUnwindSafe(|| atomic_write_file(file, &source, Durability::Fsync))",
+            ),
+            "not a compile",
+            "a write in place of the compile",
+        ),
+        (
+            replaced(
+                "lint.rs",
+                "mds::lint(path, ctx.runtime_vars.clone(), &config)",
+                "mds::lint(path, ctx.base_dir_cache.borrow_mut().remove(path), &config)",
+            ),
+            "changes state",
+            "an argument that changes state",
+        ),
+        (
+            replaced(
+                "build.rs",
+                "compile_to_content(file, runtime_vars.clone(), quiet, opts)",
+                "compile_to_content(file, runtime_vars.clone(), quiet, &mut opts)",
+            ),
+            "changes state",
+            "a mutable borrow",
+        ),
+        (
+            replaced(
+                "main.rs",
+                "mds::check_collecting_warnings(file, runtime_vars.clone()))",
+                "mds::check_collecting_warnings(file, runtime_vars.clone()).map(|c| c))",
+            ),
+            "more than its one call",
+            "a call chained onto the compile",
+        ),
+        (
+            replaced(
+                "main.rs",
+                "AssertUnwindSafe(|| mds::check_collecting_warnings(file, runtime_vars.clone()))",
+                "|| mds::check_collecting_warnings(file, runtime_vars.clone())",
+            ),
+            "AssertUnwindSafe",
+            "a closure not wrapped in `AssertUnwindSafe`",
+        ),
+        (
+            replaced("fmt.rs", "= catch_compile(", "= uncaught("),
+            "must hold one",
+            "a catch gone from a listed place",
+        ),
+        (
+            appended(
+                "watch.rs",
+                "let _ = crate::output::catch_compile(src, AssertUnwindSafe(|| \
+                 compile_to_content(src, None, true, mds::CompileOptions::default())));",
+            ),
+            "not a listed place",
+            "a catch in an unlisted place",
+        ),
+        (
+            appended("watch.rs", "let _ = crate::output::catch_panic(|| src);"),
+            "outside its places",
+            "a `catch_panic` outside its places",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (planted, reason, what) in &plants {
+        let found = catch_findings(planted);
+        if !found.iter().any(|finding| finding.contains(reason)) {
+            missed.push(format!("{what} (expected {reason:?}; found {found:?})"));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "each of these must be reported:\n{}",
+        missed.join("\n")
     );
 }
 
@@ -913,10 +1874,206 @@ fn machinery_findings(sources: &[(String, String)], allowed: &[(&str, &str, &str
     found
 }
 
+/// Where each per-file catch sits in mds-cli's sources, as (file, the `fn` it is in): the
+/// compile of one file of a batch — a directory run, or a watch session (#389).
+const COMPILE_CATCHES: &[(&str, &str)] = &[
+    ("build.rs", "run_build_directory"),
+    ("fmt.rs", "format_one_file"),
+    ("lint.rs", "lint_dir_entry"),
+    ("lint.rs", "lint_input"),
+    ("main.rs", "run_check_directory"),
+    ("watch.rs", "compile"),
+    ("watch.rs", "compile_source"),
+];
+
+/// What a catch's closure may call: each compiles, checks, formats or lints one file, and
+/// writes nothing.
+const COMPILE_CALLS: &[&str] = &[
+    "compile_to_content",
+    "check_collecting_warnings",
+    "format_source_named",
+    "lint",
+    "run_fix_pipeline",
+];
+
+/// What the compile call's arguments may not hold: a write, a delete, a change to state, a
+/// mutable borrow, an assignment, a macro, a closure, a statement.
+const STATE_CHANGES: &[&str] = &[
+    "write", "remove", "delete", "rename", "create", "insert", "push", "clear", "take", "exit",
+    "print", "&mut", "=", "!", "|", ";", "{",
+];
+
+/// Where mds-cli calls `catch_panic` outside its test modules, as (file, the `fn` it is
+/// in): `main`, around the whole command, and `catch_compile`.
+const PANIC_CATCHES: &[(&str, &str)] = &[("main.rs", "main"), ("output.rs", "catch_compile")];
+
+/// What is wrong with the per-file catches in `sources` (see
+/// [`each_catch_wraps_one_compile_call_and_nothing_else`]); empty when nothing is.
+fn catch_findings(sources: &[(String, String)]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut placed: Vec<(String, String)> = Vec::new();
+    for (name, src) in sources {
+        let code = blank(src, true);
+        let tests = mod_body(&code, "tests");
+        // A call of `function` outside the test module: a `(` follows its name.
+        let calls = |function: &str| -> Vec<(usize, String)> {
+            ident_positions(&code, function)
+                .into_iter()
+                .filter(|at| {
+                    code[at + function.len()..].trim_start().starts_with('(')
+                        && !tests.as_ref().is_some_and(|t| t.contains(at))
+                })
+                .map(|at| {
+                    let inside = innermost_fn(&code, at).map_or_else(|| "-".to_string(), |f| f.0);
+                    (at, inside)
+                })
+                .collect()
+        };
+        for (at, inside) in calls("catch_compile") {
+            if let Err(reason) = catch_closure(&code, at) {
+                found.push(format!(
+                    "{name}:{} (`{inside}`): {reason}",
+                    line_of(&code, at)
+                ));
+            }
+            placed.push((name.clone(), inside));
+        }
+        for (at, inside) in calls("catch_panic") {
+            if !PANIC_CATCHES.contains(&(name.as_str(), inside.as_str())) {
+                found.push(format!(
+                    "{name}:{}: `catch_panic` in `{inside}`, outside its places",
+                    line_of(&code, at)
+                ));
+            }
+        }
+    }
+    for (file, in_fn) in COMPILE_CATCHES {
+        let count = placed
+            .iter()
+            .filter(|(name, inside)| name == file && inside == in_fn)
+            .count();
+        if count != 1 {
+            found.push(format!(
+                "{file}: `{in_fn}` must hold one `catch_compile`; it holds {count}"
+            ));
+        }
+    }
+    for (file, inside) in &placed {
+        if !COMPILE_CATCHES.contains(&(file.as_str(), inside.as_str())) {
+            found.push(format!(
+                "{file}: a `catch_compile` in `{inside}`, which is not a listed place"
+            ));
+        }
+    }
+    found
+}
+
+/// Check the closure of the `catch_compile` call at byte `at` of blanked `code`: its
+/// second argument is `AssertUnwindSafe(|| <one call>)`, the call one of
+/// [`COMPILE_CALLS`], nothing chained onto it, and none of [`STATE_CHANGES`] in its
+/// arguments.
+fn catch_closure(code: &str, at: usize) -> Result<(), String> {
+    let open = at + code[at..].find('(').ok_or("no argument list")?;
+    let close = closing_paren(code, open).ok_or("an argument list that never closes")?;
+    let args = top_level_parts(&code[open + 1..close]);
+    let [_label, closure] = args.as_slice() else {
+        return Err(format!(
+            "takes {} arguments, not a label and a closure",
+            args.len()
+        ));
+    };
+    let closure: String = closure.split_whitespace().collect();
+    let body = closure
+        .strip_prefix("AssertUnwindSafe(")
+        .or_else(|| closure.strip_prefix("std::panic::AssertUnwindSafe("))
+        .and_then(|inner| inner.strip_suffix(')'))
+        .and_then(|inner| {
+            inner
+                .strip_prefix("||")
+                .or_else(|| inner.strip_prefix("move||"))
+        })
+        .ok_or_else(|| format!("its closure is not `AssertUnwindSafe(|| …)`: `{closure}`"))?;
+    let body = body
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .unwrap_or(body);
+    let paren = body
+        .find('(')
+        .ok_or_else(|| format!("its closure calls nothing: `{body}`"))?;
+    let callee = &body[..paren];
+    if !callee
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
+        return Err(format!("its closure wraps more than one call: `{body}`"));
+    }
+    let function = callee.rsplit("::").next().unwrap_or(callee);
+    if !COMPILE_CALLS.contains(&function) {
+        return Err(format!(
+            "its closure calls `{callee}`, which is not a compile"
+        ));
+    }
+    let end = closing_paren(body, paren).ok_or("a call that never closes")?;
+    if end + 1 != body.len() {
+        return Err(format!("its closure does more than its one call: `{body}`"));
+    }
+    let call_args = &body[paren + 1..end];
+    match STATE_CHANGES
+        .iter()
+        .find(|change| call_args.contains(**change))
+    {
+        Some(change) => Err(format!(
+            "its call changes state: `{change}` in `{call_args}`"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Index of the `)` closing the `(` at `open` in `text`, blanked of literals.
+fn closing_paren(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in text.bytes().enumerate().skip(open) {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `text` split at its top-level commas, each part trimmed, empty parts left out (a
+/// trailing comma).
+fn top_level_parts(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in text.bytes().enumerate() {
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(text[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(text[start..].trim());
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
 /// Where `src` runs a process without setting or removing `RUST_BACKTRACE` (see
 /// [`every_run_sets_or_removes_rust_backtrace`]).
 struct UnsetRuns {
-    /// Every `.spawn(` / `.output(` / `.status(` call in code.
+    /// Every `.spawn(` / `.output(` / `.status(` call in code, and every call of a
+    /// [`SPAWN_HELPERS`] helper.
     runs: usize,
     /// 1-based lines of the calls whose function names `RUST_BACKTRACE` in neither an
     /// `env(RUST_BACKTRACE, …)` nor an `env_remove(RUST_BACKTRACE)` call.
@@ -929,7 +2086,10 @@ fn runs_without_rust_backtrace(src: &str) -> UnsetRuns {
         runs: 0,
         stray: Vec::new(),
     };
-    for call in [".spawn(", ".output(", ".status("] {
+    let calls = [".spawn(", ".output(", ".status("]
+        .into_iter()
+        .chain(SPAWN_HELPERS.iter().copied());
+    for call in calls {
         for (at, _) in code.match_indices(call) {
             found.runs += 1;
             let sets = innermost_fn(&code, at).is_some_and(|(_, body)| {
@@ -1030,6 +2190,8 @@ fn hook_findings(output: &str) -> Vec<String> {
 fn trigger_findings(sources: &[(String, String)]) -> Vec<String> {
     let mut found = Vec::new();
     let mut modules = 0usize;
+    let mut defined = vec![0usize; TRIGGER_FNS.len()];
+    let mut stubs = vec![0usize; TRIGGER_FNS.len()];
     for (name, src) in sources {
         let code = blank(src, true);
         let with_literals = blank(src, false);
@@ -1056,18 +2218,23 @@ fn trigger_findings(sources: &[(String, String)]) -> Vec<String> {
                 }
             }
         }
-        // The release build's stub: under `#[cfg(not(debug_assertions))]`, with an empty
-        // body.
+        // Each trigger function: defined in the module, and a release build's stub outside
+        // it, under `#[cfg(not(debug_assertions))]`, with an empty body.
         for (fn_name, body) in fn_bodies(&code) {
-            if fn_name != "panic_on_request" || inside(*body.start()) {
+            let Some(index) = TRIGGER_FNS.iter().position(|f| *f == fn_name) else {
+                continue;
+            };
+            if inside(*body.start()) {
+                defined[index] += 1;
                 continue;
             }
+            stubs[index] += 1;
             let item = with_literals[..*body.start()]
-                .rfind("fn panic_on_request")
+                .rfind(&format!("fn {fn_name}"))
                 .unwrap_or(0);
             if !attributes_above(&with_literals, item).contains(&"#[cfg(not(debug_assertions))]") {
                 found.push(format!(
-                    "{name}: a `panic_on_request` outside the module is not under \
+                    "{name}: a `{fn_name}` outside the module is not under \
                      `#[cfg(not(debug_assertions))]`"
                 ));
             }
@@ -1076,7 +2243,7 @@ fn trigger_findings(sources: &[(String, String)]) -> Vec<String> {
                 .to_string();
             if !inner.is_empty() {
                 found.push(format!(
-                    "{name}: the release build's `panic_on_request` must do nothing; it does \
+                    "{name}: the release build's `{fn_name}` must do nothing; it does \
                      `{inner}`"
                 ));
             }
@@ -1087,8 +2254,21 @@ fn trigger_findings(sources: &[(String, String)]) -> Vec<String> {
             "the crate must hold exactly one `mod panic_trigger`; it holds {modules}"
         ));
     }
+    for ((fn_name, defined), stubs) in TRIGGER_FNS.iter().zip(defined).zip(stubs) {
+        if defined != 1 || stubs != 1 {
+            found.push(format!(
+                "`{fn_name}` must be defined once in `mod panic_trigger` and once as a \
+                 release build's stub; it is defined {defined} and {stubs} times"
+            ));
+        }
+    }
     found
 }
+
+/// The trigger's functions: `panic_on_request` in the dispatch, `panic_on_compile` in
+/// `catch_compile`, `panic_in_handler` in `mds watch`'s file-event callback and Ctrl-C
+/// handler.
+const TRIGGER_FNS: &[&str] = &["panic_on_request", "panic_on_compile", "panic_in_handler"];
 
 /// What is wrong with `debug-panics` in `manifest`; empty when nothing is (see
 /// [`debug_panics_is_never_on_by_default`]): every line, comments left out, that names it

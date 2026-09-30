@@ -973,7 +973,7 @@ described below the table.
 | `mds::expected_markdown` | Rust API only: `CompileResult::into_markdown()` on a messages result | `mds-core` API | n/a | Rust |
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
-| `mds::internal` | A panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`) | napi, WASM, Python | n/a | napi, WASM, Python |
+| `mds::internal` | A panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | napi, WASM, Python; `mds lint` | n/a / 101 | napi, WASM, Python, CLI (`lint --format json`) |
 | `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`) | napi, WASM, Python, `@mdscript/mds` | n/a | napi, WASM, Python, `@mdscript/mds` |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
@@ -1030,8 +1030,20 @@ closed pipe lifts its exit code to at least 2.
 **Panics on the CLI (#389).** A panic in `mds` is an internal compiler error. Stderr
 gets exactly two lines, `mds: internal compiler error` and `note: this is a bug in mds;
 please report it at <repository>/issues` (the repository `mds-cli`'s manifest names),
-and the run exits 101. The panic's message and source location are never shown, and no
-error object is made of the panic. A panic on a thread other than the one running the
+and the run exits 101. The panic's message and source location are never shown. A panic
+compiling one file of a batch — a file of `mds build`, `mds check`, `mds fmt` or
+`mds lint` given a directory, and any compile of an `mds watch` session — fails that
+file alone: only the compile, format or analysis of the file is caught, never a write
+or delete of an output. The file counts as failed in the run's summary (`mds lint`:
+under "with errors"), the other files are compiled and written, and the run exits 101
+when it has finished. `mds watch` takes it as a failed compile and keeps watching — the
+next edit rebuilds — and exits 101 when it is stopped. The text is the panic's one
+report: no error line names the file, and the only error object made of it is
+`mds lint --format json`'s — a directory's entry
+`{"file": …, "error": {"code": "mds::internal", "message": "internal compiler error",
+"help": null, "span": null}}`, or, for a panic in the `--fix` pipeline of a file
+argument, the run's error document `{"version": 1, "error": {…}}` with the same error.
+A panic on a thread other than the one running the
 command ends the process at once with the same text and exit 101, and so does a second
 panic while the first is still unwinding — a destructor that panics, or the panic Rust
 raises when an unwind reaches a function that cannot unwind. Ending the process at once
@@ -1052,8 +1064,8 @@ prints the text, and then the process aborts. Only a build with `mds-cli`'s
 never-shipped `debug-panics` feature (`SECURITY.md`) prints the message and location,
 after the text. A build with debug assertions — `cargo install --debug`, or a profile
 that turns them on — also holds a test-only trigger that panics on purpose when
-`MDS_TEST_PANIC` is `main` or `thread`; a release build compiles it out unless its
-profile turns debug assertions on.
+`MDS_TEST_PANIC` is `main`, `thread`, `compile:<file stem>`, `notify` or `ctrlc`; a
+release build compiles it out unless its profile turns debug assertions on.
 
 The `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
 `MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised
@@ -1312,7 +1324,7 @@ Keys are in alphabetical order (BTreeMap serialization). Within each `files[].di
 
 **`lint_warnings` field (binding surfaces only):** The napi, WASM, and Python binding surfaces include an optional top-level `"lint_warnings"` key in the returned result object when non-fatal warnings were produced during linting (for example, unknown rule names in `mds.json`). In the JSON wire form (napi, WASM, and Python `to_dict()` / `to_json()`) the key is absent (not `null`, not `[]`) when no warnings occurred; on the Python live-object surface, `LintResult.lint_warnings` is a property that always exists and returns an empty list when no warnings occurred. In alphabetical key order `"lint_warnings"` sorts between `"files"` and `"truncated"`. The CLI does **not** include `"lint_warnings"` in its `--format json` stdout envelope — it writes warnings to stderr so the JSON stdout remains valid and parseable without modification.
 
-A file that produces a per-file analysis failure in directory mode (malformed config, I/O error) emits a `{"file":"…","error":{"code":"…","message":"…","help":"…","span":…}}` entry without a `"diagnostics"` key and contributes to exit code 2. When a stdin source fails the check gate before linting begins, the CLI emits an analysis-failure envelope to stdout: `{"version":1,"error":{"code":"…","message":"…","help":"…","span":…}}`. This envelope carries no `"files"` or `"truncated"` key, and no `"file"` key (unlike the success envelope above). A JSON consumer MUST handle both the success envelope and the analysis-failure envelope and MUST NOT assume a `"file"` key is present in error results.
+A file that produces a per-file analysis failure in directory mode (malformed config, I/O error) emits a `{"file":"…","error":{"code":"…","message":"…","help":"…","span":…}}` entry without a `"diagnostics"` key and contributes to exit code 2. A file whose analysis panicked emits the same entry with the error `{"code":"mds::internal","message":"internal compiler error","help":null,"span":null}`, counts under "with errors", and the run exits 101 (§5 "Panics on the CLI"). When a stdin source fails the check gate before linting begins, the CLI emits an analysis-failure envelope to stdout: `{"version":1,"error":{"code":"…","message":"…","help":"…","span":…}}`. This envelope carries no `"files"` or `"truncated"` key, and no `"file"` key (unlike the success envelope above). A JSON consumer MUST handle both the success envelope and the analysis-failure envelope and MUST NOT assume a `"file"` key is present in error results.
 
 #### Sanitization invariant (v1)
 

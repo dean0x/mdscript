@@ -56,10 +56,15 @@
 //! another reason — the JSON report, a diff, the fixed source — is reported once as
 //! `mds::io`, and the funnel lifts the code to at least 2; in directory mode a file whose
 //! diff it lost counts under "with errors" (#157).
+//!
+//! A panic ends the run with 101 through the funnel (#389). A panic in an entry's
+//! analysis — `mds::lint` on a directory's entry, or the fix pipeline — fails that input
+//! alone: a directory counts it under "with errors" and goes on to its other entries.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -72,8 +77,8 @@ use crate::build::{
 };
 use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, eprint_warning, render_unified_diff,
-    safe_inline, safe_path, Durability, STDIN_DISPLAY_LABEL,
+    atomic_write_file, catch_compile, collect_mds_files_detailed, eprint_warning,
+    render_unified_diff, safe_inline, safe_path, Durability, Panicked, STDIN_DISPLAY_LABEL,
 };
 
 // AC-224-15: No local rule-name list. The single source of truth is
@@ -166,6 +171,16 @@ impl<'a> LintSource<'a> {
             Self::Stdin => STDIN_DISPLAY_LABEL,
             Self::File { name, .. } => name,
             Self::DirEntry { key, .. } => key,
+        }
+    }
+
+    /// The path the input is read from, as the user reaches it: `-` for stdin, the path
+    /// as typed for a file argument, the path the walk produced for a directory's entry.
+    fn path(&self) -> &'a Path {
+        match *self {
+            Self::Stdin => Path::new("-"),
+            Self::File { typed, .. } => typed,
+            Self::DirEntry { path, .. } => path,
         }
     }
 
@@ -878,6 +893,10 @@ enum Outcome {
     /// An entry of a directory that could not be linted — or, under `--format json`, read to
     /// fix it — and the tally it counts under.
     Failed { error: MdsError, tally: FileTally },
+    /// The input's analysis panicked: `mds::lint` on an entry of a directory, or the fix
+    /// pipeline on any input. The panic hook reported it, and the run will exit 101
+    /// (#389); the input counts under "with errors".
+    Panicked,
     /// `--fix --check` / `--fix --diff`: the input's findings, the text they index, and what
     /// `--fix` would do. The findings shown stay the input's own: what is wrong now.
     Previewed {
@@ -1002,14 +1021,31 @@ fn lint_input<'a>(
             };
         }
     };
-    let fix = run_fix_pipeline(
-        &input,
-        &result,
-        &text,
-        base_dir,
-        runtime_vars.clone(),
-        &config,
+    // The fix pipeline lints its candidate again. A panic in it fails this input alone:
+    // a directory's other entries go on (#389).
+    let fix = catch_compile(
+        input.path(),
+        AssertUnwindSafe(|| {
+            run_fix_pipeline(
+                &input,
+                &result,
+                &text,
+                base_dir,
+                runtime_vars.clone(),
+                &config,
+            )
+        }),
     );
+    let fix = match fix {
+        Ok(fix) => fix,
+        Err(Panicked) => {
+            return FileReport {
+                input,
+                truncated,
+                outcome: Outcome::Panicked,
+            }
+        }
+    };
     let outcome = if flags.check || flags.diff {
         preview_fix(&input, result, text, fix, flags)
     } else {
@@ -1181,6 +1217,10 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
         Outcome::Failed { error, tally } => {
             sink.failed(&input, error);
             (tally, false)
+        }
+        Outcome::Panicked => {
+            sink.panicked(&input);
+            (FileTally::Error, false)
         }
         Outcome::Previewed {
             findings,
@@ -1666,11 +1706,24 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
         Ok(config) => config,
         Err(e) => return failed(e, FileTally::Error),
     };
-    let result = match mds::lint(path, ctx.runtime_vars.clone(), &config) {
-        Ok(result) => result,
-        Err(e) => {
+    // A panic in the analysis fails this entry alone, and the rest of the tree goes on
+    // (#389).
+    let linted = catch_compile(
+        path,
+        AssertUnwindSafe(|| mds::lint(path, ctx.runtime_vars.clone(), &config)),
+    );
+    let result = match linted {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
             let tally = failure_tally(&e);
             return failed(e, tally);
+        }
+        Err(Panicked) => {
+            return FileReport {
+                input: entry(),
+                truncated: false,
+                outcome: Outcome::Panicked,
+            }
         }
     };
     let linted = Linted {
@@ -2307,6 +2360,10 @@ mod tests {
         fn failed(&mut self, input: &LintSource<'_>, error: MdsError) {
             let call = format!("failed ({})", code_of(&error));
             self.record(&call, input);
+        }
+
+        fn panicked(&mut self, input: &LintSource<'_>) {
+            self.record("panicked", input);
         }
 
         fn write_failed(&mut self, input: &LintSource<'_>, _: MdsError) {

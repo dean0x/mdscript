@@ -48,6 +48,10 @@ pub(crate) trait ResultSink {
     /// fix it. Not `--quiet`: it is an error.
     fn failed(&mut self, input: &LintSource<'_>, error: MdsError);
 
+    /// An input whose analysis panicked. The panic hook has printed the internal compiler
+    /// error text and recorded the panic, so the run exits 101 (#389).
+    fn panicked(&mut self, input: &LintSource<'_>);
+
     /// A `--fix` rewrite of the input's file that failed. Not `--quiet`: it is an error.
     fn write_failed(&mut self, input: &LintSource<'_>, error: MdsError);
 
@@ -253,6 +257,9 @@ impl ResultSink for HumanSink {
         eprint_error(miette::Report::from(error));
     }
 
+    /// Nothing: the panic hook's text is the one report of a panic.
+    fn panicked(&mut self, _input: &LintSource<'_>) {}
+
     /// A directory's entry: `error writing <path>: <error>`. A file argument: the error.
     fn write_failed(&mut self, input: &LintSource<'_>, error: MdsError) {
         match *input {
@@ -382,6 +389,25 @@ impl ResultSink for JsonSink {
         self.analysis_failure(&error, None);
     }
 
+    /// A directory's entry: `{"file": …, "error": …}` with the internal error
+    /// ([`internal_error`]) is the file's one record in the document. A file argument: the
+    /// error document `{"error": …, "version": 1}` with it, on stdout — the run's one
+    /// document. Stdin never gets here: `--fix --format json` refuses it.
+    fn panicked(&mut self, input: &LintSource<'_>) {
+        match self.document.as_mut() {
+            Some(document) => document.push(serde_json::json!({
+                "file": entry_key(input),
+                "error": internal_error(),
+            })),
+            None => {
+                emit_stdout(&json_line(&serde_json::json!({
+                    "version": 1,
+                    "error": internal_error(),
+                })));
+            }
+        }
+    }
+
     /// A directory's entry: the failure, in its own words, is the file's one record in the
     /// document. A file argument: the error, on stderr.
     fn write_failed(&mut self, input: &LintSource<'_>, error: MdsError) {
@@ -446,8 +472,26 @@ fn files_of(findings: &mds::LintResult) -> Vec<Value> {
 /// reads the same in both entry types, and sorts where its key says.
 fn error_entry(input: &LintSource<'_>, error: &MdsError) -> Value {
     serde_json::json!({
-        "file": mds::sanitize_control_chars_wire(input.display_label()).into_owned(),
+        "file": entry_key(input),
         "error": error.serialize()
+    })
+}
+
+/// The `file` key of an entry that does not pass through `to_canonical_json`, escaped as
+/// that escapes the key of an entry with findings.
+fn entry_key(input: &LintSource<'_>) -> String {
+    mds::sanitize_control_chars_wire(input.display_label()).into_owned()
+}
+
+/// The JSON error of an input whose analysis panicked (#389): the code the bindings give a
+/// caught panic, `mds::internal`, and the fixed message the panic hook prints — nothing of
+/// the panic itself. `help` and `span` are `null`, as in every other JSON error.
+fn internal_error() -> Value {
+    serde_json::json!({
+        "code": "mds::internal",
+        "message": "internal compiler error",
+        "help": null,
+        "span": null,
     })
 }
 
