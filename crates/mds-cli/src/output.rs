@@ -194,11 +194,11 @@ static OUTPUT_STATE: OutputState = OutputState::new();
 /// Record, for the exit code, that an output operation of this run failed for a reason
 /// other than a closed pipe: [`exit`] then ends the run with at least 2 (#157).
 ///
-/// For a run that reports a failure and carries on — a directory build or `mds fmt
-/// <dir>` counting the file as failed — and so never returns the error to `main`. A run
-/// that returns the `mds::io` error reaches the same exit code through `exit_code`
-/// instead. `mds watch` never calls it: a rebuild's failure is reported as it happens
-/// and does not change how the session exits ([`note_watch_session_live`]).
+/// For a run that reports a failure and carries on — a directory build or
+/// `mds fmt <dir>` counting the file as failed — and so never returns the error to
+/// `main`. A run that returns the `mds::io` error reaches the same exit code through
+/// `exit_code` instead. `mds watch` never calls it: a rebuild's failure is reported as
+/// it happens and does not change how the session exits ([`note_watch_session_live`]).
 pub(crate) fn note_io_failure() {
     OUTPUT_STATE.note_io_failure();
 }
@@ -212,8 +212,8 @@ pub(crate) fn note_watch_session_live() {
     OUTPUT_STATE.note_watch_live();
 }
 
-/// Report an I/O failure of a run that carries on past it — a directory build, `mds fmt
-/// <dir>` — as one `mds::io` error, and record it for the exit code (#157).
+/// Report an I/O failure of a run that carries on past it — a directory build,
+/// `mds fmt <dir>` — as one `mds::io` error, and record it for the exit code (#157).
 pub(crate) fn eprint_io_failure(e: mds::MdsError) {
     note_io_failure();
     eprint_error(miette::Report::new(e));
@@ -888,6 +888,23 @@ pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Re
     })
 }
 
+// ── Working directory (#390) ──────────────────────────────────────────────────
+
+/// The working directory, which a path typed relative to it resolves against (#390).
+///
+/// Fails closed: a working directory that cannot be determined — deleted while the
+/// process is in it, say — is `mds::io` (exit 2), `cannot determine current directory:
+/// <reason>`, never a fallback to `"."`, which would name whatever directory the process
+/// is left in rather than the one the path was typed against. The words are mds-core's
+/// for a string compile that needs the working directory (its private
+/// `current_dir_base`), so a relative output location and a stdin source that meet the
+/// same failure read the same.
+pub(crate) fn current_dir() -> std::result::Result<PathBuf, mds::MdsError> {
+    std::env::current_dir().map_err(|e| mds::MdsError::Io {
+        message: format!("cannot determine current directory: {}", safe_inline(&e)),
+    })
+}
+
 // ── Output-location validation (#265) ─────────────────────────────────────────
 
 /// Refuse an output location that carries a forbidden path character (#265):
@@ -912,6 +929,28 @@ pub(crate) fn reject_forbidden_output_path(
     mds::reject_forbidden_path(what, Path::new(value), &value.to_string_lossy())
 }
 
+/// Refuse an output location that is not valid UTF-8 (#390): `mds::io`, exit 2,
+/// `<what> is not valid UTF-8: "<value>"`, the value shown with U+FFFD for each invalid
+/// sequence and escaped by [`mds::escape_path_for_message`].
+///
+/// Every status line and comparison would name such a location by its lossy form, which
+/// is a different path. Callers run it up front, beside
+/// [`reject_forbidden_output_path`], so it is never created or written.
+pub(crate) fn reject_non_utf8_output_path(
+    what: &str,
+    value: &OsStr,
+) -> std::result::Result<(), mds::MdsError> {
+    if value.to_str().is_some() {
+        return Ok(());
+    }
+    Err(mds::MdsError::Io {
+        message: format!(
+            "{what} is not valid UTF-8: \"{}\"",
+            mds::escape_path_for_message(&value.to_string_lossy())
+        ),
+    })
+}
+
 /// Refuse an output location whose RESOLVED form carries a forbidden path character
 /// (#265): `mds::io`, exit 2.
 ///
@@ -928,12 +967,16 @@ pub(crate) fn reject_forbidden_output_path(
 /// names `typed`, the value as typed, escaped by [`mds::escape_path_for_message`] —
 /// never the absolute resolved path. The scan and the message are
 /// [`mds::reject_forbidden_path`]'s.
+///
+/// A relative value is resolved against the working directory, so one that cannot be
+/// determined refuses it too, in [`current_dir`]'s words (#390): there is no directory
+/// the value names.
 pub(crate) fn reject_forbidden_resolved_output_path(
     what: &str,
     path: &Path,
     typed: &OsStr,
 ) -> std::result::Result<(), mds::MdsError> {
-    let Some(resolved) = resolve_existing_prefix(path) else {
+    let Some(resolved) = resolve_existing_prefix(path)? else {
         return Ok(());
     };
     mds::reject_forbidden_path(
@@ -944,18 +987,19 @@ pub(crate) fn reject_forbidden_resolved_output_path(
 }
 
 /// The canonical form of the deepest existing ancestor of `path` (`path` itself when
-/// it exists); a relative `path` is taken against the working directory.
+/// it exists); a relative `path` is taken against the working directory, which must
+/// exist ([`current_dir`]).
 ///
-/// `None` when nothing resolves — the working directory is gone, so there is nothing
-/// on disk the value could lead through, and the typed check stands alone.
-fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
+/// `None` when no ancestor resolves, so there is nothing on disk the value could lead
+/// through and the typed check stands alone.
+fn resolve_existing_prefix(path: &Path) -> std::result::Result<Option<PathBuf>, mds::MdsError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().ok()?.join(path)
+        current_dir()?.join(path)
     };
     // Bounded: one step per component of `absolute`.
-    absolute.ancestors().find_map(|a| a.canonicalize().ok())
+    Ok(absolute.ancestors().find_map(|a| a.canonicalize().ok()))
 }
 
 /// Refuse an `mds.json` `build.output_dir` with a `..` component: `mds::io`, exit 2.
@@ -997,28 +1041,27 @@ pub(crate) enum OutputBase {
 /// Resolve `out_dir` to an absolute, canonicalized path for reliable `starts_with` checks.
 ///
 /// Used by both `run_build_directory` and `dir_watch_startup` before calling
-/// [`resolve_output_base`]. Relative paths are resolved against `current_dir`; the result
-/// is then canonicalized (falls back to the absolute form when the directory does not yet exist).
-pub(crate) fn canonicalize_out_dir(out_dir: Option<&PathBuf>) -> Option<PathBuf> {
-    out_dir.map(|d| {
-        let abs = if d.is_absolute() {
-            d.clone()
-        } else {
-            // Fail-OPEN, deliberately left alone here (#217): when `current_dir()` fails
-            // — the cwd was deleted, or is unreadable — the relative `--out-dir` is
-            // anchored at `"."` instead, which resolves against whatever the process's
-            // cwd actually is. The subsequent `canonicalize()` then usually fails too and
-            // the non-absolute form is returned, so `starts_with` containment checks
-            // downstream compare against a path that is not the one they assume.
-            // Turning this into a hard error changes the signature of an infallible
-            // helper and every caller with it; tracked as a follow-up rather than folded
-            // into this change.
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(d)
-        };
-        abs.canonicalize().unwrap_or(abs)
-    })
+/// [`resolve_output_base`]. A relative path is resolved against the working directory;
+/// the result is then canonicalized (falls back to the absolute form when the directory
+/// does not yet exist).
+///
+/// # Errors
+///
+/// A relative `out_dir` when the working directory cannot be determined: `mds::io`, in
+/// [`current_dir`]'s words (#390). It is never anchored at `"."` instead, which would
+/// leave a relative base that every `starts_with` check downstream misreads.
+pub(crate) fn canonicalize_out_dir(
+    out_dir: Option<&PathBuf>,
+) -> std::result::Result<Option<PathBuf>, mds::MdsError> {
+    let Some(d) = out_dir else {
+        return Ok(None);
+    };
+    let abs = if d.is_absolute() {
+        d.clone()
+    } else {
+        current_dir()?.join(d)
+    };
+    Ok(Some(abs.canonicalize().unwrap_or(abs)))
 }
 
 /// Compute the `OutputBase` for directory mode.
@@ -4980,6 +5023,82 @@ mod tests {
             drops.load(Ordering::SeqCst),
             1,
             "a forgotten payload's destructor never runs"
+        );
+    }
+
+    /// The variable that makes [`a_working_directory_that_is_gone_fails_closed_in_core_s_words`]
+    /// run as its own child.
+    #[cfg(unix)]
+    const GONE_CWD_CHILD: &str = "MDS_OUTPUT_GONE_CWD_CHILD";
+
+    /// Where the working directory is gone, [`current_dir`] fails in exactly the words,
+    /// and with the code, mds-core gives a string compile that needs it (#390) — core's
+    /// function is private, so its words are taken from `mds::check_str_with` with no
+    /// base directory — and [`canonicalize_out_dir`] refuses a relative out-dir with that
+    /// error instead of anchoring it at `"."`.
+    ///
+    /// The test removes its own working directory, which is the whole process's, so it
+    /// runs as a child: this test binary, this one test. Controls: the child really ran
+    /// it (the harness reports it passed); an absolute out-dir needs no working
+    /// directory; and where it exists, [`current_dir`] is it.
+    ///
+    /// Unix-only: Windows cannot remove a directory that is a process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_that_is_gone_fails_closed_in_core_s_words() {
+        const NAME: &str =
+            "output::tests::a_working_directory_that_is_gone_fails_closed_in_core_s_words";
+        if std::env::var_os(GONE_CWD_CHILD).is_some_and(|value| value == NAME) {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let gone = dir.path().join("gone");
+            std::fs::create_dir(&gone).expect("create the working directory");
+            std::env::set_current_dir(&gone).expect("move into it");
+            std::fs::remove_dir(&gone).expect("remove it");
+
+            let ours = current_dir().expect_err("no working directory to determine");
+            let core = mds::check_str_with("Hello!\n", None, None)
+                .expect_err("core needs the working directory as the base");
+            assert!(
+                matches!(
+                    (&ours, &core),
+                    (mds::MdsError::Io { .. }, mds::MdsError::Io { .. })
+                ),
+                "both mds::io: {ours:?} / {core:?}"
+            );
+            assert_eq!(ours.to_string(), core.to_string(), "core's words exactly");
+            assert!(
+                ours.to_string()
+                    .starts_with("cannot determine current directory: "),
+                "{ours}"
+            );
+            let refused = canonicalize_out_dir(Some(&PathBuf::from("out")))
+                .expect_err("a relative out-dir has no directory to resolve against");
+            assert_eq!(refused.to_string(), ours.to_string());
+            let absolute = dir.path().join("out");
+            assert_eq!(
+                canonicalize_out_dir(Some(&absolute)).expect("an absolute out-dir resolves"),
+                Some(absolute),
+                "control: an absolute out-dir needs no working directory"
+            );
+            assert_eq!(canonicalize_out_dir(None).expect("no out-dir"), None);
+            return;
+        }
+        assert_eq!(
+            current_dir().expect("the working directory exists"),
+            std::env::current_dir().expect("the working directory exists"),
+            "control: where it exists, it is the working directory"
+        );
+        let binary = std::env::current_exe().expect("the test binary's path");
+        let child = std::process::Command::new(binary)
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(GONE_CWD_CHILD, NAME)
+            .output()
+            .expect("the child runs");
+        let report = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && report.contains("1 passed"),
+            "the child ran the test and it passed; stdout:\n{report}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
         );
     }
 }

@@ -2748,7 +2748,7 @@ fn dir_watch_startup(
 
     // Canonicalize out_dir as absolute so the starts_with(&root) in-root exclusion check
     // is reliable even when cwd contains symlinks (root is already canonical — security #8).
-    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref());
+    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref())?;
 
     // Compute the OutputBase (Fix 2 — subtree mirroring). Reject `..` at startup.
     let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;

@@ -732,6 +732,28 @@ fn build_invalid_mds_json_errors() {
     );
 }
 
+/// An `mds.json` over its cap names the cap in the unit it is: 1,048,576 bytes is 1 MiB,
+/// not 1 MB (#390).
+#[test]
+fn an_oversized_mds_json_names_its_cap_in_mib() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+    std::fs::write(dir.path().join("mds.json"), vec![b' '; 1024 * 1024 + 1]).unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["build", "hello.mds"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("mds.json at ./mds.json is too large (1048577 bytes; maximum is 1 MiB)"),
+        "the cap is named in MiB; stderr: {stderr}"
+    );
+}
+
 #[test]
 fn build_empty_mds_json_uses_defaults() {
     // `{}` in mds.json is valid and falls back to default behavior (file next to source).
@@ -2550,5 +2572,460 @@ mod entry_overwrite {
             "E\n"
         );
         assert_eq!(std::fs::read_to_string(root.join("e.mds")).unwrap(), "E\n");
+    }
+}
+
+// ── #390: what a run resolves against the working directory ─────────────────
+
+mod working_directory {
+    #[cfg(unix)]
+    use super::entry_overwrite::snapshot;
+    use super::*;
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// The words mds-core refuses a string compile with when it needs the working
+    /// directory and cannot determine it; the CLI refuses a relative output location in
+    /// the same words.
+    #[cfg(unix)]
+    const CANNOT_DETERMINE: &str = "cannot determine current directory: ";
+
+    /// One finished run of `mds`.
+    struct Run {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// `s` without whitespace or miette's `│` frame marker, so a message miette wrapped
+    /// compares equal to the unwrapped one.
+    #[cfg(unix)]
+    fn squash(s: &str) -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect()
+    }
+
+    /// Run `cmd` to its end with `stdin` as its input.
+    ///
+    /// Bounded: a run still going after 20 s — a `watch` expected to stop at startup that
+    /// started watching instead — is killed and fails the test rather than hanging the
+    /// suite.
+    fn run_bounded(cmd: &mut Command, stdin: &[u8]) -> Run {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mds");
+        let mut input = child.stdin.take().expect("stdin is piped");
+        // A run that stops before it reads stdin closes it; that write failing is not
+        // what a test here is about.
+        let _ = input.write_all(stdin);
+        drop(input);
+        let drain = |mut pipe: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            })
+        };
+        let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
+        let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+        // Bounded: at most 20 s of 10 ms polls.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll mds") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "mds was still running after 20 s; stderr:\n{}",
+                    stderr.join().unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Run {
+            code: status.code(),
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+        }
+    }
+
+    /// Run `mds` with `args` in `gone`, a directory the child removes right before `mds`
+    /// starts: the run's working directory no longer exists.
+    ///
+    /// std changes into `gone` before it runs the closure below. Were that order ever
+    /// reversed, the change would fail once the directory is gone, and the spawn with it,
+    /// so the test would fail rather than run somewhere else.
+    #[cfg(unix)]
+    fn run_where_the_working_directory_is_gone(gone: &Path, args: &[&str], stdin: &[u8]) -> Run {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+
+        std::fs::create_dir(gone).expect("create the working directory the child removes");
+        let target = std::ffi::CString::new(gone.as_os_str().as_bytes())
+            .expect("a temporary path holds no NUL");
+        let mut cmd = mds_bin();
+        cmd.current_dir(gone).args(args);
+        // SAFETY: the closure runs in the forked child just before `exec`, where only
+        // async-signal-safe work is sound: `rmdir` is a thin wrapper around its system call
+        // that takes no lock and allocates nothing, and the path it reads was allocated
+        // before the fork. The closure touches none of the parent's state.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::rmdir(target.as_ptr()) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let run = run_bounded(&mut cmd, stdin);
+        assert!(
+            !gone.exists(),
+            "control: the run's working directory was gone; stderr: {}",
+            run.stderr
+        );
+        run
+    }
+
+    /// A run refused because the working directory it resolves a relative output
+    /// location against is gone: `mds::io`, exit 2, in mds-core's words, nothing on
+    /// stdout.
+    #[cfg(unix)]
+    fn assert_refused_for_the_working_directory(run: &Run, label: &str) {
+        assert_eq!(run.code, Some(2), "{label}: stderr: {}", run.stderr);
+        assert!(
+            run.stderr.contains("mds::io"),
+            "{label}: mds::io; stderr: {}",
+            run.stderr
+        );
+        assert!(
+            squash(&run.stderr).contains(&squash(CANNOT_DETERMINE)),
+            "{label}: refused in mds-core's words {CANNOT_DETERMINE:?}; stderr: {}",
+            run.stderr
+        );
+        assert!(
+            run.stdout.is_empty(),
+            "{label}: nothing on stdout; got: {}",
+            run.stdout
+        );
+    }
+
+    /// A tree to build from, by absolute paths, so that no argument but the output
+    /// location depends on the working directory: `page.mds` and `src/a.mds`.
+    #[cfg(unix)]
+    fn tree(root: &Path) -> (String, String) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("page.mds"), "Hello!\n").unwrap();
+        std::fs::write(root.join("src").join("a.mds"), "A\n").unwrap();
+        (
+            root.join("page.mds").to_str().unwrap().to_owned(),
+            root.join("src").to_str().unwrap().to_owned(),
+        )
+    }
+
+    /// Where the working directory is gone, `mds build` cannot resolve a relative output
+    /// location, and refuses it before anything is written — `mds::io`, exit 2, in the
+    /// words mds-core uses for the same failure — instead of resolving it against `.`,
+    /// whatever directory that turns out to be (#390): a relative `--out-dir` in file and
+    /// directory mode, a relative `-o`, and `-o -` with an inline source map, whose
+    /// `sources` are relative to the working directory.
+    ///
+    /// Control: each run writes its output from a working directory that exists.
+    ///
+    /// Unix-only: Windows cannot remove a directory that is a process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_output_location_is_refused_where_the_working_directory_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        let (page, src) = tree(&root);
+        let before = snapshot(&root);
+        let runs: [&[&str]; 4] = [
+            &["build", page.as_str(), "--out-dir", "out"],
+            &["build", page.as_str(), "-o", "out.md"],
+            &["build", src.as_str(), "--out-dir", "out"],
+            &[
+                "build",
+                page.as_str(),
+                "-o",
+                "-",
+                "--source-map",
+                "--inline",
+            ],
+        ];
+        for (i, args) in runs.iter().enumerate() {
+            let gone = dir.path().join(format!("gone{i}"));
+            let run = run_where_the_working_directory_is_gone(&gone, args, b"");
+            let label = format!("{args:?}");
+            assert_refused_for_the_working_directory(&run, &label);
+            assert_eq!(snapshot(&root), before, "{label}: nothing is written");
+        }
+
+        let live = dir.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        for (args, written) in [
+            (runs[0], "out/page.md"),
+            (runs[1], "out.md"),
+            (runs[2], "out/a.md"),
+        ] {
+            let run = run_bounded(mds_bin().current_dir(&live).args(args), b"");
+            assert_eq!(
+                run.code,
+                Some(0),
+                "control {args:?}: stderr: {}",
+                run.stderr
+            );
+            assert!(live.join(written).is_file(), "control {args:?}: {written}");
+        }
+        let run = run_bounded(mds_bin().current_dir(&live).args(runs[3]), b"");
+        assert_eq!(run.code, Some(0), "control: stderr: {}", run.stderr);
+        assert!(
+            run.stdout.contains("Hello!") && run.stdout.contains("sourceMappingURL"),
+            "control: the output and its map on stdout; got: {}",
+            run.stdout
+        );
+    }
+
+    /// Where the working directory is gone, `mds watch` with a relative `--out-dir` stops
+    /// at startup — `mds::io`, exit 2, in mds-core's words, nothing written — in file and
+    /// directory mode, where it used to report the failed write and keep watching,
+    /// failing again on every rebuild (#390).
+    ///
+    /// Control: from a working directory that exists, the same session writes its output
+    /// before it reports readiness.
+    ///
+    /// Unix-only: Windows cannot remove a directory that is a process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn watch_with_a_relative_out_dir_stops_at_startup_where_the_working_directory_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        let (page, src) = tree(&root);
+        let before = snapshot(&root);
+        let sessions: [&[&str]; 2] = [
+            &[
+                "watch",
+                page.as_str(),
+                "--out-dir",
+                "out",
+                "--debounce",
+                "0",
+            ],
+            &["watch", src.as_str(), "--out-dir", "out", "--debounce", "0"],
+        ];
+        for (i, args) in sessions.iter().enumerate() {
+            let gone = dir.path().join(format!("gone{i}"));
+            let run = run_where_the_working_directory_is_gone(&gone, args, b"");
+            let label = format!("{args:?}");
+            assert_refused_for_the_working_directory(&run, &label);
+            assert_eq!(snapshot(&root), before, "{label}: nothing is written");
+        }
+
+        for (i, (args, written)) in [(sessions[0], "out/page.md"), (sessions[1], "out/a.md")]
+            .into_iter()
+            .enumerate()
+        {
+            let live = dir.path().join(format!("live{i}"));
+            std::fs::create_dir(&live).unwrap();
+            let (child, tap, _) = spawn_watch_ready(
+                mds_bin()
+                    .current_dir(&live)
+                    .args(args)
+                    .arg("-q")
+                    .stdout(Stdio::null()),
+            );
+            let _child = ChildGuard(child);
+            assert!(
+                live.join(written).is_file(),
+                "control {args:?}: {written} before readiness; stderr:\n{}",
+                tap.text()
+            );
+        }
+    }
+
+    /// With the working directory gone, a relative output location and a stdin source —
+    /// resolved by the CLI and by mds-core — fail in the same words, code and exit, so
+    /// one failure reads the same whichever of them meets it (#390).
+    ///
+    /// Unix-only: Windows cannot remove a directory that is a process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_that_is_gone_reads_the_same_through_the_cli_and_mds_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let (page, _) = tree(&dir.path().join("tree"));
+        let core = run_where_the_working_directory_is_gone(
+            &dir.path().join("gone-stdin"),
+            &["build", "-"],
+            b"Hello!\n",
+        );
+        let cli = run_where_the_working_directory_is_gone(
+            &dir.path().join("gone-out-dir"),
+            &["build", page.as_str(), "--out-dir", "out"],
+            b"",
+        );
+        assert_refused_for_the_working_directory(&core, "control: mds-core, stdin");
+        assert_eq!(cli.code, core.code, "cli: stderr: {}", cli.stderr);
+        assert_eq!(
+            cli.stderr, core.stderr,
+            "the CLI's refusal reads exactly as mds-core's"
+        );
+    }
+
+    /// A run that resolves nothing against the working directory still works where it is
+    /// gone: an output beside an absolute source, and stdout without a source map. Only
+    /// a relative location is refused (#390).
+    ///
+    /// Unix-only: Windows cannot remove a directory that is a process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_with_no_relative_location_works_where_the_working_directory_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        let (page, _) = tree(&root);
+        let run = run_where_the_working_directory_is_gone(
+            &dir.path().join("gone-stdout"),
+            &["build", page.as_str(), "-o", "-"],
+            b"",
+        );
+        assert_eq!(run.code, Some(0), "-o -: stderr: {}", run.stderr);
+        assert!(run.stdout.contains("Hello!"), "-o -: got: {}", run.stdout);
+        let run = run_where_the_working_directory_is_gone(
+            &dir.path().join("gone-beside"),
+            &["build", page.as_str()],
+            b"",
+        );
+        assert_eq!(run.code, Some(0), "beside: stderr: {}", run.stderr);
+        assert_eq!(
+            std::fs::read_to_string(root.join("page.md")).unwrap(),
+            "Hello!\n"
+        );
+    }
+
+    /// With no file argument, every subcommand looks for the one `.mds` file in the
+    /// working directory and names it as found there — `solo.mds`, exactly as the run
+    /// typed `solo.mds` would, not by the absolute path of the directory the run happens
+    /// to be in, which the user never typed (#390).
+    ///
+    /// Control: typed as an absolute path, the file is named by it.
+    #[test]
+    fn auto_detection_names_the_file_as_found_in_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("solo.mds"), "Solo\n").unwrap();
+        let tmp_name = dir.path().file_name().unwrap().to_str().unwrap();
+
+        for (args, banner) in [
+            (&["build"][..], "Building solo.mds\n"),
+            (&["fmt", "--check"][..], "Formatting solo.mds\n"),
+        ] {
+            let found = run_bounded(mds_bin().current_dir(dir.path()).args(args), b"");
+            let typed = run_bounded(
+                mds_bin().current_dir(dir.path()).args(args).arg("solo.mds"),
+                b"",
+            );
+            assert_eq!(found.code, Some(0), "{args:?}: stderr: {}", found.stderr);
+            assert_eq!(
+                typed.code,
+                Some(0),
+                "{args:?} solo.mds: stderr: {}",
+                typed.stderr
+            );
+            assert_eq!(
+                found.stderr,
+                format!("{banner}{}", typed.stderr),
+                "{args:?}: the file is named as typing `solo.mds` names it"
+            );
+            assert!(
+                !found.stderr.contains(tmp_name),
+                "{args:?}: no absolute path; stderr: {}",
+                found.stderr
+            );
+            assert!(
+                found.stdout.is_empty(),
+                "{args:?}: stdout: {}",
+                found.stdout
+            );
+        }
+        assert!(dir.path().join("solo.md").is_file());
+
+        let typed = dir.path().join("solo.mds");
+        let run = run_bounded(mds_bin().arg("build").arg(&typed), b"");
+        assert_eq!(run.code, Some(0), "control: stderr: {}", run.stderr);
+        assert!(
+            run.stderr.contains(&format!(
+                "Compiled to {}",
+                dir.path().join("solo.md").display()
+            )),
+            "control: a path typed absolute is named by it; stderr: {}",
+            run.stderr
+        );
+    }
+
+    /// Auto-detection in a working directory it cannot list names that directory as `.`
+    /// and is an I/O failure — `mds::io`, exit 2 — under every subcommand that auto-
+    /// detects, where it was an uncoded error, exit 1 (`lint`: 2) that showed the
+    /// directory's absolute path (#390).
+    ///
+    /// Control: once the directory can be listed again, the same run finds the file.
+    ///
+    /// Unix-only: it takes the directory's read permission away with a mode.
+    #[cfg(unix)]
+    #[test]
+    fn auto_detection_in_a_working_directory_it_cannot_list_names_it_as_a_dot() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("solo.mds"), "Solo\n").unwrap();
+        // Search without read: a process can work in the directory but not list it.
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o100)).unwrap();
+        if std::fs::read_dir(&cwd).is_ok() {
+            let _ = std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o755));
+            eprintln!(
+                "skipped: {} can be listed at mode 0o100 (running as root?)",
+                cwd.display()
+            );
+            return;
+        }
+        let runs: Vec<(&str, Run)> = ["build", "check", "fmt", "lint", "watch"]
+            .into_iter()
+            .map(|sub| (sub, run_bounded(mds_bin().current_dir(&cwd).arg(sub), b"")))
+            .collect();
+        // Restore the mode BEFORE asserting, so a failing assertion cannot leave a
+        // directory the temp-dir cleanup cannot list.
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tmp_name = dir.path().file_name().unwrap().to_str().unwrap();
+        for (sub, run) in &runs {
+            assert_eq!(run.code, Some(2), "{sub}: stderr: {}", run.stderr);
+            assert!(
+                run.stderr.contains("mds::io"),
+                "{sub}: mds::io; stderr: {}",
+                run.stderr
+            );
+            assert!(
+                squash(&run.stderr).contains(&squash("cannot read directory .: ")),
+                "{sub}: the directory is named `.`; stderr: {}",
+                run.stderr
+            );
+            assert!(
+                !run.stderr.contains(tmp_name),
+                "{sub}: no absolute path; stderr: {}",
+                run.stderr
+            );
+        }
+
+        let run = run_bounded(mds_bin().current_dir(&cwd).arg("build"), b"");
+        assert_eq!(run.code, Some(0), "control: stderr: {}", run.stderr);
+        assert!(cwd.join("solo.md").is_file(), "control: solo.md is built");
     }
 }

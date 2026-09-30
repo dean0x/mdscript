@@ -136,7 +136,7 @@ fn default_sort_frontmatter_keys() -> bool {
     true
 }
 
-/// Maximum allowed size for `mds.json` (1 MB) to prevent runaway memory use.
+/// Maximum allowed size for `mds.json` (1 MiB) to prevent runaway memory use.
 const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
 /// Walk up from `start` looking for `mds.json`.
@@ -184,7 +184,7 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
                 miette::miette!("cannot read {shown}: {}", crate::output::safe_inline(&e))
             };
             let too_large = |size: u64| {
-                miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MB)")
+                miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MiB)")
             };
             let mut file = std::fs::File::open(&candidate).map_err(cannot_read)?;
             let size = file.metadata().map_err(cannot_read)?.len();
@@ -846,20 +846,26 @@ fn output_dir_failure(dir: &Path, e: &std::io::Error) -> MdsError {
     }
 }
 
-/// Scan the current directory for `.mds` files.
+/// Scan the working directory for `.mds` files.
 ///
-/// Returns `Ok(path)` if exactly one `.mds` file is found, or an `Err` describing
-/// why auto-detection failed (zero files, multiple files, or I/O error).
+/// Returns `Ok(name)` if exactly one `.mds` file is found — its bare file name, the
+/// path relative to the working directory, so the run names it exactly as the same
+/// command given that name would (`Building x.mds`), never by an absolute path the
+/// user did not type (#390). An `Err` describes why auto-detection failed: zero files,
+/// multiple files, or a working directory that cannot be listed — `mds::io` (exit 2),
+/// naming it `.` (#390).
 pub(crate) fn auto_detect_mds_file(subcommand: &str) -> Result<PathBuf> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
-
-    let entries: Vec<PathBuf> = std::fs::read_dir(&cwd)
-        .map_err(|e| miette::miette!("cannot read directory {}: {e}", cwd.display()))?
+    let entries: Vec<PathBuf> = std::fs::read_dir(".")
+        .map_err(|e| MdsError::Io {
+            message: format!(
+                "cannot read directory .: {}",
+                crate::output::safe_inline(&e)
+            ),
+        })?
         .filter_map(|res| {
-            let path = res.ok()?.path();
-            (path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds"))
-                .then_some(path)
+            let name = PathBuf::from(res.ok()?.file_name());
+            (name.is_file() && name.extension().and_then(|e| e.to_str()) == Some("mds"))
+                .then_some(name)
         })
         .collect();
 
@@ -1258,9 +1264,10 @@ pub(crate) fn embed_carrier(content: String, map_json: &str) -> String {
 /// single choke-point in core).  Must be called BEFORE constructing
 /// `CompileOptions` so `source_map_base` can be set on the options struct.
 ///
-/// The result is always absolutized against the current working directory so
-/// that core's root-containment check works correctly against the absolute
-/// project root.
+/// The result is always absolutized against the working directory so that core's
+/// root-containment check works correctly against the absolute project root. Only a
+/// build that writes a source map needs it: core relativizes `sources[]` against it and
+/// reads it for nothing else.
 ///
 /// Mirrors the output-directory rules of [`resolve_output_path_for_kind`]:
 /// - `-o -` or stdin-with-no-output → current working directory.
@@ -1268,38 +1275,45 @@ pub(crate) fn embed_carrier(content: String, map_json: &str) -> String {
 /// - `--out-dir <dir>` → that directory (absolutized if relative).
 /// - mds.json `output_dir` → config-directory-relative.
 /// - Default → beside the source file.
+///
+/// # Errors
+///
+/// A base that needs the working directory when it cannot be determined: `mds::io`, in
+/// [`crate::output::current_dir`]'s words (#390). It is never anchored at `"."`
+/// instead: core takes a relative base as an absolute one, so `sources[]` would be
+/// computed against the wrong directory without a word.
 fn compute_source_map_base(
     input: &Path,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<(MdsConfig, PathBuf)>,
-) -> Option<PathBuf> {
-    let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let abs = |p: PathBuf| -> PathBuf {
+) -> Result<PathBuf, MdsError> {
+    use crate::output::current_dir;
+    let abs = |p: PathBuf| -> Result<PathBuf, MdsError> {
         if p.is_absolute() {
-            p
+            Ok(p)
         } else {
-            cwd().join(p)
+            Ok(current_dir()?.join(p))
         }
     };
 
     match output.as_deref() {
         Some("-") => {
             // -o - : stdout; relativize against CWD (PF-005: unconditional).
-            Some(cwd())
+            current_dir()
         }
         Some(o) => {
             // -o <file>: map lives beside the output file.
             // effective_parent maps "" (bare filename) to "." — PF-006.
-            Some(abs(effective_parent(Path::new(o)).to_path_buf()))
+            abs(effective_parent(Path::new(o)).to_path_buf())
         }
         None => {
             if let Some(dir) = out_dir {
                 // --out-dir <dir>: absolutize if relative.
-                Some(abs(dir.clone()))
+                abs(dir.clone())
             } else if input == Path::new("-") {
                 // Stdin with no -o or --out-dir → stdout → relativize against CWD.
-                Some(cwd())
+                current_dir()
             } else if let Some((cfg, config_dir)) = config {
                 if let Some(ref output_dir) = cfg.build.output_dir {
                     // mds.json output_dir: config-directory-relative.  `config_dir`
@@ -1308,14 +1322,14 @@ fn compute_source_map_base(
                     // "result is always absolutized" contract above structural
                     // rather than incidental — a relative base would silently
                     // demote core's map-relative emission to root-relative.
-                    Some(abs(config_dir.join(output_dir)))
+                    abs(config_dir.join(output_dir))
                 } else {
                     // Default: beside the source file.
-                    Some(abs(effective_parent(input).to_path_buf()))
+                    abs(effective_parent(input).to_path_buf())
                 }
             } else {
                 // No config, no -o, no --out-dir: beside the source file.
-                Some(abs(effective_parent(input).to_path_buf()))
+                abs(effective_parent(input).to_path_buf())
             }
         }
     }
@@ -1436,15 +1450,25 @@ fn has_sidecar_head(reader: &mut impl Read, expected_basename: &str) -> std::io:
     Ok(mds::read_at_most(reader, len, len)? == head.as_bytes())
 }
 
-/// Refuse `-o/--output` and `--out-dir` values carrying a forbidden path character
-/// (#265): `mds::io`, exit 2 — as typed, then in the form they resolve to (a symlink
-/// into a hostile-named directory). Shared by `build` and `watch`, which both call it
-/// before any other work, so a refused location is never created or written.
+/// Refuse `-o/--output` and `--out-dir` values that name no location mds can write
+/// and show faithfully: `mds::io`, exit 2. Shared by `build` and `watch`, which both
+/// call it before any other work, so a refused location is never created or written.
+///
+/// - A forbidden path character (#265), as typed, then in the form the value resolves
+///   to (a symlink into a hostile-named directory).
+/// - An `--out-dir` that is not valid UTF-8 (#390). `-o` needs no check here: the
+///   argument parser takes it as text and refuses such a value itself.
+/// - A relative value when the working directory cannot be determined (#390): it names
+///   no directory, and is refused in [`crate::output::current_dir`]'s words rather than
+///   resolved against `"."`.
 pub(crate) fn reject_forbidden_output_flags(
     output: Option<&str>,
     out_dir: Option<&Path>,
 ) -> Result<()> {
-    use crate::output::{reject_forbidden_output_path, reject_forbidden_resolved_output_path};
+    use crate::output::{
+        reject_forbidden_output_path, reject_forbidden_resolved_output_path,
+        reject_non_utf8_output_path,
+    };
     if let Some(o) = output {
         let shown = std::ffi::OsStr::new(o);
         reject_forbidden_output_path("-o/--output", shown)?;
@@ -1455,6 +1479,7 @@ pub(crate) fn reject_forbidden_output_flags(
     }
     if let Some(d) = out_dir {
         reject_forbidden_output_path("--out-dir", d.as_os_str())?;
+        reject_non_utf8_output_path("--out-dir", d.as_os_str())?;
         reject_forbidden_resolved_output_path("--out-dir", d, d.as_os_str())?;
     }
     Ok(())
@@ -1560,7 +1585,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             );
         }
 
-        let source_map_base = compute_source_map_base(Path::new("-"), &output, &out_dir, &None);
+        let source_map_base = use_source_map
+            .then(|| compute_source_map_base(Path::new("-"), &output, &out_dir, &None))
+            .transpose()?;
         let opts = mds::CompileOptions::default()
             .with_source_map(use_source_map)
             .with_include_sources_content(use_embed_sources)
@@ -1684,7 +1711,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         );
     }
 
-    let source_map_base = compute_source_map_base(&input, &output, &out_dir, &config);
+    let source_map_base = use_source_map
+        .then(|| compute_source_map_base(&input, &output, &out_dir, &config))
+        .transpose()?;
     let opts = mds::CompileOptions::default()
         .with_source_map(use_source_map)
         .with_include_sources_content(use_embed_sources)
@@ -1868,7 +1897,7 @@ fn run_build_directory(
     // Load project config from the directory root.
     let config = load_config(dir)?;
     // Canonicalize out_dir as absolute so starts_with checks are reliable.
-    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref());
+    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref())?;
     let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
 
     // Canonicalize dir for the starts_with comparison (issue 4): abs_out_dir (d) is already
@@ -2276,7 +2305,7 @@ mod tests {
     // project root, so a relative base fails the containment check and silently
     // demotes the result to root-relative — a `sources[]` entry that no longer
     // resolves from the map file's directory.  The invariant is therefore
-    // "every branch returns Some(absolute)", asserted here per branch because
+    // "every branch returns an absolute path", asserted here per branch because
     // the failure mode is silent (wrong paths, not an error).
 
     #[test]
@@ -2297,7 +2326,7 @@ mod tests {
         ];
         for (label, output, out_dir) in cases {
             let got = compute_source_map_base(&input, &output, &out_dir, &None)
-                .unwrap_or_else(|| panic!("{label}: source_map_base must never be None"));
+                .unwrap_or_else(|e| panic!("{label}: the working directory exists: {e}"));
             assert!(
                 got.is_absolute(),
                 "{label}: source_map_base must be absolute so core's root-containment \

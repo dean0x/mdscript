@@ -17,6 +17,7 @@
 mod common;
 use common::{assert_no_control_chars, mds_bin};
 
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
@@ -34,7 +35,7 @@ fn escaped(ch: char) -> String {
 /// Bounded: a command still running after 20 s — a `watch` expected to refuse at
 /// startup that started watching instead — is killed and fails the test rather than
 /// hanging the suite.
-fn run(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+fn run<S: AsRef<OsStr> + std::fmt::Debug>(dir: &Path, args: &[S]) -> (Option<i32>, String) {
     let mut child = mds_bin()
         .current_dir(dir)
         .args(args)
@@ -639,6 +640,105 @@ fn clean_output_locations_are_accepted() {
     assert_eq!(code, Some(0), "got: {text}");
     assert!(dir.path().join("o.md").is_file());
     assert!(dir.path().join("out").join("in.md").is_file());
+}
+
+/// Every path below `dir`, sorted: equal listings mean a run created nothing.
+#[cfg(unix)]
+fn paths_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+        assert!(depth < 8, "fixture trees are shallow");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                walk(&path, depth + 1, out);
+            }
+            out.push(path);
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 0, &mut out);
+    out.sort();
+    out
+}
+
+/// An `--out-dir` that is not valid UTF-8 is refused up front — `mds::io`, exit 2,
+/// `--out-dir is not valid UTF-8: "<value>"`, each invalid sequence shown as U+FFFD —
+/// before anything is created, by `mds build` and `mds watch` in file and directory mode
+/// (#390). Every status line and comparison would have used a lossy form of it, which
+/// names another path. `-o` is text to the argument parser, which refuses such a value
+/// itself before `mds` sees it (exit 2); nothing is created either.
+///
+/// Control: an `--out-dir` spelled in valid non-ASCII UTF-8 is created and written.
+///
+/// Unix-only: the value is built from raw bytes with `OsStrExt`. No file of that name is
+/// ever created, so the run needs a filesystem that could hold one on neither platform.
+#[cfg(unix)]
+#[test]
+fn an_out_dir_that_is_not_utf8_is_refused_before_anything_is_created() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.mds"), "Hi\n").unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("a.mds"), "A\n").unwrap();
+    let before = paths_under(dir.path());
+    let value = OsStr::from_bytes(b"o\x80ut");
+    let expected = format!(
+        "--out-dir is not valid UTF-8: \"o{}ut\"",
+        char::REPLACEMENT_CHARACTER
+    );
+
+    for (sub, input) in [
+        ("build", "in.mds"),
+        ("build", "src"),
+        ("watch", "in.mds"),
+        ("watch", "src"),
+    ] {
+        let args = [
+            OsStr::new(sub),
+            OsStr::new(input),
+            OsStr::new("--out-dir"),
+            value,
+        ];
+        let label = format!("{sub} {input} --out-dir");
+        let (code, text) = run(dir.path(), &args);
+        assert_eq!(code, Some(2), "{label}: got: {text}");
+        assert!(text.contains("mds::io"), "{label}: mds::io; got: {text}");
+        assert!(
+            squash(&text).contains(&squash(&expected)),
+            "{label}: expected {expected:?}; got: {text}"
+        );
+        assert_eq!(
+            paths_under(dir.path()),
+            before,
+            "{label}: nothing is created"
+        );
+    }
+
+    let output = OsStr::from_bytes(b"o\x80ut.md");
+    let (code, text) = run(
+        dir.path(),
+        &[
+            OsStr::new("build"),
+            OsStr::new("in.mds"),
+            OsStr::new("-o"),
+            output,
+        ],
+    );
+    assert_eq!(code, Some(2), "-o: got: {text}");
+    assert!(
+        text.contains("UTF-8"),
+        "-o: the parser names it; got: {text}"
+    );
+    assert_eq!(paths_under(dir.path()), before, "-o: nothing is created");
+
+    let clean = "o\u{e9}ut";
+    let (code, text) = run(dir.path(), &["build", "in.mds", "--out-dir", clean]);
+    assert_eq!(code, Some(0), "control: got: {text}");
+    assert!(
+        dir.path().join(clean).join("in.md").is_file(),
+        "control: a UTF-8 --out-dir is created and written"
+    );
 }
 
 fn write_mds_json(dir: &Path, output_dir: &str) {
