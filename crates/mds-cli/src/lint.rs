@@ -155,10 +155,10 @@ impl<'a> LintSource<'a> {
     /// A file argument, named by its file name.
     ///
     /// `mds::io` when the path has no file name in UTF-8, which cannot happen once
-    /// [`read_source_file`] has read it: [`ensure_existing_mds_file`] accepted the path,
-    /// so it ends in a file name with the `.mds` extension, and the read refuses a path
-    /// whose canonical form — ending in the file's own name, never a link's — is not
-    /// valid UTF-8.
+    /// `mds::lint` has accepted the path: [`ensure_existing_mds_file`] accepted it, so it
+    /// ends in a file name with the `.mds` extension, and `mds::lint` refuses a path that
+    /// is not valid UTF-8 before it reads anything. [`read_source_file`] is not enough:
+    /// it validates the canonical path it opens, not the path as typed.
     fn file(typed: &'a Path) -> std::result::Result<Self, MdsError> {
         let name = typed
             .file_name()
@@ -1135,18 +1135,19 @@ fn run_lint_file(
             crate::output::exit(mds_error_exit_code(&e));
         }
     };
-    // Named only after the read, which is what makes a name that is not UTF-8
-    // impossible here (see `LintSource::file`).
-    let input = match LintSource::file(path) {
-        Ok(input) => input,
+
+    let mut result = match mds::lint(path, runtime_vars.clone(), &config) {
+        Ok(r) => r,
         Err(e) => {
             emit_analysis_failure_json_or_stderr(&e, format, None);
             crate::output::exit(mds_error_exit_code(&e));
         }
     };
-
-    let mut result = match mds::lint(path, runtime_vars.clone(), &config) {
-        Ok(r) => r,
+    // Named only after `mds::lint` accepted the path, which refuses a path that is not
+    // UTF-8 first: the name is UTF-8 here, and every refusal is `mds::lint`'s own (see
+    // `LintSource::file`).
+    let input = match LintSource::file(path) {
+        Ok(input) => input,
         Err(e) => {
             emit_analysis_failure_json_or_stderr(&e, format, None);
             crate::output::exit(mds_error_exit_code(&e));
