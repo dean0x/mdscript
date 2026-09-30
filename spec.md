@@ -1027,9 +1027,24 @@ that ends before it is live — at a startup error, or at a startup write that f
 stdout's reader gone — exits by the rules above, so a stderr that failed other than by a
 closed pipe lifts its exit code to at least 2.
 
-A panic on the CLI is
-not converted into an error object: it is a Rust panic with exit code 101. The
-`mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
+**Panics on the CLI (#389).** A panic in `mds` is an internal compiler error. Stderr
+gets exactly two lines, `mds: internal compiler error` and `note: this is a bug in mds;
+please report it at <repository>/issues` (the repository `mds-cli`'s manifest names),
+and the run exits 101. The panic's message and source location are never shown, and no
+error object is made of the panic. A panic on a thread other than the one running the
+command ends the process at once with the same text and exit 101, and so does a second
+panic while the first is still unwinding. 101 wins over every other exit code: a closed
+pipe, an I/O failure and `mds watch`'s rule once live change nothing. The text is
+written once and its write error ignored, so with stderr closed or failing the run still
+exits 101. With `RUST_BACKTRACE` set to anything but `0`, a `stack backtrace:` line and
+the panicking thread's frames follow the text — every frame for `full`, the frames from
+the panic on for any other value — each line WIRE-escaped; the message is still not
+shown. A panic that cannot unwind at all (an undefined-behaviour check a debug build
+compiles in) prints the text, and then the process aborts. Only a build with `mds-cli`'s
+never-shipped `debug-panics` feature (`SECURITY.md`) prints the message and location,
+after the text.
+
+The `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
 `MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised
 by the bindings and do not exist in `mds-core`.
 
@@ -1245,6 +1260,7 @@ and the exit code are unaffected by `--quiet`.
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Any error-severity finding, analysis failure (parse/resolve/IO/config), or usage error |
 | `3` | Resource limit exceeded |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
 
 With `--fix`, residual post-fix findings determine the exit code.
 
@@ -1557,6 +1573,7 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 | `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials), and a run in which files failed but none with an error of the `2` row below — template errors and resource limits, say (§7.2 continue-on-error) |
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8, a path carrying a forbidden path character — §4.6); also an output location (`-o`, `--out-dir`, `build.output_dir`) or `mds init` filename carrying one, a `build.output_dir` containing `..`, a directory argument that is a symlink or the filesystem root (§7.2), and an output that is the entry file itself (§7.2). The CLI's I/O failures listed in §5 "Streams and I/O failures" are `mds::io`, exit 2: an output, `.map` sidecar or starter file that cannot be written (a symlink at the destination included), an output directory that cannot be created, a stale sibling or sidecar that cannot be removed, a stale sidecar that cannot be read, a stdout write that fails other than by a closed pipe, and stdin that cannot be read or is not valid UTF-8 (#157). In directory mode a failure of this row — one of these, or a file's own, such as a source that cannot be read — makes the run exit 2 while the other files are still processed (§7.2 continue-on-error). (Changed in v0.5.0: these exited 1, a directory run whose failed files included one of this row's errors exited 1, and a stale sibling or sidecar that could not be removed, or a stale sidecar that could not be read, only warned.) |
 | `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels, or stdin over 10 MiB — changed in v0.5.0; previously exit 1) |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
 
 A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").
 
@@ -1568,6 +1585,7 @@ A closed stdout or stderr pipe never changes any of these codes (§5 "Streams an
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8); also an I/O failure (#157): a `--fix` rewrite that fails, a stdout write that fails other than by a closed pipe — which lifts a clean or warning-only run to 2 — and stdin that cannot be read or is not valid UTF-8, each `mds::io` except a rewrite failure in a directory run under `--format human` (`error writing <path>: …`) |
 | `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2) |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
 
 The code-by-code classification behind these tables is the "Error Codes" registry in §5.
 

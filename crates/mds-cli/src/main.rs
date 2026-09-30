@@ -238,12 +238,27 @@ enum Commands {
 }
 
 fn main() {
+    // #389: first, so that any panic after it — clap's parsing included — prints the
+    // fixed internal-compiler-error text, never the panic's message.
+    output::install_panic_hook();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => exit_after_clap_output(&err),
     };
 
-    let verdict = match run(cli) {
+    // A panic in the command unwinds to here, running the destructors on its way (a
+    // temporary file removes itself), and the run exits 101 through the funnel. The hook
+    // has reported it.
+    let verdict = match output::catch_panic(move || verdict_of(run(cli))) {
+        Ok(verdict) => verdict,
+        Err(output::Panicked) => output::PANIC_EXIT,
+    };
+    output::exit(verdict)
+}
+
+/// The exit code of a command's result, its error reported first when it has one.
+fn verdict_of(result: Result<()>) -> i32 {
+    match result {
         Ok(()) => 0,
         Err(e) => {
             // Route through the single render choke point, never a hand-rolled
@@ -254,8 +269,7 @@ fn main() {
             output::eprint_error(e);
             code
         }
-    };
-    output::exit(verdict)
+    }
 }
 
 /// Print clap's help, version or usage error and end the run with clap's exit code — 0
@@ -477,6 +491,7 @@ Your items:
 }
 
 fn run(cli: Cli) -> Result<()> {
+    output::panic_on_request();
     let quiet = cli.quiet;
     match cli.command {
         Commands::Build {

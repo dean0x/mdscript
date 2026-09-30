@@ -40,17 +40,18 @@
 //!   macro — test modules and the writer macros' own bodies included, with no exemption
 //!   ([`no_raw_print_macro_outside_the_writer`], #157). Status lines go through the
 //!   writer macros; a command's product goes through `write_stdout`.
-//! - **One way out of the process.** Only the exit funnel `output::exit` calls
-//!   `std::process::exit` ([`EXIT_FUNNELS`]); `std::process::abort` appears nowhere, and
-//!   a `use` that would let a call skip naming `process::exit` — renamed, braced,
-//!   globbed, or through a renamed `process` — is reported
-//!   ([`process_exit_only_in_the_funnel`]).
+//! - **One way out of the process.** Only the exit funnel `output::exit`, and the panic
+//!   path's `output::exit_after_panic` (#389), call `std::process::exit`
+//!   ([`EXIT_FUNNELS`]); `std::process::abort` appears nowhere, and a `use` that would let
+//!   a call skip naming `process::exit` — renamed, braced, globbed, or through a renamed
+//!   `process` — is reported ([`process_exit_only_in_the_funnel`]).
 //! - **Stream handles only in the writers.** `stdout` / `stderr`, the std functions that
 //!   hand out a terminal stream, are named only inside the functions in
 //!   [`STREAM_HANDLE_OWNERS`], or to ask `.is_terminal()`
 //!   ([`terminal_streams_are_opened_only_by_the_writers`]). A second writer holding its
 //!   own handle would not see a stdout closed for good or a failure already reported;
-//!   `mds lint` had one (#157).
+//!   `mds lint` had one (#157). The panic hook is listed on purpose: it writes one fixed
+//!   text, and `tests/panic_hook.rs` pins that it writes nothing else (#389).
 //! - These three scans read every module the crate compiles: `crate_sources` resolves
 //!   each `mod name;` from `main.rs` as rustc does and fails on one it did not read.
 //! - **`mds lint` shows its results through its result sink** (#309): lint's writer-macro
@@ -287,10 +288,10 @@ const FLOORS_PENDING: &[(&str, &str)] = &[];
 const RAW_PRINT_MACROS: &[&str] = &["println", "print", "eprintln", "eprint", "dbg"];
 
 /// The functions allowed to call `std::process::exit`, by file: the CLI's exit funnel,
-/// which applies the output-failure rule to every exit code (#157). A second funnel — a
-/// panic path that cannot return to it — is listed here beside it, never exempted by
-/// name elsewhere.
-const EXIT_FUNNELS: &[(&str, &str)] = &[("output.rs", "exit")];
+/// which applies the output-failure rule to every exit code (#157), and the panic path's
+/// own way out, for a panic that cannot return to it — nothing catches it, or it comes
+/// while its thread unwinds from another — which exits 101 at once (#389).
+const EXIT_FUNNELS: &[(&str, &str)] = &[("output.rs", "exit"), ("output.rs", "exit_after_panic")];
 
 /// The `std::process` functions that end the process: `exit` only through a funnel,
 /// `abort` never.
@@ -301,12 +302,15 @@ const STREAM_HANDLES: &[&str] = &["stdout", "stderr"];
 
 /// The functions allowed to name a [`STREAM_HANDLES`] function for anything but an
 /// `.is_terminal()` query, by file: the two writers, which keep the state every write
-/// consults — a pipe closed for good, a failure already reported (#157) — and the exit
-/// after clap's own output, which flushes what clap printed.
+/// consults — a pipe closed for good, a failure already reported (#157) — the exit
+/// after clap's own output, which flushes what clap printed, and the panic hook, which
+/// writes its one fixed text with a `write_all` of its own: a panic may come from inside
+/// the writer, and the text is written whatever the writer's state says (#389).
 const STREAM_HANDLE_OWNERS: &[(&str, &str)] = &[
     ("output.rs", "write_stderr_fmt"),
     ("output.rs", "write_stdout"),
     ("main.rs", "exit_after_clap_output"),
+    ("output.rs", "on_panic"),
 ];
 
 /// The calls through which `mds lint` shows a result, by name: the writer macros, the
@@ -1516,6 +1520,35 @@ fn the_exit_guard_flags_every_way_out_but_the_funnel() {
         "the funnel body counts as the funnel only in the file that lists it"
     );
 
+    // Two funnels in one file: each holds its one exit, and an exit in any other function
+    // of the file — a name that merely starts with a funnel's included — is still stray.
+    let two_funnels = r#"
+        pub(crate) fn exit(verdict: i32) -> ! {
+            std::process::exit(final_exit_code(verdict))
+        }
+        fn exit_after_panic() -> ! {
+            std::process::exit(PANIC_EXIT)
+        }
+        fn exit_after_panic_twice() -> ! {
+            std::process::exit(PANIC_EXIT)
+        }
+    "#;
+    assert_eq!(
+        process_end_mentions(two_funnels, &["exit", "exit_after_panic"]),
+        ProcessEnds {
+            stray: vec![9],
+            in_funnel: 2
+        }
+    );
+    assert_eq!(
+        process_end_mentions(two_funnels, &["exit"]),
+        ProcessEnds {
+            stray: vec![6, 9],
+            in_funnel: 1
+        },
+        "a panic path's exit is stray until it is listed as a funnel"
+    );
+
     // Neither: the funnel's callers, other `std::process` items, a plain module import,
     // names that merely contain the words, comments and literals.
     let prose = r#"
@@ -1575,6 +1608,27 @@ fn the_stream_handle_guard_flags_a_second_writer() {
             stray: Vec::new(),
             in_owner: vec![1]
         }
+    );
+
+    // The panic hook's handle, bound to a local of the stream's own name: every mention
+    // in the owner's body counts for it, and the same body is stray until it is listed.
+    let hook = r#"
+        fn on_panic(info: &PanicHookInfo<'_>) {
+            let mut stderr = std::io::stderr();
+            let _ = stderr.write_all(ICE_TEXT.as_bytes());
+        }
+    "#;
+    assert_eq!(
+        stream_handle_mentions(hook, &["write_stdout", "on_panic"]),
+        StreamHandles {
+            stray: Vec::new(),
+            in_owner: vec![0, 3]
+        }
+    );
+    assert_eq!(
+        stream_handle_mentions(hook, &["write_stdout"]).stray,
+        vec![3, 3, 4],
+        "the hook's handle is stray until the hook is listed as an owner"
     );
 
     // Neither: a field or method of that name, a longer identifier, a definition,

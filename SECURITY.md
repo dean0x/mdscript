@@ -127,23 +127,50 @@ growth, or non-termination.
 
 ## ⚠️ The `debug-panics` feature must never ship enabled
 
-The three binding crates — `mds-napi`, `mds-wasm` and `mds-python` — declare an
-off-by-default `debug-panics` Cargo feature (`crates/mds-napi/Cargo.toml`,
-`crates/mds-wasm/Cargo.toml`, `crates/mds-python/Cargo.toml`). `mds-core` and
-`mds-cli` have no such feature: the CLI installs no panic hook, so a panic there is
-a plain Rust panic (exit code 101) with no error object to attach a payload to. When
-enabled, the feature surfaces the raw Rust panic payload as `err.detail` on
-`mds::internal` errors thrown at the binding boundary, to help diagnose unexpected
-panics during local development.
+The three binding crates — `mds-napi`, `mds-wasm` and `mds-python` — and `mds-cli`
+declare an off-by-default `debug-panics` Cargo feature (`crates/mds-napi/Cargo.toml`,
+`crates/mds-wasm/Cargo.toml`, `crates/mds-python/Cargo.toml`,
+`crates/mds-cli/Cargo.toml`). `mds-core` has none. In a binding the feature surfaces
+the raw Rust panic payload as `err.detail` on `mds::internal` errors thrown at the
+binding boundary; in the CLI it prints the panic's message and location after the
+internal-compiler-error text below. Both exist to help diagnose unexpected panics
+during local development.
+
+**The CLI's panic output (#389).** A panic in `mds` prints these two lines on stderr and
+nothing else, and the run exits 101:
+
+```
+mds: internal compiler error
+note: this is a bug in mds; please report it at https://github.com/dean0x/mdscript/issues
+```
+
+The panic's message and its source location are never shown: a message can carry a
+template author's text or the build machine's absolute paths. The two lines are one
+fixed text, written once with its write error ignored, so a closed or failing stderr
+loses the text and the run still exits 101, not by a signal. A panic on a thread other
+than the one running the command — a `mds watch` helper thread, say — ends the process
+at once with the same text and exit 101, and so does a second panic while the first is
+still unwinding, which Rust would otherwise turn into an abort. Exit 101 wins over every
+other exit code, `mds watch`'s included. With `RUST_BACKTRACE` set to anything but `0`
+(`full` for every frame), a backtrace of the panicking thread follows the two lines,
+each line escaped as a status line is. It still shows no message, but its frames name
+the functions and source files the binary was built from, with the build machine's
+paths; leave `RUST_BACKTRACE` unset where that matters. A panic that Rust cannot unwind
+at all — one of the undefined-behaviour checks a debug build compiles in — prints the
+text and then aborts. `crates/mds-cli/tests/panic_hook.rs` pins this output, and pins
+the panic hook's code to one write of the fixed text.
 
 **Never enable `debug-panics` in a published or production build.** Panic messages
 can contain absolute filesystem paths and other internal details that should not be
 exposed to template authors or end users. The feature is off unless opted into
-explicitly: none of the three crates lists it in a `default` feature set
+explicitly: none of the four crates lists it in a `default` feature set
 (`mds-python`'s default is `extension-module` only), and the commands that build the
 published artifacts — `napi build --release` in `release.yml` for the addon, the
 `@mdscript/mds-wasm` build script (`wasm-pack build ../../crates/mds-wasm --target
 nodejs …` and `--target web …`) for the WASM package, and `maturin` with
 `pyproject.toml`'s `features = ["pyo3/abi3-py311"]` for the wheels — pass no
-`--features debug-panics`. No automated gate asserts this; it is checked by reading
-those three build sites.
+`--features debug-panics`. For `mds-cli` alone, `crates/mds-cli/tests/panic_hook.rs`
+fails when a `default` feature or any other feature turns it on; the build sites are
+checked by reading them. `mds-cli` is published to crates.io, so
+`cargo install mds-cli --features debug-panics` builds a CLI that prints panic
+messages: build one only for your own debugging.

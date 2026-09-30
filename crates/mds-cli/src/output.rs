@@ -11,6 +11,9 @@
 //!   instead (#157). [`write_stdout`] writes a command's product and reports a
 //!   [`StdoutOutcome`], writing nothing once stdout's reader is gone; [`exit`] ends the
 //!   process through [`final_exit_code`].
+//! - [`install_panic_hook`] / [`catch_panic`]: a panic prints one fixed
+//!   internal-compiler-error text — never the panic's message or location — and the run
+//!   exits 101 (#389).
 //! - [`eprint_error`]: the CLI's error-report choke point — escapes every report's
 //!   message, help, and label text before miette renders it (CWE-150), then writes the
 //!   frame through `ewriteln!`.
@@ -93,6 +96,8 @@ impl OutputState {
     /// A `mds watch` session went live: from then on its output failures do not change
     /// the exit code ([`ExitPolicy::WatchSession`]).
     const WATCH_LIVE: u8 = 1 << 4;
+    /// A panic happened (#389): the run exits 101, whatever else it recorded.
+    const PANICKED: u8 = 1 << 5;
 
     pub(crate) const fn new() -> Self {
         Self {
@@ -159,6 +164,15 @@ impl OutputState {
         self.set(Self::WATCH_LIVE);
     }
 
+    /// Record that a panic happened (#389).
+    pub(crate) fn note_panicked(&self) {
+        self.set(Self::PANICKED);
+    }
+
+    pub(crate) fn panicked(&self) -> bool {
+        self.has(Self::PANICKED)
+    }
+
     /// The rule [`final_exit_code`] applies when the process exits:
     /// [`ExitPolicy::WatchSession`] once a watch session went live,
     /// [`ExitPolicy::Batch`] for every other run.
@@ -173,7 +187,7 @@ impl OutputState {
 
 /// The process's own [`OutputState`], used by the process-boundary functions
 /// [`write_stderr_fmt`], [`write_stdout`], [`note_io_failure`],
-/// [`note_watch_session_live`] and [`exit`].
+/// [`note_watch_session_live`], [`exit`] and the panic hook, [`on_panic`].
 static OUTPUT_STATE: OutputState = OutputState::new();
 
 /// Record, for the exit code, that an output operation of this run failed for a reason
@@ -360,11 +374,16 @@ const IO_FAILURE_EXIT: i32 = 2;
 /// The code a run whose verdict is `verdict` exits with, given what happened to its
 /// output.
 ///
-/// A closed stdout or stderr pipe never changes it. Under [`ExitPolicy::Batch`], any
-/// other output failure lifts it to `max(verdict, 2)` — a resource limit keeps its 3.
-/// [`ExitPolicy::WatchSession`] returns `verdict` unchanged.
+/// A panic comes first: a run that panicked exits 101 ([`PANIC_EXIT`]) under either
+/// policy, whatever its verdict (#389). Otherwise a closed stdout or stderr pipe never
+/// changes the code. Under [`ExitPolicy::Batch`], any other output failure lifts it to
+/// `max(verdict, 2)` — a resource limit keeps its 3. [`ExitPolicy::WatchSession`]
+/// returns `verdict` unchanged.
 #[must_use]
 pub(crate) fn final_exit_code(verdict: i32, state: &OutputState, policy: ExitPolicy) -> i32 {
+    if state.panicked() {
+        return PANIC_EXIT;
+    }
     match policy {
         ExitPolicy::Batch if state.io_failed() => verdict.max(IO_FAILURE_EXIT),
         ExitPolicy::Batch | ExitPolicy::WatchSession => verdict,
@@ -383,6 +402,237 @@ pub(crate) fn exit(verdict: i32) -> ! {
         OUTPUT_STATE.exit_policy(),
     ))
 }
+
+// ── Panics: one internal-compiler-error text (#389) ──────────────────────────
+//
+// A panic anywhere in the process runs `on_panic`, which prints `ICE_TEXT` and never
+// the panic's message or location: a panic message can carry a user's text or a build
+// machine's absolute paths. The run then exits 101. `main` runs the whole command
+// inside `catch_panic`, so a panic on its thread unwinds — running the destructors that
+// remove temporary files — to the exit funnel; a panic nothing catches, on a helper
+// thread for one, ends the process at once through `exit_after_panic`.
+
+/// What the CLI prints when it panics: that it failed, and where to report it. Nothing
+/// about the panic itself.
+const ICE_TEXT: &str = concat!(
+    "mds: internal compiler error\n",
+    "note: this is a bug in mds; please report it at ",
+    env!("CARGO_PKG_REPOSITORY"),
+    "/issues\n",
+);
+
+/// The exit code of a run that panicked, whatever else happened (#389) — Rust's own code
+/// for a panic that ends `main`.
+pub(crate) const PANIC_EXIT: i32 = 101;
+
+/// The backtrace a panic prints after [`ICE_TEXT`], as `RUST_BACKTRACE` asks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BacktraceStyle {
+    /// The frames from the panic on.
+    Short,
+    /// Every frame (`RUST_BACKTRACE=full`).
+    Full,
+}
+
+impl BacktraceStyle {
+    /// The backtrace `RUST_BACKTRACE`'s `value` asks for, read as std reads it: none when
+    /// it is unset or `0`, every frame for `full`, the short form for any other value.
+    fn from_env(value: Option<&OsStr>) -> Option<Self> {
+        match value {
+            None => None,
+            Some(value) if value == OsStr::new("0") => None,
+            Some(value) if value == OsStr::new("full") => Some(Self::Full),
+            Some(_) => Some(Self::Short),
+        }
+    }
+}
+
+thread_local! {
+    /// Whether this thread is running a [`catch_panic`] closure, which catches a panic
+    /// that unwinds out of it.
+    static CATCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread is unwinding from a panic the hook let unwind, and no
+    /// [`catch_panic`] has caught yet.
+    static UNWINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install the CLI's panic hook, [`on_panic`] (#389). `main` calls it before anything
+/// else. `RUST_BACKTRACE` is read here, once: the hook itself reads no environment.
+pub(crate) fn install_panic_hook() {
+    let backtrace = BacktraceStyle::from_env(std::env::var_os("RUST_BACKTRACE").as_deref());
+    std::panic::set_hook(Box::new(move |info| on_panic(backtrace, info)));
+}
+
+/// The panic hook: what a panic on any thread does (#389).
+///
+/// 1. One `write_all` of [`ICE_TEXT`] to stderr, its error ignored — a closed or failing
+///    stderr loses the text and nothing else. Nothing the panic carries is formatted, so
+///    no `Display` of the payload can run here, and std's stderr is a reentrant lock, so a
+///    thread that panicked while writing to stderr takes it again. If another thread is
+///    stuck inside a stderr write, this one waits with it.
+/// 2. Record the panic: from here on [`final_exit_code`] is 101.
+/// 3. With `RUST_BACKTRACE` asking, [`write_backtrace`]. With the never-shipped
+///    `debug-panics` feature, the panic's message and location.
+/// 4. Let the panic unwind only to a [`catch_panic`] on this thread that is not already
+///    unwinding from an earlier one. Otherwise end the process now, exit 101
+///    ([`exit_after_panic`]): a panic on a thread that nothing catches — a watch helper
+///    thread — would end that thread alone and leave the command running without it; and
+///    a second panic while the thread unwinds from the first — a destructor that panics
+///    — would make std abort the process after a message of its own.
+///
+/// It must not panic: std aborts a process whose panic hook panics, after printing the
+/// second panic's location. `std::panic::always_abort`, with which a panic aborts without
+/// calling any hook, is unstable, and the CLI never calls it; std sets it only in a child
+/// between `fork` and `exec`, before the child is `mds` at all. A panic that cannot
+/// unwind at all — a check of undefined behaviour that debug builds compile in, say —
+/// prints the text, and then std aborts.
+fn on_panic(backtrace: Option<BacktraceStyle>, info: &std::panic::PanicHookInfo<'_>) {
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(ICE_TEXT.as_bytes());
+    OUTPUT_STATE.note_panicked();
+    if let Some(style) = backtrace {
+        write_backtrace(&mut stderr, style);
+    }
+    #[cfg(feature = "debug-panics")]
+    write_panic_detail(&mut stderr, info);
+    #[cfg(not(feature = "debug-panics"))]
+    let _ = info;
+    if !unwinds_to_a_catch() {
+        exit_after_panic();
+    }
+}
+
+/// Whether the panic being reported will unwind to a [`catch_panic`] on this thread:
+/// the thread is inside one, and not already unwinding from an earlier panic. Marks the
+/// thread as unwinding.
+fn unwinds_to_a_catch() -> bool {
+    let catching = CATCHING.with(std::cell::Cell::get);
+    let already_unwinding = UNWINDING.with(|unwinding| unwinding.replace(true));
+    catching && !already_unwinding
+}
+
+/// End the process after a panic that nothing will catch: exit 101 at once (#389). The
+/// panicking thread cannot return to [`exit`], so the panic path has this way out of its
+/// own.
+fn exit_after_panic() -> ! {
+    std::process::exit(PANIC_EXIT)
+}
+
+/// A panic that unwound out of a [`catch_panic`] closure. The hook has reported it.
+#[derive(Debug)]
+pub(crate) struct Panicked;
+
+/// Run `f`, catching a panic that unwinds out of it — the one place the CLI catches a
+/// panic (#389). The hook has already printed the text and recorded the panic, so the
+/// run exits 101 whatever it does next; nothing here reports the panic again.
+///
+/// The panic's payload is dropped without running its destructor (`mem::forget`): that
+/// destructor is arbitrary code, and a panic in it would be a panic outside any catch.
+pub(crate) fn catch_panic<T>(
+    f: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> std::result::Result<T, Panicked> {
+    let outer = CATCHING.with(|catching| catching.replace(true));
+    let caught = std::panic::catch_unwind(f);
+    CATCHING.with(|catching| catching.set(outer));
+    caught.map_err(|payload| {
+        std::mem::forget(payload);
+        UNWINDING.with(|unwinding| unwinding.set(false));
+        Panicked
+    })
+}
+
+/// Write the panicking thread's backtrace to `sink`, as `RUST_BACKTRACE` asked: a
+/// `stack backtrace:` line, then the frames, each line WIRE-escaped with its line break
+/// kept. A write that fails is ignored — stderr is where it would be reported.
+fn write_backtrace<W: std::io::Write + ?Sized>(sink: &mut W, style: BacktraceStyle) {
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    let mut text = String::from("stack backtrace:\n");
+    // A frame that fails to render ends the text where it failed.
+    let _ = match style {
+        BacktraceStyle::Short => std::fmt::Write::write_fmt(&mut text, format_args!("{backtrace}")),
+        BacktraceStyle::Full => {
+            std::fmt::Write::write_fmt(&mut text, format_args!("{backtrace:#}"))
+        }
+    };
+    let _ = sink.write_all(escape_each_line(&text).as_bytes());
+}
+
+/// `text` with each line WIRE-escaped on its own and ended by a line break, so a line
+/// keeps its break and gains no raw control character.
+fn escape_each_line(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for line in text.split_terminator('\n') {
+        escaped.push_str(&mds::sanitize_control_chars_wire(line));
+        escaped.push('\n');
+    }
+    escaped
+}
+
+/// The panic's message and location, escaped as a backtrace line is — only in a build
+/// with the never-shipped `debug-panics` feature (#389).
+#[cfg(feature = "debug-panics")]
+fn write_panic_detail<W: std::io::Write + ?Sized>(
+    sink: &mut W,
+    info: &std::panic::PanicHookInfo<'_>,
+) {
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(a panic payload that is not text)");
+    let mut text = String::new();
+    let _ = std::fmt::Write::write_fmt(&mut text, format_args!("panic: {message}\n"));
+    if let Some(location) = info.location() {
+        let _ = std::fmt::Write::write_fmt(&mut text, format_args!("  at {location}\n"));
+    }
+    let _ = sink.write_all(escape_each_line(&text).as_bytes());
+}
+
+// ── Test-only panic trigger (#389) ───────────────────────────────────────────
+
+/// `MDS_TEST_PANIC`: how a debug build is made to panic on purpose, for the tests of the
+/// panic hook (`tests/panic_hook.rs`). A release build has none of it.
+#[cfg(debug_assertions)]
+mod panic_trigger {
+    /// The variable that asks for a panic, and where: `main` in the command's dispatch,
+    /// `thread` in a thread the dispatch starts and waits for.
+    const VARIABLE: &str = "MDS_TEST_PANIC";
+
+    /// A word the payload carries, for a test to look for.
+    pub(super) const SENTINEL: &str = "mds-test-panic-payload";
+
+    /// Panic as `MDS_TEST_PANIC` asks, if it asks. The dispatch calls it first.
+    pub(crate) fn panic_on_request() {
+        match std::env::var_os(VARIABLE)
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+        {
+            Some("main") => std::panic::panic_any(payload()),
+            Some("thread") => {
+                // A thread's panic that does not end the process leaves the dispatch to
+                // carry on as if nothing had happened — what a test must be able to see.
+                let _ = std::thread::spawn(|| std::panic::panic_any(payload())).join();
+            }
+            _ => {}
+        }
+    }
+
+    /// A payload no panic output may show: the sentinel, a raw ESC and the absolute path
+    /// of the working directory.
+    pub(super) fn payload() -> String {
+        let esc = char::from(0x1b);
+        let here = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        format!("{SENTINEL} {esc}[2J {}", here.display())
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) use panic_trigger::panic_on_request;
+
+/// A release build's `MDS_TEST_PANIC` trigger: nothing (#389).
+#[cfg(not(debug_assertions))]
+pub(crate) fn panic_on_request() {}
 
 // ── Stdin display sentinel ────────────────────────────────────────────────────
 
@@ -4217,5 +4467,292 @@ mod tests {
             1,
             "going live is sticky, and a failure recorded after it changes nothing"
         );
+    }
+
+    // ── Panics (#389) ─────────────────────────────────────────────────────────
+
+    /// A panic makes the run exit 101, whatever its verdict, whatever else it recorded,
+    /// and under either policy — a live watch session's included.
+    #[test]
+    fn a_panic_exits_101_whatever_else_was_recorded() {
+        use ExitPolicy::{Batch, WatchSession};
+        // (verdict, stderr closed, I/O failed, policy)
+        let cases = [
+            (0, false, false, Batch),
+            (1, false, false, Batch),
+            (2, false, true, Batch),
+            (3, false, true, Batch),
+            (0, true, false, Batch),
+            (0, false, false, WatchSession),
+            (1, true, true, WatchSession),
+            (3, false, true, WatchSession),
+        ];
+        for (verdict, closed, failed, policy) in cases {
+            let state = OutputState::new();
+            if closed {
+                state.note_stderr_closed();
+            }
+            if failed {
+                state.note_io_failure();
+            }
+            assert!(
+                final_exit_code(verdict, &state, policy) < 101,
+                "control: verdict {verdict} closed={closed} failed={failed} {policy:?} \
+                 exits below 101 until a panic is recorded"
+            );
+            state.note_panicked();
+            assert!(state.panicked());
+            assert_eq!(
+                final_exit_code(verdict, &state, policy),
+                101,
+                "verdict {verdict} closed={closed} failed={failed} {policy:?}"
+            );
+        }
+    }
+
+    /// `RUST_BACKTRACE` asks for a backtrace when it is set to anything but `0`, and for
+    /// every frame when it is `full` — as std reads it.
+    #[test]
+    fn rust_backtrace_picks_the_backtrace_a_panic_prints() {
+        let cases = [
+            (None, None),
+            (Some("0"), None),
+            (Some("1"), Some(BacktraceStyle::Short)),
+            (Some("full"), Some(BacktraceStyle::Full)),
+            (Some(""), Some(BacktraceStyle::Short)),
+            (Some("short"), Some(BacktraceStyle::Short)),
+        ];
+        for (value, want) in cases {
+            assert_eq!(
+                BacktraceStyle::from_env(value.map(OsStr::new)),
+                want,
+                "RUST_BACKTRACE={value:?}"
+            );
+        }
+    }
+
+    /// The text is two fixed lines: that the CLI failed, and the issue tracker of the
+    /// repository its manifest names.
+    #[test]
+    fn the_internal_compiler_error_text_names_the_issue_tracker() {
+        let lines: Vec<&str> = ICE_TEXT.lines().collect();
+        assert_eq!(lines.len(), 2, "{ICE_TEXT:?}");
+        assert!(ICE_TEXT.ends_with('\n'), "{ICE_TEXT:?}");
+        assert_eq!(lines[0], "mds: internal compiler error");
+        let tracker = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
+        assert!(
+            tracker.starts_with("https://github.com/") && tracker.len() > 26,
+            "the manifest names a GitHub repository: {tracker}"
+        );
+        assert!(lines[1].ends_with(tracker), "{ICE_TEXT:?}");
+        assert!(
+            ICE_TEXT.chars().all(|c| c == '\n' || !c.is_control()),
+            "{ICE_TEXT:?}"
+        );
+    }
+
+    /// Each line of a backtrace is WIRE-escaped on its own and keeps its line break: an
+    /// ESC, a CR or a bidi override inside a line becomes its escape; a tab stays.
+    #[test]
+    fn a_backtrace_is_escaped_line_by_line() {
+        let esc = char::from(0x1b);
+        let cr = char::from(0x0d);
+        let rlo = char::from_u32(0x202E).expect("U+202E");
+        let code = |c: char| format!("{}u{:04X}", '\\', u32::from(c));
+        let text = format!("frame {esc}[2J\n\tat {rlo}file.rs{cr}\nlast");
+        assert_eq!(
+            escape_each_line(&text),
+            format!(
+                "frame {}[2J\n\tat {}file.rs{}\nlast\n",
+                code(esc),
+                code(rlo),
+                code(cr)
+            )
+        );
+        // Control: clean text comes back as it is, each line ended by its line break.
+        assert_eq!(escape_each_line("a\nb\n"), "a\nb\n");
+    }
+
+    /// `write_backtrace` writes a header and this thread's frames — the writer's own among
+    /// them — every line escaped, in one write; a write that fails is not retried and does
+    /// not panic.
+    #[test]
+    fn write_backtrace_writes_escaped_frames_and_ignores_a_failed_write() {
+        for style in [BacktraceStyle::Short, BacktraceStyle::Full] {
+            let mut sink = Sink::new(OnWrite::Accept);
+            write_backtrace(&mut sink, style);
+            let text = String::from_utf8(sink.bytes).expect("a backtrace is UTF-8");
+            assert!(text.starts_with("stack backtrace:\n"), "{style:?}: {text}");
+            assert!(
+                text.contains("write_backtrace"),
+                "{style:?}: the frames include the writer's own; {text}"
+            );
+            assert!(
+                text.split_terminator('\n')
+                    .all(|line| mds::sanitize_control_chars_wire(line) == line),
+                "{style:?}: every line is escaped; {text}"
+            );
+            assert_eq!(sink.writes, 1, "{style:?}: one write");
+            for kind in [
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::StorageFull,
+            ] {
+                let mut failing = Sink::new(OnWrite::Fail(kind));
+                write_backtrace(&mut failing, style);
+                assert_eq!(
+                    failing.writes, 1,
+                    "{style:?}: a failed write is not retried"
+                );
+            }
+        }
+    }
+
+    /// The trigger's payload is one no panic output may show: the sentinel, a raw ESC and
+    /// the absolute path of the working directory.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_trigger_s_payload_carries_a_sentinel_an_esc_and_an_absolute_path() {
+        let payload = panic_trigger::payload();
+        let here = std::env::current_dir().expect("the working directory");
+        assert!(here.is_absolute(), "{here:?}");
+        assert!(payload.contains(panic_trigger::SENTINEL), "{payload:?}");
+        assert!(payload.contains(char::from(0x1b)), "{payload:?}");
+        assert!(payload.contains(&here.display().to_string()), "{payload:?}");
+    }
+
+    /// The variable that makes a test run as the child [`panic_in_a_child`] starts.
+    const PANIC_CHILD: &str = "MDS_OUTPUT_PANIC_CHILD";
+
+    /// Run the test `name` again as a child — this test binary, that one test — with
+    /// [`PANIC_CHILD`] set, so that it installs the panic hook in a process of its own.
+    /// The child's `RUST_BACKTRACE` is removed: CI sets it for every job.
+    fn panic_in_a_child(name: &str) -> std::process::Output {
+        let binary = std::env::current_exe().expect("the test binary's path");
+        std::process::Command::new(binary)
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(PANIC_CHILD, name)
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .expect("the child runs")
+    }
+
+    fn in_the_child(name: &str) -> bool {
+        std::env::var_os(PANIC_CHILD).is_some_and(|value| value == name)
+    }
+
+    /// The child's streams: what the harness and the test wrote to stdout, and stderr.
+    fn streams(child: &std::process::Output) -> (String, String) {
+        (
+            String::from_utf8_lossy(&child.stdout).into_owned(),
+            String::from_utf8_lossy(&child.stderr).into_owned(),
+        )
+    }
+
+    /// A panic that unwinds to [`catch_panic`] is reported once and caught, and the run
+    /// goes on: the thread is not left unwinding, so a second panic is caught as well,
+    /// and the run then ends through [`exit`] with 101 (#389).
+    ///
+    /// Control: the child really ran the test (the harness announced it), and ended at the
+    /// funnel, not in the harness.
+    #[test]
+    fn a_caught_panic_is_reported_once_and_the_run_goes_on() {
+        const NAME: &str = "output::tests::a_caught_panic_is_reported_once_and_the_run_goes_on";
+        if in_the_child(NAME) {
+            install_panic_hook();
+            let first = catch_panic(|| {
+                panic!("first");
+            });
+            let second = catch_panic(|| {
+                panic!("second");
+            });
+            if first.is_err() && second.is_err() {
+                let _ = write_stdout(b"after both catches\n");
+            }
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "a run that caught a panic exits 101; stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            report.contains("after both catches") && !report.contains("test result"),
+            "both panics were caught and the run went on to the exit; stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
+    }
+
+    /// A panic that nothing catches ends the process at once with 101, after the text —
+    /// before the test harness, which would catch it, sees it.
+    #[test]
+    fn a_panic_nothing_catches_ends_the_run_at_once_with_101() {
+        const NAME: &str = "output::tests::a_panic_nothing_catches_ends_the_run_at_once_with_101";
+        if in_the_child(NAME) {
+            install_panic_hook();
+            panic!("uncaught");
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            !report.contains("test result"),
+            "the process ended at the panic, before the harness could report it; \
+             stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT, "the text, once");
+    }
+
+    /// A panic while the thread is unwinding from another — a value that panics when it
+    /// is dropped — ends the process at once with 101 instead of the abort std would make
+    /// of it; each panic prints the text.
+    #[test]
+    fn a_panic_while_unwinding_ends_the_run_with_101_not_an_abort() {
+        const NAME: &str =
+            "output::tests::a_panic_while_unwinding_ends_the_run_with_101_not_an_abort";
+        struct PanicsWhenDropped;
+        impl Drop for PanicsWhenDropped {
+            fn drop(&mut self) {
+                panic!("second");
+            }
+        }
+        if in_the_child(NAME) {
+            install_panic_hook();
+            let _ = catch_panic(|| {
+                let _armed = PanicsWhenDropped;
+                panic!("first");
+            });
+            let _ = write_stdout(b"the run went on\n");
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "exit 101, not an abort (a signal: None); stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            !report.contains("the run went on") && !report.contains("test result"),
+            "the process ended at the second panic; stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
     }
 }
