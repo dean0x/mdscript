@@ -79,13 +79,12 @@ use mds::MdsError;
 use crate::build::{
     admit_output, auto_detect_mds_file, build_runtime_vars, compile_to_content,
     emit_duplicate_var_warnings, load_config, resolve_output_path_for_kind, write_output,
-    CompileOutput, EntryPaths, MdsConfig, OutputKind, RuntimeVarArgs,
+    CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
 };
 use crate::output::{
-    canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
-    is_within_default_excluded_dir, output_base_no_ext, output_path_for, probe_and_remove_stale,
-    resolve_output_base, safe_inline, safe_path, stdout_failure, write_stdout, OutputBase,
-    Panicked, StdoutOutcome,
+    collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
+    output_base_no_ext, output_path_for, probe_and_remove_stale, resolve_output_base, safe_inline,
+    safe_path, stdout_failure, write_stdout, OutputBase, Panicked, StdoutOutcome, WriteTarget,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -1227,11 +1226,11 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 // ── Single-file watch ─────────────────────────────────────────────────────────
 
 /// What [`compile_and_write`] returns on success, `(output_path, deps, content)`:
-/// - `output_path`: the resolved output path (None for stdout).
+/// - `output_path`: the resolved output, written and shown (None for stdout).
 /// - `deps`: transitive dependency paths.
 /// - `content`: the compiled string (issue 3 — reused by the watch baseline block
 ///   so startup does not compile twice).
-type WrittenEntry = (Option<PathBuf>, Vec<String>, String);
+type WrittenEntry = (Option<WriteTarget>, Vec<String>, String);
 
 /// Outcome of [`compile_and_write`]'s compile-and-write attempt, for an output route every
 /// rebuild can use.
@@ -1280,17 +1279,22 @@ impl OutputWrite {
     }
 }
 
+/// The path a session's output is written to; `None` for stdout.
+fn written_path(output: &Option<WriteTarget>) -> Option<&Path> {
+    output.as_ref().map(|target| target.path.as_path())
+}
+
 /// Write `content` where the session writes: the output file, through [`write_output`]
 /// (`announce` prints its `Compiled to` line), or stdout for `-o -` (`output_path` is
 /// `None`).
 fn write_session_output(
-    output_path: Option<PathBuf>,
+    output_path: Option<&WriteTarget>,
     content: &str,
     quiet: bool,
     announce: bool,
 ) -> OutputWrite {
     match output_path {
-        Some(path) => match write_output(Some(path), content, quiet, announce) {
+        Some(target) => match write_output(Some(target), content, quiet, announce) {
             Ok(()) => OutputWrite::Written,
             Err(e) => OutputWrite::Failed(Some(e)),
         },
@@ -1327,7 +1331,7 @@ fn compile_and_write(
     entry: &WatchedPath,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
-    config: &Option<(MdsConfig, PathBuf)>,
+    config: &Option<ProjectConfig>,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<CompileWriteOutcome> {
@@ -1343,7 +1347,7 @@ fn compile_and_write(
         compiled.kind,
     )?;
     admit_output(
-        output_path.as_deref(),
+        written_path(&output_path),
         entry.paths(),
         output,
         compiled.kind,
@@ -1351,7 +1355,7 @@ fn compile_and_write(
     )
     .map_err(miette::Error::from)?;
     Ok(
-        match write_session_output(output_path.clone(), &compiled.content, quiet, true) {
+        match write_session_output(output_path.as_ref(), &compiled.content, quiet, true) {
             OutputWrite::Written => {
                 CompileWriteOutcome::Written((output_path, compiled.dependencies, compiled.content))
             }
@@ -1385,7 +1389,7 @@ struct FileCompileCtx {
     /// kind (intrinsic extension), or the Markdown fallback of a failed startup compile.
     /// `None` is stdout (`-o -`). A route that fails to resolve never gets here: it ends
     /// `mds watch` at startup.
-    output_path: Option<PathBuf>,
+    output_path: Option<WriteTarget>,
     quiet: bool,
 }
 
@@ -1618,7 +1622,7 @@ fn rebuild_file(
         // extension warning (`&None`): startup printed it for the path every rebuild
         // reuses.
         admit_output(
-            output_path.as_deref(),
+            written_path(&output_path),
             entry.paths(),
             &None,
             compiled.kind,
@@ -1636,8 +1640,7 @@ fn rebuild_file(
     };
 
     // The content-dedup key, and the name the "Recompiled" line shows.
-    let output_key: String = output_path
-        .as_deref()
+    let output_key: String = written_path(&output_path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<stdout>".to_string());
 
@@ -1675,7 +1678,7 @@ fn rebuild_file(
     if !content_changed {
         return ControlFlow::Continue(());
     }
-    match write_session_output(output_path, &compiled.content, ctx.quiet, false) {
+    match write_session_output(output_path.as_ref(), &compiled.content, ctx.quiet, false) {
         OutputWrite::Written => {
             let elapsed = t0.elapsed().as_millis();
             let dep_count = compiled.dependencies.len();
@@ -1892,7 +1895,7 @@ fn run_watch_file(
             // admitting the fallback only decides whether the `-o` extension warning,
             // which announces a write, is printed — never for a fallback that is the entry.
             let _ = admit_output(
-                fallback_path.as_deref(),
+                written_path(&fallback_path),
                 entry.paths(),
                 &output,
                 OutputKind::Markdown,
@@ -1927,8 +1930,7 @@ fn run_watch_file(
     startup_race_probe();
 
     // Key: resolved output path string, or the sentinel "<stdout>" when output_path is None.
-    let output_key: String = output_path
-        .as_deref()
+    let output_key: String = written_path(&output_path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<stdout>".to_string());
 
@@ -2284,18 +2286,18 @@ fn compile_one_source(
             // Content-based dedup: skip write when content unchanged.
             let content_changed = state
                 .last_written
-                .get(&out)
+                .get(&out.path)
                 .is_none_or(|prev| *prev != compiled.content);
 
             if content_changed {
-                match write_output(Some(out.clone()), &compiled.content, quiet, false) {
+                match write_output(Some(&out), &compiled.content, quiet, false) {
                     Ok(()) => {
                         let elapsed = t0.elapsed().as_millis();
                         let dep_count = compiled.dependencies.len();
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Recompiled {} ({} deps) in {}ms",
-                                safe_path(&out),
+                                safe_path(&out.path),
                                 dep_count,
                                 elapsed
                             );
@@ -2333,7 +2335,7 @@ fn compile_one_source(
                             src,
                             dep_paths,
                             root,
-                            Some(&out),
+                            Some(&out.path),
                             Some(compiled.content),
                         );
                         true
@@ -2669,7 +2671,10 @@ fn handle_fs_event_dir(
     changed.extend(drained.paths);
 
     // Defense-in-depth: ignore events from inside the out-dir subtree.
-    if let OutputBase::Dir(ref od) = ctx.output_base {
+    if let OutputBase::Dir {
+        canonical: ref od, ..
+    } = ctx.output_base
+    {
         changed.retain(|p| !p.starts_with(od));
     }
 
@@ -2748,17 +2753,15 @@ fn dir_watch_startup(
     let static_set_vars = set_vars;
     let static_set_string_vars = set_string_vars;
 
-    // Canonicalize out_dir as absolute so the starts_with(&root) in-root exclusion check
-    // is reliable even when cwd contains symlinks (root is already canonical — security #8).
-    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref())?;
-
-    // Compute the OutputBase (Fix 2 — subtree mirroring). Reject `..` at startup.
-    let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
+    // Compute the OutputBase (Fix 2 — subtree mirroring). Reject `..` at startup. The
+    // out-dir's canonical form keeps the starts_with(&root) in-root exclusion check
+    // reliable even when cwd contains symlinks (root is already canonical — security #8).
+    let output_base = resolve_output_base(out_dir.as_ref(), &config)?;
 
     // When the out-dir is inside root, exclude it from collection so the watcher
     // doesn't self-pollute (AC-M7 / edge case 6).
     let exclude_prefix: Option<PathBuf> = match &output_base {
-        OutputBase::Dir(d) if d.starts_with(root) => Some(d.clone()),
+        OutputBase::Dir { canonical: d, .. } if d.starts_with(root) => Some(d.clone()),
         _ => None,
     };
 
@@ -2925,11 +2928,10 @@ fn dir_watch_startup(
                     // here (#217).
                     let ext = compiled.kind.extension();
                     let out = output_path_for(&key, root, &output_base, ext);
-                    if let Err(e) = write_output(Some(out.clone()), &compiled.content, quiet, true)
-                    {
+                    if let Err(e) = write_output(Some(&out), &compiled.content, quiet, true) {
                         eprint_error(e);
                     } else {
-                        state.last_written.insert(out, compiled.content);
+                        state.last_written.insert(out.path, compiled.content);
                     }
                 }
             }
@@ -2999,11 +3001,11 @@ fn dir_watch_startup(
                     // and every source would be rewritten on the first real event.
                     let ext = compiled.kind.extension();
                     let out = output_path_for(&key, root, &output_base, ext);
-                    if state.last_written.contains_key(&out) {
+                    if state.last_written.contains_key(&out.path) {
                         // Already recorded from startup compile — skip.
                         continue;
                     }
-                    state.last_written.insert(out, compiled.content);
+                    state.last_written.insert(out.path, compiled.content);
                 }
                 Err(_) => {
                     // Baseline compile failed — leave entry absent so next rebuild always writes.
@@ -3653,14 +3655,39 @@ mod tests {
 
     // Fix 2 unit tests — output_path_for / resolve_output_base
 
+    /// An out-dir whose two forms are the same path.
+    fn dir_base(d: impl Into<PathBuf>) -> OutputBase {
+        let d = d.into();
+        OutputBase::Dir {
+            canonical: d.clone(),
+            shown: d,
+        }
+    }
+
+    /// A loaded `mds.json` in `/project` with the given `build.output_dir`, reached as `.`.
+    fn project_config(output_dir: &str) -> Option<ProjectConfig> {
+        use crate::build::{BuildConfig, MdsConfig};
+        Some(ProjectConfig {
+            config: MdsConfig {
+                build: BuildConfig {
+                    output_dir: Some(output_dir.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            dir: PathBuf::from("/project"),
+            shown_dir: PathBuf::from("."),
+        })
+    }
+
     // Mirroring: subtree preserved.
     #[test]
     fn output_path_for_mirrors_subtree() {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = dir_base("/out");
         let result = output_path_for(&source, &root, &base, "md");
-        assert_eq!(result, PathBuf::from("/out/a/b/foo.md"));
+        assert_eq!(result.path, PathBuf::from("/out/a/b/foo.md"));
     }
 
     // No stem collision: two files with the same stem in different subdirs.
@@ -3669,18 +3696,18 @@ mod tests {
         let root = PathBuf::from("/root");
         let a = PathBuf::from("/root/a/x.mds");
         let b = PathBuf::from("/root/b/x.mds");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = dir_base("/out");
         assert_ne!(
             output_path_for(&a, &root, &base, "md"),
             output_path_for(&b, &root, &base, "md"),
             "two files with the same stem in different subdirs must not collide"
         );
         assert_eq!(
-            output_path_for(&a, &root, &base, "md"),
+            output_path_for(&a, &root, &base, "md").path,
             PathBuf::from("/out/a/x.md")
         );
         assert_eq!(
-            output_path_for(&b, &root, &base, "md"),
+            output_path_for(&b, &root, &base, "md").path,
             PathBuf::from("/out/b/x.md")
         );
     }
@@ -3691,7 +3718,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
         let result = output_path_for(&source, &root, &OutputBase::NextToSource, "md");
-        assert_eq!(result, PathBuf::from("/root/a/b/foo.md"));
+        assert_eq!(result.path, PathBuf::from("/root/a/b/foo.md"));
     }
 
     // Compound extension and extensionless stem.
@@ -3699,9 +3726,9 @@ mod tests {
     fn output_path_for_compound_extension() {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/foo.bar.mds");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = dir_base("/out");
         let result = output_path_for(&source, &root, &base, "md");
-        assert_eq!(result, PathBuf::from("/out/foo.bar.md"));
+        assert_eq!(result.path, PathBuf::from("/out/foo.bar.md"));
     }
 
     // Path-escape guard (AC-M7): source outside root stays inside out-dir.
@@ -3710,15 +3737,15 @@ mod tests {
         let root = PathBuf::from("/root");
         // Source is completely outside root — strip_prefix will fail.
         let source = PathBuf::from("/elsewhere/a/b/foo.mds");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = dir_base("/out");
         let result = output_path_for(&source, &root, &base, "md");
         // Must be inside /out, not escape to /elsewhere.
         assert!(
-            result.starts_with("/out"),
+            result.path.starts_with("/out"),
             "output must stay inside out-dir even when source is outside root; got {result:?}"
         );
         // Must not join an absolute path that escapes out-dir.
-        assert_eq!(result, PathBuf::from("/out/foo.md"));
+        assert_eq!(result.path, PathBuf::from("/out/foo.md"));
     }
 
     // resolve_output_base: --out-dir takes precedence.
@@ -3726,26 +3753,19 @@ mod tests {
     fn resolve_output_base_outdir_wins() {
         let d = PathBuf::from("/my/out");
         let result = resolve_output_base(Some(&d), &None).unwrap();
-        assert!(matches!(result, OutputBase::Dir(p) if p == d));
+        assert!(
+            matches!(result, OutputBase::Dir { ref canonical, .. } if canonical == &d),
+            "expected Dir(/my/out), got {result:?}"
+        );
     }
 
     // resolve_output_base: mds.json config used when no --out-dir.
     #[test]
     fn resolve_output_base_config_used_when_no_outdir() {
-        use crate::build::{BuildConfig, MdsConfig};
-        let config = Some((
-            MdsConfig {
-                build: BuildConfig {
-                    output_dir: Some("dist".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            PathBuf::from("/project"),
-        ));
-        let result = resolve_output_base(None, &config).unwrap();
+        let result = resolve_output_base(None, &project_config("dist")).unwrap();
         assert!(
-            matches!(result, OutputBase::Dir(ref p) if p == &PathBuf::from("/project/dist")),
+            matches!(result, OutputBase::Dir { ref canonical, .. }
+                if canonical == &PathBuf::from("/project/dist")),
             "expected Dir(/project/dist), got {result:?}"
         );
     }
@@ -3753,18 +3773,7 @@ mod tests {
     // resolve_output_base: `..` in output_dir rejected at startup.
     #[test]
     fn resolve_output_base_rejects_dotdot() {
-        use crate::build::{BuildConfig, MdsConfig};
-        let config = Some((
-            MdsConfig {
-                build: BuildConfig {
-                    output_dir: Some("../bad".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            PathBuf::from("/project"),
-        ));
-        let result = resolve_output_base(None, &config);
+        let result = resolve_output_base(None, &project_config("../bad"));
         assert!(
             result.is_err(),
             "resolve_output_base must reject output_dir with '..' components"
@@ -4681,7 +4690,7 @@ mod tests {
                 canonical: root,
                 what: Watched::Root,
             },
-            &OutputBase::Dir(out.clone()),
+            &dir_base(out.clone()),
             &None,
             true,
             &mut state,
@@ -4784,9 +4793,9 @@ mod tests {
         assert!(!new_subdir.exists(), "precondition: subdir does not exist");
 
         let source = root.join("template.mds");
-        let base = OutputBase::Dir(new_subdir.clone());
+        let base = dir_base(new_subdir.clone());
         let result = output_path_for(&source, &root, &base, "md");
-        assert_eq!(result, new_subdir.join("template.md"));
+        assert_eq!(result.path, new_subdir.join("template.md"));
         assert!(
             !new_subdir.exists(),
             "output_path_for must not create directories"

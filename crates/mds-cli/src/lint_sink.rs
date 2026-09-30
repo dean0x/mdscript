@@ -27,8 +27,8 @@ use serde_json::Value;
 
 use crate::lint::{DirSummary, LintSource};
 use crate::output::{
-    eprint_error, eprint_io_failure, relabel_stdin_error, safe_file_display, safe_inline,
-    safe_path, stdout_failure, write_stdout, StdoutOutcome, WalkResult, STDIN_DISPLAY_LABEL,
+    eprint_error, eprint_io_failure, relabel_stdin_error, safe_inline, safe_path, stdout_failure,
+    write_stdout, StdoutOutcome, WalkResult, STDIN_DISPLAY_LABEL,
 };
 
 /// Where one `mds lint` run shows its results.
@@ -274,14 +274,14 @@ impl ResultSink for HumanSink {
         }
     }
 
-    /// `Clean:` names a file argument. Stdin and a directory's entries print none; a
-    /// directory's summary counts its clean files. `--quiet` suppresses it.
+    /// `Clean:` names a file argument as typed, as `Fixed:` does (#390). Stdin and a
+    /// directory's entries print none; a directory's summary counts its clean files.
+    /// `--quiet` suppresses it.
     fn clean(&mut self, input: &LintSource<'_>, findings: &mds::LintResult) {
-        if matches!(input, LintSource::File { .. })
-            && !self.quiet
-            && findings.diagnostics.is_empty()
-        {
-            crate::output::ewriteln!("Clean: {}", safe_file_display(input.display_label()));
+        if let LintSource::File { typed, .. } = *input {
+            if !self.quiet && findings.diagnostics.is_empty() {
+                crate::output::ewriteln!("Clean: {}", safe_path(typed));
+            }
         }
     }
 

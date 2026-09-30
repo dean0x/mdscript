@@ -1159,6 +1159,8 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 
 In all paths, `<ext>` is `md` for Markdown templates and `json` for messages templates.
 
+**Status lines.** `Compiled to`, `Source map written to` and `Removed stale map` name each file as the user named it, never by a canonical or absolute path they did not type (#390). Under route 4 the output is named below `--out-dir` exactly as typed — `mds build src --out-dir out` prints `Compiled to out/a/b.md`, an out-dir reached through a symlink is named by the link, and an absolute one is shown as typed; in directory mode without it, below the directory argument as typed (`src/a/b.md`). Under route 5 it is named below the directory the input reached `mds.json` by, one `..` per step up, as a config error names `mds.json` itself: `mds build page.mds` prints `Compiled to ./dist/page.md`, `mds build src` with `mds.json` beside `src` prints `Compiled to src/../dist/b.md`. Routes 2 and 6 name the output by the path they build from what was typed (`-o out.md` → `out.md`, `mds build page.mds` → `./page.md`). The warning that `build.source_map` has no effect when writing to stdout names that `mds.json` the same way (`warning: source_map in ./mds.json has no effect …`), and an output directory that cannot be created is named as its output is. `mds watch` announces its startup outputs through the same `Compiled to` line, so an output under `--out-dir` in directory mode, or under route 5 in either mode, is named the same way there.
+
 A route that fails to resolve — route 5 with a `build.output_dir` containing `..` (§7.8) — is refused by `mds build` and `mds watch` alike (`mds::io`, exit 2, `mds.json output_dir '<dir>' must not contain '..' components`), and nothing is written. `mds watch` resolves its route once, at startup, and every rebuild writes where it resolved, so it refuses such a route at startup, in file and directory mode — in file mode whether or not the startup compile succeeds (a failed compile is reported before the refusal) — and never falls back to stdout: under `mds watch`, only `-o -` writes to stdout. A relative `-o` or `--out-dir` is resolved against the working directory, which must exist: when it cannot be determined, `mds build` and `mds watch` alike refuse the run before any input is read (`mds::io`, exit 2, `cannot determine current directory: <reason>`) — `mds watch` at startup, in file and directory mode, where it used to report the failed write and fail again on every rebuild — and nothing is written; the location is never resolved against `.` instead (#390).
 
 Whichever route resolves it, an output that is the entry file itself is refused before anything is written or any directory created — `mds::io`, exit 2, `output would overwrite the entry file: "<entry>"; write it elsewhere with -o <file> or --out-dir <dir>`, the entry named as typed (#425) — and without the `-o` extension-mismatch warning, which announces a write. The two paths are compared as the files they name, canonical with canonical, so another spelling of the entry — through `..`, a case variant on a case-insensitive volume, or a symlinked directory leading back to it — is the entry too. An output whose directory does not exist yet is resolved as the write will create it: a created directory is a plain one, so `-o newdir/../page.md` is `page.md`, and a symlink after the `..` is followed; a symlink at the output path itself is refused by the write (below), and a hard link to the entry is another name the write replaces by rename, so it is written and the entry keeps its content. Route 6 reaches the entry for a `.md` entry that declares `type: mds` and compiles to Markdown, as do routes 4 and 5 naming the entry's directory; route 2 can name any entry. `mds watch` in file mode refuses the same output at startup (exit 2) and, on a rebuild, reports the refusal and keeps watching. Directory mode compiles only `.mds` files, whose outputs are `.md` or `.json`, so no output there is its own entry.
@@ -1276,6 +1278,14 @@ json`); stdin writes fixed source to stdout rather than writing back to a file, 
 path-bearing `Fixed:` line appears there. All of these status messages go to **stderr**
 regardless of `--format`; the JSON stdout envelope is unaffected. Error-severity diagnostics
 and the exit code are unaffected by `--quiet`.
+
+**Names in status lines:** `Clean:`, `Fixed:`, `Partially fixed:` and `Would fix:` name a
+file argument as typed — `mds lint docs/page.mds` prints `Clean: docs/page.mds`, and an
+absolute argument is shown as typed — and a directory's entry by the walk's path below the
+directory argument as typed (`src/a.mds`); stdin is `<stdin>` (#390). `Clean:` is printed
+for a file argument's clean human report only, never for stdin or a directory's entries,
+and `--quiet` suppresses it. The JSON `file` key is unchanged: a file argument's file name,
+a directory entry's path relative to the directory argument.
 
 **Exit codes** (lint-specific; differ from `mds build`/`mds check`):
 
@@ -1474,8 +1484,8 @@ The CLI's own **display text** — `file` per the per-field rule above — gets 
 respelling through a separate mechanism, `mds::display_native_path` (a no-op off
 Windows): the diagnostic `file` field is WIRE-escaped for control/bidi/separator
 characters as the table above describes, and independently of that, any path a CLI
-status line or error message shows (a canonicalized `--out-dir`, an `atomic_write_file`
-I/O failure) is passed through `display_native_path` before display, at the CLI's
+status line or error message shows (an `atomic_write_file` I/O failure below a
+canonicalized `--out-dir`, say) is passed through `display_native_path` before display, at the CLI's
 `safe_path` choke-point. The two are orthogonal: escaping defends against a hostile
 filename, `display_native_path` respells a canonicalization artefact that is not
 hostile, just platform-specific.

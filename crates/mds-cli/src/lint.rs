@@ -73,7 +73,7 @@ use miette::Result;
 
 use crate::build::{
     build_runtime_vars, emit_duplicate_var_warnings, ensure_existing_mds_file, load_config,
-    read_stdin, resolve_input, RuntimeVarArgs,
+    read_stdin, resolve_input, ProjectConfig, RuntimeVarArgs,
 };
 use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
 use crate::output::{
@@ -127,9 +127,9 @@ struct LintFlags {
 ///   diagnostic frame renders the source under.
 /// - [`diff_label`](Self::diff_label) — the name a `--fix --diff` header shows.
 ///
-/// `Clean:` shows the display label, escaped. The other status lines that name the input —
-/// `Fixed:`, `Partially fixed:`, `Would fix:`, and in a directory run `fix rejected:`
-/// and the cap notice — show the same text as the diff header, but the result sink
+/// The status lines that name the input — `Clean:`, `Fixed:`, `Partially fixed:`,
+/// `Would fix:`, and in a directory run `fix rejected:` and the cap notice — show the
+/// same text as the diff header, the path as typed or walked (#390), but the result sink
 /// (`lint_sink.rs`) spells it inside the writer macro, as [`STDIN_DISPLAY_LABEL`] or
 /// `safe_path` of the path, because the print-discipline guard accepts only an escape call
 /// or an allowlisted name there.
@@ -329,7 +329,9 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     let config_opt = load_config(dir)?;
     match config_opt {
         None => Ok(mds::LintConfig::default()),
-        Some((mds_config, _config_dir)) => {
+        Some(ProjectConfig {
+            config: mds_config, ..
+        }) => {
             // into_core_config returns (config, Option<UnknownRuleNames>) in one step —
             // structurally forcing the caller to handle the unknowns report so detection
             // cannot be accidentally skipped (review finding at config.rs:104).
@@ -1481,7 +1483,11 @@ impl<'a> LintDirCtx<'a> {
                     .insert(base_dir.to_path_buf(), Rc::clone(&rc));
                 Ok(rc)
             }
-            Some((mds_config, config_dir)) => {
+            Some(ProjectConfig {
+                config: mds_config,
+                dir: config_dir,
+                ..
+            }) => {
                 // Fast path 2: a different base_dir already resolved to this same
                 // config directory (e.g. a/file.mds and b/file.mds both governed by
                 // root/mds.json). Return the cached config without emitting a

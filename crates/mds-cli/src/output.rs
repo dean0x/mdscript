@@ -3,7 +3,8 @@
 //! # What lives here
 //!
 //! - [`OutputBase`] / [`resolve_output_base`] / [`output_path_for`]: directory-mode
-//!   path resolution used by watch and build-directory.
+//!   path resolution used by watch and build-directory. Each output is a
+//!   [`WriteTarget`]: the path written, and the path a message shows (#390).
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
 //! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr choke point,
@@ -37,7 +38,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use miette::Result;
 
-use crate::build::{MdsConfig, OutputKind};
+use crate::build::{OutputKind, ProjectConfig};
 
 // ── Streams and the exit funnel (#157) ───────────────────────────────────────
 
@@ -1027,21 +1028,65 @@ pub(crate) fn reject_output_dir_traversal(
 
 /// Describes where directory-mode output files are written.
 ///
-/// `Dir(base)` mirrors the source subtree under `base`:
-///   `source.strip_prefix(root)` → `base/rel/stem.<ext>`
+/// `Dir` mirrors the source subtree under a directory:
+///   `source.strip_prefix(root)` → `<dir>/rel/stem.<ext>`
 /// `NextToSource` places the output next to the source file.
 #[derive(Debug, Clone)]
 pub(crate) enum OutputBase {
-    Dir(PathBuf),
+    /// The directory, in the two forms [`resolve_output_base`] fixes once (#390).
+    Dir {
+        /// Absolute, canonical where it exists: where outputs are written, and what every
+        /// containment check (`starts_with`) compares.
+        canonical: PathBuf,
+        /// The same directory as the user named it: `--out-dir` as typed, or `mds.json`
+        /// `build.output_dir` below the directory `mds.json` was reached by. The only form
+        /// a message names an output by.
+        shown: PathBuf,
+    },
     NextToSource,
+}
+
+/// One file the CLI writes, in the two forms fixed where its location is resolved —
+/// [`output_path_for`] in directory mode, `resolve_output_path_for_kind` for a single
+/// file (#390).
+///
+/// `path` is where the bytes go. `shown` is the same file as the user named it: the path
+/// as typed, or the part below a directory they named — the directory argument,
+/// `--out-dir`, or the directory `mds.json` was reached by — joined to that directory as
+/// typed. A message names the file by `shown` alone, so display never resolves a path
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteTarget {
+    pub(crate) path: PathBuf,
+    pub(crate) shown: PathBuf,
+}
+
+impl WriteTarget {
+    /// A file named exactly as it is written: a path the user typed, or one built from a
+    /// typed path alone, so its two forms are one.
+    pub(crate) fn as_typed(path: PathBuf) -> Self {
+        Self {
+            shown: path.clone(),
+            path,
+        }
+    }
+
+    /// The file `edit` derives from this one, in both forms — the sidecar map beside an
+    /// output, say.
+    pub(crate) fn sibling(&self, edit: impl Fn(&Path) -> PathBuf) -> Self {
+        Self {
+            path: edit(&self.path),
+            shown: edit(&self.shown),
+        }
+    }
 }
 
 /// Resolve `out_dir` to an absolute, canonicalized path for reliable `starts_with` checks.
 ///
-/// Used by both `run_build_directory` and `dir_watch_startup` before calling
-/// [`resolve_output_base`]. A relative path is resolved against the working directory;
-/// the result is then canonicalized (falls back to the absolute form when the directory
-/// does not yet exist).
+/// [`resolve_output_base`] calls it for the `--out-dir` of `run_build_directory` and
+/// `dir_watch_startup`. A relative path is resolved against the working directory; the
+/// result is then canonicalized (falls back to the absolute form when the directory does
+/// not yet exist).
 ///
 /// # Errors
 ///
@@ -1062,24 +1107,42 @@ pub(crate) fn canonicalize_out_dir(
     Ok(Some(abs.canonicalize().unwrap_or(abs)))
 }
 
-/// Compute the `OutputBase` for directory mode.
+/// Compute the `OutputBase` for directory mode, fixing both forms of its directory here,
+/// once (#390).
 ///
-/// Precedence (mirrors `resolve_output_path` for file mode):
-/// 1. `--out-dir` → `Dir(abs_out_dir)`
-/// 2. `mds.json build.output_dir` → `Dir(config_dir.join(output_dir))`
-///    — rejects `..` components at startup (`mds::io`, exit 2).
+/// Precedence (mirrors `resolve_output_path_for_kind` for file mode):
+/// 1. `--out-dir` → `Dir`: canonical per [`canonicalize_out_dir`], shown as typed.
+/// 2. `mds.json build.output_dir` → `Dir`: below the config directory, shown below the
+///    directory `mds.json` was reached by — rejects `..` components at startup
+///    (`mds::io`, exit 2).
 /// 3. Default → `NextToSource`
+///
+/// # Errors
+///
+/// A relative `--out-dir` when the working directory cannot be determined
+/// ([`canonicalize_out_dir`]), and a `build.output_dir` with a `..` component.
 pub(crate) fn resolve_output_base(
-    abs_out_dir: Option<&Path>,
-    config: &Option<(MdsConfig, PathBuf)>,
+    out_dir: Option<&PathBuf>,
+    config: &Option<ProjectConfig>,
 ) -> Result<OutputBase> {
-    if let Some(d) = abs_out_dir {
-        return Ok(OutputBase::Dir(d.to_path_buf()));
+    if let (Some(typed), Some(canonical)) = (out_dir, canonicalize_out_dir(out_dir)?) {
+        return Ok(OutputBase::Dir {
+            canonical,
+            shown: typed.clone(),
+        });
     }
-    if let Some((cfg, config_dir)) = config {
-        if let Some(ref output_dir) = cfg.build.output_dir {
+    if let Some(ProjectConfig {
+        config,
+        dir,
+        shown_dir,
+    }) = config
+    {
+        if let Some(ref output_dir) = config.build.output_dir {
             reject_output_dir_traversal(output_dir)?;
-            return Ok(OutputBase::Dir(config_dir.join(output_dir)));
+            return Ok(OutputBase::Dir {
+                canonical: dir.join(output_dir),
+                shown: shown_dir.join(output_dir),
+            });
         }
     }
     Ok(OutputBase::NextToSource)
@@ -1093,11 +1156,13 @@ pub(crate) fn resolve_output_base(
 /// kept in one place (issue 5 — single source of truth), shared with
 /// [`output_base_no_ext`].
 ///
-/// - `Dir(base)`: mirrors `source` relative to `root` under `base`.
+/// - `Dir`: mirrors `source` relative to `root` under the directory — its canonical form
+///   for the write, its shown form for the message (#390).
 ///   If `strip_prefix` fails (source not under root after canonicalization),
-///   falls back to `base/stem.<ext>` — **never** joins an absolute path that
+///   falls back to `<dir>/stem.<ext>` — **never** joins an absolute path that
 ///   could escape the output directory (AC-M7 path-escape guard).
-/// - `NextToSource`: `source.with_extension(ext)`.
+/// - `NextToSource`: `source.with_extension(ext)`, shown as the source is: the walk's
+///   path, below the directory argument as typed.
 ///
 /// The `ext` parameter is the output extension without leading `.` (`"md"` or `"json"`).
 ///
@@ -1114,48 +1179,16 @@ pub(crate) fn resolve_output_base(
 /// startup/baseline loops use canonical keys under a canonical root whose walker skips
 /// symlinks. The warning is therefore an invariant report, not a user-facing condition —
 /// if it is ever seen, one of those gates has moved.
-pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext: &str) -> PathBuf {
+pub(crate) fn output_path_for(
+    source: &Path,
+    root: &Path,
+    base: &OutputBase,
+    ext: &str,
+) -> WriteTarget {
     match base {
-        OutputBase::Dir(d) => {
-            let mirrored = mirror_stem(source, root, d);
-            let flattened = matches!(mirrored, MirroredStem::Flattened(_));
-            let no_ext = mirrored.into_path();
-            // Invariant: `no_ext` was built by `mirror_stem` as `<something>/<stem>`, so
-            // `file_name()` is `Some`. The literal fallback exists because the previous
-            // one — `source.as_os_str()` — could be absolute, and an absolute name makes
-            // the `join` below re-root out of the out-dir.
-            let mut name = no_ext
-                .file_name()
-                .unwrap_or_else(|| OsStr::new("output"))
-                .to_os_string();
-            name.push(".");
-            name.push(ext);
-            let out = no_ext.parent().unwrap_or(d.as_path()).join(&name);
-            // AC-M7 containment invariant: the output path must remain inside the out-dir.
-            // `mirror_stem` already guards the strip_prefix escape case by returning
-            // `d/<stem>` for out-of-root sources; the with-extension step cannot escape.
-            // The check here is a defence-in-depth belt-and-suspenders assertion, and it
-            // stays DEBUG-ONLY on purpose: the release fallback below is contained, so
-            // there is nothing for a release-time check to prevent.
-            let out = if out.starts_with(d) {
-                out
-            } else {
-                debug_assert!(
-                    false,
-                    "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
-                );
-                let flat_name = {
-                    // Invariant: same as above — the join argument must be relative.
-                    let mut n = source
-                        .file_stem()
-                        .unwrap_or_else(|| OsStr::new("output"))
-                        .to_os_string();
-                    n.push(".");
-                    n.push(ext);
-                    n
-                };
-                d.join(flat_name)
-            };
+        OutputBase::Dir { canonical, shown } => {
+            let (path, flattened) = mirrored_output(source, root, canonical, ext);
+            let (shown, _) = mirrored_output(source, root, shown, ext);
             if flattened {
                 // Invariant report, not gated on --quiet (like the depth-limit and
                 // stale-unlink warnings above). Emitted once per output-path computation:
@@ -1167,13 +1200,56 @@ pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext
                      overwrite it)",
                     safe_path(source),
                     safe_path(root),
-                    safe_path(&out)
+                    safe_path(&shown)
                 ));
             }
-            out
+            WriteTarget { path, shown }
         }
-        OutputBase::NextToSource => output_base_no_ext(source, root, base).with_extension(ext),
+        OutputBase::NextToSource => {
+            WriteTarget::as_typed(output_base_no_ext(source, root, base).with_extension(ext))
+        }
     }
+}
+
+/// `source`'s output below the directory `d`, mirrored as [`mirror_stem`] mirrors it, and
+/// whether the mirror was flattened. [`output_path_for`] calls it once per form of the
+/// directory, so both forms name the same file below it.
+fn mirrored_output(source: &Path, root: &Path, d: &Path, ext: &str) -> (PathBuf, bool) {
+    let mirrored = mirror_stem(source, root, d);
+    let flattened = matches!(mirrored, MirroredStem::Flattened(_));
+    let no_ext = mirrored.into_path();
+    // Invariant: `no_ext` was built by `mirror_stem` as `<something>/<stem>`, so
+    // `file_name()` is `Some`. The literal fallback exists because the previous
+    // one — `source.as_os_str()` — could be absolute, and an absolute name makes
+    // the `join` below re-root out of the out-dir.
+    let mut name = no_ext
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("output"))
+        .to_os_string();
+    name.push(".");
+    name.push(ext);
+    let out = no_ext.parent().unwrap_or(d).join(&name);
+    // AC-M7 containment invariant: the output path must remain inside the out-dir.
+    // `mirror_stem` already guards the strip_prefix escape case by returning
+    // `d/<stem>` for out-of-root sources; the with-extension step cannot escape.
+    // The check here is a defence-in-depth belt-and-suspenders assertion, and it
+    // stays DEBUG-ONLY on purpose: the release fallback below is contained, so
+    // there is nothing for a release-time check to prevent.
+    if out.starts_with(d) {
+        return (out, flattened);
+    }
+    debug_assert!(
+        false,
+        "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
+    );
+    // Invariant: same as above — the join argument must be relative.
+    let mut flat_name = source
+        .file_stem()
+        .unwrap_or_else(|| OsStr::new("output"))
+        .to_os_string();
+    flat_name.push(".");
+    flat_name.push(ext);
+    (d.join(flat_name), flattened)
 }
 
 // ── Directory traversal ───────────────────────────────────────────────────────
@@ -1515,11 +1591,12 @@ fn mirror_stem(source: &Path, root: &Path, d: &Path) -> MirroredStem {
 ///
 /// Used to construct the `base_no_ext` argument to [`probe_and_remove_stale`].
 ///
-/// For `Dir(base)` mode this defers to [`mirror_stem`] so the stem is always computed
-/// consistently with [`output_path_for`].
+/// For `Dir` mode this defers to [`mirror_stem`] so the stem is always computed
+/// consistently with [`output_path_for`], below the directory's canonical form: the stem
+/// is for probing the filesystem, not for a message.
 pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) -> PathBuf {
     match base {
-        OutputBase::Dir(d) => mirror_stem(source, root, d).into_path(),
+        OutputBase::Dir { canonical, .. } => mirror_stem(source, root, canonical).into_path(),
         OutputBase::NextToSource => {
             // source.with_extension("") removes the existing extension.
             source.with_extension("")
@@ -2443,23 +2520,99 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// An out-dir written at `/out` and typed as `out`, so every assertion tells the two
+    /// forms apart.
+    fn out_base() -> OutputBase {
+        OutputBase::Dir {
+            canonical: PathBuf::from("/out"),
+            shown: PathBuf::from("out"),
+        }
+    }
+
+    fn target(path: &str, shown: &str) -> WriteTarget {
+        WriteTarget {
+            path: PathBuf::from(path),
+            shown: PathBuf::from(shown),
+        }
+    }
+
+    /// #390: a directory-mode output is written below the out-dir's canonical form and
+    /// named below its shown form — the same file below each; a map sidecar derives from
+    /// both forms alike; and an output next to its source is named as the walk found it.
+    #[test]
+    fn an_output_is_written_below_the_canonical_out_dir_and_named_below_the_typed_one() {
+        let source = Path::new("/root/sub/page.mds");
+        let root = Path::new("/root");
+        let out = output_path_for(source, root, &out_base(), "md");
+        assert_eq!(out, target("/out/sub/page.md", "out/sub/page.md"));
+        assert_eq!(
+            out.sibling(crate::build::map_path_for),
+            target("/out/sub/page.md.map", "out/sub/page.md.map")
+        );
+        assert_eq!(
+            output_path_for(
+                Path::new("src/sub/page.mds"),
+                Path::new("src"),
+                &OutputBase::NextToSource,
+                "md"
+            ),
+            WriteTarget::as_typed(PathBuf::from("src/sub/page.md"))
+        );
+    }
+
+    /// #390: `resolve_output_base` fixes both forms of the out-dir: the canonical form is
+    /// absolute, the shown form is the out-dir exactly as typed; `mds.json`'s
+    /// `build.output_dir` is resolved below the config directory and shown below the
+    /// directory `mds.json` was reached by.
+    #[test]
+    fn the_out_dir_is_shown_as_typed_and_resolved_absolute() {
+        let typed = PathBuf::from("out");
+        match resolve_output_base(Some(&typed), &None).expect("a relative out-dir resolves") {
+            OutputBase::Dir { canonical, shown } => {
+                assert!(canonical.is_absolute(), "canonical: {canonical:?}");
+                assert!(canonical.ends_with("out"), "canonical: {canonical:?}");
+                assert_eq!(shown, typed);
+            }
+            other => panic!("want Dir; got {other:?}"),
+        }
+
+        let config = Some(ProjectConfig {
+            config: crate::build::MdsConfig {
+                build: crate::build::BuildConfig {
+                    output_dir: Some("dist".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            dir: PathBuf::from("/project"),
+            shown_dir: PathBuf::from("src/.."),
+        });
+        match resolve_output_base(None, &config).expect("a config output_dir resolves") {
+            OutputBase::Dir { canonical, shown } => {
+                assert_eq!(canonical, Path::new("/project").join("dist"));
+                assert_eq!(shown, Path::new("src/..").join("dist"));
+            }
+            other => panic!("want Dir; got {other:?}"),
+        }
+    }
+
     // T-CLI-21 (unit): output_path_for with "json" / "md" extensions.
     #[test]
     fn output_path_for_json_extension_dir_mode() {
         let source = PathBuf::from("/root/src/chat.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = out_base();
         let result = output_path_for(&source, &root, &base, "json");
-        assert_eq!(result, PathBuf::from("/out/src/chat.json"));
+        assert_eq!(result, target("/out/src/chat.json", "out/src/chat.json"));
     }
 
     #[test]
     fn output_path_for_md_extension_dir_mode() {
         let source = PathBuf::from("/root/src/page.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = out_base();
         let result = output_path_for(&source, &root, &base, "md");
-        assert_eq!(result, PathBuf::from("/out/src/page.md"));
+        assert_eq!(result, target("/out/src/page.md", "out/src/page.md"));
     }
 
     #[test]
@@ -2468,7 +2621,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
         let result = output_path_for(&source, &root, &base, "md");
-        assert_eq!(result, PathBuf::from("/root/src/page.md"));
+        assert_eq!(result, target("/root/src/page.md", "/root/src/page.md"));
     }
 
     #[test]
@@ -2477,7 +2630,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
         let result = output_path_for(&source, &root, &base, "json");
-        assert_eq!(result, PathBuf::from("/root/src/chat.json"));
+        assert_eq!(result, target("/root/src/chat.json", "/root/src/chat.json"));
     }
 
     // T-CLI-21 (unit): ..‑containment guard (AC-M7) still holds.
@@ -2486,14 +2639,14 @@ mod tests {
     fn output_path_for_outside_root_falls_back_to_flat() {
         let source = PathBuf::from("/other/page.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = out_base();
         let result = output_path_for(&source, &root, &base, "md");
         // Must be inside /out, not escape to /other.
         assert!(
-            result.starts_with("/out"),
+            result.path.starts_with("/out"),
             "output must be inside /out; got {result:?}"
         );
-        assert_eq!(result, PathBuf::from("/out/page.md"));
+        assert_eq!(result, target("/out/page.md", "out/page.md"));
     }
 
     /// Body of the first `fn` whose header starts with `header`, brace-matched from the
@@ -2559,7 +2712,7 @@ mod tests {
     fn stemless_source_never_escapes_out_dir() {
         let source = Path::new("/");
         let root = Path::new("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = out_base();
 
         assert_eq!(
             output_base_no_ext(source, root, &base),
@@ -2568,7 +2721,7 @@ mod tests {
         );
         assert_eq!(
             output_path_for(source, root, &base, "md"),
-            PathBuf::from("/out/output.md"),
+            target("/out/output.md", "out/output.md"),
             "the write oracle must not join an absolute stem"
         );
     }
@@ -2858,7 +3011,7 @@ mod tests {
     fn output_base_no_ext_dir_mode() {
         let source = PathBuf::from("/root/src/chat.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = out_base();
         let result = output_base_no_ext(&source, &root, &base);
         assert_eq!(result, PathBuf::from("/out/src/chat"));
     }

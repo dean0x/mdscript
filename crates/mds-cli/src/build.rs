@@ -8,7 +8,7 @@ use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
-use crate::output::Durability;
+use crate::output::{Durability, WriteTarget};
 use mds::{
     effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
     STRING_SOURCE_MAP_LABEL,
@@ -139,21 +139,36 @@ fn default_sort_frontmatter_keys() -> bool {
 /// Maximum allowed size for `mds.json` (1 MiB) to prevent runaway memory use.
 const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
+/// A loaded `mds.json` and the directory that contains it, in two forms.
+pub(crate) struct ProjectConfig {
+    pub(crate) config: MdsConfig,
+    /// The directory, canonical: relative `output_dir` values are resolved against it.
+    pub(crate) dir: PathBuf,
+    /// The same directory as the start path leads to it — `.`, `sub/..`, one `..` per
+    /// step up: the only form a message names it, or a path below it, by (#265, #390).
+    pub(crate) shown_dir: PathBuf,
+}
+
+impl ProjectConfig {
+    /// `mds.json` itself, as a message names it: `./mds.json`, `sub/../mds.json`.
+    pub(crate) fn shown_file(&self) -> PathBuf {
+        self.shown_dir.join("mds.json")
+    }
+}
+
 /// Walk up from `start` looking for `mds.json`.
 ///
-/// Returns `Ok(Some((config, config_dir)))` when found, `Ok(None)` when no
-/// `mds.json` exists in the hierarchy, or `Err(...)` when a file is found but
-/// contains invalid JSON.
-///
-/// The `config_dir` is the directory that *contains* `mds.json` — used to
-/// resolve relative `output_dir` values.
+/// Returns `Ok(Some(config))` when found, `Ok(None)` when no `mds.json` exists in the
+/// hierarchy, or `Err(...)` when a file is found but contains invalid JSON.
 ///
 /// Every error names the file by the path `start` leads to it — `./mds.json`,
 /// `sub/../mds.json` — escaped by [`crate::output::safe_path`], never by the
 /// canonical path the walk uses: that one is absolute, which the caller did not
 /// type, and it can carry a forbidden character from a hostile-named directory above
-/// the project, since the config loads before the input is validated (#265).
-pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> {
+/// the project, since the config loads before the input is validated (#265). The
+/// returned [`ProjectConfig`] carries that directory as well, so a later message names
+/// an output below it the same way (#390).
+pub(crate) fn load_config(start: &Path) -> Result<Option<ProjectConfig>> {
     // Walk upward from `start` (which may be a file; begin at its parent).
     // avoids PF-006: a relative start_dir (e.g. "" or ".") causes current.parent()
     // to return None after just 1–2 iterations, making grandparent mds.json
@@ -225,7 +240,11 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
                     typed,
                 )?;
             }
-            return Ok(Some((config, current)));
+            return Ok(Some(ProjectConfig {
+                config,
+                dir: current,
+                shown_dir,
+            }));
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
@@ -343,17 +362,22 @@ pub(crate) fn compute_output_dir_path_for_kind(
 /// For rules 4–6 the extension is derived from `kind` (markdown → `.md`, messages → `.json`).
 /// For rule 2 (`-o <path>`), the path is used verbatim, whatever its extension; once the
 /// write is certain, [`warn_output_extension_mismatch`] warns when it conflicts with `kind`.
+///
+/// The output's shown form is fixed here too (#390): every rule but 5 builds the path
+/// from what the caller passed alone, so it is shown as built; rule 5 writes below the
+/// canonical config directory and is shown below the directory `mds.json` was reached by
+/// (`./dist/x.md`, `sub/../dist/x.md`), as a config error names `mds.json` itself.
 pub(crate) fn resolve_output_path_for_kind(
     input: &Option<PathBuf>,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
-    config: &Option<(MdsConfig, PathBuf)>,
+    config: &Option<ProjectConfig>,
     kind: OutputKind,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<WriteTarget>> {
     // 1 & 2. Explicit `-o` flag: `-` means stdout, anything else is a literal path.
     match output.as_deref() {
         Some("-") => return Ok(None),
-        Some(o) => return Ok(Some(PathBuf::from(o))),
+        Some(o) => return Ok(Some(WriteTarget::as_typed(PathBuf::from(o)))),
         None => {}
     }
 
@@ -370,21 +394,30 @@ pub(crate) fn resolve_output_path_for_kind(
 
     // 4. `--out-dir <dir>`
     if let Some(dir) = out_dir {
-        return Ok(Some(compute_output_dir_path_for_kind(
-            dir, input_path, kind,
+        return Ok(Some(WriteTarget::as_typed(
+            compute_output_dir_path_for_kind(dir, input_path, kind),
         )));
     }
 
     // 5. `mds.json` output_dir
-    if let Some((cfg, config_dir)) = config {
-        if let Some(ref output_dir) = cfg.build.output_dir {
+    if let Some(ProjectConfig {
+        config,
+        dir,
+        shown_dir,
+    }) = config
+    {
+        if let Some(ref output_dir) = config.build.output_dir {
             // Reject path traversal: `output_dir` must not contain `..` components
             // (exit 2). A forbidden character was already refused by `load_config`.
             crate::output::reject_output_dir_traversal(output_dir)?;
-            let dir = config_dir.join(output_dir);
-            return Ok(Some(compute_output_dir_path_for_kind(
-                &dir, input_path, kind,
-            )));
+            return Ok(Some(WriteTarget {
+                path: compute_output_dir_path_for_kind(&dir.join(output_dir), input_path, kind),
+                shown: compute_output_dir_path_for_kind(
+                    &shown_dir.join(output_dir),
+                    input_path,
+                    kind,
+                ),
+            }));
         }
     }
 
@@ -394,7 +427,7 @@ pub(crate) fn resolve_output_path_for_kind(
             let filename = derive_output_filename_for_kind(p, kind);
             // effective_parent maps "" (bare filename) to "." — avoids PF-006.
             let dir = effective_parent(p);
-            Ok(Some(dir.join(filename)))
+            Ok(Some(WriteTarget::as_typed(dir.join(filename))))
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
         None => Ok(None),
@@ -786,9 +819,9 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
 
 /// Write compiled output to a file or stdout.
 ///
-/// When `output_path` is `Some(path)`, creates any missing parent directories,
-/// writes the compiled string, and prints `"Compiled to {path}"` to stderr
-/// unless `quiet` or `announce` is false.  When `output_path` is `None`,
+/// When `target` is `Some`, creates any missing parent directories, writes the
+/// compiled string to `target.path`, and prints `"Compiled to {target.shown}"` to stderr
+/// unless `quiet` or `announce` is false (#390).  When `target` is `None`,
 /// writes the compiled string to stdout with no trailing newline: a closed stdout is
 /// not an error (the reader is gone, so nothing more is written and the run keeps its
 /// verdict), any other stdout failure is `mds::io` (#157). This is where a
@@ -809,25 +842,25 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
 /// are derived files a rebuild reproduces, and `F_FULLFSYNC` per artifact tripled a
 /// 500-template watch startup. Source rewrites (`fmt`, `lint --fix`) keep the fsync.
 pub(crate) fn write_output(
-    output_path: Option<PathBuf>,
+    target: Option<&WriteTarget>,
     compiled: &str,
     quiet: bool,
     announce: bool,
 ) -> Result<()> {
-    match output_path {
-        Some(path) => {
-            if let Some(parent) = path.parent() {
+    match target {
+        Some(target) => {
+            if let Some(parent) = target.path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| output_dir_failure(parent, &e))?;
+                    std::fs::create_dir_all(parent).map_err(|e| output_dir_failure(target, &e))?;
                 }
             }
             // #227: temp-file + fsync + rename, so a failed or interrupted build leaves
             // the previous artifact intact instead of a truncated one. The primitive
             // owns the symlink refusal; the create_dir_all above stays here because the
             // primitive deliberately does not create directories.
-            crate::output::atomic_write_file(&path, compiled, Durability::RenameOnly)?;
+            crate::output::atomic_write_file(&target.path, compiled, Durability::RenameOnly)?;
             if !quiet && announce {
-                crate::output::ewriteln!("Compiled to {}", crate::output::safe_path(&path));
+                crate::output::ewriteln!("Compiled to {}", crate::output::safe_path(&target.shown));
             }
         }
         None => crate::output::write_stdout(compiled.as_bytes()).into_batch_result()?,
@@ -835,12 +868,13 @@ pub(crate) fn write_output(
     Ok(())
 }
 
-/// The `mds::io` error for an output directory that cannot be created (#157).
-fn output_dir_failure(dir: &Path, e: &std::io::Error) -> MdsError {
+/// The `mds::io` error for the directory of `output` that cannot be created (#157),
+/// naming it by the output's shown form (#390).
+fn output_dir_failure(output: &WriteTarget, e: &std::io::Error) -> MdsError {
     MdsError::Io {
         message: format!(
             "cannot create output directory {}: {}",
-            crate::output::safe_path(dir),
+            crate::output::safe_path(effective_parent(&output.shown)),
             crate::output::safe_inline(e)
         ),
     }
@@ -1287,7 +1321,7 @@ fn compute_source_map_base(
     input: &Path,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
-    config: &Option<(MdsConfig, PathBuf)>,
+    config: &Option<ProjectConfig>,
 ) -> Result<PathBuf, MdsError> {
     use crate::output::current_dir;
     let abs = |p: PathBuf| -> Result<PathBuf, MdsError> {
@@ -1315,15 +1349,15 @@ fn compute_source_map_base(
             } else if input == Path::new("-") {
                 // Stdin with no -o or --out-dir → stdout → relativize against CWD.
                 current_dir()
-            } else if let Some((cfg, config_dir)) = config {
-                if let Some(ref output_dir) = cfg.build.output_dir {
-                    // mds.json output_dir: config-directory-relative.  `config_dir`
+            } else if let Some(ProjectConfig { config, dir, .. }) = config {
+                if let Some(ref output_dir) = config.build.output_dir {
+                    // mds.json output_dir: config-directory-relative.  `dir`
                     // is canonical (load_config canonicalizes before walking up) so
                     // the join is already absolute in practice; `abs` makes the
                     // "result is always absolutized" contract above structural
                     // rather than incidental — a relative base would silently
                     // demote core's map-relative emission to root-relative.
-                    abs(config_dir.join(output_dir))
+                    abs(dir.join(output_dir))
                 } else {
                     // Default: beside the source file.
                     abs(effective_parent(input).to_path_buf())
@@ -1372,7 +1406,7 @@ pub(crate) fn apply_source_map_file_label(
     }
 }
 
-/// Delete the `.map` file at `map_path` when it is the sidecar an earlier
+/// Delete the `.map` file at `map.path` when it is the sidecar an earlier
 /// `--source-map` build wrote for the output named `expected_basename` (stale-map
 /// reconciliation), and leave anything else in place, never clobbering a hand-authored
 /// file that happens to share its name.
@@ -1380,31 +1414,32 @@ pub(crate) fn apply_source_map_file_label(
 /// A missing file is skipped silently. Anything else that is not such a sidecar is left
 /// in place with a warning (unless `quiet`): one that is not a regular file is never
 /// opened — opening a FIFO with no writer blocks — and a regular file is recognised by
-/// its first bytes alone ([`has_sidecar_head`]), so none is read whole (#428).
+/// its first bytes alone ([`has_sidecar_head`]), so none is read whole (#428). Every
+/// message names the map by `map.shown` (#390).
 ///
 /// # Errors
 ///
 /// A map that cannot be read — so nothing is known of its content — and a sidecar that
 /// cannot be removed are `mds::io` (exit 2, #157).
 pub(crate) fn verify_then_delete_map(
-    map_path: &Path,
+    map: &WriteTarget,
     expected_basename: &str,
     quiet: bool,
 ) -> Result<(), MdsError> {
     let unreadable = |e: &std::io::Error| MdsError::Io {
         message: format!(
             "cannot read stale map {}: {}",
-            crate::output::safe_path(map_path),
+            crate::output::safe_path(&map.shown),
             crate::output::safe_inline(e)
         ),
     };
-    let metadata = match std::fs::metadata(map_path) {
+    let metadata = match std::fs::metadata(&map.path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(unreadable(&e)),
     };
     let sidecar = if metadata.is_file() {
-        match std::fs::File::open(map_path)
+        match std::fs::File::open(&map.path)
             .and_then(|mut file| has_sidecar_head(&mut file, expected_basename))
         {
             Ok(sidecar) => sidecar,
@@ -1418,20 +1453,20 @@ pub(crate) fn verify_then_delete_map(
         if !quiet {
             crate::output::ewriteln!(
                 "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
-                crate::output::safe_path(map_path)
+                crate::output::safe_path(&map.shown)
             );
         }
         return Ok(());
     }
-    std::fs::remove_file(map_path).map_err(|e| MdsError::Io {
+    std::fs::remove_file(&map.path).map_err(|e| MdsError::Io {
         message: format!(
             "could not remove stale map {}: {}",
-            crate::output::safe_path(map_path),
+            crate::output::safe_path(&map.shown),
             crate::output::safe_inline(&e)
         ),
     })?;
     if !quiet {
-        crate::output::ewriteln!("Removed stale map {}", crate::output::safe_path(map_path));
+        crate::output::ewriteln!("Removed stale map {}", crate::output::safe_path(&map.shown));
     }
     Ok(())
 }
@@ -1540,11 +1575,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         let dir_config = load_config(&input)?;
         let cfg_source_map = dir_config
             .as_ref()
-            .map(|(c, _)| c.build.source_map)
+            .map(|c| c.config.build.source_map)
             .unwrap_or(false);
         let cfg_embed_sources = dir_config
             .as_ref()
-            .map(|(c, _)| c.build.embed_sources)
+            .map(|c| c.config.build.embed_sources)
             .unwrap_or(false);
         let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
         let use_embed_sources = flag_embed_sources || cfg_embed_sources;
@@ -1623,7 +1658,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
         if let Some(ref mut sm) = source_map {
             // Set `file` field and relabel source entry for stdin builds (AC-FUNC-12).
-            apply_source_map_file_label(sm, output_path.as_deref(), true);
+            apply_source_map_file_label(sm, output_path.as_ref().map(|t| t.path.as_path()), true);
         }
 
         if use_source_map {
@@ -1635,7 +1670,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 } else {
                     content
                 };
-                return write_output(output_path, &final_content, quiet, true);
+                return write_output(output_path.as_ref(), &final_content, quiet, true);
             } else {
                 // Sidecar: write output first (byte-identical to no-flag; ADR-002).
                 match &output_path {
@@ -1653,9 +1688,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         ));
                     }
                     Some(out) => {
-                        write_output(Some(out.clone()), &content, quiet, true)?;
+                        write_output(Some(out), &content, quiet, true)?;
                         if let Some(ref sm) = source_map {
-                            let map_path = map_path_for(out);
+                            let map = out.sibling(map_path_for);
                             // The sidecar's `file` / `sources` / `sourcesContent` are
                             // written VERBATIM, by decision — spec §7.5 "Carve-out:
                             // functional path references". They are resolved against the
@@ -1665,14 +1700,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             // line below is a diagnostic surface and IS escaped.
                             let map_json = sm.to_json();
                             crate::output::atomic_write_file(
-                                &map_path,
+                                &map.path,
                                 &map_json,
                                 Durability::RenameOnly,
                             )?;
                             if !quiet {
                                 crate::output::ewriteln!(
                                     "Source map written to {}",
-                                    crate::output::safe_path(&map_path)
+                                    crate::output::safe_path(&map.shown)
                                 );
                             }
                         }
@@ -1682,7 +1717,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             }
         }
 
-        return write_output(output_path, &content, quiet, true);
+        return write_output(output_path.as_ref(), &content, quiet, true);
     }
 
     // ── File input path ──────────────────────────────────────────────────────────
@@ -1691,11 +1726,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let config = load_config(&input)?;
     let cfg_source_map = config
         .as_ref()
-        .map(|(c, _)| c.build.source_map)
+        .map(|c| c.config.build.source_map)
         .unwrap_or(false);
     let cfg_embed_sources = config
         .as_ref()
-        .map(|(c, _)| c.build.embed_sources)
+        .map(|c| c.config.build.embed_sources)
         .unwrap_or(false);
 
     let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
@@ -1741,12 +1776,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         typed: &input,
         canonical: &input,
     };
-    admit_output(output_path.as_deref(), entry, &output, compiled.kind, quiet)
+    let written_path = output_path.as_ref().map(|t| t.path.as_path());
+    admit_output(written_path, entry, &output, compiled.kind, quiet)
         .map_err(miette::Error::from)?;
 
     let mut source_map = compiled.source_map;
     if let Some(ref mut sm) = source_map {
-        apply_source_map_file_label(sm, output_path.as_deref(), false);
+        apply_source_map_file_label(sm, written_path, false);
     }
 
     if use_source_map {
@@ -1759,17 +1795,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             } else {
                 compiled.content
             };
-            write_output(output_path.clone(), &final_content, quiet, true)?;
+            write_output(output_path.as_ref(), &final_content, quiet, true)?;
 
             // Stale sidecar reconciliation: if there is an existing .map file from
             // a prior sidecar build, remove it (AC-FUNC-10).
             if let Some(ref out) = output_path {
-                let map_path = map_path_for(out);
-                let basename = out
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                verify_then_delete_map(&map_path, &basename, quiet)?;
+                verify_then_delete_map(&out.sibling(map_path_for), &file_name_of(out), quiet)?;
             }
         } else {
             // Sidecar: write output byte-identical to no-flag build (ADR-002).
@@ -1788,35 +1819,37 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                              to skip it"
                         ));
                     }
-                    // Case 3 — config-sourced source_map: degrade gracefully.
+                    // Case 3 — config-sourced source_map: degrade gracefully. The warning
+                    // names `mds.json` as the input reached it, as a config error does
+                    // (#390).
                     if !quiet {
                         let cfg_path = config
                             .as_ref()
-                            .map(|(_, p)| p.display().to_string())
-                            .unwrap_or_else(|| "mds.json".to_owned());
+                            .map(ProjectConfig::shown_file)
+                            .unwrap_or_else(|| PathBuf::from("mds.json"));
                         crate::output::ewriteln!(
                             "warning: source_map in {} has no effect when writing to \
                              stdout (sidecar requires -o <file> or --out-dir); use --inline to \
                              embed the map, or --no-source-map to silence this warning",
-                            crate::output::safe_inline(&cfg_path)
+                            crate::output::safe_path(&cfg_path)
                         );
                     }
                     return write_output(None, &compiled.content, quiet, true);
                 }
                 Some(out) => {
-                    write_output(Some(out.clone()), &compiled.content, quiet, true)?;
+                    write_output(Some(out), &compiled.content, quiet, true)?;
                     if let Some(ref sm) = source_map {
-                        let map_path = map_path_for(out);
+                        let map = out.sibling(map_path_for);
                         let map_json = sm.to_json();
                         crate::output::atomic_write_file(
-                            &map_path,
+                            &map.path,
                             &map_json,
                             Durability::RenameOnly,
                         )?;
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Source map written to {}",
-                                crate::output::safe_path(&map_path)
+                                crate::output::safe_path(&map.shown)
                             );
                         }
                     }
@@ -1824,23 +1857,29 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             }
         }
     } else {
-        write_output(output_path.clone(), &compiled.content, quiet, true)?;
+        write_output(output_path.as_ref(), &compiled.content, quiet, true)?;
 
         // No-source-map build: if a stale sidecar exists from a prior source-map build,
         // remove it (AC-FUNC-10).
         if let Some(ref out) = output_path {
-            let map_path = map_path_for(out);
-            if map_path.exists() {
-                let basename = out
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                verify_then_delete_map(&map_path, &basename, quiet)?;
+            let map = out.sibling(map_path_for);
+            if map.path.exists() {
+                verify_then_delete_map(&map, &file_name_of(out), quiet)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// The file name of `output`, the name its sidecar map records as `file` — lossy, as
+/// [`has_sidecar_head`] compares it.
+fn file_name_of(output: &WriteTarget) -> String {
+    output
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Compile every non-partial `.mds` file under `dir`, streaming one at a time
@@ -1895,20 +1934,20 @@ fn run_build_directory(
     inline: bool,
 ) -> Result<()> {
     use crate::output::{
-        canonicalize_out_dir, collect_mds_files_detailed, is_partial, output_base_no_ext,
-        output_path_for, probe_and_remove_stale, resolve_output_base, OutputBase,
+        collect_mds_files_detailed, is_partial, output_base_no_ext, output_path_for,
+        probe_and_remove_stale, resolve_output_base, OutputBase,
     };
 
     const MAX_DEPTH: usize = 64;
 
     // Load project config from the directory root.
     let config = load_config(dir)?;
-    // Canonicalize out_dir as absolute so starts_with checks are reliable.
-    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref())?;
-    let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
+    // The out-dir's canonical form keeps the starts_with checks reliable; its shown form
+    // is the out-dir as typed (#390).
+    let output_base = resolve_output_base(out_dir.as_ref(), &config)?;
 
-    // Canonicalize dir for the starts_with comparison (issue 4): abs_out_dir (d) is already
-    // canonical, but `dir` may be a raw relative or pre-resolved-but-not-canonical path.
+    // Canonicalize dir for the starts_with comparison (issue 4): the out-dir's canonical
+    // form (d) is canonical, but `dir` may be a raw relative or pre-resolved-but-not-canonical path.
     // Mismatch (e.g. /private/tmp vs /tmp on macOS) causes the exclusion to silently fail
     // and includes the out-dir in the collection — not a security issue (only .mds are
     // gathered) but causes redundant scanning. Fall back to raw dir when canonicalize fails
@@ -1917,7 +1956,7 @@ fn run_build_directory(
 
     // Exclude the out-dir from collection when it is nested inside the source root.
     let exclude_prefix: Option<PathBuf> = match &output_base {
-        OutputBase::Dir(d) if d.starts_with(&canonical_dir) => Some(d.clone()),
+        OutputBase::Dir { canonical: d, .. } if d.starts_with(&canonical_dir) => Some(d.clone()),
         _ => None,
     };
 
@@ -1991,16 +2030,13 @@ fn run_build_directory(
         // Per-file source_map_base: the output directory for this file, computed
         // from the kind-independent directory oracle, without creating it — an early
         // create_dir_all would leave an empty directory on compile failure (Step 6
-        // Caveat 1 / PF-004).
+        // Caveat 1). A walked file's output stem always has a parent, the directory it
+        // lands in, so the base is always that directory.
         let base_no_ext = output_base_no_ext(file, dir, &output_base);
-        let source_map_base = base_no_ext
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
         let opts = mds::CompileOptions::default()
             .with_source_map(source_map)
             .with_include_sources_content(embed_sources)
-            .with_source_map_base(Some(source_map_base));
+            .with_source_map_base(base_no_ext.parent().map(Path::to_path_buf));
 
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
         // A panic in it fails this file alone, and the batch goes on (#389).
@@ -2011,13 +2047,13 @@ fn run_build_directory(
         match compiled {
             Ok(Ok(mut compiled)) => {
                 let ext = compiled.kind.extension();
-                let out_path = output_path_for(file, dir, &output_base, ext);
+                let target = output_path_for(file, dir, &output_base, ext);
 
                 // Ensure parent directory exists.
-                if let Some(parent) = out_path.parent() {
+                if let Some(parent) = target.path.parent() {
                     if !parent.as_os_str().is_empty() {
                         if let Err(e) = std::fs::create_dir_all(parent) {
-                            crate::output::eprint_io_failure(output_dir_failure(parent, &e));
+                            crate::output::eprint_io_failure(output_dir_failure(&target, &e));
                             fail_count += 1;
                             continue;
                         }
@@ -2026,7 +2062,7 @@ fn run_build_directory(
 
                 // Set `file` field for this output path (sources already relativized by core).
                 if let Some(ref mut sm) = compiled.source_map {
-                    apply_source_map_file_label(sm, Some(&out_path), false);
+                    apply_source_map_file_label(sm, Some(&target.path), false);
                 }
 
                 // Determine final content (inline embeds the carrier).
@@ -2049,7 +2085,7 @@ fn run_build_directory(
                 // it accumulates per-file counters instead of returning early, so it is
                 // its own call site. Both are enforced by `tests/write_funnel.rs`.
                 match crate::output::atomic_write_file(
-                    &out_path,
+                    &target.path,
                     &final_content,
                     Durability::RenameOnly,
                 ) {
@@ -2060,18 +2096,18 @@ fn run_build_directory(
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Compiled to {}",
-                                crate::output::safe_path(&out_path)
+                                crate::output::safe_path(&target.shown)
                             );
                         }
-                        written_this_run.insert(out_path.clone());
+                        written_this_run.insert(target.path.clone());
 
                         // Write sidecar map (non-inline mode).
                         if source_map && !inline {
                             if let Some(ref sm) = compiled.source_map {
-                                let map_path = map_path_for(&out_path);
+                                let map = target.sibling(map_path_for);
                                 let map_json = sm.to_json();
                                 if let Err(e) = crate::output::atomic_write_file(
-                                    &map_path,
+                                    &map.path,
                                     &map_json,
                                     Durability::RenameOnly,
                                 ) {
@@ -2084,7 +2120,7 @@ fn run_build_directory(
                                 if !quiet {
                                     crate::output::ewriteln!(
                                         "Source map written to {}",
-                                        crate::output::safe_path(&map_path)
+                                        crate::output::safe_path(&map.shown)
                                     );
                                 }
                             }
@@ -2105,7 +2141,7 @@ fn run_build_directory(
                         let base_no_ext = output_base_no_ext(file, dir, &output_base);
                         let stale_path =
                             base_no_ext.with_extension(compiled.kind.stale_extension());
-                        let safe_to_delete = matches!(output_base, OutputBase::Dir(_))
+                        let safe_to_delete = matches!(output_base, OutputBase::Dir { .. })
                             || written_this_run.contains(&stale_path);
                         if safe_to_delete {
                             // The output itself was built, so the file is not counted as
@@ -2486,7 +2522,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            Some(PathBuf::from("/some/dir/hello.md")),
+            Some(WriteTarget::as_typed(PathBuf::from("/some/dir/hello.md"))),
             "default should produce .md next to source"
         );
     }
@@ -2505,7 +2541,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            Some(out_dir.join("output.md")),
+            Some(WriteTarget::as_typed(out_dir.join("output.md"))),
             "stdin with --out-dir should produce output.md inside the out dir"
         );
         // #425: resolving creates nothing — `write_output` creates the directory, once
@@ -2513,18 +2549,46 @@ mod tests {
         assert!(!out_dir.exists(), "resolving creates no directory");
     }
 
-    #[test]
-    fn resolve_output_path_explicit_o_wins_over_config() {
-        let config = Some((
-            MdsConfig {
+    /// A loaded `mds.json` with `build.output_dir = "build"` in `/project`, reached as
+    /// `shown_dir`.
+    fn config_with_output_dir(shown_dir: &str) -> Option<ProjectConfig> {
+        Some(ProjectConfig {
+            config: MdsConfig {
                 build: BuildConfig {
                     output_dir: Some("build".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
             },
-            PathBuf::from("/project"),
-        ));
+            dir: PathBuf::from("/project"),
+            shown_dir: PathBuf::from(shown_dir),
+        })
+    }
+
+    /// #390: an output under `mds.json` `build.output_dir` is written below the canonical
+    /// config directory and named below the directory `mds.json` was reached by.
+    #[test]
+    fn resolve_output_path_config_output_dir_is_shown_below_the_directory_reached() {
+        let result = resolve_output_path_for_kind(
+            &Some(PathBuf::from("src/hello.mds")),
+            &None,
+            &None,
+            &config_with_output_dir("src/.."),
+            OutputKind::Markdown,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(WriteTarget {
+                path: Path::new("/project").join("build").join("hello.md"),
+                shown: Path::new("src/..").join("build").join("hello.md"),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_explicit_o_wins_over_config() {
+        let config = config_with_output_dir(".");
         let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("/project/hello.mds")),
             &Some("out.md".to_string()),
@@ -2535,7 +2599,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            Some(PathBuf::from("out.md")),
+            Some(WriteTarget::as_typed(PathBuf::from("out.md"))),
             "-o should win over mds.json config"
         );
     }
@@ -2574,7 +2638,7 @@ mod tests {
         .unwrap();
 
         let result = load_config(dir.path()).expect("valid fmt config must load");
-        let (config, _) = result.expect("mds.json must be found");
+        let config = result.expect("mds.json must be found").config;
         assert!(
             !config.fmt.sort_frontmatter_keys,
             "sort_frontmatter_keys: false must deserialize correctly"
@@ -3080,13 +3144,15 @@ mod tests {
 
         // Control: a writable directory, and the sidecar is removed.
         std::fs::write(&map, sidecar).unwrap();
-        assert!(verify_then_delete_map(&map, "out.md", true).is_ok());
+        assert!(
+            verify_then_delete_map(&WriteTarget::as_typed(map.clone()), "out.md", true).is_ok()
+        );
         assert!(!map.exists(), "control: the stale sidecar must be removed");
 
         std::fs::write(&map, sidecar).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let probe = std::fs::write(dir.path().join("probe"), b"");
-        let result = verify_then_delete_map(&map, "out.md", true);
+        let result = verify_then_delete_map(&WriteTarget::as_typed(map.clone()), "out.md", true);
         let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
         if probe.is_ok() {
             crate::output::ewriteln!(
@@ -3122,7 +3188,9 @@ mod tests {
 
         // Control: readable, not a sidecar — left in place, no error.
         std::fs::write(&map, "{\"hand\":\"written\"}").unwrap();
-        assert!(verify_then_delete_map(&map, "out.md", true).is_ok());
+        assert!(
+            verify_then_delete_map(&WriteTarget::as_typed(map.clone()), "out.md", true).is_ok()
+        );
         assert!(map.exists(), "control: a hand-written map is left in place");
 
         let sidecar = "{\"version\":3,\"file\":\"out.md\",\"sources\":[],\"mappings\":\"\"}";
@@ -3134,7 +3202,7 @@ mod tests {
             );
             return;
         }
-        let result = verify_then_delete_map(&map, "out.md", true);
+        let result = verify_then_delete_map(&WriteTarget::as_typed(map.clone()), "out.md", true);
         match result {
             Err(MdsError::Io { message }) => assert!(
                 message.starts_with("cannot read stale map ") && message.contains("out.md.map"),

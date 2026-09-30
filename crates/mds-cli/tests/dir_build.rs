@@ -1911,8 +1911,8 @@ fn dir_build_dotdot_root_mirrors_without_warning() {
 /// `watch` — single-file `-o`/`--out-dir` never canonicalizes). On Windows,
 /// `Path::canonicalize` always returns the verbatim form (`\\?\C:\…`) once the
 /// directory exists, so `--out-dir` must already exist for this test to exercise
-/// the bug. The `Compiled to …` status line — and every other path `--out-dir`
-/// feeds — must show the conventional form instead.
+/// the bug. The `Compiled to …` status line names the output below the out-dir as
+/// typed (#390), so no verbatim prefix reaches it.
 #[cfg(windows)]
 #[test]
 fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
@@ -1939,9 +1939,10 @@ fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
         output.status.success(),
         "dir build should succeed; stderr: {stderr}"
     );
+    let expected_line = format!("Compiled to {}\n", out.path().join("plain.md").display());
     assert!(
-        stderr.contains("Compiled to"),
-        "expected a Compiled to status line; got: {stderr}"
+        stderr.contains(&expected_line),
+        "expected the out-dir as typed, {expected_line:?}; got: {stderr}"
     );
     assert!(
         !stdout.contains(r"\\?\"),
@@ -1953,16 +1954,13 @@ fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
     );
 }
 
-/// Unix control for the Windows test above: off Windows, canonicalizing
-/// `--out-dir` never produces a verbatim path, so `display_native_path` is a
-/// no-op and the `Compiled to …` line names the canonical output path unchanged.
-///
-/// `#[cfg(unix)]`: this is the off-Windows control arm for the preceding
-/// Windows-only test; the property it asserts (no verbatim prefix, because
-/// there is none to strip) does not apply on Windows (#147/#409).
-#[cfg(unix)]
+/// The `Compiled to …` line of a directory build names the output below `--out-dir`
+/// exactly as typed, never below the out-dir's canonical path (#390). On macOS the
+/// temporary directory is `/var/…` and its canonical path `/private/var/…`, so the two
+/// differ; where they coincide the canonical check has nothing to tell apart, and the
+/// typed line is still pinned exactly.
 #[test]
-fn dir_build_out_dir_status_line_unchanged_off_windows() {
+fn dir_build_out_dir_status_line_names_the_out_dir_as_typed() {
     let src = tempfile::tempdir().unwrap();
     create_plain_mds(src.path(), "plain.mds");
 
@@ -1974,16 +1972,17 @@ fn dir_build_out_dir_status_line_unchanged_off_windows() {
         output.status.success(),
         "dir build should succeed; stderr: {stderr}"
     );
-    let expected_line = format!(
-        "Compiled to {}",
-        out.path()
-            .canonicalize()
-            .unwrap()
-            .join("plain.md")
-            .display()
-    );
+    let typed = out.path().join("plain.md");
+    let expected_line = format!("Compiled to {}\n", typed.display());
     assert!(
         stderr.contains(&expected_line),
-        "expected the unchanged canonical status line {expected_line:?}; got: {stderr}"
+        "expected the out-dir as typed, {expected_line:?}; got: {stderr}"
     );
+    let canonical = out.path().canonicalize().unwrap().join("plain.md");
+    if canonical != typed {
+        assert!(
+            !stderr.contains(&format!("Compiled to {}", canonical.display())),
+            "never the canonical out-dir {canonical:?}; got: {stderr}"
+        );
+    }
 }
