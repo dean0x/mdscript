@@ -1035,8 +1035,8 @@ compiling one file of a batch — a file of `mds build`, `mds check`, `mds fmt` 
 `mds lint` given a directory, and any compile of an `mds watch` session — fails that
 file alone: only the compile, format or analysis of the file is caught, never a write
 or delete of an output. The file counts as failed in the run's summary (`mds lint`:
-under "with errors"), the other files are compiled and written, and the run exits 101
-when it has finished. `mds watch` takes it as a failed compile and keeps watching — the
+under "with errors"), the run goes on with the other files, and it exits 101 when it
+has finished. `mds watch` takes it as a failed compile and keeps watching — the
 next edit rebuilds — and exits 101 when it is stopped. The text is the panic's one
 report: no error line names the file, and the only error object made of it is
 `mds lint --format json`'s — a directory's entry

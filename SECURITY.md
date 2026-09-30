@@ -136,8 +136,8 @@ binding boundary; in the CLI it prints the panic's message and location after th
 internal-compiler-error text below. Both exist to help diagnose unexpected panics
 during local development.
 
-**The CLI's panic output (#389).** A panic in `mds` prints these two lines on stderr and
-nothing else, and the run exits 101:
+**The CLI's panic output (#389).** A panic in `mds` is reported with these two lines on
+stderr, and the run exits 101:
 
 ```
 mds: internal compiler error
@@ -146,31 +146,62 @@ note: this is a bug in mds; please report it at https://github.com/dean0x/mdscri
 
 The panic's message and its source location are never shown: a message can carry a
 template author's text or the build machine's absolute paths. The two lines are one
-fixed text, written once with its write error ignored, so a closed or failing stderr
-loses the text and the run still exits 101, not by a signal. A panic on a thread other
-than the one running the command — a `mds watch` helper thread, say — ends the process
-at once with the same text and exit 101, and so does a second panic while the first is
-still unwinding, which Rust would otherwise turn into an abort. Ending the process at
-once runs no destructors, so an output being written at that moment can be left
-part-way: its temporary file (`.mds-tmp-….tmp`) can stay beside it, and stdout's reader
-can get part of the product. Exit 101 wins over every other exit code, `mds watch`'s
-included. With `RUST_BACKTRACE` set to anything but `0`, a backtrace of the panicking
-thread follows the two lines — the same frames for every value, from where the hook
-captured them, with each frame's address added for `full` — each line escaped as a
-status line is. It still shows no message, but its frames name the functions and source
-files the binary was built from, with the build machine's paths and the Rust
-toolchain's; leave `RUST_BACKTRACE` unset where that matters. A panic that Rust cannot
-unwind at all and that follows no other — one of the undefined-behaviour checks a build
-with debug assertions compiles in — can print the text and then abort.
+fixed text, printed once per panic and written with its write error ignored, so a closed
+or failing stderr loses the text and the run still exits 101, not by a signal.
+
+A panic compiling one file of a batch — a file of `mds build`, `mds check`, `mds fmt` or
+`mds lint` given a directory, or any compile of an `mds watch` session — is caught, and
+the batch goes on without that file. Only the file's compile, format or analysis runs
+inside the catch, not the write or delete of an output, so what the panic abandons is
+the compile's own work. The file counts as failed in the run's summary (`mds lint`:
+under "with errors"), and the run exits 101 once it has finished; `mds watch` keeps
+watching, rebuilds on the next edit, and exits 101 when it is stopped. A compile that
+panics again prints the two lines again. No error line names the file.
+`mds lint --format json` records it as a directory entry whose error is
+`{"code": "mds::internal", "message": "internal compiler error", "help": null, "span": null}`;
+for a panic in the `--fix` pipeline of a file argument, the run's one error document
+carries that error. Neither holds anything of the panic itself.
+
+A panic anywhere else on the thread running the command ends the run: it unwinds to the
+end, which removes an output's temporary file on the way, and exits 101. A panic on
+another thread — `mds watch`'s file-event callback or its Ctrl-C handler, each on a
+thread of its own — ends the process at once with the same text and exit 101, and so
+does a second panic while the first is still unwinding, which Rust would otherwise turn
+into an abort. Ending the process at once runs no destructors, so an output being
+written at that moment can be left part-way: its temporary file (`.mds-tmp-….tmp`) can
+stay beside it, and stdout's reader can get part of the product. Exit 101 wins over
+every other exit code, `mds watch`'s included.
+
+With `RUST_BACKTRACE` set to anything but `0`, a backtrace of the panicking thread
+follows the two lines — the same frames for every value, from where the hook captured
+them, with each frame's address added for `full` — each line escaped as a status line
+is. It still shows no message, but its frames name the functions and source files the
+binary was built from, with the build machine's paths and the Rust toolchain's; leave
+`RUST_BACKTRACE` unset where that matters. A panic that Rust cannot unwind at all and
+that follows no other — one of the undefined-behaviour checks a build with debug
+assertions compiles in — can print the text and then abort.
 `crates/mds-cli/tests/panic_hook.rs` pins this output, and pins the panic hook's code to
-one write of the fixed text.
+one write of the fixed text. It also pins where each per-file catch sits, and that each
+wraps one compile call which, through the functions of `mds-cli` it calls, changes no
+file or directory, writes nothing to stdout and does not end the process. That check is
+lexical: it follows calls by name, and does not see into a macro, `mds-core`, or a call
+through a function pointer or a trait object.
 
 A build with debug assertions — `cargo install --debug`, or a profile that turns them
 on — also compiles in a test-only trigger: with the environment variable
-`MDS_TEST_PANIC` set to `main` or `thread`, `mds` panics on purpose, to exercise the
-output above. It is compiled only under `cfg(debug_assertions)`, which `panic_hook.rs`
-pins, so a release build has it only when its profile turns debug assertions on. Build
-with debug assertions for development, not for anything you ship.
+`MDS_TEST_PANIC` set to one of these values, `mds` panics on purpose, to exercise the
+output above:
+
+- `main`: in the command's dispatch;
+- `thread`: in a thread the dispatch starts and waits for;
+- `compile:<file stem>`: in the per-file catch, compiling a file with that stem;
+- `notify`: in `mds watch`'s file-event callback;
+- `ctrlc`: in `mds watch`'s Ctrl-C handler.
+
+The trigger is compiled only under `cfg(debug_assertions)`, which `panic_hook.rs` pins.
+A release build therefore does not contain it — the variable is never read — unless its
+profile turns debug assertions on. Build with debug assertions for development, not for
+anything you ship.
 
 **Never enable `debug-panics` in a published or production build.** Panic messages
 can contain absolute filesystem paths and other internal details that should not be

@@ -1542,19 +1542,26 @@ fn the_trigger_is_compiled_only_into_debug_builds() {
 
 /// A panic in one file's compile fails that file alone (#389), so each per-file catch — a
 /// `catch_compile` call — wraps that compile and nothing else: its closure is
-/// `AssertUnwindSafe(|| <one call>)`, the call is one of [`COMPILE_CALLS`], and no
-/// argument of it writes, deletes or changes state. A panic abandons the closure part-way,
-/// so only what the closure holds is left unfinished. The catches sit where
-/// [`COMPILE_CATCHES`] lists them, one per compile of a batch, and `catch_panic`, which
-/// catches around anything, only where [`PANIC_CATCHES`] lists it.
+/// `AssertUnwindSafe(|| <one call>)`, the call is one of [`COMPILE_CALLS`] as written
+/// there, and no argument of it writes, deletes or changes state. Each of those mds-cli
+/// defines is defined once, in its file, and neither it nor a function of mds-cli it
+/// reaches writes, renames or deletes a file, writes to stdout or ends the process
+/// ([`compile_reach_findings`]). A panic abandons the closure part-way, so only what the
+/// closure holds is left unfinished. The catches sit where [`COMPILE_CATCHES`] lists
+/// them, one per compile of a batch, and `catch_panic`, which catches around anything,
+/// only where [`PANIC_CATCHES`] lists it.
 ///
-/// The check is lexical: it sees the call a closure makes, not what that call does.
+/// The check is lexical: it follows calls by name, and does not see into a macro,
+/// mds-core, or a call through a function pointer or a trait object.
 ///
 /// Controls, each planted into the real sources and reported for its own reason: a state
 /// change beside the compile, a write in its place, an argument that changes state, a
 /// mutable borrow, a call chained onto the compile, a closure not wrapped in
-/// `AssertUnwindSafe`, a catch gone from a listed place, one in an unlisted place and a
-/// `catch_panic` outside its places.
+/// `AssertUnwindSafe`, a catch gone from a listed place, one in an unlisted place, a
+/// `catch_panic` outside its places, a helper named like the compile in its place, a
+/// write inside a compile, a write in a function it calls, a delete in a method it calls,
+/// an exit inside a compile, and a second compile of the same name. A write that no catch
+/// reaches is not reported.
 #[test]
 fn each_catch_wraps_one_compile_call_and_nothing_else() {
     let sources = crate_sources();
@@ -1583,6 +1590,15 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
             .find(|(name, _)| name == file)
             .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
         text.push_str(&format!("\nfn planted(src: &Path) {{\n    {body}\n}}\n"));
+        planted
+    };
+    let defined = |file: &str, item: &str| -> Vec<(String, String)> {
+        let mut planted = sources.to_vec();
+        let (_, text) = planted
+            .iter_mut()
+            .find(|(name, _)| name == file)
+            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
+        text.push_str(&format!("\n{item}\n"));
         planted
     };
     let plants = [
@@ -1660,6 +1676,62 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
             "outside its places",
             "a `catch_panic` outside its places",
         ),
+        (
+            replaced(
+                "lint.rs",
+                "AssertUnwindSafe(|| mds::lint(path, ctx.runtime_vars.clone(), &config))",
+                "AssertUnwindSafe(|| lint(path, ctx.runtime_vars.clone(), &config))",
+            ),
+            "not a compile",
+            "a helper named like the compile in its place",
+        ),
+        (
+            replaced(
+                "build.rs",
+                "let kind = OutputKind::from(&result.output);",
+                "crate::output::atomic_write_file(input, \"\", Durability::Fsync)?;\n    \
+                 let kind = OutputKind::from(&result.output);",
+            ),
+            "which calls `atomic_write_file`",
+            "a write inside the compile a catch calls",
+        ),
+        (
+            replaced(
+                "build.rs",
+                "CompiledOutput::Markdown(s) => Ok(s),",
+                "CompiledOutput::Markdown(s) => { std::fs::write(\"x\", &s).ok(); Ok(s) }",
+            ),
+            "which calls `fs::write`",
+            "a write in a function the compile calls",
+        ),
+        (
+            replaced(
+                "lint.rs",
+                "let residual = mds::lint_str_with(",
+                "std::fs::remove_file(self.base_dir).ok();\n        \
+                 let residual = mds::lint_str_with(",
+            ),
+            "which calls `remove_file`",
+            "a delete in a method the compile calls",
+        ),
+        (
+            replaced(
+                "fmt.rs",
+                "let changed = formatted != source;",
+                "crate::output::exit(1);\n    let changed = formatted != source;",
+            ),
+            "which calls `exit`",
+            "an exit in the formatter a catch calls",
+        ),
+        (
+            defined(
+                "watch.rs",
+                "fn compile_to_content(input: &Path) -> Result<()> {\n    \
+                 crate::output::atomic_write_file(input, \"\", Durability::Fsync)\n}",
+            ),
+            "must be defined once",
+            "a second compile of the same name",
+        ),
     ];
     let mut missed = Vec::new();
     for (planted, reason, what) in &plants {
@@ -1672,6 +1744,16 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         missed.is_empty(),
         "each of these must be reported:\n{}",
         missed.join("\n")
+    );
+
+    let unreached = defined(
+        "watch.rs",
+        "fn planted_unreached() {\n    std::fs::write(\"x\", \"\").ok();\n}",
+    );
+    let found = catch_findings(&unreached);
+    assert!(
+        found.is_empty(),
+        "control: a write that no catch reaches is not reported; found {found:?}"
     );
 }
 
@@ -1886,14 +1968,63 @@ const COMPILE_CATCHES: &[(&str, &str)] = &[
     ("watch.rs", "compile_source"),
 ];
 
-/// What a catch's closure may call: each compiles, checks, formats or lints one file, and
-/// writes nothing.
-const COMPILE_CALLS: &[&str] = &[
-    "compile_to_content",
-    "check_collecting_warnings",
-    "format_source_named",
-    "lint",
-    "run_fix_pipeline",
+/// What a catch's closure may call, as the call is written there, and the file of mds-cli
+/// that defines it — `None` for a function of mds-core. Each compiles, checks, formats or
+/// lints one file, and writes nothing: [`compile_reach_findings`] follows the ones mds-cli
+/// defines.
+const COMPILE_CALLS: &[(&str, Option<&str>)] = &[
+    ("compile_to_content", Some("build.rs")),
+    ("mds::check_collecting_warnings", None),
+    ("format_source_named", Some("fmt.rs")),
+    ("mds::lint", None),
+    ("run_fix_pipeline", Some("lint.rs")),
+];
+
+/// What a compile a catch wraps must never reach, through the functions of mds-cli it
+/// calls: a write, rename or delete of a file, a write to stdout, or an end of the process.
+/// A call matches when its path ends with the entry, so `fs::write` is `std::fs::write(`.
+/// Stderr's status lines — a compile's warnings — are not in it: the writer formats a line
+/// before it writes it, so a panic leaves no part of one.
+const WRITES: &[&str] = &[
+    "atomic_write_file",
+    "write_output",
+    "write_session_output",
+    "write_stdout",
+    "fs::write",
+    "fs::copy",
+    "File::create",
+    "OpenOptions::new",
+    "persist",
+    "persist_noclobber",
+    "rename",
+    "remove_file",
+    "remove_dir",
+    "remove_dir_all",
+    "create_dir",
+    "create_dir_all",
+    "hard_link",
+    "set_permissions",
+    "probe_and_remove_stale",
+    "verify_then_delete_map",
+    "exit",
+    "exit_after_panic",
+];
+
+/// The first path segments of a call into another crate — mds-cli's dependencies and the
+/// standard library — which [`compile_reach_findings`] does not follow.
+const OTHER_CRATES: &[&str] = &[
+    "mds",
+    "std",
+    "core",
+    "alloc",
+    "clap",
+    "serde",
+    "serde_json",
+    "miette",
+    "notify",
+    "ctrlc",
+    "similar",
+    "tempfile",
 ];
 
 /// What the compile call's arguments may not hold: a write, a delete, a change to state, a
@@ -1965,6 +2096,7 @@ fn catch_findings(sources: &[(String, String)]) -> Vec<String> {
             ));
         }
     }
+    found.extend(compile_reach_findings(sources));
     found
 }
 
@@ -2007,8 +2139,7 @@ fn catch_closure(code: &str, at: usize) -> Result<(), String> {
     {
         return Err(format!("its closure wraps more than one call: `{body}`"));
     }
-    let function = callee.rsplit("::").next().unwrap_or(callee);
-    if !COMPILE_CALLS.contains(&function) {
+    if !COMPILE_CALLS.iter().any(|(call, _)| *call == callee) {
         return Err(format!(
             "its closure calls `{callee}`, which is not a compile"
         ));
@@ -2027,6 +2158,122 @@ fn catch_closure(code: &str, at: usize) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// What is wrong with the compiles the catches call, in `sources`: each of mds-cli's
+/// [`COMPILE_CALLS`] is defined once, in its file, and neither it nor any function of
+/// mds-cli it reaches calls one of [`WRITES`].
+///
+/// A call is a name followed by `(`, a method call's included, unless its path starts
+/// with one of [`OTHER_CRATES`]. It leads to every function of mds-cli outside the test
+/// modules with that name — each one, when several types define it — so the walk sees
+/// more than a compile runs, never less. It does not see into a macro, a function of
+/// another crate (mds-core's among them), or a call through a function pointer or a
+/// trait object.
+fn compile_reach_findings(sources: &[(String, String)]) -> Vec<String> {
+    let codes: Vec<(&str, String)> = sources
+        .iter()
+        .map(|(name, src)| (name.as_str(), blank(src, true)))
+        .collect();
+    // Every `fn` of mds-cli outside its test modules: (index into `codes`, name, body).
+    let mut defs: Vec<(usize, String, RangeInclusive<usize>)> = Vec::new();
+    for (index, (_, code)) in codes.iter().enumerate() {
+        let tests = mod_body(code, "tests");
+        for (name, body) in fn_bodies(code) {
+            if !tests.as_ref().is_some_and(|t| t.contains(body.start())) {
+                defs.push((index, name, body));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for (callee, file) in COMPILE_CALLS {
+        let Some(file) = file else { continue };
+        let mut pending: Vec<usize> = (0..defs.len()).filter(|&i| defs[i].1 == *callee).collect();
+        let places: Vec<&str> = pending.iter().map(|&i| codes[defs[i].0].0).collect();
+        if places != [*file] {
+            found.push(format!(
+                "`{callee}` must be defined once, in {file}; it is defined in {places:?}"
+            ));
+        }
+        // Each function is looked at once, so the walk ends after `defs.len()` steps.
+        let mut seen = vec![false; defs.len()];
+        while let Some(i) = pending.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            let (index, name, body) = &defs[i];
+            let (file_name, code) = &codes[*index];
+            let text = &code[body.clone()];
+            for write in WRITES {
+                if let Some(at) = calls_ending_with(text, write).first() {
+                    found.push(format!(
+                        "{file_name}:{}: `{callee}` reaches `{name}`, which calls `{write}`",
+                        line_of(code, body.start() + at)
+                    ));
+                }
+            }
+            let called = called_names(text);
+            pending.extend((0..defs.len()).filter(|&j| !seen[j] && called.contains(&defs[j].1)));
+        }
+    }
+    found
+}
+
+/// Byte offsets in blanked `text` of the calls whose path ends with `path`: its last name,
+/// then `(`, with the rest of `path` written just before that name.
+fn calls_ending_with(text: &str, path: &str) -> Vec<usize> {
+    let name = path.rsplit("::").next().unwrap_or(path);
+    ident_positions(text, name)
+        .into_iter()
+        .filter(|&at| {
+            text[at + name.len()..].trim_start().starts_with('(')
+                && text[..at + name.len()].ends_with(path)
+        })
+        .collect()
+}
+
+/// The names blanked `text` calls — each a name followed by `(` — except a call whose path
+/// starts with one of [`OTHER_CRATES`].
+fn called_names(text: &str) -> std::collections::HashSet<String> {
+    let b = text.as_bytes();
+    let mut names = std::collections::HashSet::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !is_ident_byte(b[i]) || prev_is_ident(b, i) {
+            i += 1;
+            continue;
+        }
+        let end = i + b[i..].iter().take_while(|c| is_ident_byte(**c)).count();
+        if text[end..].trim_start().starts_with('(') && !OTHER_CRATES.contains(&path_head(text, i))
+        {
+            names.insert(text[i..end].to_string());
+        }
+        i = end;
+    }
+    names
+}
+
+/// The first name of the path that ends with the name at byte `at` of `text`:
+/// `std` for `std::fs::write`, the name itself when nothing precedes it.
+fn path_head(text: &str, at: usize) -> &str {
+    let mut start = at;
+    while start >= 2 && &text[start - 2..start] == "::" {
+        let segment_end = start - 2;
+        let segment_start = text[..segment_end]
+            .bytes()
+            .rposition(|c| !is_ident_byte(c))
+            .map_or(0, |p| p + 1);
+        if segment_start == segment_end {
+            break;
+        }
+        start = segment_start;
+    }
+    let end = start
+        + text[start..]
+            .bytes()
+            .take_while(|c| is_ident_byte(*c))
+            .count();
+    &text[start..end]
 }
 
 /// Index of the `)` closing the `(` at `open` in `text`, blanked of literals.
