@@ -51,7 +51,8 @@
 //!   ([`terminal_streams_are_opened_only_by_the_writers`]). A second writer holding its
 //!   own handle would not see a stdout closed for good or a failure already reported;
 //!   `mds lint` had one (#157). The panic hook is listed on purpose: it writes one fixed
-//!   text, and `tests/panic_hook.rs` pins that it writes nothing else (#389).
+//!   text, and `tests/panic_hook.rs` pins that it writes nothing else (#389). So is one
+//!   unit test of the hook, which only holds stderr's lock.
 //! - These three scans read every module the crate compiles: `crate_sources` resolves
 //!   each `mod name;` from `main.rs` as rustc does and fails on one it did not read.
 //! - **`mds lint` shows its results through its result sink** (#309): lint's writer-macro
@@ -305,12 +306,15 @@ const STREAM_HANDLES: &[&str] = &["stdout", "stderr"];
 /// consults — a pipe closed for good, a failure already reported (#157) — the exit
 /// after clap's own output, which flushes what clap printed, and the panic hook, which
 /// writes its one fixed text with a `write_all` of its own: a panic may come from inside
-/// the writer, and the text is written whatever the writer's state says (#389).
+/// the writer, and the text is written whatever the writer's state says (#389). One unit
+/// test is listed as well: it holds stderr's lock, writing nothing, so that the hook's
+/// write waits, and checks that the panic is recorded all the same (#389).
 const STREAM_HANDLE_OWNERS: &[(&str, &str)] = &[
     ("output.rs", "write_stderr_fmt"),
     ("output.rs", "write_stdout"),
     ("main.rs", "exit_after_clap_output"),
     ("output.rs", "on_panic"),
+    ("output.rs", "a_panic_is_recorded_before_the_hook_writes"),
 ];
 
 /// The calls through which `mds lint` shows a result, by name: the writer macros, the

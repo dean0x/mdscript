@@ -425,18 +425,20 @@ const ICE_TEXT: &str = concat!(
 /// for a panic that ends `main`.
 pub(crate) const PANIC_EXIT: i32 = 101;
 
-/// The backtrace a panic prints after [`ICE_TEXT`], as `RUST_BACKTRACE` asks for it.
+/// The backtrace a panic prints after [`ICE_TEXT`], as `RUST_BACKTRACE` asks for it. Both
+/// print the same frames, from the capture itself on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BacktraceStyle {
-    /// The frames from the panic on.
+    /// Each frame's function and source line.
     Short,
-    /// Every frame (`RUST_BACKTRACE=full`).
+    /// The same, with each frame's address (`RUST_BACKTRACE=full`).
     Full,
 }
 
 impl BacktraceStyle {
     /// The backtrace `RUST_BACKTRACE`'s `value` asks for, read as std reads it: none when
-    /// it is unset or `0`, every frame for `full`, the short form for any other value.
+    /// it is unset or `0`, the frames with their addresses for `full`, the frames alone
+    /// for any other value.
     fn from_env(value: Option<&OsStr>) -> Option<Self> {
         match value {
             None => None,
@@ -465,31 +467,35 @@ pub(crate) fn install_panic_hook() {
 
 /// The panic hook: what a panic on any thread does (#389).
 ///
-/// 1. One `write_all` of [`ICE_TEXT`] to stderr, its error ignored — a closed or failing
+/// 1. Record the panic: from here on [`final_exit_code`] is 101. This comes before
+///    anything that can wait, so a run that ends while this thread is still in step 2 —
+///    a helper thread's panic, say — still exits 101.
+/// 2. One `write_all` of [`ICE_TEXT`] to stderr, its error ignored — a closed or failing
 ///    stderr loses the text and nothing else. Nothing the panic carries is formatted, so
 ///    no `Display` of the payload can run here, and std's stderr is a reentrant lock, so a
 ///    thread that panicked while writing to stderr takes it again. If another thread is
 ///    stuck inside a stderr write, this one waits with it.
-/// 2. Record the panic: from here on [`final_exit_code`] is 101.
 /// 3. With `RUST_BACKTRACE` asking, [`write_backtrace`]. With the never-shipped
 ///    `debug-panics` feature, the panic's message and location.
 /// 4. Let the panic unwind only to a [`catch_panic`] on this thread that is not already
 ///    unwinding from an earlier one. Otherwise end the process now, exit 101
 ///    ([`exit_after_panic`]): a panic on a thread that nothing catches — a watch helper
 ///    thread — would end that thread alone and leave the command running without it; and
-///    a second panic while the thread unwinds from the first — a destructor that panics
-///    — would make std abort the process after a message of its own.
+///    a second panic while the thread unwinds from the first — a destructor that panics,
+///    or the panic Rust raises where an unwind reaches a function that cannot unwind —
+///    would make std abort the process after a message of its own.
 ///
 /// It must not panic: std aborts a process whose panic hook panics, after printing the
 /// second panic's location. `std::panic::always_abort`, with which a panic aborts without
 /// calling any hook, is unstable, and the CLI never calls it; std sets it only in a child
 /// between `fork` and `exec`, before the child is `mds` at all. A panic that cannot
-/// unwind at all — a check of undefined behaviour that debug builds compile in, say —
-/// prints the text, and then std aborts.
+/// unwind and follows no other — a check of undefined behaviour that a debug build
+/// compiles in — looks to the hook like one that can: stable Rust does not say which it
+/// is. Inside a [`catch_panic`] it prints the text, and then std aborts.
 fn on_panic(backtrace: Option<BacktraceStyle>, info: &std::panic::PanicHookInfo<'_>) {
+    OUTPUT_STATE.note_panicked();
     let mut stderr = std::io::stderr();
     let _ = stderr.write_all(ICE_TEXT.as_bytes());
-    OUTPUT_STATE.note_panicked();
     if let Some(style) = backtrace {
         write_backtrace(&mut stderr, style);
     }
@@ -526,8 +532,7 @@ pub(crate) struct Panicked;
 /// panic (#389). The hook has already printed the text and recorded the panic, so the
 /// run exits 101 whatever it does next; nothing here reports the panic again.
 ///
-/// The panic's payload is dropped without running its destructor (`mem::forget`): that
-/// destructor is arbitrary code, and a panic in it would be a panic outside any catch.
+/// The panic's payload goes to [`dispose_payload`].
 pub(crate) fn catch_panic<T>(
     f: impl FnOnce() -> T + std::panic::UnwindSafe,
 ) -> std::result::Result<T, Panicked> {
@@ -535,10 +540,34 @@ pub(crate) fn catch_panic<T>(
     let caught = std::panic::catch_unwind(f);
     CATCHING.with(|catching| catching.set(outer));
     caught.map_err(|payload| {
-        std::mem::forget(payload);
+        dispose_payload(payload);
         UNWINDING.with(|unwinding| unwinding.set(false));
         Panicked
     })
+}
+
+/// What [`dispose_payload`] did with a caught panic's payload.
+#[derive(Debug, PartialEq, Eq)]
+enum Disposal {
+    /// Dropped: a panic message, whose destructor only frees its memory.
+    Dropped,
+    /// Forgotten: its destructor never runs, and the memory it holds is not freed.
+    Forgotten,
+}
+
+/// Get rid of a caught panic's payload. The `String` or `&'static str` message a
+/// `panic!` makes is dropped, which runs no code of the panic's own, so a watch session
+/// that catches panics again and again does not hold on to their messages. Any other
+/// payload is forgotten (`mem::forget`): its destructor is arbitrary code, and a panic
+/// in it would be a panic outside any catch.
+fn dispose_payload(payload: Box<dyn std::any::Any + Send>) -> Disposal {
+    if payload.is::<String>() || payload.is::<&'static str>() {
+        drop(payload);
+        Disposal::Dropped
+    } else {
+        std::mem::forget(payload);
+        Disposal::Forgotten
+    }
 }
 
 /// Write the panicking thread's backtrace to `sink`, as `RUST_BACKTRACE` asked: a
@@ -4511,7 +4540,7 @@ mod tests {
     }
 
     /// `RUST_BACKTRACE` asks for a backtrace when it is set to anything but `0`, and for
-    /// every frame when it is `full` — as std reads it.
+    /// each frame's address as well when it is `full` — as std reads it.
     #[test]
     fn rust_backtrace_picks_the_backtrace_a_panic_prints() {
         let cases = [
@@ -4754,5 +4783,133 @@ mod tests {
             "the process ended at the second panic; stdout:\n{report}"
         );
         assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
+    }
+
+    /// A panic is recorded before the hook writes anything, so the run exits 101 even
+    /// when the hook cannot write: here the test holds stderr's lock, and a helper
+    /// thread's hook waits on it while the test ends the run through [`exit`].
+    ///
+    /// Controls: the child really ran the test and ended at the funnel; the hook's write
+    /// never landed, so it really was waiting.
+    #[test]
+    fn a_panic_is_recorded_before_the_hook_writes() {
+        const NAME: &str = "output::tests::a_panic_is_recorded_before_the_hook_writes";
+        /// How long the test waits for the helper's panic to be recorded: 500 polls,
+        /// 10 ms apart.
+        const POLLS: u32 = 500;
+        const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+        if in_the_child(NAME) {
+            install_panic_hook();
+            // Held until the process ends, so the helper's hook blocks in its write.
+            let _held = std::io::stderr().lock();
+            let _helper = std::thread::spawn(|| panic!("helper"));
+            for _ in 0..POLLS {
+                if OUTPUT_STATE.panicked() {
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+            let _ = write_stdout(b"at the funnel\n");
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert!(
+            report.contains("at the funnel") && !report.contains("test result"),
+            "control: the child ended at the funnel; stdout:\n{report}"
+        );
+        assert_eq!(
+            shown, "",
+            "control: the hook's write waited on the held lock until the process ended"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "a panic whose hook cannot write still makes the run exit 101; stdout:\n{report}"
+        );
+    }
+
+    /// A panic that unwinds into a function that cannot unwind — an `extern "C"`
+    /// function — makes Rust raise a second panic there, one that cannot unwind at all.
+    /// The thread is already unwinding from the first, so the hook ends the run with 101
+    /// before std can abort.
+    #[test]
+    fn a_panic_into_a_function_that_cannot_unwind_ends_the_run_with_101_not_an_abort() {
+        const NAME: &str = "output::tests::\
+            a_panic_into_a_function_that_cannot_unwind_ends_the_run_with_101_not_an_abort";
+        extern "C" fn cannot_unwind() {
+            panic!("first");
+        }
+        if in_the_child(NAME) {
+            install_panic_hook();
+            let _ = catch_panic(|| cannot_unwind());
+            let _ = write_stdout(b"the run went on\n");
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "exit 101, not an abort (a signal: None); stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            !report.contains("the run went on") && !report.contains("test result"),
+            "the process ended at the second panic; stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
+    }
+
+    /// A caught panic's payload is dropped when dropping it runs no code of the panic's
+    /// own — a `String` or `&'static str` message, which is what `panic!` makes — and is
+    /// forgotten otherwise: any other payload's destructor is arbitrary code, and a panic
+    /// in it would be a panic outside any catch.
+    ///
+    /// Control: the counting payload's destructor does run when it is dropped.
+    #[test]
+    fn a_caught_payload_is_dropped_only_when_that_runs_no_code_of_its_own() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        struct CountsDrops(Arc<AtomicUsize>);
+        impl Drop for CountsDrops {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        assert_eq!(
+            dispose_payload(Box::new(String::from("a formatted message"))),
+            Disposal::Dropped,
+            "a `String` message is dropped"
+        );
+        assert_eq!(
+            dispose_payload(Box::new("a literal message")),
+            Disposal::Dropped,
+            "a `&'static str` message is dropped"
+        );
+        let drops = Arc::new(AtomicUsize::new(0));
+        drop(CountsDrops(Arc::clone(&drops)));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "control: the counting payload's destructor runs when it is dropped"
+        );
+        assert_eq!(
+            dispose_payload(Box::new(CountsDrops(Arc::clone(&drops)))),
+            Disposal::Forgotten,
+            "any other payload is forgotten"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "a forgotten payload's destructor never runs"
+        );
     }
 }

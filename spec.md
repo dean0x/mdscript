@@ -1033,16 +1033,27 @@ please report it at <repository>/issues` (the repository `mds-cli`'s manifest na
 and the run exits 101. The panic's message and source location are never shown, and no
 error object is made of the panic. A panic on a thread other than the one running the
 command ends the process at once with the same text and exit 101, and so does a second
-panic while the first is still unwinding. 101 wins over every other exit code: a closed
-pipe, an I/O failure and `mds watch`'s rule once live change nothing. The text is
-written once and its write error ignored, so with stderr closed or failing the run still
-exits 101. With `RUST_BACKTRACE` set to anything but `0`, a `stack backtrace:` line and
-the panicking thread's frames follow the text — every frame for `full`, the frames from
-the panic on for any other value — each line WIRE-escaped; the message is still not
-shown. A panic that cannot unwind at all (an undefined-behaviour check a debug build
-compiles in) prints the text, and then the process aborts. Only a build with `mds-cli`'s
+panic while the first is still unwinding — a destructor that panics, or the panic Rust
+raises when an unwind reaches a function that cannot unwind. Ending the process at once
+runs no destructors, so an output being written at that moment can be left part-way:
+its temporary file (`.mds-tmp-….tmp`) can stay beside it, and stdout's reader can get
+part of the product. A panic on the command's own thread otherwise unwinds to the end
+of the run, which removes such a temporary file on the way. 101 wins over every other
+exit code: a closed pipe, an I/O failure and `mds watch`'s rule once live change
+nothing. The panic is recorded before the text is written, and the text is written once
+with its write error ignored, so with stderr closed or failing — or held by another
+thread's write, if the run ends first — the run still exits 101. With `RUST_BACKTRACE`
+set to anything but `0`, a `stack backtrace:` line and the panicking thread's frames
+follow the text, from where the panic hook captured them; `full` shows the same frames
+with each frame's address added. Each line is WIRE-escaped; the message is still not
+shown. A panic that cannot unwind at all and follows no other (an undefined-behaviour
+check that a build with debug assertions compiles in) on the command's own thread
+prints the text, and then the process aborts. Only a build with `mds-cli`'s
 never-shipped `debug-panics` feature (`SECURITY.md`) prints the message and location,
-after the text.
+after the text. A build with debug assertions — `cargo install --debug`, or a profile
+that turns them on — also holds a test-only trigger that panics on purpose when
+`MDS_TEST_PANIC` is `main` or `thread`; a release build compiles it out unless its
+profile turns debug assertions on.
 
 The `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
 `MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised

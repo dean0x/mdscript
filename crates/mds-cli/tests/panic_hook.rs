@@ -475,14 +475,17 @@ fn every_run_sets_or_removes_rust_backtrace() {
     );
 }
 
-/// The panic hook — `on_panic` in `src/output.rs` — writes one constant and nothing about
-/// the panic: exactly one `write_all`, of `ICE_TEXT`; no print or format macro, no
-/// miette, no `.payload()` or `.location()`, nothing that can panic; the hook's
-/// `PanicHookInfo` named only on the lines the `debug-panics` feature gates. `main`
-/// installs it first; only `install_panic_hook` sets a hook, and only `catch_panic`
-/// catches a panic, so no catch site can report one a second time.
+/// The panic hook — `on_panic` in `src/output.rs` — records the panic before anything
+/// else, then writes one constant and nothing about the panic: exactly one `write_all`,
+/// of `ICE_TEXT`; no print or format macro, no miette, no `.payload()` or `.location()`,
+/// nothing that can panic; the hook's `PanicHookInfo` named only on the lines the
+/// `debug-panics` feature gates. `main` installs it first. The panic machinery stays
+/// where [`CLI_PANIC_MACHINERY`] and [`CORE_PANIC_MACHINERY`] list it: only
+/// `install_panic_hook` sets a hook and only `catch_panic` catches a panic, so no catch
+/// site can report one a second time, and nothing unwinds without the hook.
 ///
-/// Controls: each of those, planted into the real hook's body, is reported.
+/// Controls: each of those, planted into the real hook's body or the real sources, is
+/// reported.
 #[test]
 fn the_hook_writes_one_constant_and_nothing_about_the_panic() {
     let output = read_source("src/output.rs");
@@ -520,6 +523,22 @@ fn the_hook_writes_one_constant_and_nothing_about_the_panic() {
         !hook_findings(&not_constant).is_empty(),
         "a hook that writes anything but ICE_TEXT must be reported"
     );
+    // The panic recorded after the write: a hook blocked in the write would leave the
+    // run to exit without it.
+    const RECORD: &str = "OUTPUT_STATE.note_panicked();\n";
+    let record_last = output.replacen(RECORD, "", 1).replacen(
+        ICE_WRITE,
+        &format!("{ICE_WRITE}\n    {RECORD}"),
+        1,
+    );
+    assert_ne!(
+        record_last, output,
+        "precondition: the hook records the panic with `{RECORD}`"
+    );
+    assert!(
+        !hook_findings(&record_last).is_empty(),
+        "a hook that writes before it records the panic must be reported"
+    );
 
     // Installed first in `main`.
     let main = read_source("src/main.rs");
@@ -532,32 +551,96 @@ fn the_hook_writes_one_constant_and_nothing_about_the_panic() {
         &first[..first.len().min(120)]
     );
 
-    // One hook, one catch, across the crate.
-    let mut hooks = Vec::new();
-    let mut catches = Vec::new();
-    for (name, src) in crate_sources() {
-        let code = blank(&src, true);
-        for needle in ["set_hook", "take_hook", "catch_unwind"] {
-            for (at, _) in code.match_indices(needle) {
-                let inside = innermost_fn(&code, at).map(|(fn_name, _)| fn_name);
-                let site = format!("{name}:{}", inside.as_deref().unwrap_or("-"));
-                if needle == "catch_unwind" {
-                    catches.push(site);
-                } else {
-                    hooks.push(site);
-                }
-            }
-        }
+    // The panic machinery, in mds-cli and in mds-core, whose code runs inside the CLI's
+    // catch.
+    let cli = crate_sources();
+    let core = core_sources();
+    for (krate, sources, allowed) in [
+        ("mds-cli", &cli, CLI_PANIC_MACHINERY),
+        ("mds-core", &core, CORE_PANIC_MACHINERY),
+    ] {
+        let found = machinery_findings(sources, allowed);
+        assert!(
+            found.is_empty(),
+            "{krate}: the panic machinery must stay where it is listed:\n{}",
+            found.join("\n")
+        );
     }
-    assert_eq!(
-        hooks,
-        vec!["output.rs:install_panic_hook".to_string()],
-        "only `install_panic_hook` sets the panic hook"
-    );
-    assert_eq!(
-        catches,
-        vec!["output.rs:catch_panic".to_string()],
-        "only `catch_panic` catches a panic"
+    let plant = |sources: &[(String, String)], file: &str, body: &str| {
+        let mut planted = sources.to_vec();
+        let (_, text) = planted
+            .iter_mut()
+            .find(|(name, _)| name == file)
+            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
+        text.push_str(&format!("\nfn planted() {{\n    {body}\n}}\n"));
+        planted
+    };
+    let missed: Vec<&str> = [
+        (
+            machinery_findings(
+                &plant(&cli, "main.rs", "std::panic::resume_unwind(Box::new(0u8));"),
+                CLI_PANIC_MACHINERY,
+            ),
+            "a `resume_unwind` in main.rs",
+        ),
+        (
+            machinery_findings(
+                &plant(
+                    &cli,
+                    "output.rs",
+                    "let _ = std::panic::catch_unwind(|| ());",
+                ),
+                CLI_PANIC_MACHINERY,
+            ),
+            "a second `catch_unwind` in output.rs",
+        ),
+        (
+            machinery_findings(
+                &plant(&cli, "watch.rs", "let _ = std::panic::take_hook();"),
+                CLI_PANIC_MACHINERY,
+            ),
+            "a `take_hook` in watch.rs",
+        ),
+        (
+            machinery_findings(
+                &plant(&core, "lib.rs", "let _ = std::panic::catch_unwind(|| ());"),
+                CORE_PANIC_MACHINERY,
+            ),
+            "a `catch_unwind` in mds-core's lib.rs",
+        ),
+        (
+            machinery_findings(
+                &plant(&core, "lib.rs", "std::panic::set_hook(Box::new(|_| ()));"),
+                CORE_PANIC_MACHINERY,
+            ),
+            "a `set_hook` in mds-core's lib.rs",
+        ),
+        (
+            machinery_findings(
+                &plant(&core, "lib.rs", "std::panic::resume_unwind(Box::new(0u8));"),
+                CORE_PANIC_MACHINERY,
+            ),
+            "a `resume_unwind` in mds-core's lib.rs",
+        ),
+        (
+            machinery_findings(
+                &cli,
+                &[
+                    CLI_PANIC_MACHINERY,
+                    &[("take_hook", "output.rs", "install_panic_hook")],
+                ]
+                .concat(),
+            ),
+            "a listed place that does not name its function",
+        ),
+    ]
+    .into_iter()
+    .filter(|(found, _)| found.is_empty())
+    .map(|(_, what)| what)
+    .collect();
+    assert!(
+        missed.is_empty(),
+        "each of these must be reported; missed: {missed:?}"
     );
 }
 
@@ -631,11 +714,12 @@ fn the_trigger_is_compiled_only_into_debug_builds() {
     );
 }
 
-/// `debug-panics` is declared and off unless asked for: no `default` feature and no other
-/// feature of `mds-cli` turns it on.
+/// `debug-panics` is declared, enables nothing, and is off unless asked for: nothing in
+/// `mds-cli`'s manifest names it as a value, so no `default` feature and no other feature
+/// turns it on, however the list is written.
 ///
-/// Controls: each way of turning it on, and a manifest that does not declare it, are
-/// reported.
+/// Controls: each way of turning it on, a declaration that enables something, and a
+/// manifest that does not declare it are reported; a mention in a comment is not.
 #[test]
 fn debug_panics_is_never_on_by_default() {
     let manifest = read_source("Cargo.toml");
@@ -646,24 +730,62 @@ fn debug_panics_is_never_on_by_default() {
         found.join("\n")
     );
     let declared = "debug-panics = []";
-    for (plant, what) in [
+    let after_declared =
+        |extra: &str| manifest.replacen(declared, &format!("{declared}\n{extra}"), 1);
+    let plants = [
         (
-            format!("{declared}\ndefault = [\"debug-panics\"]"),
+            after_declared("default = [\"debug-panics\"]"),
             "a default that enables it",
         ),
         (
-            format!("{declared}\nverbose = [\"startup-race-probe\", \"debug-panics\"]"),
+            after_declared("default = [\n    \"debug-panics\",\n]"),
+            "a default over several lines that enables it",
+        ),
+        (
+            after_declared("default = ['debug-panics']"),
+            "a default that names it in a literal string",
+        ),
+        (
+            after_declared("verbose = [\"startup-race-probe\", \"debug-panics\"]"),
             "another feature that enables it",
         ),
-        (String::new(), "a manifest that does not declare it"),
-    ] {
-        let planted = manifest.replacen(declared, &plant, 1);
-        assert_ne!(planted, manifest, "precondition: Cargo.toml declares it");
-        assert!(
-            !feature_findings(&planted).is_empty(),
-            "{what} must be reported"
+        (
+            after_declared("verbose = [\"a#b\", \"debug-panics\"]"),
+            "a feature that enables it after a `#` inside a string",
+        ),
+        (
+            format!("features.default = [\"debug-panics\"]\n{manifest}"),
+            "a dotted `features.default` that enables it",
+        ),
+        (
+            manifest.replacen(declared, "debug-panics = [\"startup-race-probe\"]", 1),
+            "a declaration that enables another feature",
+        ),
+        (
+            manifest.replacen(declared, "", 1),
+            "a manifest that does not declare it",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (planted, what) in &plants {
+        assert_ne!(
+            planted, &manifest,
+            "precondition: the plant changes Cargo.toml ({what})"
         );
+        if feature_findings(planted).is_empty() {
+            missed.push(*what);
+        }
     }
+    assert!(
+        missed.is_empty(),
+        "each of these must be reported; missed: {missed:?}"
+    );
+    let commented = after_declared("# default = [\"debug-panics\"]");
+    assert_eq!(
+        feature_findings(&commented),
+        Vec::<String>::new(),
+        "a mention in a comment turns nothing on"
+    );
 }
 
 // ── Lexical helpers ───────────────────────────────────────────────────────────
@@ -674,35 +796,121 @@ fn read_source(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Every `.rs` file under `src/`, by file name, with its text.
+/// Every `.rs` file under `crates/mds-cli/src/`, by its path below `src/`, with its text.
 fn crate_sources() -> Vec<(String, String)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut pending: Vec<PathBuf> = vec![root];
+    rust_sources("src", "main.rs", 8)
+}
+
+/// Every `.rs` file under `crates/mds-core/src/`, by its path below `src/` (`lib.rs`,
+/// `lint/mod.rs`), with its text.
+fn core_sources() -> Vec<(String, String)> {
+    rust_sources("../mds-core/src", "lib.rs", 20)
+}
+
+/// Every `.rs` file under `relative` (from this package's directory), by its path below
+/// it with `/` between names, with its text. Non-vacuity: the walk found `root_file` and
+/// at least `at_least` files.
+fn rust_sources(relative: &str, root_file: &str, at_least: usize) -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    let mut pending: Vec<PathBuf> = vec![root.clone()];
     let mut files = Vec::new();
     for _ in 0..64 {
         let Some(dir) = pending.pop() else { break };
-        for entry in std::fs::read_dir(&dir).expect("read src") {
-            let path = entry.expect("read a src entry").path();
+        for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+            let path = entry.expect("read a source directory entry").path();
             if path.is_dir() {
                 pending.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") {
-                let name = path.file_name().expect("a file name");
+                let below = path.strip_prefix(&root).expect("a path below the root");
+                let name = below
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 let text = std::fs::read_to_string(&path).expect("read a source");
-                files.push((name.to_string_lossy().into_owned(), text));
+                files.push((name, text));
             }
         }
     }
     assert!(
         pending.is_empty(),
-        "src/ nests deeper than the walk's bound"
+        "{relative} nests deeper than the walk's bound"
     );
     assert!(
-        files.iter().any(|(name, _)| name == "main.rs") && files.len() >= 8,
-        "non-vacuity: the walk found the crate's modules; found {}",
+        files.iter().any(|(name, _)| name == root_file) && files.len() >= at_least,
+        "non-vacuity: the walk of {relative} found {root_file} and at least {at_least} \
+         files; found {}",
         files.len()
     );
     files.sort();
     files
+}
+
+/// The std functions that change what a panic does: set or take the panic hook, catch a
+/// panic, or unwind without calling the hook at all.
+const PANIC_MACHINERY: &[&str] = &["set_hook", "take_hook", "catch_unwind", "resume_unwind"];
+
+/// Where mds-cli's sources name the [`PANIC_MACHINERY`], as (function, file, the `fn` it
+/// is named in): the hook is set in one place and a panic is caught in one place, so no
+/// catch site reports a panic a second time. `resume_unwind` has no place: it unwinds
+/// without calling the hook, so its panic prints nothing and records nothing for the
+/// exit code, and on a thread that nothing catches it ends that thread alone.
+const CLI_PANIC_MACHINERY: &[(&str, &str, &str)] = &[
+    ("set_hook", "output.rs", "install_panic_hook"),
+    ("catch_unwind", "output.rs", "catch_panic"),
+];
+
+/// Where mds-core's sources name the [`PANIC_MACHINERY`]: two unit tests, each catching
+/// the panic of a check that debug builds compile in. mds-core's library code runs inside
+/// the CLI's catch, where a hook or a catch of its own would take a panic away from the
+/// CLI's hook, and an unwind without the hook would report nothing.
+const CORE_PANIC_MACHINERY: &[(&str, &str, &str)] = &[
+    (
+        "catch_unwind",
+        "resolver_tests.rs",
+        "attach_import_span_non_boundary_offset_degrades_to_zero_len_span",
+    ),
+    (
+        "catch_unwind",
+        "resolver_tests.rs",
+        "check_child_only_blocks_non_boundary_offset_degrades",
+    ),
+];
+
+/// What is wrong with the panic machinery in `sources` (see
+/// [`the_hook_writes_one_constant_and_nothing_about_the_panic`]); empty when nothing is:
+/// every [`PANIC_MACHINERY`] name in code outside the places `allowed` lists, and every
+/// listed place that does not name its function exactly once.
+fn machinery_findings(sources: &[(String, String)], allowed: &[(&str, &str, &str)]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut named = vec![0usize; allowed.len()];
+    for (name, src) in sources {
+        let code = blank(src, true);
+        for needle in PANIC_MACHINERY {
+            for (at, _) in code.match_indices(needle) {
+                let inside = innermost_fn(&code, at).map(|(fn_name, _)| fn_name);
+                let place = allowed.iter().position(|(function, file, in_fn)| {
+                    function == needle && file == name && inside.as_deref() == Some(*in_fn)
+                });
+                match place {
+                    Some(place) => named[place] += 1,
+                    None => found.push(format!(
+                        "{name}:{}: `{needle}` in `{}`",
+                        line_of(&code, at),
+                        inside.as_deref().unwrap_or("-")
+                    )),
+                }
+            }
+        }
+    }
+    for ((function, file, in_fn), count) in allowed.iter().zip(named) {
+        if count != 1 {
+            found.push(format!(
+                "{file}: `{in_fn}` must name `{function}` once; it names it {count} times"
+            ));
+        }
+    }
+    found
 }
 
 /// Where `src` runs a process without setting or removing `RUST_BACKTRACE` (see
@@ -749,6 +957,18 @@ fn hook_findings(output: &str) -> Vec<String> {
     let compact: String = text.split_whitespace().collect();
     let mut found = Vec::new();
 
+    // The panic is recorded before anything that can wait: a hook blocked in its write
+    // must not leave the run to exit without it.
+    if !code[body.start() + 1..]
+        .trim_start()
+        .starts_with("OUTPUT_STATE.note_panicked();")
+    {
+        found.push(
+            "the hook must record the panic first: its body starts \
+             `OUTPUT_STATE.note_panicked();`"
+                .to_string(),
+        );
+    }
     let writes = compact.matches("write_all(").count();
     if writes != 1 || !compact.contains("write_all(ICE_TEXT.as_bytes())") {
         found.push(format!(
@@ -871,13 +1091,26 @@ fn trigger_findings(sources: &[(String, String)]) -> Vec<String> {
 }
 
 /// What is wrong with `debug-panics` in `manifest`; empty when nothing is (see
-/// [`debug_panics_is_never_on_by_default`]).
+/// [`debug_panics_is_never_on_by_default`]): every line, comments left out, that names it
+/// in quotes — a value, which is how a feature turns another on, whether the list sits on
+/// one line or several and whatever key holds it (`default`, `features.default`) — and a
+/// `[features]` table that does not declare it as `debug-panics = []`. The declaration's
+/// key is bare, so it is no quoted mention; a key written in quotes is reported too.
 fn feature_findings(manifest: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut in_features = false;
     let mut declared = false;
-    for line in manifest.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
+    for (index, line) in manifest.lines().enumerate() {
+        let line = toml_code(line).trim();
+        if ["\"debug-panics\"", "'debug-panics'"]
+            .iter()
+            .any(|quoted| line.contains(quoted))
+        {
+            found.push(format!(
+                "Cargo.toml:{}: `{line}` names `debug-panics` as a value, which turns it on",
+                index + 1
+            ));
+        }
         if line.starts_with('[') {
             in_features = line == "[features]";
             continue;
@@ -885,20 +1118,37 @@ fn feature_findings(manifest: &str) -> Vec<String> {
         let Some((key, value)) = line.split_once('=').filter(|_| in_features) else {
             continue;
         };
-        let (key, value) = (key.trim(), value.trim());
-        if key == "debug-panics" {
+        if key.trim() == "debug-panics" {
             declared = true;
+            let value = value.trim();
             if value != "[]" {
                 found.push(format!("`debug-panics` must enable nothing; it is {value}"));
             }
-        } else if value.contains("debug-panics") {
-            found.push(format!("the `{key}` feature turns `debug-panics` on"));
         }
     }
     if !declared {
         found.push("Cargo.toml's [features] does not declare `debug-panics`".to_string());
     }
     found
+}
+
+/// `line` of a TOML file without its comment: the text before the first `#` that is not
+/// inside a string — `"…"`, with `\` escapes, or `'…'`, as TOML writes one on a line.
+fn toml_code(line: &str) -> &str {
+    let mut open: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in line.char_indices() {
+        match open {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(quote) if c == quote => open = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => open = Some(c),
+            None if c == '#' => return &line[..at],
+            None => {}
+        }
+    }
+    line
 }
 
 /// `src` with comments — and, when `literals` is set, string and char literals — blanked

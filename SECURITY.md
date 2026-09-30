@@ -150,15 +150,27 @@ fixed text, written once with its write error ignored, so a closed or failing st
 loses the text and the run still exits 101, not by a signal. A panic on a thread other
 than the one running the command — a `mds watch` helper thread, say — ends the process
 at once with the same text and exit 101, and so does a second panic while the first is
-still unwinding, which Rust would otherwise turn into an abort. Exit 101 wins over every
-other exit code, `mds watch`'s included. With `RUST_BACKTRACE` set to anything but `0`
-(`full` for every frame), a backtrace of the panicking thread follows the two lines,
-each line escaped as a status line is. It still shows no message, but its frames name
-the functions and source files the binary was built from, with the build machine's
-paths; leave `RUST_BACKTRACE` unset where that matters. A panic that Rust cannot unwind
-at all — one of the undefined-behaviour checks a debug build compiles in — prints the
-text and then aborts. `crates/mds-cli/tests/panic_hook.rs` pins this output, and pins
-the panic hook's code to one write of the fixed text.
+still unwinding, which Rust would otherwise turn into an abort. Ending the process at
+once runs no destructors, so an output being written at that moment can be left
+part-way: its temporary file (`.mds-tmp-….tmp`) can stay beside it, and stdout's reader
+can get part of the product. Exit 101 wins over every other exit code, `mds watch`'s
+included. With `RUST_BACKTRACE` set to anything but `0`, a backtrace of the panicking
+thread follows the two lines — the same frames for every value, from where the hook
+captured them, with each frame's address added for `full` — each line escaped as a
+status line is. It still shows no message, but its frames name the functions and source
+files the binary was built from, with the build machine's paths and the Rust
+toolchain's; leave `RUST_BACKTRACE` unset where that matters. A panic that Rust cannot
+unwind at all and that follows no other — one of the undefined-behaviour checks a build
+with debug assertions compiles in — can print the text and then abort.
+`crates/mds-cli/tests/panic_hook.rs` pins this output, and pins the panic hook's code to
+one write of the fixed text.
+
+A build with debug assertions — `cargo install --debug`, or a profile that turns them
+on — also compiles in a test-only trigger: with the environment variable
+`MDS_TEST_PANIC` set to `main` or `thread`, `mds` panics on purpose, to exercise the
+output above. It is compiled only under `cfg(debug_assertions)`, which `panic_hook.rs`
+pins, so a release build has it only when its profile turns debug assertions on. Build
+with debug assertions for development, not for anything you ship.
 
 **Never enable `debug-panics` in a published or production build.** Panic messages
 can contain absolute filesystem paths and other internal details that should not be
@@ -170,7 +182,9 @@ published artifacts — `napi build --release` in `release.yml` for the addon, t
 nodejs …` and `--target web …`) for the WASM package, and `maturin` with
 `pyproject.toml`'s `features = ["pyo3/abi3-py311"]` for the wheels — pass no
 `--features debug-panics`. For `mds-cli` alone, `crates/mds-cli/tests/panic_hook.rs`
-fails when a `default` feature or any other feature turns it on; the build sites are
-checked by reading them. `mds-cli` is published to crates.io, so
+fails when a line of its manifest names the feature in quotes outside a comment — how a
+`default` feature or any other feature turns it on, on one line or several — or when the
+manifest declares it as anything but `debug-panics = []`; the build sites are checked by
+reading them. `mds-cli` is published to crates.io, so
 `cargo install mds-cli --features debug-panics` builds a CLI that prints panic
 messages: build one only for your own debugging.
