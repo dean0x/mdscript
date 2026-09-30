@@ -931,19 +931,17 @@ pub(crate) fn reject_forbidden_output_path(
 
 /// Refuse an output location that is not valid UTF-8 (#390): `mds::io`, exit 2,
 /// `<what> is not valid UTF-8: "<value>"`, the value shown with U+FFFD for each invalid
-/// sequence and escaped by [`mds::escape_path_for_message`].
+/// sequence and escaped by [`mds::escape_path_for_message`]. Otherwise the value, as
+/// text.
 ///
 /// Every status line and comparison would name such a location by its lossy form, which
-/// is a different path. Callers run it up front, beside
+/// is a different path. Callers run it up front, after
 /// [`reject_forbidden_output_path`], so it is never created or written.
-pub(crate) fn reject_non_utf8_output_path(
+pub(crate) fn reject_non_utf8_output_path<'a>(
     what: &str,
-    value: &OsStr,
-) -> std::result::Result<(), mds::MdsError> {
-    if value.to_str().is_some() {
-        return Ok(());
-    }
-    Err(mds::MdsError::Io {
+    value: &'a OsStr,
+) -> std::result::Result<&'a str, mds::MdsError> {
+    value.to_str().ok_or_else(|| mds::MdsError::Io {
         message: format!(
             "{what} is not valid UTF-8: \"{}\"",
             mds::escape_path_for_message(&value.to_string_lossy())

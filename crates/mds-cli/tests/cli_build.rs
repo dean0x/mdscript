@@ -734,6 +734,10 @@ fn build_invalid_mds_json_errors() {
 
 /// An `mds.json` over its cap names the cap in the unit it is: 1,048,576 bytes is 1 MiB,
 /// not 1 MB (#390).
+///
+/// The file is named by the path the input leads to it, `.` joined to `mds.json`, so the
+/// expected text spells it with the platform's separator: `./mds.json`, `.\mds.json` on
+/// Windows.
 #[test]
 fn an_oversized_mds_json_names_its_cap_in_mib() {
     let dir = tempfile::tempdir().unwrap();
@@ -748,9 +752,11 @@ fn an_oversized_mds_json_names_its_cap_in_mib() {
 
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    let shown = "./mds.json".replace('/', std::path::MAIN_SEPARATOR_STR);
+    let expected = format!("mds.json at {shown} is too large (1048577 bytes; maximum is 1 MiB)");
     assert!(
-        stderr.contains("mds.json at ./mds.json is too large (1048577 bytes; maximum is 1 MiB)"),
-        "the cap is named in MiB; stderr: {stderr}"
+        stderr.contains(&expected),
+        "the cap is named in MiB; expected {expected:?}; stderr: {stderr}"
     );
 }
 

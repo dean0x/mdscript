@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
@@ -50,8 +51,10 @@ enum Commands {
         /// Output destination: a file path, or "-" for stdout.
         /// Defaults to `<name>.md` or `<name>.json` next to the source file, based on output kind.
         /// Mutually exclusive with --out-dir.
+        // Taken as given, like `--out-dir`: a value that is not valid UTF-8 is refused
+        // as `mds::io` by `build::reject_forbidden_output_flags`, not by the parser (#390).
         #[arg(short = 'o', long = "output", conflicts_with = "out_dir")]
-        output: Option<String>,
+        output: Option<OsString>,
         /// Output directory. The output file is named `<input-stem>.md` or `<input-stem>.json`
         /// inside this directory, based on output kind.
         /// Directory is created if it does not exist.
@@ -203,8 +206,10 @@ enum Commands {
         input: Option<PathBuf>,
         /// Output destination: a file path, or "-" for stdout.
         /// Mutually exclusive with --out-dir. Not allowed in directory mode.
+        // Taken as given, like `--out-dir`: a value that is not valid UTF-8 is refused
+        // as `mds::io` by `build::reject_forbidden_output_flags`, not by the parser (#390).
         #[arg(short = 'o', long = "output", conflicts_with = "out_dir")]
-        output: Option<String>,
+        output: Option<OsString>,
         /// Output directory for compiled files (directory mode).
         /// Output mirrors the source subtree: src/a/b/foo.mds → out/a/b/foo.md.
         /// Mutually exclusive with -o/--output.

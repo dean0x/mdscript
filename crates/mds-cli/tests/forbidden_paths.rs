@@ -661,20 +661,22 @@ fn paths_under(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// An `--out-dir` that is not valid UTF-8 is refused up front — `mds::io`, exit 2,
-/// `--out-dir is not valid UTF-8: "<value>"`, each invalid sequence shown as U+FFFD —
-/// before anything is created, by `mds build` and `mds watch` in file and directory mode
-/// (#390). Every status line and comparison would have used a lossy form of it, which
-/// names another path. `-o` is text to the argument parser, which refuses such a value
-/// itself before `mds` sees it (exit 2); nothing is created either.
+/// An output location that is not valid UTF-8 — an `--out-dir` or a `-o` — is refused
+/// up front — `mds::io`, exit 2, `<flag> is not valid UTF-8: "<value>"`, each invalid
+/// sequence shown as U+FFFD — before anything is created, by `mds build` and
+/// `mds watch` in file and directory mode (#390). Every status line and comparison
+/// would have used a lossy form of it, which names another path. The two flags are
+/// refused alike: the same check, code and words, and — for a value that also carries
+/// a forbidden character — the same order, the forbidden character first.
 ///
-/// Control: an `--out-dir` spelled in valid non-ASCII UTF-8 is created and written.
+/// Controls: an `--out-dir` and a `-o` spelled in valid non-ASCII UTF-8 are created and
+/// written, and `-o -` still writes to stdout.
 ///
 /// Unix-only: the value is built from raw bytes with `OsStrExt`. No file of that name is
 /// ever created, so the run needs a filesystem that could hold one on neither platform.
 #[cfg(unix)]
 #[test]
-fn an_out_dir_that_is_not_utf8_is_refused_before_anything_is_created() {
+fn an_output_location_that_is_not_utf8_is_refused_before_anything_is_created() {
     use std::os::unix::ffi::OsStrExt as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -682,32 +684,60 @@ fn an_out_dir_that_is_not_utf8_is_refused_before_anything_is_created() {
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src").join("a.mds"), "A\n").unwrap();
     let before = paths_under(dir.path());
-    let value = OsStr::from_bytes(b"o\x80ut");
-    let expected = format!(
-        "--out-dir is not valid UTF-8: \"o{}ut\"",
-        char::REPLACEMENT_CHARACTER
-    );
+    let replaced = char::REPLACEMENT_CHARACTER;
 
-    for (sub, input) in [
-        ("build", "in.mds"),
-        ("build", "src"),
-        ("watch", "in.mds"),
-        ("watch", "src"),
+    for (flag, value, expected) in [
+        (
+            "--out-dir",
+            OsStr::from_bytes(b"o\x80ut"),
+            format!("--out-dir is not valid UTF-8: \"o{replaced}ut\""),
+        ),
+        (
+            "-o",
+            OsStr::from_bytes(b"o\x80ut.md"),
+            format!("-o/--output is not valid UTF-8: \"o{replaced}ut.md\""),
+        ),
+    ] {
+        for (sub, input) in [
+            ("build", "in.mds"),
+            ("build", "src"),
+            ("watch", "in.mds"),
+            ("watch", "src"),
+        ] {
+            let args = [OsStr::new(sub), OsStr::new(input), OsStr::new(flag), value];
+            let label = format!("{sub} {input} {flag}");
+            let (code, text) = run(dir.path(), &args);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert!(text.contains("mds::io"), "{label}: mds::io; got: {text}");
+            assert!(
+                squash(&text).contains(&squash(&expected)),
+                "{label}: expected {expected:?}; got: {text}"
+            );
+            assert_eq!(
+                paths_under(dir.path()),
+                before,
+                "{label}: nothing is created"
+            );
+        }
+    }
+
+    // A value both hostile and not valid UTF-8 is refused for its forbidden character
+    // first, under either flag: that check runs before any other whose message quotes
+    // the value (#265).
+    for (flag, value) in [
+        ("--out-dir", OsStr::from_bytes(b"o\x1b\x80")),
+        ("-o", OsStr::from_bytes(b"o\x1b\x80.md")),
     ] {
         let args = [
-            OsStr::new(sub),
-            OsStr::new(input),
-            OsStr::new("--out-dir"),
+            OsStr::new("build"),
+            OsStr::new("in.mds"),
+            OsStr::new(flag),
             value,
         ];
-        let label = format!("{sub} {input} --out-dir");
+        let label = format!("build in.mds {flag} with U+001B and 0x80");
         let (code, text) = run(dir.path(), &args);
         assert_eq!(code, Some(2), "{label}: got: {text}");
-        assert!(text.contains("mds::io"), "{label}: mds::io; got: {text}");
-        assert!(
-            squash(&text).contains(&squash(&expected)),
-            "{label}: expected {expected:?}; got: {text}"
-        );
+        assert_refusal(&text, ESC, &format!("o{}{replaced}", escaped(ESC)), &label);
         assert_eq!(
             paths_under(dir.path()),
             before,
@@ -715,29 +745,28 @@ fn an_out_dir_that_is_not_utf8_is_refused_before_anything_is_created() {
         );
     }
 
-    let output = OsStr::from_bytes(b"o\x80ut.md");
-    let (code, text) = run(
-        dir.path(),
-        &[
-            OsStr::new("build"),
-            OsStr::new("in.mds"),
-            OsStr::new("-o"),
-            output,
-        ],
+    let (code, text) = run(dir.path(), &["build", "in.mds", "-o", "-"]);
+    assert_eq!(code, Some(0), "control -o -: got: {text}");
+    assert!(text.contains("Hi"), "control -o -: to stdout; got: {text}");
+    assert_eq!(
+        paths_under(dir.path()),
+        before,
+        "control -o -: stdout, no file"
     );
-    assert_eq!(code, Some(2), "-o: got: {text}");
-    assert!(
-        text.contains("UTF-8"),
-        "-o: the parser names it; got: {text}"
-    );
-    assert_eq!(paths_under(dir.path()), before, "-o: nothing is created");
 
     let clean = "o\u{e9}ut";
     let (code, text) = run(dir.path(), &["build", "in.mds", "--out-dir", clean]);
-    assert_eq!(code, Some(0), "control: got: {text}");
+    assert_eq!(code, Some(0), "control --out-dir: got: {text}");
     assert!(
         dir.path().join(clean).join("in.md").is_file(),
         "control: a UTF-8 --out-dir is created and written"
+    );
+    let clean = "o\u{e9}ut.md";
+    let (code, text) = run(dir.path(), &["build", "in.mds", "-o", clean]);
+    assert_eq!(code, Some(0), "control -o: got: {text}");
+    assert!(
+        dir.path().join(clean).is_file(),
+        "control: a UTF-8 -o is written"
     );
 }
 

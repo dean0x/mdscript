@@ -3,7 +3,7 @@
 //! All helpers in this module are `pub(crate)` so that `watch.rs` can reuse them
 //! without duplicating logic or bypassing resource limits.
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -1142,7 +1142,8 @@ pub(crate) fn admit_output(
 
 pub(crate) struct BuildArgs {
     pub(crate) input: Option<PathBuf>,
-    pub(crate) output: Option<String>,
+    /// `-o/--output` as given; [`reject_forbidden_output_flags`] turns it into text.
+    pub(crate) output: Option<OsString>,
     pub(crate) out_dir: Option<PathBuf>,
     pub(crate) vars: Option<PathBuf>,
     pub(crate) set_vars: Vec<(String, String)>,
@@ -1453,36 +1454,42 @@ fn has_sidecar_head(reader: &mut impl Read, expected_basename: &str) -> std::io:
 /// Refuse `-o/--output` and `--out-dir` values that name no location mds can write
 /// and show faithfully: `mds::io`, exit 2. Shared by `build` and `watch`, which both
 /// call it before any other work, so a refused location is never created or written.
+/// Returns the `-o` value as text, the form the rest of the run uses.
 ///
-/// - A forbidden path character (#265), as typed, then in the form the value resolves
-///   to (a symlink into a hostile-named directory).
-/// - An `--out-dir` that is not valid UTF-8 (#390). `-o` needs no check here: the
-///   argument parser takes it as text and refuses such a value itself.
-/// - A relative value when the working directory cannot be determined (#390): it names
-///   no directory, and is refused in [`crate::output::current_dir`]'s words rather than
-///   resolved against `"."`.
+/// Each value is checked in the same order:
+/// - A forbidden path character (#265), as typed.
+/// - A value that is not valid UTF-8 (#390).
+/// - A forbidden path character in the form the value resolves to (#265: a symlink into
+///   a hostile-named directory) — for `-o`, unless it is `-`, stdout. A relative value
+///   is resolved against the working directory, so one that cannot be determined
+///   refuses it (#390): it names no directory, and is refused in
+///   [`crate::output::current_dir`]'s words rather than resolved against `"."`.
 pub(crate) fn reject_forbidden_output_flags(
-    output: Option<&str>,
+    output: Option<&OsStr>,
     out_dir: Option<&Path>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     use crate::output::{
         reject_forbidden_output_path, reject_forbidden_resolved_output_path,
         reject_non_utf8_output_path,
     };
-    if let Some(o) = output {
-        let shown = std::ffi::OsStr::new(o);
-        reject_forbidden_output_path("-o/--output", shown)?;
-        // `-o -` is stdout, not a path.
-        if o != "-" {
-            reject_forbidden_resolved_output_path("-o/--output", Path::new(o), shown)?;
+    let output = match output {
+        Some(o) => {
+            reject_forbidden_output_path("-o/--output", o)?;
+            let text = reject_non_utf8_output_path("-o/--output", o)?;
+            // `-o -` is stdout, not a path.
+            if text != "-" {
+                reject_forbidden_resolved_output_path("-o/--output", Path::new(o), o)?;
+            }
+            Some(text.to_owned())
         }
-    }
+        None => None,
+    };
     if let Some(d) = out_dir {
         reject_forbidden_output_path("--out-dir", d.as_os_str())?;
         reject_non_utf8_output_path("--out-dir", d.as_os_str())?;
         reject_forbidden_resolved_output_path("--out-dir", d, d.as_os_str())?;
     }
-    Ok(())
+    Ok(output)
 }
 
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
@@ -1499,8 +1506,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         inline,
         embed_sources: flag_embed_sources,
     } = args;
-    // #265: refuse a hostile output location before anything is read or compiled.
-    reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
+    // #265, #390: refuse a hostile output location before anything is read or compiled.
+    let output = reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
     let resolved = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,

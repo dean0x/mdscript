@@ -92,7 +92,8 @@ use crate::output::{
 
 pub(crate) struct WatchArgs {
     pub(crate) input: Option<PathBuf>,
-    pub(crate) output: Option<String>,
+    /// `-o/--output` as given; `reject_forbidden_output_flags` turns it into text.
+    pub(crate) output: Option<std::ffi::OsString>,
     pub(crate) out_dir: Option<PathBuf>,
     pub(crate) vars: Option<PathBuf>,
     pub(crate) set_vars: Vec<(String, String)>,
@@ -1144,8 +1145,9 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         poll_interval,
     } = args;
 
-    // #265: refuse a hostile output location before anything is read or compiled.
-    crate::build::reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
+    // #265, #390: refuse a hostile output location before anything is read or compiled.
+    let output =
+        crate::build::reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
 
     // ── Input mode dispatch ───────────────────────────────────────────────────
 
