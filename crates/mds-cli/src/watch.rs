@@ -498,9 +498,7 @@ fn stop_watching(quiet: bool, why: StopReason) {
     }
     match why {
         StopReason::Interrupted => crate::output::ewriteln!("Stopped watching."),
-        StopReason::StdoutClosed => {
-            crate::output::ewriteln!("Stopped watching (stdout closed).");
-        }
+        StopReason::StdoutClosed => crate::output::ewriteln!("Stopped watching (stdout closed)."),
     }
 }
 
