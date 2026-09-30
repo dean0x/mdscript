@@ -8,6 +8,8 @@
 //! - `-` (stdin): read from stdin, report diagnostics to stderr, exit by severity.
 //!   With `--fix`: fixed source → stdout, diagnostics → stderr.
 //!
+//! Each input is a [`LintSource`], which gives it the names lint shows for it.
+//!
 //! # Channel discipline
 //!
 //! - Human diagnostics → **stderr** via miette Report.
@@ -69,6 +71,7 @@
 //! `mds::io`, and the funnel lifts the code to at least 2; in directory mode a file whose
 //! diff it lost counts under "with errors" (#157).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -121,6 +124,73 @@ struct LintFlags {
     diff: bool,
     quiet: bool,
     format: LintFormat,
+}
+
+/// One input of `mds lint`, and the names lint shows for it (#173).
+///
+/// Stdin, a file argument and each file of a directory get their names here, so the
+/// three modes cannot drift into three conventions:
+///
+/// - [`display_label`](Self::display_label) — the name the input's diagnostics carry:
+///   each `diag.file`, hence the JSON `files[].file` key, and the name a human
+///   diagnostic frame renders the source under.
+/// - [`diff_label`](Self::diff_label) — the name a `--fix --diff` header shows.
+///
+/// `Clean:` shows the display label. The other status lines that name the input —
+/// `Fixed:`, `Partially fixed:`, `Would fix:`, and in a directory run `fix rejected:`
+/// and the cap notice — show the same text as the diff header, but spell it inside the
+/// writer macro, as [`STDIN_DISPLAY_LABEL`] or `safe_path` of the path, because the
+/// print-discipline guard accepts only an escape call or an allowlisted name there.
+enum LintSource<'a> {
+    /// `mds lint -`: the source comes from stdin and has no path.
+    Stdin,
+    /// `mds lint <file>`: the path as typed, and its file name.
+    File { typed: &'a Path, name: &'a str },
+    /// A file under `mds lint <dir>`: the path the walk produced, and its key relative to
+    /// the directory argument (see [`relative_display`]).
+    DirEntry { path: &'a Path, key: &'a str },
+}
+
+impl<'a> LintSource<'a> {
+    /// A file argument, named by its file name.
+    ///
+    /// `mds::io` when the path has no file name in UTF-8, which cannot happen once
+    /// [`read_source_file`] has read it: [`ensure_existing_mds_file`] accepted the path,
+    /// so it ends in a file name with the `.mds` extension, and the read refuses a path
+    /// whose canonical form — ending in the file's own name, never a link's — is not
+    /// valid UTF-8.
+    fn file(typed: &'a Path) -> std::result::Result<Self, MdsError> {
+        let name = typed
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| MdsError::Io {
+                message: format!(
+                    "path has no UTF-8 file name: {}",
+                    mds::escape_path_for_message(&typed.to_string_lossy())
+                ),
+            })?;
+        Ok(Self::File { typed, name })
+    }
+
+    /// The name the input's diagnostics carry: [`STDIN_DISPLAY_LABEL`] for stdin, the
+    /// file name of a file argument, the root-relative key of a directory entry.
+    fn display_label(&self) -> &'a str {
+        match *self {
+            Self::Stdin => STDIN_DISPLAY_LABEL,
+            Self::File { name, .. } => name,
+            Self::DirEntry { key, .. } => key,
+        }
+    }
+
+    /// The name a unified-diff header shows, escaped for a terminal:
+    /// [`STDIN_DISPLAY_LABEL`] for stdin, otherwise the path as typed or walked.
+    fn diff_label(&self) -> Cow<'a, str> {
+        match *self {
+            Self::Stdin => Cow::Borrowed(STDIN_DISPLAY_LABEL),
+            Self::File { typed, .. } => Cow::Owned(safe_path(typed)),
+            Self::DirEntry { path, .. } => Cow::Owned(safe_path(path)),
+        }
+    }
 }
 
 /// Entry point for `mds lint`. Always returns `Ok(())`; every other exit goes through
@@ -315,12 +385,10 @@ fn emit_unknown_rule_warning(unknown: &mds::UnknownRuleNames, quiet: bool) {
 /// This function replaces the field with the caller-supplied relative path so
 /// the JSON output uses distinct, navigable paths.
 ///
-/// **AD-211-4 (stdin relabel):** also used for stdin mode — called with
-/// `STDIN_DISPLAY_LABEL` immediately after every `mds::lint_str_with` call so
-/// that `diag.file` in the JSON wire output reads `"<stdin>"` rather than the
-/// internal VFS key `"input.mds"` (`STRING_SOURCE_MAP_LABEL`).
-///
-/// Call this immediately after every `mds::lint` / `mds::lint_str_with` call.
+/// Call this immediately after every `mds::lint` / `mds::lint_str_with` call, with the
+/// input's [`LintSource::display_label`]. For stdin that is `<stdin>`, so `diag.file` in
+/// the JSON wire output reads `"<stdin>"` rather than the internal VFS key
+/// `"input.mds"` (`STRING_SOURCE_MAP_LABEL`).
 fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
     for diag in &mut result.diagnostics {
         diag.file = Some(display.to_string());
@@ -580,8 +648,8 @@ enum FixFileOutcome {
 ///
 /// `base_dir` is the file's parent (for reverify recompile).
 ///
-/// `display_label` is the caller-supplied display path (relative, forward-slash-normalised)
-/// written into every `diag.file` in residual results via `set_diag_display_path`; it
+/// `display_label` is the input's [`LintSource::display_label`], written into every
+/// `diag.file` in residual results via `set_diag_display_path`; it
 /// becomes the `files[].file` wire key after `to_canonical_json` applies
 /// `sanitize_control_chars_wire`.  This is the value that appears in the JSON wire output
 /// and must be pre-sanitized by the caller for error-envelope entries that bypass
@@ -864,6 +932,7 @@ fn run_lint_stdin(
             crate::output::exit(code);
         }
     };
+    let input = LintSource::Stdin;
     // The working directory, as the caller did not type it: `"."` anchors at it and is
     // what a refusal of it shows (see `read_stdin`).
     let cwd = Path::new(".");
@@ -899,7 +968,7 @@ fn run_lint_stdin(
     // "files[].file" emits "<stdin>" across all code paths (AC-P1-01); for the
     // write path, plan_and_apply_fixes relabels its internally produced residual
     // before returning.
-    set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
+    set_diag_display_path(&mut result, input.display_label());
 
     // D4 (AD-216-11): status message, not an error — suppress under --quiet.
     // PF-004: stdin is a separate emitter from file/directory mode; the cap notice
@@ -923,12 +992,12 @@ fn run_lint_stdin(
                 cwd,
                 runtime_vars.clone(),
                 &config,
-                STDIN_DISPLAY_LABEL,
+                input.display_label(),
             );
-            // AD-211-1: pass STDIN_DISPLAY_LABEL so span context renders "<stdin>", not
-            // the internal STRING_SOURCE_MAP_LABEL ("input.mds").
+            // The display label, `<stdin>`, is what span context renders, not the
+            // internal STRING_SOURCE_MAP_LABEL ("input.mds").
             let named_source = if format == LintFormat::Human {
-                Some((STDIN_DISPLAY_LABEL, source.as_str()))
+                Some((input.display_label(), source.as_str()))
             } else {
                 None
             };
@@ -943,7 +1012,7 @@ fn run_lint_stdin(
                     ref residual,
                 } => {
                     if diff {
-                        let diff_str = render_unified_diff(&source, fixed, STDIN_DISPLAY_LABEL);
+                        let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
                         emit_stdout(&diff_str);
                     }
                     if check && !quiet {
@@ -973,7 +1042,7 @@ fn run_lint_stdin(
             cwd,
             runtime_vars,
             &config,
-            STDIN_DISPLAY_LABEL,
+            input.display_label(),
         );
         let (output_src, diag_result) = match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1009,19 +1078,19 @@ fn run_lint_stdin(
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
-        // Stdin diagnostics: pass source text for span context rendering.
-        // AD-211-1: use STDIN_DISPLAY_LABEL so source frame header reads "<stdin>".
-        let named_source = (STDIN_DISPLAY_LABEL, output_src.as_str());
+        // Stdin diagnostics: pass source text for span context rendering, under the
+        // display label, so the source frame header reads "<stdin>".
+        let named_source = (input.display_label(), output_src.as_str());
         render_result_human(&diag_result, quiet, named_source);
         emit_stdout(&output_src);
         exit_by_severity(&diag_result);
         return Ok(());
     }
 
-    // Report-only mode: pass stdin source for span context rendering.
-    // AD-211-1: use STDIN_DISPLAY_LABEL so span source frame reads "<stdin>".
+    // Report-only mode: pass stdin source for span context rendering, under the display
+    // label, so the span source frame reads "<stdin>".
     let named_source = if format == LintFormat::Human {
-        Some((STDIN_DISPLAY_LABEL, source.as_str()))
+        Some((input.display_label(), source.as_str()))
     } else {
         None
     };
@@ -1066,10 +1135,15 @@ fn run_lint_file(
             crate::output::exit(mds_error_exit_code(&e));
         }
     };
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("<file>");
+    // Named only after the read, which is what makes a name that is not UTF-8
+    // impossible here (see `LintSource::file`).
+    let input = match LintSource::file(path) {
+        Ok(input) => input,
+        Err(e) => {
+            emit_analysis_failure_json_or_stderr(&e, format, None);
+            crate::output::exit(mds_error_exit_code(&e));
+        }
+    };
 
     let mut result = match mds::lint(path, runtime_vars.clone(), &config) {
         Ok(r) => r,
@@ -1085,8 +1159,8 @@ fn run_lint_file(
     // arms rely on mds::lint independently deriving the same basename — correct
     // today, but a silent coupling that would break if the two derivations ever
     // diverged.  Centralising the relabel here is the explicit invariant:
-    // every FixFileOutcome carries `filename` as its display path.
-    set_diag_display_path(&mut result, filename);
+    // every FixFileOutcome carries the input's display label.
+    set_diag_display_path(&mut result, input.display_label());
 
     // D4 (AD-216-11): status message, not an error — suppress under --quiet
     // (the global `--quiet` help text: "Suppress status and diagnostic output; errors
@@ -1100,13 +1174,19 @@ fn run_lint_file(
         );
     }
 
-    // Named source for span rendering: (display filename, source text).
-    let named_source = Some((filename, source.as_str()));
+    // Named source for span rendering: (display label, source text).
+    let named_source = Some((input.display_label(), source.as_str()));
 
     // ── Write path: --fix without preview ────────────────────────────────────
     if fix && !check && !diff {
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, runtime_vars, &config, filename);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            base_dir,
+            runtime_vars,
+            &config,
+            input.display_label(),
+        );
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1151,7 +1231,7 @@ fn run_lint_file(
             FixFileOutcome::NothingToFix { original } => {
                 emit_result(format, &original, quiet, named_source);
                 if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
-                    crate::output::ewriteln!("Clean: {}", safe_file_display(filename));
+                    crate::output::ewriteln!("Clean: {}", safe_file_display(input.display_label()));
                 }
                 exit_by_severity(&original);
             }
@@ -1164,7 +1244,14 @@ fn run_lint_file(
     // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
     // a diff or check result could misrepresent what --fix would actually do.
     if fix && (check || diff) {
-        let preview = preview_fixes(&result, &source, base_dir, runtime_vars, &config, filename);
+        let preview = preview_fixes(
+            &result,
+            &source,
+            base_dir,
+            runtime_vars,
+            &config,
+            input.display_label(),
+        );
         match preview {
             // ONE arm for both --check and --diff (R1): the emitted body stays
             // PRE-fix — the preview reports what is wrong NOW — and the exit code
@@ -1174,8 +1261,7 @@ fn run_lint_file(
                 ref residual,
             } => {
                 if diff {
-                    let label = safe_path(path);
-                    let diff_str = render_unified_diff(&source, fixed, &label);
+                    let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
                     emit_stdout(&diff_str);
                 }
                 if check && !quiet {
@@ -1206,7 +1292,7 @@ fn run_lint_file(
     // ── Report-only mode (no --fix) ───────────────────────────────────────────
     emit_result(format, &result, quiet, named_source);
     if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
-        crate::output::ewriteln!("Clean: {}", safe_file_display(filename));
+        crate::output::ewriteln!("Clean: {}", safe_file_display(input.display_label()));
     }
     exit_by_severity(&result);
     Ok(())
@@ -1637,6 +1723,11 @@ fn lint_one_file_accumulating(
         ..
     } = ctx.flags;
 
+    let input = LintSource::DirEntry {
+        path: file,
+        key: display_path,
+    };
+
     // `display_path` is the lint-root-relative key computed once by
     // `run_lint_directory`'s pre-pass (#217) — it is never recomputed here, so a
     // path this helper could not name has already failed the whole run.  It is
@@ -1652,7 +1743,7 @@ fn lint_one_file_accumulating(
     // key in diagnostic entries — hostile filenames cannot inject control, bidi,
     // or separator characters into either entry type (spec.md §lint-json `file`
     // contract; ADR-008).
-    let file_key = mds::sanitize_control_chars_wire(display_path).into_owned();
+    let file_key = mds::sanitize_control_chars_wire(input.display_label()).into_owned();
 
     // `source` is only consumed in the fix branch (below); the report-only/JSON
     // path does not need it — mds::lint() reads the file independently (I-06).
@@ -1688,7 +1779,7 @@ fn lint_one_file_accumulating(
         }
     };
     // Remap basename-only file field → relative display path.
-    set_diag_display_path(&mut result, display_path);
+    set_diag_display_path(&mut result, input.display_label());
 
     if result.truncated {
         *any_truncated = true;
@@ -1725,7 +1816,7 @@ fn lint_one_file_accumulating(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            display_path,
+            input.display_label(),
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1815,7 +1906,7 @@ fn lint_one_file_accumulating(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            display_path,
+            input.display_label(),
         ) {
             PreviewOutcome::WouldFix {
                 ref fixed,
@@ -1823,8 +1914,7 @@ fn lint_one_file_accumulating(
             } => {
                 *any_would_fix = true;
                 let diff_lost = if diff {
-                    let label = safe_path(file);
-                    let diff_str = render_unified_diff(&source, fixed, &label);
+                    let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
                     emit_stdout(&diff_str)
                 } else {
                     false
@@ -1878,6 +1968,11 @@ fn lint_one_file_human(
         ..
     } = ctx.flags;
 
+    let input = LintSource::DirEntry {
+        path: file,
+        key: display_path,
+    };
+
     // `display_path` is the lint-root-relative key computed once by
     // `run_lint_directory`'s pre-pass (#217), normalised to forward slashes and
     // identical to the unsanitized base used by that pre-pass's sort (AC-P1-10).
@@ -1907,7 +2002,7 @@ fn lint_one_file_human(
     };
 
     // Named source for span rendering: relative display path + source text.
-    let named_source = (display_path, source.as_str());
+    let named_source = (input.display_label(), source.as_str());
 
     let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
@@ -1921,7 +2016,7 @@ fn lint_one_file_human(
         }
     };
     // Remap basename-only file field → relative display path.
-    set_diag_display_path(&mut result, display_path);
+    set_diag_display_path(&mut result, input.display_label());
 
     if result.truncated {
         *any_truncated = true;
@@ -1944,7 +2039,7 @@ fn lint_one_file_human(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            display_path,
+            input.display_label(),
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -2022,7 +2117,7 @@ fn lint_one_file_human(
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            display_path,
+            input.display_label(),
         ) {
             PreviewOutcome::WouldFix {
                 ref fixed,
@@ -2030,8 +2125,7 @@ fn lint_one_file_human(
             } => {
                 *any_would_fix = true;
                 let diff_lost = if diff {
-                    let label = safe_path(file);
-                    let diff_str = render_unified_diff(&source, fixed, &label);
+                    let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
                     emit_stdout(&diff_str)
                 } else {
                     false
