@@ -615,10 +615,18 @@ fn preview_exit_code(residual: &mds::LintResult) -> i32 {
     result_exit_code(residual).max(1)
 }
 
-// ── Fix pipeline helpers ──────────────────────────────────────────────────────
+// ── Fix pipeline ──────────────────────────────────────────────────────────────
 
-/// Outcome of the `--fix` pipeline for one file.
-enum FixFileOutcome {
+/// What the `--fix` pipeline made of one input's findings (#173).
+///
+/// `--fix` and its preview (`--fix --check` / `--fix --diff`) read the same outcome of the
+/// same pipeline, so they cannot disagree about what a fix would do. `--fix` writes the
+/// source of `Fixed` and `PartiallyFixed`; the preview reads either of them as "would
+/// fix", shows the would-be source in `--diff`, and takes its exit code from the residual
+/// ([`preview_exit_code`]). After `Rejected` and `NothingToFix`, the findings the pipeline
+/// was given stand.
+enum FixPipelineOutcome {
+    /// Every planned edit applied.
     Fixed {
         new_source: String,
         residual: mds::LintResult,
@@ -628,130 +636,143 @@ enum FixFileOutcome {
     /// Produced when `apply_fixes_incremental` falls back to the per-edit path and not
     /// all edits pass. The `new_source` is the partially-fixed text; `residual` carries
     /// remaining diagnostics (from the last successful per-edit reverify).
-    /// `applied_count` / `total_count` are used for the summary line.
+    /// `applied_count` / `total_count` are used for the `--fix` summary line.
     PartiallyFixed {
         new_source: String,
         residual: mds::LintResult,
         applied_count: usize,
         total_count: usize,
     },
-    Rejected {
-        reason: String,
-        original: mds::LintResult,
-    },
-    NothingToFix {
-        original: mds::LintResult,
-    },
+    /// No edit applied: the plan was refused (e.g. an overlap), or every candidate was.
+    /// Carries the human-readable reason.
+    Rejected { reason: String },
+    /// No fixable edit, and no overlap.
+    NothingToFix,
 }
 
-/// Run the `--fix` pipeline for a single file's lint result.
+/// The check every candidate source must pass before the fix pipeline accepts it, in
+/// `--fix` and its preview alike.
 ///
-/// `base_dir` is the file's parent (for reverify recompile).
+/// [`verify`](Self::verify) refuses a candidate that `mds::lint_str_with` cannot lint —
+/// one that no longer resolves — and, when every planned edit is output-neutral
+/// (`mds::fix::is_output_neutral`) and the original source compiles, one whose compiled
+/// output differs from the original's. Otherwise it returns the candidate's findings, and
+/// `mds::fix::apply_fixes_incremental` refuses a candidate that has more findings than the
+/// original for a rule the plan does not target.
 ///
-/// `display_label` is the input's [`LintSource::display_label`], written into every
-/// `diag.file` in residual results via `set_diag_display_path`; it
-/// becomes the `files[].file` wire key after `to_canonical_json` applies
-/// `sanitize_control_chars_wire`.  This is the value that appears in the JSON wire output
-/// and must be pre-sanitized by the caller for error-envelope entries that bypass
-/// `to_canonical_json`.
-///
-/// ## Reverify gate (AC-F-20)
-///
-/// The reverify closure checks three conditions:
-/// 1. Recompile-success — fixed source must still compile.
-/// 2. No-new-untargeted-diagnostics — edit must not introduce new problems.
-/// 3. Output byte-equality — when the original source is standalone-compilable,
-///    compiled output of the fixed source must be byte-identical to the original.
-///
-/// If the original source does not compile (e.g. missing runtime vars), the
-/// output-diff is skipped — conditions 1 and 2 still apply, and Tier B is
-/// already suggestion-only (non-standalone) in that scenario.
-fn plan_and_apply_fixes(
-    result: mds::LintResult,
-    source: &str,
-    base_dir: &Path,
-    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
-    config: &mds::LintConfig,
-    display_label: &str,
-) -> FixFileOutcome {
-    let is_standalone = result.is_standalone;
-    let plan = mds::fix::plan_fixes_with_options(&result, source, is_standalone);
+/// When the original does not compile (e.g. it needs runtime vars) the output check is
+/// skipped; the other checks still apply, and Tier B is already suggestion-only for such
+/// a source (it is not standalone). `legacy-interpolation` edits change compiled output
+/// on purpose — they turn plain `{x}` text into `{{x}}` interpolation — so a plan with any
+/// such edit skips the output check for every edit in it.
+struct ReverifyGate<'a> {
+    base_dir: &'a Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    config: &'a mds::LintConfig,
+    /// The original source's compiled output when the output check applies; `None` when
+    /// the plan changes output on purpose or the original does not compile.
+    original_output: Option<mds::CompiledOutput>,
+}
 
-    // Treat overlap_rejected as "something to do" — don't short-circuit as NothingToFix
-    // when edits were rejected due to overlap.  The incremental fallback (per-edit retry)
-    // handles individual edits that survive the overlap check.
-    if plan.edits.is_empty() && !plan.overlap_rejected {
-        return FixFileOutcome::NothingToFix { original: result };
+impl<'a> ReverifyGate<'a> {
+    /// The gate for `plan`'s candidates of `source`, which resolve against `base_dir`.
+    fn new(
+        plan: &mds::fix::FixPlan,
+        source: &str,
+        base_dir: &'a Path,
+        runtime_vars: Option<HashMap<String, mds::Value>>,
+        config: &'a mds::LintConfig,
+    ) -> Self {
+        let all_output_neutral = plan
+            .edits
+            .iter()
+            .all(|e| mds::fix::is_output_neutral(&e.rule));
+        let original_output =
+            mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
+                .ok()
+                .map(|r| r.output)
+                .filter(|_| all_output_neutral);
+        Self {
+            base_dir,
+            runtime_vars,
+            config,
+            original_output,
+        }
     }
 
-    // Capture total edit count before moving plan into apply_fixes_incremental.
-    // Used to compute the "{applied} of {total}" summary for PartiallyFixed output.
-    let total_edits = plan.edits.len();
-
-    // `legacy-interpolation` edits intentionally change compiled output (they migrate
-    // `{x}` plain-text to `{{x}}` interpolation).  When the plan contains any such
-    // edit, the output byte-equality gate below must be skipped — it only applies to
-    // output-neutral fixes (dup-import removal, empty-block removal, etc.).
-    let all_output_neutral = plan
-        .edits
-        .iter()
-        .all(|e| mds::fix::is_output_neutral(&e.rule));
-
-    // AC-F-20 output-delta baseline: compile the original source once.
-    // If it fails (e.g. missing runtime vars at eval time), skip the output-diff —
-    // existing gates (recompile-success, no-new-diagnostics) still apply.
-    let original_output =
-        mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
-            .ok()
-            .map(|r| r.output);
-
-    let base_dir_owned = base_dir.to_path_buf();
-    let config_clone = config.clone();
-    // apply_fixes_incremental requires F: Fn (not FnOnce) — the reverify closure
-    // may be called up to plan.edits.len()+1 times (batch attempt + per-edit fallback).
-    // All captured variables are either borrowed (&) or cloned inside, so the closure
-    // satisfies Fn without any extra effort.
-    let outcome = mds::fix::apply_fixes_incremental(source, plan, &result, |fixed| {
+    /// The candidate's findings, or the reason it is refused. `apply_fixes_incremental`
+    /// calls it for the whole plan and, when that candidate is refused, for each edit on
+    /// its own.
+    fn verify(&self, candidate: &str) -> std::result::Result<mds::LintResult, MdsError> {
         let residual = mds::lint_str_with(
-            fixed,
-            Some(&base_dir_owned),
-            runtime_vars.clone(),
-            &config_clone,
+            candidate,
+            Some(self.base_dir),
+            self.runtime_vars.clone(),
+            self.config,
         )?;
-
-        // AC-F-20 output byte-equality gate: refuse if the fix changes compiled output.
-        // Skipped when the plan contains any output-changing rule (currently only
-        // `legacy-interpolation`) — those fixes intentionally alter compiled output
-        // and the gate would always reject them.
-        if all_output_neutral {
-            if let Some(ref orig_out) = original_output {
-                match mds::compile_str_collecting_warnings(
-                    fixed,
-                    Some(&base_dir_owned),
-                    runtime_vars.clone(),
-                ) {
-                    Ok(fixed_compile) if fixed_compile.output != *orig_out => {
-                        return Err(MdsError::Io {
-                            message: "lint --fix would change compiled output; \
-                                      edit reverted to preserve template semantics"
-                                .to_string(),
-                        });
-                    }
-                    _ => {} // outputs match, or fixed source didn't compile (lint_str_with caught it)
+        if let Some(original_output) = &self.original_output {
+            match mds::compile_str_collecting_warnings(
+                candidate,
+                Some(self.base_dir),
+                self.runtime_vars.clone(),
+            ) {
+                Ok(compiled) if compiled.output != *original_output => {
+                    return Err(MdsError::Io {
+                        message: "lint --fix would change compiled output; \
+                                  edit reverted to preserve template semantics"
+                            .to_string(),
+                    });
                 }
+                // Same output, or the candidate does not compile (the lint above refused
+                // that already).
+                _ => {}
             }
         }
-
         Ok(residual)
-    });
+    }
+}
+
+/// Run the fix pipeline over `input`'s findings: plan the edits, pass the candidates
+/// through the [`ReverifyGate`], and apply the edits it accepts to `source` in memory.
+/// Nothing is written here: `--fix` writes the outcome's source, and its preview shows
+/// it (see [`FixPipelineOutcome`]).
+///
+/// `result` is `input`'s lint result, relabelled with [`LintSource::display_label`];
+/// every residual diagnostic gets the same label through [`set_diag_display_path`], in
+/// place of the internal name `mds::lint_str_with` gives a candidate. It becomes the
+/// JSON `files[].file` key once `to_canonical_json` applies
+/// `sanitize_control_chars_wire`. `base_dir` is what a candidate resolves against: the
+/// file's parent, or the working directory for stdin.
+fn run_fix_pipeline(
+    input: &LintSource<'_>,
+    result: &mds::LintResult,
+    source: &str,
+    base_dir: &Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    config: &mds::LintConfig,
+) -> FixPipelineOutcome {
+    let plan = mds::fix::plan_fixes_with_options(result, source, result.is_standalone);
+
+    // An overlap clears the plan's edits, yet it is not "nothing to fix":
+    // `apply_fixes_incremental` reports it as a rejection.
+    if plan.edits.is_empty() && !plan.overlap_rejected {
+        return FixPipelineOutcome::NothingToFix;
+    }
+
+    // Counted before the plan moves into `apply_fixes_incremental`, for the
+    // "{applied} of {total}" summary of a partial fix.
+    let total_edits = plan.edits.len();
+    let gate = ReverifyGate::new(&plan, source, base_dir, runtime_vars, config);
+    let outcome =
+        mds::fix::apply_fixes_incremental(source, plan, result, |candidate| gate.verify(candidate));
 
     match outcome {
         mds::fix::FixOutcome::Fixed {
             source: new_source,
             mut residual,
         } => {
-            set_diag_display_path(&mut residual, display_label);
-            FixFileOutcome::Fixed {
+            set_diag_display_path(&mut residual, input.display_label());
+            FixPipelineOutcome::Fixed {
                 new_source,
                 residual,
             }
@@ -761,148 +782,19 @@ fn plan_and_apply_fixes(
             mut residual,
             rejected,
         } => {
-            set_diag_display_path(&mut residual, display_label);
-            FixFileOutcome::PartiallyFixed {
+            set_diag_display_path(&mut residual, input.display_label());
+            FixPipelineOutcome::PartiallyFixed {
                 new_source,
                 residual,
                 applied_count: total_edits - rejected.len(),
                 total_count: total_edits,
             }
         }
-        mds::fix::FixOutcome::Rejected { source: _, reason } => FixFileOutcome::Rejected {
-            reason,
-            original: result,
-        },
-        mds::fix::FixOutcome::NothingToFix => FixFileOutcome::NothingToFix { original: result },
-        // FixOutcome is #[non_exhaustive]: a wildcard arm is required when
-        // matching from outside mds-core.  New variants added in future
-        // releases should be plumbed here; until then, treat them as no-ops.
-        _ => FixFileOutcome::NothingToFix { original: result },
-    }
-}
-
-/// Outcome of the preview fix pipeline (`--fix --check` / `--fix --diff`).
-///
-/// Distinguishes "would fix", "rejected by reverify gate", and "nothing to fix"
-/// so that callers can surface rejection reasons in `--fix --check` output
-/// (PF-004: preview must use the same gated pipeline as apply and be equally honest
-/// about outcomes).
-enum PreviewOutcome {
-    /// At least one edit would be applied.  Carries the would-be fixed source
-    /// (for `--diff` rendering) and the residual post-fix [`mds::LintResult`]
-    /// (for the R1 preview exit code — `preview_exit_code(&residual)`).
-    WouldFix {
-        fixed: String,
-        residual: mds::LintResult,
-    },
-    /// Every edit was refused by the reverify gate (overlap or recompile failure);
-    /// contains the human-readable rejection reason.
-    Rejected(String),
-    /// No fixable edits exist or the plan is empty with no overlap.
-    NothingToFix,
-}
-
-/// Run the fix pipeline in preview mode (for `--fix --check` / `--fix --diff`).
-///
-/// Routes through the same gated pipeline as the write path — plan, reverify, and
-/// apply — but does NOT write to disk.  Returns [`PreviewOutcome::WouldFix`] with
-/// the would-be fixed source AND the residual post-fix result when at least one
-/// edit would be applied; [`PreviewOutcome::Rejected`] with the rejection reason
-/// when the reverify gate refused every edit; [`PreviewOutcome::NothingToFix`]
-/// when the plan is empty.
-///
-/// `display_label` mirrors the `plan_and_apply_fixes` contract: it is written
-/// into every residual `diag.file` via `set_diag_display_path` so the residual
-/// carries the same display path as the write path's residual would (R1) —
-/// without it the residual would leak the basename / `STRING_SOURCE_MAP_LABEL`
-/// that `mds::lint_str_with` sets internally.
-///
-/// ADR-004 / PF-004: preview must use the same gated pipeline as apply so that
-/// `--diff` shows exactly what `--fix` would write, and the preview exit code
-/// reflects what a real `--fix` run would leave behind (R1:
-/// `max(1 if fixes pending, residual severity)` — see [`preview_exit_code`]).
-/// The `Rejected` variant gives `--fix --check` the same honesty as `--fix`
-/// (which prints "fix rejected: …" on refusal).
-fn preview_fixes(
-    result: &mds::LintResult,
-    source: &str,
-    base_dir: &Path,
-    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
-    config: &mds::LintConfig,
-    display_label: &str,
-) -> PreviewOutcome {
-    let is_standalone = result.is_standalone;
-    let plan = mds::fix::plan_fixes_with_options(result, source, is_standalone);
-
-    if plan.edits.is_empty() && !plan.overlap_rejected {
-        return PreviewOutcome::NothingToFix;
-    }
-
-    // Same output-neutral check as plan_and_apply_fixes: skip the equality gate when
-    // the plan contains any output-changing rule (e.g. legacy-interpolation).
-    let all_output_neutral = plan
-        .edits
-        .iter()
-        .all(|e| mds::fix::is_output_neutral(&e.rule));
-
-    let original_output =
-        mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
-            .ok()
-            .map(|r| r.output);
-
-    let base_dir_owned = base_dir.to_path_buf();
-    let config_clone = config.clone();
-    let outcome = mds::fix::apply_fixes_incremental(source, plan, result, |fixed| {
-        let residual = mds::lint_str_with(
-            fixed,
-            Some(&base_dir_owned),
-            runtime_vars.clone(),
-            &config_clone,
-        )?;
-
-        // Output byte-equality gate — skipped for output-changing rules.
-        if all_output_neutral {
-            if let Some(ref orig_out) = original_output {
-                match mds::compile_str_collecting_warnings(
-                    fixed,
-                    Some(&base_dir_owned),
-                    runtime_vars.clone(),
-                ) {
-                    Ok(fixed_compile) if fixed_compile.output != *orig_out => {
-                        return Err(MdsError::Io {
-                            message: "lint --fix would change compiled output; \
-                                      edit reverted to preserve template semantics"
-                                .to_string(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(residual)
-    });
-
-    match outcome {
-        mds::fix::FixOutcome::Fixed {
-            source: new_source,
-            mut residual,
-        }
-        | mds::fix::FixOutcome::PartiallyFixed {
-            source: new_source,
-            mut residual,
-            ..
-        } => {
-            set_diag_display_path(&mut residual, display_label);
-            PreviewOutcome::WouldFix {
-                fixed: new_source,
-                residual,
-            }
-        }
-        mds::fix::FixOutcome::Rejected { reason, .. } => PreviewOutcome::Rejected(reason),
-        mds::fix::FixOutcome::NothingToFix => PreviewOutcome::NothingToFix,
-        // FixOutcome is #[non_exhaustive]: wildcard required from outside mds-core.
-        _ => PreviewOutcome::NothingToFix,
+        mds::fix::FixOutcome::Rejected { reason, .. } => FixPipelineOutcome::Rejected { reason },
+        mds::fix::FixOutcome::NothingToFix => FixPipelineOutcome::NothingToFix,
+        // `FixOutcome` is `#[non_exhaustive]`, so a match outside mds-core needs a
+        // wildcard arm. A new variant counts as nothing to fix until it is plumbed here.
+        _ => FixPipelineOutcome::NothingToFix,
     }
 }
 
@@ -963,11 +855,10 @@ fn run_lint_stdin(
 
     // AD-211-4 / AD-211-1: relabel diag.file from STRING_SOURCE_MAP_LABEL →
     // STDIN_DISPLAY_LABEL at the CLI output boundary.  fix.rs never reads diag.file
-    // (verified: zero reads in fix.rs), so this relabel is safe upstream of both
-    // preview_fixes and plan_and_apply_fixes.  This single call ensures
+    // (verified: zero reads in fix.rs), so this relabel is safe upstream of
+    // run_fix_pipeline.  This single call ensures
     // "files[].file" emits "<stdin>" across all code paths (AC-P1-01); for the
-    // write path, plan_and_apply_fixes relabels its internally produced residual
-    // before returning.
+    // residual, run_fix_pipeline relabels the one it produces before returning.
     set_diag_display_path(&mut result, input.display_label());
 
     // D4 (AD-216-11): status message, not an error — suppress under --quiet.
@@ -986,14 +877,8 @@ fn run_lint_stdin(
         // Mirrors run_lint_file's preview path so stdin honours --check / --diff the
         // same way file targets do (PF-004: same gated pipeline as the write path).
         if check || diff {
-            let preview = preview_fixes(
-                &result,
-                &source,
-                cwd,
-                runtime_vars.clone(),
-                &config,
-                input.display_label(),
-            );
+            let preview =
+                run_fix_pipeline(&input, &result, &source, cwd, runtime_vars.clone(), &config);
             // The display label, `<stdin>`, is what span context renders, not the
             // internal STRING_SOURCE_MAP_LABEL ("input.mds").
             let named_source = if format == LintFormat::Human {
@@ -1007,12 +892,18 @@ fn run_lint_stdin(
                 // code comes from the residual, floored at 1 because a fix is
                 // pending.  Emit-before-exit: diagnostics render before the exit
                 // (the old --check arm exited without rendering them).
-                PreviewOutcome::WouldFix {
-                    ref fixed,
+                FixPipelineOutcome::Fixed {
+                    ref new_source,
                     ref residual,
+                }
+                | FixPipelineOutcome::PartiallyFixed {
+                    ref new_source,
+                    ref residual,
+                    ..
                 } => {
                     if diff {
-                        let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
+                        let diff_str =
+                            render_unified_diff(&source, new_source, &input.diff_label());
                         emit_stdout(&diff_str);
                     }
                     if check && !quiet {
@@ -1021,12 +912,12 @@ fn run_lint_stdin(
                     emit_result(format, &result, quiet, named_source);
                     crate::output::exit(preview_exit_code(residual));
                 }
-                PreviewOutcome::Rejected(ref reason) => {
+                FixPipelineOutcome::Rejected { ref reason } => {
                     if !quiet {
                         crate::output::ewriteln!("fix rejected: {}", safe_inline(reason));
                     }
                 }
-                PreviewOutcome::NothingToFix => {}
+                FixPipelineOutcome::NothingToFix => {}
             }
             // When nothing would change / fix rejected: render diagnostics of the
             // original result and exit by severity.
@@ -1036,20 +927,13 @@ fn run_lint_stdin(
         }
 
         // ── Write path: apply fixes, emit fixed source to stdout ─────────────────
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            cwd,
-            runtime_vars,
-            &config,
-            input.display_label(),
-        );
+        let fix_outcome = run_fix_pipeline(&input, &result, &source, cwd, runtime_vars, &config);
         let (output_src, diag_result) = match fix_outcome {
-            FixFileOutcome::Fixed {
+            FixPipelineOutcome::Fixed {
                 new_source,
                 residual,
             } => (new_source, residual),
-            FixFileOutcome::PartiallyFixed {
+            FixPipelineOutcome::PartiallyFixed {
                 new_source,
                 residual,
                 applied_count,
@@ -1062,10 +946,10 @@ fn run_lint_stdin(
                 }
                 (new_source, residual)
             }
-            FixFileOutcome::Rejected { reason, original } => {
+            FixPipelineOutcome::Rejected { reason } => {
                 // D4 (AD-216-11): "fix rejected" is a status message — the safety
                 // gate fired and the original diagnostics are unmodified.  Suppress under
-                // --quiet, matching this function's own `PreviewOutcome::Rejected` arm and
+                // --quiet, matching this function's own preview `Rejected` arm and
                 // the directory-mode emitters in `lint_one_file_accumulating` /
                 // `lint_one_file_human`.  PF-004: stdin is a separate emitter from
                 // directory mode and must not bypass the gate (the #43/#173 divergence
@@ -1074,9 +958,9 @@ fn run_lint_stdin(
                 if !quiet {
                     crate::output::ewriteln!("fix rejected: {}", safe_inline(&reason));
                 }
-                (source, original)
+                (source, result)
             }
-            FixFileOutcome::NothingToFix { original } => (source, original),
+            FixPipelineOutcome::NothingToFix => (source, result),
         };
         // Stdin diagnostics: pass source text for span context rendering, under the
         // display label, so the source frame header reads "<stdin>".
@@ -1154,13 +1038,13 @@ fn run_lint_file(
         }
     };
     // Remap the basename-only `file` label that mds::lint() sets → the display
-    // filename so all four FixFileOutcome arms carry a consistent label.
+    // filename so all four FixPipelineOutcome arms carry a consistent label.
     // Matches the explicit relabel in lint_one_file_accumulating and
     // lint_one_file_human; without this call the Rejected and NothingToFix
     // arms rely on mds::lint independently deriving the same basename — correct
     // today, but a silent coupling that would break if the two derivations ever
     // diverged.  Centralising the relabel here is the explicit invariant:
-    // every FixFileOutcome carries the input's display label.
+    // every FixPipelineOutcome arm reports the input's display label.
     set_diag_display_path(&mut result, input.display_label());
 
     // D4 (AD-216-11): status message, not an error — suppress under --quiet
@@ -1180,16 +1064,10 @@ fn run_lint_file(
 
     // ── Write path: --fix without preview ────────────────────────────────────
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            base_dir,
-            runtime_vars,
-            &config,
-            input.display_label(),
-        );
+        let fix_outcome =
+            run_fix_pipeline(&input, &result, &source, base_dir, runtime_vars, &config);
         match fix_outcome {
-            FixFileOutcome::Fixed {
+            FixPipelineOutcome::Fixed {
                 new_source,
                 residual,
             } => {
@@ -1200,7 +1078,7 @@ fn run_lint_file(
                 }
                 exit_by_severity(&residual);
             }
-            FixFileOutcome::PartiallyFixed {
+            FixPipelineOutcome::PartiallyFixed {
                 new_source,
                 residual,
                 applied_count,
@@ -1218,23 +1096,23 @@ fn run_lint_file(
                 }
                 exit_by_severity(&residual);
             }
-            FixFileOutcome::Rejected { reason, original } => {
+            FixPipelineOutcome::Rejected { reason } => {
                 // D4 (AD-216-11): status message — suppress under --quiet,
-                // matching this function's own `PreviewOutcome::Rejected` arm and the
+                // matching this function's own preview `Rejected` arm and the
                 // directory-mode emitters.  PF-004: single-file mode is a separate
                 // emitter and must honour the same gate.
                 if !quiet {
                     crate::output::ewriteln!("fix rejected: {}", safe_inline(&reason));
                 }
-                emit_result(format, &original, quiet, named_source);
-                exit_by_severity(&original);
+                emit_result(format, &result, quiet, named_source);
+                exit_by_severity(&result);
             }
-            FixFileOutcome::NothingToFix { original } => {
-                emit_result(format, &original, quiet, named_source);
-                if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
+            FixPipelineOutcome::NothingToFix => {
+                emit_result(format, &result, quiet, named_source);
+                if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
                     crate::output::ewriteln!("Clean: {}", safe_file_display(input.display_label()));
                 }
-                exit_by_severity(&original);
+                exit_by_severity(&result);
             }
         }
         return Ok(());
@@ -1245,24 +1123,22 @@ fn run_lint_file(
     // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
     // a diff or check result could misrepresent what --fix would actually do.
     if fix && (check || diff) {
-        let preview = preview_fixes(
-            &result,
-            &source,
-            base_dir,
-            runtime_vars,
-            &config,
-            input.display_label(),
-        );
+        let preview = run_fix_pipeline(&input, &result, &source, base_dir, runtime_vars, &config);
         match preview {
             // ONE arm for both --check and --diff (R1): the emitted body stays
             // PRE-fix — the preview reports what is wrong NOW — and the exit code
             // comes from the residual, floored at 1 because a fix is pending.
-            PreviewOutcome::WouldFix {
-                ref fixed,
+            FixPipelineOutcome::Fixed {
+                ref new_source,
                 ref residual,
+            }
+            | FixPipelineOutcome::PartiallyFixed {
+                ref new_source,
+                ref residual,
+                ..
             } => {
                 if diff {
-                    let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
+                    let diff_str = render_unified_diff(&source, new_source, &input.diff_label());
                     emit_stdout(&diff_str);
                 }
                 if check && !quiet {
@@ -1275,13 +1151,13 @@ fn run_lint_file(
                 emit_result(format, &result, quiet, named_source);
                 crate::output::exit(preview_exit_code(residual));
             }
-            PreviewOutcome::Rejected(ref reason) => {
+            FixPipelineOutcome::Rejected { ref reason } => {
                 // Surface the rejection reason so --fix --check is as honest as --fix.
                 if !quiet {
                     crate::output::ewriteln!("fix rejected: {}", safe_inline(reason));
                 }
             }
-            PreviewOutcome::NothingToFix => {}
+            FixPipelineOutcome::NothingToFix => {}
         }
         // When nothing would change / fix rejected: render diagnostics and exit
         // by severity.
@@ -1811,16 +1687,16 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        let fix_outcome = plan_and_apply_fixes(
-            result,
+        let fix_outcome = run_fix_pipeline(
+            &input,
+            &result,
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            input.display_label(),
         );
         match fix_outcome {
-            FixFileOutcome::Fixed {
+            FixPipelineOutcome::Fixed {
                 new_source,
                 residual,
             } => {
@@ -1841,7 +1717,7 @@ fn lint_one_file_accumulating(
                 }
                 tally_from_result(&residual)
             }
-            FixFileOutcome::PartiallyFixed {
+            FixPipelineOutcome::PartiallyFixed {
                 new_source,
                 residual,
                 applied_count,
@@ -1866,7 +1742,7 @@ fn lint_one_file_accumulating(
                 }
                 tally_from_result(&residual)
             }
-            FixFileOutcome::Rejected { reason, original } => {
+            FixPipelineOutcome::Rejected { reason } => {
                 // D4 (AD-216-11): "fix rejected" is a status message — the safety
                 // gate fired, the original diagnostics remain unmodified.  Suppress under
                 // --quiet (main.rs:30).  The residual lint findings (and the exit code)
@@ -1878,12 +1754,12 @@ fn lint_one_file_accumulating(
                         safe_inline(&reason)
                     );
                 }
-                accumulate_result_json(&original, json_files);
-                tally_from_result(&original)
+                accumulate_result_json(&result, json_files);
+                tally_from_result(&result)
             }
-            FixFileOutcome::NothingToFix { original } => {
-                accumulate_result_json(&original, json_files);
-                tally_from_result(&original)
+            FixPipelineOutcome::NothingToFix => {
+                accumulate_result_json(&result, json_files);
+                tally_from_result(&result)
             }
         }
     } else if fix && (check || diff) {
@@ -1898,24 +1774,29 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        // R1: in the WouldFix arm the per-file tally comes from the RESIDUAL
-        // (what a real --fix would leave behind); the JSON body stays PRE-fix.
-        // run_lint_directory floors the aggregate exit at 1 via any_would_fix.
-        let tally = match preview_fixes(
+        // In the would-fix arm (`Fixed` or `PartiallyFixed`) the per-file tally comes
+        // from the RESIDUAL (what a real --fix would leave behind); the JSON body stays
+        // PRE-fix. run_lint_directory floors the aggregate exit at 1 via any_would_fix.
+        let tally = match run_fix_pipeline(
+            &input,
             &result,
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            input.display_label(),
         ) {
-            PreviewOutcome::WouldFix {
-                ref fixed,
+            FixPipelineOutcome::Fixed {
+                ref new_source,
                 ref residual,
+            }
+            | FixPipelineOutcome::PartiallyFixed {
+                ref new_source,
+                ref residual,
+                ..
             } => {
                 *any_would_fix = true;
                 let diff_lost = if diff {
-                    let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
+                    let diff_str = render_unified_diff(&source, new_source, &input.diff_label());
                     emit_stdout(&diff_str)
                 } else {
                     false
@@ -1932,7 +1813,7 @@ fn lint_one_file_accumulating(
                     tally_from_result(residual)
                 }
             }
-            PreviewOutcome::Rejected(ref reason) => {
+            FixPipelineOutcome::Rejected { ref reason } => {
                 // D4 (AD-216-11): status message — suppress under --quiet.
                 if !quiet {
                     crate::output::ewriteln!(
@@ -1943,7 +1824,7 @@ fn lint_one_file_accumulating(
                 }
                 tally_from_result(&result)
             }
-            PreviewOutcome::NothingToFix => tally_from_result(&result),
+            FixPipelineOutcome::NothingToFix => tally_from_result(&result),
         };
         accumulate_result_json(&result, json_files);
         tally
@@ -2034,16 +1915,16 @@ fn lint_one_file_human(
     }
 
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(
-            result,
+        let fix_outcome = run_fix_pipeline(
+            &input,
+            &result,
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            input.display_label(),
         );
         match fix_outcome {
-            FixFileOutcome::Fixed {
+            FixPipelineOutcome::Fixed {
                 new_source,
                 residual,
             } => {
@@ -2061,7 +1942,7 @@ fn lint_one_file_human(
                 }
                 tally_from_result(&residual)
             }
-            FixFileOutcome::PartiallyFixed {
+            FixPipelineOutcome::PartiallyFixed {
                 new_source,
                 residual,
                 applied_count,
@@ -2087,7 +1968,7 @@ fn lint_one_file_human(
                 }
                 tally_from_result(&residual)
             }
-            FixFileOutcome::Rejected { reason, original } => {
+            FixPipelineOutcome::Rejected { reason } => {
                 // D4 (AD-216-11): "fix rejected" is a status message — the safety
                 // gate fired, the original diagnostics remain unmodified.  Suppress under
                 // --quiet (main.rs:30).
@@ -2098,35 +1979,40 @@ fn lint_one_file_human(
                         safe_inline(&reason)
                     );
                 }
-                render_result_human(&original, quiet, named_source);
-                tally_from_result(&original)
+                render_result_human(&result, quiet, named_source);
+                tally_from_result(&result)
             }
-            FixFileOutcome::NothingToFix { original } => {
-                render_result_human(&original, quiet, named_source);
-                tally_from_result(&original)
+            FixPipelineOutcome::NothingToFix => {
+                render_result_human(&result, quiet, named_source);
+                tally_from_result(&result)
             }
         }
     } else if fix && (check || diff) {
         // Directory-mode preview — route through gated pipeline.
-        // R1: in the WouldFix arm the per-file tally comes from the RESIDUAL
-        // (what a real --fix would leave behind); the rendered body stays
-        // PRE-fix.  run_lint_directory floors the aggregate exit at 1 via
+        // In the would-fix arm (`Fixed` or `PartiallyFixed`) the per-file tally comes
+        // from the RESIDUAL (what a real --fix would leave behind); the rendered body
+        // stays PRE-fix.  run_lint_directory floors the aggregate exit at 1 via
         // any_would_fix.
-        let tally = match preview_fixes(
+        let tally = match run_fix_pipeline(
+            &input,
             &result,
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
-            input.display_label(),
         ) {
-            PreviewOutcome::WouldFix {
-                ref fixed,
+            FixPipelineOutcome::Fixed {
+                ref new_source,
                 ref residual,
+            }
+            | FixPipelineOutcome::PartiallyFixed {
+                ref new_source,
+                ref residual,
+                ..
             } => {
                 *any_would_fix = true;
                 let diff_lost = if diff {
-                    let diff_str = render_unified_diff(&source, fixed, &input.diff_label());
+                    let diff_str = render_unified_diff(&source, new_source, &input.diff_label());
                     emit_stdout(&diff_str)
                 } else {
                     false
@@ -2142,7 +2028,7 @@ fn lint_one_file_human(
                     tally_from_result(residual)
                 }
             }
-            PreviewOutcome::Rejected(ref reason) => {
+            FixPipelineOutcome::Rejected { ref reason } => {
                 if !quiet {
                     crate::output::ewriteln!(
                         "{}: fix rejected: {}",
@@ -2152,7 +2038,7 @@ fn lint_one_file_human(
                 }
                 tally_from_result(&result)
             }
-            PreviewOutcome::NothingToFix => tally_from_result(&result),
+            FixPipelineOutcome::NothingToFix => tally_from_result(&result),
         };
         render_result_human(&result, quiet, named_source);
         tally
@@ -2248,7 +2134,7 @@ fn accumulate_result_json(result: &mds::LintResult, json_files: &mut Vec<serde_j
 
 #[cfg(test)]
 mod tests {
-    use super::{preview_fixes, PreviewOutcome};
+    use super::{run_fix_pipeline, FixPipelineOutcome, LintSource};
     use mds::{FixLineSpan, LintDiagnostic, LintResult, Severity};
     use std::path::Path;
 
@@ -2260,7 +2146,7 @@ mod tests {
     /// through the CLI binary.
     ///
     /// This unit test covers rejection surfacing at the deepest level reachable from
-    /// the CLI crate: `preview_fixes` with a crafted `LintResult` whose `fix_removals`
+    /// the CLI crate: `run_fix_pipeline` with a crafted `LintResult` whose `fix_removals`
     /// produce the same genuine partial overlap used in the mds-core ISS-02 regression
     /// test (fix.rs: `a4_partial_overlap_still_rejected_after_dedup`).
     ///
@@ -2270,12 +2156,12 @@ mod tests {
     ///   Edit B: FixLineSpan::range_inclusive(6, 12) → ByteEdit [6,  18)
     ///   A.end=12 > B.start=6, B.end=18 > A.end=12 → partial overlap → overlap_rejected.
     ///
-    /// `preview_fixes` must return `PreviewOutcome::Rejected` — the rejection must be
+    /// `run_fix_pipeline` must return `FixPipelineOutcome::Rejected` — the rejection must be
     /// surfaced (not silently swallowed as `NothingToFix`).  This pins PF-004: the
     /// preview path uses the same gated pipeline as the write path and is equally
     /// honest about overlap refusals.
     #[test]
-    fn preview_fixes_surfaces_rejected_on_overlap() {
+    fn fix_pipeline_surfaces_rejected_on_overlap() {
         let source = "line0\nline1\nline2\n";
         // Edit A covers bytes [0, 12): line0 start through line1 end (inclusive).
         let diag_a = LintDiagnostic::new("duplicate-import", Severity::Error, "a")
@@ -2294,27 +2180,31 @@ mod tests {
             ]);
         let result = LintResult::new(vec![diag_a, diag_b]);
 
-        let outcome = preview_fixes(
+        let input = LintSource::DirEntry {
+            path: Path::new("overlap.mds"),
+            key: "overlap.mds",
+        };
+        let outcome = run_fix_pipeline(
+            &input,
             &result,
             source,
             Path::new("."),
             None,
             &mds::LintConfig::default(),
-            "overlap.mds",
         );
 
         assert!(
-            matches!(outcome, PreviewOutcome::Rejected(_)),
-            "preview_fixes must return Rejected for an overlap_rejected plan, \
-             not NothingToFix or WouldFix (PF-004 — preview must be as honest as apply)"
+            matches!(outcome, FixPipelineOutcome::Rejected { .. }),
+            "run_fix_pipeline must return Rejected for an overlap_rejected plan, not \
+             NothingToFix, Fixed or PartiallyFixed (preview must be as honest as apply)"
         );
     }
 
-    /// R1: the residual carried by `PreviewOutcome::WouldFix` must have every
-    /// diagnostic's `file` field relabelled to the caller-supplied display label,
-    /// mirroring the `plan_and_apply_fixes` contract.  Without the relabel the
+    /// The residual the preview reads from `FixPipelineOutcome::Fixed` or
+    /// `PartiallyFixed` must have every diagnostic's `file` field relabelled to the
+    /// input's display label, as the write path's residual is.  Without the relabel the
     /// residual leaks the internal `STRING_SOURCE_MAP_LABEL` basename that
-    /// `mds::lint_str_with` sets inside the reverify closure.
+    /// `mds::lint_str_with` sets inside the reverify gate.
     ///
     /// The source carries one FIXABLE finding (empty-block on the bare `@if`) and
     /// one NON-fixable finding that survives the fix (unused-variable on the
@@ -2322,23 +2212,21 @@ mod tests {
     /// assertion cannot pass vacuously (PF-013), and a non-vacuity guard asserts
     /// the expected rule survived.
     #[test]
-    fn preview_fixes_would_fix_relabels_residual_display_path() {
+    fn fix_pipeline_would_fix_relabels_residual_display_path() {
         let source = "---\nunused_key: value\n---\n\n@if \"a\" == \"a\":\n@end\n\nHello\n";
         let config = mds::LintConfig::default();
         let result = mds::lint_str_with(source, Some(Path::new(".")), None, &config)
             .expect("fixture source must lint");
 
-        let outcome = preview_fixes(
-            &result,
-            source,
-            Path::new("."),
-            None,
-            &config,
-            "custom-label.mds",
-        );
+        let input = LintSource::DirEntry {
+            path: Path::new("custom-label.mds"),
+            key: "custom-label.mds",
+        };
+        let outcome = run_fix_pipeline(&input, &result, source, Path::new("."), None, &config);
 
         match outcome {
-            PreviewOutcome::WouldFix { ref residual, .. } => {
+            FixPipelineOutcome::Fixed { ref residual, .. }
+            | FixPipelineOutcome::PartiallyFixed { ref residual, .. } => {
                 assert!(
                     !residual.diagnostics.is_empty(),
                     "non-vacuity (PF-013): the unused-variable finding must survive the fix"
@@ -2366,8 +2254,8 @@ mod tests {
                 }
             }
             _ => panic!(
-                "preview_fixes must return WouldFix for a source with a fixable \
-                 empty-block finding"
+                "run_fix_pipeline must return Fixed or PartiallyFixed for a source with a \
+                 fixable empty-block finding"
             ),
         }
     }
