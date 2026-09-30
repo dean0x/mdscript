@@ -199,8 +199,11 @@ shared partial rebuilds **all transitive importers** automatically.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
 - Ctrl+C exits with code 0 and prints `Stopped watching.`
 - With `-o -`, a reader that goes away ends the session: `mds watch page.mds -o - | head -n 1`
-  prints `Stopped watching (stdout closed).` (not under `--quiet`) and exits 0 at the next write.
-  A stdout write that fails for another reason is reported once as `mds::io`, and watching
+  prints `Stopped watching (stdout closed).` (not under `--quiet`) and exits 0 at the next write —
+  unless that is the startup write and stderr has also failed for another reason than a closed
+  pipe: the session was not watching yet, so it exits 2, as the other commands do.
+  A stdout write that fails for another reason is reported as `mds::io` — once however many writes
+  in a row it fails, and again if stdout fails anew after a write has landed — and watching
   continues; the next rebuild writes again, even when its output has not changed. A closed stderr
   does not stop the watcher, and once it is watching, no output failure changes its exit code.
 - `--vars` file is reloaded from disk on every rebuild; edits to it trigger a recompile.

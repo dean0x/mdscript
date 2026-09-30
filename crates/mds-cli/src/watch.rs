@@ -1199,10 +1199,11 @@ enum OutputWrite {
     /// Written in full.
     Written,
     /// Not written. `Some` is the failure to report: an output file that could not be
-    /// written, or the session's first stdout failure (`mds::io`, naming stdout). `None`
-    /// is a repeat of that stdout failure, which is not reported again. Either way the
-    /// content-dedup map must not record the content, so the next rebuild writes again
-    /// even when its output has not changed.
+    /// written, or a new stdout failure (`mds::io`, naming stdout) — the session's first,
+    /// or the first since a stdout write last landed. `None` is a repeat of that stdout
+    /// failure, which is not reported again. Either way the content-dedup map must not
+    /// record the content, so the next rebuild writes again even when its output has not
+    /// changed.
     Failed(Option<miette::Report>),
     /// `-o -` and stdout's reader is gone: the session ends.
     StdoutClosed,
@@ -4916,10 +4917,10 @@ mod tests {
         assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
-    /// A session reads each `-o -` outcome itself (#157): a closed pipe stops it, the
-    /// first other failure is reported as `mds::io` naming stdout, and a repeat of it is
-    /// not written and not reported — where a batch run takes both a closed pipe and a
-    /// repeat for success.
+    /// A session reads each `-o -` outcome itself (#157): a closed pipe stops it, a new
+    /// failure for another reason is reported as `mds::io` naming stdout, and a repeat of
+    /// it is not written and not reported — where a batch run takes both a closed pipe
+    /// and a repeat for success.
     #[test]
     fn a_session_reads_each_stdout_outcome_for_itself() {
         assert!(matches!(

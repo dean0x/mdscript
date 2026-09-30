@@ -67,10 +67,12 @@ pub(crate) use ewriteln;
 
 /// Sticky facts about the CLI's output streams, read when the process exits.
 ///
-/// Each fact is one bit, set with `fetch_or` and never cleared, so a fact recorded on
-/// any thread is still there at exit. Functions that decide something from these facts
-/// take `&OutputState`, so a unit test builds its own instead of sharing the process's
-/// [`OUTPUT_STATE`] with every other test in the binary.
+/// Each fact is one bit, set with `fetch_or`, so a fact recorded on any thread is still
+/// there at exit. Only `STDOUT_FAILED` is ever cleared: it marks stdout's current
+/// failure, which a write that lands ends. No fact the exit code reads is cleared.
+/// Functions that decide something from these facts take `&OutputState`, so a unit test
+/// builds its own instead of sharing the process's [`OUTPUT_STATE`] with every other
+/// test in the binary.
 ///
 /// Adding a fact is adding one bit and its accessors.
 pub(crate) struct OutputState {
@@ -85,7 +87,8 @@ impl OutputState {
     const IO_FAILED: u8 = 1 << 1;
     /// A stdout write hit a closed pipe: the reader is gone.
     const STDOUT_CLOSED: u8 = 1 << 2;
-    /// A stdout write failed for a reason other than a closed pipe.
+    /// A stdout write failed for a reason other than a closed pipe, and no write has
+    /// landed since. Cleared by a write that lands, so a later failure is a new one.
     const STDOUT_FAILED: u8 = 1 << 3;
     /// A `mds watch` session went live: from then on its output failures do not change
     /// the exit code ([`ExitPolicy::WatchSession`]).
@@ -100,6 +103,10 @@ impl OutputState {
     /// Set `bit`; `true` when this call is the one that set it.
     fn set(&self, bit: u8) -> bool {
         self.bits.fetch_or(bit, Ordering::AcqRel) & bit == 0
+    }
+
+    fn clear(&self, bit: u8) {
+        self.bits.fetch_and(!bit, Ordering::AcqRel);
     }
 
     fn has(&self, bit: u8) -> bool {
@@ -122,9 +129,17 @@ impl OutputState {
     }
 
     /// Record a stdout write that failed for a reason other than a closed pipe; `true`
-    /// for the first such failure of the run, the one that is reported.
+    /// for the first failed write since the run began or since a write last landed —
+    /// the one that is reported.
     pub(crate) fn note_stdout_failure(&self) -> bool {
         self.set(Self::STDOUT_FAILED)
+    }
+
+    /// Record a stdout write that landed: stdout's current failure, if any, is over, so
+    /// the next failure is reported again. The I/O failure recorded for the exit code
+    /// stays recorded.
+    pub(crate) fn note_stdout_written(&self) {
+        self.clear(Self::STDOUT_FAILED);
     }
 
     pub(crate) fn stderr_closed(&self) -> bool {
@@ -249,11 +264,12 @@ pub(crate) enum StdoutOutcome {
     /// The reader is gone — a closed pipe, on this write or an earlier one. Nothing more
     /// is written to stdout, and the verdict is kept.
     Closed,
-    /// The run's first stdout failure for any other reason: the caller reports it as
-    /// `mds::io`.
+    /// A new stdout failure for any other reason — the first of the run, or the first
+    /// since a write last landed: the caller reports it as `mds::io`.
     Failed(std::io::Error),
-    /// Another failure after [`StdoutOutcome::Failed`] was already returned: nothing was
-    /// written, and the failure is not reported a second time.
+    /// Another failure after [`StdoutOutcome::Failed`] was returned, with no write
+    /// landing in between: nothing was written, and the failure is not reported a
+    /// second time.
     FailedAgain,
 }
 
@@ -261,9 +277,9 @@ impl StdoutOutcome {
     /// What a run that ends on its own — build, fmt — makes of the outcome.
     ///
     /// A closed pipe is not an error: the reader is gone, so stdout gets nothing more
-    /// and the run keeps its verdict. The first other failure is `mds::io`, naming
-    /// stdout; a repeat of it was already reported (#157). Nothing is recorded here; an
-    /// `Err` reaches the exit code through the caller.
+    /// and the run keeps its verdict. A new failure for another reason is `mds::io`,
+    /// naming stdout; a repeat of it was already reported (#157). Nothing is recorded
+    /// here; an `Err` reaches the exit code through the caller.
     ///
     /// `mds watch -o -` reads the outcome itself instead: a closed pipe ends its session,
     /// and neither it nor a repeated failure is a write it may remember as done.
@@ -288,8 +304,11 @@ pub(crate) fn stdout_failure(e: &std::io::Error) -> mds::MdsError {
 ///
 /// Once stdout's reader is gone, every later call returns [`StdoutOutcome::Closed`]
 /// without writing. After a failure for another reason, later calls still write, and a
-/// repeat of the failure is [`StdoutOutcome::FailedAgain`], so it is reported once
-/// (#157).
+/// repeat of the failure is [`StdoutOutcome::FailedAgain`], so it is reported once for
+/// as long as it lasts. A write that lands ends it: a failure after that is new, and
+/// [`StdoutOutcome::Failed`] again — a `mds watch -o -` session whose stdout recovers
+/// and fails again reports both (#157). A write of no bytes shows nothing about stdout
+/// and ends nothing.
 pub(crate) fn write_stdout(bytes: &[u8]) -> StdoutOutcome {
     write_stdout_to(&OUTPUT_STATE, &mut std::io::stdout().lock(), bytes)
 }
@@ -304,7 +323,12 @@ fn write_stdout_to<W: std::io::Write + ?Sized>(
         return StdoutOutcome::Closed;
     }
     match sink.write_all(bytes).and_then(|()| sink.flush()) {
-        Ok(()) => StdoutOutcome::Written,
+        Ok(()) => {
+            if !bytes.is_empty() {
+                state.note_stdout_written();
+            }
+            StdoutOutcome::Written
+        }
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
             state.note_stdout_closed();
             StdoutOutcome::Closed
@@ -3964,9 +3988,9 @@ mod tests {
         );
     }
 
-    /// A stdout that fails for another reason is reported once: the first failed write
-    /// is `Failed`, and a later one that fails again is not, so a batch run reports the
-    /// failure once. Every write is still attempted (#157).
+    /// A stdout that fails for another reason is reported once while it keeps failing:
+    /// the first failed write is `Failed`, and a later one that fails again is not, so a
+    /// batch run reports the failure once. Every write is still attempted (#157).
     #[test]
     fn write_stdout_reports_only_the_first_other_failure() {
         let state = OutputState::new();
@@ -3999,6 +4023,67 @@ mod tests {
             !state.stdout_closed() && !state.io_failed(),
             "the writer records only the stdout failure; the caller's report records the \
              I/O failure for the exit code"
+        );
+    }
+
+    /// A stdout failure is reported once per failure episode: a write that lands ends
+    /// the episode, so the next failure is new and reported again — a `mds watch -o -`
+    /// session must not go silent on a stdout that failed, recovered and failed again.
+    /// A write of no bytes proves nothing and ends nothing. The recorded I/O failure
+    /// that lifts a batch run's exit code outlives the recovery (#157).
+    #[test]
+    fn write_stdout_reports_a_new_failure_after_stdout_recovers() {
+        let state = OutputState::new();
+        let mut full = Sink::new(OnWrite::Fail(std::io::ErrorKind::StorageFull));
+        let first = write_stdout_to(&state, &mut full, b"one\n");
+        assert!(
+            matches!(&first, StdoutOutcome::Failed(e) if e.kind() == std::io::ErrorKind::StorageFull),
+            "the first failure is reported; got {first:?}"
+        );
+        // What fmt and lint do with a reported failure: record it for the exit code.
+        state.note_io_failure();
+        let repeat = write_stdout_to(&state, &mut full, b"two\n");
+        assert!(
+            matches!(repeat, StdoutOutcome::FailedAgain),
+            "a repeat before stdout recovers is not reported; got {repeat:?}"
+        );
+
+        let mut empty = Sink::new(OnWrite::Accept);
+        let nothing = write_stdout_to(&state, &mut empty, b"");
+        assert!(matches!(nothing, StdoutOutcome::Written), "got {nothing:?}");
+        let still = write_stdout_to(&state, &mut full, b"three\n");
+        assert!(
+            matches!(still, StdoutOutcome::FailedAgain),
+            "a write of no bytes does not show that stdout recovered; got {still:?}"
+        );
+
+        let mut ok = Sink::new(OnWrite::Accept);
+        let recovered = write_stdout_to(&state, &mut ok, b"four\n");
+        assert!(
+            matches!(recovered, StdoutOutcome::Written) && ok.bytes == b"four\n",
+            "stdout recovers; got {recovered:?}"
+        );
+
+        let again = write_stdout_to(&state, &mut full, b"five\n");
+        assert!(
+            matches!(&again, StdoutOutcome::Failed(e) if e.kind() == std::io::ErrorKind::StorageFull),
+            "a failure after stdout recovered is a new one, reported again; got {again:?}"
+        );
+        let repeat_again = write_stdout_to(&state, &mut full, b"six\n");
+        assert!(
+            matches!(repeat_again, StdoutOutcome::FailedAgain),
+            "the new failure's repeat is not reported; got {repeat_again:?}"
+        );
+        assert_eq!(full.writes, 5, "every write is attempted");
+
+        assert!(
+            state.io_failed() && !state.stdout_closed(),
+            "the recovery clears neither the recorded I/O failure nor anything else"
+        );
+        assert_eq!(
+            final_exit_code(0, &state, ExitPolicy::Batch),
+            IO_FAILURE_EXIT,
+            "a batch run that lost a stdout write still exits 2 after stdout recovered"
         );
     }
 

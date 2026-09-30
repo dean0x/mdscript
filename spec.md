@@ -996,7 +996,8 @@ instead.
   destination refused, an output directory that cannot be created, a stale sibling or
   sidecar that cannot be removed, a stale sidecar that cannot be read, a stdout write
   that fails for any other reason than a closed pipe — reported once however many
-  writes it fails — and stdin that cannot be read or is not valid UTF-8. In directory
+  writes in a row it fails, and again if stdout fails anew after a write has landed —
+  and stdin that cannot be read or is not valid UTF-8. In directory
   mode the other files are still processed, and the run exits 2 when any file's failure
   is in the exit-2 class, a source that cannot be read included (§7.2
   continue-on-error); a file whose `--diff` output a failing stdout lost counts as
@@ -1014,10 +1015,11 @@ Under `mds watch` (#157), a closed stderr only drops the status lines: the sessi
 watching. With `-o -`, stdout is the session's product, so a reader that is gone ends the
 session: the write that finds the pipe closed — the startup write or a rebuild's — is
 followed by `Stopped watching (stdout closed).` on stderr (not under `--quiet`) and exit
-0. A stdout write that fails for another reason is `mds::io`, reported once in the
-session however many writes it fails, and watching continues; the lost content is not
-recorded as written, so the next rebuild writes it again even when its output has not
-changed — saving the source unchanged retries it. Once the session is live — its startup
+0. A stdout write that fails for another reason is `mds::io`, reported once however many
+writes in a row it fails, and again if stdout fails anew after a write has landed; watching
+continues. The lost content is not recorded as written, so the next rebuild writes it
+again even when its output has not changed — saving the source unchanged retries it.
+Once the session is live — its startup
 compile finished and every watch armed — an output failure, whether a rebuild's output
 file or stdout write or a stderr that fails other than by a closed pipe, is reported
 where stderr still works and does not change the exit code: Ctrl+C exits 0. A session
@@ -1149,7 +1151,7 @@ Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside fr
 
 Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template. The base directory the gate compiles against (the file's directory; the working directory for stdin) is resolved first, as `mds check` resolves it: one that is refused (§4.6) or cannot be resolved fails `mds fmt` with that error (`mds::io`, exit 2).
 
-A rewrite that fails is `mds::io`, exit 2; in directory mode the other files are still formatted, the file counts as failed, and the run exits 2, as it does for a source that cannot be read (§7.2 continue-on-error). `--diff` output and stdin filter-mode output follow §5 "Streams and I/O failures": into a closed pipe they end without an error and the exit code stands (`--check` still exits 1 when a file would change), and any other stdout failure is `mds::io`, exit 2 (#157). In directory mode that failure is reported once, and every file whose diff it lost counts as failed.
+A rewrite that fails is `mds::io`, exit 2; in directory mode the other files are still formatted, the file counts as failed, and the run exits 2, as it does for a source that cannot be read (§7.2 continue-on-error). `--diff` output and stdin filter-mode output follow §5 "Streams and I/O failures": into a closed pipe they end without an error and the exit code stands (`--check` still exits 1 when a file would change), and any other stdout failure is `mds::io`, exit 2 (#157). In directory mode that failure is reported once while stdout keeps failing, and every file whose diff it lost counts as failed.
 
 | Option | Description |
 |--------|-------------|

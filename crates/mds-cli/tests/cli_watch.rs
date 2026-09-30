@@ -7154,6 +7154,134 @@ fn watch_to_a_failing_stdout_reports_once_and_retries_the_same_content() {
     );
 }
 
+/// `mds watch -o -` into a stdout that fails, recovers and fails again reports both
+/// failures: a write that lands ends the first one, so the second is new, not a repeat
+/// to stay silent about (#157).
+///
+/// Vector: as in [`watch_to_a_failing_stdout_reports_once_and_retries_the_same_content`]
+/// — the test empties the file to let writes land, and fills it again to fail them.
+///
+/// 1. The startup write fails: report one. An order marker then settles every late
+///    rebuild of the startup text, which would otherwise land once there is room.
+/// 2. The test makes room; an edit is written and is a rebuild.
+/// 3. The test fills the file; a new edit fails: report two.
+/// 4. A further edit fails again: no third report, and no `Recompiled`. It `@include`s
+///    an empty module, whose warning shows on stderr that it was compiled.
+#[cfg(unix)]
+#[test]
+fn watch_to_stdout_reports_a_new_failure_after_stdout_recovers() {
+    const LIMIT: usize = 64;
+    const FINAL_MARKER_SOURCE: &str = "Final marker {{__final_marker__}}\n";
+    const FINAL_MARKER_LINE: &str = "undefined variable '__final_marker__'";
+    let include_warning = "@include of 'e' produced empty output";
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("empty.mds"), "").unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    // Outside the watched directory, so the output's own writes raise no events there.
+    let stdout_dir = tempfile::tempdir().unwrap();
+    let stdout_path = stdout_dir.path().join("stdout");
+
+    let mut cmd = mds_bin();
+    cmd.args([
+        "watch",
+        src.to_str().unwrap(),
+        "-o",
+        "-",
+        "--debounce",
+        "0",
+        // No idle tick: its first-tick recompile would write on its own schedule.
+        "--poll-interval",
+        "0",
+    ]);
+    let stdout_file = full_file(&stdout_path, LIMIT);
+    // Shares the child's stdout offset: the test empties and refills the file with it.
+    let mut stdout_offset = stdout_file.try_clone().unwrap();
+    cmd.stdout(Stdio::from(stdout_file));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let (mut guard, tap) = spawn_ready(&mut cmd);
+
+    // 1. The startup write failed, and was reported, before readiness.
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: the vector fails every write, so the startup output never landed"
+    );
+    wait_for_tap(&tap, "cannot write to stdout", TIMEOUT);
+    // The startup text was never written, so the content dedup does not hold it back: a
+    // late event for the source would write it once there is room. The marker's compile
+    // writes nothing, and once its line is on the tap every earlier rebuild is done.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+
+    // 2. Room in the file: stdout recovers.
+    {
+        use std::io::Seek as _;
+        stdout_offset.set_len(0).unwrap();
+        stdout_offset.seek(std::io::SeekFrom::Start(0)).unwrap();
+    }
+    write_atomic(&src, "Hello two\n");
+    let recovered = poll_tap_until(&tap, TIMEOUT, |text| text.contains("Recompiled <stdout>"));
+    assert!(
+        recovered.is_ok(),
+        "precondition: once there is room, a rebuild writes stdout; stderr:\n{}",
+        tap.text()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&stdout_path).unwrap(),
+        "Hello two\n",
+        "precondition: the recovered write reached stdout"
+    );
+
+    // 3. The file is full again: stdout fails again, and that is a new failure.
+    {
+        use std::io::{Seek as _, Write as _};
+        stdout_offset.set_len(0).unwrap();
+        stdout_offset.seek(std::io::SeekFrom::Start(0)).unwrap();
+        stdout_offset.write_all(&[b'#'; LIMIT]).unwrap();
+    }
+    write_atomic(&src, "Hello three\n");
+    wait_for_tap_count(&tap, "cannot write to stdout", 2, TIMEOUT);
+
+    // 4. Its repeat stays silent. The marker orders the tap: every rebuild before it
+    //    finished before the marker's compile.
+    write_atomic(
+        &src,
+        "@import \"./empty.mds\" as e\n@include e\nHello four\n",
+    );
+    wait_for_tap(&tap, include_warning, TIMEOUT);
+    write_atomic(&src, FINAL_MARKER_SOURCE);
+    let seen = wait_for_tap(&tap, FINAL_MARKER_LINE, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&seen, "cannot write to stdout"),
+        2,
+        "one report per failure, however many writes each fails; stderr:\n{seen}"
+    );
+    assert_eq!(
+        count_occurrences(&seen, "Recompiled"),
+        1,
+        "only the write that landed is a rebuild; stderr:\n{seen}"
+    );
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: no write after the refill reached the file"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C after a second stdout failure",
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stdout failures during the session do not change the Ctrl+C exit"
+    );
+}
+
 /// A rebuild whose output file cannot be written, in a live session, is reported and
 /// does not change the Ctrl+C exit: 0 (#157).
 ///
