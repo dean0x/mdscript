@@ -1688,13 +1688,15 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fix, lint_input, render, run_fix_pipeline, set_diag_display_path, DirSummary,
-        FileReport, FileTally, FixPipelineOutcome, InputVerdict, LintFlags, LintFormat, LintSource,
-        Linted, ReverifyGate, SourceText,
+        apply_fix, fix_stdin, lint_input, render, run_fix_pipeline, set_diag_display_path,
+        DirSummary, FileReport, FileTally, FixPipelineOutcome, InputVerdict, LintFlags, LintFormat,
+        LintSource, Linted, Outcome, ReverifyGate, SourceText,
     };
-    use crate::lint_sink::{JsonSink, ResultSink};
-    use mds::{FixLineSpan, LintDiagnostic, LintResult, Severity};
-    use std::path::Path;
+    use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
+    use crate::output::{safe_path, STDIN_DISPLAY_LABEL};
+    use mds::{FixLineSpan, LintDiagnostic, LintResult, MdsError, SerializedSpan, Severity};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
     /// ISS-13: CLI-level genuine partial overlaps are structurally impossible with
@@ -2269,6 +2271,399 @@ mod tests {
             pending.exit_code(),
             1,
             "control: a preview that would fix a clean file exits 1"
+        );
+    }
+
+    /// `error`'s diagnostic code, such as `mds::io`.
+    fn code_of(error: &MdsError) -> String {
+        miette::Diagnostic::code(error)
+            .map(|code| code.to_string())
+            .unwrap_or_default()
+    }
+
+    /// A result sink that shows nothing and records each call [`render`] makes of it, in
+    /// order, naming the input by its display label.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Vec<String>,
+    }
+
+    impl Recorder {
+        fn record(&mut self, call: &str, input: &LintSource<'_>) {
+            self.calls.push(format!("{call} {}", input.display_label()));
+        }
+    }
+
+    impl ResultSink for Recorder {
+        fn quiet(&self) -> bool {
+            false
+        }
+
+        fn findings(&mut self, input: &LintSource<'_>, findings: &LintResult, _: Option<&str>) {
+            let call = format!("findings ({})", findings.diagnostics.len());
+            self.record(&call, input);
+        }
+
+        fn failed(&mut self, input: &LintSource<'_>, error: MdsError) {
+            let call = format!("failed ({})", code_of(&error));
+            self.record(&call, input);
+        }
+
+        fn write_failed(&mut self, input: &LintSource<'_>, _: MdsError) {
+            self.record("write failed", input);
+        }
+
+        fn clean(&mut self, input: &LintSource<'_>, _: &LintResult) {
+            self.record("clean", input);
+        }
+
+        fn analysis_failure(&mut self, _: &MdsError, _: Option<&str>) {
+            self.calls.push("analysis failure".to_string());
+        }
+
+        fn start_document(&mut self) {
+            self.calls.push("start document".to_string());
+        }
+
+        fn end_document(&mut self, _: bool) {
+            self.calls.push("end document".to_string());
+        }
+
+        fn cap_reached(&mut self, input: &LintSource<'_>) {
+            self.record("cap reached", input);
+        }
+
+        fn fix_rejected(&mut self, input: &LintSource<'_>, _: &str) {
+            self.record("fix rejected", input);
+        }
+
+        fn would_fix(&mut self, input: &LintSource<'_>) {
+            self.record("would fix", input);
+        }
+
+        fn fixed(&mut self, input: &LintSource<'_>, partial: Option<(usize, usize)>) {
+            let call = format!("fixed {partial:?}");
+            self.record(&call, input);
+        }
+
+        fn diff(&mut self, _: &str) -> bool {
+            self.calls.push("diff".to_string());
+            false
+        }
+
+        fn fixed_source(&mut self, _: &str) {
+            self.calls.push("fixed source".to_string());
+        }
+    }
+
+    /// Under `--fix` a capped result announces the cap before anything else its input shows
+    /// (#309) — for an entry of a directory under `--format json` whose read to fix it fails,
+    /// before its failure. The late-read test above reads the directory's document, which
+    /// shows the failure and the `truncated` flag but not this order; the calls `render`
+    /// makes do.
+    ///
+    /// Controls: the same capped entry, readable with nothing to fix, announces the cap
+    /// before its findings; an uncapped entry whose read fails announces no cap.
+    #[test]
+    fn a_capped_entry_that_cannot_be_read_announces_the_cap_before_its_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = Rc::new(mds::LintConfig::default());
+        // The calls `render` makes to show the entry's report, linted to fix it as a
+        // directory run under `--format json` does.
+        let calls = |path: &Path, key: &str, result: LintResult| {
+            let linted = Linted {
+                input: LintSource::DirEntry { path, key },
+                base_dir: &root,
+                config: Rc::clone(&config),
+                source: SourceText::Unread(path),
+                result,
+            };
+            let mut sink = Recorder::default();
+            render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink);
+            sink.calls
+        };
+
+        let missing = root.join("gone.mds");
+        let read_failure = code_of(
+            &super::read_source_file(&missing).expect_err("precondition: the file must not read"),
+        );
+        assert_eq!(
+            calls(&missing, "gone.mds", LintResult::new(vec![]).truncated()),
+            [
+                "cap reached gone.mds".to_string(),
+                format!("failed ({read_failure}) gone.mds"),
+            ],
+        );
+
+        let readable = root.join("x.mds");
+        std::fs::write(&readable, "Hello\n").unwrap();
+        assert_eq!(
+            calls(&readable, "x.mds", LintResult::new(vec![]).truncated()),
+            ["cap reached x.mds", "findings (0) x.mds", "clean x.mds"],
+            "control: a capped entry with nothing to fix announces the cap before its findings"
+        );
+        assert_eq!(
+            calls(&missing, "gone.mds", LintResult::new(vec![])),
+            [format!("failed ({read_failure}) gone.mds")],
+            "control: an uncapped result announces no cap"
+        );
+    }
+
+    /// The environment variable that makes a test run as the child [`in_a_child`] starts;
+    /// its value names what the child shows.
+    const CHILD: &str = "MDS_LINT_TEST_CHILD";
+
+    /// What the test `name` writes to stdout and to stderr when it runs as a child with
+    /// `scenario`: this test binary again, running that one test, with [`CHILD`] set to
+    /// `scenario`.
+    ///
+    /// The sinks print through the CLI's writer to the process's own stdout and stderr,
+    /// which the test harness does not capture, so a test that reads what [`render`] shows
+    /// runs it in a child and reads the child's streams. The child's stdout also holds the
+    /// harness's report, which must say the one test ran and passed.
+    fn in_a_child(name: &str, scenario: &OsStr) -> (String, String) {
+        let binary = std::env::current_exe().expect("the test binary's path");
+        let run = std::process::Command::new(binary)
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, scenario)
+            .env("NO_COLOR", "1")
+            .env_remove("FORCE_COLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .output()
+            .expect("the child runs");
+        let product = String::from_utf8(run.stdout).expect("the child's stdout is UTF-8");
+        let shown = String::from_utf8(run.stderr).expect("the child's stderr is UTF-8");
+        assert!(
+            run.status.success() && product.contains("1 passed"),
+            "the child `{name}` ({scenario:?}) must run that one test and pass; status {:?}\n\
+             stdout:\n{product}\nstderr:\n{shown}",
+            run.status
+        );
+        (product, shown)
+    }
+
+    /// A human report whose finding comes without its source text shows the finding without
+    /// a snippet (#309): no panic, and neither the file's name nor any source text — with no
+    /// source there is no frame header to name the file. No human run lints an input it has
+    /// not read, but the report's shape allows it (an entry of a directory under
+    /// `--format json` is not read to report its findings).
+    ///
+    /// Control: the same finding with its text is framed under the file's name, over its
+    /// source, so the two needles are ones the frame shows when it can.
+    #[test]
+    fn a_human_finding_without_its_text_shows_no_file_name_and_no_snippet() {
+        const NAME: &str =
+            "lint::tests::a_human_finding_without_its_text_shows_no_file_name_and_no_snippet";
+        const FILE_NAME: &str = "frame-name-sentinel";
+        const SOURCE_TEXT: &str = "source-text-sentinel";
+        const MESSAGE: &str = "a finding shown without its text";
+        if let Some(scenario) = std::env::var_os(CHILD) {
+            let text = match scenario.to_str() {
+                Some("with text") => Some(format!("{SOURCE_TEXT}\n")),
+                Some("without text") => None,
+                _ => panic!("unknown scenario {scenario:?}"),
+            };
+            let key = format!("{FILE_NAME}.mds");
+            let path = Path::new("walked").join(&key);
+            let finding = LintDiagnostic::new("empty-block", Severity::Error, MESSAGE)
+                .with_span(SerializedSpan::new(0, SOURCE_TEXT.len()))
+                .with_file(key.as_str());
+            let report = FileReport {
+                input: LintSource::DirEntry {
+                    path: &path,
+                    key: &key,
+                },
+                truncated: false,
+                outcome: Outcome::Reported {
+                    findings: LintResult::new(vec![finding]),
+                    text,
+                },
+            };
+            let verdict = render(report, &mut HumanSink::new(false));
+            assert!(
+                verdict.tally == FileTally::Error,
+                "the error-severity finding counts"
+            );
+            return;
+        }
+
+        let (_, framed) = in_a_child(NAME, OsStr::new("with text"));
+        for needle in [MESSAGE, FILE_NAME, SOURCE_TEXT] {
+            assert!(
+                framed.contains(needle),
+                "control: a frame over its text shows {needle:?}; got:\n{framed}"
+            );
+        }
+        let (_, bare) = in_a_child(NAME, OsStr::new("without text"));
+        assert!(
+            bare.contains(MESSAGE),
+            "the finding still shows; got:\n{bare}"
+        );
+        assert!(
+            !bare.contains(FILE_NAME),
+            "no source, so no frame header names the file; got:\n{bare}"
+        );
+        assert!(!bare.contains(SOURCE_TEXT), "no snippet; got:\n{bare}");
+    }
+
+    /// The source both partial-fix tests fix.
+    const PARTIAL_BEFORE: &str = "before-fix-sentinel\n";
+    /// What their partial fix makes of [`PARTIAL_BEFORE`].
+    const PARTIAL_AFTER: &str = "after-fix-sentinel\n";
+    /// The message of the finding their partial fix leaves.
+    const PARTIAL_LEFT: &str = "a finding the partial fix left";
+    /// The message of a finding their partial fix removes.
+    const PARTIAL_REMOVED: &str = "a finding the partial fix removed";
+
+    /// An input's findings before a partial fix, and the fix, both named `label`: one of two
+    /// edits applied, the source rewritten to [`PARTIAL_AFTER`], and one warning left, at
+    /// `left_at` in that source when given.
+    ///
+    /// Built here rather than reached through a source, so the tests pin how [`render`]
+    /// shows a partial fix whichever edits produce one; `cli_lint.rs` reaches one end to end
+    /// and checks the counts' wording.
+    fn partial_fix(
+        label: &str,
+        left_at: Option<SerializedSpan>,
+    ) -> (LintResult, FixPipelineOutcome) {
+        let left = || {
+            let finding =
+                LintDiagnostic::new("empty-block", Severity::Warn, PARTIAL_LEFT).with_file(label);
+            match left_at.clone() {
+                Some(span) => finding.with_span(span),
+                None => finding,
+            }
+        };
+        let removed =
+            LintDiagnostic::new("empty-block", Severity::Warn, PARTIAL_REMOVED).with_file(label);
+        let before = LintResult::new(vec![removed, left()]);
+        let fix = FixPipelineOutcome::PartiallyFixed {
+            new_source: PARTIAL_AFTER.to_string(),
+            residual: LintResult::new(vec![left()]),
+            applied_count: 1,
+            total_count: 2,
+        };
+        (before, fix)
+    }
+
+    /// `mds lint --fix <file>` whose fix applies in part writes the partly fixed source,
+    /// shows the finding it leaves — not the one it removed — and then, as the run's last
+    /// line, `Partially fixed: <path> (1 of 2 fixes applied)` (#309).
+    #[test]
+    fn a_partial_fix_of_a_file_is_announced_after_the_findings_it_leaves() {
+        const NAME: &str =
+            "lint::tests::a_partial_fix_of_a_file_is_announced_after_the_findings_it_leaves";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = PathBuf::from(path);
+            let input = LintSource::File {
+                typed: &path,
+                name: "partial.mds",
+            };
+            let (before, fix) = partial_fix(input.display_label(), None);
+            let text = PARTIAL_BEFORE.to_string();
+            let outcome = apply_fix(&input, &path, before, text, fix, LintFormat::Human);
+            let report = FileReport {
+                input,
+                truncated: false,
+                outcome,
+            };
+            let verdict = render(report, &mut HumanSink::new(false));
+            assert!(
+                verdict.tally == FileTally::WarnOnly,
+                "the file counts by the warning the fix left"
+            );
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("partial.mds");
+        std::fs::write(&path, PARTIAL_BEFORE).unwrap();
+        let (_, shown) = in_a_child(NAME, path.as_os_str());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            PARTIAL_AFTER,
+            "precondition: the partly fixed source was written"
+        );
+
+        let announced = format!(
+            "Partially fixed: {} (1 of 2 fixes applied)",
+            safe_path(&path)
+        );
+        assert_eq!(
+            shown.lines().last(),
+            Some(announced.as_str()),
+            "the last line names the file and the counts; got:\n{shown}"
+        );
+        assert_eq!(
+            shown.matches("Partially fixed:").count(),
+            1,
+            "announced once; got:\n{shown}"
+        );
+        assert!(
+            shown.contains(PARTIAL_LEFT),
+            "the finding the fix left shows before the announcement; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(PARTIAL_REMOVED),
+            "the finding the fix removed does not show; got:\n{shown}"
+        );
+    }
+
+    /// `mds lint --fix -` whose fix applies in part announces it first —
+    /// `Partially fixed: <stdin> (1 of 2 fixes applied)`, the one status line stdin shows for
+    /// a fix — then the finding it leaves, framed over the source it emits rather than the
+    /// source it was given, and it emits that source on stdout (#309).
+    #[test]
+    fn a_partial_fix_of_stdin_is_announced_before_the_findings_it_leaves() {
+        const NAME: &str =
+            "lint::tests::a_partial_fix_of_stdin_is_announced_before_the_findings_it_leaves";
+        const AFTER_LINE: &str = "after-fix-sentinel";
+        const BEFORE_LINE: &str = "before-fix-sentinel";
+        if std::env::var_os(CHILD).is_some() {
+            let left_at = SerializedSpan::new(0, AFTER_LINE.len());
+            let (before, fix) = partial_fix(STDIN_DISPLAY_LABEL, Some(left_at));
+            let outcome = fix_stdin(before, PARTIAL_BEFORE.to_string(), fix);
+            let report = FileReport {
+                input: LintSource::Stdin,
+                truncated: false,
+                outcome,
+            };
+            let verdict = render(report, &mut HumanSink::new(false));
+            assert!(
+                verdict.tally == FileTally::WarnOnly,
+                "stdin counts by the warning the fix left"
+            );
+            return;
+        }
+
+        let (product, shown) = in_a_child(NAME, OsStr::new("stdin"));
+        let announced = format!("Partially fixed: {STDIN_DISPLAY_LABEL} (1 of 2 fixes applied)");
+        assert_eq!(
+            shown.lines().next(),
+            Some(announced.as_str()),
+            "the first line names stdin and the counts; got:\n{shown}"
+        );
+        assert_eq!(
+            shown.matches("Partially fixed:").count(),
+            1,
+            "announced once; got:\n{shown}"
+        );
+        assert!(
+            shown.contains(PARTIAL_LEFT) && shown.contains(AFTER_LINE),
+            "the finding the fix left follows, framed over the emitted source; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(BEFORE_LINE),
+            "not framed over the source as given; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(PARTIAL_REMOVED),
+            "the finding the fix removed does not show; got:\n{shown}"
+        );
+        assert!(
+            product.contains(PARTIAL_AFTER),
+            "the partly fixed source goes to stdout; got:\n{product}"
         );
     }
 

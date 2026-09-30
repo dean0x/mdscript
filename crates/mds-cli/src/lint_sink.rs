@@ -13,6 +13,12 @@
 //!
 //! `--quiet` suppresses the status lines about an input, and warning- and info-severity
 //! findings; each method says whether it honours it.
+//!
+//! A sink is not the only place a lint run prints, and `--quiet` does not reach every line
+//! printed elsewhere: the directory walk's depth-limit warning (`collect_mds_files_inner`
+//! in `output.rs`, printed when a tree is deeper than the walk's depth limit) takes no
+//! `--quiet` parameter, so it prints under `--quiet` too — for `mds lint` as for the other
+//! directory commands that share the walk, `mds build` among them.
 
 use std::path::Path;
 
@@ -303,7 +309,8 @@ impl ResultSink for HumanSink {
 /// are never corrupted.
 ///
 /// Every human run reads its input before it lints it, so a finding has its `text`; one
-/// without it would still show, only without the source snippet.
+/// without it would still show, only without the source snippet and the frame header
+/// that names the file.
 fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, filename: &str, text: Option<&str>) {
     if quiet && matches!(diag.severity, Severity::Info | Severity::Warn) {
         return;
@@ -472,5 +479,81 @@ fn emit_stdout(text: &str) -> bool {
             true
         }
         StdoutOutcome::FailedAgain => true,
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{files_document, files_of, json_line};
+    use mds::{LintDiagnostic, LintResult, SerializedSpan, Severity};
+    use serde_json::Value;
+
+    /// Findings in two files, one with a help text and a span and one without, so the
+    /// canonical JSON carries two `files[]` entries and each optional field in both forms.
+    fn findings_in_two_files() -> LintResult {
+        LintResult::new(vec![
+            LintDiagnostic::new("empty-block", Severity::Warn, "an empty block")
+                .with_help("remove the block")
+                .with_span(SerializedSpan::new(0, 7))
+                .with_file("a.mds"),
+            LintDiagnostic::new("unused-variable", Severity::Error, "an unused variable")
+                .with_file("b.mds"),
+        ])
+    }
+
+    /// The top-level keys of `document`, in the order it serializes them.
+    fn keys(document: &Value) -> Vec<String> {
+        document
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// A single input's JSON document is built from three keys — `files[]` moved out of
+    /// core's `LintResult::to_canonical_json`, `truncated`, and `version` — instead of
+    /// being core's document itself (#309). It must stay core's document: the same keys,
+    /// the same values, and the same bytes on stdout as the canonical JSON serialized
+    /// directly. A key core adds to its document and the rebuild leaves out fails the key
+    /// comparison first, naming the difference.
+    ///
+    /// Both values of `truncated`, with findings in two files: `truncated` is the one value
+    /// the rebuild takes from outside `files[]`.
+    #[test]
+    fn a_files_document_is_core_s_canonical_json() {
+        for truncated in [false, true] {
+            let result = if truncated {
+                findings_in_two_files().truncated()
+            } else {
+                findings_in_two_files()
+            };
+            let canonical = result.to_canonical_json();
+            assert_eq!(
+                canonical["truncated"], truncated,
+                "precondition: core's document carries this arm's `truncated`"
+            );
+            assert_eq!(
+                canonical["files"].as_array().map(Vec::len),
+                Some(2),
+                "precondition: core's document has an entry per file; got {canonical}"
+            );
+
+            let document = files_document(files_of(&result), result.truncated);
+            assert_eq!(
+                keys(&document),
+                keys(&canonical),
+                "truncated = {truncated}: the document's keys must be core's"
+            );
+            assert_eq!(document, canonical, "truncated = {truncated}");
+            let canonical_line = serde_json::to_string(&canonical)
+                .expect("a serde_json::Value always serializes")
+                + "\n";
+            assert_eq!(
+                json_line(&document),
+                canonical_line,
+                "truncated = {truncated}: stdout gets core's document byte for byte"
+            );
+        }
     }
 }
