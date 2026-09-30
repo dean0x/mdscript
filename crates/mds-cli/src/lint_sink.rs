@@ -278,10 +278,11 @@ impl ResultSink for HumanSink {
     /// directory's entries print none; a directory's summary counts its clean files.
     /// `--quiet` suppresses it.
     fn clean(&mut self, input: &LintSource<'_>, findings: &mds::LintResult) {
-        if let LintSource::File { typed, .. } = *input {
-            if !self.quiet && findings.diagnostics.is_empty() {
-                crate::output::ewriteln!("Clean: {}", safe_path(typed));
-            }
+        let LintSource::File { typed, .. } = *input else {
+            return;
+        };
+        if !self.quiet && findings.diagnostics.is_empty() {
+            crate::output::ewriteln!("Clean: {}", safe_path(typed));
         }
     }
 
