@@ -1878,9 +1878,13 @@ fn error_entry(input: &LintSource<'_>, e: &MdsError) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_fix_pipeline, FixPipelineOutcome, LintSource, ReverifyGate};
+    use super::{
+        apply_fix, lint_input, run_fix_pipeline, set_diag_display_path, FileTally,
+        FixPipelineOutcome, LintFlags, LintFormat, LintSource, Linted, ReverifyGate, SourceText,
+    };
     use mds::{FixLineSpan, LintDiagnostic, LintResult, Severity};
     use std::path::Path;
+    use std::rc::Rc;
 
     /// ISS-13: CLI-level genuine partial overlaps are structurally impossible with
     /// the current 10 rules.  Every pair of real-rule fix spans is either disjoint
@@ -2191,6 +2195,196 @@ mod tests {
                  compiled output, not Fixed, PartiallyFixed or NothingToFix"
             ),
         }
+    }
+
+    /// `mds lint --fix --format json --quiet <dir>`, for one entry of the directory:
+    /// `--quiet` keeps the status lines off the test's stderr, and the tests read the
+    /// directory's JSON document.
+    const DIR_JSON_FIX: LintFlags = LintFlags {
+        fix: true,
+        check: false,
+        diff: false,
+        quiet: true,
+        format: LintFormat::Json,
+    };
+
+    /// A source whose fix leaves a finding: the empty `@if` block is removed, and the
+    /// unreferenced frontmatter key stays an `unused-variable` warning.
+    const FIX_LEAVES_A_FINDING: &str =
+        "---\nunused_key: value\n---\n\n@if \"a\" == \"a\":\n@end\n\nHello\n";
+
+    /// `FIX_LEAVES_A_FINDING`'s findings, named for `input` as a directory run names them,
+    /// and what the fix pipeline makes of them: a fix that leaves a finding.
+    fn fix_leaving_a_finding(input: &LintSource<'_>) -> (LintResult, FixPipelineOutcome) {
+        let config = mds::LintConfig::default();
+        let mut result =
+            mds::lint_str_with(FIX_LEAVES_A_FINDING, Some(Path::new(".")), None, &config)
+                .expect("fixture source must lint");
+        set_diag_display_path(&mut result, input.display_label());
+        let outcome = run_fix_pipeline(
+            input,
+            &result,
+            FIX_LEAVES_A_FINDING,
+            Path::new("."),
+            None,
+            &config,
+        );
+        match &outcome {
+            FixPipelineOutcome::Fixed { residual, .. }
+            | FixPipelineOutcome::PartiallyFixed { residual, .. } => assert!(
+                !residual.diagnostics.is_empty(),
+                "precondition: the fix must leave a finding"
+            ),
+            _ => panic!("precondition: the empty-block finding must be fixed"),
+        }
+        (result, outcome)
+    }
+
+    /// A directory's JSON document records a rewritten file's remaining findings only once
+    /// the rewrite has landed. When the rewrite fails, the failure is the file's one entry:
+    /// findings recorded before the write would sit beside it and describe a file that was
+    /// never rewritten (#309).
+    ///
+    /// The directory write-failure fixtures of the CLI tests fix their file completely, so
+    /// their residual adds no entry wherever it is recorded, and they cannot see the order.
+    /// This fix leaves a warning, which can.
+    ///
+    /// Control: with a writable target the rewrite lands and the warning is recorded.
+    #[test]
+    fn directory_json_fix_records_a_failed_rewrite_as_its_only_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        let writable = root.join("x.mds");
+        std::fs::write(&writable, FIX_LEAVES_A_FINDING).unwrap();
+        let input = LintSource::DirEntry {
+            path: &writable,
+            key: "x.mds",
+        };
+        let (result, outcome) = fix_leaving_a_finding(&input);
+        let mut document = Vec::new();
+        let tally = apply_fix(
+            input,
+            FIX_LEAVES_A_FINDING.to_string(),
+            result,
+            outcome,
+            DIR_JSON_FIX,
+            Some(&mut document),
+        );
+        let rewritten = std::fs::read_to_string(&writable).unwrap();
+        assert!(
+            !rewritten.contains("@if"),
+            "control: the rewrite must land; got {rewritten:?}"
+        );
+        assert!(
+            tally == FileTally::WarnOnly,
+            "control: the file counts by the warning the fix left"
+        );
+        assert_eq!(
+            document.len(),
+            1,
+            "control: one entry, the remaining warning; got {document:?}"
+        );
+        assert_eq!(document[0]["file"], "x.mds");
+        assert_eq!(
+            document[0]["diagnostics"][0]["rule"], "unused-variable",
+            "control: got {document:?}"
+        );
+
+        // The target's directory is gone, so the temporary file cannot be created.
+        let unwritable = root.join("gone").join("x.mds");
+        let input = LintSource::DirEntry {
+            path: &unwritable,
+            key: "x.mds",
+        };
+        let (result, outcome) = fix_leaving_a_finding(&input);
+        let mut document = Vec::new();
+        let tally = apply_fix(
+            input,
+            FIX_LEAVES_A_FINDING.to_string(),
+            result,
+            outcome,
+            DIR_JSON_FIX,
+            Some(&mut document),
+        );
+        assert!(!unwritable.exists(), "precondition: nothing was written");
+        assert!(
+            tally == FileTally::Error,
+            "a failed rewrite counts under \"with errors\""
+        );
+        assert_eq!(
+            document.len(),
+            1,
+            "the failure must be the file's only entry; got {document:?}"
+        );
+        assert_eq!(document[0]["file"], "x.mds");
+        assert_eq!(document[0]["error"]["code"], "mds::io", "got {document:?}");
+        assert!(
+            document[0].get("diagnostics").is_none(),
+            "no findings for a file that was not rewritten; got {document:?}"
+        );
+    }
+
+    /// Under `--format json` a directory's entry is read only to fix it. When that read
+    /// fails, the failure is recorded as the entry and counts under "with errors", and a
+    /// capped result still marks the document truncated, as it does without `--fix`.
+    ///
+    /// The read follows a lint that read the same file, so no CLI run reaches it without a
+    /// race; the capped result is crafted.
+    ///
+    /// Control: the same entry, readable and with nothing to fix, adds no entry, counts
+    /// clean and keeps the document truncated.
+    #[test]
+    fn directory_json_fix_records_an_entry_it_cannot_read_as_a_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = Rc::new(mds::LintConfig::default());
+        let fix = |path: &Path, key: &str, document: &mut Vec<serde_json::Value>| {
+            let linted = Linted {
+                input: LintSource::DirEntry { path, key },
+                base_dir: &root,
+                config: Rc::clone(&config),
+                source: SourceText::Unread(path),
+                result: LintResult::new(vec![]).truncated(),
+            };
+            lint_input(linted, DIR_JSON_FIX, &None, Some(document))
+        };
+
+        let readable = root.join("x.mds");
+        std::fs::write(&readable, "Hello\n").unwrap();
+        let mut document = Vec::new();
+        let verdict = fix(&readable, "x.mds", &mut document);
+        assert!(
+            verdict.tally == FileTally::Clean,
+            "control: nothing to fix and no findings"
+        );
+        assert!(
+            verdict.truncated,
+            "control: a capped result marks the document truncated"
+        );
+        assert!(
+            document.is_empty(),
+            "control: no findings, no entry; got {document:?}"
+        );
+
+        let missing = root.join("gone.mds");
+        let expected = super::read_source_file(&missing)
+            .expect_err("precondition: the file must not read")
+            .serialize();
+        let mut document = Vec::new();
+        let verdict = fix(&missing, "gone.mds", &mut document);
+        assert!(
+            verdict.tally == FileTally::Error,
+            "an entry that cannot be read to fix counts under \"with errors\""
+        );
+        assert!(
+            verdict.truncated,
+            "the capped result still marks the document truncated"
+        );
+        assert_eq!(
+            document,
+            vec![serde_json::json!({ "file": "gone.mds", "error": expected })]
+        );
     }
 
     /// #217: a path that is not under the lint root must be an `Io` error, never a
