@@ -297,21 +297,35 @@ fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     out
 }
 
+/// `path`, written with `/`, in the platform's separator. A path `mds` builds by joining
+/// components — `ok.mds`'s output `./ok.md`, a directory walk's `fixes/b.mds` — is
+/// printed that way (`.\ok.md` on Windows), so an expected text naming one is built
+/// with this and stays exact on each OS.
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// The `+++` line that opens the new side of a unified diff of `path` (written with `/`,
+/// printed through [`native`]).
+fn diff_header(path: &str) -> String {
+    format!("+++ {}\n", native(path))
+}
+
 /// One command, its verdict with open streams, the stream it closes, and what the open
 /// run must print on that stream.
-struct Row {
+struct Row<'a> {
     args: &'static [&'static str],
     stdin: &'static str,
     verdict: i32,
     closed: Stream,
-    open_contains: &'static str,
+    open_contains: &'a str,
 }
 
 /// Run `row` with every stream open and then with `row.closed` closed, asserting both
 /// arms (see the module doc).
 ///
 /// Returns the file listing both runs left, for rows that also check what was written.
-fn assert_closing_keeps_the_verdict(row: &Row) -> Vec<(PathBuf, Vec<u8>)> {
+fn assert_closing_keeps_the_verdict(row: &Row<'_>) -> Vec<(PathBuf, Vec<u8>)> {
     let what = row.args.join(" ");
     let closed_name = format!("{:?}", row.closed).to_lowercase();
 
@@ -369,7 +383,7 @@ fn assert_closing_an_unused_stream_changes_nothing(
 /// The closed arm of a row: run it with `row.closed` closed in a fresh fixture directory
 /// and compare it with `open`, the open run made in `open_dir` (see the module doc).
 fn assert_the_closed_run_matches(
-    row: &Row,
+    row: &Row<'_>,
     open: &Run,
     open_dir: &Path,
 ) -> Vec<(PathBuf, Vec<u8>)> {
@@ -537,7 +551,7 @@ fn build_a_file_with_stderr_closed_exits_0_and_writes_the_output() {
         stdin: "",
         verdict: 0,
         closed: Stream::Stderr,
-        open_contains: "Compiled to ./ok.md\n",
+        open_contains: &format!("Compiled to {}\n", native("./ok.md")),
     });
     assert_eq!(
         written(&files, "ok.md"),
@@ -553,7 +567,7 @@ fn build_with_a_source_map_and_stderr_closed_exits_0_and_writes_both_files() {
         stdin: "",
         verdict: 0,
         closed: Stream::Stderr,
-        open_contains: "Source map written to ./ok.md.map\n",
+        open_contains: &format!("Source map written to {}\n", native("./ok.md.map")),
     });
     assert!(
         written(&files, "ok.md").is_some() && written(&files, "ok.md.map").is_some(),
@@ -664,7 +678,7 @@ fn fmt_check_diff_on_a_directory_with_stdout_closed_exits_1() {
         stdin: "",
         verdict: 1,
         closed: Stream::Stdout,
-        open_contains: "messy.mds\n",
+        open_contains: &diff_header("m/messy.mds"),
     });
 }
 
@@ -805,7 +819,7 @@ fn lint_fix_diff_of_a_directory_with_stdout_closed_exits_1() {
         stdin: "",
         verdict: 1,
         closed: Stream::Stdout,
-        open_contains: "+++ fixes/b.mds\n",
+        open_contains: &diff_header("fixes/b.mds"),
     });
 }
 
@@ -817,7 +831,7 @@ fn lint_json_fix_diff_of_a_directory_with_stdout_closed_exits_1() {
         stdin: "",
         verdict: 1,
         closed: Stream::Stdout,
-        open_contains: "+++ fixes/b.mds\n",
+        open_contains: &diff_header("fixes/b.mds"),
     });
 }
 
@@ -1144,13 +1158,13 @@ fn failing_stdouts() -> Vec<(&'static str, FailingStdout)> {
 }
 
 /// An `mds` run whose stdout fails for another reason than a closed pipe.
-struct FullRow {
+struct FullRow<'a> {
     args: &'static [&'static str],
     stdin: &'static str,
     /// The exit code with stdout on an open pipe.
     verdict: i32,
     /// What the open run prints on stdout: the writes a failing stdout loses.
-    open_contains: &'static [&'static str],
+    open_contains: &'a [&'a str],
     /// Run on each fresh fixture dir before `mds` is.
     prepare: fn(&Path),
 }
@@ -1163,7 +1177,7 @@ struct FullRow {
 /// loses those writes. Each failing run must exit `max(verdict, 2)` and report the
 /// failure exactly once, as one `mds::io` error naming stdout, however many writes it
 /// lost. Returns the open run and the failing runs.
-fn assert_a_failing_stdout_lifts_the_verdict(row: &FullRow) -> (Run, Vec<Run>) {
+fn assert_a_failing_stdout_lifts_the_verdict(row: &FullRow<'_>) -> (Run, Vec<Run>) {
     let what = row.args.join(" ");
     let ways = failing_stdouts();
     assert!(
@@ -1295,7 +1309,11 @@ fn lint_json_on_a_file_over_the_size_limit_into_a_failing_stdout_exits_3() {
 /// `mds lint` — as a file whose rewrite fails does, while the failure is reported once
 /// for the run. A closed stdout loses nothing: its rows above keep the open run's
 /// summary.
-fn assert_each_lost_diff_counts_as_failed(row: &FullRow, open_summary: &str, lost_summary: &str) {
+fn assert_each_lost_diff_counts_as_failed(
+    row: &FullRow<'_>,
+    open_summary: &str,
+    lost_summary: &str,
+) {
     let what = row.args.join(" ");
     let (open, failing) = assert_a_failing_stdout_lifts_the_verdict(row);
     assert!(
@@ -1321,7 +1339,7 @@ fn fmt_diff_of_a_directory_into_a_failing_stdout_counts_each_lost_diff_as_failed
             args: &["fmt", "--diff", "two"],
             stdin: "",
             verdict: 0,
-            open_contains: &["+++ two/a.mds\n", "+++ two/b.mds\n"],
+            open_contains: &[&diff_header("two/a.mds"), &diff_header("two/b.mds")],
             prepare: |_| {},
         },
         "2 would reformat, 0 unchanged, 0 failed\n",
@@ -1337,7 +1355,7 @@ fn lint_fix_diff_of_a_directory_into_a_failing_stdout_counts_each_lost_diff_unde
             args: &["lint", "--fix", "--diff", "fixes"],
             stdin: "",
             verdict: 1,
-            open_contains: &["+++ fixes/a.mds\n", "+++ fixes/b.mds\n"],
+            open_contains: &[&diff_header("fixes/a.mds"), &diff_header("fixes/b.mds")],
             prepare: |_| {},
         },
         "2 clean, 0 with warnings, 0 with errors, 0 resource-limited\n",
@@ -1354,7 +1372,11 @@ fn lint_json_fix_diff_of_a_directory_into_a_failing_stdout_counts_each_lost_diff
             args: &["lint", "--format", "json", "--fix", "--diff", "fixes"],
             stdin: "",
             verdict: 1,
-            open_contains: &["+++ fixes/a.mds\n", "+++ fixes/b.mds\n", "\"version\":1}\n"],
+            open_contains: &[
+                &diff_header("fixes/a.mds"),
+                &diff_header("fixes/b.mds"),
+                "\"version\":1}\n",
+            ],
             prepare: |_| {},
         },
         "2 clean, 0 with warnings, 0 with errors, 0 resource-limited\n",
