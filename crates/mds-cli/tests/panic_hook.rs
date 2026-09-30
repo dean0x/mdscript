@@ -278,6 +278,129 @@ mod default_output {
         mds::sanitize_control_chars_wire(line) == line
     }
 
+    /// The frame a real backtrace of a panic names: the CLI's panic hook.
+    const HOOK_FRAME: &str = "mds::output::on_panic";
+
+    /// The fewest numbered frames a real backtrace shows.
+    const MIN_FRAMES: usize = 3;
+
+    /// `line` without the crate hashes of v0 symbol names — a `[`, one or more hex digits
+    /// and a `]`, right after a crate's name — so that
+    /// `mds[1fc92abd4b2f6a9a]::output::on_panic` reads `mds::output::on_panic`, as the
+    /// legacy name `mds::output::on_panic::h…` does. rustc emits either scheme, and
+    /// `RUST_BACKTRACE=full` prints a v0 name's hashes.
+    fn without_crate_hashes(line: &str) -> String {
+        let mut parts = line.split('[');
+        let mut clean = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            let hex = part.len()
+                - part
+                    .trim_start_matches(|c: char| c.is_ascii_hexdigit())
+                    .len();
+            let after_a_name = clean.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+            match part[hex..].strip_prefix(']') {
+                Some(rest) if hex > 0 && after_a_name => clean.push_str(rest),
+                _ => {
+                    clean.push('[');
+                    clean.push_str(part);
+                }
+            }
+        }
+        clean
+    }
+
+    /// Whether a line of `backtrace` names [`HOOK_FRAME`], in either symbol-name scheme.
+    fn names_the_hook(backtrace: &str) -> bool {
+        backtrace
+            .lines()
+            .any(|line| without_crate_hashes(line).contains(HOOK_FRAME))
+    }
+
+    /// How many lines of `backtrace` start a frame: its number, right-aligned, then `: `
+    /// (`   4: mds::output::on_panic`). A frame's `at <file>:<line>` line and a function
+    /// inlined into it carry no number.
+    fn numbered_frames(backtrace: &str) -> usize {
+        backtrace
+            .lines()
+            .filter(|line| {
+                let numbered = line.trim_start_matches(' ');
+                let digits = numbered.len()
+                    - numbered
+                        .trim_start_matches(|c: char| c.is_ascii_digit())
+                        .len();
+                digits > 0 && numbered[digits..].starts_with(": ")
+            })
+            .count()
+    }
+
+    /// The backtrace check reads both of rustc's symbol-name schemes. A legacy name ends in
+    /// a hash (`mds::output::on_panic::h0123456789abcdef`); a v0 name printed in full keeps
+    /// its crate's hash (`mds[1fc92abd4b2f6a9a]::output::on_panic`, as CI's rustc prints
+    /// it with `RUST_BACKTRACE=full`), so as it stands it never reads `mds::`.
+    ///
+    /// Controls: the v0 line fails a plain `mds::` check; a bracket that is not a crate
+    /// hash is kept; another frame, of std or of the CLI, does not name the hook; a frame's
+    /// `at` line and a function inlined into a frame are not frames, so two frames with
+    /// their `at` lines fall short of [`MIN_FRAMES`] though they are more than two lines.
+    #[test]
+    fn the_backtrace_check_reads_both_symbol_name_schemes() {
+        const V0: &str = "   5:     0x55f9020bb0b0 - mds[1fc92abd4b2f6a9a]::output::on_panic";
+        const LEGACY: &str = "   5:     0x55f9020bb0b0 - mds::output::on_panic::h0123456789abcdef";
+        assert!(
+            !V0.contains("mds::"),
+            "control: the v0 line fails a plain `mds::` check"
+        );
+        for line in [V0, LEGACY] {
+            assert!(names_the_hook(line), "{line:?} names the hook's frame");
+        }
+        assert_eq!(
+            without_crate_hashes(V0),
+            "   5:     0x55f9020bb0b0 - mds::output::on_panic"
+        );
+        assert_eq!(
+            without_crate_hashes(LEGACY),
+            LEGACY,
+            "a legacy name has no crate hash"
+        );
+        assert_eq!(
+            without_crate_hashes("<std[6c98fd8553dbae28]::backtrace::Backtrace>::create"),
+            "<std::backtrace::Backtrace>::create",
+            "every crate hash on a line goes"
+        );
+        for kept in ["<[f32]>::len", "x[]", "x[1f", "x[1fz]", "x[0x1f]", "[1f]"] {
+            assert_eq!(without_crate_hashes(kept), kept, "not a crate hash");
+        }
+        for other in [
+            "   8:     0x55f902661992 - std[6c98fd8553dbae28]::panicking::panic",
+            "  14:     0x55f90206a7f4 - mds[1fc92abd4b2f6a9a]::run",
+        ] {
+            assert!(
+                !names_the_hook(other),
+                "control: {other:?} is not the hook's frame"
+            );
+        }
+
+        let frames = [
+            "stack backtrace:",
+            "   4: mds::output::write_backtrace",
+            "             at ./crates/mds-cli/src/output.rs:604:21",
+            "      mds::output::inlined_into_frame_4",
+            "  12:     0x55f90206a7f4 - mds[1fc92abd4b2f6a9a]::run",
+            "                               at /w/crates/mds-cli/src/main.rs:500:5",
+            "1000: main",
+        ];
+        assert_eq!(
+            numbered_frames(&frames.join("\n")),
+            3,
+            "only a numbered line starts a frame"
+        );
+        let two_frames = frames[..6].join("\n");
+        assert!(
+            two_frames.lines().count() > 2 && numbered_frames(&two_frames) < MIN_FRAMES,
+            "control: two frames with their `at` lines fall short of {MIN_FRAMES} frames"
+        );
+    }
+
     /// A panic prints exactly the internal compiler error text and exits 101: never the
     /// payload's sentinel, ESC or absolute path, never `panicked at`, a source location or
     /// a thread name.
@@ -313,8 +436,9 @@ mod default_output {
     /// `RUST_BACKTRACE` set to `1` or `full` adds a backtrace after the text, and only
     /// that: every line of it escaped, and still nothing of the payload. `0` adds nothing.
     ///
-    /// Controls: the line check finds a raw ESC; the backtrace is a real one, naming a
-    /// frame of the CLI's own code.
+    /// Controls: the line check finds a raw ESC; the backtrace is a real one, naming the
+    /// panic hook's frame in either symbol-name scheme among at least [`MIN_FRAMES`]
+    /// numbered frames (`the_backtrace_check_reads_both_symbol_name_schemes`).
     #[test]
     fn rust_backtrace_adds_only_an_escaped_backtrace() {
         let dir = fixture();
@@ -356,9 +480,14 @@ mod default_output {
                 run.stderr
             );
             assert!(
-                backtrace.contains("mds::") && backtrace.lines().count() > 2,
-                "RUST_BACKTRACE={value}: a real backtrace names a frame of the CLI; it \
-                 was:\n{backtrace}"
+                names_the_hook(backtrace),
+                "RUST_BACKTRACE={value}: a real backtrace names the panic hook's frame, \
+                 {HOOK_FRAME}; it was:\n{backtrace}"
+            );
+            assert!(
+                numbered_frames(backtrace) >= MIN_FRAMES,
+                "RUST_BACKTRACE={value}: a real backtrace shows at least {MIN_FRAMES} \
+                 numbered frames; it was:\n{backtrace}"
             );
             for line in backtrace.split_terminator('\n') {
                 assert!(
