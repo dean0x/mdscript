@@ -3045,7 +3045,9 @@ mod tests {
         let result = verify_then_delete_map(&map, "out.md", true);
         let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
         if probe.is_ok() {
-            eprintln!("skipped: a file can be created at mode 0o555 (running as root?)");
+            crate::output::ewriteln!(
+                "skipped: a file can be created at mode 0o555 (running as root?)"
+            );
             return;
         }
         match result {
@@ -3083,7 +3085,9 @@ mod tests {
         std::fs::write(&map, sidecar).unwrap();
         std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::File::open(&map).is_ok() {
-            eprintln!("skipped: a file can be read at mode 0o000 (running as root?)");
+            crate::output::ewriteln!(
+                "skipped: a file can be read at mode 0o000 (running as root?)"
+            );
             return;
         }
         let result = verify_then_delete_map(&map, "out.md", true);

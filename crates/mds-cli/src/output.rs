@@ -3227,7 +3227,7 @@ mod tests {
                     if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
                         && std::env::var_os("CI").is_none()
                     {
-                        eprintln!(
+                        ewriteln!(
                             "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
                         );
                         return false;
@@ -3547,7 +3547,7 @@ mod tests {
         if std::fs::metadata(&probe).is_ok() {
             // Root bypasses the mode bits; EACCES cannot be provoked here.
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-            eprintln!("running as root; cannot exercise EACCES");
+            ewriteln!("running as root; cannot exercise EACCES");
             return;
         }
 

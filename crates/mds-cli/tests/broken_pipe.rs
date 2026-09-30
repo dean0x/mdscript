@@ -36,6 +36,17 @@
 //! With stdout closed, stderr stays open and must match the open run's byte for byte,
 //! so a panic or an error report about the closed pipe fails the row as well.
 //!
+//! A command that writes nothing to the stream a row closes — `mds check` and `mds init`
+//! report on stderr only — has a row whose control asserts the open run's stream is
+//! empty instead: the row then pins that the stream stays unused.
+//!
+//! # The subcommand × closed-stream table
+//!
+//! [`TABLE`] names one row for every subcommand and closed stream, and
+//! `every_subcommand_has_a_row_for_each_closed_stream` fails for a subcommand `mds --help`
+//! lists without both rows, for a row whose subcommand is gone, and for a row that names
+//! no test. `mds watch` keeps running, so its two rows are in `cli_watch.rs`.
+//!
 //! # The other failures
 //!
 //! - An output that cannot be written: a directory at mode `0o555` (unix). Root ignores
@@ -303,7 +314,6 @@ struct Row {
 fn assert_closing_keeps_the_verdict(row: &Row) -> Vec<(PathBuf, Vec<u8>)> {
     let what = row.args.join(" ");
     let closed_name = format!("{:?}", row.closed).to_lowercase();
-    let kept = row.closed.other();
 
     let open_dir = fixture_dir();
     let open = run(open_dir.path(), row.args, row.stdin, None);
@@ -320,6 +330,52 @@ fn assert_closing_keeps_the_verdict(row: &Row) -> Vec<(PathBuf, Vec<u8>)> {
         row.open_contains,
         open.text(row.closed)
     );
+    assert_the_closed_run_matches(row, &open, open_dir.path())
+}
+
+/// [`assert_closing_keeps_the_verdict`] for a command that writes nothing to the stream
+/// it closes. The control asserts the open run's stream is empty, so the row pins that
+/// the command keeps not using it: closing it changes neither the verdict, nor the other
+/// stream, nor what is written to disk.
+fn assert_closing_an_unused_stream_changes_nothing(
+    args: &'static [&'static str],
+    verdict: i32,
+    closed: Stream,
+) -> Vec<(PathBuf, Vec<u8>)> {
+    let what = args.join(" ");
+    let open_dir = fixture_dir();
+    let open = run(open_dir.path(), args, "", None);
+    assert_eq!(
+        open.code,
+        Some(verdict),
+        "control: `mds {what}` with open streams must exit with its verdict; stderr: {:?}",
+        open.stderr
+    );
+    assert_eq!(
+        open.text(closed),
+        "",
+        "control: `mds {what}` must write nothing to {closed:?} for this row"
+    );
+    let row = Row {
+        args,
+        stdin: "",
+        verdict,
+        closed,
+        open_contains: "",
+    };
+    assert_the_closed_run_matches(&row, &open, open_dir.path())
+}
+
+/// The closed arm of a row: run it with `row.closed` closed in a fresh fixture directory
+/// and compare it with `open`, the open run made in `open_dir` (see the module doc).
+fn assert_the_closed_run_matches(
+    row: &Row,
+    open: &Run,
+    open_dir: &Path,
+) -> Vec<(PathBuf, Vec<u8>)> {
+    let what = row.args.join(" ");
+    let closed_name = format!("{:?}", row.closed).to_lowercase();
+    let kept = row.closed.other();
 
     let closed_dir = fixture_dir();
     let closed = run(closed_dir.path(), row.args, row.stdin, Some(row.closed));
@@ -341,7 +397,7 @@ fn assert_closing_keeps_the_verdict(row: &Row) -> Vec<(PathBuf, Vec<u8>)> {
         kept
     );
 
-    let open_files = files_under(open_dir.path());
+    let open_files = files_under(open_dir);
     let closed_files = files_under(closed_dir.path());
     assert_eq!(
         closed_files, open_files,
@@ -419,6 +475,23 @@ fn init_with_stderr_closed_exits_0_and_writes_the_file() {
             .as_deref()
             .is_some_and(|s| s.contains("Hello {{name}}!")),
         "`mds init` with stderr closed must still write the starter file; got {starter:?}"
+    );
+}
+
+/// `mds check` reports on stderr only; closing its stdout changes nothing.
+#[test]
+fn check_a_file_with_stdout_closed_exits_0() {
+    assert_closing_an_unused_stream_changes_nothing(&["check", "ok.mds"], 0, Stream::Stdout);
+}
+
+/// `mds init` reports on stderr only; closing its stdout changes nothing, and the
+/// starter file is written.
+#[test]
+fn init_with_stdout_closed_exits_0_and_writes_the_file() {
+    let files = assert_closing_an_unused_stream_changes_nothing(&["init"], 0, Stream::Stdout);
+    assert!(
+        written(&files, "hello.mds").is_some(),
+        "`mds init` with stdout closed must still write the starter file"
     );
 }
 
@@ -746,6 +819,228 @@ fn lint_json_fix_diff_of_a_directory_with_stdout_closed_exits_1() {
         closed: Stream::Stdout,
         open_contains: "+++ fixes/b.mds\n",
     });
+}
+
+// ── The subcommand × closed-stream table ─────────────────────────────────────
+
+/// One cell of the table: the test that closes `stream` under `subcommand`, in `file`
+/// (under `tests/`), with an open-stream control.
+struct Cell {
+    subcommand: &'static str,
+    stream: Stream,
+    file: &'static str,
+    test: &'static str,
+}
+
+/// One named row per subcommand and closed stream. Most subcommands have more rows above;
+/// this names the one each cell rests on. `mds watch` keeps running, so its rows live
+/// with the other watch tests: stdout closed ends its session with exit 0, stderr closed
+/// leaves it watching.
+const TABLE: &[Cell] = &[
+    Cell {
+        subcommand: "build",
+        stream: Stream::Stdout,
+        file: "broken_pipe.rs",
+        test: "build_to_stdout_with_stdout_closed_exits_0",
+    },
+    Cell {
+        subcommand: "build",
+        stream: Stream::Stderr,
+        file: "broken_pipe.rs",
+        test: "build_a_file_with_stderr_closed_exits_0_and_writes_the_output",
+    },
+    Cell {
+        subcommand: "check",
+        stream: Stream::Stdout,
+        file: "broken_pipe.rs",
+        test: "check_a_file_with_stdout_closed_exits_0",
+    },
+    Cell {
+        subcommand: "check",
+        stream: Stream::Stderr,
+        file: "broken_pipe.rs",
+        test: "check_a_file_with_stderr_closed_exits_0",
+    },
+    Cell {
+        subcommand: "fmt",
+        stream: Stream::Stdout,
+        file: "broken_pipe.rs",
+        test: "fmt_stdin_with_stdout_closed_exits_0",
+    },
+    Cell {
+        subcommand: "fmt",
+        stream: Stream::Stderr,
+        file: "broken_pipe.rs",
+        test: "fmt_a_file_with_stderr_closed_exits_0_and_rewrites_it",
+    },
+    Cell {
+        subcommand: "lint",
+        stream: Stream::Stdout,
+        file: "broken_pipe.rs",
+        test: "lint_json_on_a_file_with_stdout_closed_exits_1",
+    },
+    Cell {
+        subcommand: "lint",
+        stream: Stream::Stderr,
+        file: "broken_pipe.rs",
+        test: "lint_a_file_with_warnings_and_stderr_closed_exits_1",
+    },
+    Cell {
+        subcommand: "init",
+        stream: Stream::Stdout,
+        file: "broken_pipe.rs",
+        test: "init_with_stdout_closed_exits_0_and_writes_the_file",
+    },
+    Cell {
+        subcommand: "init",
+        stream: Stream::Stderr,
+        file: "broken_pipe.rs",
+        test: "init_with_stderr_closed_exits_0_and_writes_the_file",
+    },
+    Cell {
+        subcommand: "watch",
+        stream: Stream::Stdout,
+        file: "cli_watch.rs",
+        test: "watch_to_stdout_whose_reader_is_gone_stops_and_exits_0",
+    },
+    Cell {
+        subcommand: "watch",
+        stream: Stream::Stderr,
+        file: "cli_watch.rs",
+        test: "watch_with_stderr_closed_keeps_watching",
+    },
+];
+
+/// The subcommands `mds --help` lists, clap's own `help` aside.
+fn subcommands() -> Vec<String> {
+    let mut cmd = mds_bin();
+    cmd.arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn mds --help");
+    let out = drain(child.stdout.take());
+    let code = wait_bounded(&mut child, "--help");
+    assert_eq!(code, Some(0), "`mds --help` exits 0");
+    commands_in_help(&joined(out))
+}
+
+/// The command names under `Commands:` in clap's help text, `help` aside.
+fn commands_in_help(help: &str) -> Vec<String> {
+    help.lines()
+        .skip_while(|line| line.trim() != "Commands:")
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| *name != "help")
+        .map(str::to_string)
+        .collect()
+}
+
+/// What `table` lacks for `subcommands`: every subcommand × stream with no cell, and every
+/// cell for a subcommand that no longer exists.
+fn table_gaps(subcommands: &[String], table: &[Cell]) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for subcommand in subcommands {
+        for stream in [Stream::Stdout, Stream::Stderr] {
+            if !table
+                .iter()
+                .any(|cell| cell.subcommand == subcommand && cell.stream == stream)
+            {
+                gaps.push(format!("mds {subcommand} × {stream:?} closed: no row"));
+            }
+        }
+    }
+    for cell in table {
+        if !subcommands.iter().any(|s| s == cell.subcommand) {
+            gaps.push(format!(
+                "mds {} is not a subcommand, but has a row: {}",
+                cell.subcommand, cell.test
+            ));
+        }
+    }
+    gaps
+}
+
+/// Does `tests/<file>` define a function named `test` with `#[test]` among the attributes
+/// right above it?
+fn defines_test(file: &str, test: &str) -> bool {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(file);
+    let src = std::fs::read_to_string(&path).expect("read a test file");
+    let lines: Vec<&str> = src.lines().map(str::trim).collect();
+    let signature = format!("fn {test}() {{");
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == signature)
+        .any(|(at, _)| {
+            lines[..at]
+                .iter()
+                .rev()
+                .take_while(|line| line.starts_with("#[") || line.starts_with("///"))
+                .any(|line| *line == "#[test]")
+        })
+}
+
+/// Every subcommand has a row for a closed stdout and one for a closed stderr, each a
+/// test that exists (#157). A new subcommand without its rows fails here.
+#[test]
+fn every_subcommand_has_a_row_for_each_closed_stream() {
+    let subcommands = subcommands();
+    assert!(
+        subcommands.len() >= 6,
+        "non-vacuity: expected at least 6 subcommands in `mds --help`, found {subcommands:?}"
+    );
+    let gaps = table_gaps(&subcommands, TABLE);
+    assert!(
+        gaps.is_empty(),
+        "the closed-stream table has gaps:\n{gaps:#?}"
+    );
+    let missing: Vec<&str> = TABLE
+        .iter()
+        .filter(|cell| !defines_test(cell.file, cell.test))
+        .map(|cell| cell.test)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these rows name no #[test] fn in their file: {missing:?}"
+    );
+}
+
+/// The table check finds a gap for a new subcommand and a stale cell for a removed one,
+/// and a row that names no test (positive controls).
+#[test]
+fn the_table_check_reports_a_missing_row_a_stale_cell_and_an_unknown_test() {
+    let help = "Usage: mds <COMMAND>\n\nCommands:\n  build  Compile\n  serve  Serve\n  \
+                help   Print this message\n\nOptions:\n  -q  Quiet\n";
+    let subcommands = commands_in_help(help);
+    assert_eq!(subcommands, ["build", "serve"]);
+
+    let gaps = table_gaps(&subcommands, TABLE);
+    for want in [
+        "mds serve × Stdout closed: no row",
+        "mds serve × Stderr closed: no row",
+        "mds watch is not a subcommand, but has a row: watch_with_stderr_closed_keeps_watching",
+    ] {
+        assert!(
+            gaps.iter().any(|gap| gap == want),
+            "want {want:?} among {gaps:#?}"
+        );
+    }
+    assert!(
+        !gaps.iter().any(|gap| gap.starts_with("mds build ×")),
+        "build has both rows; gaps: {gaps:#?}"
+    );
+
+    assert!(defines_test(
+        "broken_pipe.rs",
+        "check_a_file_with_stderr_closed_exits_0"
+    ));
+    assert!(!defines_test(
+        "broken_pipe.rs",
+        "check_a_file_with_stdout_closed_exits_42"
+    ));
 }
 
 // ── A stdout that fails for another reason than a closed pipe ────────────────

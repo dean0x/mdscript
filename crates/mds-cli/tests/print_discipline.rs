@@ -32,7 +32,22 @@
 //!   matches a macro by name, so a stderr writer is covered only while it is listed in
 //!   [`PRINT_MACROS`]: every site that moves to an unlisted writer leaves the guard.
 //!   [`SITE_FLOORS`] fails when a listed file's site count drops, which is how such a
-//!   move shows up.
+//!   move shows up. Every file with a print site has a floor, or a written reason in
+//!   [`FLOORS_PENDING`] — `lint.rs`, until the lint pipeline refactor (#309) settles its
+//!   count ([`every_printing_file_has_a_site_floor`]).
+//! - **No std print macro at all.** `println!` / `print!` / `eprintln!` / `eprint!` /
+//!   `dbg!` panic when their write fails, so none may be named anywhere in
+//!   `crates/mds-cli/src/**`: not called, not renamed on import, not wrapped in another
+//!   macro — test modules and the writer macros' own bodies included, with no exemption
+//!   ([`no_raw_print_macro_outside_the_writer`], #157). Status lines go through the
+//!   writer macros; a command's product goes through `write_stdout`.
+//! - **One way out of the process.** Only the exit funnel `output::exit` calls
+//!   `std::process::exit` ([`EXIT_FUNNELS`]); `std::process::abort` appears nowhere, and
+//!   a `use` that would let a call skip naming `process::exit` — renamed, braced,
+//!   globbed, or through a renamed `process` — is reported
+//!   ([`process_exit_only_in_the_funnel`]).
+//! - Both of those scans read every module the crate compiles: `crate_sources` resolves
+//!   each `mod name;` from `main.rs` as rustc does and fails on one it did not read.
 //! - **Every mention of `write_stderr_fmt`**, the function the writer macros expand to.
 //!   Its argument is a `format_args!`, which is not a print site, so a direct call would
 //!   reach stderr with nothing it interpolates scanned — and so would every site of a new
@@ -83,6 +98,11 @@
 //! - `write!` / `writeln!` into an in-memory `String`, and stdout writes through a
 //!   `write_stdout` byte sink. Compiled template output is the command's *product* and
 //!   must stay byte-faithful.
+//! - clap's own help, version and usage output. `main.rs` prints it with clap's
+//!   `err.print()`, which is neither a print macro nor `write_stderr_fmt`, so it is
+//!   outside every scan here by construction (the raw-print ban skips a method of that
+//!   name on purpose). `main.rs` applies the stream rule to its result (#157); the text,
+//!   an argument clap echoes back included, is clap's to render.
 //! - `crates/mds-core/**` warning *producers*. Core does not print except through
 //!   `emit_warnings`, which escapes in HUMAN mode; the identifiers its warning producers
 //!   interpolate are WIRE-escaped at construction instead. This guard is lexical and
@@ -139,11 +159,16 @@
 //!    resolved that way, and `for label in rules { eprint_warning(label) }` in `lint.rs`
 //!    passed the guard because the file's three unrelated `let label = safe_path(…)`
 //!    bindings were all safe.
-//! 6. **Print macros are matched by the name they are invoked under.** Renaming one on
-//!    import — `use crate::output::ewriteln as say;`, or `use std::eprintln as say;` —
-//!    takes every `say!(…)` site out of the scan, the same shape as limit 1 for
-//!    sanitizers. Renaming the writer *function* on import is caught: it is a mention of
-//!    `write_stderr_fmt` outside the writer macros.
+//! 6. **Print macros are matched by the name they are invoked under.** Renaming a writer
+//!    macro on import — `use crate::output::ewriteln as say;` — takes every `say!(…)`
+//!    site out of the sanitizer scan, the same shape as limit 1 for sanitizers. Renaming
+//!    the writer *function* on import is caught: it is a mention of `write_stderr_fmt`
+//!    outside the writer macros. So is renaming a std print macro: the raw-print ban
+//!    reports any mention of its name, `use std::eprintln as say;` included.
+//! 7. **The raw-print and exit bans read this crate's text only.** Code in a dependency
+//!    that prints through std or ends the process is not a mention here: mds-core's
+//!    `emit_warnings`, still an `eprintln!` (#435), and clap's `Error::exit` and
+//!    `Parser::parse`, which exit on their own — `main.rs` calls neither.
 //!
 //! Every one of these requires writing code that looks wrong on purpose. The bar this
 //! guard is built to meet is **accidental** reintroduction — the four times #176 was
@@ -173,14 +198,23 @@
 //!   [`the_writer_fn_guard_flags_direct_calls_aliases_and_unlisted_macros`] for a direct
 //!   call to the writer function, a renamed import of it and a macro built on it under
 //!   an unlisted name.
-//! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`] and
-//!   [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`] prove the real sources
-//!   are clean.
+//!   [`the_raw_print_guard_flags_every_std_print_macro_and_its_aliases`] flags each std
+//!   print macro, a path-qualified call, a renamed import and a wrapping macro;
+//!   [`the_exit_guard_flags_every_way_out_but_the_funnel`] flags an exit outside the
+//!   funnel, `abort`, and each import shape that hides one; and
+//!   [`the_module_walk_finds_every_module_a_crate_declares`] proves the coverage check
+//!   resolves flat, directory and nested modules.
+//! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`],
+//!   [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`],
+//!   [`no_raw_print_macro_outside_the_writer`] and [`process_exit_only_in_the_funnel`]
+//!   prove the real sources are clean.
 //! - **Non-vacuity:** the same test asserts the scanner actually found the crate's
 //!   modules, its print sites (crate-wide, and per file for the files in
 //!   [`SITE_FLOORS`]), its interpolations, its `let` bindings, the non-`let` binders that
 //!   poison a name, and its calls into the sanitizing print helpers, so it cannot pass
-//!   because the parser silently returned nothing.
+//!   because the parser silently returned nothing. The two bans read every module the
+//!   crate declares, the raw-print ban saw the writer calls, and the exit ban found each
+//!   funnel holding exactly its one `process::exit`.
 //! - **Allowlist rot:** [`every_allowlist_entry_is_live`] fails if an entry in either
 //!   allowlist stops matching anything, so exemptions cannot outlive the code that
 //!   needed them.
@@ -218,6 +252,36 @@ const SITE_FLOORS: &[(&str, usize)] = &[
     ("output.rs", 6),
     ("watch.rs", 18),
 ];
+
+/// Files that print but have no [`SITE_FLOORS`] entry yet, each with the reason.
+///
+/// [`every_printing_file_has_a_site_floor`] fails on a printing file listed in neither
+/// place, and on an entry here for a file that has a floor or no print site, so the
+/// list cannot outlive its reason.
+const FLOORS_PENDING: &[(&str, &str)] = &[(
+    "lint.rs",
+    "`mds lint`'s status lines are moving out of lint.rs into the result sinks of the \
+     lint pipeline refactor (#309), which changes this file's site count on purpose. \
+     Its floor is set when that lands, so it pins the final count; until then the \
+     crate-wide floor and the sanitizer check still cover every site in it.",
+)];
+
+/// std's print macros, and `dbg!`, which prints through `eprintln!` (#157).
+///
+/// Each panics when its write fails, which is how a closed or failing stream ended a run
+/// with exit 101. None may appear anywhere in `crates/mds-cli/src/**` — see
+/// [`no_raw_print_macro_outside_the_writer`].
+const RAW_PRINT_MACROS: &[&str] = &["println", "print", "eprintln", "eprint", "dbg"];
+
+/// The functions allowed to call `std::process::exit`, by file: the CLI's exit funnel,
+/// which applies the output-failure rule to every exit code (#157). A second funnel — a
+/// panic path that cannot return to it — is listed here beside it, never exempted by
+/// name elsewhere.
+const EXIT_FUNNELS: &[(&str, &str)] = &[("output.rs", "exit")];
+
+/// The `std::process` functions that end the process: `exit` only through a funnel,
+/// `abort` never.
+const PROCESS_ENDERS: &[&str] = &["exit", "abort"];
 
 /// The function the stderr writer macros expand to (`output.rs`, #157).
 ///
@@ -684,6 +748,131 @@ fn the_stderr_writer_fn_is_called_only_by_the_writer_macros() {
     );
 }
 
+/// A per-file floor is only a guard for the files that have one. Every file with a print
+/// site has a [`SITE_FLOORS`] entry or a written reason in [`FLOORS_PENDING`], and each
+/// pending entry is still a printing file without a floor.
+#[test]
+fn every_printing_file_has_a_site_floor() {
+    let mut unfloored: Vec<String> = Vec::new();
+    let mut printing = 0usize;
+    for (name, src) in crate_sources() {
+        let sites = collect_sites(&src).len();
+        let floored = SITE_FLOORS.iter().any(|(file, _)| *file == name);
+        let pending = FLOORS_PENDING.iter().any(|(file, _)| *file == name);
+        if sites > 0 {
+            printing += 1;
+        }
+        match (sites > 0, floored, pending) {
+            (true, false, false) => {
+                unfloored.push(format!("  {name}: {sites} print sites, no floor"));
+            }
+            (_, true, true) => unfloored.push(format!(
+                "  {name}: has a floor, so its FLOORS_PENDING entry must go"
+            )),
+            (false, _, true) => unfloored.push(format!(
+                "  {name}: prints nothing, so its FLOORS_PENDING entry must go"
+            )),
+            _ => {}
+        }
+    }
+    assert!(
+        printing >= SITE_FLOORS.len() + FLOORS_PENDING.len(),
+        "non-vacuity: expected at least {} printing files, found {printing}",
+        SITE_FLOORS.len() + FLOORS_PENDING.len()
+    );
+    for (file, why) in FLOORS_PENDING {
+        assert!(
+            why.len() >= 40,
+            "FLOORS_PENDING entry {file} needs a real reason, got {why:?}"
+        );
+    }
+    assert!(
+        unfloored.is_empty(),
+        "print-discipline violation: a file's print sites are unguarded by a floor:\n{}\n\n\
+         Add the file to SITE_FLOORS at its current site count, or to FLOORS_PENDING with \
+         the reason its count is about to change.",
+        unfloored.join("\n")
+    );
+}
+
+/// std's print macros panic when their write fails, which is how a closed or failing
+/// stream ended a run with exit 101 (#157). The CLI prints through `ewriteln!` /
+/// `ewrite!`, which never panic, and writes its product through `write_stdout`, so no
+/// [`RAW_PRINT_MACROS`] name may appear in `crates/mds-cli/src/**`: not as a call, not
+/// in a `use` that renames one, not wrapped in another macro.
+///
+/// No exemption, test modules included. The writer macros need none (they expand to
+/// `write_stderr_fmt`), and a writer body that reached for `eprintln!` would bring the
+/// panic back. A unit test's skip notice goes through the writer too — it then reaches
+/// the real stderr uncaptured, which is where a skip notice belongs.
+#[test]
+fn no_raw_print_macro_outside_the_writer() {
+    let sources = crate_sources();
+    let mut found: Vec<String> = Vec::new();
+    let mut writer_calls = 0usize;
+    for (name, src) in &sources {
+        found.extend(
+            raw_print_mentions(src)
+                .into_iter()
+                .map(|line| format!("  {name}:{line}")),
+        );
+        writer_calls += find_invocations(&mask_comments(src), &["ewriteln!", "ewrite!"]).len();
+    }
+
+    // Non-vacuity: the scan read the code the CLI prints from.
+    assert!(
+        writer_calls >= 80,
+        "non-vacuity: expected at least 80 `ewriteln!` / `ewrite!` calls across \
+         mds-cli/src, found {writer_calls}"
+    );
+    assert!(
+        found.is_empty(),
+        "print-discipline violation: a std print macro ({RAW_PRINT_MACROS:?}) is named in \
+         mds-cli/src:\n{}\n\nWrite status lines through `crate::output::ewriteln!` / \
+         `ewrite!` and a command's product through `crate::output::write_stdout`; neither \
+         panics when its stream fails.",
+        found.join("\n")
+    );
+}
+
+/// Only the exit funnel ends the process: it applies the rule that an output failure
+/// lifts the exit code to at least 2 (#157), and any other `std::process::exit` would
+/// skip it. `std::process::abort` never appears. Renaming either on import, a glob import
+/// of `std::process`, or renaming `process` itself is reported as well, since the call
+/// it enables would no longer name `process::exit`.
+#[test]
+fn process_exit_only_in_the_funnel() {
+    let mut stray: Vec<String> = Vec::new();
+    let mut in_funnel = 0usize;
+    for (name, src) in crate_sources() {
+        let funnels: Vec<&str> = EXIT_FUNNELS
+            .iter()
+            .filter(|(file, _)| *file == name)
+            .map(|(_, function)| *function)
+            .collect();
+        let ends = process_end_mentions(&src, &funnels);
+        in_funnel += ends.in_funnel;
+        stray.extend(
+            ends.stray
+                .into_iter()
+                .map(|line| format!("  {name}:{line}")),
+        );
+    }
+
+    // Non-vacuity: each funnel was found, and holds its one `process::exit`.
+    assert_eq!(
+        in_funnel,
+        EXIT_FUNNELS.len(),
+        "non-vacuity: each of {EXIT_FUNNELS:?} must hold exactly one `std::process::exit`"
+    );
+    assert!(
+        stray.is_empty(),
+        "exit-funnel violation: the process is ended, or can be, outside {EXIT_FUNNELS:?}:\n\
+         {}\n\nEnd the run through `crate::output::exit(code)`.",
+        stray.join("\n")
+    );
+}
+
 // ── Scanner self-tests (PF-013 positive / negative / robustness) ──────────────
 
 #[test]
@@ -1056,6 +1245,141 @@ fn the_writer_fn_guard_flags_direct_calls_aliases_and_unlisted_macros() {
             allowed: 0
         },
         "comments, strings and other identifiers are not mentions"
+    );
+}
+
+#[test]
+fn the_raw_print_guard_flags_every_std_print_macro_and_its_aliases() {
+    // Reported, each on its own line: all five macros, a path-qualified call, a renamed
+    // import, a macro that shadows one and a macro that wraps one — the writer's own
+    // body included, since the ban has no exemption.
+    let raw = r#"
+        fn f(p: &Path) {
+            eprintln!("{}", safe_path(p));
+            std::println!("x");
+            print!("y");
+            eprint!("z");
+            let _v = dbg!(1);
+        }
+        use std::eprintln as say;
+        macro_rules! eprint { () => {}; }
+        macro_rules! ewriteln { ($($t:tt)*) => { eprintln!($($t)*) }; }
+    "#;
+    assert_eq!(raw_print_mentions(raw), vec![3, 4, 5, 6, 7, 9, 10, 11]);
+
+    // Not mentions: the writer, a method or field of that name (clap's `err.print()`),
+    // a function definition, longer identifiers, comments and literals.
+    let clean = r#"
+        fn f(err: &clap::Error, p: &Path) {
+            crate::output::ewriteln!("Clean: {}", safe_path(p));
+            ewrite!("{}", "eprintln!(\"no\")");
+            let _ = err.print();
+            let _ = err
+                .print();
+            eprint_warning("print");
+            print_diff(p);
+            // eprintln!("a comment");
+            /* dbg!(x) */
+        }
+        fn print() {}
+    "#;
+    assert_eq!(raw_print_mentions(clean), Vec::<usize>::new());
+}
+
+#[test]
+fn the_exit_guard_flags_every_way_out_but_the_funnel() {
+    // Accepted: the funnel's own `process::exit`, however qualified.
+    let funnel = r#"
+        /// Ends the run; `std::process::exit` in a doc comment is not a call.
+        pub(crate) fn exit(verdict: i32) -> ! {
+            std::process::exit(final_exit_code(verdict))
+        }
+    "#;
+    assert_eq!(
+        process_end_mentions(funnel, &["exit"]),
+        ProcessEnds {
+            stray: Vec::new(),
+            in_funnel: 1
+        }
+    );
+
+    // Reported, each on its own line: an exit outside the funnel (the same funnel body
+    // in a file that lists no funnel included), both qualifications, `abort`, a renamed
+    // import, a braced import, a glob, and a renamed `process`.
+    let bypasses = r#"
+        fn bail() { std::process::exit(1); }
+        fn out() { process::exit(2) }
+        fn crash() { ::std::process::abort() }
+        use std::process::exit as quit;
+        use std::process::{self, abort};
+        use std::process::*;
+        use std::process as p;
+        use std::{process::exit};
+    "#;
+    assert_eq!(
+        process_end_mentions(bypasses, &["exit"]),
+        ProcessEnds {
+            stray: vec![2, 3, 4, 5, 6, 7, 8, 9],
+            in_funnel: 0
+        }
+    );
+    assert_eq!(
+        process_end_mentions(funnel, &[]).stray,
+        vec![4],
+        "the funnel body counts as the funnel only in the file that lists it"
+    );
+
+    // Neither: the funnel's callers, other `std::process` items, a plain module import,
+    // names that merely contain the words, comments and literals.
+    let prose = r#"
+        use std::process;
+        use std::process::{Command, Stdio};
+        fn f() {
+            output::exit(2);
+            let code = exit_code(&e);
+            let _ = process::Command::new("mds");
+            let _ = "std::process::exit(1)";
+            // process::abort();
+        }
+    "#;
+    assert_eq!(
+        process_end_mentions(prose, &["exit"]),
+        ProcessEnds {
+            stray: Vec::new(),
+            in_funnel: 0
+        }
+    );
+}
+
+#[test]
+fn the_module_walk_finds_every_module_a_crate_declares() {
+    // A crate on disk: `main.rs` declares a flat module, a directory module and a nested
+    // one; an inline `mod tests { … }` and a commented-out declaration are no files.
+    let root = tempfile::tempdir().expect("create a temporary crate");
+    let src = root.path();
+    let write = |rel: &str, text: &str| {
+        let path = src.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create a dir");
+        std::fs::write(path, text).expect("write a module");
+    };
+    write(
+        "main.rs",
+        "mod flat;\npub(crate) mod dir;\n// mod ghost;\nmod tests {}\n",
+    );
+    write("flat.rs", "#[cfg(test)]\nmod inner;\n");
+    write("flat/inner.rs", "");
+    write("dir/mod.rs", "");
+    let mut found = declared_module_files(&src.join("main.rs"));
+    found.sort();
+    let mut want: Vec<PathBuf> = ["main.rs", "flat.rs", "flat/inner.rs", "dir/mod.rs"]
+        .iter()
+        .map(|rel| src.join(rel))
+        .collect();
+    want.sort();
+    assert_eq!(found, want);
+    assert_eq!(
+        module_declarations("mod a;\nmod b { }\n  pub mod c ;\nlet s = \"mod d;\";\n"),
+        vec!["a".to_string(), "c".to_string()]
     );
 }
 
@@ -1833,6 +2157,313 @@ fn writer_macro_bodies(masked: &str) -> Vec<std::ops::RangeInclusive<usize>> {
         i = close + 1;
     }
     bodies
+}
+
+/// Every Rust source under `crates/mds-cli/src`, as `(file key, contents)`.
+///
+/// Fails unless the walk read every module the crate compiles — each `mod name;` resolved
+/// from `main.rs` the way rustc resolves it — so a scan over these sources cannot pass by
+/// missing a file. A `#[path]` attribute, which that resolution does not model, fails it
+/// too.
+fn crate_sources() -> Vec<(String, String)> {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = rust_files(&src_dir);
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|file| {
+            let src = std::fs::read_to_string(file).expect("mds-cli source must be readable");
+            (file_key(file), src)
+        })
+        .collect();
+
+    let declared = declared_module_files(&src_dir.join("main.rs"));
+    let unread: Vec<&PathBuf> = declared.iter().filter(|f| !files.contains(f)).collect();
+    assert!(
+        declared.len() >= 7 && unread.is_empty(),
+        "non-vacuity: the scan must read every module the crate declares (main.rs and at \
+         least its 6 modules); declared {declared:?}, not read {unread:?}"
+    );
+    let with_path_attr: Vec<&str> = sources
+        .iter()
+        .filter(|(_, src)| mask_comments(src).contains("#[path"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(
+        with_path_attr.is_empty(),
+        "a `#[path]` module in {with_path_attr:?} is not modelled by the module walk; \
+         teach `declared_module_files` to resolve it"
+    );
+    sources
+}
+
+/// `root` and every file module it declares, transitively: `mod name;` resolves to
+/// `name.rs` or `name/mod.rs` beside a `main.rs`, `lib.rs` or `mod.rs`, and below
+/// `<stem>/` for any other file.
+fn declared_module_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = vec![root.to_path_buf()];
+    let mut next = 0usize;
+    // Bounded: each file is queued at most once, and a crate declares finitely many.
+    while next < found.len() {
+        let file = found[next].clone();
+        next += 1;
+        // A declared file that does not exist is reported by the caller as not read.
+        let Ok(src) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let dir = match file.file_name().and_then(|n| n.to_str()) {
+            Some("main.rs" | "lib.rs" | "mod.rs") => file.parent().map(Path::to_path_buf),
+            _ => file
+                .parent()
+                .zip(file.file_stem())
+                .map(|(parent, stem)| parent.join(stem)),
+        }
+        .expect("a module file has a parent directory");
+        for name in module_declarations(&src) {
+            let nested = dir.join(&name).join("mod.rs");
+            let child = if nested.is_file() {
+                nested
+            } else {
+                dir.join(format!("{name}.rs"))
+            };
+            if !found.contains(&child) {
+                found.push(child);
+            }
+        }
+    }
+    found
+}
+
+/// The names of the file modules `src` declares: `mod name;`, not an inline
+/// `mod name { … }`, and nothing in a comment or a literal.
+fn module_declarations(src: &str) -> Vec<String> {
+    let masked = mask_comments(src);
+    let b = masked.as_bytes();
+    let mut names = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(&masked, b, i) {
+            i = next;
+            continue;
+        }
+        let is_mod_keyword = b[i..].starts_with(b"mod")
+            && !prev_is_ident(b, i)
+            && b.get(i + 3).is_some_and(u8::is_ascii_whitespace);
+        if !is_mod_keyword {
+            i += 1;
+            continue;
+        }
+        let start = skip_ws(b, i + 3);
+        let mut end = start;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+            end += 1;
+        }
+        if end > start && b.get(skip_ws(b, end)) == Some(&b';') {
+            names.push(masked[start..end].to_string());
+        }
+        i = end.max(i + 3);
+    }
+    names
+}
+
+/// 1-based lines of every mention of a [`RAW_PRINT_MACROS`] name in `src` as code: a call
+/// (`eprintln!(…)`, `std::println!(…)`), a `use` that brings one in (`use std::eprintln as
+/// say;`), a macro that shadows or wraps one. Not a mention: a method or field of that
+/// name (`err.print()`), a function definition, a longer identifier (`eprint_warning`),
+/// and anything in a comment or a literal.
+fn raw_print_mentions(src: &str) -> Vec<usize> {
+    let masked = mask_comments(src);
+    let b = masked.as_bytes();
+    let mut lines = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(&masked, b, i) {
+            i = next;
+            continue;
+        }
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') || prev_is_ident(b, i) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+            end += 1;
+        }
+        if RAW_PRINT_MACROS.contains(&&masked[i..end])
+            && !follows_a_dot(b, i)
+            && !is_fn_definition(&masked, i)
+        {
+            lines.push(masked[..i].matches('\n').count() + 1);
+        }
+        i = end;
+    }
+    lines
+}
+
+/// Is the identifier at `i` a method or field (`value.name`, the dot perhaps on the line
+/// above)?
+fn follows_a_dot(b: &[u8], i: usize) -> bool {
+    let mut j = i;
+    while j > 0 && b[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    j > 0 && b[j - 1] == b'.'
+}
+
+/// Where one source file ends the process, or could (see [`process_end_mentions`]).
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessEnds {
+    /// 1-based lines of every way out outside a funnel: a call path naming
+    /// `process::exit` or `process::abort`, and a `use` that brings either in under a
+    /// name that path would not show — braced, globbed, or through a renamed `process`.
+    stray: Vec<usize>,
+    /// `process::exit` mentions inside the body of one of the file's funnels.
+    in_funnel: usize,
+}
+
+/// Find every way `src` ends the process ([`PROCESS_ENDERS`]), allowing a
+/// `process::exit` only inside the body of a function named in `funnels`.
+fn process_end_mentions(src: &str, funnels: &[&str]) -> ProcessEnds {
+    let masked = mask_comments(src);
+    let b = masked.as_bytes();
+    let bodies: Vec<std::ops::RangeInclusive<usize>> = funnels
+        .iter()
+        .filter_map(|name| fn_body(&masked, name))
+        .collect();
+    let line_of = |at: usize| masked[..at].matches('\n').count() + 1;
+    let mut ends = ProcessEnds {
+        stray: Vec::new(),
+        in_funnel: 0,
+    };
+
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(&masked, b, i) {
+            i = next;
+            continue;
+        }
+        if !b[i..].starts_with(b"process") || prev_is_ident(b, i) {
+            i += 1;
+            continue;
+        }
+        let after = i + "process".len();
+        let sep = skip_ws(b, after);
+        if b[sep..].starts_with(b"::") {
+            let start = skip_ws(b, sep + 2);
+            let mut end = start;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                end += 1;
+            }
+            let item = &masked[start..end];
+            if item == "exit" && bodies.iter().any(|body| body.contains(&i)) {
+                ends.in_funnel += 1;
+            } else if PROCESS_ENDERS.contains(&item) {
+                ends.stray.push(line_of(i));
+            }
+        }
+        i = after;
+    }
+
+    for (at, item) in use_items(&masked) {
+        if use_reaches_a_process_ender(&item) {
+            ends.stray.push(line_of(at));
+        }
+    }
+    ends.stray.sort_unstable();
+    ends.stray.dedup();
+    ends
+}
+
+/// The byte range of the body of `fn name` in `masked`, braces included.
+fn fn_body(masked: &str, name: &str) -> Option<std::ops::RangeInclusive<usize>> {
+    let b = masked.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(masked, b, i) {
+            i = next;
+            continue;
+        }
+        let is_fn_keyword = b[i..].starts_with(b"fn")
+            && !prev_is_ident(b, i)
+            && b.get(i + 2).is_some_and(u8::is_ascii_whitespace);
+        if is_fn_keyword {
+            let start = skip_ws(b, i + 2);
+            let end = start + name.len();
+            let named = b[start..].starts_with(name.as_bytes())
+                && !b
+                    .get(end)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+            if named {
+                let open = end + masked[end..].find('{')?;
+                let close = matching_delim(masked, b, open)?;
+                return Some(open..=close);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Every `use` item in `masked`: the byte offset of its `use` keyword and its text up to
+/// the `;`.
+fn use_items(masked: &str) -> Vec<(usize, String)> {
+    let b = masked.as_bytes();
+    let mut items = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(masked, b, i) {
+            i = next;
+            continue;
+        }
+        let is_use_keyword = b[i..].starts_with(b"use")
+            && !prev_is_ident(b, i)
+            && b.get(i + 3).is_some_and(u8::is_ascii_whitespace);
+        if !is_use_keyword {
+            i += 1;
+            continue;
+        }
+        let end = masked[i..].find(';').map_or(b.len(), |rel| i + rel);
+        items.push((i, masked[i + 3..end].to_string()));
+        i = end;
+    }
+    items
+}
+
+/// Does this `use` item (the text after `use`) bring a [`PROCESS_ENDERS`] function into
+/// scope, or rename `process` so that a call to one would not name `process::`?
+fn use_reaches_a_process_ender(item: &str) -> bool {
+    const PROCESS: &str = "process";
+    let b = item.as_bytes();
+    let whole_word = |at: &usize| {
+        !prev_is_ident(b, *at)
+            && !b
+                .get(at + PROCESS.len())
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    };
+    let Some(at) = item
+        .match_indices(PROCESS)
+        .map(|(at, _)| at)
+        .find(whole_word)
+    else {
+        return false;
+    };
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let rest = item[at + PROCESS.len()..].trim_start();
+    match rest.strip_prefix("::") {
+        // `process::exit`, `process::{self, abort}`, `process::*`.
+        Some(path) => {
+            path.trim_start().starts_with('*')
+                || words(path)
+                    .iter()
+                    .any(|w| PROCESS_ENDERS.contains(&w.as_str()))
+        }
+        // `process as p`: `p::exit(…)` would not name `process::`.
+        None => words(rest).first().is_some_and(|w| w == "as"),
+    }
 }
 
 /// Union of a format invocation's inline captures and its positional arguments.
