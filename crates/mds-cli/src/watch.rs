@@ -45,11 +45,12 @@
 //! - All status / warnings / errors → stderr (pipe-safe).
 //! - `--quiet` suppresses status + warnings but NOT compile errors.
 //! - Exit 0 on clean Ctrl+C; non-zero only on startup failure.
-//! - Streams (#157): with `-o -`, stdout's reader going away ends the session —
-//!   `Stopped watching (stdout closed).`, exit 0 — since nothing can receive its output
-//!   any more; a closed stderr only loses the status lines. Once live ([`go_live`]), a
-//!   rebuild's output failure is reported where it can be and never changes the exit
-//!   code. Every status line goes through the CLI's stderr writer, which never panics.
+//! - Streams (#157): with `-o -`, stdout's reader going away ends the session with
+//!   `Stopped watching (stdout closed).` and verdict 0, since nothing can receive its
+//!   output any more; a closed stderr only loses the status lines. Once live
+//!   ([`go_live`]), a rebuild's output failure is reported where it can be and never
+//!   changes the exit code; a session that ends at startup exits as a batch run does.
+//!   Every status line goes through the CLI's stderr writer, which never panics.
 //! - Compile errors during watching never terminate the watcher.
 //! - All loops have fixed upper bounds (reconcile rule / reliability.md): the idle tick
 //!   against an absolute deadline, and the debounce window against an absolute cap
@@ -490,8 +491,9 @@ enum StopReason {
 /// `Stopped watching (stdout closed).` when `-o -` lost its reader.
 ///
 /// Called at every point where a watch session ends without an error: Ctrl+C in both
-/// watch loops, and a gone stdout reader in file mode, at startup or on a rebuild. Each
-/// such session exits 0.
+/// watch loops, and a gone stdout reader in file mode, at startup or on a rebuild. The
+/// verdict is 0 — the exit code of a live session ([`go_live`]); a session that stops at
+/// startup exits as a batch run with that verdict does (#157).
 fn stop_watching(quiet: bool, why: StopReason) {
     if quiet {
         return;

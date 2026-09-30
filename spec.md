@@ -1010,6 +1010,21 @@ instead.
   not open for the direction used — as success: a write to it is dropped, and a read
   from it is end of input. Such a stream is therefore not reported as a failure.
 
+Under `mds watch` (#157), a closed stderr only drops the status lines: the session keeps
+watching. With `-o -`, stdout is the session's product, so a reader that is gone ends the
+session: the write that finds the pipe closed — the startup write or a rebuild's — is
+followed by `Stopped watching (stdout closed).` on stderr (not under `--quiet`) and exit
+0. A stdout write that fails for another reason is `mds::io`, reported once in the
+session however many writes it fails, and watching continues; the lost content is not
+recorded as written, so the next rebuild writes it again even when its output has not
+changed — saving the source unchanged retries it. Once the session is live — its startup
+compile finished and every watch armed — an output failure, whether a rebuild's output
+file or stdout write or a stderr that fails other than by a closed pipe, is reported
+where stderr still works and does not change the exit code: Ctrl+C exits 0. A session
+that ends before it is live — at a startup error, or at a startup write that finds
+stdout's reader gone — exits by the rules above, so a stderr that failed other than by a
+closed pipe lifts its exit code to at least 2.
+
 A panic on the CLI is
 not converted into an error object: it is a Rust panic with exit code 101. The
 `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the

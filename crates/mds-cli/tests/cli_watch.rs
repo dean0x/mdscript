@@ -6789,7 +6789,8 @@ fn watch_startup_route_refusal_controls() {
 // stdout IS the session's product, so a gone reader ends the session: one
 // `Stopped watching (stdout closed).` line, exit 0. A closed stderr only loses the
 // status lines, so the session keeps watching. Any other output failure during a live
-// session is reported (where stderr still works) and never changes the Ctrl+C exit.
+// session is reported (where stderr still works) and never changes the Ctrl+C exit; a
+// session that stops before it is live exits as a run that ends on its own does.
 
 /// The line a session ends with when `-o -` finds stdout's reader gone.
 const STOPPED_STDOUT_CLOSED: &str = "Stopped watching (stdout closed).\n";
@@ -6882,66 +6883,77 @@ fn watch_to_stdout_whose_reader_is_gone_stops_and_exits_0() {
 
 /// `mds watch -o -` whose reader goes away after the first output: the next rebuild's
 /// write finds the pipe closed, and the session ends with the same line and exit 0 —
-/// never `Recompiled`, since nothing was written (#157).
+/// never `Recompiled`, since nothing was written; `--quiet` silences the line (#157).
 ///
 /// The test owns the pipe's only reader: it reads the startup output, which the watcher
-/// writes before it signals readiness, and then drops the reader before the edit.
+/// writes before it signals readiness, and then drops the reader before the edit. The
+/// loud arm is the quiet arm's positive control: the same session prints the stop line.
 #[test]
 fn watch_to_stdout_stops_when_its_reader_goes_away_and_exits_0() {
     use std::io::Read as _;
 
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("page.mds");
-    std::fs::write(&src, "Hello one\n").unwrap();
+    for quiet in [false, true] {
+        let what = if quiet { "--quiet" } else { "loud" };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("page.mds");
+        std::fs::write(&src, "Hello one\n").unwrap();
+        let mut args = vec!["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"];
+        if quiet {
+            args.push("-q");
+        }
 
-    let (reader, writer) = std::io::pipe().unwrap();
-    let (mut guard, tap) = spawn_ready(
-        mds_bin()
-            .args(["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"])
-            .stdout(Stdio::from(writer)),
-    );
+        let (reader, writer) = std::io::pipe().unwrap();
+        let (mut guard, tap) = spawn_ready(mds_bin().args(&args).stdout(Stdio::from(writer)));
 
-    // Read the startup output on a helper thread, so the wait is bounded; the thread
-    // hands the reader back so the test decides when it goes.
-    let first_output = b"Hello one\n";
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = reader;
-        let mut first = vec![0u8; first_output.len()];
-        let read = reader.read_exact(&mut first).map(|()| first);
-        let _ = tx.send((read, reader));
-    });
-    let (read, reader) = rx
-        .recv_timeout(TIMEOUT)
-        .expect("the startup output must reach the pipe");
-    assert_eq!(
-        read.expect("read the startup output"),
-        first_output,
-        "control: the session writes its output to stdout"
-    );
-    drop(reader);
+        // Read the startup output on a helper thread, so the wait is bounded; the thread
+        // hands the reader back so the test decides when it goes.
+        let first_output = b"Hello one\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut first = vec![0u8; first_output.len()];
+            let read = reader.read_exact(&mut first).map(|()| first);
+            let _ = tx.send((read, reader));
+        });
+        let (read, reader) = rx
+            .recv_timeout(TIMEOUT)
+            .expect("the startup output must reach the pipe");
+        assert_eq!(
+            read.expect("read the startup output"),
+            first_output,
+            "control ({what}): the session writes its output to stdout"
+        );
+        drop(reader);
 
-    write_atomic(&src, "Hello two\n");
-    let status = wait_bounded(
-        &mut guard,
-        SESSION_END_TIMEOUT,
-        "watch -o - after its reader went away",
-    );
-    let stderr = tap.finish_text(&mut guard);
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "a reader that goes away ends the session with exit 0; stderr: {stderr:?}"
-    );
-    assert!(
-        stderr.ends_with(STOPPED_STDOUT_CLOSED)
-            && count_occurrences(&stderr, STOPPED_STDOUT_CLOSED) == 1,
-        "the session ends with exactly one stop line; stderr: {stderr:?}"
-    );
-    assert!(
-        stderr.starts_with("Watching ") && !stderr.contains("Recompiled"),
-        "a write the closed pipe lost is not a rebuild; stderr: {stderr:?}"
-    );
+        write_atomic(&src, "Hello two\n");
+        let status = wait_bounded(
+            &mut guard,
+            SESSION_END_TIMEOUT,
+            &format!("watch -o - ({what}) after its reader went away"),
+        );
+        let stderr = tap.finish_text(&mut guard);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{what}: a reader that goes away ends the session with exit 0; stderr: {stderr:?}"
+        );
+        if quiet {
+            assert_eq!(
+                stderr, "",
+                "--quiet prints nothing when stdout's reader goes away mid-session"
+            );
+            continue;
+        }
+        assert!(
+            stderr.ends_with(STOPPED_STDOUT_CLOSED)
+                && count_occurrences(&stderr, STOPPED_STDOUT_CLOSED) == 1,
+            "the session ends with exactly one stop line; stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.starts_with("Watching ") && !stderr.contains("Recompiled"),
+            "a write the closed pipe lost is not a rebuild; stderr: {stderr:?}"
+        );
+    }
 }
 
 /// `mds watch` with stderr closed from the start reaches readiness, rebuilds its output
@@ -7277,6 +7289,60 @@ fn watch_with_a_failing_stderr_keeps_watching_and_exits_0_at_ctrl_c() {
         status.code(),
         Some(0),
         "a failing stderr during the session does not change the Ctrl+C exit"
+    );
+    assert_eq!(
+        std::fs::read(&stderr_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: every stderr write failed"
+    );
+}
+
+/// A session that ends before it goes live keeps the rule of a run that ends on its own
+/// (#157): the startup write finds stdout's reader gone, the session stops, and a stderr
+/// that failed other than by a closed pipe lifts the exit code to 2. Only a live session
+/// leaves its exit code alone
+/// (`watch_with_a_failing_stderr_keeps_watching_and_exits_0_at_ctrl_c`).
+///
+/// Control: with stderr open the same session stops at the same point with exit 0 and
+/// prints its status lines, the stop line last, so the failing arm loses writes.
+#[cfg(unix)]
+#[test]
+fn watch_that_stops_before_it_is_live_exits_by_the_batch_rule() {
+    const LIMIT: usize = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let args = ["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"];
+
+    let (mut open, open_tap) =
+        spawn_unsynchronized(mds_bin().args(args).stdout(Stdio::from(closed_pipe())));
+    let status = wait_bounded(&mut open, SESSION_END_TIMEOUT, "stderr open");
+    let stderr = open_tap.finish_text(&mut open);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "control: with stderr open, a startup write into a gone reader ends the session \
+         with exit 0; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("Watching ") && stderr.ends_with(STOPPED_STDOUT_CLOSED),
+        "control: the session writes its status lines, the stop line last; stderr: {stderr:?}"
+    );
+
+    let stderr_dir = tempfile::tempdir().unwrap();
+    let stderr_path = stderr_dir.path().join("watch-stderr");
+    let mut cmd = mds_bin();
+    cmd.args(args)
+        .stdout(Stdio::from(closed_pipe()))
+        .stderr(Stdio::from(full_file(&stderr_path, LIMIT)));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let mut failing = ChildGuard(cmd.spawn().unwrap());
+    let status = wait_bounded(&mut failing, SESSION_END_TIMEOUT, "stderr failing");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "a session that stops before it is live exits as a batch run does: a stderr that \
+         failed other than by a closed pipe lifts its exit code to 2"
     );
     assert_eq!(
         std::fs::read(&stderr_path).unwrap(),

@@ -46,7 +46,13 @@
 //!   a `use` that would let a call skip naming `process::exit` — renamed, braced,
 //!   globbed, or through a renamed `process` — is reported
 //!   ([`process_exit_only_in_the_funnel`]).
-//! - Both of those scans read every module the crate compiles: `crate_sources` resolves
+//! - **Stream handles only in the writers.** `stdout` / `stderr`, the std functions that
+//!   hand out a terminal stream, are named only inside the functions in
+//!   [`STREAM_HANDLE_OWNERS`], or to ask `.is_terminal()`
+//!   ([`terminal_streams_are_opened_only_by_the_writers`]). A second writer holding its
+//!   own handle would not see a stdout closed for good or a failure already reported;
+//!   `mds lint` had one (#157).
+//! - These three scans read every module the crate compiles: `crate_sources` resolves
 //!   each `mod name;` from `main.rs` as rustc does and fails on one it did not read.
 //! - **Every mention of `write_stderr_fmt`**, the function the writer macros expand to.
 //!   Its argument is a `format_args!`, which is not a print site, so a direct call would
@@ -165,10 +171,13 @@
 //!    the writer *function* on import is caught: it is a mention of `write_stderr_fmt`
 //!    outside the writer macros. So is renaming a std print macro: the raw-print ban
 //!    reports any mention of its name, `use std::eprintln as say;` included.
-//! 7. **The raw-print and exit bans read this crate's text only.** Code in a dependency
-//!    that prints through std or ends the process is not a mention here: mds-core's
-//!    `emit_warnings`, still an `eprintln!` (#435), and clap's `Error::exit` and
-//!    `Parser::parse`, which exit on their own — `main.rs` calls neither.
+//! 7. **The raw-print, exit and stream-handle bans read this crate's text only, by
+//!    name.** Code in a dependency that prints through std or ends the process is not a
+//!    mention here: mds-core's `emit_warnings`, still an `eprintln!` (#435), and clap's
+//!    `Error::exit` and `Parser::parse`, which exit on their own — `main.rs` calls
+//!    neither. Nor is a way out or a stream reached without its std name: `libc::exit`
+//!    (a unix dev-dependency, so only a test module could reach it), a descriptor opened
+//!    as a file, `/dev/stdout`, or a `main` that returns without calling the funnel.
 //!
 //! Every one of these requires writing code that looks wrong on purpose. The bar this
 //! guard is built to meet is **accidental** reintroduction — the four times #176 was
@@ -201,20 +210,23 @@
 //!   [`the_raw_print_guard_flags_every_std_print_macro_and_its_aliases`] flags each std
 //!   print macro, a path-qualified call, a renamed import and a wrapping macro;
 //!   [`the_exit_guard_flags_every_way_out_but_the_funnel`] flags an exit outside the
-//!   funnel, `abort`, and each import shape that hides one; and
+//!   funnel, `abort`, and each import shape that hides one;
+//!   [`the_stream_handle_guard_flags_a_second_writer`] flags a stream handle outside its
+//!   owners, each import shape, and one bound before it is queried; and
 //!   [`the_module_walk_finds_every_module_a_crate_declares`] proves the coverage check
 //!   resolves flat, directory and nested modules.
 //! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`],
 //!   [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`],
-//!   [`no_raw_print_macro_outside_the_writer`] and [`process_exit_only_in_the_funnel`]
-//!   prove the real sources are clean.
+//!   [`no_raw_print_macro_outside_the_writer`], [`process_exit_only_in_the_funnel`] and
+//!   [`terminal_streams_are_opened_only_by_the_writers`] prove the real sources are clean.
 //! - **Non-vacuity:** the same test asserts the scanner actually found the crate's
 //!   modules, its print sites (crate-wide, and per file for the files in
 //!   [`SITE_FLOORS`]), its interpolations, its `let` bindings, the non-`let` binders that
 //!   poison a name, and its calls into the sanitizing print helpers, so it cannot pass
-//!   because the parser silently returned nothing. The two bans read every module the
-//!   crate declares, the raw-print ban saw the writer calls, and the exit ban found each
-//!   funnel holding exactly its one `process::exit`.
+//!   because the parser silently returned nothing. The three bans read every module the
+//!   crate declares, the raw-print ban saw the writer calls, the exit ban found each
+//!   funnel holding exactly its one `process::exit`, and the stream-handle ban found each
+//!   owner holding its handle.
 //! - **Allowlist rot:** [`every_allowlist_entry_is_live`] fails if an entry in either
 //!   allowlist stops matching anything, so exemptions cannot outlive the code that
 //!   needed them.
@@ -282,6 +294,19 @@ const EXIT_FUNNELS: &[(&str, &str)] = &[("output.rs", "exit")];
 /// The `std::process` functions that end the process: `exit` only through a funnel,
 /// `abort` never.
 const PROCESS_ENDERS: &[&str] = &["exit", "abort"];
+
+/// The std functions that hand out a terminal stream.
+const STREAM_HANDLES: &[&str] = &["stdout", "stderr"];
+
+/// The functions allowed to name a [`STREAM_HANDLES`] function for anything but an
+/// `.is_terminal()` query, by file: the two writers, which keep the state every write
+/// consults — a pipe closed for good, a failure already reported (#157) — and the exit
+/// after clap's own output, which flushes what clap printed.
+const STREAM_HANDLE_OWNERS: &[(&str, &str)] = &[
+    ("output.rs", "write_stderr_fmt"),
+    ("output.rs", "write_stdout"),
+    ("main.rs", "exit_after_clap_output"),
+];
 
 /// The function the stderr writer macros expand to (`output.rs`, #157).
 ///
@@ -873,6 +898,54 @@ fn process_exit_only_in_the_funnel() {
     );
 }
 
+/// A stream handle is a second way to write: a helper holding its own
+/// `std::io::stdout()` would not see a stdout closed for good or a failure already
+/// reported — the duplicate `write_stdout` `mds lint` had (#157). So only the functions in
+/// [`STREAM_HANDLE_OWNERS`] name `stdout` or `stderr`; any other code may only ask
+/// `.is_terminal()`.
+#[test]
+fn terminal_streams_are_opened_only_by_the_writers() {
+    let mut stray: Vec<String> = Vec::new();
+    let mut owners_found: Vec<String> = Vec::new();
+    for (name, src) in crate_sources() {
+        let owners: Vec<&str> = STREAM_HANDLE_OWNERS
+            .iter()
+            .filter(|(file, _)| *file == name)
+            .map(|(_, function)| *function)
+            .collect();
+        let handles = stream_handle_mentions(&src, &owners);
+        owners_found.extend(
+            owners
+                .iter()
+                .zip(&handles.in_owner)
+                .filter(|(_, count)| **count > 0)
+                .map(|(owner, _)| format!("{name}::{owner}")),
+        );
+        stray.extend(
+            handles
+                .stray
+                .into_iter()
+                .map(|line| format!("  {name}:{line}")),
+        );
+    }
+
+    // Non-vacuity: each owner was found, holding its handle.
+    assert_eq!(
+        owners_found.len(),
+        STREAM_HANDLE_OWNERS.len(),
+        "non-vacuity: each of {STREAM_HANDLE_OWNERS:?} must name a stream handle; found \
+         {owners_found:?}"
+    );
+    assert!(
+        stray.is_empty(),
+        "print-discipline violation: a terminal stream is named outside \
+         {STREAM_HANDLE_OWNERS:?} for more than an `.is_terminal()` query:\n{}\n\n\
+         Write status lines through `crate::output::ewriteln!` / `ewrite!` and a command's \
+         product through `crate::output::write_stdout`.",
+        stray.join("\n")
+    );
+}
+
 // ── Scanner self-tests (PF-013 positive / negative / robustness) ──────────────
 
 #[test]
@@ -1305,7 +1378,8 @@ fn the_exit_guard_flags_every_way_out_but_the_funnel() {
 
     // Reported, each on its own line: an exit outside the funnel (the same funnel body
     // in a file that lists no funnel included), both qualifications, `abort`, a renamed
-    // import, a braced import, a glob, and a renamed `process`.
+    // import, a braced import, a glob, and a renamed `process` — directly, as a braced
+    // `self`, and after another `process` path in the same braces.
     let bypasses = r#"
         fn bail() { std::process::exit(1); }
         fn out() { process::exit(2) }
@@ -1315,11 +1389,13 @@ fn the_exit_guard_flags_every_way_out_but_the_funnel() {
         use std::process::*;
         use std::process as p;
         use std::{process::exit};
+        use std::process::{self as pr, Command};
+        use std::{process::Command, process as sp};
     "#;
     assert_eq!(
         process_end_mentions(bypasses, &["exit"]),
         ProcessEnds {
-            stray: vec![2, 3, 4, 5, 6, 7, 8, 9],
+            stray: vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             in_funnel: 0
         }
     );
@@ -1334,6 +1410,7 @@ fn the_exit_guard_flags_every_way_out_but_the_funnel() {
     let prose = r#"
         use std::process;
         use std::process::{Command, Stdio};
+        use std::process::{self, Command};
         fn f() {
             output::exit(2);
             let code = exit_code(&e);
@@ -1347,6 +1424,65 @@ fn the_exit_guard_flags_every_way_out_but_the_funnel() {
         ProcessEnds {
             stray: Vec::new(),
             in_funnel: 0
+        }
+    );
+}
+
+#[test]
+fn the_stream_handle_guard_flags_a_second_writer() {
+    // Reported, each on its own line: stdout and stderr outside the owners, however
+    // qualified, a `use` of either, renamed or braced, a handle bound before it is queried,
+    // and an owner's body in a file that lists no owner.
+    let stray = r#"
+        fn emit(bytes: &[u8]) { let _ = std::io::stdout().write_all(bytes); }
+        fn warn(text: &str) { let _ = ::std::io::stderr().lock().write_all(text.as_bytes()); }
+        use std::io::stdout as out;
+        use std::io::{stderr, Write};
+        fn tty() -> bool { let s = io::stdout(); s.is_terminal() }
+        fn write_stdout(bytes: &[u8]) { let _ = std::io::stdout().write_all(bytes); }
+    "#;
+    assert_eq!(
+        stream_handle_mentions(stray, &[]),
+        StreamHandles {
+            stray: vec![2, 3, 4, 5, 6, 7],
+            in_owner: Vec::new()
+        }
+    );
+
+    // Accepted: an owner's own handle, and an `.is_terminal()` query anywhere.
+    let owned = r#"
+        fn write_stdout(bytes: &[u8]) -> Outcome {
+            write_stdout_to(&STATE, &mut std::io::stdout().lock(), bytes)
+        }
+        fn clear() { if std::io::stderr().is_terminal() { ewrite!("x"); } }
+        fn tty() -> bool { std::io::stdout()
+            .is_terminal() }
+    "#;
+    assert_eq!(
+        stream_handle_mentions(owned, &["write_stdout"]),
+        StreamHandles {
+            stray: Vec::new(),
+            in_owner: vec![1]
+        }
+    );
+
+    // Neither: a field or method of that name, a longer identifier, a definition,
+    // comments and literals.
+    let prose = r#"
+        fn f(child: &mut Child, err: &clap::Error, state: &State) {
+            let _ = child.stdout.take();
+            let _ = err.use_stderr();
+            let _ = state.stdout_closed();
+            let _ = "std::io::stdout().write_all(b)";
+            // std::io::stderr().write_all(b);
+        }
+        fn stdout() {}
+    "#;
+    assert_eq!(
+        stream_handle_mentions(prose, &[]),
+        StreamHandles {
+            stray: Vec::new(),
+            in_owner: Vec::new()
         }
     );
 }
@@ -2429,7 +2565,9 @@ fn use_items(masked: &str) -> Vec<(usize, String)> {
 }
 
 /// Does this `use` item (the text after `use`) bring a [`PROCESS_ENDERS`] function into
-/// scope, or rename `process` so that a call to one would not name `process::`?
+/// scope, or rename `process` so that a call to one would not name `process::`? Every
+/// `process` in the item is judged, so a rename after another `process` path in the same
+/// braces is found too.
 fn use_reaches_a_process_ender(item: &str) -> bool {
     const PROCESS: &str = "process";
     let b = item.as_bytes();
@@ -2439,31 +2577,108 @@ fn use_reaches_a_process_ender(item: &str) -> bool {
                 .get(at + PROCESS.len())
                 .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
     };
-    let Some(at) = item
-        .match_indices(PROCESS)
-        .map(|(at, _)| at)
-        .find(whole_word)
-    else {
-        return false;
-    };
     let words = |text: &str| -> Vec<String> {
         text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|w| !w.is_empty())
             .map(str::to_string)
             .collect()
     };
-    let rest = item[at + PROCESS.len()..].trim_start();
-    match rest.strip_prefix("::") {
-        // `process::exit`, `process::{self, abort}`, `process::*`.
-        Some(path) => {
-            path.trim_start().starts_with('*')
-                || words(path)
-                    .iter()
-                    .any(|w| PROCESS_ENDERS.contains(&w.as_str()))
+    item.match_indices(PROCESS)
+        .map(|(at, _)| at)
+        .filter(whole_word)
+        .any(|at| {
+            let rest = item[at + PROCESS.len()..].trim_start();
+            match rest.strip_prefix("::") {
+                // `process::exit`, `process::{self, abort}`, `process::*`, and
+                // `process::{self as p}`, which renames `process` itself.
+                Some(path) => {
+                    let path_words = words(path);
+                    path.trim_start().starts_with('*')
+                        || path_words
+                            .iter()
+                            .any(|w| PROCESS_ENDERS.contains(&w.as_str()))
+                        || path_words
+                            .windows(2)
+                            .any(|w| w[0] == "self" && w[1] == "as")
+                }
+                // `process as p`: `p::exit(…)` would not name `process::`.
+                None => words(rest).first().is_some_and(|w| w == "as"),
+            }
+        })
+}
+
+/// Where one source file names a [`STREAM_HANDLES`] function (see
+/// [`stream_handle_mentions`]).
+#[derive(Debug, PartialEq, Eq)]
+struct StreamHandles {
+    /// 1-based lines of every mention outside the owners that is not an `.is_terminal()`
+    /// query: a call, a `use` of one, a handle bound to a local.
+    stray: Vec<usize>,
+    /// For each owner passed in, in order, the mentions inside its body.
+    in_owner: Vec<usize>,
+}
+
+/// Find every mention of a [`STREAM_HANDLES`] name in `src` as code — not a method or
+/// field (`child.stdout`), a longer identifier, a definition, or anything in a comment or
+/// a literal — and sort it into [`StreamHandles`]: inside the body of one of `owners`, a
+/// call that only asks `.is_terminal()`, or stray.
+fn stream_handle_mentions(src: &str, owners: &[&str]) -> StreamHandles {
+    let masked = mask_comments(src);
+    let b = masked.as_bytes();
+    let bodies: Vec<Option<std::ops::RangeInclusive<usize>>> =
+        owners.iter().map(|name| fn_body(&masked, name)).collect();
+    let mut handles = StreamHandles {
+        stray: Vec::new(),
+        in_owner: vec![0; owners.len()],
+    };
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(&masked, b, i) {
+            i = next;
+            continue;
         }
-        // `process as p`: `p::exit(…)` would not name `process::`.
-        None => words(rest).first().is_some_and(|w| w == "as"),
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') || prev_is_ident(b, i) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+            end += 1;
+        }
+        if STREAM_HANDLES.contains(&&masked[i..end])
+            && !follows_a_dot(b, i)
+            && !is_fn_definition(&masked, i)
+        {
+            let owner = bodies
+                .iter()
+                .position(|body| body.as_ref().is_some_and(|body| body.contains(&i)));
+            match owner {
+                Some(owner) => handles.in_owner[owner] += 1,
+                None if asks_is_terminal(&masked, end) => {}
+                None => handles.stray.push(masked[..i].matches('\n').count() + 1),
+            }
+        }
+        i = end;
     }
+    handles
+}
+
+/// Is the stream handle named just before `end` called only to ask `.is_terminal()`
+/// (`stdout().is_terminal()`, whitespace allowed)?
+fn asks_is_terminal(masked: &str, end: usize) -> bool {
+    const QUERY: &str = "is_terminal";
+    let b = masked.as_bytes();
+    let mut j = skip_ws(b, end);
+    for expected in [b'(', b')', b'.'] {
+        if b.get(j) != Some(&expected) {
+            return false;
+        }
+        j = skip_ws(b, j + 1);
+    }
+    masked[j..].starts_with(QUERY)
+        && !b
+            .get(j + QUERY.len())
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// Union of a format invocation's inline captures and its positional arguments.
