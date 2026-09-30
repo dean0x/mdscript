@@ -2669,7 +2669,7 @@ fn asks_is_terminal(masked: &str, end: usize) -> bool {
     const QUERY: &str = "is_terminal";
     let b = masked.as_bytes();
     let mut j = skip_ws(b, end);
-    for expected in [b'(', b')', b'.'] {
+    for expected in *b"()." {
         if b.get(j) != Some(&expected) {
             return false;
         }
