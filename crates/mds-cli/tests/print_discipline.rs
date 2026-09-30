@@ -33,8 +33,7 @@
 //!   [`PRINT_MACROS`]: every site that moves to an unlisted writer leaves the guard.
 //!   [`SITE_FLOORS`] fails when a listed file's site count drops, which is how such a
 //!   move shows up. Every file with a print site has a floor, or a written reason in
-//!   [`FLOORS_PENDING`] — `lint.rs`, until the lint pipeline refactor (#309) settles its
-//!   count ([`every_printing_file_has_a_site_floor`]).
+//!   [`FLOORS_PENDING`] ([`every_printing_file_has_a_site_floor`]).
 //! - **No std print macro at all.** `println!` / `print!` / `eprintln!` / `eprint!` /
 //!   `dbg!` panic when their write fails, so none may be named anywhere in
 //!   `crates/mds-cli/src/**`: not called, not renamed on import, not wrapped in another
@@ -54,6 +53,10 @@
 //!   `mds lint` had one (#157).
 //! - These three scans read every module the crate compiles: `crate_sources` resolves
 //!   each `mod name;` from `main.rs` as rustc does and fails on one it did not read.
+//! - **`mds lint` shows its results through its result sink** (#309): lint's writer-macro
+//!   calls, stdout writes and error renderers sit in `lint_sink.rs`, never in `lint.rs`,
+//!   and neither file ends the process — `main` exits with the code `lint::run_lint`
+//!   returns ([`lint_output_goes_through_the_sink`]).
 //! - **Every mention of `write_stderr_fmt`**, the function the writer macros expand to.
 //!   Its argument is a `format_args!`, which is not a print site, so a direct call would
 //!   reach stderr with nothing it interpolates scanned — and so would every site of a new
@@ -212,9 +215,11 @@
 //!   [`the_exit_guard_flags_every_way_out_but_the_funnel`] flags an exit outside the
 //!   funnel, `abort`, and each import shape that hides one;
 //!   [`the_stream_handle_guard_flags_a_second_writer`] flags a stream handle outside its
-//!   owners, each import shape, and one bound before it is queried; and
+//!   owners, each import shape, and one bound before it is queried;
 //!   [`the_module_walk_finds_every_module_a_crate_declares`] proves the coverage check
-//!   resolves flat, directory and nested modules.
+//!   resolves flat, directory and nested modules; and
+//!   [`lint_output_goes_through_the_sink`] reports a writer call, a stdout write, an error
+//!   renderer and an exit planted in `lint.rs`, and an exit planted in `lint_sink.rs`.
 //! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`],
 //!   [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`],
 //!   [`no_raw_print_macro_outside_the_writer`], [`process_exit_only_in_the_funnel`] and
@@ -260,6 +265,8 @@ const PRINT_MACROS: &[&str] = &[
 const SITE_FLOORS: &[(&str, usize)] = &[
     ("build.rs", 27),
     ("fmt.rs", 11),
+    ("lint.rs", 1),
+    ("lint_sink.rs", 15),
     ("main.rs", 11),
     ("output.rs", 6),
     ("watch.rs", 18),
@@ -270,13 +277,7 @@ const SITE_FLOORS: &[(&str, usize)] = &[
 /// [`every_printing_file_has_a_site_floor`] fails on a printing file listed in neither
 /// place, and on an entry here for a file that has a floor or no print site, so the
 /// list cannot outlive its reason.
-const FLOORS_PENDING: &[(&str, &str)] = &[(
-    "lint.rs",
-    "`mds lint`'s status lines are moving out of lint.rs into the result sinks of the \
-     lint pipeline refactor (#309), which changes this file's site count on purpose. \
-     Its floor is set when that lands, so it pins the final count; until then the \
-     crate-wide floor and the sanitizer check still cover every site in it.",
-)];
+const FLOORS_PENDING: &[(&str, &str)] = &[];
 
 /// std's print macros, and `dbg!`, which prints through `eprintln!` (#157).
 ///
@@ -306,6 +307,18 @@ const STREAM_HANDLE_OWNERS: &[(&str, &str)] = &[
     ("output.rs", "write_stderr_fmt"),
     ("output.rs", "write_stdout"),
     ("main.rs", "exit_after_clap_output"),
+];
+
+/// The calls through which `mds lint` shows a result, by name: the writer macros, the
+/// stdout path, and the error renderers that write a whole diagnostic to stderr. They
+/// belong in its result sink, `lint_sink.rs`, never in `lint.rs` — see
+/// [`lint_output_goes_through_the_sink`].
+const LINT_OUTPUT_CALLS: &[&str] = &[
+    "ewriteln!",
+    "ewrite!",
+    "write_stdout",
+    "eprint_error",
+    "eprint_io_failure",
 ];
 
 /// The function the stderr writer macros expand to (`output.rs`, #157).
@@ -429,13 +442,13 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "`usize` tally of files `mds fmt <dir>` could not process, in its summary line.",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "walk.excluded_by_default",
         "`usize` count of `.mds` files the default-exclusion walker skipped \
          (hidden dirs, node_modules); produced by `collect_mds_files_detailed`.",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "STDIN_DISPLAY_LABEL",
         "`&'static str` compile-time constant defined in `output.rs` as `\"<stdin>\"`. \
          It is the uniform stdin source-identity sentinel (AD-211-3 / issue #211); \
@@ -444,29 +457,29 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
     (
         "fmt.rs",
         "STDIN_DISPLAY_LABEL",
-        "Same `output.rs` constant as the `lint.rs` entry above — `mds fmt -`'s \
+        "Same `output.rs` constant as the `lint_sink.rs` entry above — `mds fmt -`'s \
          `Would reformat:` status line names the source with the shared sentinel \
          instead of its own literal (AD-211-3).",
     ),
     (
         "main.rs",
         "STDIN_DISPLAY_LABEL",
-        "Same `output.rs` constant as the `lint.rs` entry above — `mds check -`'s \
+        "Same `output.rs` constant as the `lint_sink.rs` entry above — `mds check -`'s \
          `OK:` status line names the source with the shared sentinel instead of its \
          own literal (AD-211-3).",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "applied_count",
         "`usize` tally of lint fixes actually applied, in the `Partially fixed:` line.",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "total_count",
         "`usize` tally of lint fixes planned, in the `Partially fixed:` line.",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "mds::MAX_DIAGNOSTICS",
         "`usize` compile-time constant `mds::MAX_DIAGNOSTICS` (the per-file diagnostic cap).",
     ),
@@ -508,28 +521,27 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "elapsed",
         "`u128` elapsed milliseconds from `Instant::elapsed().as_millis()` — pure arithmetic.",
     ),
-    // AD-216-3/5/10: four counters for the `mds lint <dir>` summary line.
-    // AD-216-10: names are file-unique (limit 2, :106-110) — none collide with
-    // existing lint.rs entries; no future variable silently inherits an exemption
-    // by reusing an already-listed name.
+    // Four counters for the `mds lint <dir>` summary line. Their names are file-unique
+    // (limit 2) — none collide with the other lint_sink.rs entries; no future variable
+    // silently inherits an exemption by reusing an already-listed name.
     (
-        "lint.rs",
+        "lint_sink.rs",
         "clean_count",
         "`usize` tally of files with no lint findings in the `mds lint <dir>` summary line.",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "warn_file_count",
         "`usize` tally of files with warning-severity findings in the `mds lint <dir>` summary line.",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "error_file_count",
         "`usize` tally of files with error-severity findings or analysis failures \
          in the `mds lint <dir>` summary line.",
     ),
     (
-        "lint.rs",
+        "lint_sink.rs",
         "limit_file_count",
         "`usize` tally of files that aborted with `MdsError::ResourceLimit` \
          in the `mds lint <dir>` summary line.",
@@ -848,10 +860,9 @@ fn no_raw_print_macro_outside_the_writer() {
     // below cannot pass by reading nothing (a broken module walk, a masking bug, a
     // renamed macro). It is not a coverage count. Which files print through the writer
     // is guarded file by file, by `SITE_FLOORS` in
-    // `cli_print_sites_sanitize_every_interpolated_value`, with `lint.rs` in
-    // `FLOORS_PENDING` until its status lines move to the result sinks. So this number
-    // sits well under the crate's real count, and a refactor that removes duplicated
-    // print sites must never have to keep them to satisfy it.
+    // `cli_print_sites_sanitize_every_interpolated_value`. So this number sits well
+    // under the crate's real count, and a refactor that removes duplicated print sites
+    // must never have to keep them to satisfy it.
     assert!(
         writer_calls >= 60,
         "non-vacuity: expected at least 60 `ewriteln!` / `ewrite!` calls across \
@@ -950,6 +961,99 @@ fn terminal_streams_are_opened_only_by_the_writers() {
          Write status lines through `crate::output::ewriteln!` / `ewrite!` and a command's \
          product through `crate::output::write_stdout`.",
         stray.join("\n")
+    );
+}
+
+/// `mds lint` shows its results only through its result sink (#309): lint's writer-macro
+/// calls, stdout writes and error renderers ([`LINT_OUTPUT_CALLS`]) appear in
+/// `lint_sink.rs`, never in `lint.rs`, and neither file ends the process — `lint::run_lint`
+/// returns the exit code, and `main`, the driver, exits with it. A print or an exit
+/// written back into `lint.rs` would bypass the order `lint::render` decides and the exit
+/// code the run returns.
+///
+/// `lint.rs` keeps one print on purpose, `mds.json`'s unknown-rule warning, which it shows
+/// through `eprint_warning` while the config loads; the sanitizer scan above covers it.
+/// Calls are matched by name, as in the other scans here.
+#[test]
+fn lint_output_goes_through_the_sink() {
+    let sources = crate_sources();
+    let source = |name: &str| -> &str {
+        sources
+            .iter()
+            .find(|(file, _)| file == name)
+            .map(|(_, src)| src.as_str())
+            .unwrap_or_else(|| panic!("{name} must be one of the crate's modules"))
+    };
+    let (lint, sink, main) = (source("lint.rs"), source("lint_sink.rs"), source("main.rs"));
+
+    // Non-vacuity: the scan read lint's module, found the sink's status lines and its
+    // stdout path, and found the driver ending the run with lint's code.
+    assert!(
+        fn_body(&mask_comments(lint), "run_lint").is_some(),
+        "non-vacuity: lint.rs must define `run_lint`"
+    );
+    let funnel = lint_funnel(lint, sink, main);
+    assert!(
+        funnel.sink_writer_calls >= 10,
+        "non-vacuity: expected lint's status lines in lint_sink.rs (at least 10 writer-macro \
+         calls), found {}",
+        funnel.sink_writer_calls
+    );
+    assert!(
+        funnel.sink_stdout_writes >= 1,
+        "non-vacuity: expected lint's stdout path in lint_sink.rs"
+    );
+    assert_eq!(
+        funnel.driver_exits, 1,
+        "non-vacuity: main.rs must end an `mds lint` run with `exit(lint::run_lint(…))`"
+    );
+    assert!(
+        funnel.stray.is_empty(),
+        "print-discipline violation: `mds lint` prints or exits outside its result sink:\n{}\n\n\
+         Show the result through a `ResultSink` method in lint_sink.rs, and return the exit \
+         code from `run_lint`.",
+        funnel.stray.join("\n")
+    );
+
+    // Positive controls: each call planted in lint.rs is reported, and so is an exit
+    // planted in lint_sink.rs.
+    for plant in [
+        "crate::output::ewriteln!(\"planted\");",
+        "let _ = crate::output::write_stdout(b\"planted\");",
+        "crate::output::eprint_error(miette::miette!(\"planted\"));",
+        "crate::output::exit(2);",
+    ] {
+        let planted = format!("{lint}\nfn planted() {{ {plant} }}\n");
+        let found = lint_funnel(&planted, sink, main).stray;
+        assert_eq!(
+            found.len(),
+            1,
+            "a `{plant}` planted in lint.rs must be reported; got {found:?}"
+        );
+    }
+    let exit_in_sink = format!("{sink}\nfn planted() {{ crate::output::exit(2); }}\n");
+    let found = lint_funnel(lint, &exit_in_sink, main).stray;
+    assert_eq!(
+        found.len(),
+        1,
+        "an exit planted in lint_sink.rs must be reported; got {found:?}"
+    );
+    // …and a driver that stops exiting with lint's code is not counted.
+    let unfunnelled = main.replacen("output::exit(lint::run_lint(", "(lint::run_lint(", 1);
+    assert_ne!(
+        unfunnelled, main,
+        "precondition: main.rs exits with `lint::run_lint`'s code"
+    );
+    assert_eq!(lint_funnel(lint, sink, &unfunnelled).driver_exits, 0);
+
+    // Negative control: a comment and a string literal are not calls.
+    let prose = format!(
+        "{lint}\n// crate::output::exit(2);\nconst PLANTED: &str = \"ewriteln!(\\\"x\\\")\";\n"
+    );
+    let found = lint_funnel(&prose, sink, main).stray;
+    assert!(
+        found.is_empty(),
+        "a comment or a literal is not a call; got {found:?}"
     );
 }
 
@@ -2686,6 +2790,47 @@ fn asks_is_terminal(masked: &str, end: usize) -> bool {
         && !b
             .get(j + QUERY.len())
             .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+/// Where `mds lint`'s output calls sit (see [`lint_funnel`]).
+#[derive(Debug)]
+struct LintFunnel {
+    /// `file:line: call` for every [`LINT_OUTPUT_CALLS`] call or `exit(…)` in `lint.rs`,
+    /// and every `exit(…)` in `lint_sink.rs`.
+    stray: Vec<String>,
+    /// `ewriteln!` / `ewrite!` calls in `lint_sink.rs`.
+    sink_writer_calls: usize,
+    /// `write_stdout(…)` calls in `lint_sink.rs`.
+    sink_stdout_writes: usize,
+    /// `exit(lint::run_lint(…))` calls in `main.rs`: the driver ending the run with lint's
+    /// exit code.
+    driver_exits: usize,
+}
+
+/// Sort the output calls in the sources of `lint.rs`, `lint_sink.rs` and `main.rs` into
+/// [`LintFunnel`]. A call is a name from [`LINT_OUTPUT_CALLS`], or `exit`, followed by its
+/// parenthesised arguments, outside comments and literals — `output::exit(…)` and
+/// `std::process::exit(…)` alike, never `exit_code(…)`.
+fn lint_funnel(lint: &str, sink: &str, main: &str) -> LintFunnel {
+    let calls = |src: &str, names: &[&str]| find_invocations(&mask_comments(src), names);
+    let reported = |file: &str, invocations: Vec<Invocation>| -> Vec<String> {
+        invocations
+            .into_iter()
+            .map(|inv| format!("  {file}:{}: {}", inv.line, inv.name))
+            .collect()
+    };
+    let mut stray = reported("lint.rs", calls(lint, LINT_OUTPUT_CALLS));
+    stray.extend(reported("lint.rs", calls(lint, &["exit"])));
+    stray.extend(reported("lint_sink.rs", calls(sink, &["exit"])));
+    LintFunnel {
+        stray,
+        sink_writer_calls: calls(sink, &["ewriteln!", "ewrite!"]).len(),
+        sink_stdout_writes: calls(sink, &["write_stdout"]).len(),
+        driver_exits: calls(main, &["exit"])
+            .iter()
+            .filter(|inv| inv.body.trim_start().starts_with("lint::run_lint("))
+            .count(),
+    }
 }
 
 /// Union of a format invocation's inline captures and its positional arguments.

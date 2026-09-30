@@ -7,6 +7,7 @@ mod build;
 mod fmt;
 mod input;
 mod lint;
+mod lint_sink;
 mod output;
 mod watch;
 
@@ -535,7 +536,7 @@ fn run(cli: Cli) -> Result<()> {
                     output::exit(2);
                 }
             };
-            lint::run_lint(lint::LintArgs {
+            output::exit(lint::run_lint(lint::LintArgs {
                 input,
                 fix,
                 check,
@@ -545,7 +546,7 @@ fn run(cli: Cli) -> Result<()> {
                 vars,
                 set_vars,
                 set_string_vars,
-            })
+            }))
         }
         Commands::Init { filename, force } => run_init(filename, force, quiet),
         Commands::Watch {
