@@ -963,9 +963,8 @@ fn lint_input(
         SourceText::Unread(path) => match read_source_file(path) {
             Ok(text) => text,
             Err(e) => {
-                let tally = dir_entry_failed(&input, e, FileTally::Error, dir_document);
                 return InputVerdict {
-                    tally,
+                    tally: dir_entry_failed(&input, e, FileTally::Error, dir_document),
                     would_fix: false,
                     truncated,
                 };
