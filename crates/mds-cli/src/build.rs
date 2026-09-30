@@ -363,12 +363,15 @@ pub(crate) fn compute_output_dir_path_for_kind(
 /// For rule 2 (`-o <path>`), the path is used verbatim, whatever its extension; once the
 /// write is certain, [`warn_output_extension_mismatch`] warns when it conflicts with `kind`.
 ///
-/// The output's shown form is fixed here too (#390): every rule but 5 builds the path
-/// from what the caller passed alone, so it is shown as built; rule 5 writes below the
-/// canonical config directory and is shown below the directory `mds.json` was reached by
-/// (`./dist/x.md`, `sub/../dist/x.md`), as a config error names `mds.json` itself.
+/// The output's shown form is fixed here too (#390). The file name comes from the input's
+/// `canonical` form in every rule that derives one. Rules 2 and 4 build the path from
+/// what was typed and show it as built; rule 5 writes below the canonical config
+/// directory and is shown below the directory `mds.json` was reached by (`./dist/x.md`,
+/// `sub/../dist/x.md`), as a config error names `mds.json` itself; rule 6 writes beside
+/// the input's `canonical` form and is shown beside its `typed` one (`./x.md` for a bare
+/// `x.mds`). `mds build` passes its input as typed in both forms ([`EntryPaths`]).
 pub(crate) fn resolve_output_path_for_kind(
-    input: &Option<PathBuf>,
+    input: Option<EntryPaths<'_>>,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<ProjectConfig>,
@@ -383,7 +386,8 @@ pub(crate) fn resolve_output_path_for_kind(
 
     // Derive the output filename from the input path (needed for steps 3-6).
     // Treat stdin ("-") as None so we fall back to "output.md/json" instead of "-.md".
-    let input_path = input.as_deref().filter(|p| *p != Path::new("-"));
+    let input = input.filter(|entry| entry.typed != Path::new("-"));
+    let input_path = input.map(|entry| entry.canonical);
 
     // 3. Stdin input with no explicit output destination → stdout.
     //    But if --out-dir is set, fall through so the user's explicit CLI flag
@@ -421,13 +425,16 @@ pub(crate) fn resolve_output_path_for_kind(
         }
     }
 
-    // 6. Default: file next to source, with kind-derived extension.
-    match input_path {
-        Some(p) => {
-            let filename = derive_output_filename_for_kind(p, kind);
+    // 6. Default: file next to source, with kind-derived extension — written beside the
+    //    input's canonical form, named beside it as typed (#390).
+    match input {
+        Some(entry) => {
+            let filename = derive_output_filename_for_kind(entry.canonical, kind);
             // effective_parent maps "" (bare filename) to "." — avoids PF-006.
-            let dir = effective_parent(p);
-            Ok(Some(WriteTarget::as_typed(dir.join(filename))))
+            Ok(Some(WriteTarget {
+                path: effective_parent(entry.canonical).join(&filename),
+                shown: effective_parent(entry.typed).join(filename),
+            }))
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
         None => Ok(None),
@@ -936,10 +943,9 @@ pub(crate) struct CompileOutput {
     pub(crate) content: String,
     /// The output kind (derived intrinsically from the compiled output).
     pub(crate) kind: OutputKind,
-    /// Transitive dependency paths (empty when no `@import`s), as watch graph keys
-    /// ([`crate::watch::graph_key`]): the canonical form notify event paths are
-    /// compared in. `CompileResult.dependencies` is the conventional form, which on
-    /// Windows drops the `\\?\` prefix the watcher's own paths carry (#409).
+    /// Transitive dependency paths (empty when no `@import`s), as the compiler reports
+    /// them (`CompileResult.dependencies`). `mds watch` alone reads them, and keys them by
+    /// path itself (#390, #409).
     pub(crate) dependencies: Vec<String>,
     /// Source map if `opts.source_map` was `true` and the compilation produced one.
     pub(crate) source_map: Option<mds::SourceMap>,
@@ -1014,19 +1020,10 @@ pub(crate) fn compile_to_content(
     // Move result.output into serialize_output so the Markdown arm avoids a clone
     // (the kind was already derived from the borrow above — issue 2).
     let content = serialize_output(result.output)?;
-    let dependencies = result
-        .dependencies
-        .iter()
-        .map(|dep| {
-            crate::watch::graph_key(Path::new(dep))
-                .display()
-                .to_string()
-        })
-        .collect();
     Ok(CompileOutput {
         content,
         kind,
-        dependencies,
+        dependencies: result.dependencies,
         source_map,
     })
 }
@@ -1045,6 +1042,16 @@ pub(crate) fn compile_to_content(
 pub(crate) struct EntryPaths<'a> {
     pub(crate) typed: &'a Path,
     pub(crate) canonical: &'a Path,
+}
+
+impl<'a> EntryPaths<'a> {
+    /// An entry held only as typed, as `mds build` holds it: the typed path as both.
+    pub(crate) fn as_typed(path: &'a Path) -> Self {
+        Self {
+            typed: path,
+            canonical: path,
+        }
+    }
 }
 
 /// The canonical path of the file `path` names, for comparing two paths as files, or
@@ -1652,8 +1659,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
         // Stdin: no project config; output path follows -o flag or defaults to stdout.
         // There is no entry file to refuse (#425), so the `-o` warning is printed now.
-        let output_path =
-            resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind)?;
+        let output_path = resolve_output_path_for_kind(
+            Some(EntryPaths::as_typed(&input)),
+            &output,
+            &out_dir,
+            &None,
+            kind,
+        )?;
         warn_output_extension_mismatch(&output, kind, quiet);
 
         if let Some(ref mut sm) = source_map {
@@ -1762,20 +1774,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         .with_source_map_base(source_map_base);
 
     let compiled = compile_to_content(&input, runtime_vars, quiet, opts)?;
-    let output_path = resolve_output_path_for_kind(
-        &Some(input.clone()),
-        &output,
-        &out_dir,
-        &config,
-        compiled.kind,
-    )?;
-    // #425: nothing — output or sidecar map — is written once the output is the entry,
-    // and no warning announces that write. `mds build` holds only the typed path;
+    // `mds build` holds only the typed path: the output is resolved from it, and
     // `admit_output` canonicalizes both sides itself.
-    let entry = EntryPaths {
-        typed: &input,
-        canonical: &input,
-    };
+    let entry = EntryPaths::as_typed(&input);
+    let output_path =
+        resolve_output_path_for_kind(Some(entry), &output, &out_dir, &config, compiled.kind)?;
+    // #425: nothing — output or sidecar map — is written once the output is the entry,
+    // and no warning announces that write.
     let written_path = output_path.as_ref().map(|t| t.path.as_path());
     admit_output(written_path, entry, &output, compiled.kind, quiet)
         .map_err(miette::Error::from)?;
@@ -1935,7 +1940,7 @@ fn run_build_directory(
 ) -> Result<()> {
     use crate::output::{
         collect_mds_files_detailed, is_partial, output_base_no_ext, output_path_for,
-        probe_and_remove_stale, resolve_output_base, OutputBase,
+        probe_and_remove_stale, resolve_output_base, OutputBase, RootPaths,
     };
 
     const MAX_DEPTH: usize = 64;
@@ -2047,7 +2052,7 @@ fn run_build_directory(
         match compiled {
             Ok(Ok(mut compiled)) => {
                 let ext = compiled.kind.extension();
-                let target = output_path_for(file, dir, &output_base, ext);
+                let target = output_path_for(file, RootPaths::as_typed(dir), &output_base, ext);
 
                 // Ensure parent directory exists.
                 if let Some(parent) = target.path.parent() {
@@ -2200,39 +2205,6 @@ fn run_build_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// #409: the watch loop compares dependency paths with canonical event paths
-    /// and graph keys, so `compile_to_content` hands it graph keys, not the
-    /// conventional form `CompileResult.dependencies` carries.
-    #[test]
-    fn compile_to_content_reports_dependencies_as_graph_keys() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join("main.mds"),
-            "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
-        let main = dir.path().join("main.mds");
-
-        let compiled =
-            compile_to_content(&main, None, true, mds::CompileOptions::default()).unwrap();
-        let expected = crate::watch::graph_key(&dir.path().join("lib.mds"));
-        assert_eq!(
-            compiled.dependencies,
-            [expected.display().to_string()],
-            "the dependency is the watch graph key of the imported file"
-        );
-
-        // On Windows the graph key is verbatim while the library result is not:
-        // this is the mismatch the mapping exists for.
-        #[cfg(windows)]
-        {
-            let library = mds::compile_with_deps(&main, None).unwrap().dependencies;
-            assert!(compiled.dependencies[0].starts_with(r"\\?\"));
-            assert!(!library[0].starts_with(r"\\?\"));
-        }
-    }
 
     /// #425: `admit_output` refuses an output that is the entry file and names the entry
     /// by `typed`, never by `canonical`; any other output is admitted, stdout included.
@@ -2484,7 +2456,7 @@ mod tests {
     #[test]
     fn resolve_output_path_dash_o_dash_is_stdout() {
         let result = resolve_output_path_for_kind(
-            &Some(PathBuf::from("foo.mds")),
+            Some(EntryPaths::as_typed(Path::new("foo.mds"))),
             &Some("-".to_string()),
             &None,
             &None,
@@ -2497,7 +2469,7 @@ mod tests {
     #[test]
     fn resolve_output_path_stdin_no_o_is_stdout() {
         let result = resolve_output_path_for_kind(
-            &Some(PathBuf::from("-")),
+            Some(EntryPaths::as_typed(Path::new("-"))),
             &None,
             &None,
             &None,
@@ -2513,7 +2485,7 @@ mod tests {
     #[test]
     fn resolve_output_path_default_file_next_to_source() {
         let result = resolve_output_path_for_kind(
-            &Some(PathBuf::from("/some/dir/hello.mds")),
+            Some(EntryPaths::as_typed(Path::new("/some/dir/hello.mds"))),
             &None,
             &None,
             &None,
@@ -2527,12 +2499,51 @@ mod tests {
         );
     }
 
+    /// #390: an entry held in two forms, as `mds watch` holds it, has its default output
+    /// written beside the canonical form and named beside the typed one — `./hello.md`
+    /// for a bare name, `..` kept as typed — while `--out-dir` takes the name from the
+    /// canonical form and shows the out-dir as typed.
+    #[test]
+    fn resolve_output_path_default_is_named_beside_the_entry_as_typed() {
+        let resolve = |typed: &str, out_dir: Option<&str>| {
+            resolve_output_path_for_kind(
+                Some(EntryPaths {
+                    typed: Path::new(typed),
+                    canonical: Path::new("/some/dir/hello.mds"),
+                }),
+                &None,
+                &out_dir.map(PathBuf::from),
+                &None,
+                OutputKind::Markdown,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            resolve("hello.mds", None),
+            Some(WriteTarget {
+                path: PathBuf::from("/some/dir/hello.md"),
+                shown: PathBuf::from("./hello.md"),
+            })
+        );
+        assert_eq!(
+            resolve("sub/../sub/hello.mds", None),
+            Some(WriteTarget {
+                path: PathBuf::from("/some/dir/hello.md"),
+                shown: PathBuf::from("sub/../sub/hello.md"),
+            })
+        );
+        assert_eq!(
+            resolve("hello.mds", Some("out")),
+            Some(WriteTarget::as_typed(PathBuf::from("out/hello.md")))
+        );
+    }
+
     #[test]
     fn resolve_output_path_stdin_with_out_dir_uses_out_dir() {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = dir.path().join("out");
         let result = resolve_output_path_for_kind(
-            &Some(PathBuf::from("-")),
+            Some(EntryPaths::as_typed(Path::new("-"))),
             &None,
             &Some(out_dir.clone()),
             &None,
@@ -2570,7 +2581,7 @@ mod tests {
     #[test]
     fn resolve_output_path_config_output_dir_is_shown_below_the_directory_reached() {
         let result = resolve_output_path_for_kind(
-            &Some(PathBuf::from("src/hello.mds")),
+            Some(EntryPaths::as_typed(Path::new("src/hello.mds"))),
             &None,
             &None,
             &config_with_output_dir("src/.."),
@@ -2590,7 +2601,7 @@ mod tests {
     fn resolve_output_path_explicit_o_wins_over_config() {
         let config = config_with_output_dir(".");
         let result = resolve_output_path_for_kind(
-            &Some(PathBuf::from("/project/hello.mds")),
+            Some(EntryPaths::as_typed(Path::new("/project/hello.mds"))),
             &Some("out.md".to_string()),
             &None,
             &config,

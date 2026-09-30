@@ -1082,6 +1082,39 @@ impl WriteTarget {
     }
 }
 
+/// A directory-mode root in the two forms its sources are walked in and named by, always
+/// in `(typed, walked)` order, so the two cannot be passed swapped (#390).
+///
+/// `walked` is the form the sources below it are walked in — what [`output_path_for`]
+/// strips a source against. `typed` is the directory argument as typed: an output next to
+/// its source is named below it. `mds build` walks the directory as typed and passes it as
+/// both; `mds watch` walks its canonical form, which matches the event paths notify
+/// reports.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RootPaths<'a> {
+    pub(crate) typed: &'a Path,
+    pub(crate) walked: &'a Path,
+}
+
+impl<'a> RootPaths<'a> {
+    /// A root walked as typed: its two forms are one.
+    pub(crate) fn as_typed(dir: &'a Path) -> Self {
+        Self {
+            typed: dir,
+            walked: dir,
+        }
+    }
+
+    /// `source`, a path the walk of `walked` produced, named below `typed`. A source not
+    /// below `walked` has no typed form and keeps its own.
+    fn shown_below(self, source: &Path) -> PathBuf {
+        match source.strip_prefix(self.walked) {
+            Ok(below) => self.typed.join(below),
+            Err(_) => source.to_path_buf(),
+        }
+    }
+}
+
 /// Resolve `out_dir` to an absolute, canonicalized path for reliable `starts_with` checks.
 ///
 /// [`resolve_output_base`] calls it for the `--out-dir` of `run_build_directory` and
@@ -1157,13 +1190,13 @@ pub(crate) fn resolve_output_base(
 /// kept in one place (issue 5 — single source of truth), shared with
 /// [`output_base_no_ext`].
 ///
-/// - `Dir`: mirrors `source` relative to `root` under the directory — its canonical form
-///   for the write, its shown form for the message (#390).
+/// - `Dir`: mirrors `source` relative to `root.walked` under the directory — its
+///   canonical form for the write, its shown form for the message (#390).
 ///   If `strip_prefix` fails (source not under root after canonicalization),
 ///   falls back to `<dir>/stem.<ext>` — **never** joins an absolute path that
 ///   could escape the output directory (AC-M7 path-escape guard).
-/// - `NextToSource`: `source.with_extension(ext)`, shown as the source is: the walk's
-///   path, below the directory argument as typed.
+/// - `NextToSource`: `source.with_extension(ext)` beside the source as walked, named
+///   below the directory argument as typed ([`output_stem_for`], #390).
 ///
 /// The `ext` parameter is the output extension without leading `.` (`"md"` or `"json"`).
 ///
@@ -1182,14 +1215,14 @@ pub(crate) fn resolve_output_base(
 /// if it is ever seen, one of those gates has moved.
 pub(crate) fn output_path_for(
     source: &Path,
-    root: &Path,
+    root: RootPaths<'_>,
     base: &OutputBase,
     ext: &str,
 ) -> WriteTarget {
     match base {
         OutputBase::Dir { canonical, shown } => {
-            let (path, flattened) = mirrored_output(source, root, canonical, ext);
-            let (shown, _) = mirrored_output(source, root, shown, ext);
+            let (path, flattened) = mirrored_output(source, root.walked, canonical, ext);
+            let (shown, _) = mirrored_output(source, root.walked, shown, ext);
             if flattened {
                 // Invariant report, not gated on --quiet (like the depth-limit and
                 // stale-unlink warnings above). Emitted once per output-path computation:
@@ -1200,14 +1233,14 @@ pub(crate) fn output_path_for(
                      as {} (another source outside the root with the same file name would \
                      overwrite it)",
                     safe_path(source),
-                    safe_path(root),
+                    safe_path(root.walked),
                     safe_path(&shown)
                 ));
             }
             WriteTarget { path, shown }
         }
         OutputBase::NextToSource => {
-            WriteTarget::as_typed(output_base_no_ext(source, root, base).with_extension(ext))
+            output_stem_for(source, root, base).sibling(|stem| stem.with_extension(ext))
         }
     }
 }
@@ -1603,6 +1636,26 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
             source.with_extension("")
         }
     }
+}
+
+/// [`output_base_no_ext`] in both forms, fixed here as [`output_path_for`] fixes an
+/// output's (#390): `path` is the extension-less stem the filesystem is probed at; `shown`
+/// is the same stem below the out-dir's shown form, or — next to the source — below the
+/// directory argument as typed. `mds watch` names a deleted source's output by `shown`.
+///
+/// Like [`output_base_no_ext`] it is a probe: it reports nothing, the flattened arm
+/// included.
+pub(crate) fn output_stem_for(
+    source: &Path,
+    root: RootPaths<'_>,
+    base: &OutputBase,
+) -> WriteTarget {
+    let path = output_base_no_ext(source, root.walked, base);
+    let shown = match base {
+        OutputBase::Dir { shown, .. } => mirror_stem(source, root.walked, shown).into_path(),
+        OutputBase::NextToSource => root.shown_below(source).with_extension(""),
+    };
+    WriteTarget { path, shown }
 }
 
 // ── Atomic file write ─────────────────────────────────────────────────────────
@@ -2544,7 +2597,7 @@ mod tests {
     fn an_output_is_written_below_the_canonical_out_dir_and_named_below_the_typed_one() {
         let source = Path::new("/root/sub/page.mds");
         let root = Path::new("/root");
-        let out = output_path_for(source, root, &out_base(), "md");
+        let out = output_path_for(source, RootPaths::as_typed(root), &out_base(), "md");
         assert_eq!(out, target("/out/sub/page.md", "out/sub/page.md"));
         assert_eq!(
             out.sibling(crate::build::map_path_for),
@@ -2553,11 +2606,47 @@ mod tests {
         assert_eq!(
             output_path_for(
                 Path::new("src/sub/page.mds"),
-                Path::new("src"),
+                RootPaths::as_typed(Path::new("src")),
                 &OutputBase::NextToSource,
                 "md"
             ),
             WriteTarget::as_typed(PathBuf::from("src/sub/page.md"))
+        );
+    }
+
+    /// #390: a root walked in another form than it was typed in — `mds watch` walks the
+    /// canonical directory — names an output next to its source, and the stem of a
+    /// deleted source's output, below the directory as typed, while both are written and
+    /// probed below the walked form; under an out-dir the typed root changes nothing. A
+    /// source outside the walked root has no typed form and keeps its own.
+    #[test]
+    fn an_output_next_to_its_source_is_named_below_the_root_as_typed() {
+        let root = RootPaths {
+            typed: Path::new("src"),
+            walked: Path::new("/root"),
+        };
+        let source = Path::new("/root/sub/page.mds");
+        let next_to = OutputBase::NextToSource;
+
+        assert_eq!(
+            output_path_for(source, root, &next_to, "md"),
+            target("/root/sub/page.md", "src/sub/page.md")
+        );
+        assert_eq!(
+            output_stem_for(source, root, &next_to),
+            target("/root/sub/page", "src/sub/page")
+        );
+        assert_eq!(
+            output_path_for(source, root, &out_base(), "json"),
+            target("/out/sub/page.json", "out/sub/page.json")
+        );
+        assert_eq!(
+            output_stem_for(source, root, &out_base()),
+            target("/out/sub/page", "out/sub/page")
+        );
+        assert_eq!(
+            output_stem_for(Path::new("/other/page.mds"), root, &next_to),
+            target("/other/page", "/other/page")
         );
     }
 
@@ -2603,7 +2692,7 @@ mod tests {
         let source = PathBuf::from("/root/src/chat.mds");
         let root = PathBuf::from("/root");
         let base = out_base();
-        let result = output_path_for(&source, &root, &base, "json");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "json");
         assert_eq!(result, target("/out/src/chat.json", "out/src/chat.json"));
     }
 
@@ -2612,7 +2701,7 @@ mod tests {
         let source = PathBuf::from("/root/src/page.mds");
         let root = PathBuf::from("/root");
         let base = out_base();
-        let result = output_path_for(&source, &root, &base, "md");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         assert_eq!(result, target("/out/src/page.md", "out/src/page.md"));
     }
 
@@ -2621,7 +2710,7 @@ mod tests {
         let source = PathBuf::from("/root/src/page.mds");
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
-        let result = output_path_for(&source, &root, &base, "md");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         assert_eq!(result, target("/root/src/page.md", "/root/src/page.md"));
     }
 
@@ -2630,7 +2719,7 @@ mod tests {
         let source = PathBuf::from("/root/src/chat.mds");
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
-        let result = output_path_for(&source, &root, &base, "json");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "json");
         assert_eq!(result, target("/root/src/chat.json", "/root/src/chat.json"));
     }
 
@@ -2641,7 +2730,7 @@ mod tests {
         let source = PathBuf::from("/other/page.mds");
         let root = PathBuf::from("/root");
         let base = out_base();
-        let result = output_path_for(&source, &root, &base, "md");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         // Must be inside /out, not escape to /other.
         assert!(
             result.path.starts_with("/out"),
@@ -2721,7 +2810,7 @@ mod tests {
             "the probe oracle must keep a stem-less source inside the out-dir"
         );
         assert_eq!(
-            output_path_for(source, root, &base, "md"),
+            output_path_for(source, RootPaths::as_typed(root), &base, "md"),
             target("/out/output.md", "out/output.md"),
             "the write oracle must not join an absolute stem"
         );
@@ -2745,8 +2834,6 @@ mod tests {
 
         let oracle = fn_body(SRC, "fn output_path_for(")
             .expect("non-vacuity: fn output_path_for must be present in this file");
-        let probe = fn_body(SRC, "fn output_base_no_ext(")
-            .expect("non-vacuity: fn output_base_no_ext must be present in this file");
 
         assert!(
             oracle.contains("eprint_warning("),
@@ -2756,15 +2843,21 @@ mod tests {
             oracle.contains(NEEDLE),
             "the write oracle's report must name the out-of-root condition; body: {oracle}"
         );
-        assert!(
-            !probe.contains("eprint_warning("),
-            "the probe oracle must stay silent — it runs on bookkeeping, not on writes; \
-             body: {probe}"
-        );
-        assert!(
-            !probe.contains(NEEDLE),
-            "the probe oracle must not carry the report text either; body: {probe}"
-        );
+        // Both probes: the stem, and the stem in both forms that names a deleted
+        // source's output (#390).
+        for header in ["fn output_base_no_ext(", "fn output_stem_for("] {
+            let probe = fn_body(SRC, header)
+                .unwrap_or_else(|| panic!("non-vacuity: {header} must be present in this file"));
+            assert!(
+                !probe.contains("eprint_warning("),
+                "the probe oracle must stay silent — it runs on bookkeeping, not on writes; \
+                 body: {probe}"
+            );
+            assert!(
+                !probe.contains(NEEDLE),
+                "the probe oracle must not carry the report text either; body: {probe}"
+            );
+        }
     }
 
     /// The `.<name>.tmp-<pid>-<n>` temp files an atomic write leaves in flight must

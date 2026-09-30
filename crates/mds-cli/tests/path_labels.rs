@@ -1,9 +1,11 @@
-//! The lines of `mds build`, `mds check` and `mds lint` pinned here name a path as typed,
-//! or as the part below a directory the user named, as typed — the directory argument,
-//! `--out-dir`, or the directory `mds.json` was reached by — never by a canonical or
-//! absolute spelling the user did not type (#390). The text of an I/O error raised while
-//! writing below a directory build's `--out-dir` is not among them: it still names the
-//! canonical path.
+//! The lines of `mds build`, `mds check`, `mds lint` and `mds watch` pinned here name a
+//! path as typed, or as the part below a directory the user named, as typed — the
+//! directory argument, `--out-dir`, or the directory `mds.json` was reached by — never by
+//! a canonical or absolute spelling the user did not type (#390). Not among them: the text
+//! of an I/O error raised while writing below a directory's `--out-dir`, and of the
+//! warning for a stale output of the other kind that cannot be removed, both of which
+//! still name the canonical path; and a directory `mds watch` watches for a dependency,
+//! which has only the path the compile reported.
 //!
 //! Each run starts in a scratch directory with relative arguments, so the scratch
 //! directory's own absolute path has no business in any output: [`leak`] looks for it in
@@ -22,8 +24,9 @@ use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::time::Duration;
 
-use common::mds_bin;
+use common::{mds_bin, write_atomic};
 
 /// A scratch directory whose name no output could carry by chance.
 fn scratch() -> tempfile::TempDir {
@@ -762,8 +765,8 @@ fn no_listed_build_check_or_lint_run_names_the_working_directory() {
 
 /// `mds watch` announces its startup outputs through build's `Compiled to` line, so an
 /// output under `--out-dir` (directory mode) or under `mds.json` `build.output_dir`
-/// (both modes) is named as `mds build` names it. The rest of watch's own lines are not
-/// pinned here.
+/// (both modes) is named as `mds build` names it. Watch's own lines are pinned in the
+/// section below.
 #[test]
 fn watch_startup_names_an_out_dir_and_a_config_output_dir_as_build_does() {
     let dir = scratch();
@@ -812,6 +815,496 @@ fn watch_startup_names_an_out_dir_and_a_config_output_dir_as_build_does() {
     }
 }
 
+// ── `mds watch`'s own lines ──────────────────────────────────────────────────
+
+/// Bound for one step of a watch session — a rebuild, a deletion. A failure bound only:
+/// each wait returns as soon as its line is on stderr.
+const WATCH_STEP: Duration = Duration::from_secs(10);
+
+/// `mds watch <args> --debounce 0` in `cwd`, live — every watch armed, its startup output
+/// printed. stdout is tapped when `tap_stdout` (`-o -`), discarded otherwise.
+fn watch_live(
+    cwd: &Path,
+    args: &[impl AsRef<OsStr>],
+    tap_stdout: bool,
+) -> (
+    common::ChildGuard,
+    common::StderrTap,
+    Option<common::StdoutTap>,
+) {
+    let stdout = if tap_stdout {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    let (child, stderr, stdout) = common::spawn_watch_ready(
+        mds_bin()
+            .current_dir(cwd)
+            .args(args)
+            .args(["--debounce", "0"])
+            .stdout(stdout),
+    );
+    (common::ChildGuard(child), stderr, stdout)
+}
+
+/// The lines of `text` that start with `prefix`, sorted: a directory's sources are
+/// compiled in the order the walk finds them, which the filesystem decides.
+fn lines_starting(text: &str, prefix: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `Watching` names the entry as typed — below a subdirectory, through `..` uncollapsed,
+/// and by its bare name when auto-detection found it — and `Watching directory` names the
+/// directory argument as typed, `.` included; never by the canonical absolute path the
+/// session matches events against. Each session's startup output is compared whole, the
+/// `Compiled to` beside each source included, so every line the absence check covers is
+/// proven printed.
+#[test]
+fn watching_names_the_entry_and_the_directory_as_typed() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "sub/page.mds", "Page\n");
+    put(root, "solo/x.mds", "X\n");
+    put(root, "src/a.mds", "A\n");
+    put(root, "src/sub/b.mds", "B\n");
+
+    // (working directory, arguments, the banner, the startup `Compiled to` names)
+    let cases: [(&str, &[&str], &str, &[&str]); 6] = [
+        (
+            ".",
+            &["watch", "sub/page.mds"],
+            "Watching sub/page.mds",
+            &["sub/page.md"],
+        ),
+        (
+            ".",
+            &["watch", "sub/../sub/page.mds"],
+            "Watching sub/../sub/page.mds",
+            &["sub/../sub/page.md"],
+        ),
+        ("solo", &["watch"], "Watching x.mds", &["./x.md"]),
+        (
+            ".",
+            &["watch", "src"],
+            "Watching directory src",
+            &["src/a.md", "src/sub/b.md"],
+        ),
+        (
+            "src",
+            &["watch", "."],
+            "Watching directory .",
+            &["./a.md", "./sub/b.md"],
+        ),
+        (
+            ".",
+            &["watch", "src/sub/.."],
+            "Watching directory src/sub/..",
+            &["src/sub/../a.md", "src/sub/../sub/b.md"],
+        ),
+    ];
+    for (cwd, args, banner, compiled) in cases {
+        let args = typed_args(args);
+        let label = format!("(in {cwd}) mds {}", args.join(" "));
+        let (mut child, tap, _) = watch_live(&root.join(cwd), &args, false);
+        let stderr = tap.finish_text(&mut child);
+
+        let mut expected: Vec<String> = compiled
+            .iter()
+            .map(|name| format!("Compiled to {}", native(name)))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            stderr.lines().next(),
+            Some(native(banner).as_str()),
+            "{label}: the banner names the argument as typed; stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Compiled to "),
+            expected,
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            stderr.lines().count(),
+            1 + compiled.len(),
+            "{label}: nothing but the banner and the startup outputs; stderr: {stderr}"
+        );
+        assert_eq!(leak(&stderr, root), None, "{label}: stderr: {stderr}");
+    }
+}
+
+/// An entry, and a directory argument, reached through a symlinked directory are named by
+/// the link, as typed — in the banner, the startup `Compiled to` and a rebuild's
+/// `Recompiled` — never by the directory the link resolves to, which is what the session
+/// watches.
+///
+/// Unix-only: it creates a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watching_names_a_path_reached_through_a_symlink_by_the_link() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "real-target/page.mds", "Page\n");
+    put(root, "real-target/sub/b.mds", "B\n");
+    std::os::unix::fs::symlink(root.join("real-target"), root.join("alias-link")).unwrap();
+
+    // (arguments, the banner, the output's name, the source edited, the output written)
+    let cases: [(&[&str], &str, &str, &str, &str); 2] = [
+        (
+            &["watch", "alias-link/page.mds"],
+            "Watching alias-link/page.mds",
+            "alias-link/page.md",
+            "real-target/page.mds",
+            "real-target/page.md",
+        ),
+        (
+            &["watch", "alias-link/sub"],
+            "Watching directory alias-link/sub",
+            "alias-link/sub/b.md",
+            "real-target/sub/b.mds",
+            "real-target/sub/b.md",
+        ),
+    ];
+    for (args, banner, output, edit, written) in cases {
+        let (mut child, tap, _) = watch_live(root, args, false);
+        write_atomic(&root.join(edit), "Edited\n");
+        common::wait_for_tap(&tap, "Recompiled ", WATCH_STEP);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            stderr.lines().next(),
+            Some(banner),
+            "{args:?}: stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Compiled to "),
+            [format!("Compiled to {output}")],
+            "{args:?}: stderr: {stderr}"
+        );
+        let recompiled = lines_starting(&stderr, "Recompiled ");
+        assert!(
+            !recompiled.is_empty()
+                && recompiled
+                    .iter()
+                    .all(|line| line.starts_with(&format!("Recompiled {output} ("))),
+            "{args:?}: every rebuild names the output by the link; stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(written)).unwrap(),
+            "Edited\n",
+            "{args:?}: the rebuild was written through the link"
+        );
+        assert!(
+            !stderr.contains("real-target"),
+            "{args:?}: never by the link's target; stderr: {stderr}"
+        );
+        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+    }
+}
+
+/// One `mds watch` session of [`SESSIONS`]: where it runs and what it runs, the outputs
+/// its startup names, the source it edits once live and the name the rebuild's
+/// `Recompiled` line gives, and — in directory mode — the source it deletes after that
+/// and the name the `Removed` line gives its output. Every path is written with `/`,
+/// relative to `cwd`.
+struct Session {
+    cwd: &'static str,
+    args: &'static [&'static str],
+    /// `-o -`: stdout is the session's product and is checked as well.
+    stdout: bool,
+    compiled: &'static [&'static str],
+    edit: &'static str,
+    recompiled: &'static str,
+    removed: Option<(&'static str, &'static str)>,
+}
+
+const SESSIONS: &[Session] = &[
+    Session {
+        cwd: ".",
+        args: &["watch", "w1/page.mds"],
+        stdout: false,
+        compiled: &["w1/page.md"],
+        edit: "w1/page.mds",
+        recompiled: "w1/page.md",
+        removed: None,
+    },
+    Session {
+        cwd: ".",
+        args: &["watch", "w2/page.mds", "--out-dir", "o2"],
+        stdout: false,
+        compiled: &["o2/page.md"],
+        edit: "w2/page.mds",
+        recompiled: "o2/page.md",
+        removed: None,
+    },
+    Session {
+        cwd: ".",
+        args: &["watch", "w3/page.mds", "-o", "o3/y.md"],
+        stdout: false,
+        compiled: &["o3/y.md"],
+        edit: "w3/page.mds",
+        recompiled: "o3/y.md",
+        removed: None,
+    },
+    Session {
+        cwd: ".",
+        args: &["watch", "w4/page.mds", "-o", "-"],
+        stdout: true,
+        compiled: &[],
+        edit: "w4/page.mds",
+        recompiled: "<stdout>",
+        removed: None,
+    },
+    Session {
+        cwd: "w5",
+        args: &["watch"],
+        stdout: false,
+        compiled: &["./x.md"],
+        edit: "x.mds",
+        recompiled: "./x.md",
+        removed: None,
+    },
+    Session {
+        cwd: "p6",
+        args: &["watch", "p.mds"],
+        stdout: false,
+        compiled: &["./dist/p.md"],
+        edit: "p.mds",
+        recompiled: "./dist/p.md",
+        removed: None,
+    },
+    Session {
+        cwd: ".",
+        args: &["watch", "d7"],
+        stdout: false,
+        compiled: &["d7/a.md", "d7/sub/b.md"],
+        edit: "d7/sub/b.mds",
+        recompiled: "d7/sub/b.md",
+        removed: Some(("d7/sub/b.mds", "d7/sub/b.md")),
+    },
+    Session {
+        cwd: ".",
+        args: &["watch", "d8", "--out-dir", "o8"],
+        stdout: false,
+        compiled: &["o8/a.md", "o8/sub/b.md"],
+        edit: "d8/sub/b.mds",
+        recompiled: "o8/sub/b.md",
+        removed: Some(("d8/sub/b.mds", "o8/sub/b.md")),
+    },
+    Session {
+        cwd: "d9",
+        args: &["watch", "."],
+        stdout: false,
+        compiled: &["./a.md", "./sub/b.md"],
+        edit: "sub/b.mds",
+        recompiled: "./sub/b.md",
+        removed: Some(("sub/b.mds", "./sub/b.md")),
+    },
+    Session {
+        cwd: "p10",
+        args: &["watch", "src"],
+        stdout: false,
+        compiled: &["src/../dist/q.md", "src/../dist/sub/r.md"],
+        edit: "src/sub/r.mds",
+        recompiled: "src/../dist/sub/r.md",
+        removed: Some(("src/sub/r.mds", "src/../dist/sub/r.md")),
+    },
+];
+
+/// Every `mds watch` session in [`SESSIONS`] names each output as typed, in every line
+/// that names one — the startup `Compiled to`, a rebuild's `Recompiled` and, in directory
+/// mode, the `Removed … (source deleted)` of a deleted source's output — and so never
+/// mixes a typed `Compiled to` with an absolute `Recompiled`. Run from the scratch
+/// directory with relative arguments, no session names any spelling of it on stdout or
+/// stderr; each line the absence check covers is proven printed first.
+#[test]
+fn recompiled_and_removed_name_each_output_as_typed() {
+    let dir = scratch();
+    let root = dir.path();
+    for src in ["w1", "w2", "w3", "w4"] {
+        put(root, &format!("{src}/page.mds"), "Page\n");
+    }
+    put(root, "w5/x.mds", "X\n");
+    put(root, "p6/mds.json", r#"{"build":{"output_dir":"dist"}}"#);
+    put(root, "p6/p.mds", "P\n");
+    for src in ["d7", "d8", "d9"] {
+        put(root, &format!("{src}/a.mds"), "A\n");
+        put(root, &format!("{src}/sub/b.mds"), "B\n");
+    }
+    put(root, "p10/mds.json", r#"{"build":{"output_dir":"dist"}}"#);
+    put(root, "p10/src/q.mds", "Q\n");
+    put(root, "p10/src/sub/r.mds", "R\n");
+
+    for session in SESSIONS {
+        let cwd = root.join(session.cwd);
+        let args = typed_args(session.args);
+        let label = format!("(in {}) mds {}", session.cwd, args.join(" "));
+        let (mut child, tap, stdout_tap) = watch_live(&cwd, &args, session.stdout);
+
+        write_atomic(&cwd.join(native(session.edit)), "Edited\n");
+        common::wait_for_tap(&tap, "Recompiled ", WATCH_STEP);
+        if let Some((source, _)) = session.removed {
+            std::fs::remove_file(cwd.join(native(source))).expect("delete the source");
+            common::wait_for_tap(&tap, "(source deleted)", WATCH_STEP);
+        }
+        let stderr = tap.finish_text(&mut child);
+        let stdout = stdout_tap.map_or_else(String::new, |tap| tap.finish_text(&mut child));
+
+        let mut compiled: Vec<String> = session
+            .compiled
+            .iter()
+            .map(|name| format!("Compiled to {}", native(name)))
+            .collect();
+        compiled.sort();
+        assert_eq!(
+            lines_starting(&stderr, "Compiled to "),
+            compiled,
+            "{label}: stderr: {stderr}"
+        );
+        let recompiled = lines_starting(&stderr, "Recompiled ");
+        let prefix = format!("Recompiled {} (", native(session.recompiled));
+        assert!(
+            !recompiled.is_empty() && recompiled.iter().all(|line| line.starts_with(&prefix)),
+            "{label}: every rebuild names the output as {prefix:?}; stderr: {stderr}"
+        );
+        let removed: Vec<String> = session
+            .removed
+            .iter()
+            .map(|(_, output)| format!("Removed {} (source deleted)", native(output)))
+            .collect();
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            removed,
+            "{label}: stderr: {stderr}"
+        );
+        if session.stdout {
+            assert_eq!(
+                stdout, "Page\nEdited\n",
+                "{label}: the startup output and the rebuild went to stdout"
+            );
+        }
+        assert_eq!(leak(&stderr, root), None, "{label}: stderr: {stderr}");
+        assert_eq!(leak(&stdout, root), None, "{label}: stdout: {stdout}");
+    }
+}
+
+/// A source deleted in the same batch as an edit to the `--vars` file — the batch that
+/// recompiles every source — has its output named as typed in the `Removed … (source
+/// deleted)` line, as a deletion alone does.
+#[test]
+fn removed_names_the_output_as_typed_when_the_vars_file_changes_in_the_same_batch() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "d/a.mds", "A {{name}}\n");
+    put(root, "d/sub/b.mds", "B\n");
+    put(root, "vars.json", r#"{"name": "one"}"#);
+
+    // A debounce window long enough to take both changes into one batch.
+    let (child, tap, _) = common::spawn_watch_ready(
+        mds_bin()
+            .current_dir(root)
+            .args(typed_args(&["watch", "d", "--vars", "vars.json"]))
+            .args(["--debounce", "500"])
+            .stdout(Stdio::null()),
+    );
+    let mut child = common::ChildGuard(child);
+    std::fs::remove_file(root.join(native("d/sub/b.mds"))).expect("delete the source");
+    write_atomic(&root.join("vars.json"), r#"{"name": "two"}"#);
+    common::wait_for_tap(&tap, "(source deleted)", WATCH_STEP);
+    common::wait_for_tap(&tap, "Recompiled ", WATCH_STEP);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        lines_starting(&stderr, "Removed "),
+        [format!("Removed {} (source deleted)", native("d/sub/b.md"))],
+        "stderr: {stderr}"
+    );
+    let prefix = format!("Recompiled {} (", native("d/a.md"));
+    let recompiled = lines_starting(&stderr, "Recompiled ");
+    assert!(
+        !recompiled.is_empty() && recompiled.iter().all(|line| line.starts_with(&prefix)),
+        "the vars change rebuilt the other source, named as {prefix:?}; stderr: {stderr}"
+    );
+    assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
+}
+
+/// A deleted source's output that cannot be removed — its directory is read-only — is
+/// named as typed in the warning that says so, as a removed one is in `Removed`: after a
+/// deletion alone, and after one in the same batch as an edit to the `--vars` file.
+///
+/// Unix-only: it makes a directory read-only; skipped with a reason where the mode does
+/// not stop a removal (running as root).
+#[cfg(unix)]
+#[test]
+fn an_output_that_cannot_be_removed_is_named_as_typed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// Makes the directory writable again on drop, so the scratch directory can go.
+    struct Writable(PathBuf);
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let dir = scratch();
+    let root = dir.path();
+    // (fixture directory, the extra arguments, whether the `--vars` file is edited too)
+    for (fixture, extra, edit_vars) in [
+        ("alone", &["--debounce", "0"][..], false),
+        (
+            "with-vars",
+            &["--vars", "vars.json", "--debounce", "500"][..],
+            true,
+        ),
+    ] {
+        let cwd = root.join(fixture);
+        put(&cwd, "d/sub/b.mds", "B\n");
+        put(&cwd, "vars.json", r#"{"name": "one"}"#);
+        let (child, tap, _) = common::spawn_watch_ready(
+            mds_bin()
+                .current_dir(&cwd)
+                .args(["watch", "d", "--out-dir", "o"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        let mut child = common::ChildGuard(child);
+        let sub = cwd.join("o/sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _writable = Writable(sub.clone());
+        if std::fs::write(sub.join(".write-probe"), b"").is_ok() {
+            let _ = std::fs::remove_file(sub.join(".write-probe"));
+            eprintln!(
+                "skipped: {} is writable at mode 0o555 (running as root?)",
+                sub.display()
+            );
+            return;
+        }
+
+        std::fs::remove_file(cwd.join("d/sub/b.mds")).expect("delete the source");
+        if edit_vars {
+            write_atomic(&cwd.join("vars.json"), r#"{"name": "two"}"#);
+        }
+        common::wait_for_tap(&tap, "could not remove", WATCH_STEP);
+        let stderr = tap.finish_text(&mut child);
+
+        assert!(
+            stderr.contains("warning: could not remove o/sub/b.md: "),
+            "{fixture}: the output is named below the out-dir as typed; stderr: {stderr}"
+        );
+        assert!(
+            sub.join("b.md").is_file(),
+            "{fixture}: the output is still there"
+        );
+        assert_eq!(leak(&stderr, root), None, "{fixture}: stderr: {stderr}");
+    }
+}
+
 // ── Windows ──────────────────────────────────────────────────────────────────
 
 /// Windows: a directory build under an out-dir that already exists — the case in which
@@ -852,4 +1345,66 @@ fn compiled_to_and_map_lines_under_an_existing_out_dir_carry_no_verbatim_prefix(
     assert!(!stdout.contains(r"\\?\"), "stdout: {stdout}");
     assert!(!stderr.contains(r"\\?\"), "stderr: {stderr}");
     assert_eq!(leak(&stderr, dir.path()), None, "stderr: {stderr}");
+}
+
+/// Windows: `mds watch` matches events against canonical — verbatim `\\?\` — paths, yet
+/// its banner and a rebuild's `Recompiled` line name the argument, and the output below
+/// it, as typed, with no verbatim prefix, in directory mode under an out-dir that already
+/// exists and in file mode.
+#[cfg(windows)]
+#[test]
+fn watch_banner_and_recompiled_lines_carry_no_verbatim_prefix() {
+    let dir = scratch();
+    put(dir.path(), "src/sub/page.mds", "Page\n");
+    std::fs::create_dir(dir.path().join("out")).unwrap();
+    // Control: canonicalizing IS verbatim on this host, so the absence assertions below
+    // can fail.
+    assert!(
+        dir.path()
+            .join("src")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(r"\\?\"),
+        "test assumption: canonicalize must yield a verbatim path on Windows"
+    );
+
+    // (arguments, the banner, the output's name)
+    let cases: [(&[&str], &str, &str); 2] = [
+        (
+            &["watch", "src", "--out-dir", "out"],
+            "Watching directory src",
+            "out/sub/page.md",
+        ),
+        (
+            &["watch", "src/sub/page.mds"],
+            "Watching src/sub/page.mds",
+            "src/sub/page.md",
+        ),
+    ];
+    for (args, banner, output) in cases {
+        let args = typed_args(args);
+        let (mut child, tap, _) = watch_live(dir.path(), &args, false);
+        write_atomic(&dir.path().join(native("src/sub/page.mds")), "Edited\n");
+        common::wait_for_tap(&tap, "Recompiled ", WATCH_STEP);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            stderr.lines().next(),
+            Some(native(banner).as_str()),
+            "{args:?}: stderr: {stderr}"
+        );
+        let prefix = format!("Recompiled {} (", native(output));
+        let recompiled = lines_starting(&stderr, "Recompiled ");
+        assert!(
+            !recompiled.is_empty() && recompiled.iter().all(|line| line.starts_with(&prefix)),
+            "{args:?}: every rebuild names the output as {prefix:?}; stderr: {stderr}"
+        );
+        assert!(!stderr.contains(r"\\?\"), "{args:?}: stderr: {stderr}");
+        assert_eq!(
+            leak(&stderr, dir.path()),
+            None,
+            "{args:?}: stderr: {stderr}"
+        );
+    }
 }

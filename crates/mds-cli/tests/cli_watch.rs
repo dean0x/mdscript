@@ -5868,9 +5868,8 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
 /// Directory mode takes its argument through the resolver every directory-mode
 /// subcommand shares, where it used to run `NativeFs::check_symlink`, which cannot take
 /// a path with no final name and failed with `file not found: .`. Each form compiles
-/// every file at startup, announces the canonical directory and rebuilds on an edit.
-/// The banner prints the canonical path in its on-disk spelling, so it is compared
-/// canonical to canonical, never with a typed spelling (#408).
+/// every file at startup, announces the directory as typed — never by the canonical
+/// path it watches (#390) — and rebuilds on an edit.
 #[test]
 fn watch_dot_forms_watch_the_canonical_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -5915,9 +5914,12 @@ fn watch_dot_forms_watch_the_canonical_directory() {
             .find_map(|l| l.strip_prefix("Watching directory "))
             .unwrap_or_else(|| panic!("{label}: no banner; stderr: {stderr}"));
         assert_eq!(
-            Path::new(banner.trim()).canonicalize().unwrap(),
-            canonical,
-            "{label}: the banner names the directory `{typed}` resolves to"
+            banner, typed,
+            "{label}: the banner names the directory as typed"
+        );
+        assert!(
+            !stderr.contains(&format!("Watching directory {}", canonical.display())),
+            "{label}: never by the canonical directory; stderr: {stderr}"
         );
 
         let edited = format!("P{i}");

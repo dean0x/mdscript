@@ -83,8 +83,9 @@ use crate::build::{
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
-    output_base_no_ext, output_path_for, probe_and_remove_stale, resolve_output_base, safe_inline,
-    safe_path, stdout_failure, write_stdout, OutputBase, Panicked, StdoutOutcome, WriteTarget,
+    output_base_no_ext, output_path_for, output_stem_for, probe_and_remove_stale,
+    resolve_output_base, safe_inline, safe_path, stdout_failure, write_stdout, OutputBase,
+    Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -119,14 +120,15 @@ enum Msg {
 // ── Pure helpers (unit-tested below) ─────────────────────────────────────────
 
 /// Compute the set of parent directories that need to be watched (non-recursively)
-/// to cover `entry`, all `deps`, and an optional `vars_file`.
+/// to cover `entry`, all `deps` (graph keys, [`graph_keys`]), and an optional
+/// `vars_file`.
 ///
 /// Watching parent directories rather than file inodes is necessary because editors
 /// perform atomic save via rename: a file-inode watch is silently orphaned after the
 /// swap, but a directory watch survives.
 pub(crate) fn dirs_to_watch(
     entry: &Path,
-    deps: &[String],
+    deps: &[PathBuf],
     vars_file: Option<&Path>,
 ) -> BTreeSet<PathBuf> {
     let mut dirs = BTreeSet::new();
@@ -142,7 +144,7 @@ pub(crate) fn dirs_to_watch(
     push_parent(entry, &mut dirs);
 
     for dep in deps {
-        push_parent(Path::new(dep), &mut dirs);
+        push_parent(dep, &mut dirs);
     }
 
     if let Some(vf) = vars_file {
@@ -153,16 +155,16 @@ pub(crate) fn dirs_to_watch(
 }
 
 /// Build the set of paths that are "of interest" for a single-file watch:
-/// the entry itself, all dependency paths, and the vars file if given.
+/// the entry itself, all dependency paths (graph keys), and the vars file if given.
 pub(crate) fn files_of_interest(
     entry: &Path,
-    deps: &[String],
+    deps: &[PathBuf],
     vars_file: Option<&Path>,
 ) -> HashSet<PathBuf> {
     let mut set = HashSet::new();
     set.insert(entry.to_path_buf());
     for dep in deps {
-        set.insert(PathBuf::from(dep));
+        set.insert(dep.clone());
     }
     if let Some(vf) = vars_file {
         set.insert(vf.to_path_buf());
@@ -254,6 +256,16 @@ pub(crate) fn graph_key(p: &Path) -> PathBuf {
         }
     }
     p.to_path_buf()
+}
+
+/// The graph keys ([`graph_key`]) of the dependencies a compile reported, in the
+/// canonical form notify reports event paths in — which on Windows keeps the `\\?\`
+/// prefix the compiler's own list drops (#409).
+///
+/// Each stays a path (#390): the text of a path is lossy for a name that is not UTF-8,
+/// so two dependencies whose names differ only there would share one key.
+pub(crate) fn graph_keys<P: AsRef<Path>>(paths: &[P]) -> Vec<PathBuf> {
+    paths.iter().map(|p| graph_key(p.as_ref())).collect()
 }
 
 /// Compute the transitive set of sources affected by `seeds`.
@@ -963,7 +975,9 @@ impl Watched {
 /// `typed` is the path as the user reaches it: as typed, or for a source the root as
 /// typed joined with the source's path below it, the form `mds build <dir>` walks. Every
 /// compile goes through it, so an error names the file that way, never by its canonical
-/// absolute path (#417, #265), and `mds.json` is looked up from it at startup (#413).
+/// absolute path (#417, #265), `mds.json` is looked up from it at startup (#413), and
+/// every status line names the path, and an output resolved beside or below it, that
+/// way (#390).
 /// `canonical` is the form notify reports event paths under: every identity check —
 /// watched directories, files of interest, graph keys, output paths, baselines — uses
 /// it. The two are never compared as text (#408):
@@ -1041,6 +1055,15 @@ impl WatchedPath {
         compiled
             .map_err(|Panicked| CompileFailure::Panicked)?
             .map_err(CompileFailure::from)
+    }
+
+    /// The root in the two forms an output below it is resolved and named by: walked
+    /// canonical, named as typed (#390).
+    fn root_paths(&self) -> RootPaths<'_> {
+        RootPaths {
+            typed: &self.typed,
+            walked: &self.canonical,
+        }
     }
 
     /// The path `src` (a walked or graph-key path under the root's `canonical`) is
@@ -1227,10 +1250,10 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 
 /// What [`compile_and_write`] returns on success, `(output_path, deps, content)`:
 /// - `output_path`: the resolved output, written and shown (None for stdout).
-/// - `deps`: transitive dependency paths.
+/// - `deps`: transitive dependency paths, as graph keys ([`graph_keys`]).
 /// - `content`: the compiled string (issue 3 — reused by the watch baseline block
 ///   so startup does not compile twice).
-type WrittenEntry = (Option<WriteTarget>, Vec<String>, String);
+type WrittenEntry = (Option<WriteTarget>, Vec<PathBuf>, String);
 
 /// Outcome of [`compile_and_write`]'s compile-and-write attempt, for an output route every
 /// rebuild can use.
@@ -1284,6 +1307,14 @@ fn written_path(output: &Option<WriteTarget>) -> Option<&Path> {
     output.as_ref().map(|target| target.path.as_path())
 }
 
+/// The session's output as a status line names it: the file by its shown form (#390), or
+/// `<stdout>`.
+fn shown_output(output: &Option<WriteTarget>) -> &Path {
+    output
+        .as_ref()
+        .map_or(Path::new("<stdout>"), |target| target.shown.as_path())
+}
+
 /// Write `content` where the session writes: the output file, through [`write_output`]
 /// (`announce` prints its `Compiled to` line), or stdout for `-o -` (`output_path` is
 /// `None`).
@@ -1303,7 +1334,8 @@ fn write_session_output(
 }
 
 /// Compile `entry` ([`WatchedPath::compile`]), derive the output path from the compiled
-/// kind and `entry.canonical`, and write — file mode's startup compile.
+/// kind and the entry's two forms — written beside `entry.canonical`, named beside
+/// `entry.typed` (#390) — and write: file mode's startup compile.
 ///
 /// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
 /// reports and keeps watching through: the compile, the write; `StdoutClosed` ends the
@@ -1339,13 +1371,8 @@ fn compile_and_write(
         Ok(compiled) => compiled,
         Err(failure) => return Ok(CompileWriteOutcome::Failed(failure.unreported())),
     };
-    let output_path = resolve_output_path_for_kind(
-        &Some(entry.canonical.clone()),
-        output,
-        out_dir,
-        config,
-        compiled.kind,
-    )?;
+    let output_path =
+        resolve_output_path_for_kind(Some(entry.paths()), output, out_dir, config, compiled.kind)?;
     admit_output(
         written_path(&output_path),
         entry.paths(),
@@ -1356,9 +1383,11 @@ fn compile_and_write(
     .map_err(miette::Error::from)?;
     Ok(
         match write_session_output(output_path.as_ref(), &compiled.content, quiet, true) {
-            OutputWrite::Written => {
-                CompileWriteOutcome::Written((output_path, compiled.dependencies, compiled.content))
-            }
+            OutputWrite::Written => CompileWriteOutcome::Written((
+                output_path,
+                graph_keys(&compiled.dependencies),
+                compiled.content,
+            )),
             OutputWrite::Failed(e) => CompileWriteOutcome::Failed(e),
             OutputWrite::StdoutClosed => CompileWriteOutcome::StdoutClosed,
         },
@@ -1393,6 +1422,27 @@ struct FileCompileCtx {
     quiet: bool,
 }
 
+/// What file mode's content-dedup map is keyed by: stdout, or the output file by the
+/// path it is written to (#390).
+///
+/// A path, never its text: the text is lossy for a name that is not UTF-8, so two outputs
+/// whose names differ only there would share one key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum OutputKey {
+    Stdout,
+    File(PathBuf),
+}
+
+impl OutputKey {
+    /// The key of the session's output: `None` is stdout (`-o -`).
+    fn of(output: Option<&WriteTarget>) -> Self {
+        match output {
+            Some(target) => Self::File(target.path.clone()),
+            None => Self::Stdout,
+        }
+    }
+}
+
 /// Mutable loop state for single-file watch mode.
 ///
 /// Groups the per-loop variables that are updated on every rebuild or liveness tick,
@@ -1410,8 +1460,8 @@ struct FileWatchState {
     foi: HashSet<PathBuf>,
     /// Snapshot of `(mtime, size)` used by the liveness probe (reconcile rule).
     last_mtimes: StampMap,
-    /// Content-dedup map keyed by output-path string (or `"<stdout>"`).
-    last_written: HashMap<String, String>,
+    /// Content-dedup map: what was last written, by where it was written.
+    last_written: HashMap<OutputKey, String>,
     /// Whether the entry file was missing on the previous liveness tick.
     entry_was_missing: bool,
     /// True on the very first tick; forces a reconcile to close the startup race window.
@@ -1639,10 +1689,8 @@ fn rebuild_file(
         }
     };
 
-    // The content-dedup key, and the name the "Recompiled" line shows.
-    let output_key: String = written_path(&output_path)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<stdout>".to_string());
+    // The content-dedup key: where the output is written.
+    let output_key = OutputKey::of(output_path.as_ref());
 
     // Content-based dedup: skip write + summary line when unchanged.
     let content_changed = state
@@ -1658,20 +1706,13 @@ fn rebuild_file(
     }
 
     // Freshness rule: always recompute dep set from fresh output.
-    let new_dirs = dirs_to_watch(
-        &ctx.entry.canonical,
-        &compiled.dependencies,
-        ctx.vars_path.as_deref(),
-    );
+    let deps = graph_keys(&compiled.dependencies);
+    let new_dirs = dirs_to_watch(&ctx.entry.canonical, &deps, ctx.vars_path.as_deref());
     state.watched_dirs = resync_watches(watcher, &state.watched_dirs, &new_dirs);
     // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
     // dirs removed by resync_watches are no longer in watched_dirs.
     state.armed_dirs = state.watched_dirs.clone();
-    state.foi = files_of_interest(
-        &ctx.entry.canonical,
-        &compiled.dependencies,
-        ctx.vars_path.as_deref(),
-    );
+    state.foi = files_of_interest(&ctx.entry.canonical, &deps, ctx.vars_path.as_deref());
     // Update mtime snapshot after a compile (even if content unchanged).
     state.last_mtimes = snapshot_state(&state.foi);
 
@@ -1681,11 +1722,11 @@ fn rebuild_file(
     match write_session_output(output_path.as_ref(), &compiled.content, ctx.quiet, false) {
         OutputWrite::Written => {
             let elapsed = t0.elapsed().as_millis();
-            let dep_count = compiled.dependencies.len();
+            let dep_count = deps.len();
             if !ctx.quiet {
                 crate::output::ewriteln!(
                     "Recompiled {} ({} deps) in {}ms",
-                    safe_inline(&output_key),
+                    safe_path(shown_output(&output_path)),
                     dep_count,
                     elapsed
                 );
@@ -1716,10 +1757,30 @@ fn settle_after_failure(state: &mut FileWatchState, failure: CompileFailure) {
     state.last_mtimes = snapshot_state(&state.foi);
 }
 
+/// A directory file mode watches, as a message names it (#390): the entry's directory,
+/// or the `--vars` file's (`vars` holds that file's canonical and typed paths), by the
+/// path the user typed; any other — a dependency's — by the path the compile reported,
+/// the only one it has.
+fn shown_watched_dir<'a>(
+    dir: &'a Path,
+    entry: &'a WatchedPath,
+    vars: Option<(&'a Path, &'a Path)>,
+) -> &'a Path {
+    if dir == mds::effective_parent(&entry.canonical) {
+        return mds::effective_parent(&entry.typed);
+    }
+    match vars {
+        Some((canonical, typed)) if dir == mds::effective_parent(canonical) => {
+            mds::effective_parent(typed)
+        }
+        _ => dir,
+    }
+}
+
 /// Single-file watch: `entry.typed` is the path as typed — the entry is compiled by it
-/// (#417) and `mds.json` is looked up from it at startup (#413), so their errors name
-/// the files as the user reaches them; `entry.canonical` is its canonical form, which
-/// everything else uses.
+/// (#417), `mds.json` is looked up from it at startup (#413), and every status line
+/// names the entry and its output by it (#390), so they name the files as the user
+/// reaches them; `entry.canonical` is its canonical form, which everything else uses.
 #[allow(clippy::too_many_arguments)]
 fn run_watch_file(
     entry: WatchedPath,
@@ -1751,7 +1812,7 @@ fn run_watch_file(
     let static_set_string_vars = set_string_vars;
 
     if !quiet {
-        crate::output::ewriteln!("Watching {}", safe_path(&entry.canonical));
+        crate::output::ewriteln!("Watching {}", safe_path(&entry.typed));
     }
 
     // ── Arm before publish (startup race) ─────────────────────────────────────
@@ -1884,7 +1945,7 @@ fn run_watch_file(
             // is refused here as after a successful compile (exit 2): no rebuild could
             // write anywhere else.
             let fallback_path = resolve_output_path_for_kind(
-                &Some(entry.canonical.clone()),
+                Some(entry.paths()),
                 &output,
                 &out_dir,
                 &config,
@@ -1923,16 +1984,11 @@ fn run_watch_file(
     // rebuild is ever removed. Directory mode has no such fallback, which is why the
     // equivalent capture there is load-bearing and measured (#321).
     for dep in &initial_deps {
-        baseline_path(Path::new(dep), &mut pre_mtimes);
+        baseline_path(dep, &mut pre_mtimes);
     }
 
     // The startup output is now published — the positive-control injection point.
     startup_race_probe();
-
-    // Key: resolved output path string, or the sentinel "<stdout>" when output_path is None.
-    let output_key: String = written_path(&output_path)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<stdout>".to_string());
 
     // Arm the dependency directories the compile just reported. Dirs already armed
     // above are skipped; anything still unarmed — including a pre-arm attempt that
@@ -1945,10 +2001,11 @@ fn run_watch_file(
                 watched_dirs.insert(dir);
             }
             Err(e) => {
+                let vars = vars_path.as_deref().zip(vars_path_typed.as_deref());
                 return Err(miette::miette!(
                     "failed to watch directory {}: {e}\n\
                      hint: on Linux you may need to increase fs.inotify.max_user_watches",
-                    dir.display()
+                    safe_path(shown_watched_dir(&dir, &entry, vars))
                 ));
             }
         }
@@ -1957,11 +2014,11 @@ fn run_watch_file(
     // Record the dedup baseline. The event loop has not started, so nothing can
     // consult this map before it is populated (guard 3 above).
     // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
-    let mut last_written: HashMap<String, String> = HashMap::new();
+    let mut last_written: HashMap<OutputKey, String> = HashMap::new();
     if !initial_content.is_empty() {
         // initial_content is empty only when the initial compile failed (error path above).
         // In that case leave last_written empty so the next successful rebuild always writes.
-        last_written.insert(output_key.clone(), initial_content);
+        last_written.insert(OutputKey::of(output_path.as_ref()), initial_content);
     }
 
     let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
@@ -2086,15 +2143,15 @@ const MAX_COLLECT_DEPTH: usize = 64;
 /// Mutable state for the directory-mode watch loop.
 struct DirWatchState {
     /// Forward dependency map: canonical source → its canonical (transitive) deps.
-    /// Dep values are graph keys already: `compile_to_content` maps them through
-    /// [`graph_key`]; do not re-canonicalize.
+    /// Dep values are graph keys already: every compile's list goes through
+    /// [`graph_keys`]; do not re-canonicalize.
     forward_deps: HashMap<PathBuf, Vec<PathBuf>>,
     /// Sources whose last compile attempt failed. Re-seeded into every batch that
     /// carries a real change, so a fix to whatever broke them is picked up.
     errored: HashSet<PathBuf>,
     /// Last-seen collected `.mds` set for reconcile/rename detection.
     known_files: BTreeSet<PathBuf>,
-    /// Content-dedup map keyed by output path.
+    /// Content-dedup map keyed by the path each output is written to (`WriteTarget.path`).
     last_written: HashMap<PathBuf, String>,
     /// Parent dirs of dependencies located outside the watched root.
     /// Watched NonRecursive; re-armed by liveness probe.
@@ -2264,7 +2321,7 @@ fn compile_one_source(
     let t0 = Instant::now();
     match watch_root.compile_source(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
-            let dep_paths: Vec<PathBuf> = compiled.dependencies.iter().map(PathBuf::from).collect();
+            let dep_paths = graph_keys(&compiled.dependencies);
 
             // Partials (DD2): refresh graph edges but do NOT write output.
             if is_partial(src) {
@@ -2281,7 +2338,7 @@ fn compile_one_source(
             // equivalent gate in `process_dir_batch_vars_changed`; out-of-root deps take
             // the dep-refresh-only branch above and never call this function.
             let ext = compiled.kind.extension();
-            let out = output_path_for(src, root, output_base, ext);
+            let out = output_path_for(src, watch_root.root_paths(), output_base, ext);
 
             // Content-based dedup: skip write when content unchanged.
             let content_changed = state
@@ -2297,7 +2354,7 @@ fn compile_one_source(
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Recompiled {} ({} deps) in {}ms",
-                                safe_path(&out.path),
+                                safe_path(&out.shown),
                                 dep_count,
                                 elapsed
                             );
@@ -2766,7 +2823,7 @@ fn dir_watch_startup(
     };
 
     if !quiet {
-        crate::output::ewriteln!("Watching directory {}", safe_path(root));
+        crate::output::ewriteln!("Watching directory {}", safe_path(&watch_root.typed));
     }
 
     // Additionally watch the vars file's parent if it is outside root.
@@ -2825,7 +2882,7 @@ fn dir_watch_startup(
         miette::miette!(
             "failed to watch directory {}: {e}\n\
                  hint: on Linux you may need to increase fs.inotify.max_user_watches",
-            root.display()
+            safe_path(&watch_root.typed)
         )
     })?;
 
@@ -2834,9 +2891,13 @@ fn dir_watch_startup(
     // a transient failure must not abort the session, applies the reconcile rule / consistency fix).
     if let Some(ref vd) = vars_dir_extra {
         if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
+            // Named as the `--vars` file was typed (#390).
+            let shown = vars_path_typed
+                .as_deref()
+                .map_or(vd.as_path(), mds::effective_parent);
             eprint_warning(&format!(
                 "warning: failed to watch vars directory {}: {}",
-                safe_path(vd),
+                safe_path(shown),
                 safe_inline(&e)
             ));
         }
@@ -2889,9 +2950,7 @@ fn dir_watch_startup(
         let key = graph_key(source);
         match watch_root.compile_source(source, runtime_vars.clone(), quiet) {
             Ok(compiled) => {
-                // Collect dep paths (graph keys from compile_to_content).
-                let dep_paths: Vec<PathBuf> =
-                    compiled.dependencies.iter().map(PathBuf::from).collect();
+                let dep_paths = graph_keys(&compiled.dependencies);
 
                 // Track external dep dirs (DD3 — cross-root).
                 for dep in &dep_paths {
@@ -2927,7 +2986,7 @@ fn dir_watch_startup(
                     // prefixed by `root` and the out-of-root flatten arm cannot fire
                     // here (#217).
                     let ext = compiled.kind.extension();
-                    let out = output_path_for(&key, root, &output_base, ext);
+                    let out = output_path_for(&key, watch_root.root_paths(), &output_base, ext);
                     if let Err(e) = write_output(Some(&out), &compiled.content, quiet, true) {
                         eprint_error(e);
                     } else {
@@ -3000,7 +3059,7 @@ fn dir_watch_startup(
                     // with the startup loop or the `contains_key` check below would miss
                     // and every source would be rewritten on the first real event.
                     let ext = compiled.kind.extension();
-                    let out = output_path_for(&key, root, &output_base, ext);
+                    let out = output_path_for(&key, watch_root.root_paths(), &output_base, ext);
                     if state.last_written.contains_key(&out.path) {
                         // Already recorded from startup compile — skip.
                         continue;
@@ -3232,7 +3291,6 @@ fn process_dir_batch_vars_changed(
     quiet: bool,
     state: &mut DirWatchState,
 ) -> bool {
-    let root = watch_root.canonical.as_path();
     let mut any_changed = false;
     let all_sources: Vec<PathBuf> = state.known_files.iter().cloned().collect();
 
@@ -3240,31 +3298,32 @@ fn process_dir_batch_vars_changed(
     // removed just as in the incremental deletion step (step 5).
     let deleted: Vec<&PathBuf> = all_sources.iter().filter(|p| !p.exists()).collect();
     for del_src in &deleted {
-        // Source is gone — we don't know the extension it used. Probe both.
-        let base_no_ext = output_base_no_ext(del_src, root, output_base);
+        // Source is gone — we don't know the extension it used. Probe both; name each
+        // output as typed (#390).
+        let stem = output_stem_for(del_src, watch_root.root_paths(), output_base);
         for ext in &["md", "json"] {
-            let out = base_no_ext.with_extension(ext);
-            if out.exists() {
-                match std::fs::remove_file(&out) {
+            let out = stem.sibling(|p| p.with_extension(ext));
+            if out.path.exists() {
+                match std::fs::remove_file(&out.path) {
                     Ok(()) => {
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Removed {} (source deleted)",
-                                safe_path(&out)
+                                safe_path(&out.shown)
                             );
                         }
                     }
                     Err(e) => {
                         eprint_warning(&format!(
                             "warning: could not remove {}: {}",
-                            safe_path(&out),
+                            safe_path(&out.shown),
                             safe_inline(&e)
                         ));
                     }
                 }
                 // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
                 // (forward_deps, errored, known_files, last_written).
-                state.forget(del_src, &out);
+                state.forget(del_src, &out.path);
             }
         }
         // Ensure the source is cleaned from state even if neither sibling existed.
@@ -3386,9 +3445,9 @@ fn process_dir_batch_incremental(
             // Compile to refresh deps only; suppress output by using quiet=true.
             match watch_root.compile_source(src, runtime_vars.clone(), true) {
                 Ok(compiled) => {
-                    let dep_paths: Vec<PathBuf> =
-                        compiled.dependencies.iter().map(PathBuf::from).collect();
-                    state.forward_deps.insert(src.clone(), dep_paths);
+                    state
+                        .forward_deps
+                        .insert(src.clone(), graph_keys(&compiled.dependencies));
                     state.errored.remove(src);
                 }
                 Err(failure) => {
@@ -3407,30 +3466,31 @@ fn process_dir_batch_incremental(
 
     // 5. Deletions: after importers recompiled, clean up graph + outputs.
     for del_src in &deleted {
-        // Source is gone — we don't know the extension it used. Probe both.
-        let base_no_ext = output_base_no_ext(del_src, root, output_base);
+        // Source is gone — we don't know the extension it used. Probe both; name each
+        // output as typed (#390).
+        let stem = output_stem_for(del_src, watch_root.root_paths(), output_base);
         for ext in &["md", "json"] {
-            let out = base_no_ext.with_extension(ext);
-            if out.exists() {
-                match std::fs::remove_file(&out) {
+            let out = stem.sibling(|p| p.with_extension(ext));
+            if out.path.exists() {
+                match std::fs::remove_file(&out.path) {
                     Ok(()) => {
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Removed {} (source deleted)",
-                                safe_path(&out)
+                                safe_path(&out.shown)
                             );
                         }
                     }
                     Err(e) => {
                         eprint_warning(&format!(
                             "warning: could not remove {}: {}",
-                            safe_path(&out),
+                            safe_path(&out.shown),
                             safe_inline(&e)
                         ));
                     }
                 }
             }
-            state.forget(del_src, &out);
+            state.forget(del_src, &out.path);
         }
         // Ensure source is cleaned even if no outputs were found.
         state.forward_deps.remove(del_src);
@@ -3504,9 +3564,9 @@ mod tests {
     fn dirs_to_watch_deduplicates_parents() {
         let entry = PathBuf::from("/project/src/entry.mds");
         let deps = vec![
-            "/project/src/a.mds".to_string(),
-            "/project/src/b.mds".to_string(), // same parent as entry
-            "/project/lib/c.mds".to_string(), // different parent
+            PathBuf::from("/project/src/a.mds"),
+            PathBuf::from("/project/src/b.mds"), // same parent as entry
+            PathBuf::from("/project/lib/c.mds"), // different parent
         ];
         let vars = PathBuf::from("/project/vars.json");
         let dirs = dirs_to_watch(&entry, &deps, Some(&vars));
@@ -3521,7 +3581,7 @@ mod tests {
     #[test]
     fn files_of_interest_contains_all() {
         let entry = PathBuf::from("/a/entry.mds");
-        let deps = vec!["/a/dep1.mds".to_string(), "/b/dep2.mds".to_string()];
+        let deps = vec![PathBuf::from("/a/dep1.mds"), PathBuf::from("/b/dep2.mds")];
         let vars = PathBuf::from("/c/vars.json");
         let foi = files_of_interest(&entry, &deps, Some(&vars));
         assert!(foi.contains(&PathBuf::from("/a/entry.mds")));
@@ -3529,6 +3589,104 @@ mod tests {
         assert!(foi.contains(&PathBuf::from("/b/dep2.mds")));
         assert!(foi.contains(&PathBuf::from("/c/vars.json")));
         assert_eq!(foi.len(), 4);
+    }
+
+    /// #390: a graph key and file mode's content-dedup key are paths, never their text.
+    /// Two paths whose names differ only in bytes that are not UTF-8 are one text once
+    /// made lossy — the key the text mapping built, which let them share one graph node
+    /// and one dedup entry — and stay two keys.
+    ///
+    /// The paths are built from bytes and no such file is created, so it runs on every
+    /// unix: macOS's filesystem refuses such a name, but nothing here asks it for one.
+    #[cfg(unix)]
+    #[test]
+    fn distinct_non_utf8_paths_stay_distinct_graph_and_output_keys() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join(OsStr::from_bytes(b"\xff.mds"));
+        let b = dir.path().join(OsStr::from_bytes(b"\xfe.mds"));
+        // Control: one text once made lossy.
+        assert_ne!(a, b);
+        assert_eq!(a.display().to_string(), b.display().to_string());
+
+        let keys = graph_keys(&[a.clone(), b.clone()]);
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1], "two dependencies, two graph keys");
+        assert_eq!(keys[0].file_name(), a.file_name(), "a key keeps its bytes");
+
+        let key = |p: &Path| OutputKey::of(Some(&WriteTarget::as_typed(p.with_extension("md"))));
+        assert_ne!(key(&a), key(&b), "two outputs, two dedup keys");
+        assert_ne!(key(&a), OutputKey::Stdout);
+        assert_eq!(OutputKey::of(None), OutputKey::Stdout);
+    }
+
+    /// #409: watch keys a compile's dependencies by [`graph_key`] — the canonical form
+    /// notify event paths are compared in — from the list the compiler reports, which
+    /// `compile_to_content` passes on as it is. On Windows the key is verbatim while the
+    /// reported path is not: the mismatch the mapping exists for.
+    #[test]
+    fn a_compile_s_dependencies_are_keyed_as_notify_reports_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("main.mds"),
+            "@import \"./lib.mds\" as lib\n{{lib.hi()}}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
+        let main = dir.path().join("main.mds");
+
+        let compiled =
+            compile_to_content(&main, None, true, mds::CompileOptions::default()).unwrap();
+        let reported = mds::compile_with_deps(&main, None).unwrap().dependencies;
+        assert_eq!(
+            compiled.dependencies, reported,
+            "the compiler's list, passed on as it is"
+        );
+        assert_eq!(
+            graph_keys(&compiled.dependencies),
+            [graph_key(&dir.path().join("lib.mds"))],
+            "the dependency is keyed by the watch graph key of the imported file"
+        );
+
+        #[cfg(windows)]
+        {
+            assert!(graph_keys(&reported)[0]
+                .to_string_lossy()
+                .starts_with(r"\\?\"));
+            assert!(!reported[0].starts_with(r"\\?\"));
+        }
+    }
+
+    /// #390: file mode names the directory of its entry, and of its `--vars` file, as
+    /// typed in a message about watching it; a dependency's directory, which the user
+    /// never typed, keeps the path the compile reported.
+    #[test]
+    fn a_watched_directory_is_named_as_the_user_typed_it() {
+        let entry = WatchedPath {
+            typed: PathBuf::from("page.mds"),
+            canonical: PathBuf::from("/project/page.mds"),
+            what: Watched::Entry,
+        };
+        let vars = Some((Path::new("/elsewhere/v.json"), Path::new("../v.json")));
+
+        assert_eq!(
+            shown_watched_dir(Path::new("/project"), &entry, vars),
+            Path::new(".")
+        );
+        assert_eq!(
+            shown_watched_dir(Path::new("/elsewhere"), &entry, vars),
+            Path::new("..")
+        );
+        assert_eq!(
+            shown_watched_dir(Path::new("/lib"), &entry, vars),
+            Path::new("/lib")
+        );
+        assert_eq!(
+            shown_watched_dir(Path::new("/elsewhere"), &entry, None),
+            Path::new("/elsewhere")
+        );
     }
 
     // T-U3a: is_content_event filters Access events, passes Modify/Create/Remove/Any/Other.
@@ -3686,7 +3844,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
         let base = dir_base("/out");
-        let result = output_path_for(&source, &root, &base, "md");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         assert_eq!(result.path, PathBuf::from("/out/a/b/foo.md"));
     }
 
@@ -3698,16 +3856,16 @@ mod tests {
         let b = PathBuf::from("/root/b/x.mds");
         let base = dir_base("/out");
         assert_ne!(
-            output_path_for(&a, &root, &base, "md"),
-            output_path_for(&b, &root, &base, "md"),
+            output_path_for(&a, RootPaths::as_typed(&root), &base, "md"),
+            output_path_for(&b, RootPaths::as_typed(&root), &base, "md"),
             "two files with the same stem in different subdirs must not collide"
         );
         assert_eq!(
-            output_path_for(&a, &root, &base, "md").path,
+            output_path_for(&a, RootPaths::as_typed(&root), &base, "md").path,
             PathBuf::from("/out/a/x.md")
         );
         assert_eq!(
-            output_path_for(&b, &root, &base, "md").path,
+            output_path_for(&b, RootPaths::as_typed(&root), &base, "md").path,
             PathBuf::from("/out/b/x.md")
         );
     }
@@ -3717,7 +3875,12 @@ mod tests {
     fn output_path_for_next_to_source() {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
-        let result = output_path_for(&source, &root, &OutputBase::NextToSource, "md");
+        let result = output_path_for(
+            &source,
+            RootPaths::as_typed(&root),
+            &OutputBase::NextToSource,
+            "md",
+        );
         assert_eq!(result.path, PathBuf::from("/root/a/b/foo.md"));
     }
 
@@ -3727,7 +3890,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/foo.bar.mds");
         let base = dir_base("/out");
-        let result = output_path_for(&source, &root, &base, "md");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         assert_eq!(result.path, PathBuf::from("/out/foo.bar.md"));
     }
 
@@ -3738,7 +3901,7 @@ mod tests {
         // Source is completely outside root — strip_prefix will fail.
         let source = PathBuf::from("/elsewhere/a/b/foo.mds");
         let base = dir_base("/out");
-        let result = output_path_for(&source, &root, &base, "md");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         // Must be inside /out, not escape to /elsewhere.
         assert!(
             result.path.starts_with("/out"),
@@ -4798,7 +4961,7 @@ mod tests {
 
         let source = root.join("template.mds");
         let base = dir_base(new_subdir.clone());
-        let result = output_path_for(&source, &root, &base, "md");
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         assert_eq!(result.path, new_subdir.join("template.md"));
         assert!(
             !new_subdir.exists(),
