@@ -690,8 +690,7 @@ mod panic_trigger {
         let Some(stem) = label.file_stem().and_then(std::ffi::OsStr::to_str) else {
             return;
         };
-        let wanted = requested();
-        if wanted
+        if requested()
             .as_deref()
             .and_then(|value| value.strip_prefix("compile:"))
             == Some(stem)
