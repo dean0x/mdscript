@@ -2134,7 +2134,7 @@ fn accumulate_result_json(result: &mds::LintResult, json_files: &mut Vec<serde_j
 
 #[cfg(test)]
 mod tests {
-    use super::{run_fix_pipeline, FixPipelineOutcome, LintSource};
+    use super::{run_fix_pipeline, FixPipelineOutcome, LintSource, ReverifyGate};
     use mds::{FixLineSpan, LintDiagnostic, LintResult, Severity};
     use std::path::Path;
 
@@ -2256,6 +2256,195 @@ mod tests {
             _ => panic!(
                 "run_fix_pipeline must return Fixed or PartiallyFixed for a source with a \
                  fixable empty-block finding"
+            ),
+        }
+    }
+
+    /// The source the reverify-gate tests share: an empty `@if` block (a fixable,
+    /// output-neutral `empty-block` finding) above a line of text.
+    const EMPTY_BLOCK_SOURCE: &str = "@if \"a\" == \"a\":\n@end\n\nHello\n";
+
+    /// The gate's refusal of a candidate that would change the compiled output.
+    const OUTPUT_CHANGED: &str =
+        "lint --fix would change compiled output; edit reverted to preserve template semantics";
+
+    /// `source`'s compiled output, resolved against the working directory like the
+    /// tests' gates.
+    fn compiled(source: &str) -> mds::CompiledOutput {
+        mds::compile_str_collecting_warnings(source, Some(Path::new(".")), None)
+            .expect("fixture source must compile")
+            .output
+    }
+
+    /// `source`'s findings and the fix plan `run_fix_pipeline` builds from them.
+    fn lint_and_plan(source: &str, config: &mds::LintConfig) -> (LintResult, mds::fix::FixPlan) {
+        let result = mds::lint_str_with(source, Some(Path::new(".")), None, config)
+            .expect("fixture source must lint");
+        let plan = mds::fix::plan_fixes_with_options(&result, source, result.is_standalone);
+        (result, plan)
+    }
+
+    /// When every planned edit is output-neutral, the gate refuses a candidate that
+    /// compiles to different output, with the `mds::io` message a `fix rejected:` line
+    /// quotes.
+    ///
+    /// No known `mds lint --fix` input reaches this refusal end to end, so the candidate
+    /// is crafted. It still lints, which leaves the output check as the only check that
+    /// can refuse it.
+    ///
+    /// Control: the plan's own fix compiles to the same output and is accepted, so the
+    /// gate does not refuse every candidate.
+    #[test]
+    fn reverify_gate_refuses_a_candidate_that_changes_compiled_output() {
+        let config = mds::LintConfig::default();
+        let (_, plan) = lint_and_plan(EMPTY_BLOCK_SOURCE, &config);
+        assert!(
+            !plan.edits.is_empty()
+                && plan
+                    .edits
+                    .iter()
+                    .all(|e| mds::fix::is_output_neutral(&e.rule)),
+            "precondition: the plan must have edits, all output-neutral; got {:?}",
+            plan.edits
+        );
+        let gate = ReverifyGate::new(&plan, EMPTY_BLOCK_SOURCE, Path::new("."), None, &config);
+
+        let fixed = mds::fix::apply_plan_unchecked(EMPTY_BLOCK_SOURCE, &plan);
+        assert_eq!(
+            compiled(&fixed),
+            compiled(EMPTY_BLOCK_SOURCE),
+            "precondition: the plan's own fix must keep the compiled output"
+        );
+        if let Err(err) = gate.verify(&fixed) {
+            panic!("control: the gate must accept an output-identical candidate; got: {err}");
+        }
+
+        let changed = EMPTY_BLOCK_SOURCE.replace("Hello", "Goodbye");
+        if let Err(err) = mds::lint_str_with(&changed, Some(Path::new(".")), None, &config) {
+            panic!(
+                "precondition: the changed candidate must lint, so that only the output \
+                 check can refuse it; got: {err}"
+            );
+        }
+        assert_ne!(
+            compiled(&changed),
+            compiled(EMPTY_BLOCK_SOURCE),
+            "precondition: the changed candidate must compile to different output"
+        );
+        let err = gate
+            .verify(&changed)
+            .expect_err("the gate must refuse a candidate that changes the compiled output");
+        assert!(
+            matches!(err, mds::MdsError::Io { .. }),
+            "the refusal must be an Io error; got: {err:?}"
+        );
+        assert_eq!(err.to_string(), OUTPUT_CHANGED);
+        assert_eq!(
+            miette::Diagnostic::code(&err)
+                .map(|code| code.to_string())
+                .as_deref(),
+            Some("mds::io")
+        );
+    }
+
+    /// A plan with any edit that changes output on purpose (`legacy-interpolation`)
+    /// skips the output check for every candidate: one that changes the output is
+    /// accepted as long as it lints.
+    ///
+    /// Control: the same candidate against the plan's output-neutral edits alone is
+    /// refused, so the acceptance comes from the output-changing edit.
+    #[test]
+    fn reverify_gate_skips_the_output_check_for_a_plan_that_changes_output() {
+        let source = "@if \"a\" == \"a\":\n@end\n\nHello {name}\n";
+        let config = mds::LintConfig::default();
+        let neutral = |e: &mds::fix::ByteEdit| mds::fix::is_output_neutral(&e.rule);
+        let (_, plan) = lint_and_plan(source, &config);
+        assert!(
+            plan.edits.iter().any(neutral) && !plan.edits.iter().all(neutral),
+            "precondition: the plan must mix output-neutral and output-changing edits; \
+             got {:?}",
+            plan.edits
+        );
+        let changed = source.replace("Hello", "Goodbye");
+        assert_ne!(
+            compiled(&changed),
+            compiled(source),
+            "precondition: the changed candidate must compile to different output"
+        );
+
+        let gate = ReverifyGate::new(&plan, source, Path::new("."), None, &config);
+        if let Err(err) = gate.verify(&changed) {
+            panic!("a plan with an output-changing edit must skip the output check; got: {err}");
+        }
+
+        let (_, mut neutral_plan) = lint_and_plan(source, &config);
+        neutral_plan.edits.retain(neutral);
+        assert!(
+            !neutral_plan.edits.is_empty(),
+            "precondition: the control plan must keep the output-neutral edit"
+        );
+        let neutral_gate = ReverifyGate::new(&neutral_plan, source, Path::new("."), None, &config);
+        let err = neutral_gate
+            .verify(&changed)
+            .expect_err("control: an all-neutral plan must refuse the changed candidate");
+        assert_eq!(err.to_string(), OUTPUT_CHANGED);
+    }
+
+    /// The gate's refusal reaches the pipeline's outcome as `Rejected`, and its words
+    /// reach the reason `fix rejected:` prints. The `LintResult` is crafted, as in the
+    /// overlap test above: an output-neutral `empty-block` removal aimed at the `Hello`
+    /// line, which no real rule plans.
+    ///
+    /// Control: the real findings of the same source are fixed.
+    #[test]
+    fn fix_pipeline_rejects_a_fix_that_would_change_compiled_output() {
+        let config = mds::LintConfig::default();
+        let input = LintSource::DirEntry {
+            path: Path::new("output.mds"),
+            key: "output.mds",
+        };
+
+        let (real, _) = lint_and_plan(EMPTY_BLOCK_SOURCE, &config);
+        let outcome = run_fix_pipeline(
+            &input,
+            &real,
+            EMPTY_BLOCK_SOURCE,
+            Path::new("."),
+            None,
+            &config,
+        );
+        assert!(
+            matches!(outcome, FixPipelineOutcome::Fixed { .. }),
+            "control: the real empty-block fix must apply"
+        );
+
+        let hello = EMPTY_BLOCK_SOURCE
+            .find("Hello")
+            .expect("the fixture has a Hello line");
+        let crafted = LintResult::new(vec![LintDiagnostic::new(
+            "empty-block",
+            Severity::Warn,
+            "crafted",
+        )
+        .with_fix_removals(vec![FixLineSpan::range_inclusive(hello, hello)])]);
+        match run_fix_pipeline(
+            &input,
+            &crafted,
+            EMPTY_BLOCK_SOURCE,
+            Path::new("."),
+            None,
+            &config,
+        ) {
+            FixPipelineOutcome::Rejected { reason } => assert_eq!(
+                reason,
+                format!(
+                    "could not verify fix — the edited source did not re-parse cleanly \
+                     ({OUTPUT_CHANGED}); leaving the file unchanged"
+                )
+            ),
+            _ => panic!(
+                "run_fix_pipeline must return Rejected for a fix that would change the \
+                 compiled output, not Fixed, PartiallyFixed or NothingToFix"
             ),
         }
     }
