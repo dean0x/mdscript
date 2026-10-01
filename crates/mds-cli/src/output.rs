@@ -1696,7 +1696,7 @@ pub(crate) enum Durability {
     RenameOnly,
 }
 
-/// Write `content` to `path` atomically via a temp-file-then-rename cycle.
+/// Write `content` to `target.path` atomically via a temp-file-then-rename cycle.
 ///
 /// Centralising this helper in `output.rs` ensures both `fmt` and `lint --fix`
 /// route through the same write path (avoids PF-004 — a check enforced on the
@@ -2558,9 +2558,9 @@ pub(crate) fn safe_file_display(name: &str) -> String {
 ///
 /// This is the general form of [`safe_path`] / [`safe_file_display`]: the same WIRE
 /// escape (those two also escape `\t`, which a path may not carry), for values that are
-/// neither a `Path` nor a filename — an `io::Error`
-/// `Display` (which embeds a filesystem path), an `mds.json` rule name or config value,
-/// a `--format` argument, a fix-rejection reason.
+/// neither a `Path` nor a filename — the cause of an I/O or file-watcher error, with its
+/// paths dropped first ([`io_cause`], [`notify_cause`]), an `mds.json` rule name or config
+/// value, a `--format` argument, a fix-rejection reason.
 ///
 /// # Why WIRE, on human surfaces too
 ///
@@ -3916,10 +3916,16 @@ mod tests {
 
     // ── io_cause / notify_cause: a cause with no path in it (#390) ─────────────
 
-    /// An absolute path no cause text could carry by chance, below a directory that does
-    /// not exist — so an error about it is a real one, raised for that path.
+    /// The name of a directory no cause text could carry by chance. The tests look for
+    /// this name, not for the whole path: tempfile and notify quote a path in its `Debug`
+    /// spelling, which doubles each `\`, so on Windows a path as it displays never
+    /// appears in their text.
+    const SENTINEL_DIR: &str = "sentinel-cause-dir";
+
+    /// An absolute path below [`SENTINEL_DIR`], a directory that does not exist — so an
+    /// error about it is a real one, raised for that path.
     fn sentinel(dir: &tempfile::TempDir) -> PathBuf {
-        dir.path().join("sentinel-cause-dir").join("leaf")
+        dir.path().join(SENTINEL_DIR).join("leaf")
     }
 
     /// A library error that carries a path in its own text is shown by its kind alone:
@@ -3930,18 +3936,18 @@ mod tests {
     fn io_cause_drops_the_path_an_error_carries() {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = sentinel(&dir);
-        let needle = sentinel.parent().unwrap().display().to_string();
+        let needle = SENTINEL_DIR;
 
         // tempfile wraps the error creating its file in one that names the file.
         let tempfile = tempfile::Builder::new()
             .tempfile_in(sentinel.parent().unwrap())
             .expect_err("no temporary file below a directory that does not exist");
         assert!(
-            tempfile.to_string().contains(&needle),
+            tempfile.to_string().contains(needle),
             "control: tempfile's text names the path: {tempfile}"
         );
         let cause = io_cause(&tempfile);
-        assert!(!cause.contains(&needle), "{cause}");
+        assert!(!cause.contains(needle), "{cause}");
         assert!(!cause.contains("at path"), "{cause}");
         assert_eq!(cause, tempfile.kind().to_string(), "its kind's text");
 
@@ -3949,7 +3955,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             format!("denied: {}", sentinel.display()),
         );
-        assert!(custom.to_string().contains(&needle), "control: {custom}");
+        assert!(custom.to_string().contains(needle), "control: {custom}");
         assert_eq!(io_cause(&custom), "permission denied");
 
         // The operating system's own error keeps its words and code.
@@ -3966,13 +3972,17 @@ mod tests {
     /// A file watcher's error is shown by its kind's text, without the paths notify lists
     /// after it (` about ["…"]`): notify's own fixed texts as notify words them, an I/O
     /// error through [`io_cause`], and a backend's message as it gives it unless it names
-    /// a path. Controls: notify's own text of each carries the sentinel.
+    /// a path. Every kind notify has is listed. Controls: notify's own text of each carries
+    /// the sentinel.
     #[test]
     fn notify_cause_drops_the_paths_a_watcher_error_lists() {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = sentinel(&dir);
-        let needle = sentinel.display().to_string();
+        let needle = SENTINEL_DIR;
         let listing = |e: notify::Error| e.add_path(sentinel.clone());
+        let os = std::fs::File::open(&sentinel).expect_err("the sentinel does not exist");
+        let os_text = os.to_string();
+        let config = notify::Config::default();
 
         // (the error, its cause)
         let cases = [
@@ -3981,9 +3991,18 @@ mod tests {
                 "No path was found.".to_owned(),
             ),
             (
+                listing(notify::Error::watch_not_found()),
+                "No watch was found.".to_owned(),
+            ),
+            (
+                listing(notify::Error::invalid_config(&config)),
+                format!("Invalid configuration: {config:?}"),
+            ),
+            (
                 listing(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
                 "OS file watch limit reached.".to_owned(),
             ),
+            (listing(notify::Error::io(os)), os_text),
             (
                 listing(notify::Error::generic(
                     "Input watch path is neither a file nor a directory.",
@@ -4006,9 +4025,9 @@ mod tests {
         ];
         for (error, expected) in cases {
             let shown = error.to_string();
-            assert!(shown.contains(&needle), "control: {shown}");
+            assert!(shown.contains(needle), "control: {shown}");
             let cause = notify_cause(&error);
-            assert!(!cause.contains(&needle), "{cause}");
+            assert!(!cause.contains(needle), "{cause}");
             assert!(!cause.contains(" about "), "{cause}");
             assert_eq!(cause, expected, "the cause of {shown:?}");
         }
