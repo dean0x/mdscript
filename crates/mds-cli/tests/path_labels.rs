@@ -1,21 +1,26 @@
-//! The lines of `mds build`, `mds check`, `mds lint` and `mds watch` pinned here name a
+//! The lines of `mds build`, `mds check`, `mds fmt`, `mds lint`, `mds watch` and
+//! `mds init` pinned here, each in the form spec.md §7.10 gives it (#390). Most name a
 //! path as typed, or as the part below a directory the user named, as typed — the
 //! directory argument, `--out-dir`, the directory `mds.json` was reached by, or the
-//! entry's directory — never by a canonical or absolute spelling the user did not type
-//! (#390). The file name of `mds watch`'s output beside its entry is the one the volume
-//! holds, which differs from the name as typed for an entry typed in another case on a
-//! case-insensitive volume. Not among them: the text of an I/O error raised while writing
-//! below a directory's `--out-dir`, and of the warning for a stale output of the other
-//! kind that cannot be removed, both of which still name the canonical path; and a
-//! directory `mds watch` watches for a dependency outside the entry's directory and the
-//! directory argument, which has only the path the compile reported (one below either is
-//! named below it as typed — only a refused watch prints it, so watch.rs's unit tests pin
-//! that).
+//! entry's directory — never by a canonical or absolute spelling the user did not type;
+//! `mds lint`'s findings name a file argument by its file name. The carve-outs are pinned
+//! as they stand: the text of an error writing an output names the path the write was
+//! given, the canonical one below a directory resolved to it, and tempfile's own cause
+//! text an absolute one; and the file name of `mds watch`'s output beside its entry is the
+//! one the volume holds, which differs from the name as typed for an entry typed in
+//! another case on a case-insensitive volume. A directory `mds watch` watches for a
+//! dependency outside the entry's directory and the directory argument has only the path
+//! the compile reported (one below either is named below it as typed — only a refused
+//! watch prints it, so watch.rs's unit tests pin that).
+//!
+//! spec.md §7.10's table cites, row by row, the tests that pin each line it lists;
+//! [`the_spec_s_path_label_table_cites_exactly_these_tests`] keeps the table and
+//! [`LABEL_TABLE`] in step and checks that each test cited is defined.
 //!
 //! Each run starts in a scratch directory with relative arguments, so the scratch
-//! directory's own absolute path has no business in any output: [`leak`] looks for it in
-//! every spelling it can take. Every absence check sits beside a check that the line it
-//! is about was printed, so no test passes on a run that printed nothing.
+//! directory's own absolute path has no business in a line pinned as typed: [`leak`] looks
+//! for it in every spelling it can take. Every absence check sits beside a check that the
+//! line it is about was printed, so no test passes on a run that printed nothing.
 //!
 //! An expected path is written with `/` and printed through [`native`], so it names the
 //! path in the platform's separator, exactly as `mds` prints it. A path argument is typed
@@ -25,6 +30,7 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -526,6 +532,257 @@ fn clean_names_a_file_argument_as_typed() {
     );
 }
 
+/// The two lines that open a unified diff of `path` (written with `/`, printed through
+/// [`native`]).
+fn diff_header(path: &str) -> String {
+    let path = native(path);
+    format!("--- {path}\n+++ {path}\n")
+}
+
+/// `mds lint` names a file argument as typed in `Fixed:`, `Would fix:` and the header of a
+/// `--fix --diff`, a directory's entry below the directory argument as typed, and stdin as
+/// `<stdin>`. A finding's source frame and the JSON `file` key name a file argument by its
+/// file name and a directory's entry by its path relative to the directory argument,
+/// `/`-separated on every OS.
+#[test]
+fn lint_names_a_file_argument_as_typed_and_its_findings_by_its_file_name() {
+    const WARN: &str = "---\ngreeting: Hello\nunused_key: x\n---\n\n{{greeting}}, world!\n";
+    const FIXABLE: &str = "@if \"x\" == \"y\":\nhidden\n@end\nHello\n";
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "sub/warn.mds", WARN);
+    put(root, "lints/deep/warn.mds", WARN);
+    put(root, "sub/f.mds", FIXABLE);
+    put(root, "fix/deep/f.mds", FIXABLE);
+    let lint = |args: &[&str], stdin: Option<&'static str>| {
+        let args = typed_args(args);
+        let out = match stdin {
+            Some(input) => run_with_stdin(root, &args, input),
+            None => run(root, &args),
+        };
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(leak(&stdout, root), None, "{args:?}: stdout: {stdout}");
+        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+        (
+            out.status.code(),
+            stdout,
+            stderr,
+            format!("mds {}", args.join(" ")),
+        )
+    };
+
+    // (the input, stdin, the source frame's header, the JSON `file` key)
+    for (input, stdin, frame, key) in [
+        ("sub/warn.mds", None, "[warn.mds:3:1]", "warn.mds"),
+        ("lints", None, "[deep/warn.mds:3:1]", "deep/warn.mds"),
+        ("-", Some(WARN), "[<stdin>:3:1]", "<stdin>"),
+    ] {
+        let (code, _, stderr, label) = lint(&["lint", input], stdin);
+        assert_eq!(code, Some(1), "{label}: stderr: {stderr}");
+        assert!(
+            stderr.contains(frame),
+            "{label}: the finding's frame names the input as {frame:?}; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&format!("[{}", native(input))) || input == "-",
+            "{label}: never by the path as typed; stderr: {stderr}"
+        );
+        let (code, stdout, _, label) = lint(&["lint", input, "--format", "json"], stdin);
+        assert_eq!(code, Some(1), "{label}: stdout: {stdout}");
+        let key = format!("\"file\":\"{key}\"");
+        assert!(stdout.contains(&key), "{label}: {key}; stdout: {stdout}");
+    }
+
+    // Read-only first, then the fixes.
+    let (code, _, stderr, label) = lint(&["lint", "--fix", "--check", "sub/f.mds"], None);
+    assert_eq!(code, Some(1), "{label}: stderr: {stderr}");
+    let would = format!("Would fix: {}", native("sub/f.mds"));
+    assert!(
+        stderr.lines().any(|line| line == would),
+        "{label}: {would:?}; stderr: {stderr}"
+    );
+    let (code, _, stderr, label) = lint(&["lint", "--fix", "--check", "-"], Some(FIXABLE));
+    assert_eq!(code, Some(1), "{label}: stderr: {stderr}");
+    assert!(
+        stderr.lines().any(|line| line == "Would fix: <stdin>"),
+        "{label}: stderr: {stderr}"
+    );
+    for (input, shown) in [("sub/f.mds", "sub/f.mds"), ("fix", "fix/deep/f.mds")] {
+        let (code, stdout, stderr, label) = lint(&["lint", "--fix", "--diff", input], None);
+        assert_eq!(code, Some(1), "{label}: stderr: {stderr}");
+        assert!(
+            stdout.starts_with(&diff_header(shown)),
+            "{label}: the diff names the input as {shown:?}; stdout: {stdout}"
+        );
+    }
+    let (code, _, stderr, label) = lint(&["lint", "--fix", "sub/f.mds"], None);
+    assert_eq!(code, Some(0), "{label}: stderr: {stderr}");
+    assert_eq!(
+        stderr,
+        format!("Fixed: {}\n", native("sub/f.mds")),
+        "{label}"
+    );
+    let (code, _, stderr, label) = lint(&["lint", "--fix", "fix"], None);
+    assert_eq!(code, Some(0), "{label}: stderr: {stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "Fixed: {}\n1 clean, 0 with warnings, 0 with errors, 0 resource-limited\n",
+            native("fix/deep/f.mds")
+        ),
+        "{label}"
+    );
+}
+
+// ── `mds fmt` and `mds init` ─────────────────────────────────────────────────
+
+/// `mds fmt` names a file argument as typed, a directory's entry below the directory
+/// argument as typed and stdin as `<stdin>`, in `Formatted:`, `Unchanged:` and
+/// `Would reformat:` and in the header of a `--diff`.
+#[test]
+fn fmt_names_a_file_argument_as_typed_and_a_directory_s_entries_below_it() {
+    let dir = scratch();
+    let root = dir.path();
+    // Without a final newline each of these reformats; `fine.mds` does not.
+    put(root, "sub/messy.mds", "Hello");
+    put(root, "sub/fine.mds", "Fine\n");
+    put(root, "src/a.mds", "A");
+    put(root, "src/inner/b.mds", "B");
+    let fmt = |args: &[&str], stdin: Option<&'static str>| {
+        let args = typed_args(args);
+        let out = match stdin {
+            Some(input) => run_with_stdin(root, &args, input),
+            None => run(root, &args),
+        };
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(leak(&stdout, root), None, "{args:?}: stdout: {stdout}");
+        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+        (
+            out.status.code(),
+            stdout,
+            stderr,
+            format!("mds {}", args.join(" ")),
+        )
+    };
+
+    // Read-only first: (arguments, stdin, exit, the start of stdout, all of stderr).
+    let cases = [
+        (
+            &["fmt", "--check", "sub/messy.mds"][..],
+            None,
+            1,
+            String::new(),
+            format!("Would reformat: {}\n", native("sub/messy.mds")),
+        ),
+        (
+            &["fmt", "--check", "sub/fine.mds"][..],
+            None,
+            0,
+            String::new(),
+            format!("Unchanged: {}\n", native("sub/fine.mds")),
+        ),
+        (
+            &["fmt", "--diff", "sub/messy.mds"][..],
+            None,
+            0,
+            diff_header("sub/messy.mds"),
+            String::new(),
+        ),
+        (
+            &["fmt", "--check", "-"][..],
+            Some("Q"),
+            1,
+            String::new(),
+            "Would reformat: <stdin>\n".to_owned(),
+        ),
+        (
+            &["fmt", "--diff", "-"][..],
+            Some("Q"),
+            0,
+            diff_header("<stdin>"),
+            String::new(),
+        ),
+    ];
+    for (args, stdin, exit, stdout_start, expected_stderr) in cases {
+        let (code, stdout, stderr, label) = fmt(args, stdin);
+        assert_eq!(code, Some(exit), "{label}: stderr: {stderr}");
+        assert!(
+            stdout.starts_with(&stdout_start),
+            "{label}: stdout starts {stdout_start:?}; stdout: {stdout}"
+        );
+        assert_eq!(stderr, expected_stderr, "{label}");
+    }
+    // A directory's entries come in the order the walk finds them.
+    let (code, stdout, stderr, label) = fmt(&["fmt", "--diff", "src"], None);
+    assert_eq!(code, Some(0), "{label}: stderr: {stderr}");
+    for entry in ["src/a.mds", "src/inner/b.mds"] {
+        assert!(
+            stdout.contains(&diff_header(entry)),
+            "{label}: {entry} is named below the directory as typed; stdout: {stdout}"
+        );
+    }
+    assert_eq!(
+        stderr, "2 would reformat, 0 unchanged, 0 failed\n",
+        "{label}"
+    );
+
+    let (code, _, stderr, label) = fmt(&["fmt", "sub/messy.mds"], None);
+    assert_eq!(code, Some(0), "{label}: stderr: {stderr}");
+    assert_eq!(
+        stderr,
+        format!("Formatted: {}\n", native("sub/messy.mds")),
+        "{label}"
+    );
+    let (code, _, stderr, label) = fmt(&["fmt", "src"], None);
+    assert_eq!(code, Some(0), "{label}: stderr: {stderr}");
+    assert_eq!(
+        lines_starting(&stderr, "Formatted: "),
+        [
+            format!("Formatted: {}", native("src/a.mds")),
+            format!("Formatted: {}", native("src/inner/b.mds")),
+        ],
+        "{label}: stderr: {stderr}"
+    );
+    assert!(
+        stderr.ends_with("2 formatted, 0 unchanged, 0 failed\n"),
+        "{label}: stderr: {stderr}"
+    );
+}
+
+/// `mds init` names the file it creates as typed, in `Created` and in its `Try:` hint, and
+/// in its refusal to overwrite the file; with no argument the file is `hello.mds`.
+#[test]
+fn init_names_the_file_it_creates_as_typed() {
+    let dir = scratch();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::create_dir_all(root.join("bare")).unwrap();
+    let typed = native("sub/new.mds");
+
+    let out = run(root, &typed_args(&["init", "sub/new.mds"]));
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        stderr,
+        format!("Created {typed}\n  Try: mds build {typed}\n")
+    );
+    assert!(root.join("sub/new.mds").is_file(), "the file was created");
+    assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
+
+    let out = run(root, &typed_args(&["init", "sub/new.mds"]));
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    let refusal = format!("{typed} already exists (use --force to overwrite)");
+    assert!(stderr.contains(&refusal), "{refusal:?}; stderr: {stderr}");
+    assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
+
+    let out = run(&root.join("bare"), &["init"]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(stderr, "Created hello.mds\n  Try: mds build hello.mds\n");
+    assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
+}
+
 // ── The build, check and lint runs listed in `ROWS` ──────────────────────────
 
 /// One run of the sweep below: where it runs, what it runs, what it reads on stdin, its
@@ -548,6 +805,14 @@ const ROWS: &[Row] = &[
         exit: 0,
         stdout: None,
         stderr: Some("Compiled to ./x.md\n"),
+    },
+    Row {
+        cwd: ".",
+        args: &["build", "src/a.mds"],
+        stdin: None,
+        exit: 0,
+        stdout: None,
+        stderr: Some("Compiled to src/a.md\n"),
     },
     Row {
         cwd: ".",
@@ -636,6 +901,14 @@ const ROWS: &[Row] = &[
         exit: 0,
         stdout: None,
         stderr: Some("OK: x.mds\n"),
+    },
+    Row {
+        cwd: ".",
+        args: &["check", "src/a.mds"],
+        stdin: None,
+        exit: 0,
+        stdout: None,
+        stderr: Some("OK: src/a.mds\n"),
     },
     Row {
         cwd: ".",
@@ -851,6 +1124,18 @@ fn watch_live(
             .stdout(stdout),
     );
     (common::ChildGuard(child), stderr, stdout)
+}
+
+/// Makes a directory writable again on drop, so the scratch directory can go.
+#[cfg(unix)]
+struct Writable(PathBuf);
+
+#[cfg(unix)]
+impl Drop for Writable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
 }
 
 /// The lines of `text` that start with `prefix`, sorted: a directory's sources are
@@ -1250,14 +1535,6 @@ fn removed_names_the_output_as_typed_when_the_vars_file_changes_in_the_same_batc
 fn an_output_that_cannot_be_removed_is_named_as_typed() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// Makes the directory writable again on drop, so the scratch directory can go.
-    struct Writable(PathBuf);
-    impl Drop for Writable {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-
     let dir = scratch();
     let root = dir.path();
     // (fixture directory, the extra arguments, whether the `--vars` file is edited too)
@@ -1438,6 +1715,262 @@ fn a_vars_directory_that_cannot_be_watched_is_named_as_typed() {
     }
 }
 
+// ── Carve-outs: the text of an error writing an output ───────────────────────
+
+/// `root/rel`'s canonical path, as `mds` prints a path it was given in that form.
+#[cfg(unix)]
+fn canonical(root: &Path, rel: &str) -> String {
+    root.join(rel)
+        .canonicalize()
+        .expect("the path exists")
+        .display()
+        .to_string()
+}
+
+/// `path`'s refusal as a symlink at an output's path.
+#[cfg(unix)]
+fn refused(path: &str) -> String {
+    format!("cannot write {path}: refusing to replace a symlink")
+}
+
+/// Plant a symlink at `root/rel` to a regular file, creating `rel`'s directories.
+#[cfg(unix)]
+fn plant_symlink(root: &Path, rel: &str) {
+    let target = root.join("target.md");
+    if !target.exists() {
+        put(root, "target.md", "T\n");
+    }
+    let at = root.join(rel);
+    std::fs::create_dir_all(at.parent().expect("a path below the root")).unwrap();
+    std::os::unix::fs::symlink(target, at).expect("plant a symlink");
+}
+
+/// Carve-out (spec §7.10): the text of an error writing an output names the path the write
+/// was given. Below a directory argument's `--out-dir` and below `mds.json`
+/// `build.output_dir`, in either mode, that is the canonical path — in `cannot write …` and
+/// in `could not remove stale output …` — though the status line names the output as typed.
+/// Under `-o`, below a file argument's `--out-dir` and beside the source it is the path as
+/// typed (the controls). The cause tempfile gives, `at path "…"`, names the temporary
+/// file's absolute path even then.
+///
+/// Unix-only: it plants symlinks and makes a directory read-only; the read-only arm is
+/// skipped with a reason where the mode does not stop a write (running as root).
+#[cfg(unix)]
+#[test]
+fn an_error_writing_below_a_resolved_output_directory_names_the_canonical_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "src/a.mds", "A\n");
+    plant_symlink(root, "out/a.md");
+    put(root, "proj/mds.json", r#"{"build":{"output_dir":"dist"}}"#);
+    put(root, "proj/p.mds", "P\n");
+    put(root, "proj/src/q.mds", "Q\n");
+    plant_symlink(root, "proj/dist/p.md");
+    plant_symlink(root, "proj/dist/q.md");
+    put(root, "nts/n.mds", "N\n");
+    plant_symlink(root, "nts/n.md");
+    plant_symlink(root, "o4/a.md");
+    plant_symlink(root, "o5/y.md");
+
+    // (working directory, arguments, the error's text)
+    let canonical_cases = [
+        (
+            ".",
+            &["build", "src", "--out-dir", "out"][..],
+            refused(&format!("{}/a.md", canonical(root, "out"))),
+        ),
+        (
+            "proj",
+            &["build", "p.mds"][..],
+            refused(&format!("{}/p.md", canonical(root, "proj/dist"))),
+        ),
+        (
+            "proj",
+            &["build", "src"][..],
+            refused(&format!("{}/q.md", canonical(root, "proj/dist"))),
+        ),
+    ];
+    for (cwd, args, error) in canonical_cases {
+        let out = run(&root.join(cwd), args);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            squash(&stderr).contains(&squash(&error)),
+            "{args:?}: the error names the canonical path, {error:?}; stderr: {stderr}"
+        );
+    }
+
+    // A stale `x.md` that is a directory, which no file removal removes, beside the
+    // `x.json` a messages template writes now: below `--out-dir` and below
+    // `build.output_dir`.
+    put(root, "msrc/x.mds", "@message user:\nHi\n@end\n");
+    put(root, "stale/x.md/keep", "keep\n");
+    put(root, "proj/msrc/x.mds", "@message user:\nHi\n@end\n");
+    put(root, "proj/dist/x.md/keep", "keep\n");
+    // (working directory, arguments, the status line, the directory the error names)
+    for (cwd, args, status, written) in [
+        (
+            ".",
+            &["build", "msrc", "--out-dir", "stale"][..],
+            "Compiled to stale/x.json\n",
+            "stale",
+        ),
+        (
+            "proj",
+            &["build", "msrc"][..],
+            "Compiled to msrc/../dist/x.json\n",
+            "proj/dist",
+        ),
+    ] {
+        let out = run(&root.join(cwd), args);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains(status),
+            "{args:?}: the status line names the output as typed; stderr: {stderr}"
+        );
+        let error = format!(
+            "could not remove stale output {}/x.md: ",
+            canonical(root, written)
+        );
+        assert!(
+            squash(&stderr).contains(&squash(&error)),
+            "{args:?}: the error names the canonical path, {error:?}; stderr: {stderr}"
+        );
+    }
+
+    // Controls: the write was given the path as typed, and the error names it so.
+    for (args, shown) in [
+        (&["build", "src/a.mds", "-o", "o5/y.md"][..], "o5/y.md"),
+        (&["build", "src/a.mds", "--out-dir", "o4"][..], "o4/a.md"),
+        (&["build", "nts/n.mds"][..], "nts/n.md"),
+        (&["build", "nts"][..], "nts/n.md"),
+    ] {
+        let out = run(root, args);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            squash(&stderr).contains(&squash(&refused(shown))),
+            "{args:?}: the error names the path as typed, {shown:?}; stderr: {stderr}"
+        );
+        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+    }
+
+    // tempfile's cause text: a temporary file in a read-only directory.
+    std::fs::create_dir(root.join("ro")).unwrap();
+    std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _writable = Writable(root.join("ro"));
+    if std::fs::write(root.join("ro/.write-probe"), b"").is_ok() {
+        let _ = std::fs::remove_file(root.join("ro/.write-probe"));
+        eprintln!("skipped the read-only arm: ro is writable at mode 0o555 (running as root?)");
+        return;
+    }
+    let out = run(root, &["build", "src/a.mds", "-o", "ro/y.md"]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    for part in [
+        "cannot create temp file for ro/y.md: ".to_owned(),
+        format!("at path \"{}/.mds-tmp-", canonical(root, "ro")),
+    ] {
+        assert!(
+            squash(&stderr).contains(&squash(&part)),
+            "{part:?}; stderr: {stderr}"
+        );
+    }
+}
+
+/// Carve-out (spec §7.10): `mds watch` names the path the write was given in the text of
+/// an error writing an output — the canonical path beside the entry and beside a directory
+/// argument's source, the path as typed under `-o` and below file mode's `--out-dir` (the
+/// controls) — and the canonical path below a directory argument's `--out-dir` in the
+/// warning that a stale output of the other kind could not be removed, though the
+/// `Recompiled` line names the output as typed.
+///
+/// Unix-only: it plants symlinks.
+#[cfg(unix)]
+#[test]
+fn watch_names_the_path_written_in_an_error_writing_an_output() {
+    let dir = scratch();
+    let root = dir.path();
+    for (source, output) in [
+        ("d1/a.mds", "d1/a.md"),
+        ("w1/page.mds", "w1/page.md"),
+        ("w2/page.mds", "o2/y.md"),
+        ("w3/page.mds", "o3/page.md"),
+    ] {
+        put(root, source, "Page\n");
+        plant_symlink(root, output);
+    }
+
+    // (arguments, the startup write's refusal, whether it names the path as typed)
+    let cases = [
+        (
+            &["watch", "d1"][..],
+            refused(&format!("{}/a.md", canonical(root, "d1"))),
+            false,
+        ),
+        (
+            &["watch", "w1/page.mds"][..],
+            refused(&format!("{}/page.md", canonical(root, "w1"))),
+            false,
+        ),
+        (
+            &["watch", "w2/page.mds", "-o", "o2/y.md"][..],
+            refused("o2/y.md"),
+            true,
+        ),
+        (
+            &["watch", "w3/page.mds", "--out-dir", "o3"][..],
+            refused("o3/page.md"),
+            true,
+        ),
+    ];
+    for (args, error, typed) in cases {
+        let (child, tap, _) = common::spawn_watch_unsynchronized(
+            mds_bin()
+                .current_dir(root)
+                .args(args)
+                .args(["--debounce", "0"])
+                .stdout(Stdio::null()),
+        );
+        let mut child = common::ChildGuard(child);
+        // The refusal's last word: an error frame may wrap the line between any two.
+        common::wait_for_tap(&tap, "symlink", WATCH_STEP);
+        let stderr = tap.finish_text(&mut child);
+        assert!(
+            squash(&stderr).contains(&squash(&error)),
+            "{args:?}: {error:?}; stderr: {stderr}"
+        );
+        if typed {
+            assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+        }
+    }
+
+    // The stale output this session wrote, replaced by a directory no file removal
+    // removes, when its source turns into a messages template.
+    put(root, "d5/a.mds", "A\n");
+    let (mut child, tap, _) = watch_live(root, &["watch", "d5", "--out-dir", "o5"], false);
+    std::fs::remove_file(root.join("o5/a.md")).expect("remove the startup output");
+    put(root, "o5/a.md/keep", "keep\n");
+    write_atomic(&root.join("d5/a.mds"), "@message user:\nHi\n@end\n");
+    common::wait_for_tap(&tap, "stale", WATCH_STEP);
+    let stderr = tap.finish_text(&mut child);
+    let warning = format!(
+        "warning: could not remove stale output {}/a.md: ",
+        canonical(root, "o5")
+    );
+    assert!(
+        squash(&stderr).contains(&squash(&warning)),
+        "{warning:?}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Recompiled o5/a.json ("),
+        "the rebuild names the output as typed; stderr: {stderr}"
+    );
+}
+
 // ── Windows ──────────────────────────────────────────────────────────────────
 
 /// Windows: a directory build under an out-dir that already exists — the case in which
@@ -1540,4 +2073,420 @@ fn watch_banner_and_recompiled_lines_carry_no_verbatim_prefix() {
             "{args:?}: stderr: {stderr}"
         );
     }
+}
+
+// ── spec.md §7.10: the table of these lines ──────────────────────────────────
+
+/// The heading of the section of spec.md that holds the path-label table.
+const LABEL_SECTION: &str = "### 7.10 Path labels";
+
+/// The table's header row, cell by cell.
+const LABEL_COLUMNS: [&str; 4] = ["Command", "Line", "Form", "Pinned by"];
+
+/// The sweep the table cites for many rows.
+const SWEEP: &str = "no_listed_build_check_or_lint_run_names_the_working_directory";
+
+/// The tests each row of spec.md §7.10's table cites, row by row, in the table's order.
+/// The table and this list change together: a row added, removed or moved, or a test
+/// cited or no longer cited, fails [`the_spec_s_path_label_table_cites_exactly_these_tests`]
+/// until the other follows.
+const LABEL_TABLE: &[&[&str]] = &[
+    &["auto_detection_names_the_file_as_found_in_the_working_directory"],
+    &[SWEEP],
+    &[SWEEP],
+    &[SWEEP],
+    &[SWEEP],
+    &[
+        "compiled_to_under_a_relative_out_dir_names_the_out_dir_as_typed",
+        "compiled_to_under_a_symlinked_out_dir_names_the_link_not_its_target",
+        "dir_build_out_dir_status_line_names_the_out_dir_as_typed",
+    ],
+    &["a_config_output_dir_is_named_through_the_directory_mds_json_was_reached_by"],
+    &[
+        "source_map_lines_under_an_out_dir_name_the_out_dir_as_typed",
+        "a_config_output_dir_names_the_map_written_and_the_stale_map_removed",
+        SWEEP,
+    ],
+    &["a_config_output_dir_names_the_map_written_and_the_stale_map_removed"],
+    &["an_output_directory_that_cannot_be_created_is_named_as_its_output_is"],
+    &["the_config_source_map_warning_names_mds_json_as_reached"],
+    &["r3_error_frame_names_root_relative_path_for_subdir_file"],
+    &["an_error_writing_below_a_resolved_output_directory_names_the_canonical_path"],
+    &[SWEEP],
+    &["fmt_names_a_file_argument_as_typed_and_a_directory_s_entries_below_it"],
+    &["fmt_names_a_file_argument_as_typed_and_a_directory_s_entries_below_it"],
+    &["clean_names_a_file_argument_as_typed", SWEEP],
+    &[
+        "lint_names_a_file_argument_as_typed_and_its_findings_by_its_file_name",
+        "a_partial_fix_of_a_file_is_announced_after_the_findings_it_leaves",
+        SWEEP,
+    ],
+    &["lint_names_a_file_argument_as_typed_and_its_findings_by_its_file_name"],
+    &[
+        "lint_names_a_file_argument_as_typed_and_its_findings_by_its_file_name",
+        SWEEP,
+    ],
+    &[
+        "watching_names_the_entry_and_the_directory_as_typed",
+        "watching_names_a_path_reached_through_a_symlink_by_the_link",
+    ],
+    &[
+        "watching_names_the_entry_and_the_directory_as_typed",
+        "watching_names_a_path_reached_through_a_symlink_by_the_link",
+        "watch_dot_forms_watch_the_canonical_directory",
+    ],
+    &[
+        "watch_startup_names_an_out_dir_and_a_config_output_dir_as_build_does",
+        "recompiled_and_removed_name_each_output_as_typed",
+    ],
+    &[
+        "recompiled_and_removed_name_each_output_as_typed",
+        "watching_names_a_path_reached_through_a_symlink_by_the_link",
+    ],
+    &[
+        "recompiled_and_removed_name_each_output_as_typed",
+        "removed_names_the_output_as_typed_when_the_vars_file_changes_in_the_same_batch",
+    ],
+    &["an_output_that_cannot_be_removed_is_named_as_typed"],
+    &["an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk"],
+    &["a_watched_directory_is_named_as_the_user_typed_it"],
+    &[
+        "a_vars_directory_that_cannot_be_watched_is_named_as_typed",
+        "a_watched_directory_is_named_as_the_user_typed_it",
+    ],
+    &["a_watched_directory_is_named_as_the_user_typed_it"],
+    &["watch_names_the_path_written_in_an_error_writing_an_output"],
+    &["init_names_the_file_it_creates_as_typed"],
+    &[
+        "a_relative_output_location_is_refused_where_the_working_directory_is_gone",
+        "watch_with_a_relative_out_dir_stops_at_startup_where_the_working_directory_is_gone",
+    ],
+    &["auto_detection_in_a_working_directory_it_cannot_list_names_it_as_a_dot"],
+    &[
+        "compiled_to_and_map_lines_under_an_existing_out_dir_carry_no_verbatim_prefix",
+        "dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows",
+    ],
+    &["watch_banner_and_recompiled_lines_carry_no_verbatim_prefix"],
+];
+
+/// One body row of the table: the spec.md line it is on (from 1) and the tests it cites.
+#[derive(Debug, PartialEq)]
+struct LabelRow {
+    line: usize,
+    tests: Vec<String>,
+}
+
+/// The cells of a table line, `| a | b |` → `["a", "b"]`: split at each `|` not escaped
+/// as `\|`, each cell trimmed.
+fn table_cells(line: &str) -> Vec<String> {
+    let inner = line.trim();
+    let inner = inner.strip_prefix('|').unwrap_or(inner);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    for c in inner.chars() {
+        if c == '|' && !escaped {
+            cells.push(cell.trim().to_owned());
+            cell.clear();
+        } else {
+            cell.push(c);
+        }
+        escaped = c == '\\' && !escaped;
+    }
+    cells.push(cell.trim().to_owned());
+    cells
+}
+
+/// Is `name` spelled as a test function is: lower-case ASCII letters, digits and `_`,
+/// starting with a letter?
+fn is_test_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The tests a `Pinned by` cell cites: one or more test names, each in backticks,
+/// separated by `, `. Anything else — an empty cell, a dash, a name without backticks,
+/// prose — is refused, so no row can stand without a test.
+fn cited_tests(cell: &str) -> Result<Vec<String>, String> {
+    if cell.is_empty() {
+        return Err("the Pinned by cell cites no test".to_owned());
+    }
+    cell.split(", ")
+        .map(|item| {
+            item.strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+                .filter(|name| is_test_name(name))
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{item:?} is not a test name in backticks"))
+        })
+        .collect()
+}
+
+/// The body rows of the table in `spec`'s §7.10. The section must appear once and hold
+/// one table, headed by [`LABEL_COLUMNS`], whose every row has four cells, none of them
+/// empty, and cites at least one test. A line may end in CRLF.
+fn label_table(spec: &str) -> Result<Vec<LabelRow>, String> {
+    let lines: Vec<&str> = spec.lines().map(str::trim_end).collect();
+    let starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == LABEL_SECTION)
+        .map(|(at, _)| at)
+        .collect();
+    let [start] = starts.as_slice() else {
+        return Err(format!(
+            "expected one {LABEL_SECTION:?} heading, found {}",
+            starts.len()
+        ));
+    };
+    // The section runs to the next heading or horizontal rule. Line numbers count from 1.
+    let table: Vec<(usize, &str)> = lines[start + 1..]
+        .iter()
+        .enumerate()
+        .map(|(at, line)| (start + 2 + at, *line))
+        .take_while(|(_, line)| !line.starts_with('#') && *line != "---")
+        .filter(|(_, line)| line.starts_with('|'))
+        .collect();
+    let (Some(&(first, header)), Some(&(last, _))) = (table.first(), table.last()) else {
+        return Err("the section holds no table".to_owned());
+    };
+    if table.len() != last - first + 1 {
+        return Err(format!(
+            "the table lines {first}..={last} are not one table: other lines lie between them"
+        ));
+    }
+    if table_cells(header) != LABEL_COLUMNS {
+        return Err(format!(
+            "line {first}: the header is {:?}, not {LABEL_COLUMNS:?}",
+            table_cells(header)
+        ));
+    }
+    let is_rule = |cell: &String| {
+        let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+        dashes.len() >= 3 && dashes.chars().all(|c| c == '-')
+    };
+    match table.get(1) {
+        Some(&(_, separator))
+            if table_cells(separator).len() == LABEL_COLUMNS.len()
+                && table_cells(separator).iter().all(is_rule) => {}
+        _ => return Err(format!("line {}: no separator row", first + 1)),
+    }
+    let rows = table[2..]
+        .iter()
+        .map(|&(line, text)| {
+            let cells = table_cells(text);
+            if cells.len() != LABEL_COLUMNS.len() {
+                return Err(format!(
+                    "line {line}: {} cells, not {}",
+                    cells.len(),
+                    LABEL_COLUMNS.len()
+                ));
+            }
+            if let Some(empty) = cells[..3].iter().position(String::is_empty) {
+                return Err(format!(
+                    "line {line}: the {} cell is empty",
+                    LABEL_COLUMNS[empty]
+                ));
+            }
+            let tests = cited_tests(&cells[3]).map_err(|e| format!("line {line}: {e}"))?;
+            Ok(LabelRow { line, tests })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if rows.is_empty() {
+        return Err(format!("line {first}: the table has no rows"));
+    }
+    Ok(rows)
+}
+
+/// Every `.rs` file directly under `crates/mds-cli/tests/` and `crates/mds-cli/src/`,
+/// with its text.
+fn cli_rust_sources() -> Vec<(PathBuf, String)> {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    for sub in ["tests", "src"] {
+        for entry in std::fs::read_dir(crate_dir.join(sub)).expect("list a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read a source file");
+                sources.push((path, text));
+            }
+        }
+    }
+    sources.sort();
+    sources
+}
+
+/// The files of `sources` that define a test named `name`: a line `fn <name>() {` with
+/// `#[test]` among the attribute and doc-comment lines right above it.
+fn test_definitions<'a>(name: &str, sources: &'a [(PathBuf, String)]) -> Vec<&'a Path> {
+    let signature = format!("fn {name}() {{");
+    sources
+        .iter()
+        .filter(|(_, text)| {
+            let lines: Vec<&str> = text.lines().map(str::trim).collect();
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| **line == signature)
+                .any(|(at, _)| {
+                    lines[..at]
+                        .iter()
+                        .rev()
+                        .take_while(|line| line.starts_with("#[") || line.starts_with("///"))
+                        .any(|line| *line == "#[test]")
+                })
+        })
+        .map(|(path, _)| path.as_path())
+        .collect()
+}
+
+/// spec.md §7.10's table and [`LABEL_TABLE`] cite the same tests, row by row, and each
+/// test they cite is a `#[test]` function defined once among mds-cli's test and source
+/// files — so a row added or removed, a test cited or dropped, and a cited test renamed or
+/// deleted each fail here.
+#[test]
+fn the_spec_s_path_label_table_cites_exactly_these_tests() {
+    let spec_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec.md");
+    let spec = std::fs::read_to_string(&spec_path).expect("read spec.md");
+    let rows = label_table(&spec).unwrap_or_else(|e| panic!("spec.md §7.10: {e}"));
+
+    let cited: BTreeSet<&str> = rows
+        .iter()
+        .flat_map(|row| row.tests.iter().map(String::as_str))
+        .collect();
+    let listed: BTreeSet<&str> = LABEL_TABLE
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect();
+    let unlisted: Vec<&str> = cited.difference(&listed).copied().collect();
+    let uncited: Vec<&str> = listed.difference(&cited).copied().collect();
+    assert!(
+        unlisted.is_empty() && uncited.is_empty(),
+        "spec.md §7.10 cites tests LABEL_TABLE does not list: {unlisted:?}; \
+         LABEL_TABLE lists tests spec.md §7.10 does not cite: {uncited:?}"
+    );
+
+    let table: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|row| row.tests.iter().map(String::as_str).collect())
+        .collect();
+    let lines: Vec<usize> = rows.iter().map(|row| row.line).collect();
+    assert_eq!(
+        table, LABEL_TABLE,
+        "spec.md §7.10's rows (lines {lines:?}) and LABEL_TABLE differ row by row"
+    );
+
+    let sources = cli_rust_sources();
+    let undefined: Vec<String> = listed
+        .iter()
+        .filter_map(|name| {
+            let defined = test_definitions(name, &sources);
+            (defined.len() != 1).then(|| format!("{name}: defined in {defined:?}"))
+        })
+        .collect();
+    assert!(
+        undefined.is_empty(),
+        "each test spec.md §7.10 cites must be a #[test] fn defined once in \
+         crates/mds-cli/tests/*.rs or crates/mds-cli/src/*.rs: {undefined:#?}"
+    );
+}
+
+/// The table check refuses each way a row could stand without a test, reads a CRLF spec
+/// as an LF one, and finds a test only where one `#[test]` function of that name is
+/// defined (positive controls).
+#[test]
+fn the_table_check_refuses_a_row_without_a_test_and_finds_only_defined_tests() {
+    let spec = |rows: &str| {
+        format!(
+            "## 7. CLI\n\n{LABEL_SECTION}\n\nProse.\n\n| Command | Line | Form | Pinned by |\n\
+             |---|---|---|---|\n{rows}\n\n---\n\n## 8. Next\n\n| a | b |\n|---|---|\n"
+        )
+    };
+    let good = spec("| `mds x` | `X` | as typed | `a_test`, `b_test` |");
+    assert_eq!(
+        label_table(&good),
+        Ok(vec![LabelRow {
+            line: 9,
+            tests: vec!["a_test".to_owned(), "b_test".to_owned()],
+        }])
+    );
+    assert_eq!(
+        label_table(&good.replace('\n', "\r\n")),
+        label_table(&good),
+        "a CRLF spec reads as the LF one"
+    );
+    assert!(
+        label_table(&spec("| `mds x` | `a \\| b` | as typed | `a_test` |")).is_ok(),
+        "an escaped pipe stays inside its cell"
+    );
+    for (rows, what) in [
+        ("| `mds x` | `X` | as typed | — |", "a dash"),
+        ("| `mds x` | `X` | as typed |  |", "an empty Pinned by cell"),
+        ("| `mds x` | `X` | as typed | a_test |", "a name without backticks"),
+        ("| `mds x` | `X` | as typed | `a_test` and prose |", "prose"),
+        ("| `mds x` | `X` | as typed | `a_test`,`b_test` |", "another separator"),
+        ("| `mds x` | `X` | as typed | `A_Test` |", "a name no test has"),
+        ("| `mds x` | `X` | `a_test` |", "three cells"),
+        ("| `mds x` |  | as typed | `a_test` |", "an empty Line cell"),
+        (
+            "| `mds x` | `X` | as typed | `a_test` |\n\nProse.\n\n| `mds y` | `Y` | as typed | `b_test` |",
+            "a second table",
+        ),
+    ] {
+        assert!(
+            label_table(&spec(rows)).is_err(),
+            "{what} must be refused: {rows:?}"
+        );
+    }
+    assert!(label_table("# spec\n").is_err(), "no section");
+    assert!(
+        label_table(&format!("{good}{good}")).is_err(),
+        "the section twice"
+    );
+    assert!(
+        label_table(&good.replace("| Pinned by |", "| Tests |")).is_err(),
+        "another header"
+    );
+    assert!(label_table(&spec("")).is_err(), "a table with no rows");
+
+    let planted =
+        vec![
+        (
+            PathBuf::from("a.rs"),
+            "/// Doc.\n#[cfg(unix)]\n#[test]\nfn planted_test() {\n}\n\nfn planted_helper() {\n}\n"
+                .to_owned(),
+        ),
+        (PathBuf::from("b.rs"), "#[test]\nfn twice() {\n}\n".to_owned()),
+        (PathBuf::from("c.rs"), "#[test]\nfn twice() {\n}\n".to_owned()),
+    ];
+    assert_eq!(
+        test_definitions("planted_test", &planted),
+        [Path::new("a.rs")]
+    );
+    assert!(
+        test_definitions("planted_helper", &planted).is_empty(),
+        "a function without #[test] is no test"
+    );
+    assert!(
+        test_definitions("planted", &planted).is_empty(),
+        "no prefix match"
+    );
+    assert_eq!(
+        test_definitions("twice", &planted).len(),
+        2,
+        "a test defined twice is found twice, which the table check refuses"
+    );
+    let sources = cli_rust_sources();
+    let here = test_definitions("clean_names_a_file_argument_as_typed", &sources);
+    assert!(
+        here.len() == 1 && here[0].ends_with("path_labels.rs"),
+        "a real test is found where it is defined: {here:?}"
+    );
+    assert!(
+        test_definitions("scratch", &sources).is_empty(),
+        "a real helper is no test"
+    );
 }
