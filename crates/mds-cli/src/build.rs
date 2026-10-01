@@ -196,7 +196,10 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<ProjectConfig>> {
             // — or one that grows while it is read — is never held in memory whole
             // (#428).
             let cannot_read = |e: std::io::Error| {
-                miette::miette!("cannot read {shown}: {}", crate::output::safe_inline(&e))
+                miette::miette!(
+                    "cannot read {shown}: {}",
+                    crate::output::safe_inline(crate::output::io_cause(&e))
+                )
             };
             let too_large = |size: u64| {
                 miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MiB)")
@@ -582,7 +585,10 @@ pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
     let lossy = path.to_string_lossy();
     let shown = mds::escape_path_for_message(&lossy);
     let exists = path.try_exists().map_err(|e| MdsError::Io {
-        message: format!("cannot check {shown}: {e}"),
+        message: format!(
+            "cannot check {shown}: {}",
+            crate::output::safe_inline(crate::output::io_cause(&e))
+        ),
     })?;
     if !exists {
         return Err(MdsError::FileNotFound {
@@ -812,7 +818,10 @@ pub(crate) fn read_stdin() -> Result<String, MdsError> {
 /// a read that fails and bytes that are not UTF-8 are `mds::io` (exit 2) (#157).
 fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
     let bytes = mds::read_at_most(reader, MAX_FILE_SIZE + 1, 0).map_err(|e| MdsError::Io {
-        message: format!("cannot read stdin: {}", crate::output::safe_inline(&e)),
+        message: format!(
+            "cannot read stdin: {}",
+            crate::output::safe_inline(crate::output::io_cause(&e))
+        ),
     })?;
     if bytes.len() as u64 > MAX_FILE_SIZE {
         return Err(MdsError::ResourceLimit {
@@ -865,7 +874,7 @@ pub(crate) fn write_output(
             // the previous artifact intact instead of a truncated one. The primitive
             // owns the symlink refusal; the create_dir_all above stays here because the
             // primitive deliberately does not create directories.
-            crate::output::atomic_write_file(&target.path, compiled, Durability::RenameOnly)?;
+            crate::output::atomic_write_file(target, compiled, Durability::RenameOnly)?;
             if !quiet && announce {
                 crate::output::ewriteln!("Compiled to {}", crate::output::safe_path(&target.shown));
             }
@@ -882,7 +891,7 @@ fn output_dir_failure(output: &WriteTarget, e: &std::io::Error) -> MdsError {
         message: format!(
             "cannot create output directory {}: {}",
             crate::output::safe_path(effective_parent(&output.shown)),
-            crate::output::safe_inline(e)
+            crate::output::safe_inline(crate::output::io_cause(e))
         ),
     }
 }
@@ -900,7 +909,7 @@ pub(crate) fn auto_detect_mds_file(subcommand: &str) -> Result<PathBuf> {
         .map_err(|e| MdsError::Io {
             message: format!(
                 "cannot read directory .: {}",
-                crate::output::safe_inline(&e)
+                crate::output::safe_inline(crate::output::io_cause(&e))
             ),
         })?
         .filter_map(|res| {
@@ -1437,7 +1446,7 @@ pub(crate) fn verify_then_delete_map(
         message: format!(
             "cannot read stale map {}: {}",
             crate::output::safe_path(&map.shown),
-            crate::output::safe_inline(e)
+            crate::output::safe_inline(crate::output::io_cause(e))
         ),
     };
     let metadata = match std::fs::metadata(&map.path) {
@@ -1469,7 +1478,7 @@ pub(crate) fn verify_then_delete_map(
         message: format!(
             "could not remove stale map {}: {}",
             crate::output::safe_path(&map.shown),
-            crate::output::safe_inline(&e)
+            crate::output::safe_inline(crate::output::io_cause(&e))
         ),
     })?;
     if !quiet {
@@ -1712,7 +1721,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             // line below is a diagnostic surface and IS escaped.
                             let map_json = sm.to_json();
                             crate::output::atomic_write_file(
-                                &map.path,
+                                &map,
                                 &map_json,
                                 Durability::RenameOnly,
                             )?;
@@ -1846,11 +1855,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     if let Some(ref sm) = source_map {
                         let map = out.sibling(map_path_for);
                         let map_json = sm.to_json();
-                        crate::output::atomic_write_file(
-                            &map.path,
-                            &map_json,
-                            Durability::RenameOnly,
-                        )?;
+                        crate::output::atomic_write_file(&map, &map_json, Durability::RenameOnly)?;
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Source map written to {}",
@@ -1940,7 +1945,7 @@ fn run_build_directory(
 ) -> Result<()> {
     use crate::output::{
         collect_mds_files_detailed, is_partial, output_base_no_ext, output_path_for,
-        probe_and_remove_stale, resolve_output_base, OutputBase, RootPaths,
+        output_stem_for, probe_and_remove_stale, resolve_output_base, OutputBase, RootPaths,
     };
 
     const MAX_DEPTH: usize = 64;
@@ -2090,7 +2095,7 @@ fn run_build_directory(
                 // it accumulates per-file counters instead of returning early, so it is
                 // its own call site. Both are enforced by `tests/write_funnel.rs`.
                 match crate::output::atomic_write_file(
-                    &target.path,
+                    &target,
                     &final_content,
                     Durability::RenameOnly,
                 ) {
@@ -2112,7 +2117,7 @@ fn run_build_directory(
                                 let map = target.sibling(map_path_for);
                                 let map_json = sm.to_json();
                                 if let Err(e) = crate::output::atomic_write_file(
-                                    &map.path,
+                                    &map,
                                     &map_json,
                                     Durability::RenameOnly,
                                 ) {
@@ -2143,9 +2148,11 @@ fn run_build_directory(
                         // no hand-authored sibling risk). In NextToSource mode and the
                         // stale path was not written by us this run, skip to protect
                         // hand-authored files.
-                        let base_no_ext = output_base_no_ext(file, dir, &output_base);
-                        let stale_path =
-                            base_no_ext.with_extension(compiled.kind.stale_extension());
+                        let base_no_ext =
+                            output_stem_for(file, RootPaths::as_typed(dir), &output_base);
+                        let stale_path = base_no_ext
+                            .path
+                            .with_extension(compiled.kind.stale_extension());
                         let safe_to_delete = matches!(output_base, OutputBase::Dir { .. })
                             || written_this_run.contains(&stale_path);
                         if safe_to_delete {
@@ -3070,7 +3077,11 @@ mod tests {
         let err: miette::Report = read_stdin_from(&mut Unreadable).unwrap_err().into();
         assert_eq!(
             (exit_code(&err), err.to_string()),
-            (2, "cannot read stdin: stream broke".to_owned())
+            (
+                2,
+                format!("cannot read stdin: {}", std::io::ErrorKind::Other)
+            ),
+            "the error's kind, not the text it carries (#390)"
         );
         assert_eq!(read_stdin_from(&mut &b"Hello!\n"[..]).unwrap(), "Hello!\n");
     }

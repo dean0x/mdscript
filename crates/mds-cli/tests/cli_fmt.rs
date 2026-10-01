@@ -1488,3 +1488,83 @@ fn fmt_non_utf8_path_exits_two() {
         "the diagnostic must say why; got: {stderr}"
     );
 }
+
+// ── #390: a directory entry's `--diff` header ───────────────────────────────
+
+/// The first two lines `mds fmt <args> --diff` prints, run in `cwd`.
+fn diff_header(cwd: &Path, args: &[&str]) -> Vec<String> {
+    let out = mds_bin()
+        .current_dir(cwd)
+        .arg("fmt")
+        .args(args)
+        .arg("--diff")
+        .output()
+        .expect("run mds fmt");
+    String::from_utf8(out.stdout)
+        .expect("a diff is UTF-8")
+        .lines()
+        .take(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `--diff` header of a directory's entry names it below the directory argument as
+/// typed, so it equals the header the same file gets as a file argument typed that way
+/// (#390). Control: the file argument's run prints that header.
+#[test]
+fn a_directory_entry_s_diff_header_equals_its_file_mode_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("src").join("inner");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("b.mds"), read_fixture("fmt_unformatted.mds")).unwrap();
+    let typed = ["src", "inner", "b.mds"].join(std::path::MAIN_SEPARATOR_STR);
+
+    let file_mode = diff_header(dir.path(), &[&typed]);
+    assert_eq!(
+        file_mode,
+        [format!("--- {typed}"), format!("+++ {typed}")],
+        "control: the file argument's diff header"
+    );
+    assert_eq!(
+        diff_header(dir.path(), &["src"]),
+        file_mode,
+        "the directory's entry is named as the file argument is"
+    );
+}
+
+/// A directory's entry whose name holds U+001B is refused before its diff, and the
+/// refusal names it escaped; nothing either stream carries holds the raw byte (#390).
+/// Control: the run still prints its other entry's diff header.
+///
+/// Unix-only: Windows file systems refuse a control character in a file name.
+#[cfg(unix)]
+#[test]
+fn a_directory_entry_named_with_a_control_character_is_named_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("b.mds"), read_fixture("fmt_unformatted.mds")).unwrap();
+    let hostile = format!("a{}b.mds", '\x1b');
+    fs::write(src.join(&hostile), read_fixture("fmt_unformatted.mds")).unwrap();
+
+    let out = mds_bin()
+        .current_dir(dir.path())
+        .args(["fmt", "src", "--diff"])
+        .output()
+        .expect("run mds fmt");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.starts_with("--- src/b.mds\n+++ src/b.mds\n"),
+        "control: the other entry's diff; stdout: {stdout}"
+    );
+    assert!(
+        !out.stdout.contains(&0x1B) && !out.stderr.contains(&0x1B),
+        "no raw ESC on either stream; stdout: {stdout:?}; stderr: {stderr:?}"
+    );
+    let escaped = format!("src/a{}u001Bb.mds", '\\');
+    assert!(
+        stderr.contains(&escaped),
+        "the refusal names the entry escaped, {escaped:?}; stderr: {stderr}"
+    );
+}

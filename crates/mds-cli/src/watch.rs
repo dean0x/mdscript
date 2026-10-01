@@ -82,10 +82,10 @@ use crate::build::{
     CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
 };
 use crate::output::{
-    collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
-    output_base_no_ext, output_path_for, output_stem_for, probe_and_remove_stale,
-    resolve_output_base, safe_inline, safe_path, stdout_failure, write_stdout, OutputBase,
-    Panicked, RootPaths, StdoutOutcome, WriteTarget,
+    collect_mds_files, eprint_error, eprint_warning, io_cause, is_partial,
+    is_within_default_excluded_dir, notify_cause, output_base_no_ext, output_path_for,
+    output_stem_for, probe_and_remove_stale, resolve_output_base, safe_inline, safe_path,
+    stdout_failure, write_stdout, OutputBase, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -482,7 +482,7 @@ pub(crate) fn resync_watches(
             eprint_warning(&format!(
                 "warning: failed to watch {}: {}",
                 safe_path(&shown_watched_dir(dir, root, vars)),
-                safe_inline(&e)
+                safe_inline(notify_cause(&e))
             ));
         } else {
             result.insert(dir.clone());
@@ -584,8 +584,10 @@ const READY_MARKER: &str = "MDS_WATCH_READY";
 /// coupling: stdout and stderr stay byte-for-byte what a real user would see.
 ///
 /// Write-then-rename so a test polling for the path can never observe a partially
-/// written marker. Failures are ignored: this is a test affordance, and a watcher
-/// that cannot create the file must still watch.
+/// written marker. The temporary file is created new ([`create_ready_marker`]), so a
+/// symlink planted at `<marker>.tmp` never redirects the write (#390). Failures are
+/// ignored: this is a test affordance, and a watcher that cannot create the file must
+/// still watch.
 fn emit_ready_marker() {
     let Some(raw) = std::env::var_os(READY_MARKER_ENV) else {
         return;
@@ -599,11 +601,34 @@ fn emit_ready_marker() {
     let mut tmp = path.clone().into_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    // Raw write is deliberate (#227): this is already temp+rename. Allow-listed in
-    // tests/write_funnel.rs.
-    if std::fs::write(&tmp, READY_MARKER).is_ok() {
+    if create_ready_marker(&tmp).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
+}
+
+/// Create `tmp` new, holding [`READY_MARKER`]: never through an entry already at it,
+/// which a write that opens the path would follow if it were a symlink (#390). An entry
+/// there — a leftover, or a planted link — is removed (the entry itself, never what a link
+/// points to) and the file created once more; another entry in between ends the attempt.
+///
+/// A raw write, not `atomic_write_file`'s, by design (#227): the rename that follows it
+/// is the atomic step. Allow-listed in tests/write_funnel.rs.
+fn create_ready_marker(tmp: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+    };
+    let mut file = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp)?;
+            create()?
+        }
+        created => created?,
+    };
+    file.write_all(READY_MARKER.as_bytes())
 }
 
 /// Idle-tick scheduler holding an **absolute** deadline (#319).
@@ -854,7 +879,7 @@ fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome
                     Msg::Fs(Err(e)) => {
                         eprint_warning(&format!(
                             "warning: watch error during debounce: {}",
-                            safe_inline(&e)
+                            safe_inline(notify_cause(&e))
                         ));
                     }
                     Msg::Interrupt => break DebounceEnd::Interrupted,
@@ -1575,7 +1600,10 @@ fn handle_fs_event_file(
     let interrupted = match msg {
         Msg::Interrupt => true,
         Msg::Fs(Err(e)) => {
-            eprint_warning(&format!("warning: watch error: {}", safe_inline(&e)));
+            eprint_warning(&format!(
+                "warning: watch error: {}",
+                safe_inline(notify_cause(&e))
+            ));
             // Non-fatal watch error — skip but don't rebuild.
             return FileEventAction::Skip;
         }
@@ -1891,7 +1919,12 @@ fn run_watch_file(
         },
         notify::Config::default(),
     )
-    .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
+    .map_err(|e| {
+        miette::miette!(
+            "failed to initialize file watcher: {}",
+            safe_inline(notify_cause(&e))
+        )
+    })?;
 
     // Arm the directories that are knowable before any read: the entry's parent
     // and the vars file's parent. Dependency dirs are unknown until the compile
@@ -2024,9 +2057,10 @@ fn run_watch_file(
             Err(e) => {
                 let vars = vars_dir_paths(vars_path.as_deref(), vars_path_typed.as_deref());
                 return Err(miette::miette!(
-                    "failed to watch directory {}: {e}\n\
+                    "failed to watch directory {}: {}\n\
                      hint: on Linux you may need to increase fs.inotify.max_user_watches",
-                    safe_path(&shown_watched_dir(&dir, entry.dir_paths(), vars))
+                    safe_path(&shown_watched_dir(&dir, entry.dir_paths(), vars)),
+                    safe_inline(notify_cause(&e))
                 ));
             }
         }
@@ -2394,9 +2428,11 @@ fn compile_one_source(
                         // The watcher self-trigger guard (content-dedup / last_written)
                         // also covers the freshly written `out` — the next event for that
                         // path will find identical content and skip the write.
-                        let base_no_ext = output_base_no_ext(src, root, output_base);
-                        let stale_path =
-                            base_no_ext.with_extension(compiled.kind.stale_extension());
+                        let base_no_ext =
+                            output_stem_for(src, watch_root.root_paths(), output_base);
+                        let stale_path = base_no_ext
+                            .path
+                            .with_extension(compiled.kind.stale_extension());
                         // Remove the stale-extension sibling from last_written so the key
                         // doesn't accumulate stale entries (memory hygiene). The remove()
                         // return value tells us whether this tool wrote the stale path.
@@ -2721,7 +2757,10 @@ fn handle_fs_event_dir(
     let interrupted = match msg {
         Msg::Interrupt => true,
         Msg::Fs(Err(e)) => {
-            eprint_warning(&format!("warning: watch error: {}", safe_inline(&e)));
+            eprint_warning(&format!(
+                "warning: watch error: {}",
+                safe_inline(notify_cause(&e))
+            ));
             return DirEventOutcome::Skip;
         }
         Msg::Fs(Ok(event)) => {
@@ -2904,14 +2943,20 @@ fn dir_watch_startup(
         },
         notify::Config::default(),
     )
-    .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
+    .map_err(|e| {
+        miette::miette!(
+            "failed to initialize file watcher: {}",
+            safe_inline(notify_cause(&e))
+        )
+    })?;
 
     // Watch the root recursively.
     watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
         miette::miette!(
-            "failed to watch directory {}: {e}\n\
+            "failed to watch directory {}: {}\n\
                  hint: on Linux you may need to increase fs.inotify.max_user_watches",
-            safe_path(&shown_watched_dir(root, watch_root.root_paths(), vars_dir))
+            safe_path(&shown_watched_dir(root, watch_root.root_paths(), vars_dir)),
+            safe_inline(notify_cause(&e))
         )
     })?;
 
@@ -2923,7 +2968,7 @@ fn dir_watch_startup(
             eprint_warning(&format!(
                 "warning: failed to watch vars directory {}: {}",
                 safe_path(&shown_watched_dir(vd, watch_root.root_paths(), vars_dir)),
-                safe_inline(&e)
+                safe_inline(notify_cause(&e))
             ));
         }
     }
@@ -3047,7 +3092,7 @@ fn dir_watch_startup(
                     watch_root.root_paths(),
                     vars_dir
                 )),
-                safe_inline(&e)
+                safe_inline(notify_cause(&e))
             ));
         }
     }
@@ -3346,7 +3391,7 @@ fn process_dir_batch_vars_changed(
                         eprint_warning(&format!(
                             "warning: could not remove {}: {}",
                             safe_path(&out.shown),
-                            safe_inline(&e)
+                            safe_inline(io_cause(&e))
                         ));
                     }
                 }
@@ -3514,7 +3559,7 @@ fn process_dir_batch_incremental(
                         eprint_warning(&format!(
                             "warning: could not remove {}: {}",
                             safe_path(&out.shown),
-                            safe_inline(&e)
+                            safe_inline(io_cause(&e))
                         ));
                     }
                 }
@@ -5250,7 +5295,14 @@ mod tests {
         let failed = std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left");
         match OutputWrite::from_stdout(StdoutOutcome::Failed(failed)) {
             OutputWrite::Failed(Some(report)) => {
-                assert_eq!(report.to_string(), "cannot write to stdout: no space left");
+                assert_eq!(
+                    report.to_string(),
+                    format!(
+                        "cannot write to stdout: {}",
+                        std::io::ErrorKind::StorageFull
+                    ),
+                    "the error's kind, not the text it carries (#390)"
+                );
                 assert_eq!(
                     report.code().map(|c| c.to_string()).as_deref(),
                     Some("mds::io")

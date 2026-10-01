@@ -78,7 +78,8 @@ use crate::build::{
 use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
 use crate::output::{
     atomic_write_file, catch_compile, collect_mds_files_detailed, eprint_warning,
-    render_unified_diff, safe_inline, safe_path, Durability, Panicked, STDIN_DISPLAY_LABEL,
+    render_unified_diff, safe_inline, safe_path, Durability, Panicked, WriteTarget,
+    STDIN_DISPLAY_LABEL,
 };
 
 // AC-224-15: No local rule-name list. The single source of truth is
@@ -1138,7 +1139,11 @@ fn apply_fix(
             };
         }
     };
-    let fix = match atomic_write_file(path, &new_source, Durability::Fsync) {
+    let fix = match atomic_write_file(
+        &WriteTarget::as_typed(path.to_path_buf()),
+        &new_source,
+        Durability::Fsync,
+    ) {
         Ok(()) => Rewrite::Written { residual, partial },
         Err(error) => {
             // A directory's JSON document holds one entry per file, so a rewrite that

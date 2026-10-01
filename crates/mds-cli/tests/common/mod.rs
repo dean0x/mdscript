@@ -599,6 +599,24 @@ pub fn spawn_watch_ready_stderr_untapped(cmd: &mut Command) -> (Child, Option<St
     (child, stdout_tap)
 }
 
+/// [`spawn_watch_ready`] with the readiness file at `marker`, a path the caller chose —
+/// so it can plant something at it, or at the temporary path beside it, first. `marker`
+/// must be absolute and in a directory that test owns.
+#[allow(dead_code)]
+pub fn spawn_watch_ready_at(
+    cmd: &mut Command,
+    marker: &Path,
+) -> (Child, StderrTap, Option<StdoutTap>) {
+    assert!(
+        marker.is_absolute(),
+        "MDS_TEST_READY must be absolute; mds watch ignores relative values"
+    );
+    let (mut child, tap, stdout_tap) =
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", marker));
+    wait_for_ready(marker, &mut child, || tap.text());
+    (child, tap, stdout_tap)
+}
+
 /// The file one spawned watcher creates when it is live (`MDS_TEST_READY`).
 struct ReadyFile {
     /// A private directory per spawn: the suite runs at full parallelism, so a shared
@@ -623,39 +641,44 @@ impl ReadyFile {
         &self.path
     }
 
-    /// Block until `child` has created the marker. `stderr` reports what the child has
-    /// printed so far, for the panic messages.
-    ///
-    /// # Panics
-    /// Panics if the child exits first, or if [`READY_TIMEOUT`] passes (the child is
-    /// killed and reaped first).
+    /// Block until `child` has created the marker; see [`wait_for_ready`].
     fn wait(&self, child: &mut Child, stderr: impl Fn() -> String) {
-        // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
-        let deadline = std::time::Instant::now() + READY_TIMEOUT;
-        loop {
-            if std::fs::read(&self.path).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
-                return;
-            }
-            // Check liveness before the deadline so a watcher that failed at startup is
-            // reported as "exited", not as "timed out".
-            if let Ok(Some(status)) = child.try_wait() {
-                let seen = stderr();
-                panic!(
-                    "mds watch exited with {status:?} before signalling readiness; \
-                     stderr was:\n{seen}"
-                );
-            }
-            if std::time::Instant::now() >= deadline {
-                let seen = stderr();
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "mds watch did not signal readiness within {READY_TIMEOUT:?}; \
-                     stderr so far was:\n{seen}"
-                );
-            }
-            std::thread::sleep(READY_POLL);
+        wait_for_ready(&self.path, child, stderr);
+    }
+}
+
+/// Block until `child` has created the readiness file at `marker`. `stderr` reports what
+/// the child has printed so far, for the panic messages.
+///
+/// # Panics
+/// Panics if the child exits first, or if [`READY_TIMEOUT`] passes (the child is killed
+/// and reaped first).
+fn wait_for_ready(marker: &Path, child: &mut Child, stderr: impl Fn() -> String) {
+    // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    loop {
+        if std::fs::read(marker).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
+            return;
         }
+        // Check liveness before the deadline so a watcher that failed at startup is
+        // reported as "exited", not as "timed out".
+        if let Ok(Some(status)) = child.try_wait() {
+            let seen = stderr();
+            panic!(
+                "mds watch exited with {status:?} before signalling readiness; \
+                 stderr was:\n{seen}"
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            let seen = stderr();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "mds watch did not signal readiness within {READY_TIMEOUT:?}; \
+                 stderr so far was:\n{seen}"
+            );
+        }
+        std::thread::sleep(READY_POLL);
     }
 }
 

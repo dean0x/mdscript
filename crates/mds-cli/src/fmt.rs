@@ -32,8 +32,8 @@ use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::{
-    atomic_write_file, catch_compile, collect_mds_files_detailed, render_unified_diff,
-    stdout_failure, write_stdout, Durability, Panicked, StdoutOutcome,
+    atomic_write_file, catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path,
+    stdout_failure, write_stdout, Durability, Panicked, StdoutOutcome, WriteTarget,
 };
 
 pub(crate) struct FmtArgs {
@@ -156,12 +156,12 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     // path and does not silently fall through to the structural_equivalent fallback
     // that would swallow a genuine mds::syntax error. avoids PF-006, applies ADR-001.
     let base_dir = Some(effective_parent(path));
-    let file_name = path.display().to_string();
+    // The label of its error frames and of its `--diff` header (#390).
+    let file_name = safe_path(path);
     let result = format_source_named(&source, base_dir, &file_name)?;
 
     if diff && result.changed {
-        let label = crate::output::safe_path(path);
-        let rendered = render_unified_diff(&source, &result.formatted, &label);
+        let rendered = render_unified_diff(&source, &result.formatted, &file_name);
         write_stdout(rendered.as_bytes()).into_batch_result()?;
     }
 
@@ -171,7 +171,11 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
             // Atomic write preserves file permissions and avoids truncate-then-write
             // data loss on crash or full disk (avoids the issue fixed for lint by
             // commit c5aa086 — both write paths now share the same helper).
-            atomic_write_file(path, &result.formatted, Durability::Fsync)?;
+            atomic_write_file(
+                &WriteTarget::as_typed(path.to_path_buf()),
+                &result.formatted,
+                Durability::Fsync,
+            )?;
             if !quiet {
                 crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
             }
@@ -221,12 +225,17 @@ enum FileOutcome {
 /// returned as [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
 /// read and format errors are treated in the surrounding loop — and recorded as I/O
 /// failures, so the run exits at least 2; so is a read or format error in the I/O and
-/// file-system class. A failing stdout is reported once for the run; every file whose
-/// diff it lost counts as failed. A closed stdout is not a failure: the diff has no
-/// reader, and the file's outcome stands (#157).
+/// file-system class. A failing stdout is reported once per failure episode — the first
+/// failed write since the run began or since a write last landed; every file whose diff
+/// it lost counts as failed. A closed stdout is not a failure: the diff has no reader,
+/// and the file's outcome stands (#157).
+///
+/// `file` is the walk's path, below the directory argument as typed: the label of its
+/// error frames and of its `--diff` header, as a file argument typed that way is named
+/// (#390).
 fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, quiet } = flags;
-    let file_name = file.display().to_string();
+    let file_name = safe_path(file);
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
@@ -280,7 +289,11 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         // Atomic write preserves file permissions and avoids truncate-then-write
         // data loss on crash or full disk — same guarantee as lint --fix (avoids
         // the divergence introduced after commit c5aa086 hardened the lint path).
-        match atomic_write_file(file, &result.formatted, Durability::Fsync) {
+        match atomic_write_file(
+            &WriteTarget::as_typed(file.to_path_buf()),
+            &result.formatted,
+            Durability::Fsync,
+        ) {
             Ok(()) => {
                 if !quiet {
                     crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(file));

@@ -42,7 +42,7 @@ use common::{
     ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
 };
 #[cfg(unix)]
-use common::{full_file, limit_file_growth};
+use common::{full_file, limit_file_growth, spawn_watch_ready_at};
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -5859,6 +5859,46 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
         "the whole startup output must reach stdout; got {} bytes of {}",
         stdout.len(),
         body.len()
+    );
+}
+
+/// A symlink planted at the readiness file's temporary path does not redirect the marker
+/// (#390): `mds watch` creates that file new, never through an entry already there, so the
+/// file the link points to keeps its bytes and the marker is a file of its own. Control:
+/// the watcher still signals readiness — the harness returns only once the marker holds
+/// its text.
+///
+/// Unix-only: it plants a symlink, which Windows creates only with a privilege.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_readiness_file_s_temporary_path_does_not_redirect_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Page\n").unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, "VICTIM\n").unwrap();
+    let marker = dir.path().join("ready");
+    std::os::unix::fs::symlink(&victim, dir.path().join("ready.tmp")).unwrap();
+
+    let (child, _tap, _) = spawn_watch_ready_at(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
+            .stdout(Stdio::null()),
+        &marker,
+    );
+    let _child = ChildGuard(child);
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "VICTIM\n",
+        "the file the planted link points to keeps its bytes"
+    );
+    assert!(
+        std::fs::symlink_metadata(&marker)
+            .unwrap()
+            .file_type()
+            .is_file(),
+        "the marker is a file of its own, not the planted link"
     );
 }
 

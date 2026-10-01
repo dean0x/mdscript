@@ -468,7 +468,7 @@ fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
     if filename.exists() && !force {
         return Err(miette::miette!(
             "{} already exists (use --force to overwrite)",
-            filename.display()
+            output::safe_path(&filename)
         ));
     }
     let starter = "\
@@ -490,7 +490,11 @@ Your items:
     // written through; `--force` replaces a regular file by rename with its mode
     // preserved. `RenameOnly` because the starter is a fixed public template a re-run
     // reproduces.
-    output::atomic_write_file(&filename, starter, output::Durability::RenameOnly)?;
+    output::atomic_write_file(
+        &output::WriteTarget::as_typed(filename.clone()),
+        starter,
+        output::Durability::RenameOnly,
+    )?;
     if !quiet {
         output::ewriteln!(
             "Created {}\n  Try: mds build {}",

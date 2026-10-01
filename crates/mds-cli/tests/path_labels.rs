@@ -3,14 +3,12 @@
 //! path as typed, or as the part below a directory the user named, as typed — the
 //! directory argument, `--out-dir`, the directory `mds.json` was reached by, or the
 //! entry's directory — never by a canonical or absolute spelling the user did not type;
-//! `mds lint`'s rule findings name a file argument by its file name. The carve-outs
-//! are pinned as they stand: the text of an error writing an output names the path the
-//! write was given, the canonical one below a directory resolved to it, and tempfile's own
-//! cause text an absolute one, as does notify's own cause text after the colon of a
-//! `failed to watch` line on Linux, which the absence check skips; and the file name of
+//! `mds lint`'s rule findings name a file argument by its file name. The cause an error
+//! pinned here gives after its path — the operating system's, the file watcher's or
+//! tempfile's — names no path. The carve-outs are pinned as they stand: the file name of
 //! `mds watch`'s output beside its entry is the one the volume holds, which differs from
-//! the name as typed for an entry typed in another case on a case-insensitive volume. A
-//! directory `mds watch` watches for a dependency outside the entry's directory and the
+//! the name as typed for an entry typed in another case on a case-insensitive volume, and
+//! a directory `mds watch` watches for a dependency outside the entry's directory and the
 //! directory argument has only the path the compile reported (one below either is named
 //! below it as typed — only a refused watch prints it, so watch.rs's unit tests pin that).
 //!
@@ -1654,8 +1652,10 @@ fn an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk() {
 
 /// `failed to watch vars directory` names the directory as the `--vars` file was typed:
 /// a directory that does not exist, and — for a bare file name — the working directory,
-/// which the session asks the watcher for as the empty path. Neither file exists, so each
-/// session then ends at startup, refusing the `--vars` file.
+/// which the session asks the watcher for as the empty path. The cause after it is the
+/// watcher's, without the path notify lists, so no line of the run names the scratch
+/// directory. Neither file exists, so each session then ends at startup, refusing the
+/// `--vars` file.
 ///
 /// The bare name runs on macOS only: its watcher refuses the empty path, while the Linux
 /// and Windows watchers resolve it against the working directory, which exists, and watch
@@ -1700,42 +1700,28 @@ fn a_vars_directory_that_cannot_be_watched_is_named_as_typed() {
             "{label}: a missing --vars file ends the session at startup; stderr: {stderr}"
         );
         let warning = format!(
-            "warning: failed to watch vars directory {}: ",
+            "warning: failed to watch vars directory {}: {WATCHER_REFUSAL}\n",
             native(shown)
         );
         assert!(
             stderr.contains(&warning),
-            "{label}: the directory is named as the --vars file was typed; stderr: {stderr}"
+            "{label}: the directory is named as the --vars file was typed, and the watcher's \
+             cause names no path; stderr: {stderr}"
         );
-        // The text after the colon is notify's own error, which its Linux backend quotes
-        // with an absolute path; a path-free cause is a later change. Until then the
-        // absence check covers every line but that cause.
-        let authored = stderr
-            .lines()
-            .map(|line| {
-                if line.starts_with(&warning) {
-                    warning.as_str()
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(leak(&authored, root), None, "{label}: stderr: {stderr}");
+        assert_eq!(leak(&stderr, root), None, "{label}: stderr: {stderr}");
     }
 }
 
-// ── Carve-outs: the text of an error writing an output ───────────────────────
+/// The cause the file watcher gives for a directory that does not exist, once `mds`
+/// drops the paths notify lists after it (#390). Windows' watcher words its own refusal;
+/// FSEvents and inotify report notify's "path not found".
+const WATCHER_REFUSAL: &str = if cfg!(windows) {
+    "Input watch path is neither a file nor a directory."
+} else {
+    "No path was found."
+};
 
-/// `root/rel`'s canonical path, as `mds` prints a path it was given in that form.
-#[cfg(unix)]
-fn canonical(root: &Path, rel: &str) -> String {
-    root.join(rel)
-        .canonicalize()
-        .expect("the path exists")
-        .display()
-        .to_string()
-}
+// ── The text of an error writing an output ───────────────────────────────────
 
 /// `path`'s refusal as a symlink at an output's path.
 #[cfg(unix)]
@@ -1755,19 +1741,20 @@ fn plant_symlink(root: &Path, rel: &str) {
     std::os::unix::fs::symlink(target, at).expect("plant a symlink");
 }
 
-/// Carve-out (spec §7.10): the text of an error writing an output names the path the write
-/// was given. Below a directory argument's `--out-dir` and below `mds.json`
-/// `build.output_dir`, in either mode, that is the canonical path — in `cannot write …` and
-/// in `could not remove stale output …` — though the status line names the output as typed.
-/// Under `-o`, below a file argument's `--out-dir` and beside the source it is the path as
-/// typed (the controls). The cause tempfile gives, `at path "…"`, names the temporary
-/// file's absolute path even then.
+/// The text of an error writing an output names it as its `Compiled to` line does, and
+/// the cause after it names no path (#390): below a directory argument's `--out-dir` and
+/// below `mds.json` `build.output_dir`, where the write goes to the directory's canonical
+/// path, as well as under `-o`, below a file argument's `--out-dir` and beside the source
+/// — in `cannot write …`, in `could not remove stale output …`, and in
+/// `cannot create temp file for …`, whose cause is the error's kind alone where tempfile
+/// added the temporary file's absolute path to it. Each error's presence is the control
+/// for the absence of the scratch directory from the run's output.
 ///
 /// Unix-only: it plants symlinks and makes a directory read-only; the read-only arm is
 /// skipped with a reason where the mode does not stop a write (running as root).
 #[cfg(unix)]
 #[test]
-fn an_error_writing_below_a_resolved_output_directory_names_the_canonical_path() {
+fn an_error_writing_an_output_names_it_as_its_status_line_does() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = scratch();
@@ -1784,32 +1771,28 @@ fn an_error_writing_below_a_resolved_output_directory_names_the_canonical_path()
     plant_symlink(root, "o4/a.md");
     plant_symlink(root, "o5/y.md");
 
-    // (working directory, arguments, the error's text)
-    let canonical_cases = [
+    // (working directory, arguments, the output as its status line names it)
+    for (cwd, args, shown) in [
+        (".", &["build", "src", "--out-dir", "out"][..], "out/a.md"),
+        ("proj", &["build", "p.mds"][..], "./dist/p.md"),
+        ("proj", &["build", "src"][..], "src/../dist/q.md"),
+        (".", &["build", "src/a.mds", "-o", "o5/y.md"][..], "o5/y.md"),
         (
             ".",
-            &["build", "src", "--out-dir", "out"][..],
-            refused(&format!("{}/a.md", canonical(root, "out"))),
+            &["build", "src/a.mds", "--out-dir", "o4"][..],
+            "o4/a.md",
         ),
-        (
-            "proj",
-            &["build", "p.mds"][..],
-            refused(&format!("{}/p.md", canonical(root, "proj/dist"))),
-        ),
-        (
-            "proj",
-            &["build", "src"][..],
-            refused(&format!("{}/q.md", canonical(root, "proj/dist"))),
-        ),
-    ];
-    for (cwd, args, error) in canonical_cases {
+        (".", &["build", "nts/n.mds"][..], "nts/n.md"),
+        (".", &["build", "nts"][..], "nts/n.md"),
+    ] {
         let out = run(&root.join(cwd), args);
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
         assert!(
-            squash(&stderr).contains(&squash(&error)),
-            "{args:?}: the error names the canonical path, {error:?}; stderr: {stderr}"
+            squash(&stderr).contains(&squash(&refused(shown))),
+            "{args:?}: the error names the output as {shown:?}; stderr: {stderr}"
         );
+        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
     }
 
     // A stale `x.md` that is a directory, which no file removal removes, beside the
@@ -1819,56 +1802,27 @@ fn an_error_writing_below_a_resolved_output_directory_names_the_canonical_path()
     put(root, "stale/x.md/keep", "keep\n");
     put(root, "proj/msrc/x.mds", "@message user:\nHi\n@end\n");
     put(root, "proj/dist/x.md/keep", "keep\n");
-    // (working directory, arguments, the status line, the directory the error names)
-    for (cwd, args, status, written) in [
-        (
-            ".",
-            &["build", "msrc", "--out-dir", "stale"][..],
-            "Compiled to stale/x.json\n",
-            "stale",
-        ),
-        (
-            "proj",
-            &["build", "msrc"][..],
-            "Compiled to msrc/../dist/x.json\n",
-            "proj/dist",
-        ),
+    // (working directory, arguments, the output as its status line names it)
+    for (cwd, args, shown) in [
+        (".", &["build", "msrc", "--out-dir", "stale"][..], "stale/x"),
+        ("proj", &["build", "msrc"][..], "msrc/../dist/x"),
     ] {
         let out = run(&root.join(cwd), args);
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
         assert!(
-            stderr.contains(status),
+            stderr.contains(&format!("Compiled to {shown}.json\n")),
             "{args:?}: the status line names the output as typed; stderr: {stderr}"
         );
-        let error = format!(
-            "could not remove stale output {}/x.md: ",
-            canonical(root, written)
-        );
+        let error = format!("could not remove stale output {shown}.md: ");
         assert!(
             squash(&stderr).contains(&squash(&error)),
-            "{args:?}: the error names the canonical path, {error:?}; stderr: {stderr}"
-        );
-    }
-
-    // Controls: the write was given the path as typed, and the error names it so.
-    for (args, shown) in [
-        (&["build", "src/a.mds", "-o", "o5/y.md"][..], "o5/y.md"),
-        (&["build", "src/a.mds", "--out-dir", "o4"][..], "o4/a.md"),
-        (&["build", "nts/n.mds"][..], "nts/n.md"),
-        (&["build", "nts"][..], "nts/n.md"),
-    ] {
-        let out = run(root, args);
-        let stderr = text(&out.stderr);
-        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
-        assert!(
-            squash(&stderr).contains(&squash(&refused(shown))),
-            "{args:?}: the error names the path as typed, {shown:?}; stderr: {stderr}"
+            "{args:?}: the error names the stale output as typed, {error:?}; stderr: {stderr}"
         );
         assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
     }
 
-    // tempfile's cause text: a temporary file in a read-only directory.
+    // A temporary file in a read-only directory: tempfile's error names the file.
     std::fs::create_dir(root.join("ro")).unwrap();
     std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
     let _writable = Writable(root.join("ro"));
@@ -1880,28 +1834,32 @@ fn an_error_writing_below_a_resolved_output_directory_names_the_canonical_path()
     let out = run(root, &["build", "src/a.mds", "-o", "ro/y.md"]);
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
-    for part in [
-        "cannot create temp file for ro/y.md: ".to_owned(),
-        format!("at path \"{}/.mds-tmp-", canonical(root, "ro")),
-    ] {
-        assert!(
-            squash(&stderr).contains(&squash(&part)),
-            "{part:?}; stderr: {stderr}"
-        );
-    }
+    let error = format!(
+        "cannot create temp file for ro/y.md: {}",
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(
+        squash(&stderr).contains(&squash(&error)),
+        "{error:?}; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(".mds-tmp-") && !stderr.contains("at path"),
+        "no temporary file is named; stderr: {stderr}"
+    );
+    assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
 }
 
-/// Carve-out (spec §7.10): `mds watch` names the path the write was given in the text of
-/// an error writing an output — the canonical path beside the entry and beside a directory
-/// argument's source, the path as typed under `-o` and below file mode's `--out-dir` (the
-/// controls) — and the canonical path below a directory argument's `--out-dir` in the
-/// warning that a stale output of the other kind could not be removed, though the
-/// `Recompiled` line names the output as typed.
+/// `mds watch` names an output in the text of an error writing it as its `Compiled to`
+/// line does (#390): beside the entry and beside a directory argument's source, where the
+/// write goes to the canonical path, as well as under `-o` and below file mode's
+/// `--out-dir`; and below a directory argument's `--out-dir` in the warning that a stale
+/// output of the other kind could not be removed, as the `Recompiled` line beside it
+/// does. Each error's presence is the control for the absence of the scratch directory.
 ///
 /// Unix-only: it plants symlinks.
 #[cfg(unix)]
 #[test]
-fn watch_names_the_path_written_in_an_error_writing_an_output() {
+fn watch_names_an_output_as_its_status_line_does_in_an_error_writing_it() {
     let dir = scratch();
     let root = dir.path();
     for (source, output) in [
@@ -1914,30 +1872,16 @@ fn watch_names_the_path_written_in_an_error_writing_an_output() {
         plant_symlink(root, output);
     }
 
-    // (arguments, the startup write's refusal, whether it names the path as typed)
-    let cases = [
-        (
-            &["watch", "d1"][..],
-            refused(&format!("{}/a.md", canonical(root, "d1"))),
-            false,
-        ),
-        (
-            &["watch", "w1/page.mds"][..],
-            refused(&format!("{}/page.md", canonical(root, "w1"))),
-            false,
-        ),
-        (
-            &["watch", "w2/page.mds", "-o", "o2/y.md"][..],
-            refused("o2/y.md"),
-            true,
-        ),
+    // (arguments, the output the startup write refuses, as its status line names it)
+    for (args, shown) in [
+        (&["watch", "d1"][..], "d1/a.md"),
+        (&["watch", "w1/page.mds"][..], "w1/page.md"),
+        (&["watch", "w2/page.mds", "-o", "o2/y.md"][..], "o2/y.md"),
         (
             &["watch", "w3/page.mds", "--out-dir", "o3"][..],
-            refused("o3/page.md"),
-            true,
+            "o3/page.md",
         ),
-    ];
-    for (args, error, typed) in cases {
+    ] {
         let (child, tap, _) = common::spawn_watch_unsynchronized(
             mds_bin()
                 .current_dir(root)
@@ -1949,13 +1893,12 @@ fn watch_names_the_path_written_in_an_error_writing_an_output() {
         // The refusal's last word: an error frame may wrap the line between any two.
         common::wait_for_tap(&tap, "symlink", WATCH_STEP);
         let stderr = tap.finish_text(&mut child);
+        let error = refused(shown);
         assert!(
             squash(&stderr).contains(&squash(&error)),
             "{args:?}: {error:?}; stderr: {stderr}"
         );
-        if typed {
-            assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
-        }
+        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
     }
 
     // The stale output this session wrote, replaced by a directory no file removal
@@ -1967,18 +1910,16 @@ fn watch_names_the_path_written_in_an_error_writing_an_output() {
     write_atomic(&root.join("d5/a.mds"), "@message user:\nHi\n@end\n");
     common::wait_for_tap(&tap, "stale", WATCH_STEP);
     let stderr = tap.finish_text(&mut child);
-    let warning = format!(
-        "warning: could not remove stale output {}/a.md: ",
-        canonical(root, "o5")
-    );
+    let warning = "warning: could not remove stale output o5/a.md: ";
     assert!(
-        squash(&stderr).contains(&squash(&warning)),
+        squash(&stderr).contains(&squash(warning)),
         "{warning:?}; stderr: {stderr}"
     );
     assert!(
         stderr.contains("Recompiled o5/a.json ("),
         "the rebuild names the output as typed; stderr: {stderr}"
     );
+    assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
 }
 
 // ── Windows ──────────────────────────────────────────────────────────────────
@@ -2124,7 +2065,7 @@ const LABEL_TABLE: &[&[&str]] = &[
     &["an_output_directory_that_cannot_be_created_is_named_as_its_output_is"],
     &["the_config_source_map_warning_names_mds_json_as_reached"],
     &["r3_error_frame_names_root_relative_path_for_subdir_file"],
-    &["an_error_writing_below_a_resolved_output_directory_names_the_canonical_path"],
+    &["an_error_writing_an_output_names_it_as_its_status_line_does"],
     &[SWEEP],
     &["fmt_names_a_file_argument_as_typed_and_a_directory_s_entries_below_it"],
     &["fmt_names_a_file_argument_as_typed_and_a_directory_s_entries_below_it"],
@@ -2168,7 +2109,7 @@ const LABEL_TABLE: &[&[&str]] = &[
         "a_watched_directory_is_named_as_the_user_typed_it",
     ],
     &["a_watched_directory_is_named_as_the_user_typed_it"],
-    &["watch_names_the_path_written_in_an_error_writing_an_output"],
+    &["watch_names_an_output_as_its_status_line_does_in_an_error_writing_it"],
     &["init_names_the_file_it_creates_as_typed"],
     &[
         "a_relative_output_location_is_refused_where_the_working_directory_is_gone",

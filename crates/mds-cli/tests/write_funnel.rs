@@ -13,14 +13,15 @@
 //!
 //! # Scope and lexical limits (what this guard does NOT see)
 //!
-//! The scan is lexical. It matches the two needles in [`NEEDLES`] after masking comment
+//! The scan is lexical. It matches the three needles in [`NEEDLES`] after masking comment
 //! and string-literal text and stripping `#[cfg(test)] mod … { … }` blocks (test code
 //! legitimately writes fixtures with `std::fs::write`). It therefore does NOT catch:
 //!
-//! - `OpenOptions::new(…).write(true)` followed by `write_all` on a hand-opened `File`.
-//!   No such site exists in this crate today. Needling `OpenOptions::new(` was rejected
-//!   deliberately: it would fire on read-only opens too, and an allow-list full of
-//!   read-only entries is an allow-list nobody reads.
+//! - `OpenOptions::new(…).write(true)` without `.create_new(` — a hand-opened `File` that
+//!   may already exist — followed by `write_all`. No such site exists in this crate
+//!   today. Needling `OpenOptions::new(` was rejected deliberately: it would fire on
+//!   read-only opens too, and an allow-list full of read-only entries is an allow-list
+//!   nobody reads.
 //! - A write reached through an alias (`use std::fs::write as w;`) or a helper in another
 //!   crate.
 //! - `#[cfg(test)] fn` items outside a `mod tests` block (the crate has none).
@@ -31,8 +32,9 @@
 use std::path::{Path, PathBuf};
 
 /// Raw write entry points that must be funnelled. `std::fs::write(` contains
-/// `fs::write(`, so the short form matches both the qualified and imported spellings.
-const NEEDLES: &[&str] = &["fs::write(", "File::create("];
+/// `fs::write(`, so the short form matches both the qualified and imported spellings;
+/// `.create_new(` is a file a hand-built `OpenOptions` creates.
+const NEEDLES: &[&str] = &["fs::write(", "File::create(", ".create_new("];
 
 /// Production sites that may keep a raw write: `(file basename, needle, max hits, why)`.
 ///
@@ -42,9 +44,10 @@ const NEEDLES: &[&str] = &["fs::write(", "File::create("];
 /// behind for a future raw write to hide under.
 const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[(
     "watch.rs",
-    "fs::write(",
+    ".create_new(",
     1,
-    "test-only readiness marker: written to <path>.tmp then renamed — already atomic",
+    "test-only readiness marker: created new at <path>.tmp, never through an entry \
+     already there, then renamed — already atomic",
 )];
 
 #[test]
@@ -182,6 +185,15 @@ fn the_guard_flags_a_planted_raw_write() {
         scan_violation_count("fn f(p: &Path) { let _ = std::fs::File::create(p); }"),
         1,
         "a planted File::create in a plain fn must be flagged"
+    );
+
+    // So is the third: a file a hand-built `OpenOptions` creates new.
+    assert_eq!(
+        scan_violation_count(
+            "fn f(p: &Path) { let _ = OpenOptions::new().write(true).create_new(true).open(p); }"
+        ),
+        1,
+        "a planted create_new open in a plain fn must be flagged"
     );
 }
 

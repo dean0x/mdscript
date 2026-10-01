@@ -311,7 +311,7 @@ impl StdoutOutcome {
 /// pipe (#157).
 pub(crate) fn stdout_failure(e: &std::io::Error) -> mds::MdsError {
     mds::MdsError::Io {
-        message: format!("cannot write to stdout: {}", safe_inline(e)),
+        message: format!("cannot write to stdout: {}", safe_inline(io_cause(e))),
     }
 }
 
@@ -867,8 +867,8 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// - `mds check -`: `run_check` in `crates/mds-cli/src/main.rs`
 /// - `mds build -` (single-file path): `compile_to_content` in `crates/mds-cli/src/build.rs`
 /// - `mds build -` (directory stdin path): `run_build` in `crates/mds-cli/src/build.rs`
-/// - `mds lint -`: `run_lint_stdin` in `crates/mds-cli/src/lint.rs` (direct call)
-///   and `run_lint_file` via `emit_analysis_failure_json_or_stderr` (indirect)
+/// - `mds lint -`: the human result sink's `analysis_failure` in
+///   `crates/mds-cli/src/lint_sink.rs`, for every failure of a stdin run
 ///
 /// Any new CLI boundary that renders a stdin analysis failure must call this
 /// function; skipping it renders `<source>` and breaks the uniform-sentinel rule.
@@ -902,7 +902,10 @@ pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Re
 /// same failure read the same.
 pub(crate) fn current_dir() -> std::result::Result<PathBuf, mds::MdsError> {
     std::env::current_dir().map_err(|e| mds::MdsError::Io {
-        message: format!("cannot determine current directory: {}", safe_inline(&e)),
+        message: format!(
+            "cannot determine current directory: {}",
+            safe_inline(io_cause(&e))
+        ),
     })
 }
 
@@ -1053,9 +1056,9 @@ pub(crate) enum OutputBase {
 /// `path` is where the bytes go. `shown` is the same file as the user named it: the path
 /// as typed, or the part below a directory they named — the directory argument,
 /// `--out-dir`, or the directory `mds.json` was reached by — joined to that directory as
-/// typed. A status line, and a message the caller writes itself, names the file by
-/// `shown` alone, so display never resolves a path again; the text of an I/O error that
-/// [`atomic_write_file`] raises for `path` still names `path`.
+/// typed. A status line, a message the caller writes itself, and the error
+/// [`atomic_write_file`] raises writing it name the file by `shown` alone, so display
+/// never resolves a path again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteTarget {
     pub(crate) path: PathBuf,
@@ -1552,28 +1555,27 @@ pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
 /// cannot be removed is an `mds::io` error the caller reports (#157); nothing is printed
 /// here.
 ///
-/// `base_path` must be the path WITHOUT extension (e.g. `/out/foo` for a source
-/// `foo.mds`). The function constructs `base_path.with_extension("md")` and
-/// `base_path.with_extension("json")` and removes the one that contradicts `kind`.
+/// `base_no_ext` is the output's path WITHOUT extension (e.g. `/out/foo` for a source
+/// `foo.mds`) in both of [`output_stem_for`]'s forms. The function constructs
+/// `with_extension("md")` and `with_extension("json")` of it and removes the one that
+/// contradicts `kind`; its error names that file by the `shown` form (#390).
 ///
 /// AC-FUNC-23 (watch format-flip) and the equivalent dir-build stale-cleanup both
 /// call this function so the probe-and-unlink logic is shared.
 pub(crate) fn probe_and_remove_stale(
-    base_no_ext: &Path,
+    base_no_ext: &WriteTarget,
     kind: OutputKind,
 ) -> std::result::Result<(), mds::MdsError> {
     let stale_ext = kind.stale_extension();
-    let stale_path = base_no_ext.with_extension(stale_ext);
-    if !stale_path.exists() {
+    let stale = base_no_ext.sibling(|base| base.with_extension(stale_ext));
+    if !stale.path.exists() {
         return Ok(());
     }
-    // The path is walker-derived and the `io::Error` Display embeds a path of its own,
-    // so both are WIRE-escaped as the message is built.
-    std::fs::remove_file(&stale_path).map_err(|e| mds::MdsError::Io {
+    std::fs::remove_file(&stale.path).map_err(|e| mds::MdsError::Io {
         message: format!(
             "could not remove stale output {}: {}",
-            safe_path(&stale_path),
-            safe_inline(&e)
+            safe_path(&stale.shown),
+            safe_inline(io_cause(&e))
         ),
     })
 }
@@ -1633,7 +1635,8 @@ fn mirror_stem(source: &Path, root: &Path, d: &Path) -> MirroredStem {
 
 /// Return the path stem (path without extension) for a compiled source.
 ///
-/// Used to construct the `base_no_ext` argument to [`probe_and_remove_stale`].
+/// The `path` of [`output_stem_for`], whose result is the `base_no_ext` argument to
+/// [`probe_and_remove_stale`].
 ///
 /// For `Dir` mode this defers to [`mirror_stem`] so the stem is always computed
 /// consistently with [`output_path_for`], below the directory's canonical form: the stem
@@ -1738,23 +1741,26 @@ pub(crate) enum Durability {
 ///
 /// # Errors
 ///
-/// Every failure is `mds::io` (exit 2, #157), its message naming the target.
+/// Every failure is `mds::io` (exit 2, #157). Its message names the target by
+/// `target.shown`, the form the caller's status line names it by, never by
+/// `target.path`, and the cause after it names no path ([`io_cause`]) (#390).
 pub(crate) fn atomic_write_file(
-    path: &Path,
+    target: &WriteTarget,
     content: &str,
     durability: Durability,
 ) -> std::result::Result<(), mds::MdsError> {
     use mds::{effective_parent, NativeFs};
 
+    let path = target.path.as_path();
     // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
     let parent = effective_parent(path);
 
-    // #409: this primitive writes every `mds build`/`watch` output (under a
-    // possibly-canonicalized `--out-dir`) and every `fmt`/`lint --fix` source
-    // rewrite, so its own error text must show the conventional form too, not a
-    // Windows verbatim prefix. Computed once and reused below.
-    let shown = mds::display_native_path(path);
-    let io_error = |message: String| mds::MdsError::Io { message };
+    // Every message names the file as the caller's status line does (#390), escaped and
+    // without a Windows verbatim prefix (#409).
+    let shown = safe_path(&target.shown);
+    let io_error = |what: &str, cause: String| mds::MdsError::Io {
+        message: format!("{what} {shown}: {}", safe_inline(cause)),
+    };
 
     // #227: `mds build` targets may not exist yet. Probe with lstat, which never
     // follows a symlink: `Ok` means something is there (a regular file, or a
@@ -1764,19 +1770,16 @@ pub(crate) fn atomic_write_file(
     let existing = match path.symlink_metadata() {
         Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_error(format!("cannot stat {}: {e}", shown.display()))),
+        Err(e) => return Err(io_error("cannot stat", io_cause(&e))),
     };
 
     if let Some(m) = &existing {
         if m.file_type().is_symlink() {
-            return Err(io_error(format!(
-                "cannot write {}: refusing to replace a symlink",
-                shown.display()
-            )));
+            return Err(io_error("cannot write", SYMLINK_REFUSAL.to_owned()));
         }
-        // Re-check for symlink right before writing (TOCTOU guard).
-        NativeFs::check_symlink(path)
-            .map_err(|e| io_error(format!("cannot write {}: {e}", shown.display())))?;
+        // Re-check for symlink right before writing (TOCTOU guard). Its error names
+        // `path`, so the refusal is worded here instead.
+        NativeFs::check_symlink(path).map_err(|e| io_error("cannot write", recheck_refusal(&e)))?;
     }
 
     // Mode to restore on Unix. The lstat result of a non-symlink IS the file's
@@ -1801,12 +1804,10 @@ pub(crate) fn atomic_write_file(
         use std::os::unix::fs::PermissionsExt as _;
         builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    let mut tmp = builder.tempfile_in(parent).map_err(|e| {
-        io_error(format!(
-            "cannot create temp file for {}: {e}",
-            shown.display()
-        ))
-    })?;
+    // tempfile's error names the temporary file's absolute path; `io_cause` drops it.
+    let mut tmp = builder
+        .tempfile_in(parent)
+        .map_err(|e| io_error("cannot create temp file for", io_cause(&e)))?;
 
     // Restore original permissions before writing; mask off file-type bits
     // (high bits of st_mode) so only the permission bits reach from_mode.
@@ -1814,16 +1815,14 @@ pub(crate) fn atomic_write_file(
     if let Some(mode) = original_mode {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode & 0o7777))
-            .map_err(|e| {
-                io_error(format!(
-                    "cannot set permissions on temp file for {}: {e}",
-                    shown.display()
-                ))
-            })?;
+            .map_err(|e| io_error("cannot set permissions on temp file for", io_cause(&e)))?;
     }
 
-    tmp.write_all(content.as_bytes())
-        .map_err(|e| io_error(format!("cannot write {}: {e}", shown.display())))?;
+    // Written through the `File` itself: `NamedTempFile`'s own `Write` wraps an error in
+    // one that names the temporary file, which would leave `io_cause` the kind alone.
+    tmp.as_file_mut()
+        .write_all(content.as_bytes())
+        .map_err(|e| io_error("cannot write", io_cause(&e)))?;
 
     // sync_all() flushes data + metadata to storage (flush() is a no-op on
     // unbuffered File and provides no crash durability guarantee). Skipped for
@@ -1831,18 +1830,31 @@ pub(crate) fn atomic_write_file(
     if durability == Durability::Fsync {
         tmp.as_file()
             .sync_all()
-            .map_err(|e| io_error(format!("cannot fsync {}: {e}", shown.display())))?;
+            .map_err(|e| io_error("cannot fsync", io_cause(&e)))?;
     }
 
     // persist() atomically renames the temp file to the target path.
-    tmp.persist(path).map_err(|e| {
-        io_error(format!(
-            "cannot rename temp file to {}: {e}",
-            shown.display()
-        ))
-    })?;
+    tmp.persist(path)
+        .map_err(|e| io_error("cannot rename temp file to", io_cause(&e.error)))?;
 
     Ok(())
+}
+
+/// Why [`atomic_write_file`] refuses to replace a symlink at its target.
+const SYMLINK_REFUSAL: &str = "refusing to replace a symlink";
+
+/// Why the re-check right before a write refused its target, in words of its own: the
+/// error `NativeFs::check_symlink` raises names the path it was given, which may be a
+/// canonical one (#390). It raises three: a symlink that has appeared, a forbidden path
+/// character in the target's resolved path, and a target it cannot resolve.
+fn recheck_refusal(e: &mds::MdsError) -> String {
+    match e {
+        mds::MdsError::ImportError { .. } => SYMLINK_REFUSAL.to_owned(),
+        mds::MdsError::Io { .. } => {
+            "its resolved path contains a forbidden path character".to_owned()
+        }
+        _ => io_cause(&std::io::ErrorKind::NotFound.into()),
+    }
 }
 
 // ── Sanitized stderr render ───────────────────────────────────────────────────
@@ -2575,6 +2587,49 @@ pub(crate) fn safe_file_display(name: &str) -> String {
 /// Enforced mechanically by `tests/print_discipline.rs`.
 pub(crate) fn safe_inline(value: impl std::fmt::Display) -> String {
     mds::sanitize_control_chars_wire(&value.to_string()).into_owned()
+}
+
+/// The text [`notify_cause`] shows for a file watcher's own message that names a path.
+const WATCHER_ERROR: &str = "file watcher error";
+
+/// The cause an [`std::io::Error`] gives, with any path it carries dropped (#390): what
+/// every message `mds` builds around an I/O error interpolates — through [`safe_inline`],
+/// like any other value a line interpolates.
+///
+/// An error the operating system raised displays as the system's description and code
+/// (`Permission denied (os error 13)`), and one made from a kind alone, or from a message
+/// of std's own, as that kind or message: none of them names a path, so each is shown as
+/// it displays. An error that carries a payload — text or an error a library attached —
+/// is shown by its kind alone (`permission denied`): the payload may quote a path, as
+/// tempfile's does (`… at path "<the temporary file>"`), and its cause chain need not lead
+/// back to the error it wraps (tempfile's skips it).
+pub(crate) fn io_cause(e: &std::io::Error) -> String {
+    match e.get_ref() {
+        None => e.to_string(),
+        Some(_) => e.kind().to_string(),
+    }
+}
+
+/// The cause a [`notify::Error`] gives, without the paths it lists (#390) — through
+/// [`safe_inline`] in a message, as [`io_cause`]'s is.
+///
+/// notify displays an error as its kind's text followed by ` about [<paths>]`, the paths
+/// it was handed — for `mds watch`, a directory's canonical path. Only the kind's text is
+/// shown: an I/O error's through [`io_cause`], notify's own fixed texts in notify's words,
+/// and a backend's own message as given (`Input watch path is neither a file nor a
+/// directory.` on Windows) unless it carries a path separator, when [`WATCHER_ERROR`]
+/// stands for it.
+pub(crate) fn notify_cause(e: &notify::Error) -> String {
+    use notify::ErrorKind;
+    match &e.kind {
+        ErrorKind::Io(io) => io_cause(io),
+        ErrorKind::Generic(text) if !text.contains(['/', '\\']) => text.clone(),
+        ErrorKind::Generic(_) => WATCHER_ERROR.to_owned(),
+        ErrorKind::PathNotFound => notify::Error::path_not_found().to_string(),
+        ErrorKind::WatchNotFound => notify::Error::watch_not_found().to_string(),
+        ErrorKind::InvalidConfig(config) => notify::Error::invalid_config(config).to_string(),
+        ErrorKind::MaxFilesWatch => notify::Error::new(ErrorKind::MaxFilesWatch).to_string(),
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -3859,7 +3914,223 @@ mod tests {
         assert!(colorized.contains("\x1b[36m+++ b\x1b[0m"));
     }
 
+    // ── io_cause / notify_cause: a cause with no path in it (#390) ─────────────
+
+    /// An absolute path no cause text could carry by chance, below a directory that does
+    /// not exist — so an error about it is a real one, raised for that path.
+    fn sentinel(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("sentinel-cause-dir").join("leaf")
+    }
+
+    /// A library error that carries a path in its own text is shown by its kind alone:
+    /// tempfile's `at path "…"`, and any other payload. An error of the operating system's
+    /// keeps its text, which names no path. Controls: each error's own text carries the
+    /// sentinel, so its absence below means the helper dropped it.
+    #[test]
+    fn io_cause_drops_the_path_an_error_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = sentinel(&dir);
+        let needle = sentinel.parent().unwrap().display().to_string();
+
+        // tempfile wraps the error creating its file in one that names the file.
+        let tempfile = tempfile::Builder::new()
+            .tempfile_in(sentinel.parent().unwrap())
+            .expect_err("no temporary file below a directory that does not exist");
+        assert!(
+            tempfile.to_string().contains(&needle),
+            "control: tempfile's text names the path: {tempfile}"
+        );
+        let cause = io_cause(&tempfile);
+        assert!(!cause.contains(&needle), "{cause}");
+        assert!(!cause.contains("at path"), "{cause}");
+        assert_eq!(cause, tempfile.kind().to_string(), "its kind's text");
+
+        let custom = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("denied: {}", sentinel.display()),
+        );
+        assert!(custom.to_string().contains(&needle), "control: {custom}");
+        assert_eq!(io_cause(&custom), "permission denied");
+
+        // The operating system's own error keeps its words and code.
+        let os = std::fs::File::open(&sentinel).expect_err("the sentinel does not exist");
+        assert!(os.raw_os_error().is_some(), "control: an OS error: {os:?}");
+        assert_eq!(io_cause(&os), os.to_string());
+        assert!(io_cause(&os).contains("(os error "), "{}", io_cause(&os));
+
+        // An error made from a kind alone is that kind's text.
+        let kind = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(io_cause(&kind), std::io::ErrorKind::NotFound.to_string());
+    }
+
+    /// A file watcher's error is shown by its kind's text, without the paths notify lists
+    /// after it (` about ["…"]`): notify's own fixed texts as notify words them, an I/O
+    /// error through [`io_cause`], and a backend's message as it gives it unless it names
+    /// a path. Controls: notify's own text of each carries the sentinel.
+    #[test]
+    fn notify_cause_drops_the_paths_a_watcher_error_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = sentinel(&dir);
+        let needle = sentinel.display().to_string();
+        let listing = |e: notify::Error| e.add_path(sentinel.clone());
+
+        // (the error, its cause)
+        let cases = [
+            (
+                listing(notify::Error::path_not_found()),
+                "No path was found.".to_owned(),
+            ),
+            (
+                listing(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+                "OS file watch limit reached.".to_owned(),
+            ),
+            (
+                listing(notify::Error::generic(
+                    "Input watch path is neither a file nor a directory.",
+                )),
+                "Input watch path is neither a file nor a directory.".to_owned(),
+            ),
+            (
+                listing(notify::Error::generic(&format!(
+                    "Expected ack for {sentinel:?}"
+                ))),
+                WATCHER_ERROR.to_owned(),
+            ),
+            (
+                listing(notify::Error::io(std::io::Error::other(format!(
+                    "IO error for operation on {}",
+                    sentinel.display()
+                )))),
+                std::io::ErrorKind::Other.to_string(),
+            ),
+        ];
+        for (error, expected) in cases {
+            let shown = error.to_string();
+            assert!(shown.contains(&needle), "control: {shown}");
+            let cause = notify_cause(&error);
+            assert!(!cause.contains(&needle), "{cause}");
+            assert!(!cause.contains(" about "), "{cause}");
+            assert_eq!(cause, expected, "the cause of {shown:?}");
+        }
+
+        // A backend's message is kept as given; a line escapes it through `safe_inline`,
+        // as it does every value it interpolates.
+        let raw = format!("bad{}word", '\x1b');
+        let cause = notify_cause(&notify::Error::generic(&raw));
+        assert_eq!(cause, raw, "the cause is the backend's text");
+        let shown = safe_inline(&cause);
+        assert!(!shown.contains('\x1b'), "{shown:?}");
+        assert!(
+            shown.starts_with("bad") && shown.ends_with("word"),
+            "{shown:?}"
+        );
+    }
+
     // ── atomic_write_file ─────────────────────────────────────────────────────
+
+    /// [`atomic_write_file`] of a file named as it is written.
+    fn write_as_typed(
+        path: &Path,
+        content: &str,
+        durability: Durability,
+    ) -> std::result::Result<(), mds::MdsError> {
+        atomic_write_file(
+            &WriteTarget::as_typed(path.to_path_buf()),
+            content,
+            durability,
+        )
+    }
+
+    /// An error writing a file names it by `shown`, never by `path`, and its cause names
+    /// no path (#390): tempfile's error creating its file names that file's absolute path,
+    /// and the cause is the error's kind alone. Control: the whole message is the one
+    /// expected, so the target is named.
+    ///
+    /// `#[cfg(unix)]`: a read-only directory is what makes the temporary file fail, and
+    /// Windows' read-only attribute does not stop a file being created in one (#147).
+    #[cfg(unix)]
+    #[test]
+    fn an_error_writing_names_the_file_as_shown_and_no_path_of_its_own() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let target = WriteTarget {
+            path: sub.join("locked.mds"),
+            shown: Path::new("out").join("locked.mds"),
+        };
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = std::fs::write(sub.join("probe"), "");
+        let result = atomic_write_file(&target, "NEW", Durability::Fsync);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if probe.is_ok() {
+            ewriteln!("running as root; a read-only directory does not stop the write");
+            return;
+        }
+
+        let err = result
+            .expect_err("a read-only directory must fail the write")
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "cannot create temp file for out/locked.mds: {}",
+                std::io::ErrorKind::PermissionDenied
+            )
+        );
+        let tmp = dir.path().display().to_string();
+        assert!(!err.contains(&tmp), "no path of the write's own: {err}");
+        assert!(!err.contains(".mds-tmp-"), "no temporary file: {err}");
+    }
+
+    /// The re-check's refusal names no path, whichever error `NativeFs::check_symlink`
+    /// raised (#390). Controls: each error's own text names the path it was given.
+    #[test]
+    fn the_recheck_s_refusal_names_no_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.md");
+        std::fs::write(&real, "R").unwrap();
+        let link = dir.path().join("link.md");
+        let missing = dir.path().join("missing.md");
+
+        let mut cases = vec![(
+            mds::NativeFs::check_symlink(&missing).expect_err("nothing to resolve"),
+            std::io::ErrorKind::NotFound.to_string(),
+        )];
+        if make_symlink(&real, &link) {
+            cases.push((
+                mds::NativeFs::check_symlink(&link).expect_err("a symlink"),
+                SYMLINK_REFUSAL.to_owned(),
+            ));
+        }
+        // A forbidden character in the resolved path: a name Windows cannot hold.
+        #[cfg(unix)]
+        {
+            let hostile = dir.path().join(format!("a{}b", '\x1b'));
+            std::fs::create_dir(&hostile).unwrap();
+            std::fs::write(hostile.join("x.md"), "X").unwrap();
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&hostile, &alias).unwrap();
+            cases.push((
+                mds::NativeFs::check_symlink(&alias.join("x.md"))
+                    .expect_err("a forbidden character in the resolved path"),
+                "its resolved path contains a forbidden path character".to_owned(),
+            ));
+        }
+        let needle = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for (error, expected) in cases {
+            assert!(error.to_string().contains(&needle), "control: {error}");
+            let refusal = recheck_refusal(&error);
+            assert!(!refusal.contains(&needle), "{refusal}");
+            assert_eq!(refusal, expected, "the refusal of {error}");
+        }
+    }
 
     /// Names of leftover `.mds-tmp-*` entries directly inside `dir`.
     fn temp_residue(dir: &Path) -> Vec<String> {
@@ -3921,7 +4192,7 @@ mod tests {
         let target = dir.path().join("fresh.md");
         assert!(!target.exists(), "precondition: target must be absent");
 
-        atomic_write_file(&target, "CREATED", Durability::Fsync)
+        write_as_typed(&target, "CREATED", Durability::Fsync)
             .expect("writing an absent target must succeed");
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "CREATED");
@@ -3944,8 +4215,8 @@ mod tests {
         // Fresh target: created, with the same content and mode as the Fsync sibling.
         let quick = dir.path().join("quick.md");
         let synced = dir.path().join("synced.md");
-        atomic_write_file(&quick, "DERIVED", Durability::RenameOnly).unwrap();
-        atomic_write_file(&synced, "DERIVED", Durability::Fsync).unwrap();
+        write_as_typed(&quick, "DERIVED", Durability::RenameOnly).unwrap();
+        write_as_typed(&synced, "DERIVED", Durability::Fsync).unwrap();
         assert_eq!(std::fs::read_to_string(&quick).unwrap(), "DERIVED");
         #[cfg(unix)]
         {
@@ -3958,7 +4229,7 @@ mod tests {
         }
 
         // Existing target: replaced, previous content gone.
-        atomic_write_file(&quick, "REBUILT", Durability::RenameOnly).unwrap();
+        write_as_typed(&quick, "REBUILT", Durability::RenameOnly).unwrap();
         assert_eq!(std::fs::read_to_string(&quick).unwrap(), "REBUILT");
 
         // Symlink target: still refused (the fsync is not what enforces this).
@@ -3969,7 +4240,7 @@ mod tests {
             if !make_symlink(&real, &link) {
                 return;
             }
-            let err = atomic_write_file(&link, "NEW", Durability::RenameOnly)
+            let err = write_as_typed(&link, "NEW", Durability::RenameOnly)
                 .expect_err("RenameOnly must still refuse a symlink target");
             assert!(
                 err.to_string().contains("symlink"),
@@ -4000,7 +4271,7 @@ mod tests {
         let out = dir.path().join("out.md");
         let ctl = dir.path().join("ctl.md");
 
-        atomic_write_file(&out, "X", Durability::Fsync).unwrap();
+        write_as_typed(&out, "X", Durability::Fsync).unwrap();
         std::fs::write(&ctl, "X").unwrap();
 
         let mode_out = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
@@ -4024,7 +4295,7 @@ mod tests {
         std::fs::write(&target, "OLD").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
 
-        atomic_write_file(&target, "NEW", Durability::Fsync).unwrap();
+        write_as_typed(&target, "NEW", Durability::Fsync).unwrap();
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
         assert_eq!(
@@ -4047,7 +4318,7 @@ mod tests {
             return;
         }
 
-        let err = atomic_write_file(&link, "NEW", Durability::Fsync)
+        let err = write_as_typed(&link, "NEW", Durability::Fsync)
             .expect_err("writing through a symlink must be refused");
         assert!(
             matches!(err, mds::MdsError::Io { .. }),
@@ -4072,7 +4343,7 @@ mod tests {
         );
 
         // CONTROL: the same directory and content, addressed at the real file.
-        atomic_write_file(&real, "NEW", Durability::Fsync)
+        write_as_typed(&real, "NEW", Durability::Fsync)
             .expect("writing the real file must succeed");
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW");
     }
@@ -4088,7 +4359,7 @@ mod tests {
             return;
         }
 
-        let err = atomic_write_file(&link, "NEW", Durability::Fsync)
+        let err = write_as_typed(&link, "NEW", Durability::Fsync)
             .expect_err("writing through a dangling symlink must be refused")
             .to_string();
         assert!(
@@ -4132,7 +4403,7 @@ mod tests {
         let (ino, mtime) = (before.ino(), before.modified().unwrap());
 
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let result = atomic_write_file(&target, "NEW", Durability::Fsync);
+        let result = write_as_typed(&target, "NEW", Durability::Fsync);
         // Restore before asserting so a failed assertion cannot leave an
         // undeletable tempdir behind.
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4163,7 +4434,7 @@ mod tests {
         );
 
         // CONTROL: writable again — the same call succeeds and swaps the inode.
-        atomic_write_file(&target, "NEW", Durability::Fsync)
+        write_as_typed(&target, "NEW", Durability::Fsync)
             .expect("write must succeed once the dir is writable");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
         assert_ne!(
@@ -4181,13 +4452,27 @@ mod tests {
         let target = dir.path().join("adir");
         std::fs::create_dir(&target).unwrap();
 
-        let err = atomic_write_file(&target, "X", Durability::Fsync)
-            .expect_err("a directory target must not be written")
-            .to_string();
+        // Named as shown (#390): the rename's error names neither the path written nor
+        // the temporary file.
+        let shown = Path::new("out").join("adir");
+        let err = atomic_write_file(
+            &WriteTarget {
+                path: target.clone(),
+                shown: shown.clone(),
+            },
+            "X",
+            Durability::Fsync,
+        )
+        .expect_err("a directory target must not be written")
+        .to_string();
+        let named = format!("cannot rename temp file to {}: ", safe_path(&shown));
         assert!(
-            err.contains("adir"),
-            "error must name the target; got {err}"
+            err.starts_with(&named),
+            "error must name the target as shown; got {err}"
         );
+        let tmp = dir.path().display().to_string();
+        assert!(!err.contains(&tmp), "no path of the write's own: {err}");
+        assert!(!err.contains(".mds-tmp-"), "no temporary file: {err}");
         assert!(target.is_dir(), "the directory must survive the refusal");
         let residue = temp_residue(dir.path());
         assert!(
@@ -4222,7 +4507,7 @@ mod tests {
             return;
         }
 
-        let result = atomic_write_file(&p.join("x.md"), "X", Durability::Fsync);
+        let result = write_as_typed(&p.join("x.md"), "X", Durability::Fsync);
         // Restore before asserting so tempdir cleanup always succeeds.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -4752,7 +5037,14 @@ mod tests {
         .into_batch_result();
         match failed {
             Err(mds::MdsError::Io { message }) => {
-                assert_eq!(message, "cannot write to stdout: no space left");
+                assert_eq!(
+                    message,
+                    format!(
+                        "cannot write to stdout: {}",
+                        std::io::ErrorKind::StorageFull
+                    ),
+                    "the error's kind, not the text it carries (#390)"
+                );
             }
             other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
         }
