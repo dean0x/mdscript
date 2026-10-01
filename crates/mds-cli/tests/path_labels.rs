@@ -6,12 +6,13 @@
 //! `mds lint`'s findings name a file argument by its file name. The carve-outs are pinned
 //! as they stand: the text of an error writing an output names the path the write was
 //! given, the canonical one below a directory resolved to it, and tempfile's own cause
-//! text an absolute one; and the file name of `mds watch`'s output beside its entry is the
-//! one the volume holds, which differs from the name as typed for an entry typed in
-//! another case on a case-insensitive volume. A directory `mds watch` watches for a
-//! dependency outside the entry's directory and the directory argument has only the path
-//! the compile reported (one below either is named below it as typed — only a refused
-//! watch prints it, so watch.rs's unit tests pin that).
+//! text an absolute one, as does notify's own cause text after the colon of a
+//! `failed to watch` line on Linux, which the absence check skips; and the file name of
+//! `mds watch`'s output beside its entry is the one the volume holds, which differs from
+//! the name as typed for an entry typed in another case on a case-insensitive volume. A
+//! directory `mds watch` watches for a dependency outside the entry's directory and the
+//! directory argument has only the path the compile reported (one below either is named
+//! below it as typed — only a refused watch prints it, so watch.rs's unit tests pin that).
 //!
 //! spec.md §7.10's table cites, row by row, the tests that pin each line it lists;
 //! [`the_spec_s_path_label_table_cites_exactly_these_tests`] keeps the table and
@@ -1704,14 +1705,29 @@ fn a_vars_directory_that_cannot_be_watched_is_named_as_typed() {
             !status.success(),
             "{label}: a missing --vars file ends the session at startup; stderr: {stderr}"
         );
+        let warning = format!(
+            "warning: failed to watch vars directory {}: ",
+            native(shown)
+        );
         assert!(
-            stderr.contains(&format!(
-                "warning: failed to watch vars directory {}: ",
-                native(shown)
-            )),
+            stderr.contains(&warning),
             "{label}: the directory is named as the --vars file was typed; stderr: {stderr}"
         );
-        assert_eq!(leak(&stderr, root), None, "{label}: stderr: {stderr}");
+        // The text after the colon is notify's own error, which its Linux backend quotes
+        // with an absolute path; a path-free cause is a later change. Until then the
+        // absence check covers every line but that cause.
+        let authored = stderr
+            .lines()
+            .map(|line| {
+                if line.starts_with(&warning) {
+                    warning.as_str()
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(leak(&authored, root), None, "{label}: stderr: {stderr}");
     }
 }
 
@@ -2049,6 +2065,9 @@ fn watch_banner_and_recompiled_lines_carry_no_verbatim_prefix() {
         ),
     ];
     for (args, banner, output) in cases {
+        // `mds watch` prints `Recompiled` only when an output's content changes, and the
+        // previous session left `Edited\n`.
+        put(dir.path(), "src/sub/page.mds", "Page\n");
         let args = typed_args(args);
         let (mut child, tap, _) = watch_live(dir.path(), &args, false);
         write_atomic(&dir.path().join(native("src/sub/page.mds")), "Edited\n");
