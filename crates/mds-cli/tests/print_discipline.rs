@@ -96,6 +96,32 @@
 //!
 //!   The guard fails closed: a false positive costs one allowlist entry with
 //!   a written justification, a false negative costs another review round.
+//! - **No raw path and no raw error cause in a message** (#390). These three rules read
+//!   the crate's code with its `#[cfg(test)]` items left out, every module included:
+//!   - `.display()` and `to_string_lossy()`, std's ways of turning a path into text, are
+//!     called only inside the functions [`PATH_TEXT_HELPERS`] lists, as often as it says
+//!     ([`paths_become_text_only_in_the_listed_functions`]). Any other path reaches a
+//!     message through `safe_path` / `safe_file_display`, as typed and escaped.
+//!   - An error value reaches a message — a `format!`, `miette!`, writer macro or
+//!     `write!` argument, an `eprint_warning` or `io_error` argument, a `message:` field —
+//!     only as its cause, `safe_inline(io_cause(&e))` / `safe_inline(notify_cause(&e))`,
+//!     or bare where `io_error` escapes it ([`messages_interpolate_an_error_only_as_its_cause`]).
+//!     io, notify and tempfile errors name paths in their own text; the cause helpers
+//!     drop them. An error value is a name an `Err(…)` pattern, a `map_err`-style closure
+//!     or an error-typed parameter binds, `e` / `err` / `error`, or a `let` one hop from
+//!     one. [`PATH_FREE_ERRORS`] lists the error values shown another way, each with its
+//!     site count and why its text names no path.
+//!   - Every `failed to watch …` message names its directory through
+//!     `safe_path(&shown_watched_dir(…))`, at [`WATCH_FAILURE_SITES`] sites
+//!     ([`every_watch_failure_names_its_directory_as_shown`]). The rule pins the call, not
+//!     what it returns; `shown_watched_dir`'s unit test pins that, including the
+//!     directory outside the entry's directory and the root that it names canonically.
+//!
+//!   The carve-outs are the entries of those lists that are no escape helper or cause,
+//!   each with its reason: `lint.rs`'s `relative_display` and `read_canonical_source`
+//!   messages, which show the typed or walked path through `Display`; the source map's
+//!   `file` key and the sidecar name compared with it; the debug-build panic trigger;
+//!   and the errors in [`PATH_FREE_ERRORS`].
 //!
 //! **Not covered, deliberately, and not claimed to be:**
 //! - `miette::miette!(…)` report construction, and `MdsError` message bodies built in
@@ -183,8 +209,19 @@
 //!    neither. Nor is a way out or a stream reached without its std name: `libc::exit`
 //!    (a unix dev-dependency, so only a test module could reach it), a descriptor opened
 //!    as a file, `/dev/stdout`, or a `main` that returns without calling the funnel.
+//! 8. **The path-sink rules read names, not types.** A path turned into text another
+//!    way — a `{:?}` capture, `to_str()`, `as_os_str()` — is not a mention. An error
+//!    held under a name none of the binders above gives it (a struct field, a value two
+//!    `let`s away, a pattern binder other than `Err(…)`), or a cause hoisted into a
+//!    `let` and interpolated unescaped, is not seen. Nor is a message built by a
+//!    function this crate does not define. An io error cannot become an `MdsError`
+//!    through `?`: mds-core defines no conversion from `io::Error`, which is the type
+//!    system's guarantee, not this guard's.
+//! 9. **Only `#[cfg(test)]` items are skipped by the path-sink rules.** Code under
+//!    another test-only `cfg` is read as product code, which can only add findings.
 //!
-//! Every one of these requires writing code that looks wrong on purpose. The bar this
+//! Each of limits 1–7 requires writing code that looks wrong on purpose; limit 8 does
+//! not (a `{:?}` of a path looks ordinary), and review remains its check. The bar this
 //! guard is built to meet is **accidental** reintroduction — the four times #176 was
 //! reopened, it was an ordinary `eprintln!` or an ordinary hoisted `format!`, never an
 //! alias. Closing the lexical gaps beyond that bar would need a rustc lint or a
@@ -222,10 +259,22 @@
 //!   resolves flat, directory and nested modules; and
 //!   [`lint_output_goes_through_the_sink`] reports a writer call, a stdout write, an error
 //!   renderer and an exit planted in `lint.rs`, and an exit planted in `lint_sink.rs`.
+//!   For the path-sink rules, [`the_path_text_guard_flags_a_path_shown_outside_the_helpers`]
+//!   flags `.display()`, `to_string_lossy()` and a path to either outside the helpers,
+//!   skips test items and reads the code after them;
+//!   [`the_cause_guard_flags_an_error_shown_with_its_paths`] flags a raw, a stringified, a
+//!   Debug-captured and a `safe_inline`-escaped error, one hoisted into a `let`, one in a
+//!   `message:` field, a warning, a nested `format!`, a `write!` and `io_error`, each binder
+//!   shape, and an unescaped cause; and
+//!   [`the_watch_label_guard_flags_a_directory_named_any_other_way`] flags a watched
+//!   directory escaped as it is, captured, displayed or relabelled.
 //! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`],
 //!   [`the_stderr_writer_fn_is_called_only_by_the_writer_macros`],
-//!   [`no_raw_print_macro_outside_the_writer`], [`process_exit_only_in_the_funnel`] and
-//!   [`terminal_streams_are_opened_only_by_the_writers`] prove the real sources are clean.
+//!   [`no_raw_print_macro_outside_the_writer`], [`process_exit_only_in_the_funnel`],
+//!   [`terminal_streams_are_opened_only_by_the_writers`] and the three path-sink rules
+//!   prove the real sources are clean. The path-sink rules also count what they found:
+//!   each listed helper's exact calls, at least 150 message sinks and 25 causes, and
+//!   exactly [`WATCH_FAILURE_SITES`] watch-failure messages.
 //! - **Non-vacuity:** the same test asserts the scanner actually found the crate's
 //!   modules, its print sites (crate-wide, and per file for the files in
 //!   [`SITE_FLOORS`]), its interpolations, its `let` bindings, the non-`let` binders that
@@ -236,7 +285,8 @@
 //!   owner holding its handle.
 //! - **Allowlist rot:** [`every_allowlist_entry_is_live`] fails if an entry in either
 //!   allowlist stops matching anything, so exemptions cannot outlive the code that
-//!   needed them.
+//!   needed them. [`PATH_TEXT_HELPERS`] and [`PATH_FREE_ERRORS`] carry exact counts,
+//!   checked by their rules in both directions.
 
 use std::path::{Path, PathBuf};
 
@@ -594,6 +644,225 @@ const ALLOWED_UNTRACED_HELPER_ARGS: &[(&str, &str, &str)] = &[
          bare-`w` sites, because the list is keyed by (file, expression).",
     ),
 ];
+
+// ── Path sinks (#390) ─────────────────────────────────────────────────────────
+
+/// The two ways std turns a path into text. Each shows the path as `Display` prints it,
+/// which is neither the form the user typed nor escaped.
+const PATH_TEXT_METHODS: &[&str] = &["display", "to_string_lossy"];
+
+/// The functions allowed to call a [`PATH_TEXT_METHODS`] method (#390), by file, with
+/// the exact number of calls in the function's body and the reason.
+///
+/// Outside these bodies neither method may appear in the crate's code, its
+/// `#[cfg(test)]` items aside ([`paths_become_text_only_in_the_listed_functions`]). The
+/// count is exact, so a new call inside a listed function fails the guard just as one
+/// elsewhere does, and an entry whose function lost its calls (or was renamed) fails it
+/// too. Most entries are escape helpers: the lossy text goes straight into
+/// `mds::escape_path_for_message`, or the path through `safe_path`. The rest are the
+/// carve-outs, each saying why it shows or keeps a path some other way.
+const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
+    (
+        "output.rs",
+        "safe_path",
+        1,
+        "The escape helper every path in a message goes through: it strips a Windows \
+         verbatim prefix, then escapes every forbidden path character.",
+    ),
+    (
+        "output.rs",
+        "reject_forbidden_output_path",
+        1,
+        "Scans the typed value lossily for a forbidden path character, as mds-core does; \
+         its refusal names the value through core's escape.",
+    ),
+    (
+        "output.rs",
+        "reject_non_utf8_output_path",
+        1,
+        "Names a value that is not UTF-8 through `mds::escape_path_for_message` of its \
+         lossy text, the form a message can carry.",
+    ),
+    (
+        "output.rs",
+        "reject_forbidden_resolved_output_path",
+        1,
+        "Hands the typed value, lossy, to `mds::reject_forbidden_path`, which escapes it \
+         in its refusal; the resolved path is scanned, never shown.",
+    ),
+    (
+        "output.rs",
+        "payload",
+        1,
+        "Carve-out: the debug-build test trigger of the panic hook builds a payload that \
+         names the working directory on purpose, and `tests/panic_hook.rs` pins that the \
+         hook never shows it.",
+    ),
+    (
+        "build.rs",
+        "ensure_existing_mds_file",
+        1,
+        "Binds the lossy typed path and escapes it at once \
+         (`mds::escape_path_for_message`); every message in the function names that.",
+    ),
+    (
+        "build.rs",
+        "refuse_output_over_entry",
+        1,
+        "Names the typed entry through `mds::escape_path_for_message` of its lossy text.",
+    ),
+    (
+        "build.rs",
+        "apply_source_map_file_label",
+        1,
+        "Carve-out: the source map's `file` key, the output's file name. A source map's \
+         paths are the spec's named exception to escaping (not a diagnostic), and this is \
+         no message.",
+    ),
+    (
+        "build.rs",
+        "file_name_of",
+        1,
+        "Carve-out: the file name a sidecar map records as `file`, compared with the map \
+         on disk before it is replaced; no message shows it.",
+    ),
+    (
+        "input.rs",
+        "refusal",
+        1,
+        "Names the typed directory argument through `mds::escape_path_for_message` of \
+         its lossy text.",
+    ),
+    (
+        "lint.rs",
+        "file",
+        1,
+        "Names a typed file argument with no UTF-8 file name through \
+         `mds::escape_path_for_message` of its lossy text.",
+    ),
+    (
+        "lint.rs",
+        "relative_display",
+        3,
+        "Carve-out: `path escapes lint root` (the root and the walked path, an invariant \
+         a directory walk cannot break) and `path is not valid UTF-8` (the walked path, \
+         lossy) show the path as typed below the root, through `Display`, unescaped. \
+         Routing them through `safe_path` would change the text a hostile name shows, so \
+         that is left to its own change.",
+    ),
+    (
+        "lint.rs",
+        "read_canonical_source",
+        2,
+        "Carve-out: `path is not valid UTF-8` names the typed path through `Display`, \
+         after `check_symlink` refused a forbidden character in it; the other call hands \
+         the canonical directory to `anchor_base_dir`, an argument and no message.",
+    ),
+    (
+        "watch.rs",
+        "canonicalize_vars_path",
+        1,
+        "Names the typed `--vars` path through `mds::escape_path_for_message` of its \
+         lossy text when it is a symlink.",
+    ),
+    (
+        "watch.rs",
+        "moved",
+        1,
+        "Names the typed watched path through `mds::escape_path_for_message` of its \
+         lossy text when it resolves somewhere new.",
+    ),
+];
+
+/// The functions that turn an io, notify or tempfile error into the cause a message shows,
+/// with every path it carries dropped (`output.rs`, #390). An error reaches a message
+/// only as one of these, escaped: `safe_inline(io_cause(&e))`. Bare, it reaches only
+/// [`CAUSE_ESCAPING_CALLS`], which escape the cause themselves.
+const CAUSE_PRODUCERS: &[&str] = &["io_cause", "notify_cause", "recheck_refusal"];
+
+/// Names taken to hold an error wherever they appear. [`error_names`] adds every name a
+/// file binds to one.
+const ERROR_NAMES: &[&str] = &["e", "err", "error"];
+
+/// Macros whose arguments become a message's text. For `write!` / `writeln!` the first
+/// argument is the sink, not text.
+const MESSAGE_MACROS: &[&str] = &[
+    "format!",
+    "miette!",
+    "ewriteln!",
+    "ewrite!",
+    "writeln!",
+    "write!",
+];
+
+/// Calls whose every argument is message text: `eprint_warning`'s warning, and
+/// `atomic_write_file`'s `io_error`, which takes the cause it shows after the file.
+const MESSAGE_CALLS: &[&str] = &["eprint_warning", "io_error"];
+
+/// The [`MESSAGE_CALLS`] that pass their cause through `safe_inline` themselves, so a
+/// bare [`CAUSE_PRODUCERS`] call is their accepted argument.
+const CAUSE_ESCAPING_CALLS: &[&str] = &["io_error"];
+
+/// The struct field an error's message is built in (`MdsError::Io { message }`).
+const MESSAGE_FIELD: &str = "message";
+
+/// Error values a message interpolates other than as a cause, by file and normalized
+/// expression, with the exact number of sites and the reason each names no path.
+///
+/// [`messages_interpolate_an_error_only_as_its_cause`] fails on a count that differs, in
+/// either direction, so an entry cannot outlive its sites or quietly cover a new one.
+const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
+    (
+        "build.rs",
+        "crate::output::safe_inline(&e)",
+        3,
+        "Escaped, and none names a path: a `FromUtf8Error` reading `mds.json` (a byte \
+         count and an offset), a `serde_json` error parsing it (a message, a line and a \
+         column), and one serializing `messages` output (fixed text).",
+    ),
+    (
+        "lint.rs",
+        "e",
+        3,
+        "A `miette::Report` from `build::load_config`, turned into an `MdsError` for the \
+         lint sinks: text this crate wrote, which names `mds.json` through `safe_path` \
+         and its cause through `io_cause` or a path-free `serde_json` / UTF-8 error.",
+    ),
+    (
+        "lint_sink.rs",
+        "safe_inline(&error)",
+        1,
+        "An `MdsError` from `atomic_write_file`, whose text names the file as shown \
+         through `safe_path` and its cause through `io_cause` (#390).",
+    ),
+    (
+        "lint_sink.rs",
+        "error",
+        1,
+        "The same `atomic_write_file` error as the entry above, kept as the message of \
+         the file's record in the JSON document.",
+    ),
+    (
+        "watch.rs",
+        "safe_inline(&e)",
+        1,
+        "An `MdsError` from `probe_and_remove_stale`, whose text names the stale output \
+         as shown through `safe_path` and its cause through `io_cause` (#390).",
+    ),
+];
+
+/// The text a message about a directory the file watcher refused begins with.
+const WATCH_FAILURE_TEXT: &str = "failed to watch";
+
+/// The function that names a watched directory as shown in that message (`watch.rs`):
+/// below the entry's directory or the root as typed (#390).
+const WATCH_FAILURE_LABEL: &str = "shown_watched_dir";
+
+/// The [`WATCH_FAILURE_TEXT`] messages in `watch.rs`: the rebuild-time re-arm, file and
+/// directory mode's `failed to watch directory`, `failed to watch vars directory` and
+/// `failed to watch external dep dir`. Changing it is a decision made in the commit that
+/// adds or removes a site.
+const WATCH_FAILURE_SITES: usize = 5;
 
 // ── The guard ─────────────────────────────────────────────────────────────────
 
@@ -1792,6 +2061,325 @@ fn the_guard_rejects_a_dynamic_format_string() {
     let exprs = only_site(r#"fn f() { eprintln!(FMT, y); }"#);
     assert_eq!(exprs, vec!["FMT, y".to_string()]);
     assert!(!is_sanitizer_call(&exprs[0]));
+}
+
+// ── Path sinks (#390) ─────────────────────────────────────────────────────────
+
+/// A path reaches a message as the user typed it, escaped, through the escape helpers
+/// (#390). std's `Display` of a path is neither: it shows a canonical or absolute path
+/// as such, and a forbidden character raw. So the [`PATH_TEXT_METHODS`] are called only
+/// inside the functions [`PATH_TEXT_HELPERS`] lists, exactly as often as it says, in the
+/// crate's code with its `#[cfg(test)]` items left out.
+#[test]
+fn paths_become_text_only_in_the_listed_functions() {
+    let sources = crate_sources();
+    let mut stray: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for (name, src) in &sources {
+        let listed: Vec<&(&str, &str, usize, &str)> = PATH_TEXT_HELPERS
+            .iter()
+            .filter(|(file, ..)| *file == name.as_str())
+            .collect();
+        let helpers: Vec<&str> = listed.iter().map(|(_, function, ..)| *function).collect();
+        let texts = path_text_mentions(src, &helpers);
+        stray.extend(texts.stray.iter().map(|line| format!("  {name}:{line}")));
+        for ((_, function, count, _), calls) in listed.iter().zip(&texts.in_helper) {
+            found += calls.unwrap_or(0);
+            if *calls != Some(*count) {
+                stray.push(format!(
+                    "  {name}::{function}: listed with {count} call(s), found {calls:?} \
+                     (None: no such function in the file's code)"
+                ));
+            }
+        }
+    }
+
+    for (file, function, _, why) in PATH_TEXT_HELPERS {
+        assert!(
+            sources.iter().any(|(name, _)| name == file),
+            "PATH_TEXT_HELPERS names {file}, which is not a source of the crate"
+        );
+        assert!(
+            why.len() >= 40,
+            "PATH_TEXT_HELPERS entry {file}::{function} needs a real reason, got {why:?}"
+        );
+    }
+    // Non-vacuity: the scan found the listed calls, so it cannot pass by reading nothing.
+    let listed_total: usize = PATH_TEXT_HELPERS.iter().map(|(_, _, n, _)| n).sum();
+    assert!(
+        found >= 15 && listed_total >= 15,
+        "non-vacuity: expected at least 15 path-to-text calls in the listed functions, \
+         found {found} of {listed_total} listed"
+    );
+    assert!(
+        stray.is_empty(),
+        "path-sink violation: a path is turned into text ({PATH_TEXT_METHODS:?}) outside \
+         the functions PATH_TEXT_HELPERS lists, or a listed count no longer holds:\n{}\n\n\
+         Name a path in a message through `crate::output::safe_path` (or \
+         `safe_file_display`), which shows it as typed and escaped. A function that must \
+         turn a path into text for another reason goes in PATH_TEXT_HELPERS with its \
+         exact count and why.",
+        stray.join("\n")
+    );
+}
+
+/// io, notify and tempfile errors name paths in their own text, absolute ones included —
+/// tempfile's `at path "…"`, notify's ` about [...]` (#390). A message shows such an error
+/// only as its cause, with the paths dropped and escaped: `safe_inline(io_cause(&e))`,
+/// `safe_inline(notify_cause(&e))`, or bare as the cause `atomic_write_file`'s `io_error`
+/// escapes itself. [`PATH_FREE_ERRORS`] lists the error values a message shows otherwise,
+/// each with its exact site count and why it names no path.
+#[test]
+fn messages_interpolate_an_error_only_as_its_cause() {
+    let sources = crate_sources();
+    let mut violations: Vec<String> = Vec::new();
+    // `(file, expression, line)` of every value a PATH_FREE_ERRORS entry names.
+    let mut exempt: Vec<(String, String, usize)> = Vec::new();
+    let mut sinks = 0usize;
+    let mut causes = 0usize;
+    for (name, src) in &sources {
+        let values = message_values(src);
+        sinks += values.sinks;
+        causes += values.causes;
+        for (line, sink, expr) in values.raw {
+            let listed = PATH_FREE_ERRORS
+                .iter()
+                .any(|(file, listed, ..)| *file == name.as_str() && *listed == expr);
+            if listed {
+                exempt.push((name.clone(), expr, line));
+            } else {
+                violations.push(format!("  {name}:{line}: {sink} interpolates `{expr}`"));
+            }
+        }
+    }
+    for (file, expr, count, why) in PATH_FREE_ERRORS {
+        assert!(
+            why.len() >= 40,
+            "PATH_FREE_ERRORS entry {file} `{expr}` needs a real reason, got {why:?}"
+        );
+        let lines: Vec<usize> = exempt
+            .iter()
+            .filter(|(name, seen, _)| name == file && seen == expr)
+            .map(|(_, _, line)| *line)
+            .collect();
+        if lines.len() != *count {
+            violations.push(format!(
+                "  PATH_FREE_ERRORS {file} `{expr}`: listed for {count} site(s), found {} \
+                 at lines {lines:?}",
+                lines.len()
+            ));
+        }
+    }
+
+    // Non-vacuity: the scan read the crate's messages and recognised the causes in them.
+    assert!(
+        sinks >= 150,
+        "non-vacuity: expected at least 150 message sinks across mds-cli/src, found {sinks}"
+    );
+    assert!(
+        causes >= 25,
+        "non-vacuity: expected at least 25 causes shown through {CAUSE_PRODUCERS:?}, found \
+         {causes}"
+    );
+    assert!(
+        violations.is_empty(),
+        "path-sink violation: a message shows an error with whatever paths it carries:\n\
+         {}\n\nShow an io, notify or tempfile error as its cause: \
+         `safe_inline(io_cause(&e))` / `safe_inline(notify_cause(&e))` \
+         (crates/mds-cli/src/output.rs). An error whose text names no path goes in \
+         PATH_FREE_ERRORS with its exact site count and why.",
+        violations.join("\n")
+    );
+}
+
+/// `shown_watched_dir` names a directory the file watcher refused below the entry's
+/// directory or the root, as typed (#390). Most of these messages have no local vector —
+/// notify must refuse a directory that exists — so a site that named the directory any
+/// other way would pass every behavioural test. Every message whose format string says
+/// `failed to watch` therefore fills its first placeholder with
+/// `safe_path(&shown_watched_dir(…))`; [`WATCH_FAILURE_SITES`] fixes how many there are.
+/// What `shown_watched_dir` returns is pinned by its own unit test in `watch.rs`.
+#[test]
+fn every_watch_failure_names_its_directory_as_shown() {
+    let mut sites: Vec<(String, usize, bool)> = Vec::new();
+    let mut texts = 0usize;
+    for (name, src) in crate_sources() {
+        texts += product_code(&src).matches(WATCH_FAILURE_TEXT).count();
+        sites.extend(
+            watch_failure_sites(&src)
+                .into_iter()
+                .map(|(line, named)| (name.clone(), line, named)),
+        );
+    }
+
+    assert_eq!(
+        sites.len(),
+        WATCH_FAILURE_SITES,
+        "non-vacuity: expected {WATCH_FAILURE_SITES} `{WATCH_FAILURE_TEXT}` messages, found \
+         {sites:?}. Adding or removing one changes WATCH_FAILURE_SITES in the same commit."
+    );
+    assert_eq!(
+        texts,
+        sites.len(),
+        "the text `{WATCH_FAILURE_TEXT}` appears in the crate's code outside a message's \
+         format string, where this check cannot see which directory it names: {sites:?}"
+    );
+    let bypassing: Vec<String> = sites
+        .iter()
+        .filter(|(_, _, named)| !named)
+        .map(|(name, line, _)| format!("  {name}:{line}"))
+        .collect();
+    assert!(
+        bypassing.is_empty(),
+        "path-sink violation: a `{WATCH_FAILURE_TEXT}` message names its directory other \
+         than through `safe_path(&{WATCH_FAILURE_LABEL}(…))`:\n{}",
+        bypassing.join("\n")
+    );
+}
+
+#[test]
+fn the_path_text_guard_flags_a_path_shown_outside_the_helpers() {
+    // Reported, each on its own line: `.display()` in a message, `to_string_lossy()`, a
+    // path to the method called or passed, and a call whose dot is on the line above.
+    // Product code after a test item is still read.
+    let src = r#"
+        fn label(p: &Path) -> String { safe_path(p) }
+        fn warn(p: &Path) { eprint_warning(&format!("cannot read {}", p.display())); }
+        fn lossy(p: &Path) -> String { p.to_string_lossy().into_owned() }
+        fn ufcs(p: &Path) -> String { format!("{}", Path::display(p)) }
+        fn mapped(ps: &[PathBuf]) { let _ = ps.iter().map(Path::display); }
+        fn chained(p: &Path) -> String { p
+            .display()
+            .to_string() }
+        fn safe_path(p: &Path) -> String { safe_file_display(&p.display().to_string()) }
+        fn display(display: &str) -> String { display.to_string() }
+        // p.display()
+        const NOTE: &str = "p.display()";
+        #[cfg(test)]
+        mod tests {
+            fn t(p: &Path) { let _ = p.display(); }
+        }
+        #[cfg(test)]
+        fn only_in_tests(p: &Path) -> String { p.to_string_lossy().into_owned() }
+        fn after(p: &Path) -> String { p.display().to_string() }
+    "#;
+    assert_eq!(
+        path_text_mentions(src, &["safe_path"]),
+        PathTexts {
+            stray: vec![3, 4, 5, 6, 8, 20],
+            in_helper: vec![Some(1)]
+        }
+    );
+
+    // The helper's own call is stray until it is listed, and a listed function the code
+    // does not define is reported as missing, not as clean.
+    assert_eq!(
+        path_text_mentions(src, &[]).stray,
+        vec![3, 4, 5, 6, 8, 10, 20]
+    );
+    assert_eq!(
+        path_text_mentions(src, &["safe_path", "gone"]).in_helper,
+        vec![Some(1), None]
+    );
+}
+
+#[test]
+fn the_cause_guard_flags_an_error_shown_with_its_paths() {
+    // Reported, each on its own line: a raw `{e}`, `e.to_string()`, `safe_inline(&e)`, a
+    // Debug capture, a `message:` field, a warning, a nested `format!`, a `let` one hop
+    // away, names bound by `Err(…)`, by a `map_err` closure and by an error-typed
+    // parameter, a cause left unescaped, a `write!`, and `io_error` handed the error.
+    let flagged = r#"
+        fn read(p: &Path) -> Result<String, MdsError> {
+            std::fs::read_to_string(p).map_err(|e| MdsError::Io { message: format!("cannot read: {e}") })
+        }
+        fn raw_method(e: std::io::Error) -> String { format!("cannot read: {}", e.to_string()) }
+        fn escaped(e: std::io::Error) -> miette::Report { miette::miette!("cannot read: {}", safe_inline(&e)) }
+        fn debug(err: std::io::Error) { ewriteln!("cannot read: {err:?}"); }
+        fn field(e: std::io::Error) -> MdsError { MdsError::Io { message: e.to_string() } }
+        fn warning(e: notify::Error) { eprint_warning(&safe_inline(&e)); }
+        fn nested(e: std::io::Error) -> String { format!("{}", format!("cannot read: {e}")) }
+        fn hoisted(e: std::io::Error) -> String { let msg = e.to_string(); format!("cannot read: {msg}") }
+        fn matched(r: Result<(), Failure>) -> String { match r { Err(failure) => format!("{failure}"), Ok(()) => String::new() } }
+        fn closure(r: std::io::Result<()>) -> Result<(), String> { r.map_err(|source| format!("cannot read: {source}")) }
+        fn param(why: &std::io::Error) -> String { format!("cannot read: {}", safe_inline(why)) }
+        fn unescaped(e: std::io::Error) -> String { format!("cannot read: {}", io_cause(&e)) }
+        fn written(e: std::io::Error) -> String { let mut s = String::new(); let _ = write!(s, "{}", e); s }
+        fn handed(e: std::io::Error) -> MdsError { io_error("cannot write", e.to_string()) }
+    "#;
+    let mut raw = message_values(flagged).raw;
+    raw.sort();
+    let expected: Vec<(usize, String, String)> = [
+        (3, "format!", "e"),
+        (5, "format!", "e.to_string()"),
+        (6, "miette!", "safe_inline(&e)"),
+        (7, "ewriteln!", "err"),
+        (8, "message", "e.to_string()"),
+        (9, "eprint_warning", "&safe_inline(&e)"),
+        (10, "format!", "e"),
+        (11, "format!", "msg"),
+        (12, "format!", "failure"),
+        (13, "format!", "source"),
+        (14, "format!", "safe_inline(why)"),
+        (15, "format!", "io_cause(&e)"),
+        (16, "write!", "e"),
+        (17, "io_error", "e.to_string()"),
+    ]
+    .into_iter()
+    .map(|(line, sink, expr)| (line, sink.to_string(), expr.to_string()))
+    .collect();
+    assert_eq!(raw, expected);
+
+    // Accepted: the cause, escaped, with or without module paths; the bare cause in
+    // `io_error`, which escapes it, whatever the producer is handed; an `io::ErrorKind`.
+    // Ignored: a test module.
+    let accepted = r#"
+        fn a(e: std::io::Error) -> String { format!("cannot read x: {}", safe_inline(io_cause(&e))) }
+        fn b(e: std::io::Error) -> MdsError { MdsError::Io { message: format!("cannot read x: {}", crate::output::safe_inline(crate::output::io_cause(&e))) } }
+        fn c(e: notify::Error) { eprint_warning(&format!("warning: {}", safe_inline(notify_cause(&e)))); }
+        fn d(e: std::io::Error) -> MdsError { io_error("cannot stat", io_cause(&e)) }
+        fn f(e: tempfile::PersistError) -> MdsError { io_error("cannot rename", io_cause(&e.error)) }
+        fn g(e: MdsError) -> MdsError { io_error("cannot write", recheck_refusal(&e)) }
+        fn h(e: std::io::Error) -> String { format!("kind: {}", e.kind()) }
+        #[cfg(test)]
+        mod tests { fn t(e: std::io::Error) -> String { format!("{e}") } }
+    "#;
+    let values = message_values(accepted);
+    assert_eq!(values.raw, Vec::new());
+    assert_eq!(
+        values.causes, 6,
+        "each of a, b, c, d, f and g shows one cause"
+    );
+}
+
+#[test]
+fn the_watch_label_guard_flags_a_directory_named_any_other_way() {
+    // Named as shown: through `safe_path(&shown_watched_dir(…))`, with or without module
+    // paths, and through an explicit position. Reported: a directory escaped as it is,
+    // captured, displayed, or the label's result changed after it.
+    let src = r#"
+        fn one(dir: &Path, e: notify::Error) { eprint_warning(&format!("warning: failed to watch {}: {}", safe_path(&shown_watched_dir(dir, root, vars)), safe_inline(notify_cause(&e)))); }
+        fn two(dir: &Path) -> miette::Report { miette::miette!("failed to watch directory {}: x", crate::output::safe_path(&crate::watch::shown_watched_dir(dir, root, None))) }
+        fn three(dir: &Path) { eprint_warning(&format!("warning: failed to watch {}: x", safe_path(dir))); }
+        fn four(dir: &Path) { eprint_warning(&format!("warning: failed to watch {dir:?}")); }
+        fn five(dir: &Path) { eprint_warning(&format!("warning: failed to watch {}: x", dir.display())); }
+        fn six(dir: &Path) { eprint_warning(&format!("warning: failed to watch {}: x", safe_path(&shown_watched_dir(dir, root, vars).canonicalize()))); }
+        fn seven(dir: &Path) { eprint_warning(&format!("warning: failed to watch {1}: {0}", safe_inline(&x), safe_path(&shown_watched_dir(dir, root, vars)))); }
+        #[cfg(test)]
+        mod tests { fn t(dir: &Path) -> String { format!("failed to watch {}", dir.display()) } }
+    "#;
+    assert_eq!(
+        watch_failure_sites(src),
+        vec![
+            (2, true),
+            (3, true),
+            (4, false),
+            (5, false),
+            (6, false),
+            (7, false),
+            (8, true)
+        ]
+    );
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -3194,4 +3782,487 @@ fn matching_delim(src: &str, b: &[u8], open: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+// ── Path-sink scanners (#390) ─────────────────────────────────────────────────
+
+/// The code the path-sink rules read: `src` with its comments masked and every
+/// `#[cfg(test)]` item blanked, each byte but a newline replaced by a space, so lines and
+/// byte offsets stay where they were.
+fn product_code(src: &str) -> String {
+    blank_cfg_test_items(&mask_comments(src))
+}
+
+/// `masked` with every item that follows a `#[cfg(test)]` attribute blanked, the
+/// attribute included: a test module (`mod tests { … }` or `mod tests;`), a test-only
+/// function or method, a `use`. The item ends at its first top-level `;`, or at the `}`
+/// that closes its first top-level `{`. An attribute in a literal is not one.
+fn blank_cfg_test_items(masked: &str) -> String {
+    const ATTR: &[u8] = b"#[cfg(test)]";
+    let b = masked.as_bytes();
+    let mut out = b.to_vec();
+    let mut i = 0usize;
+    // Bounded: every step moves `i` forward, past a literal, a byte or a blanked item.
+    while i < b.len() {
+        if let Some(next) = skip_literal(masked, b, i) {
+            i = next;
+            continue;
+        }
+        if !b[i..].starts_with(ATTR) {
+            i += 1;
+            continue;
+        }
+        let end = item_end(masked, b, i + ATTR.len()).unwrap_or(b.len() - 1);
+        for byte in &mut out[i..=end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        i = end + 1;
+    }
+    String::from_utf8(out).expect("blanking replaces whole items with ASCII spaces")
+}
+
+/// Index of the byte that ends the item starting at `from`: its first `;` outside any
+/// parentheses or brackets, or the `}` closing its first such `{`.
+fn item_end(text: &str, b: &[u8], from: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = from;
+    while i < b.len() {
+        if let Some(next) = skip_literal(text, b, i) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b';' if depth == 0 => return Some(i),
+            b'{' if depth == 0 => return matching_delim(text, b, i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Where one source file turns a path into text (see [`path_text_mentions`]).
+#[derive(Debug, PartialEq, Eq)]
+struct PathTexts {
+    /// 1-based lines of every [`PATH_TEXT_METHODS`] call outside the helpers.
+    stray: Vec<usize>,
+    /// For each helper passed in, in order, the calls inside its body; `None` when the
+    /// file's code defines no function of that name.
+    in_helper: Vec<Option<usize>>,
+}
+
+/// Find every call of a [`PATH_TEXT_METHODS`] method in the product code of `src` — a
+/// method call (`path.display()`, the dot perhaps on the line above) or a path to the
+/// method (`Path::display(p)`, `.map(Path::display)`), not a local or a parameter of that
+/// name, a longer identifier, a definition, a comment or a literal — and sort it into
+/// [`PathTexts`]: inside the body of one of `helpers`, or stray.
+fn path_text_mentions(src: &str, helpers: &[&str]) -> PathTexts {
+    let code = product_code(src);
+    let b = code.as_bytes();
+    let bodies: Vec<Option<std::ops::RangeInclusive<usize>>> =
+        helpers.iter().map(|name| fn_body(&code, name)).collect();
+    let mut texts = PathTexts {
+        stray: Vec::new(),
+        in_helper: bodies.iter().map(|body| body.as_ref().map(|_| 0)).collect(),
+    };
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(&code, b, i) {
+            i = next;
+            continue;
+        }
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') || prev_is_ident(b, i) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+            end += 1;
+        }
+        if PATH_TEXT_METHODS.contains(&&code[i..end])
+            && (follows_a_dot(b, i) || follows_a_path_separator(b, i))
+            && !is_fn_definition(&code, i)
+        {
+            let helper = bodies
+                .iter()
+                .position(|body| body.as_ref().is_some_and(|body| body.contains(&i)));
+            match helper.and_then(|h| texts.in_helper[h].as_mut()) {
+                Some(count) => *count += 1,
+                None => texts.stray.push(code[..i].matches('\n').count() + 1),
+            }
+        }
+        i = end;
+    }
+    texts
+}
+
+/// Is the identifier at `i` the last segment of a path (`Path::display`), the `::`
+/// perhaps on the line above?
+fn follows_a_path_separator(b: &[u8], i: usize) -> bool {
+    let mut j = i;
+    while j > 0 && b[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    j >= 2 && b[j - 1] == b':' && b[j - 2] == b':'
+}
+
+/// How one source file's messages interpolate error values (see [`message_values`]).
+#[derive(Debug, Default)]
+struct MessageValues {
+    /// Message sinks read: [`MESSAGE_MACROS`] and [`MESSAGE_CALLS`] invocations and
+    /// [`MESSAGE_FIELD`] initialisers.
+    sinks: usize,
+    /// Values that reach a message as a [`CAUSE_PRODUCERS`] call, escaped where the sink
+    /// needs it: the accepted shape.
+    causes: usize,
+    /// `(line, sink, expression)` for every error value a message interpolates otherwise:
+    /// raw (`{e}`, `e.to_string()`), escaped but with its paths (`safe_inline(&e)`), or a
+    /// cause left unescaped where the sink does not escape it.
+    raw: Vec<(usize, String, String)>,
+}
+
+/// Judge every value the product code of `src` interpolates into a message, where the
+/// value is an error ([`error_valued`]) or a cause ([`CAUSE_PRODUCERS`]).
+fn message_values(src: &str) -> MessageValues {
+    let code = product_code(src);
+    let names = error_names(&code);
+    let mut values = MessageValues::default();
+    let judge = |values: &mut MessageValues, line: usize, sink: &str, expr: &str| {
+        let sink_escapes = CAUSE_ESCAPING_CALLS.contains(&sink);
+        match judge_message_value(expr, &names, sink_escapes) {
+            Some(true) => values.causes += 1,
+            Some(false) => values.raw.push((line, sink.to_string(), normalize(expr))),
+            None => {}
+        }
+    };
+    for name in MESSAGE_MACROS {
+        for inv in nested_invocations(&code, name) {
+            values.sinks += 1;
+            let text = if name.starts_with("write") {
+                split_first_arg(&inv.body).map_or("", |(_, rest)| rest)
+            } else {
+                inv.body.as_str()
+            };
+            for expr in message_exprs(text) {
+                judge(&mut values, inv.line, name, &expr);
+            }
+        }
+    }
+    for name in MESSAGE_CALLS {
+        for inv in nested_invocations(&code, name) {
+            values.sinks += 1;
+            for arg in split_top_level(&inv.body) {
+                judge(&mut values, inv.line, name, &arg);
+            }
+        }
+    }
+    for (line, expr) in message_fields(&code) {
+        values.sinks += 1;
+        judge(&mut values, line, MESSAGE_FIELD, &expr);
+    }
+    values
+}
+
+/// `Some(true)` when `expr` is a cause in the shape its sink takes —
+/// `safe_inline(io_cause(…))` (any [`SANITIZERS`] around any [`CAUSE_PRODUCERS`] call,
+/// with any module path), or for a sink that escapes the cause itself the bare producer
+/// call too. `Some(false)` when it is an error value in any other shape, or a cause left
+/// unescaped. `None` when it is neither.
+fn judge_message_value(expr: &str, names: &[String], sink_escapes: bool) -> Option<bool> {
+    let e = strip_refs(expr);
+    if let Some(inner) = whole_call_to(e, SANITIZERS) {
+        if whole_call_to(strip_refs(&inner), CAUSE_PRODUCERS).is_some() {
+            return Some(true);
+        }
+        return error_valued(&inner, names).then_some(false);
+    }
+    if whole_call_to(e, CAUSE_PRODUCERS).is_some() {
+        return Some(sink_escapes);
+    }
+    error_valued(e, names).then_some(false)
+}
+
+/// Does `expr` hold an error — one of `names`, as itself, through a method or a field
+/// (`e.to_string()`, `e.error`), or behind `&` / `*` — and not merely `e.kind()`, an
+/// `io::ErrorKind`, which names no path?
+fn error_valued(expr: &str, names: &[String]) -> bool {
+    let e = strip_refs(expr);
+    let end = e
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(e.len());
+    let root = &e[..end];
+    names.iter().any(|name| name == root) && normalize(&e[end..]) != ".kind()"
+}
+
+/// `expr` without leading `&`, `&mut`, `*` or whitespace.
+fn strip_refs(expr: &str) -> &str {
+    let mut e = expr.trim();
+    // Bounded: every pass that does not return removes at least one byte.
+    loop {
+        let stripped = e.trim_start_matches(['&', '*']).trim_start();
+        let stripped = stripped
+            .strip_prefix("mut ")
+            .unwrap_or(stripped)
+            .trim_start();
+        if stripped.len() == e.len() {
+            return e;
+        }
+        e = stripped;
+    }
+}
+
+/// The argument text of `expr` when `expr` is wholly a call to a function whose last
+/// path segment is one of `names` (`safe_inline(x)`, `crate::output::io_cause(&e)`):
+/// every segment of the callee a plain identifier, nothing after the closing paren.
+fn whole_call_to(expr: &str, names: &[&str]) -> Option<String> {
+    let e = expr.trim();
+    let open = e.find('(')?;
+    let callee = e[..open].trim();
+    let segments: Vec<&str> = callee.split("::").map(str::trim).collect();
+    if !segments.iter().all(|s| is_ident(s)) || !names.contains(segments.last()?) {
+        return None;
+    }
+    let close = matching_paren(e, e.as_bytes(), open)?;
+    e[close + 1..]
+        .trim()
+        .is_empty()
+        .then(|| e[open + 1..close].to_string())
+}
+
+/// The names `code` holds an error in: [`ERROR_NAMES`]; every `Err(name)` /
+/// `Err(name @ …)` pattern; the closure parameter of every `map_err`, `or_else`,
+/// `unwrap_or_else` and `inspect_err`; every function parameter whose type names an
+/// `Error`; and, one hop on, every `let` whose initialiser holds one of those
+/// (`let msg = e.to_string();`).
+fn error_names(code: &str) -> Vec<String> {
+    let b = code.as_bytes();
+    let mut names: Vec<String> = ERROR_NAMES.iter().map(|n| (*n).to_string()).collect();
+
+    for inv in find_invocations(code, &["Err"]) {
+        let body = inv.body.trim();
+        let end = body
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len());
+        let (head, tail) = body.split_at(end);
+        let tail = tail.trim_start();
+        if is_ident(head) && head != "_" && (tail.is_empty() || tail.starts_with('@')) {
+            names.push(head.to_string());
+        }
+    }
+    for inv in find_invocations(
+        code,
+        &["map_err", "or_else", "unwrap_or_else", "inspect_err"],
+    ) {
+        let Some(params) = inv.body.trim_start().strip_prefix('|') else {
+            continue;
+        };
+        let Some(close) = params.find('|') else {
+            continue;
+        };
+        let pat = params[..close].split(':').next().unwrap_or_default().trim();
+        let pat = pat.strip_prefix("mut ").unwrap_or(pat).trim();
+        if is_ident(pat) && pat != "_" {
+            names.push(pat.to_string());
+        }
+    }
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(code, b, i) {
+            i = next;
+            continue;
+        }
+        let is_fn_keyword = b[i..].starts_with(b"fn")
+            && !prev_is_ident(b, i)
+            && b.get(i + 2).is_some_and(u8::is_ascii_whitespace);
+        if is_fn_keyword {
+            if let Some(open) = code[i..].find('(').map(|rel| i + rel) {
+                if let Some(close) = matching_paren(code, b, open) {
+                    for param in split_top_level(&code[open + 1..close]) {
+                        let Some((pat, ty)) = param.split_once(':') else {
+                            continue;
+                        };
+                        let pat = pat.trim();
+                        let pat = pat.strip_prefix("mut ").unwrap_or(pat).trim();
+                        if is_ident(pat) && ty.contains("Error") {
+                            names.push(pat.to_string());
+                        }
+                    }
+                    i = close;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let direct = names.clone();
+    for binding in collect_let_bindings(code) {
+        if error_valued(&binding.init, &direct) {
+            names.push(binding.name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Every `name(…)` invocation in `text`, those nested in another one's arguments
+/// included (`format!("{}", format!(…))`), with their 1-based lines in `text`.
+fn nested_invocations(text: &str, name: &str) -> Vec<Invocation> {
+    let mut found = Vec::new();
+    let mut pending: Vec<(String, usize)> = vec![(text.to_string(), 0)];
+    // Bounded: each invocation found is queued once, and its body is strictly shorter
+    // than the text it was found in.
+    while let Some((scope, lines_before)) = pending.pop() {
+        for inv in find_invocations(&scope, &[name]) {
+            let line = lines_before + inv.line;
+            pending.push((inv.body.clone(), line - 1));
+            found.push(Invocation {
+                line,
+                name: inv.name,
+                body: inv.body,
+            });
+        }
+    }
+    found.sort_by_key(|inv| inv.line);
+    found
+}
+
+/// The values a message invocation's arguments interpolate: the format string's
+/// captures and the arguments after it, or — when the first argument is not a string
+/// literal — every argument.
+fn message_exprs(body: &str) -> Vec<String> {
+    if parse_string_literal(body.trim_start()).is_some() {
+        return interpolated_exprs(body);
+    }
+    split_top_level(body)
+        .iter()
+        .map(|arg| normalize(strip_named_arg(arg.trim())))
+        .filter(|arg| !arg.is_empty())
+        .collect()
+}
+
+/// `(line, initialiser)` of every `message: <expr>` field in `code` — a struct literal's
+/// field, or a declaration's type, which names no value.
+fn message_fields(code: &str) -> Vec<(usize, String)> {
+    let b = code.as_bytes();
+    let field = MESSAGE_FIELD.as_bytes();
+    let mut fields = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(code, b, i) {
+            i = next;
+            continue;
+        }
+        let named = b[i..].starts_with(field)
+            && !prev_is_ident(b, i)
+            && !b
+                .get(i + field.len())
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            && !follows_a_dot(b, i)
+            && !follows_a_path_separator(b, i);
+        if !named {
+            i += 1;
+            continue;
+        }
+        let colon = skip_ws(b, i + field.len());
+        if b.get(colon) != Some(&b':') || b.get(colon + 1) == Some(&b':') {
+            i += field.len();
+            continue;
+        }
+        let start = colon + 1;
+        let end = expr_end(code, b, start);
+        fields.push((
+            code[..i].matches('\n').count() + 1,
+            normalize(&code[start..end]),
+        ));
+        i = end;
+    }
+    fields
+}
+
+/// Index just past the expression starting at `from`: the first `,`, `;`, or unmatched
+/// closing delimiter outside any nesting.
+fn expr_end(text: &str, b: &[u8], from: usize) -> usize {
+    let mut depth = 0i32;
+    let mut i = from;
+    while i < b.len() {
+        if let Some(next) = skip_literal(text, b, i) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return i,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' | b';' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Every message in the product code of `src` whose format string says
+/// [`WATCH_FAILURE_TEXT`]: its line, and whether the value that fills its first
+/// placeholder — the directory — is `safe_path(&shown_watched_dir(…))`.
+fn watch_failure_sites(src: &str) -> Vec<(usize, bool)> {
+    let code = product_code(src);
+    let mut sites = Vec::new();
+    for name in MESSAGE_MACROS {
+        for inv in nested_invocations(&code, name) {
+            let Some((fmt, _)) = parse_string_literal(inv.body.trim_start()) else {
+                continue;
+            };
+            if fmt.contains(WATCH_FAILURE_TEXT) {
+                let named =
+                    first_placeholder_value(&inv.body).is_some_and(|dir| names_a_watched_dir(&dir));
+                sites.push((inv.line, named));
+            }
+        }
+    }
+    sites.sort_unstable();
+    sites
+}
+
+/// The value that fills the first placeholder of a format invocation's string: a named
+/// capture (`{dir}`), or the positional argument a `{}` / `{N}` takes.
+fn first_placeholder_value(body: &str) -> Option<String> {
+    let trimmed = body.trim_start();
+    let (fmt, fmt_end) = parse_string_literal(trimmed)?;
+    let bytes = fmt.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' if bytes.get(i + 1) == Some(&b'{') => i += 2,
+            b'{' => {
+                let rel = fmt[i..].find('}')?;
+                let inner = &fmt[i + 1..i + rel];
+                let name = inner.split(':').next().unwrap_or_default();
+                if !name.is_empty() && !name.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(name.to_string());
+                }
+                let index: usize = if name.is_empty() {
+                    0
+                } else {
+                    name.parse().ok()?
+                };
+                let args = trimmed[fmt_end..].trim_start().strip_prefix(',')?;
+                let arg = split_top_level(args).into_iter().nth(index)?;
+                return Some(normalize(strip_named_arg(arg.trim())));
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Is `expr` wholly `safe_path(&shown_watched_dir(…))`, with any module paths?
+fn names_a_watched_dir(expr: &str) -> bool {
+    whole_call_to(strip_refs(expr), &["safe_path"])
+        .is_some_and(|dir| whole_call_to(strip_refs(&dir), &[WATCH_FAILURE_LABEL]).is_some())
 }

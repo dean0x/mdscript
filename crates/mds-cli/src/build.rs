@@ -970,8 +970,12 @@ fn serialize_output(output: CompiledOutput) -> Result<String> {
     match output {
         CompiledOutput::Markdown(s) => Ok(s),
         CompiledOutput::Messages(msgs) => {
-            let mut json = serde_json::to_string_pretty(&msgs)
-                .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
+            let mut json = serde_json::to_string_pretty(&msgs).map_err(|e| {
+                miette::miette!(
+                    "failed to serialize messages to JSON: {}",
+                    crate::output::safe_inline(&e)
+                )
+            })?;
             json.push('\n');
             Ok(json)
         }
