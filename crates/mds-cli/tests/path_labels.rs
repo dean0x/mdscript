@@ -3,10 +3,10 @@
 //! path as typed, or as the part below a directory the user named, as typed — the
 //! directory argument, `--out-dir`, the directory `mds.json` was reached by, or the
 //! entry's directory — never by a canonical or absolute spelling the user did not type;
-//! `mds lint`'s findings name a file argument by its file name. The carve-outs are pinned
-//! as they stand: the text of an error writing an output names the path the write was
-//! given, the canonical one below a directory resolved to it, and tempfile's own cause
-//! text an absolute one, as does notify's own cause text after the colon of a
+//! `mds lint`'s rule findings name a file argument by its file name. The carve-outs
+//! are pinned as they stand: the text of an error writing an output names the path the
+//! write was given, the canonical one below a directory resolved to it, and tempfile's own
+//! cause text an absolute one, as does notify's own cause text after the colon of a
 //! `failed to watch` line on Linux, which the absence check skips; and the file name of
 //! `mds watch`'s output beside its entry is the one the volume holds, which differs from
 //! the name as typed for an entry typed in another case on a case-insensitive volume. A
@@ -566,9 +566,9 @@ fn run_typed(
 
 /// `mds lint` names a file argument as typed in `Fixed:`, `Would fix:` and the header of a
 /// `--fix --diff`, a directory's entry below the directory argument as typed, and stdin as
-/// `<stdin>`. A finding's source frame and the JSON `file` key name a file argument by its
-/// file name and a directory's entry by its path relative to the directory argument,
-/// `/`-separated on every OS.
+/// `<stdin>`. The source frame of a rule's finding and the JSON `file` key name a file
+/// argument by its file name and a directory's entry by its path relative to the directory
+/// argument, `/`-separated on every OS.
 #[test]
 fn lint_names_a_file_argument_as_typed_and_its_findings_by_its_file_name() {
     const WARN: &str = "---\ngreeting: Hello\nunused_key: x\n---\n\n{{greeting}}, world!\n";
@@ -2238,9 +2238,19 @@ fn cited_tests(cell: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// Does `line` end the section [`LABEL_SECTION`] heads: a heading of its level or above,
+/// or a horizontal rule? A deeper heading is part of the section.
+fn ends_label_section(line: &str) -> bool {
+    let level = |text: &str| text.bytes().take_while(|&b| b == b'#').count();
+    let heading = level(line);
+    line == "---"
+        || ((1..=level(LABEL_SECTION)).contains(&heading)
+            && matches!(line.as_bytes().get(heading), None | Some(b' ')))
+}
+
 /// The body rows of the table in `spec`'s §7.10. The section must appear once and hold
-/// one table, headed by [`LABEL_COLUMNS`], whose every row has four cells, none of them
-/// empty, and cites at least one test. A line may end in CRLF.
+/// one table, headed by [`LABEL_COLUMNS`] and ended by a blank line, whose every row has
+/// four cells, none of them empty, and cites at least one test. A line may end in CRLF.
 fn label_table(spec: &str) -> Result<Vec<LabelRow>, String> {
     let lines: Vec<&str> = spec.lines().map(str::trim_end).collect();
     let starts: Vec<usize> = lines
@@ -2255,12 +2265,16 @@ fn label_table(spec: &str) -> Result<Vec<LabelRow>, String> {
             starts.len()
         ));
     };
-    // The section runs to the next heading or horizontal rule. Line numbers count from 1.
-    let table: Vec<(usize, &str)> = lines[start + 1..]
+    // Line numbers count from 1.
+    let section: Vec<(usize, &str)> = lines[start + 1..]
         .iter()
         .enumerate()
         .map(|(at, line)| (start + 2 + at, *line))
-        .take_while(|(_, line)| !line.starts_with('#') && *line != "---")
+        .take_while(|(_, line)| !ends_label_section(line))
+        .collect();
+    let table: Vec<(usize, &str)> = section
+        .iter()
+        .copied()
         .filter(|(_, line)| line.starts_with('|'))
         .collect();
     let (Some(&(first, header)), Some(&(last, _))) = (table.first(), table.last()) else {
@@ -2270,6 +2284,14 @@ fn label_table(spec: &str) -> Result<Vec<LabelRow>, String> {
         return Err(format!(
             "the table lines {first}..={last} are not one table: other lines lie between them"
         ));
+    }
+    // Markdown reads any line that follows a table before a blank line as one more row,
+    // with a leading `|` or without one, so such a line would be a row this check skips.
+    if let Some(&(after, _)) = section
+        .iter()
+        .find(|&&(line, text)| line == last + 1 && !text.is_empty())
+    {
+        return Err(format!("line {after}: the table must end at a blank line"));
     }
     if table_cells(header) != LABEL_COLUMNS {
         return Err(format!(
@@ -2333,7 +2355,8 @@ fn cli_rust_sources() -> Vec<(PathBuf, String)> {
 }
 
 /// The files of `sources` that define a test named `name`: a line `fn <name>() {` with
-/// `#[test]` among the attribute and doc-comment lines right above it.
+/// `#[test]`, and no `#[ignore …]`, among the attribute and doc-comment lines right above
+/// it. A file that defines it once per platform counts once.
 fn test_definitions<'a>(name: &str, sources: &'a [(PathBuf, String)]) -> Vec<&'a Path> {
     let signature = format!("fn {name}() {{");
     sources
@@ -2345,11 +2368,14 @@ fn test_definitions<'a>(name: &str, sources: &'a [(PathBuf, String)]) -> Vec<&'a
                 .enumerate()
                 .filter(|(_, line)| **line == signature)
                 .any(|(at, _)| {
-                    lines[..at]
+                    let attributes: Vec<&str> = lines[..at]
                         .iter()
                         .rev()
                         .take_while(|line| line.starts_with("#[") || line.starts_with("///"))
-                        .any(|line| *line == "#[test]")
+                        .copied()
+                        .collect();
+                    attributes.contains(&"#[test]")
+                        && !attributes.iter().any(|line| line.starts_with("#[ignore"))
                 })
         })
         .map(|(path, _)| path.as_path())
@@ -2357,9 +2383,9 @@ fn test_definitions<'a>(name: &str, sources: &'a [(PathBuf, String)]) -> Vec<&'a
 }
 
 /// spec.md §7.10's table and [`LABEL_TABLE`] cite the same tests, row by row, and each
-/// test they cite is a `#[test]` function defined once among mds-cli's test and source
-/// files — so a row added or removed, a test cited or dropped, and a cited test renamed or
-/// deleted each fail here.
+/// test they cite is a `#[test]` function, not ignored, defined in exactly one of mds-cli's
+/// test and source files — so a row added or removed, a test cited or dropped, and a cited
+/// test renamed, deleted or ignored each fail here.
 #[test]
 fn the_spec_s_path_label_table_cites_exactly_these_tests() {
     let spec_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec.md");
@@ -2402,14 +2428,14 @@ fn the_spec_s_path_label_table_cites_exactly_these_tests() {
         .collect();
     assert!(
         undefined.is_empty(),
-        "each test spec.md §7.10 cites must be a #[test] fn defined once in \
-         crates/mds-cli/tests/*.rs or crates/mds-cli/src/*.rs: {undefined:#?}"
+        "each test spec.md §7.10 cites must be a #[test] fn, not ignored, defined in exactly \
+         one file of crates/mds-cli/tests/*.rs and crates/mds-cli/src/*.rs: {undefined:#?}"
     );
 }
 
 /// The table check refuses each way a row could stand without a test, reads a CRLF spec
-/// as an LF one, and finds a test only where one `#[test]` function of that name is
-/// defined (positive controls).
+/// as an LF one, and finds a test only where a `#[test]` function of that name is defined
+/// and not ignored (positive controls).
 #[test]
 fn the_table_check_refuses_a_row_without_a_test_and_finds_only_defined_tests() {
     let spec = |rows: &str| {
@@ -2448,6 +2474,20 @@ fn the_table_check_refuses_a_row_without_a_test_and_finds_only_defined_tests() {
             "| `mds x` | `X` | as typed | `a_test` |\n\nProse.\n\n| `mds y` | `Y` | as typed | `b_test` |",
             "a second table",
         ),
+        (
+            "| `mds x` | `X` | as typed | `a_test` |\n`mds y` | `Y` | as typed | — |",
+            "a row without a leading pipe, which still continues the table",
+        ),
+        (
+            "| `mds x` | `X` | as typed | `a_test` |\n  | `mds y` | `Y` | as typed | — |",
+            "an indented row",
+        ),
+        (
+            "| `mds x` | `X` | as typed | `a_test` |\n\n#### Sub\n\n\
+             | Command | Line | Form | Pinned by |\n|---|---|---|---|\n\
+             | `mds y` | `Y` | as typed | — |",
+            "a second table below a subsection's heading",
+        ),
     ] {
         assert!(
             label_table(&spec(rows)).is_err(),
@@ -2464,9 +2504,13 @@ fn the_table_check_refuses_a_row_without_a_test_and_finds_only_defined_tests() {
         "another header"
     );
     assert!(label_table(&spec("")).is_err(), "a table with no rows");
+    assert_eq!(
+        label_table(&good.replace("---\n\n## 8. Next", "### 7.11 Next")),
+        label_table(&good),
+        "a heading of the section's own level ends it, before the next table"
+    );
 
-    let planted =
-        vec![
+    let planted = vec![
         (
             PathBuf::from("a.rs"),
             "/// Doc.\n#[cfg(unix)]\n#[test]\nfn planted_test() {\n}\n\nfn planted_helper() {\n}\n"
@@ -2474,6 +2518,15 @@ fn the_table_check_refuses_a_row_without_a_test_and_finds_only_defined_tests() {
         ),
         (PathBuf::from("b.rs"), "#[test]\nfn twice() {\n}\n".to_owned()),
         (PathBuf::from("c.rs"), "#[test]\nfn twice() {\n}\n".to_owned()),
+        (
+            PathBuf::from("d.rs"),
+            "#[cfg(unix)]\n#[test]\nfn per_platform() {\n}\n\n\
+             #[cfg(windows)]\n#[test]\nfn per_platform() {\n}\n\n\
+             #[ignore]\n#[test]\nfn ignored() {\n}\n\n\
+             #[test]\n#[ignore = \"slow\"]\nfn ignored_too() {\n}\n\n\
+             #[cfg_attr(not(unix), ignore = \"unix only\")]\n#[test]\nfn ignored_elsewhere() {\n}\n"
+                .to_owned(),
+        ),
     ];
     assert_eq!(
         test_definitions("planted_test", &planted),
@@ -2491,6 +2544,22 @@ fn the_table_check_refuses_a_row_without_a_test_and_finds_only_defined_tests() {
         test_definitions("twice", &planted).len(),
         2,
         "a test defined twice is found twice, which the table check refuses"
+    );
+    assert_eq!(
+        test_definitions("per_platform", &planted),
+        [Path::new("d.rs")],
+        "a test defined per platform in one file is found in that file"
+    );
+    for ignored in ["ignored", "ignored_too"] {
+        assert!(
+            test_definitions(ignored, &planted).is_empty(),
+            "an ignored test runs nowhere, so it pins nothing: {ignored}"
+        );
+    }
+    assert_eq!(
+        test_definitions("ignored_elsewhere", &planted),
+        [Path::new("d.rs")],
+        "a test ignored only on other platforms runs here"
     );
     let sources = cli_rust_sources();
     let here = test_definitions("clean_names_a_file_argument_as_typed", &sources);
