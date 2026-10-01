@@ -540,6 +540,30 @@ fn diff_header(path: &str) -> String {
     format!("--- {path}\n+++ {path}\n")
 }
 
+/// Runs `mds` with `args` (each passed through [`typed_args`]) against `root`, feeding
+/// `stdin` when given: the exit code, stdout, stderr — each checked for no leaked
+/// scratch-directory path — and a label naming the invocation.
+fn run_typed(
+    root: &Path,
+    args: &[&str],
+    stdin: Option<&'static str>,
+) -> (Option<i32>, String, String, String) {
+    let args = typed_args(args);
+    let out = match stdin {
+        Some(input) => run_with_stdin(root, &args, input),
+        None => run(root, &args),
+    };
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(leak(&stdout, root), None, "{args:?}: stdout: {stdout}");
+    assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+    (
+        out.status.code(),
+        stdout,
+        stderr,
+        format!("mds {}", args.join(" ")),
+    )
+}
+
 /// `mds lint` names a file argument as typed in `Fixed:`, `Would fix:` and the header of a
 /// `--fix --diff`, a directory's entry below the directory argument as typed, and stdin as
 /// `<stdin>`. A finding's source frame and the JSON `file` key name a file argument by its
@@ -555,22 +579,7 @@ fn lint_names_a_file_argument_as_typed_and_its_findings_by_its_file_name() {
     put(root, "lints/deep/warn.mds", WARN);
     put(root, "sub/f.mds", FIXABLE);
     put(root, "fix/deep/f.mds", FIXABLE);
-    let lint = |args: &[&str], stdin: Option<&'static str>| {
-        let args = typed_args(args);
-        let out = match stdin {
-            Some(input) => run_with_stdin(root, &args, input),
-            None => run(root, &args),
-        };
-        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
-        assert_eq!(leak(&stdout, root), None, "{args:?}: stdout: {stdout}");
-        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
-        (
-            out.status.code(),
-            stdout,
-            stderr,
-            format!("mds {}", args.join(" ")),
-        )
-    };
+    let lint = |args: &[&str], stdin: Option<&'static str>| run_typed(root, args, stdin);
 
     // (the input, stdin, the source frame's header, the JSON `file` key)
     for (input, stdin, frame, key) in [
@@ -649,22 +658,7 @@ fn fmt_names_a_file_argument_as_typed_and_a_directory_s_entries_below_it() {
     put(root, "sub/fine.mds", "Fine\n");
     put(root, "src/a.mds", "A");
     put(root, "src/inner/b.mds", "B");
-    let fmt = |args: &[&str], stdin: Option<&'static str>| {
-        let args = typed_args(args);
-        let out = match stdin {
-            Some(input) => run_with_stdin(root, &args, input),
-            None => run(root, &args),
-        };
-        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
-        assert_eq!(leak(&stdout, root), None, "{args:?}: stdout: {stdout}");
-        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
-        (
-            out.status.code(),
-            stdout,
-            stderr,
-            format!("mds {}", args.join(" ")),
-        )
-    };
+    let fmt = |args: &[&str], stdin: Option<&'static str>| run_typed(root, args, stdin);
 
     // Read-only first: (arguments, stdin, exit, the start of stdout, all of stderr).
     let cases = [
