@@ -1,11 +1,16 @@
 //! The lines of `mds build`, `mds check`, `mds lint` and `mds watch` pinned here name a
 //! path as typed, or as the part below a directory the user named, as typed — the
-//! directory argument, `--out-dir`, or the directory `mds.json` was reached by — never by
-//! a canonical or absolute spelling the user did not type (#390). Not among them: the text
-//! of an I/O error raised while writing below a directory's `--out-dir`, and of the
-//! warning for a stale output of the other kind that cannot be removed, both of which
-//! still name the canonical path; and a directory `mds watch` watches for a dependency,
-//! which has only the path the compile reported.
+//! directory argument, `--out-dir`, the directory `mds.json` was reached by, or the
+//! entry's directory — never by a canonical or absolute spelling the user did not type
+//! (#390). The file name of `mds watch`'s output beside its entry is the one the volume
+//! holds, which differs from the name as typed for an entry typed in another case on a
+//! case-insensitive volume. Not among them: the text of an I/O error raised while writing
+//! below a directory's `--out-dir`, and of the warning for a stale output of the other
+//! kind that cannot be removed, both of which still name the canonical path; and a
+//! directory `mds watch` watches for a dependency outside the entry's directory and the
+//! directory argument, which has only the path the compile reported (one below either is
+//! named below it as typed — only a refused watch prints it, so watch.rs's unit tests pin
+//! that).
 //!
 //! Each run starts in a scratch directory with relative arguments, so the scratch
 //! directory's own absolute path has no business in any output: [`leak`] looks for it in
@@ -24,7 +29,7 @@ use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{mds_bin, write_atomic};
 
@@ -765,8 +770,9 @@ fn no_listed_build_check_or_lint_run_names_the_working_directory() {
 
 /// `mds watch` announces its startup outputs through build's `Compiled to` line, so an
 /// output under `--out-dir` (directory mode) or under `mds.json` `build.output_dir`
-/// (both modes) is named as `mds build` names it. Watch's own lines are pinned in the
-/// section below.
+/// (both modes) is named as `mds build` names it — for an entry typed as the volume
+/// spells it (see `an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk`).
+/// Watch's own lines are pinned in the section below.
 #[test]
 fn watch_startup_names_an_out_dir_and_a_config_output_dir_as_build_does() {
     let dir = scratch();
@@ -1302,6 +1308,133 @@ fn an_output_that_cannot_be_removed_is_named_as_typed() {
             "{fixture}: the output is still there"
         );
         assert_eq!(leak(&stderr, root), None, "{fixture}: stderr: {stderr}");
+    }
+}
+
+/// An entry typed in another case than its name on a case-insensitive volume: `mds watch`
+/// derives its output's file name from the name the volume holds — the file it resolves
+/// the entry to — and writes and names the output by it, beside the entry as typed or
+/// below `--out-dir` as typed; `mds build` keeps the case as typed.
+///
+/// Unix-only, and skipped with a reason where the volume tells case apart (Linux, a
+/// case-sensitive macOS volume).
+#[cfg(unix)]
+#[test]
+fn an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "b/page.mds", "Page\n");
+    if !root.join("b/PAGE.mds").exists() {
+        eprintln!("skipped: {} tells case apart", root.display());
+        return;
+    }
+
+    let build = run(&root.join("b"), &["build", "PAGE.mds"]);
+    let built = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        built.lines().any(|line| line == "Compiled to ./PAGE.md"),
+        "control: mds build names the output by the case typed; stderr: {built}"
+    );
+
+    // (the session's directory, its arguments, the output as named, where it is written)
+    for (cwd, args, output, written) in [
+        ("w", &["watch", "PAGE.mds"][..], "./page.md", "w"),
+        (
+            "o",
+            &["watch", "PAGE.mds", "--out-dir", "out"],
+            "out/page.md",
+            "o/out",
+        ),
+    ] {
+        put(root, &format!("{cwd}/page.mds"), "Page\n");
+        let (mut child, tap, _) = watch_live(&root.join(cwd), args, false);
+        write_atomic(&root.join(cwd).join("page.mds"), "Edited\n");
+        common::wait_for_tap(&tap, "Recompiled ", WATCH_STEP);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            stderr.lines().next(),
+            Some("Watching PAGE.mds"),
+            "{args:?}: stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Compiled to "),
+            [format!("Compiled to {output}")],
+            "{args:?}: stderr: {stderr}"
+        );
+        let recompiled = lines_starting(&stderr, "Recompiled ");
+        assert!(
+            !recompiled.is_empty()
+                && recompiled
+                    .iter()
+                    .all(|line| line.starts_with(&format!("Recompiled {output} ("))),
+            "{args:?}: every rebuild names the output by the name on disk; stderr: {stderr}"
+        );
+        let names: Vec<String> = std::fs::read_dir(root.join(written))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".md"))
+            .collect();
+        assert_eq!(names, ["page.md"], "{args:?}: written under that name");
+        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+    }
+}
+
+/// `failed to watch vars directory` names the directory as the `--vars` file was typed:
+/// a directory that does not exist, and — for a bare file name — the working directory,
+/// which the session asks the watcher for as the empty path. Neither file exists, so each
+/// session then ends at startup, refusing the `--vars` file.
+///
+/// The bare name runs on macOS only: its watcher refuses the empty path, while the Linux
+/// and Windows watchers resolve it against the working directory, which exists, and watch
+/// that, so nothing is printed there.
+#[test]
+fn a_vars_directory_that_cannot_be_watched_is_named_as_typed() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "d/a.mds", "A\n");
+
+    // (the `--vars` argument, the directory the warning names)
+    let mut cases = vec![("nodir/v.json", "nodir")];
+    if cfg!(target_os = "macos") {
+        cases.push(("v.json", "."));
+    }
+    for (vars, shown) in cases {
+        let args = typed_args(&["watch", "d", "--vars", vars]);
+        let label = format!("mds {}", args.join(" "));
+        let (child, tap, _) = common::spawn_watch_unsynchronized(
+            mds_bin()
+                .current_dir(root)
+                .args(&args)
+                .stdout(Stdio::null()),
+        );
+        let mut child = common::ChildGuard(child);
+        // Bounded: the session ends at startup on its own.
+        let deadline = Instant::now() + WATCH_STEP;
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("wait for mds watch") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label}: the session did not end within {WATCH_STEP:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stderr = tap.finish_text(&mut child);
+
+        assert!(
+            !status.success(),
+            "{label}: a missing --vars file ends the session at startup; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "warning: failed to watch vars directory {}: ",
+                native(shown)
+            )),
+            "{label}: the directory is named as the --vars file was typed; stderr: {stderr}"
+        );
+        assert_eq!(leak(&stderr, root), None, "{label}: stderr: {stderr}");
     }
 }
 

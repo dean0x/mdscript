@@ -459,12 +459,15 @@ pub(crate) fn clear_terminal() {
 
 /// Update the watcher to reflect a new set of directories.
 ///
-/// Unwatch directories no longer needed, watch newly required ones.
+/// Unwatch directories no longer needed, watch newly required ones; a directory that
+/// cannot be watched is named through [`shown_watched_dir`] with `root` and `vars`.
 /// Returns the updated set of currently-watched directories.
 pub(crate) fn resync_watches(
     watcher: &mut RecommendedWatcher,
     current_dirs: &BTreeSet<PathBuf>,
     new_dirs: &BTreeSet<PathBuf>,
+    root: RootPaths<'_>,
+    vars: Option<RootPaths<'_>>,
 ) -> BTreeSet<PathBuf> {
     let mut result = current_dirs.clone();
     // Unwatch removed directories.
@@ -478,7 +481,7 @@ pub(crate) fn resync_watches(
         if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
             eprint_warning(&format!(
                 "warning: failed to watch {}: {}",
-                safe_path(dir),
+                safe_path(&shown_watched_dir(dir, root, vars)),
                 safe_inline(&e)
             ));
         } else {
@@ -1066,16 +1069,22 @@ impl WatchedPath {
         }
     }
 
+    /// The directory of the entry in the same two forms: the canonical directory notify
+    /// watches, named by the entry's directory as typed (#390).
+    fn dir_paths(&self) -> RootPaths<'_> {
+        RootPaths {
+            typed: mds::effective_parent(&self.typed),
+            walked: mds::effective_parent(&self.canonical),
+        }
+    }
+
     /// The path `src` (a walked or graph-key path under the root's `canonical`) is
-    /// compiled by.
+    /// compiled by: the form its output is named below the root by, too.
     ///
     /// A source outside the root — an out-of-root dependency (DD3) — has no walked
     /// form and is compiled by its canonical path.
     fn walked(&self, src: &Path) -> PathBuf {
-        match src.strip_prefix(&self.canonical) {
-            Ok(below) => self.typed.join(below),
-            Err(_) => src.to_path_buf(),
-        }
+        self.root_paths().shown_below(src)
     }
 
     /// Compile `src` below the root — every directory-mode compile goes through here.
@@ -1708,7 +1717,13 @@ fn rebuild_file(
     // Freshness rule: always recompute dep set from fresh output.
     let deps = graph_keys(&compiled.dependencies);
     let new_dirs = dirs_to_watch(&ctx.entry.canonical, &deps, ctx.vars_path.as_deref());
-    state.watched_dirs = resync_watches(watcher, &state.watched_dirs, &new_dirs);
+    state.watched_dirs = resync_watches(
+        watcher,
+        &state.watched_dirs,
+        &new_dirs,
+        ctx.entry.dir_paths(),
+        vars_dir_paths(ctx.vars_path.as_deref(), ctx.vars_path_typed.as_deref()),
+    );
     // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
     // dirs removed by resync_watches are no longer in watched_dirs.
     state.armed_dirs = state.watched_dirs.clone();
@@ -1757,24 +1772,30 @@ fn settle_after_failure(state: &mut FileWatchState, failure: CompileFailure) {
     state.last_mtimes = snapshot_state(&state.foi);
 }
 
-/// A directory file mode watches, as a message names it (#390): the entry's directory,
-/// or the `--vars` file's (`vars` holds that file's canonical and typed paths), by the
-/// path the user typed; any other — a dependency's — by the path the compile reported,
-/// the only one it has.
-fn shown_watched_dir<'a>(
-    dir: &'a Path,
-    entry: &'a WatchedPath,
-    vars: Option<(&'a Path, &'a Path)>,
-) -> &'a Path {
-    if dir == mds::effective_parent(&entry.canonical) {
-        return mds::effective_parent(&entry.typed);
-    }
+/// A directory `mds watch` watches, as a message names it (#390). `root` is the directory
+/// argument in directory mode, the entry's directory in file mode ([`RootPaths`]: the
+/// canonical form watched, the form typed): it is named as typed, and a directory below
+/// it — a dependency's — below it as typed. `vars` is the directory armed for the `--vars`
+/// file, named by that file's directory as typed. Any other directory — a dependency's
+/// outside both — has no typed form and is named by the path the compile reported.
+fn shown_watched_dir(dir: &Path, root: RootPaths<'_>, vars: Option<RootPaths<'_>>) -> PathBuf {
     match vars {
-        Some((canonical, typed)) if dir == mds::effective_parent(canonical) => {
-            mds::effective_parent(typed)
-        }
-        _ => dir,
+        Some(vars) if dir == vars.walked && dir != root.walked => vars.typed.to_path_buf(),
+        _ => root.typed_below(dir).unwrap_or_else(|| dir.to_path_buf()),
     }
+}
+
+/// The directory of file mode's `--vars` file in the two forms [`shown_watched_dir`]
+/// takes: the canonical directory [`dirs_to_watch`] arms, and the file's directory as
+/// typed.
+fn vars_dir_paths<'a>(
+    canonical: Option<&'a Path>,
+    typed: Option<&'a Path>,
+) -> Option<RootPaths<'a>> {
+    canonical.zip(typed).map(|(canonical, typed)| RootPaths {
+        typed: mds::effective_parent(typed),
+        walked: mds::effective_parent(canonical),
+    })
 }
 
 /// Single-file watch: `entry.typed` is the path as typed — the entry is compiled by it
@@ -2001,11 +2022,11 @@ fn run_watch_file(
                 watched_dirs.insert(dir);
             }
             Err(e) => {
-                let vars = vars_path.as_deref().zip(vars_path_typed.as_deref());
+                let vars = vars_dir_paths(vars_path.as_deref(), vars_path_typed.as_deref());
                 return Err(miette::miette!(
                     "failed to watch directory {}: {e}\n\
                      hint: on Linux you may need to increase fs.inotify.max_user_watches",
-                    safe_path(shown_watched_dir(&dir, &entry, vars))
+                    safe_path(&shown_watched_dir(&dir, entry.dir_paths(), vars))
                 ));
             }
         }
@@ -2836,6 +2857,14 @@ fn dir_watch_startup(
             None
         }
     });
+    // That directory in the two forms a message names it by ([`shown_watched_dir`]).
+    let vars_dir = vars_dir_extra
+        .as_deref()
+        .zip(vars_path_typed.as_deref())
+        .map(|(walked, typed)| RootPaths {
+            typed: mds::effective_parent(typed),
+            walked,
+        });
 
     // ── Arm before publish (startup race) ─────────────────────────────────────
     //
@@ -2882,7 +2911,7 @@ fn dir_watch_startup(
         miette::miette!(
             "failed to watch directory {}: {e}\n\
                  hint: on Linux you may need to increase fs.inotify.max_user_watches",
-            safe_path(&watch_root.typed)
+            safe_path(&shown_watched_dir(root, watch_root.root_paths(), vars_dir))
         )
     })?;
 
@@ -2891,13 +2920,9 @@ fn dir_watch_startup(
     // a transient failure must not abort the session, applies the reconcile rule / consistency fix).
     if let Some(ref vd) = vars_dir_extra {
         if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
-            // Named as the `--vars` file was typed (#390).
-            let shown = vars_path_typed
-                .as_deref()
-                .map_or(vd.as_path(), mds::effective_parent);
             eprint_warning(&format!(
                 "warning: failed to watch vars directory {}: {}",
-                safe_path(shown),
+                safe_path(&shown_watched_dir(vd, watch_root.root_paths(), vars_dir)),
                 safe_inline(&e)
             ));
         }
@@ -3017,7 +3042,11 @@ fn dir_watch_startup(
         if let Err(e) = watcher.watch(ext_dir, RecursiveMode::NonRecursive) {
             eprint_warning(&format!(
                 "warning: failed to watch external dep dir {}: {}",
-                safe_path(ext_dir),
+                safe_path(&shown_watched_dir(
+                    ext_dir,
+                    watch_root.root_paths(),
+                    vars_dir
+                )),
                 safe_inline(&e)
             ));
         }
@@ -3659,34 +3688,70 @@ mod tests {
         }
     }
 
-    /// #390: file mode names the directory of its entry, and of its `--vars` file, as
-    /// typed in a message about watching it; a dependency's directory, which the user
-    /// never typed, keeps the path the compile reported.
+    /// #390: a message about watching a directory names the entry's directory in file
+    /// mode, or the directory argument, as typed, and a dependency's directory below it
+    /// below it as typed; the `--vars` file's directory as that file was typed. A
+    /// dependency's directory outside both has no typed form and keeps the path the
+    /// compile reported. Every line that names a watched directory goes through
+    /// `shown_watched_dir`: file mode's startup `failed to watch directory` and
+    /// rebuild-time `failed to watch`, directory mode's `failed to watch directory`,
+    /// `failed to watch vars directory` and `failed to watch external dep dir`.
     #[test]
     fn a_watched_directory_is_named_as_the_user_typed_it() {
+        use std::ffi::OsStr;
+
+        // File mode: `mds watch page.mds --vars ../v.json` in `/project`.
         let entry = WatchedPath {
             typed: PathBuf::from("page.mds"),
             canonical: PathBuf::from("/project/page.mds"),
             what: Watched::Entry,
         };
-        let vars = Some((Path::new("/elsewhere/v.json"), Path::new("../v.json")));
+        let vars = vars_dir_paths(
+            Some(Path::new("/elsewhere/v.json")),
+            Some(Path::new("../v.json")),
+        );
+        let shown = |dir: &str| shown_watched_dir(Path::new(dir), entry.dir_paths(), vars);
 
+        // As typed exactly — no separator added to the directory itself.
+        assert_eq!(shown("/project").as_os_str(), OsStr::new("."));
+        assert_eq!(shown("/elsewhere").as_os_str(), OsStr::new(".."));
+        // A dependency's directory below the entry's is named below it as typed.
+        assert_eq!(shown("/project/lib"), Path::new("./lib"));
+        assert_eq!(shown("/project/lib/deep"), Path::new("./lib/deep"));
+        // Outside the entry's directory: no typed form, below the `--vars` directory
+        // included.
+        assert_eq!(shown("/lib"), Path::new("/lib"));
+        assert_eq!(shown("/elsewhere/sub"), Path::new("/elsewhere/sub"));
         assert_eq!(
-            shown_watched_dir(Path::new("/project"), &entry, vars),
-            Path::new(".")
-        );
-        assert_eq!(
-            shown_watched_dir(Path::new("/elsewhere"), &entry, vars),
-            Path::new("..")
-        );
-        assert_eq!(
-            shown_watched_dir(Path::new("/lib"), &entry, vars),
-            Path::new("/lib")
-        );
-        assert_eq!(
-            shown_watched_dir(Path::new("/elsewhere"), &entry, None),
+            shown_watched_dir(Path::new("/elsewhere"), entry.dir_paths(), None),
             Path::new("/elsewhere")
         );
+        // A `--vars` file beside the entry: its directory is the entry's, named as such.
+        let beside = vars_dir_paths(
+            Some(Path::new("/project/v.json")),
+            Some(Path::new("../project/v.json")),
+        );
+        assert_eq!(
+            shown_watched_dir(Path::new("/project"), entry.dir_paths(), beside).as_os_str(),
+            OsStr::new(".")
+        );
+
+        // Directory mode: `mds watch src --vars cfg/v.json`, the `--vars` directory armed
+        // as `cfg` — what a missing file's directory is, as typed.
+        let root = WatchedPath {
+            typed: PathBuf::from("src"),
+            canonical: PathBuf::from("/project/src"),
+            what: Watched::Root,
+        };
+        let vars = Some(RootPaths {
+            typed: Path::new("cfg"),
+            walked: Path::new("cfg"),
+        });
+        let shown = |dir: &str| shown_watched_dir(Path::new(dir), root.root_paths(), vars);
+        assert_eq!(shown("/project/src").as_os_str(), OsStr::new("src"));
+        assert_eq!(shown("/project/src/sub"), Path::new("src/sub"));
+        assert_eq!(shown("cfg").as_os_str(), OsStr::new("cfg"));
+        assert_eq!(shown("/project/shared"), Path::new("/project/shared"));
     }
 
     // T-U3a: is_content_event filters Access events, passes Modify/Create/Remove/Any/Other.

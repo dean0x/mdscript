@@ -107,8 +107,7 @@ type Frame<'a> = (&'a str, &'a str);
 const QUOTED: Frame<'static> = ("\"", "\"");
 
 /// `text` names the path exactly as `shown`, framed by `frame`, and never frames the
-/// canonical absolute form of `resolved` — status lines may name that, an error may
-/// not.
+/// canonical absolute form of `resolved`, which an error may not name.
 fn assert_names_as_typed(text: &str, frame: Frame<'_>, shown: &str, resolved: &Path, label: &str) {
     let (open, close) = frame;
     let text = squash(text);
@@ -817,7 +816,7 @@ mod resolved_output {
         );
         assert_no_control_chars(text, label);
         assert!(!text.contains('\t'), "{label}: raw TAB; got: {text:?}");
-        // The refusal itself: `watch` announces its (canonical) entry before it.
+        // The refusal itself: `watch` announces its entry before it.
         let refusal = &text[text
             .find("mds::io")
             .unwrap_or_else(|| panic!("{label}: mds::io; got: {text:?}"))..];
@@ -1010,7 +1009,7 @@ mod config_errors {
     /// run in a clean working directory: in the hostile one `watch` refuses its input
     /// before it loads the config. There the absence of the temp directory's name is
     /// what proves no absolute path is shown, and `-q` keeps `watch`'s `Watching …`
-    /// status line — which names the canonical path, as status lines may — out of it.
+    /// status line out of it, so the text checked is the config error's alone.
     #[test]
     fn config_load_errors_name_the_file_as_reached_from_the_input() {
         let tmp = tempfile::tempdir().unwrap();

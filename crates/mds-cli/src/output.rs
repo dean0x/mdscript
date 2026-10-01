@@ -1089,7 +1089,8 @@ impl WriteTarget {
 /// strips a source against. `typed` is the directory argument as typed: an output next to
 /// its source is named below it. `mds build` walks the directory as typed and passes it as
 /// both; `mds watch` walks its canonical form, which matches the event paths notify
-/// reports.
+/// reports, and holds the entry's directory and the `--vars` file's in the same two forms
+/// to name a directory it watches.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RootPaths<'a> {
     pub(crate) typed: &'a Path,
@@ -1107,11 +1108,20 @@ impl<'a> RootPaths<'a> {
 
     /// `source`, a path the walk of `walked` produced, named below `typed`. A source not
     /// below `walked` has no typed form and keeps its own.
-    fn shown_below(self, source: &Path) -> PathBuf {
-        match source.strip_prefix(self.walked) {
-            Ok(below) => self.typed.join(below),
-            Err(_) => source.to_path_buf(),
-        }
+    pub(crate) fn shown_below(self, source: &Path) -> PathBuf {
+        self.typed_below(source)
+            .unwrap_or_else(|| source.to_path_buf())
+    }
+
+    /// `path` named below `typed` — `walked` itself as `typed`, with no separator added —
+    /// or `None` when `path` is not `walked` or below it.
+    pub(crate) fn typed_below(self, path: &Path) -> Option<PathBuf> {
+        let below = path.strip_prefix(self.walked).ok()?;
+        Some(if below.as_os_str().is_empty() {
+            self.typed.to_path_buf()
+        } else {
+            self.typed.join(below)
+        })
     }
 }
 

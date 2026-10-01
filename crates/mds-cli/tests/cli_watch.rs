@@ -7480,3 +7480,174 @@ fn watch_that_stops_before_it_is_live_exits_by_the_batch_rule() {
         "precondition: every stderr write failed"
     );
 }
+
+// ── One edit, one rebuild: event paths meet the session's keys (#390) ──────────
+//
+// A session keys what it watches by path: the dependencies a compile reports, the
+// `--vars` file, and the paths notify reports events under must name each file in one
+// form, or an edit to it starts no rebuild. Every session below runs with
+// `--poll-interval 0`, so no self-heal tick can stand in for an event the session
+// failed to match, and runs twice: with `src/a.mds` as the entry, and below the
+// directory argument `src`.
+
+/// The two ways a session below reaches `src/a.mds`: as the entry, and below the
+/// directory argument.
+const ENTRY_AND_DIRECTORY: [&[&str]; 2] = [&["watch", "src/a.mds"], &["watch", "src"]];
+
+/// Run `mds watch <args>` in `base` with native events only, where `src/a.mds` reads
+/// `edited`, and check that its output `src/a.md` holds `before` at startup and `after`
+/// once `edited` has been changed to `text`, once. Return the session's stderr whole —
+/// complete up to the order marker then written to `src/a.mds`, so a count over it is
+/// exact.
+#[track_caller]
+fn one_edit(
+    base: &Path,
+    args: &[&str],
+    edited: &Path,
+    text: &str,
+    (before, after): (&str, &str),
+) -> String {
+    let output = base.join("src").join("a.md");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base)
+            .args(args)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    let startup = std::fs::read_to_string(&output).unwrap_or_default();
+    assert!(
+        startup.contains(before),
+        "{args:?}: control: the startup output holds {before:?}; it held {startup:?}"
+    );
+
+    write_atomic(edited, text);
+    wait_for_tap(&tap, "Recompiled ", TIMEOUT);
+    let rebuilt = std::fs::read_to_string(&output).unwrap_or_default();
+    assert!(
+        rebuilt.contains(after) && !rebuilt.contains(before),
+        "{args:?}: the rebuild wrote what the edit made; the output held {rebuilt:?}"
+    );
+
+    write_atomic(&base.join("src").join("a.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    tap.finish_text(&mut child)
+}
+
+/// Assert that `stderr`, a session [`one_edit`] ran, holds exactly one rebuild.
+#[track_caller]
+fn assert_one_rebuild(args: &[&str], stderr: &str) {
+    assert_eq!(
+        count_occurrences(stderr, "Recompiled "),
+        1,
+        "{args:?}: one edit, one rebuild; stderr: {stderr}"
+    );
+}
+
+/// A dependency reached through a symlinked directory is keyed by the path the compile
+/// reports for it — the link's target — and notify reports the edit under the same path:
+/// one edit, one rebuild. The target lies outside the directory argument, so directory
+/// mode watches it as an out-of-root dependency directory; a `.mdsroot` marker above both
+/// keeps the import inside the project.
+///
+/// Unix-only: it creates a directory symlink.
+#[cfg(unix)]
+#[test]
+fn watch_rebuilds_once_when_a_dependency_behind_a_symlinked_directory_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("real-lib")).unwrap();
+        std::fs::write(base.join("real-lib/x.mds"), "X one\n").unwrap();
+        std::os::unix::fs::symlink(base.join("real-lib"), base.join("src/lib-link")).unwrap();
+        std::fs::write(
+            base.join("src/a.mds"),
+            "@import \"./lib-link/x.mds\" as x\n@include x\n",
+        )
+        .unwrap();
+
+        let edited = base.join("real-lib/x.mds");
+        let stderr = one_edit(base, args, &edited, "X two\n", ("X one", "X two"));
+        assert_one_rebuild(args, &stderr);
+    }
+}
+
+/// An imported partial is a dependency like any other: one edit, one rebuild of its
+/// importer — and, below the directory argument, no output of its own.
+#[test]
+fn watch_rebuilds_once_when_an_imported_partial_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/_part.mds"), "P one\n").unwrap();
+        std::fs::write(
+            base.join("src/a.mds"),
+            "@import \"./_part.mds\" as p\n@include p\n",
+        )
+        .unwrap();
+
+        let edited = base.join("src").join("_part.mds");
+        let stderr = one_edit(base, args, &edited, "P two\n", ("P one", "P two"));
+        assert_one_rebuild(args, &stderr);
+        assert!(
+            !base.join("src").join("_part.md").exists(),
+            "{args:?}: a partial has no output of its own"
+        );
+    }
+}
+
+/// The `--vars` file, typed relative to the working directory, is matched by the path
+/// notify reports its edit under: one edit, one rebuild.
+#[test]
+fn watch_rebuilds_once_when_the_vars_file_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/a.mds"), "Hello {{name}}\n").unwrap();
+        std::fs::write(base.join("vars.json"), r#"{"name": "one"}"#).unwrap();
+
+        let args = [args, &["--vars", "vars.json"][..]].concat();
+        let edited = base.join("vars.json");
+        let stderr = one_edit(
+            base,
+            &args,
+            &edited,
+            r#"{"name": "two"}"#,
+            ("Hello one", "Hello two"),
+        );
+        assert_one_rebuild(&args, &stderr);
+    }
+}
+
+/// A dependency outside the directory argument — `../shared/y.mds`, inside the project
+/// a `.mdsroot` marker bounds — is keyed by the path the compile reports for it, and
+/// directory mode watches its directory as an out-of-root dependency directory: one
+/// edit, one rebuild of the importer, and no output for the dependency.
+#[test]
+fn watch_rebuilds_once_when_a_dependency_outside_the_directory_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("shared")).unwrap();
+        std::fs::write(base.join("shared/y.mds"), "Y one\n").unwrap();
+        std::fs::write(
+            base.join("src/a.mds"),
+            "@import \"../shared/y.mds\" as y\n@include y\n",
+        )
+        .unwrap();
+
+        let edited = base.join("shared").join("y.mds");
+        let stderr = one_edit(base, args, &edited, "Y two\n", ("Y one", "Y two"));
+        assert_one_rebuild(args, &stderr);
+        assert!(
+            !base.join("shared").join("y.md").exists(),
+            "{args:?}: a dependency outside the directory has no output"
+        );
+    }
+}
