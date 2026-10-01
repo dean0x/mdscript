@@ -925,20 +925,26 @@ pub(crate) fn auto_detect_mds_file(subcommand: &str) -> Result<PathBuf> {
              hint: run 'mds init' to create a starter template"
         )),
         [single] => Ok(single.clone()),
-        _ => {
-            let mut names: Vec<String> = entries
-                .iter()
-                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
-                .collect();
-            names.sort();
-            Err(miette::miette!(
-                "multiple .mds files found: {}\n  \
-                 hint: specify which file, e.g. 'mds {subcommand} {}'",
-                names.join(", "),
-                names.first().map(|s| s.as_str()).unwrap_or("<file>.mds"),
-            ))
-        }
+        several => Err(several_mds_files(subcommand, several)),
     }
+}
+
+/// The error [`auto_detect_mds_file`] gives for more than one `.mds` file in the working
+/// directory: their file names, each escaped (#390), sorted. The user never typed them,
+/// and a name may hold a newline.
+fn several_mds_files(subcommand: &str, entries: &[PathBuf]) -> miette::Report {
+    let mut names: Vec<String> = entries
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .map(crate::output::safe_file_display)
+        .collect();
+    names.sort();
+    miette::miette!(
+        "multiple .mds files found: {}\n  \
+         hint: specify which file, e.g. 'mds {subcommand} {}'",
+        names.join(", "),
+        names.first().map(|s| s.as_str()).unwrap_or("<file>.mds"),
+    )
 }
 
 // ── Shared compile-and-write helper (used by build and watch) ─────────────────
@@ -2216,6 +2222,41 @@ fn run_build_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #390: when the working directory holds several `.mds` files, the error lists their
+    /// names escaped. The user never typed them, and a name may hold a newline, which
+    /// would otherwise start a line of its own inside the error. The control characters
+    /// and their escaped forms are built at run time from numbers.
+    ///
+    /// Positive controls: the name carries the raw newline, so the vector reaches the
+    /// message; ordinary names keep their text and their order.
+    #[test]
+    fn several_mds_files_names_each_file_escaped() {
+        let (lf, esc) = (char::from(0x0a_u8), char::from(0x1b_u8));
+        let hostile = format!("x{lf}Built forged{esc}.mds");
+        assert!(
+            hostile.contains(lf),
+            "control: the name carries a raw newline"
+        );
+        let entries = [PathBuf::from("b.mds"), PathBuf::from(&hostile)];
+        assert_eq!(
+            several_mds_files("build", &entries).to_string(),
+            format!(
+                "multiple .mds files found: b.mds, x{}u000ABuilt forged{}u001B.mds\n  \
+                 hint: specify which file, e.g. 'mds build b.mds'",
+                '\\', '\\'
+            ),
+            "each name must be shown escaped"
+        );
+
+        let entries = [PathBuf::from("b.mds"), PathBuf::from("a.mds")];
+        assert_eq!(
+            several_mds_files("lint", &entries).to_string(),
+            "multiple .mds files found: a.mds, b.mds\n  \
+             hint: specify which file, e.g. 'mds lint a.mds'",
+            "control: ordinary names keep their text and their order"
+        );
+    }
 
     /// #425: `admit_output` refuses an output that is the entry file and names the entry
     /// by `typed`, never by `canonical`; any other output is admitted, stdout included.

@@ -441,8 +441,8 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
     let escapes = || MdsError::Io {
         message: format!(
             "path escapes lint root {}: {}",
-            root.display(),
-            path.display()
+            safe_path(root),
+            safe_path(path)
         ),
     };
     let rel = path.strip_prefix(root).map_err(|_| escapes())?;
@@ -456,8 +456,10 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
         };
         // Same wording as `read_source_file`'s non-UTF-8 rejection, which is what a
         // per-file read of this entry would have produced before the run-level check.
+        // Escaped: every key is built before any entry is read, so no per-file refusal
+        // of a forbidden character stands in front of this message (#390).
         let name = name.to_str().ok_or_else(|| MdsError::Io {
-            message: format!("path is not valid UTF-8: {}", path.display()),
+            message: format!("path is not valid UTF-8: {}", safe_path(path)),
         })?;
         if !out.is_empty() {
             out.push('/');
@@ -488,7 +490,7 @@ pub(crate) fn read_source_file(path: &Path) -> std::result::Result<String, MdsEr
 /// it is reported, not swallowed (PF-004) — `mds::io`, exit 2.
 fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<String, MdsError> {
     let path_str = canonical.to_str().ok_or_else(|| MdsError::Io {
-        message: format!("path is not valid UTF-8: {}", path.display()),
+        message: format!("path is not valid UTF-8: {}", safe_path(path)),
     })?;
     let fs = NativeFs::new();
     fs.anchor_base_dir(&effective_parent(canonical).display().to_string())?;
@@ -2834,6 +2836,100 @@ mod tests {
                 .expect("a valid-UTF-8 entry must still produce a display key"),
             "ok.mds",
             "control: the valid-UTF-8 key must be byte-identical to the pre-#217 output"
+        );
+    }
+
+    /// #390: `path is not valid UTF-8` names the path escaped, as every path in a message
+    /// is. A directory walk builds the key of every entry before any of them is read, so
+    /// no per-file refusal of a forbidden character stands in front of this message for a
+    /// walked name: one that is not valid UTF-8 and also holds a newline (or ESC) would
+    /// otherwise put the raw byte into the error text.
+    ///
+    /// Both bytes and their escaped forms are built at run time from numbers, so neither
+    /// a control byte nor an escape sequence appears in this file.
+    ///
+    /// Positive controls: the path's own text carries the raw byte, so the vector reaches
+    /// the message; an ordinary name that is not UTF-8 keeps its text, U+FFFD included.
+    ///
+    /// `#[cfg(unix)]`: builds the name with `OsStrExt` (arbitrary bytes), as
+    /// `relative_display_rejects_non_utf8_component` does.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_escaped_in_its_message() {
+        use super::{read_canonical_source, relative_display};
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        let root = Path::new("/lint-root");
+        let lossy = char::REPLACEMENT_CHARACTER;
+        for control in [0x0a_u8, 0x1b] {
+            let raw = [0xff, b'a', control, b'b', b'.', b'm', b'd', b's'];
+            let hostile = root.join(OsStr::from_bytes(&raw));
+            let raw_char = char::from(control);
+            assert!(
+                hostile.to_string_lossy().contains(raw_char),
+                "control: the hostile path must carry the raw byte 0x{control:02X}"
+            );
+            let expected = format!(
+                "path is not valid UTF-8: /lint-root/{lossy}a{}u{control:04X}b.mds",
+                '\\'
+            );
+            let walked = relative_display(&hostile, root)
+                .expect_err("a non-UTF-8 entry name must not produce a display key")
+                .to_string();
+            let read = read_canonical_source(&hostile, &hostile)
+                .expect_err("a non-UTF-8 path must not be read")
+                .to_string();
+            for message in [walked, read] {
+                assert_eq!(
+                    message, expected,
+                    "the path must be shown escaped, never with the raw byte 0x{control:02X}"
+                );
+            }
+        }
+
+        let plain = root.join(OsStr::from_bytes(&[0xff, b'.', b'm', b'd', b's']));
+        assert_eq!(
+            relative_display(&plain, root)
+                .expect_err("a non-UTF-8 entry name must not produce a display key")
+                .to_string(),
+            format!("path is not valid UTF-8: /lint-root/{lossy}.mds"),
+            "control: an ordinary name that is not UTF-8 keeps its text"
+        );
+    }
+
+    /// #390: `path escapes lint root` names the root and the path escaped. The walk cannot
+    /// produce such a path, so this guards the text, not a reachable vector. Both control
+    /// characters are built at run time.
+    ///
+    /// Positive control: an ordinary pair keeps its text.
+    #[test]
+    fn a_path_outside_the_lint_root_is_escaped_in_its_message() {
+        use super::relative_display;
+        use std::path::Path;
+
+        let (lf, esc) = (char::from(0x0a_u8), char::from(0x1b_u8));
+        let root = format!("/lint{esc}root");
+        let path = format!("/other{lf}x.mds");
+        let message = relative_display(Path::new(&path), Path::new(&root))
+            .expect_err("a path outside the lint root must not produce a display key")
+            .to_string();
+        assert_eq!(
+            message,
+            format!(
+                "path escapes lint root /lint{}u001Broot: /other{}u000Ax.mds",
+                '\\', '\\'
+            ),
+            "the root and the path must be shown escaped"
+        );
+
+        assert_eq!(
+            relative_display(Path::new("/other/x.mds"), Path::new("/lint-root"))
+                .expect_err("a path outside the lint root must not produce a display key")
+                .to_string(),
+            "path escapes lint root /lint-root: /other/x.mds",
+            "control: an ordinary pair keeps its text"
         );
     }
 

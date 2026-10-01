@@ -98,8 +98,9 @@
 //!   a written justification, a false negative costs another review round.
 //! - **No raw path and no raw error cause in a message** (#390). These three rules read
 //!   the crate's code with its `#[cfg(test)]` items left out, every module included:
-//!   - `.display()` and `to_string_lossy()`, std's ways of turning a path into text, are
-//!     called only inside the functions [`PATH_TEXT_HELPERS`] lists, as often as it says
+//!   - `.display()`, `to_string_lossy()` and `to_str()`, std's ways of turning a path
+//!     into text, are called only inside the functions [`PATH_TEXT_HELPERS`] lists, as
+//!     often as it says, and no message's format string asks for `Debug` (`{:?}`)
 //!     ([`paths_become_text_only_in_the_listed_functions`]). Any other path reaches a
 //!     message through `safe_path` / `safe_file_display`, as typed and escaped.
 //!   - An error value reaches a message — a `format!`, `miette!`, writer macro or
@@ -117,11 +118,10 @@
 //!     what it returns; `shown_watched_dir`'s unit test pins that, including the
 //!     directory outside the entry's directory and the root that it names canonically.
 //!
-//!   The carve-outs are the entries of those lists that are no escape helper or cause,
-//!   each with its reason: `lint.rs`'s `relative_display` and `read_canonical_source`
-//!   messages, which show the typed or walked path through `Display`; the source map's
-//!   `file` key and the sidecar name compared with it; the debug-build panic trigger;
-//!   and the errors in [`PATH_FREE_ERRORS`].
+//!   The carve-outs are the entries of those lists that are no escape helper, cause or
+//!   comparison with a fixed value, each with its reason: the source map's `file` key
+//!   and the sidecar name compared with it; the debug-build panic trigger; and the
+//!   errors in [`PATH_FREE_ERRORS`].
 //!
 //! **Not covered, deliberately, and not claimed to be:**
 //! - `miette::miette!(…)` report construction, and `MdsError` message bodies built in
@@ -210,19 +210,22 @@
 //!    (a unix dev-dependency, so only a test module could reach it), a descriptor opened
 //!    as a file, `/dev/stdout`, or a `main` that returns without calling the funnel.
 //! 8. **The path-sink rules read names, not types.** A path turned into text another
-//!    way — a `{:?}` capture, `to_str()`, `as_os_str()` — is not a mention. An error
-//!    held under a name none of the binders above gives it (a struct field, a value two
-//!    `let`s away, a pattern binder other than `Err(…)`), or a cause hoisted into a
-//!    `let` and interpolated unescaped, is not seen. Nor is a message built by a
-//!    function this crate does not define. An io error cannot become an `MdsError`
-//!    through `?`: mds-core defines no conversion from `io::Error`, which is the type
-//!    system's guarantee, not this guard's.
+//!    way — `into_string()`, `String::from_utf8_lossy` of its bytes, a `{:?}` outside
+//!    [`MESSAGE_MACROS`] or in a format string that is not a literal — is not a
+//!    mention, and the text a listed function takes is trusted to go where its reason
+//!    says: the count does not change when it is shown raw. An error held under a name
+//!    none of the binders above gives it (a struct field, a value two `let`s away, a
+//!    pattern binder other than `Err(…)`), or a cause hoisted into a `let` and
+//!    interpolated unescaped, is not seen. Nor is a message built by a function this
+//!    crate does not define. An io error cannot become an `MdsError` through `?`:
+//!    mds-core defines no conversion from `io::Error`, which is the type system's
+//!    guarantee, not this guard's.
 //! 9. **Only `#[cfg(test)]` items are skipped by the path-sink rules.** Code under
 //!    another test-only `cfg` is read as product code, which can only add findings.
 //!
 //! Each of limits 1–7 requires writing code that looks wrong on purpose; limit 8 does
-//! not (a `{:?}` of a path looks ordinary), and review remains its check. The bar this
-//! guard is built to meet is **accidental** reintroduction — the four times #176 was
+//! not (a listed name shown raw looks ordinary), and review remains its check. The bar
+//! this guard is built to meet is **accidental** reintroduction — the four times #176 was
 //! reopened, it was an ordinary `eprintln!` or an ordinary hoisted `format!`, never an
 //! alias. Closing the lexical gaps beyond that bar would need a rustc lint or a
 //! `syn`-based analysis over expanded HIR, which is a different tool.
@@ -260,8 +263,9 @@
 //!   [`lint_output_goes_through_the_sink`] reports a writer call, a stdout write, an error
 //!   renderer and an exit planted in `lint.rs`, and an exit planted in `lint_sink.rs`.
 //!   For the path-sink rules, [`the_path_text_guard_flags_a_path_shown_outside_the_helpers`]
-//!   flags `.display()`, `to_string_lossy()` and a path to either outside the helpers,
-//!   skips test items and reads the code after them;
+//!   flags `.display()`, `to_string_lossy()`, `to_str()` and a path to each outside the
+//!   helpers, and a message's `Debug` capture, named or positional; it skips test items
+//!   and escaped braces, and reads the code after them;
 //!   [`the_cause_guard_flags_an_error_shown_with_its_paths`] flags a raw, a stringified, a
 //!   Debug-captured and a `safe_inline`-escaped error, one hoisted into a `let`, one in a
 //!   `message:` field, a warning, a nested `format!`, a `write!` and `io_error`, each binder
@@ -647,20 +651,22 @@ const ALLOWED_UNTRACED_HELPER_ARGS: &[(&str, &str, &str)] = &[
 
 // ── Path sinks (#390) ─────────────────────────────────────────────────────────
 
-/// The two ways std turns a path into text. Each shows the path as `Display` prints it,
-/// which is neither the form the user typed nor escaped.
-const PATH_TEXT_METHODS: &[&str] = &["display", "to_string_lossy"];
+/// The ways std turns a path into text: `display` and `to_string_lossy` show it as
+/// `Display` prints it, and `to_str` gives its text when it is UTF-8. None of them is the
+/// form the user typed, escaped.
+const PATH_TEXT_METHODS: &[&str] = &["display", "to_string_lossy", "to_str"];
 
 /// The functions allowed to call a [`PATH_TEXT_METHODS`] method (#390), by file, with
 /// the exact number of calls in the function's body and the reason.
 ///
-/// Outside these bodies neither method may appear in the crate's code, its
+/// Outside these bodies no such method may appear in the crate's code, its
 /// `#[cfg(test)]` items aside ([`paths_become_text_only_in_the_listed_functions`]). The
 /// count is exact, so a new call inside a listed function fails the guard just as one
 /// elsewhere does, and an entry whose function lost its calls (or was renamed) fails it
 /// too. Most entries are escape helpers: the lossy text goes straight into
-/// `mds::escape_path_for_message`, or the path through `safe_path`. The rest are the
-/// carve-outs, each saying why it shows or keeps a path some other way.
+/// `mds::escape_path_for_message`, or the path through `safe_path`. Others compare a
+/// name or an extension, as text, with a fixed value, and show it nowhere. The rest are
+/// the carve-outs, each saying why it shows or keeps a path some other way.
 const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
     (
         "output.rs",
@@ -679,9 +685,9 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
     (
         "output.rs",
         "reject_non_utf8_output_path",
-        1,
-        "Names a value that is not UTF-8 through `mds::escape_path_for_message` of its \
-         lossy text, the form a message can carry.",
+        2,
+        "`to_str` is the UTF-8 test itself; a value that fails it is named through \
+         `mds::escape_path_for_message` of its lossy text, the form a message can carry.",
     ),
     (
         "output.rs",
@@ -699,11 +705,67 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          hook never shows it.",
     ),
     (
+        "output.rs",
+        "panic_on_compile",
+        1,
+        "Compares a file stem with the debug-build panic trigger's value; the stem \
+         reaches no message.",
+    ),
+    (
+        "output.rs",
+        "is_within_default_excluded_dir",
+        1,
+        "Compares each directory name above a file with the default exclusions; the \
+         name reaches no message.",
+    ),
+    (
+        "output.rs",
+        "collect_mds_files_inner",
+        2,
+        "Compares a walked directory's name with the default exclusions and a file's \
+         extension with `mds`; neither reaches a message.",
+    ),
+    (
+        "output.rs",
+        "count_mds_in_excluded_dir",
+        1,
+        "Compares a file's extension with `mds` to count it; the extension reaches no \
+         message.",
+    ),
+    (
+        "output.rs",
+        "is_partial",
+        1,
+        "Checks whether a file name starts with `_`; the name reaches no message.",
+    ),
+    (
+        "build.rs",
+        "warn_output_extension_mismatch",
+        1,
+        "Takes the extension of the `-o` value, which the warning shows through \
+         `safe_inline` beside the value itself.",
+    ),
+    (
         "build.rs",
         "ensure_existing_mds_file",
-        1,
+        2,
         "Binds the lossy typed path and escapes it at once \
-         (`mds::escape_path_for_message`); every message in the function names that.",
+         (`mds::escape_path_for_message`); every message in the function names that. \
+         `to_str` compares the extension with `mds`.",
+    ),
+    (
+        "build.rs",
+        "auto_detect_mds_file",
+        1,
+        "Compares the extension of each entry of the working directory with `mds`; the \
+         extension reaches no message.",
+    ),
+    (
+        "build.rs",
+        "several_mds_files",
+        1,
+        "Takes the file name of each `.mds` file in the working directory and escapes it \
+         at once through `safe_file_display`; the message lists those.",
     ),
     (
         "build.rs",
@@ -736,27 +798,25 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
     (
         "lint.rs",
         "file",
-        1,
-        "Names a typed file argument with no UTF-8 file name through \
+        2,
+        "`to_str` takes the file name a typed file argument's diagnostics carry, escaped \
+         where they are shown; an argument with none is named through \
          `mds::escape_path_for_message` of its lossy text.",
     ),
     (
         "lint.rs",
         "relative_display",
-        3,
-        "Carve-out: `path escapes lint root` (the root and the walked path, an invariant \
-         a directory walk cannot break) and `path is not valid UTF-8` (the walked path, \
-         lossy) show the path as typed below the root, through `Display`, unescaped. \
-         Routing them through `safe_path` would change the text a hostile name shows, so \
-         that is left to its own change.",
+        1,
+        "`to_str` takes each walked name below the root to build the entry's key, escaped \
+         where it is shown; both messages name their paths through `safe_path`.",
     ),
     (
         "lint.rs",
         "read_canonical_source",
         2,
-        "Carve-out: `path is not valid UTF-8` names the typed path through `Display`, \
-         after `check_symlink` refused a forbidden character in it; the other call hands \
-         the canonical directory to `anchor_base_dir`, an argument and no message.",
+        "`to_str` takes the canonical path to read it, and `display` hands its directory, \
+         lossless once that passed, to `anchor_base_dir`: arguments, not message text. \
+         The message names the path through `safe_path`.",
     ),
     (
         "watch.rs",
@@ -771,6 +831,13 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
         1,
         "Names the typed watched path through `mds::escape_path_for_message` of its \
          lossy text when it resolves somewhere new.",
+    ),
+    (
+        "watch.rs",
+        "handle_fs_event_dir",
+        1,
+        "Compares a changed path's extension with `mds`; the extension reaches no \
+         message.",
     ),
 ];
 
@@ -2066,10 +2133,11 @@ fn the_guard_rejects_a_dynamic_format_string() {
 // ── Path sinks (#390) ─────────────────────────────────────────────────────────
 
 /// A path reaches a message as the user typed it, escaped, through the escape helpers
-/// (#390). std's `Display` of a path is neither: it shows a canonical or absolute path
-/// as such, and a forbidden character raw. So the [`PATH_TEXT_METHODS`] are called only
-/// inside the functions [`PATH_TEXT_HELPERS`] lists, exactly as often as it says, in the
-/// crate's code with its `#[cfg(test)]` items left out.
+/// (#390). std's text of a path is neither: it shows a canonical or absolute path as
+/// such, and a forbidden character raw. So the [`PATH_TEXT_METHODS`] are called only
+/// inside the functions [`PATH_TEXT_HELPERS`] lists, exactly as often as it says, and no
+/// message's format string asks for `Debug` ([`debug_captures`]), in the crate's code
+/// with its `#[cfg(test)]` items left out.
 #[test]
 fn paths_become_text_only_in_the_listed_functions() {
     let sources = crate_sources();
@@ -2083,6 +2151,11 @@ fn paths_become_text_only_in_the_listed_functions() {
         let helpers: Vec<&str> = listed.iter().map(|(_, function, ..)| *function).collect();
         let texts = path_text_mentions(src, &helpers);
         stray.extend(texts.stray.iter().map(|line| format!("  {name}:{line}")));
+        stray.extend(
+            debug_captures(src)
+                .iter()
+                .map(|line| format!("  {name}:{line}: a message formats a value with Debug")),
+        );
         for ((_, function, count, _), calls) in listed.iter().zip(&texts.in_helper) {
             found += calls.unwrap_or(0);
             if *calls != Some(*count) {
@@ -2107,14 +2180,15 @@ fn paths_become_text_only_in_the_listed_functions() {
     // Non-vacuity: the scan found the listed calls, so it cannot pass by reading nothing.
     let listed_total: usize = PATH_TEXT_HELPERS.iter().map(|(_, _, n, _)| n).sum();
     assert!(
-        found >= 15 && listed_total >= 15,
-        "non-vacuity: expected at least 15 path-to-text calls in the listed functions, \
+        found >= 25 && listed_total >= 25,
+        "non-vacuity: expected at least 25 path-to-text calls in the listed functions, \
          found {found} of {listed_total} listed"
     );
     assert!(
         stray.is_empty(),
         "path-sink violation: a path is turned into text ({PATH_TEXT_METHODS:?}) outside \
-         the functions PATH_TEXT_HELPERS lists, or a listed count no longer holds:\n{}\n\n\
+         the functions PATH_TEXT_HELPERS lists, a listed count no longer holds, or a \
+         message formats a value with Debug:\n{}\n\n\
          Name a path in a message through `crate::output::safe_path` (or \
          `safe_file_display`), which shows it as typed and escaped. A function that must \
          turn a path into text for another reason goes in PATH_TEXT_HELPERS with its \
@@ -2240,8 +2314,9 @@ fn every_watch_failure_names_its_directory_as_shown() {
 #[test]
 fn the_path_text_guard_flags_a_path_shown_outside_the_helpers() {
     // Reported, each on its own line: `.display()` in a message, `to_string_lossy()`, a
-    // path to the method called or passed, and a call whose dot is on the line above.
-    // Product code after a test item is still read.
+    // path to the method called or passed, a call whose dot is on the line above, and
+    // `to_str` called or passed. Product code after a test item, a test-only field
+    // included, is still read.
     let src = r#"
         fn label(p: &Path) -> String { safe_path(p) }
         fn warn(p: &Path) { eprint_warning(&format!("cannot read {}", p.display())); }
@@ -2262,11 +2337,26 @@ fn the_path_text_guard_flags_a_path_shown_outside_the_helpers() {
         #[cfg(test)]
         fn only_in_tests(p: &Path) -> String { p.to_string_lossy().into_owned() }
         fn after(p: &Path) -> String { p.display().to_string() }
+        fn utf8(p: &Path) -> &str { p.to_str().unwrap() }
+        fn named(p: &Path) -> Option<&str> { p.file_name().and_then(std::ffi::OsStr::to_str) }
+        fn debugged(p: &Path) -> String { format!("cannot read {p:?}") }
+        fn positional(p: &Path) { ewriteln!("cannot read {:#?}", p); }
+        fn braces(p: &Path) -> String { format!("{{:?}} {}", safe_path(p)) }
+        #[cfg(test)]
+        fn debug_in_tests(p: &Path) -> String { format!("{p:?}") }
+        struct Probe {
+            #[cfg(test)]
+            calls: Vec<String>,
+            shown: String,
+        }
+        fn after_field(p: &Path) -> String { p.display().to_string() }
+        struct Last { shown: String, #[cfg(test)] calls: Vec<String> }
+        fn after_last(p: &Path) -> String { p.to_string_lossy().into_owned() }
     "#;
     assert_eq!(
         path_text_mentions(src, &["safe_path"]),
         PathTexts {
-            stray: vec![3, 4, 5, 6, 8, 20],
+            stray: vec![3, 4, 5, 6, 8, 20, 21, 22, 33, 35],
             in_helper: vec![Some(1)]
         }
     );
@@ -2275,12 +2365,16 @@ fn the_path_text_guard_flags_a_path_shown_outside_the_helpers() {
     // does not define is reported as missing, not as clean.
     assert_eq!(
         path_text_mentions(src, &[]).stray,
-        vec![3, 4, 5, 6, 8, 10, 20]
+        vec![3, 4, 5, 6, 8, 10, 20, 21, 22, 33, 35]
     );
     assert_eq!(
         path_text_mentions(src, &["safe_path", "gone"]).in_helper,
         vec![Some(1), None]
     );
+
+    // A Debug capture in a message, named or positional, is reported; escaped braces and
+    // a test item are not.
+    assert_eq!(debug_captures(src), vec![23, 24]);
 }
 
 #[test]
@@ -3795,8 +3889,9 @@ fn product_code(src: &str) -> String {
 
 /// `masked` with every item that follows a `#[cfg(test)]` attribute blanked, the
 /// attribute included: a test module (`mod tests { … }` or `mod tests;`), a test-only
-/// function or method, a `use`. The item ends at its first top-level `;`, or at the `}`
-/// that closes its first top-level `{`. An attribute in a literal is not one.
+/// function or method, a `use`, a field. The item ends at its first top-level `;` or
+/// `,`, at the `}` that closes its first top-level `{`, or before the `}` that closes the
+/// block around it. An attribute in a literal is not one.
 fn blank_cfg_test_items(masked: &str) -> String {
     const ATTR: &[u8] = b"#[cfg(test)]";
     let b = masked.as_bytes();
@@ -3823,8 +3918,11 @@ fn blank_cfg_test_items(masked: &str) -> String {
     String::from_utf8(out).expect("blanking replaces whole items with ASCII spaces")
 }
 
-/// Index of the byte that ends the item starting at `from`: its first `;` outside any
-/// parentheses or brackets, or the `}` closing its first such `{`.
+/// Index of the byte that ends the item starting at `from`: its first `;` or `,` outside
+/// any parentheses or brackets, the `}` closing its first such `{`, or the byte before a
+/// `}` that closes the block the item sits in (a field, the last one). A `,` in generic
+/// parameters (`fn f<A, B>`) ends the item early, which leaves test code to be read as
+/// product code: more findings, never fewer.
 fn item_end(text: &str, b: &[u8], from: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = from;
@@ -3836,8 +3934,9 @@ fn item_end(text: &str, b: &[u8], from: usize) -> Option<usize> {
         match b[i] {
             b'(' | b'[' => depth += 1,
             b')' | b']' => depth -= 1,
-            b';' if depth == 0 => return Some(i),
+            b';' | b',' if depth == 0 => return Some(i),
             b'{' if depth == 0 => return matching_delim(text, b, i),
+            b'}' if depth == 0 => return Some(i - 1),
             _ => {}
         }
         i += 1;
@@ -3908,6 +4007,54 @@ fn follows_a_path_separator(b: &[u8], i: usize) -> bool {
         j -= 1;
     }
     j >= 2 && b[j - 1] == b':' && b[j - 2] == b':'
+}
+
+/// 1-based lines of every [`MESSAGE_MACROS`] invocation in the product code of `src` whose
+/// format string formats a value with `Debug` (`{:?}`, `{p:?}`, `{:#?}`), which shows a
+/// path quoted and with Rust's escapes: neither as typed nor in the CLI's escape.
+fn debug_captures(src: &str) -> Vec<usize> {
+    let code = product_code(src);
+    let mut lines: Vec<usize> = MESSAGE_MACROS
+        .iter()
+        .flat_map(|name| nested_invocations(&code, name))
+        .filter(|inv| {
+            split_top_level(&inv.body).iter().any(|arg| {
+                parse_string_literal(arg.trim()).is_some_and(|(fmt, _)| formats_with_debug(&fmt))
+            })
+        })
+        .map(|inv| inv.line)
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+/// Does the format string `fmt` hold a placeholder whose spec asks for `Debug` (`{:?}`,
+/// `{name:#?}`, `{0:x?}`)? `{{` is a literal brace.
+fn formats_with_debug(fmt: &str) -> bool {
+    let b = fmt.as_bytes();
+    let mut i = 0usize;
+    // Bounded: every step moves `i` forward, past a literal brace or a placeholder.
+    while i < b.len() {
+        match b[i] {
+            b'{' if b.get(i + 1) == Some(&b'{') => i += 2,
+            b'{' => {
+                let Some(rel) = fmt[i..].find('}') else {
+                    return false;
+                };
+                let inner = &fmt[i + 1..i + rel];
+                if inner
+                    .split_once(':')
+                    .is_some_and(|(_, spec)| spec.contains('?'))
+                {
+                    return true;
+                }
+                i += rel + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// How one source file's messages interpolate error values (see [`message_values`]).

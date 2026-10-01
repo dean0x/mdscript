@@ -1239,7 +1239,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 
 - Lints every `.mds` file recursively (including `_`-prefixed partials).
 - Accumulate-and-continue: per-file errors do not abort the run.
-- Before any file is linted, every entry is named relative to the lint root; a path that is not valid UTF-8 or that escapes the lint root is an I/O error (`mds::io`, exit 2) for the whole run — no lossy or absolute `file` key is ever emitted.
+- Before any file is linted, every entry is named relative to the lint root; a path that is not valid UTF-8 or that escapes the lint root is an I/O error (`mds::io`, exit 2) for the whole run — no lossy or absolute `file` key is ever emitted. The message names the path escaped as a status line names one, so a newline or other forbidden character in the name shows as its `\uXXXX` literal (#390).
 - After processing all files, emits one summary line to stderr:
   `N clean, N with warnings, N with errors, N resource-limited`
   Each file falls in exactly one bucket, so the four counts always sum to the number of
