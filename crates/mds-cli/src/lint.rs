@@ -941,7 +941,8 @@ enum Outcome {
         fix: PreviewFix,
     },
     /// `--fix` on a file argument or an entry of a directory: the input's findings, the text
-    /// they index — the text as it was read — and what became of its file.
+    /// they index — the text as it was read — and what became of its file, which carries the
+    /// findings a fix leaves together with the fixed text they index.
     Rewritten {
         findings: mds::LintResult,
         text: String,
@@ -980,7 +981,7 @@ enum Rewrite {
     /// The fixed source was written. `residual` is what it is left with; `partial` holds the
     /// applied and planned edit counts when not every edit applied.
     Written {
-        residual: mds::LintResult,
+        residual: Residual,
         partial: Option<(usize, usize)>,
     },
     /// The fixed source could not be written. `residual` is what it would have been left
@@ -988,8 +989,16 @@ enum Rewrite {
     /// one entry per file, its findings or its failure: there the failure is the entry.
     WriteFailed {
         error: MdsError,
-        residual: Option<mds::LintResult>,
+        residual: Option<Residual>,
     },
+}
+
+/// The findings a fixed source is left with, and that source: the text their spans index
+/// (#309). They are shown over it, never over the source as it was read, where a removed
+/// block would move every finding below it.
+struct Residual {
+    findings: mds::LintResult,
+    fixed: String,
 }
 
 /// What `mds lint --fix -` did to the source.
@@ -1172,9 +1181,13 @@ fn apply_fix(
             };
         }
     };
+    let residual = Residual {
+        findings: residual,
+        fixed: new_source,
+    };
     let fix = match atomic_write_file(
         &WriteTarget::as_typed(path.to_path_buf()),
-        &new_source,
+        &residual.fixed,
         Durability::Fsync,
     ) {
         Ok(()) => Rewrite::Written { residual, partial },
@@ -1234,9 +1247,10 @@ fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -
 /// - A capped result is announced first, under `--fix` only.
 /// - A preview shows its diff, `Would fix:` or `fix rejected:`, then the input's own
 ///   findings.
-/// - A rewrite that landed shows the findings the file is left with, then `Fixed:` —
-///   never before, so no line claims a fix the file did not get. One that failed shows
-///   those findings, where the output keeps them, then the failure.
+/// - A rewrite that landed shows the findings the file is left with, rendered against the
+///   fixed source, then `Fixed:` — never before, so no line claims a fix the file did not
+///   get. One that failed shows those findings, where the output keeps them, rendered
+///   against the source it failed to write, then the failure.
 /// - The stdin filter shows its status line, then its findings, rendered against the
 ///   source it emits, then that source.
 fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
@@ -1313,13 +1327,13 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
                 (tally_from_result(&findings), false)
             }
             Rewrite::Written { residual, partial } => {
-                sink.findings(&input, &residual, Some(&text));
+                sink.findings(&input, &residual.findings, Some(&residual.fixed));
                 sink.fixed(&input, partial);
-                (tally_from_result(&residual), false)
+                (tally_from_result(&residual.findings), false)
             }
             Rewrite::WriteFailed { error, residual } => {
                 if let Some(residual) = &residual {
-                    sink.findings(&input, residual, Some(&text));
+                    sink.findings(&input, &residual.findings, Some(&residual.fixed));
                 }
                 sink.write_failed(&input, error);
                 (FileTally::Error, false)
@@ -2666,22 +2680,16 @@ mod tests {
 
     /// An input's findings before a partial fix, and the fix, both named `label`: one of two
     /// edits applied, the source rewritten to [`PARTIAL_AFTER`], and one warning left, at
-    /// `left_at` in that source when given.
+    /// `left_at` in that source.
     ///
     /// Built here rather than reached through a source, so the tests pin how [`render`]
     /// shows a partial fix whichever edits produce one; `cli_lint.rs` reaches one end to end
     /// and checks the counts' wording.
-    fn partial_fix(
-        label: &str,
-        left_at: Option<SerializedSpan>,
-    ) -> (LintResult, FixPipelineOutcome) {
+    fn partial_fix(label: &str, left_at: SerializedSpan) -> (LintResult, FixPipelineOutcome) {
         let left = || {
-            let finding =
-                LintDiagnostic::new("empty-block", Severity::Warn, PARTIAL_LEFT).with_file(label);
-            match left_at.clone() {
-                Some(span) => finding.with_span(span),
-                None => finding,
-            }
+            LintDiagnostic::new("empty-block", Severity::Warn, PARTIAL_LEFT)
+                .with_file(label)
+                .with_span(left_at.clone())
         };
         let removed =
             LintDiagnostic::new("empty-block", Severity::Warn, PARTIAL_REMOVED).with_file(label);
@@ -2696,19 +2704,23 @@ mod tests {
     }
 
     /// `mds lint --fix <file>` whose fix applies in part writes the partly fixed source,
-    /// shows the finding it leaves — not the one it removed — and then, as the run's last
-    /// line, `Partially fixed: <path> (1 of 2 fixes applied)` (#309).
+    /// shows the finding it leaves — not the one it removed — framed over the source it
+    /// wrote rather than the source it read, and then, as the run's last line,
+    /// `Partially fixed: <path> (1 of 2 fixes applied)` (#309).
     #[test]
     fn a_partial_fix_of_a_file_is_announced_after_the_findings_it_leaves() {
         const NAME: &str =
             "lint::tests::a_partial_fix_of_a_file_is_announced_after_the_findings_it_leaves";
+        const AFTER_LINE: &str = "after-fix-sentinel";
+        const BEFORE_LINE: &str = "before-fix-sentinel";
         if let Some(path) = std::env::var_os(CHILD) {
             let path = PathBuf::from(path);
             let input = LintSource::File {
                 typed: &path,
                 name: "partial.mds",
             };
-            let (before, fix) = partial_fix(input.display_label(), None);
+            let left_at = SerializedSpan::new(0, AFTER_LINE.len());
+            let (before, fix) = partial_fix(input.display_label(), left_at);
             let text = PARTIAL_BEFORE.to_string();
             let outcome = apply_fix(&input, &path, before, text, fix, LintFormat::Human);
             let report = FileReport {
@@ -2749,8 +2761,13 @@ mod tests {
             "announced once; got:\n{shown}"
         );
         assert!(
-            shown.contains(PARTIAL_LEFT),
-            "the finding the fix left shows before the announcement; got:\n{shown}"
+            shown.contains(PARTIAL_LEFT) && shown.contains(AFTER_LINE),
+            "the finding the fix left shows before the announcement, framed over the \
+             written source; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(BEFORE_LINE),
+            "not framed over the source as read; got:\n{shown}"
         );
         assert!(
             !shown.contains(PARTIAL_REMOVED),
@@ -2770,7 +2787,7 @@ mod tests {
         const BEFORE_LINE: &str = "before-fix-sentinel";
         if std::env::var_os(CHILD).is_some() {
             let left_at = SerializedSpan::new(0, AFTER_LINE.len());
-            let (before, fix) = partial_fix(STDIN_DISPLAY_LABEL, Some(left_at));
+            let (before, fix) = partial_fix(STDIN_DISPLAY_LABEL, left_at);
             let outcome = fix_stdin(before, PARTIAL_BEFORE.to_string(), fix);
             let report = FileReport {
                 input: LintSource::Stdin,

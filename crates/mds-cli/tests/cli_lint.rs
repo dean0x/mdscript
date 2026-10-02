@@ -7161,3 +7161,249 @@ fn fix_of_a_partial_in_a_directory_applies_and_reports_no_unused_function() {
     );
     assert_eq!(after.status.code(), Some(0));
 }
+
+// ── The findings a fix leaves point into the fixed source (#309) ─────────────
+//
+// The findings `--fix` leaves come from linting the fixed source, so their spans index
+// that text: a human frame must show them over it, and a JSON span must index it. Shown
+// over the source as it was read, a finding below a removed block lands lines too low,
+// on unrelated text — or past the end of the text, where the frame cannot be read.
+//
+// Fixture: a dead `@if` block (a fixable `unreachable-branch` error) above two padding
+// lines and a `redundant-else` warning no fix removes. Removing the block moves the
+// warning's `@if` from line 9 up to line 6. The same warning ABOVE the dead block does
+// not move, and is the positive control.
+
+/// A dead `@if` block above a `redundant-else` warning the fix leaves.
+const A_WARNING_BELOW_A_DEAD_BLOCK: &str = "---\nflag: true\n---\n\
+     @if \"x\" == \"y\":\nhidden\n@end\n\
+     first padding line\nsecond padding line\n\
+     @if flag:\nsame\n@else:\nsame\n@end\n";
+
+/// [`A_WARNING_BELOW_A_DEAD_BLOCK`] fixed: the dead block is gone, and the warning's
+/// `@if` is on line 6.
+const A_WARNING_BELOW_A_DEAD_BLOCK_FIXED: &str = "---\nflag: true\n---\n\
+     first padding line\nsecond padding line\n\
+     @if flag:\nsame\n@else:\nsame\n@end\n";
+
+/// The warning above the dead block: its `@if` is on line 4 before and after the fix.
+const A_WARNING_ABOVE_A_DEAD_BLOCK: &str = "---\nflag: true\n---\n\
+     @if flag:\nsame\n@else:\nsame\n@end\n\
+     padding line\n\
+     @if \"x\" == \"y\":\nhidden\n@end\n";
+
+/// The `redundant-else` warning's frame in a human report: the line and column its
+/// header names (`╭─[<label>:<line>:<col>]`), and the text the frame shows on that line.
+fn redundant_else_frame(stderr: &str, label: &str) -> (usize, usize, String) {
+    let finding = stderr
+        .find("[redundant-else]")
+        .unwrap_or_else(|| panic!("no redundant-else finding; stderr: {stderr}"));
+    let header = format!("╭─[{label}:");
+    let start = finding
+        + stderr[finding..]
+            .find(&header)
+            .unwrap_or_else(|| panic!("no frame for {label:?}; stderr: {stderr}"))
+        + header.len();
+    let (position, _) = stderr[start..]
+        .split_once(']')
+        .expect("the frame header closes");
+    let (line, col) = position.split_once(':').expect("<line>:<col>");
+    let line: usize = line.parse().expect("a line number");
+    let col: usize = col.parse().expect("a column number");
+    let gutter = format!("{line} │");
+    let shown = stderr[start..]
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix(gutter.as_str()))
+        .unwrap_or_else(|| panic!("the frame shows no line {line}; stderr: {stderr}"));
+    (
+        line,
+        col,
+        shown.strip_prefix(' ').unwrap_or(shown).to_string(),
+    )
+}
+
+/// Assert that the human report in `stderr` frames the `redundant-else` warning of
+/// `label` over `text`, the source its spans index: the line its header names shows that
+/// line of `text`, and it is the warning's `@if`, at `line`, column 1.
+fn assert_framed_over(stderr: &str, label: &str, text: &str, line: usize, what: &str) {
+    let (at, col, shown) = redundant_else_frame(stderr, label);
+    let line_of_text = at
+        .checked_sub(1)
+        .and_then(|index| text.lines().nth(index))
+        .unwrap_or("<past the end of the text>");
+    assert_eq!(
+        shown, line_of_text,
+        "{what}: the frame's line {at} must show line {at} of the text its spans index; \
+         stderr: {stderr}"
+    );
+    assert_eq!(
+        (at, col, shown.as_str()),
+        (line, 1, "@if flag:"),
+        "{what}: the frame must point at the warning's @if; stderr: {stderr}"
+    );
+}
+
+/// The line the `redundant-else` span of `file`'s entry in a JSON report starts on, in
+/// `text`, the source the span indexes; it must start a line, at the warning's `@if`.
+fn redundant_else_json_line(report: &std::process::Output, file: &str, text: &str) -> usize {
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be the JSON report: {e}; stdout: {}",
+            String::from_utf8_lossy(&report.stdout)
+        )
+    });
+    let entry = json["files"]
+        .as_array()
+        .expect("the report has files[]")
+        .iter()
+        .find(|entry| entry["file"] == file)
+        .unwrap_or_else(|| panic!("no entry for {file:?}: {json}"));
+    let diag = entry["diagnostics"]
+        .as_array()
+        .expect("the entry has diagnostics[]")
+        .iter()
+        .find(|diag| diag["rule"] == "redundant-else")
+        .unwrap_or_else(|| panic!("no redundant-else finding: {entry}"));
+    let offset = diag["span"]["offset"]
+        .as_u64()
+        .and_then(|o| usize::try_from(o).ok())
+        .expect("the finding has a span offset");
+    let (before, after) = text.split_at_checked(offset).unwrap_or_else(|| {
+        panic!(
+            "the span offset {offset} lies past the {}-byte text",
+            text.len()
+        )
+    });
+    assert!(
+        before.ends_with('\n') && after.starts_with("@if flag:"),
+        "the span offset {offset} must index the warning's @if; text after it: {after:?}"
+    );
+    before.matches('\n').count() + 1
+}
+
+#[test]
+fn a_finding_left_by_a_fix_of_a_file_points_into_the_written_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let above = tmp.path().join("y.mds");
+    let below = tmp.path().join("x.mds");
+
+    // Positive control: a warning above the removed block keeps its line, so the frame
+    // reads the same over either text.
+    fs::write(&above, A_WARNING_ABOVE_A_DEAD_BLOCK).unwrap();
+    let out = lint_path(&above, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let written = fs::read_to_string(&above).unwrap();
+    assert_ne!(
+        written, A_WARNING_ABOVE_A_DEAD_BLOCK,
+        "control: the fix is written"
+    );
+    assert_framed_over(&stderr, "y.mds", &written, 4, "control");
+
+    // JSON: the span indexes the written file.
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    let out = lint_path(&below, &["--fix", "--format", "json"]);
+    let written = fs::read_to_string(&below).unwrap();
+    assert_eq!(written, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_eq!(redundant_else_json_line(&out, "x.mds", &written), 6);
+    assert_eq!(out.status.code(), Some(1), "the warning is left");
+
+    // Human: the frame shows the written file's line 6, not the pre-fix line 9 or the
+    // padding that took its place.
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    let out = lint_path(&below, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let written = fs::read_to_string(&below).unwrap();
+    assert_eq!(written, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_framed_over(&stderr, "x.mds", &written, 6, "a file argument");
+    assert_eq!(out.status.code(), Some(1), "the warning is left");
+}
+
+#[test]
+fn a_finding_left_by_a_fix_of_a_directory_entry_points_into_the_written_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let write_both = || {
+        fs::write(d.join("x.mds"), A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+        fs::write(d.join("y.mds"), A_WARNING_ABOVE_A_DEAD_BLOCK).unwrap();
+    };
+
+    // JSON: each span indexes its written file.
+    write_both();
+    let out = lint_dir_in(tmp.path(), "d", &["--fix", "--format", "json"]);
+    let x = fs::read_to_string(d.join("x.mds")).unwrap();
+    let y = fs::read_to_string(d.join("y.mds")).unwrap();
+    assert_eq!(x, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_eq!(redundant_else_json_line(&out, "y.mds", &y), 4, "control");
+    assert_eq!(redundant_else_json_line(&out, "x.mds", &x), 6);
+
+    // Human: `y.mds` (its warning above the block) is the positive control.
+    write_both();
+    let out = lint_dir_in(tmp.path(), "d", &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let x = fs::read_to_string(d.join("x.mds")).unwrap();
+    let y = fs::read_to_string(d.join("y.mds")).unwrap();
+    assert_framed_over(&stderr, "y.mds", &y, 4, "control");
+    assert_eq!(x, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_framed_over(&stderr, "x.mds", &x, 6, "a directory entry");
+    assert_eq!(out.status.code(), Some(1), "the warnings are left");
+}
+
+#[test]
+fn a_finding_left_by_a_fix_of_stdin_points_into_the_source_it_emits() {
+    let out = lint_stdin(A_WARNING_BELOW_A_DEAD_BLOCK, &["--fix"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_framed_over(&stderr, "<stdin>", &stdout, 6, "stdin");
+}
+
+#[test]
+fn a_fix_preview_frames_the_findings_over_the_file_as_read() {
+    // A preview shows the file's own findings — what is wrong now — over the file it
+    // leaves unchanged, so the warning stays on line 9.
+    let tmp = tempfile::tempdir().unwrap();
+    let below = tmp.path().join("x.mds");
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    for mode in [&["--fix", "--check"][..], &["--fix", "--diff"]] {
+        let out = lint_path(&below, mode);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let file = fs::read_to_string(&below).unwrap();
+        assert_eq!(
+            file, A_WARNING_BELOW_A_DEAD_BLOCK,
+            "{mode:?} writes nothing"
+        );
+        assert_framed_over(&stderr, "x.mds", &file, 9, &format!("{mode:?}"));
+    }
+}
+
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
+#[cfg(unix)]
+#[test]
+fn a_finding_left_by_a_fix_that_cannot_be_written_points_into_the_fixed_source() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let below = dir.path().join("x.mds");
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let out = lint_path(&below, &["--fix"]);
+    let _ = fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        fs::read_to_string(&below).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "the write failed; stderr: {stderr}"
+    );
+    // The finding the fix would have left is a span into the fixed source.
+    assert_framed_over(
+        &stderr,
+        "x.mds",
+        A_WARNING_BELOW_A_DEAD_BLOCK_FIXED,
+        6,
+        "a failed write",
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+}
