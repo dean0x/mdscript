@@ -322,7 +322,7 @@ const SITE_FLOORS: &[(&str, usize)] = &[
     ("build.rs", 27),
     ("fmt.rs", 11),
     ("lint.rs", 1),
-    ("lint_sink.rs", 14),
+    ("lint_sink.rs", 12),
     ("main.rs", 11),
     ("output.rs", 6),
     ("watch.rs", 18),
@@ -502,12 +502,6 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "fmt.rs",
         "fail_count",
         "`usize` tally of files `mds fmt <dir>` could not process, in its summary line.",
-    ),
-    (
-        "lint_sink.rs",
-        "walk.excluded_by_default",
-        "`usize` count of `.mds` files the default-exclusion walker skipped \
-         (hidden dirs, node_modules); produced by `collect_mds_files_detailed`.",
     ),
     (
         "lint_sink.rs",
@@ -901,6 +895,15 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
         "A `miette::Report` from `build::load_config`, turned into an `MdsError` for the \
          lint sinks: text this crate wrote, which names `mds.json` through `safe_path` \
          and its cause through `io_cause` or a path-free `serde_json` / UTF-8 error.",
+    ),
+    (
+        "lint_sink.rs",
+        "report.to_string()",
+        1,
+        "A `miette::Report` that lint's setup failed with and that is not an `MdsError`, \
+         turned into one for the JSON error document: `auto_detect_mds_file`'s, text this \
+         crate wrote — no `.mds` file in the working directory, or the file names found \
+         there, each escaped through `safe_file_display` — naming no path.",
     ),
     (
         "watch.rs",

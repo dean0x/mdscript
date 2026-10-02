@@ -13,7 +13,10 @@
 //! # Channel discipline
 //!
 //! - Human diagnostics → **stderr** via miette Report.
-//! - `--format json` output → **stdout** only (single JSON object, trailing newline).
+//! - `--format json` output → **stdout** only: exactly one JSON object, with a trailing
+//!   newline, on every exit but a usage error clap reports — the findings document, or the
+//!   error document of a failure that stops the run; `--fix --diff` writes its diffs
+//!   first (#309).
 //! - `--quiet` suppresses warning+info human diagnostics and summaries, NOT errors.
 //!
 //! # Results
@@ -85,6 +88,10 @@ use crate::output::{
 // AC-224-15: No local rule-name list. The single source of truth is
 // mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
 // No rule-name string literals from the registry appear in this directory.
+
+/// Why `mds lint --fix --format json -` is refused (`mds::io`, exit 2).
+const STDIN_FIX_JSON_REFUSAL: &str = "--fix --format json with stdin input is not supported; \
+     use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output";
 
 pub(crate) struct LintArgs {
     pub(crate) input: Option<PathBuf>,
@@ -284,13 +291,14 @@ fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
 
     let (input, _auto_detected) = resolve_input(input, "lint")?;
 
-    // USAGE ERROR: --fix + --format json + stdin.
-    // DELIBERATE EXCEPTION: the JSON envelope is deferred for this 3-way combo; it stays a
-    // plain stderr usage message. Every other top-level analysis failure is shown through
-    // `ResultSink::analysis_failure`, the JSON envelope when --format json is active.
+    // `mds lint --fix -` is a filter, whose product is the source on stdout, so
+    // `--format json` refuses it — shown as an analysis failure, the error document being
+    // the run's one document (#309). Stdin is not read.
     if fix && format == LintFormat::Json && input == Path::new("-") {
-        sink.stdin_fix_json_refused();
-        return Ok(2);
+        let refusal = MdsError::Io {
+            message: STDIN_FIX_JSON_REFUSAL.to_string(),
+        };
+        return Ok(analysis_failed(sink, &refusal, None));
     }
 
     // Stdin mode.
@@ -1425,14 +1433,15 @@ fn run_lint_stdin(
 ) -> i32 {
     let source = match read_stdin() {
         Ok(source) => source,
-        Err(e) => {
-            // #157: stdin over the cap is `mds::resource_limit` (exit 3), one that cannot
-            // be read or is not UTF-8 `mds::io` (exit 2) — as for every other command.
-            let code = mds_error_exit_code(&e);
-            sink.stdin_unreadable(e);
-            return code;
-        }
+        // #157: stdin over the cap is `mds::resource_limit` (exit 3), one that cannot be
+        // read or is not UTF-8 `mds::io` (exit 2) — as for every other command.
+        Err(e) => return analysis_failed(sink, &e, None),
     };
+    // A working directory that cannot be determined — deleted while the process is in it
+    // — fails closed in the words a stdin compile meets it in (#390), before `"."` names it.
+    if let Err(e) = crate::output::current_dir() {
+        return analysis_failed(sink, &e, Some(&source));
+    }
     // The working directory, as the caller did not type it: `"."` anchors at it and is
     // what a refusal of it shows (see `read_stdin`).
     let cwd = Path::new(".");
@@ -1696,10 +1705,10 @@ fn run_lint_directory(
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
 
     // Nothing to lint emits no summary — no file was linted, so there is nothing
-    // meaningful to count. Either diagnostic bypasses --quiet and exits 2 (lint's
-    // usage-error code; build/check/fmt use 1): every file under default-excluded
-    // directories, and since #204 an empty tree — a silent ZERO exit on an empty tree was
-    // the CI green-pass hole #204 closes.
+    // meaningful to count. Either diagnostic — under --format json the error document —
+    // bypasses --quiet and exits 2 (lint's usage-error code; build/check/fmt use 1): every
+    // file under default-excluded directories, and since #204 an empty tree — a silent
+    // ZERO exit on an empty tree was the CI green-pass hole #204 closes.
     if walk.files.is_empty() {
         sink.nothing_to_lint(dir, &walk);
         return 2;

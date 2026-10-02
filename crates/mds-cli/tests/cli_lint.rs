@@ -569,20 +569,16 @@ fn directory_mode_lints_all_files_including_partials() {
 
 // ── L-CLI-USAGE-ERR: --fix --format json stdin → exit 2 ─────────────────────
 
+/// Refused with the error document on stdout, the run's one report (#309).
 #[test]
 fn fix_json_stdin_is_usage_error_exit_2() {
     let out = lint_stdin("Hello {{name}}!", &["--fix", "--format", "json"]);
     assert_eq!(
-        out.status.code(),
-        Some(2),
-        "--fix --format json stdin must exit 2 (usage error)"
+        json_exit(&out),
+        JsonExit::error(2, "mds::io"),
+        "--fix --format json stdin must exit 2 with the error document"
     );
-    // Error message must go to stderr
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.is_empty(),
-        "usage error message must appear on stderr"
-    );
+    assert_eq!(error_message(&out).as_deref(), Some(STDIN_FIX_JSON_REFUSAL));
 }
 
 // ── L-CLI-JSON4: nonexistent path → JSON error envelope ─────────────────────
@@ -5984,39 +5980,26 @@ fn lint_directory_empty_exits_two_prints_no_summary() {
     );
 }
 
-/// #204: `--format json` on an empty tree exits 2 with the stderr diagnostic and
-/// emits NO JSON envelope on stdout — the empty-tree arm returns before any emitter
-/// runs, exactly as lint's all-excluded arm does (it emits no envelope either).
-/// Relax the stdout-empty half if a JSON envelope for "nothing to lint" is ever added.
+/// #204: `--format json` on an empty tree exits 2 with the error document on stdout,
+/// the run's one document, in the words of the human report's diagnostic, and nothing
+/// on stderr (#309) — as lint's all-excluded arm does.
 #[test]
-fn lint_directory_empty_format_json_exits_two_no_envelope() {
+fn lint_directory_empty_format_json_exits_two_with_the_error_document() {
     let dir = tempfile::tempdir().unwrap();
 
     let out = lint_path(dir.path(), &["--format", "json"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-
     assert_eq!(
-        out.status.code(),
-        Some(2),
-        "empty directory lint --format json must exit 2; stderr: {stderr}"
+        json_exit(&out),
+        JsonExit::error(2, "mds::io"),
+        "empty directory lint --format json"
     );
+    let message = error_message(&out).unwrap_or_default();
     assert!(
-        stderr.contains("no .mds files found in"),
-        "the empty-tree diagnostic must appear on stderr in JSON mode; got: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("nothing was linted"),
-        "JSON mode must still say nothing was linted; got: {stderr:?}"
-    );
-    assert!(
-        stdout.is_empty(),
-        "empty directory lint --format json must emit no envelope on stdout; \
-         got: {stdout:?}"
+        message.starts_with("no .mds files found in ") && message.ends_with("; nothing was linted"),
+        "the error says nothing was linted; got: {message:?}"
     );
 
-    // Positive control: a directory with one .mds file DOES emit a
-    // JSON envelope on stdout, so the emptiness assertion above is not vacuous.
+    // Positive control: a directory with one .mds file emits the findings document.
     let control_dir = tempfile::tempdir().unwrap();
     fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
     let control = lint_path(control_dir.path(), &["--format", "json"]);
@@ -8208,5 +8191,510 @@ fn a_config_that_cannot_load_is_reported_before_a_file_over_the_size_cap() {
     assert_eq!(
         seen, expected,
         "(mds.json, input, format, mode, what it reported)"
+    );
+}
+
+// ── One JSON document on every exit (#309) ────────────────────────────────────
+//
+// Under `--format json`, every exit of `mds lint` but a usage error clap reports prints
+// exactly one JSON document on stdout: the findings document, or the error document
+// `{"error": …, "version": 1}` for a failure that stops the run before it lints anything —
+// runtime variables that cannot load, no file to auto-detect, an `mds.json` that cannot
+// load, stdin that is over the size cap or not UTF-8, a working directory that is gone, a
+// directory with nothing to lint, and stdin under `--fix`, which `--format json` refuses.
+// Nothing about that failure goes to stderr. The one exception is `--fix --diff`, whose
+// diffs come first.
+
+/// The top-level JSON documents `stdout` holds, in order; `None` when it holds anything
+/// else.
+fn json_documents(stdout: &[u8]) -> Option<Vec<serde_json::Value>> {
+    serde_json::Deserializer::from_slice(stdout)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
+/// What one `--format json` run printed.
+#[derive(Debug, PartialEq)]
+struct JsonExit {
+    exit: Option<i32>,
+    /// How many JSON documents stdout holds; `None` when it holds anything else.
+    documents: Option<usize>,
+    /// The code of the one document's error, when it is the error document.
+    code: Option<String>,
+    stderr: String,
+}
+
+impl JsonExit {
+    /// A run stopped by a failure: exit `exit`, the one error document with `code`, and
+    /// nothing on stderr.
+    fn error(exit: i32, code: &str) -> Self {
+        Self {
+            exit: Some(exit),
+            documents: Some(1),
+            code: Some(code.to_string()),
+            stderr: String::new(),
+        }
+    }
+}
+
+/// Read what `out`, a `--format json` run, printed.
+fn json_exit(out: &std::process::Output) -> JsonExit {
+    let documents = json_documents(&out.stdout);
+    let code = match documents.as_deref() {
+        Some([document]) => document["error"]["code"].as_str().map(str::to_string),
+        _ => None,
+    };
+    JsonExit {
+        exit: out.status.code(),
+        documents: documents.map(|documents| documents.len()),
+        code,
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// The message of the error document `out` printed, when stdout is exactly that document.
+fn error_message(out: &std::process::Output) -> Option<String> {
+    match json_documents(&out.stdout).as_deref() {
+        Some([document]) => document["error"]["message"].as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Run `mds lint <args>` in `cwd` with `stdin` as its input.
+fn lint_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A run that stops before it reads stdin closes it; that write failing is not what a
+    // test here is about.
+    let _ = child.stdin.take().unwrap().write_all(stdin);
+    child.wait_with_output().unwrap()
+}
+
+/// A failure that stops a `--format json` run before it lints anything prints the error
+/// document, the run's one document, and nothing on stderr — in every fix mode where the
+/// failure comes before the mode matters, and under `--quiet` too: runtime variables that
+/// cannot load, no file to auto-detect or more than one, an `mds.json` that cannot load,
+/// stdin over the size cap or not UTF-8, and a directory with nothing to lint — none at
+/// all, or every one under a default-excluded directory — in the words its human report
+/// gives it.
+///
+/// Controls: a run that lints prints its one findings document; the human report of a
+/// directory with nothing to lint is those words on stderr, with nothing on stdout.
+#[test]
+fn every_failure_that_stops_a_json_run_prints_one_error_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("x.mds"), "Hello!\n").unwrap();
+    for dir in ["none", "empty", "several", "cfg"] {
+        fs::create_dir(root.join(dir)).unwrap();
+    }
+    fs::write(root.join("several").join("a.mds"), "A\n").unwrap();
+    fs::write(root.join("several").join("b.mds"), "B\n").unwrap();
+    fs::write(root.join("cfg").join("mds.json"), "{").unwrap();
+    fs::write(root.join("cfg").join("x.mds"), "Hello!\n").unwrap();
+    let excluded = root.join("excluded").join("node_modules");
+    fs::create_dir_all(&excluded).unwrap();
+    fs::write(excluded.join("a.mds"), "A\n").unwrap();
+    let configured = Path::new("cfg").join("x.mds");
+    let configured = configured.to_str().unwrap();
+    let over_the_cap = vec![b'a'; usize::try_from(mds::MAX_FILE_SIZE).unwrap() + 1];
+    let (none, several, cfg) = (root.join("none"), root.join("several"), root.join("cfg"));
+
+    // (what stops the run, working directory, arguments, stdin, in every fix mode,
+    //  exit, error code, words its message holds)
+    #[allow(clippy::type_complexity)]
+    let rows: [(&str, &Path, &[&str], &[u8], bool, i32, &str, &str); 9] = [
+        (
+            "--vars that cannot load",
+            root,
+            &["--vars", "missing.json", "x.mds"],
+            b"",
+            true,
+            2,
+            "mds::file_not_found",
+            "missing.json",
+        ),
+        (
+            "no file to auto-detect",
+            &none,
+            &[],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "no .mds files found in current directory",
+        ),
+        (
+            "more than one file to auto-detect",
+            &several,
+            &[],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "multiple .mds files found",
+        ),
+        (
+            "an mds.json that cannot load, a file argument",
+            root,
+            &[configured],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "invalid mds.json",
+        ),
+        (
+            "an mds.json that cannot load, stdin",
+            &cfg,
+            &["-"],
+            b"Hello!\n",
+            false,
+            2,
+            "mds::io",
+            "invalid mds.json",
+        ),
+        (
+            "stdin over the size cap",
+            root,
+            &["-"],
+            &over_the_cap,
+            false,
+            3,
+            "mds::resource_limit",
+            "maximum size",
+        ),
+        (
+            "stdin that is not UTF-8",
+            root,
+            &["-"],
+            b"Hello \xff\n",
+            false,
+            2,
+            "mds::io",
+            "valid UTF-8",
+        ),
+        (
+            "a directory with no .mds file",
+            root,
+            &["empty"],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "no .mds files found in empty; nothing was linted",
+        ),
+        (
+            "a directory whose every .mds file is excluded",
+            root,
+            &["excluded"],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "1 .mds file(s) found but all are under default-excluded directories \
+             (hidden dirs, node_modules); nothing was linted",
+        ),
+    ];
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    let mut messages = Vec::new();
+    for (what, cwd, args, stdin, every_mode, exit, code, words) in rows {
+        let modes: &[&[&str]] = if every_mode { &LINT_MODES } else { &[&[]] };
+        for mode in modes {
+            for quiet in [&[][..], &["--quiet"]] {
+                let mut all = vec!["--format", "json"];
+                all.extend_from_slice(mode);
+                all.extend_from_slice(quiet);
+                all.extend_from_slice(args);
+                let out = lint_with_stdin(cwd, &all, stdin);
+                let run = all.join(" ");
+                messages.push((what, run.clone(), error_message(&out), words));
+                seen.push((what, run.clone(), json_exit(&out)));
+                expected.push((what, run, JsonExit::error(exit, code)));
+            }
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "(what stops the run, arguments, what it printed)"
+    );
+    for (what, run, message, words) in messages {
+        assert!(
+            message.as_deref().is_some_and(|m| m.contains(words)),
+            "{what} (`mds lint {run}`): the message holds {words:?}; got {message:?}"
+        );
+    }
+
+    // The words of a directory with nothing to lint are its human report's.
+    for (dir, words) in [("empty", rows[7].7), ("excluded", rows[8].7)] {
+        let human = lint_with_stdin(root, &[dir], b"");
+        assert_eq!(
+            (
+                human.status.code(),
+                String::from_utf8_lossy(&human.stdout).into_owned(),
+                String::from_utf8_lossy(&human.stderr).into_owned()
+            ),
+            (Some(2), String::new(), format!("{words}\n")),
+            "control: the human report of {dir}"
+        );
+        let json = lint_with_stdin(root, &["--format", "json", dir], b"");
+        assert_eq!(
+            error_message(&json).as_deref(),
+            Some(words),
+            "the error document of {dir} words it as the human report does"
+        );
+    }
+
+    // Control: a run that lints prints its one findings document.
+    let linted = lint_with_stdin(root, &["--format", "json", "x.mds"], b"");
+    assert_eq!(
+        json_exit(&linted),
+        JsonExit {
+            exit: Some(0),
+            documents: Some(1),
+            code: None,
+            stderr: String::new(),
+        },
+        "control: a clean file"
+    );
+    let document = &json_documents(&linted.stdout).unwrap()[0];
+    let mut keys: Vec<&String> = document.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["files", "truncated", "version"],
+        "control: {document}"
+    );
+}
+
+/// The text `mds lint --fix --format json -` is refused with.
+const STDIN_FIX_JSON_REFUSAL: &str = "--fix --format json with stdin input is not supported; \
+     use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output";
+
+/// `mds lint --fix --format json -` is refused — stdin under `--fix` is a filter, whose
+/// product is the source on stdout — with the error document, exit 2, nothing on stderr, in
+/// every `--fix` mode and under `--quiet` too.
+///
+/// Controls: the filter without `--format json` prints the source; a report of the same
+/// stdin under `--format json` prints its findings document.
+#[test]
+fn stdin_under_fix_in_json_is_refused_with_one_error_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for mode in &LINT_MODES[1..] {
+        for quiet in [&[][..], &["--quiet"]] {
+            let mut args = vec!["--format", "json"];
+            args.extend_from_slice(mode);
+            args.extend_from_slice(quiet);
+            args.push("-");
+            let out = lint_with_stdin(tmp.path(), &args, b"Hello!\n");
+            seen.push((args.join(" "), json_exit(&out), error_message(&out)));
+            expected.push((
+                args.join(" "),
+                JsonExit::error(2, "mds::io"),
+                Some(STDIN_FIX_JSON_REFUSAL.to_string()),
+            ));
+        }
+    }
+    assert_eq!(seen, expected, "(arguments, what it printed, its message)");
+
+    let filter = lint_with_stdin(tmp.path(), &["--fix", "-"], b"Hello!\n");
+    assert_eq!(
+        (
+            filter.status.code(),
+            String::from_utf8_lossy(&filter.stdout).into_owned()
+        ),
+        (Some(0), "Hello!\n".to_string()),
+        "control: the filter; stderr: {}",
+        String::from_utf8_lossy(&filter.stderr)
+    );
+    let report = lint_with_stdin(tmp.path(), &["--format", "json", "-"], b"Hello!\n");
+    assert_eq!(
+        json_exit(&report),
+        JsonExit {
+            exit: Some(0),
+            documents: Some(1),
+            code: None,
+            stderr: String::new(),
+        },
+        "control: a report of stdin"
+    );
+}
+
+/// `--fix --diff --format json` is the one exception to the one document: stdout holds the
+/// diffs first, one per file with a pending fix, then exactly one document — for a file
+/// argument and for a directory.
+///
+/// Control: `--fix --check --format json`, which prints no diff, prints exactly the one
+/// document.
+#[test]
+fn fix_diff_in_json_prints_its_diffs_then_exactly_one_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    fs::create_dir(&dir).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.join("a.mds")).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.join("b.mds")).unwrap();
+    let file = Path::new("d").join("a.mds");
+    let file = file.to_str().unwrap();
+    for (input, files) in [(file, 1), ("d", 2)] {
+        let out = lint_with_stdin(
+            tmp.path(),
+            &["--fix", "--diff", "--format", "json", input],
+            b"",
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with('{'))
+            .unwrap_or_else(|| panic!("{input}: a document on stdout; got {stdout:?}"));
+        let headers = lines[..start]
+            .iter()
+            .filter(|line| line.starts_with("--- "))
+            .count();
+        assert_eq!(
+            headers, files,
+            "{input}: a diff per file comes first; stdout: {stdout:?}"
+        );
+        let rest = lines[start..].join("\n");
+        let documents = json_documents(rest.as_bytes())
+            .unwrap_or_else(|| panic!("{input}: only JSON after the diffs; got {rest:?}"));
+        assert_eq!(documents.len(), 1, "{input}: then one document: {rest}");
+        assert!(
+            documents[0]["files"].is_array() && documents[0]["version"] == 1,
+            "{input}: the findings document: {rest}"
+        );
+
+        let check = lint_with_stdin(
+            tmp.path(),
+            &["--fix", "--check", "--format", "json", input],
+            b"",
+        );
+        assert_eq!(
+            json_documents(&check.stdout).map(|documents| documents.len()),
+            Some(1),
+            "control: {input} under --fix --check; stdout: {:?}",
+            String::from_utf8_lossy(&check.stdout)
+        );
+    }
+}
+
+/// Run `mds <args>` with `stdin` in `gone`, a directory the child removes right before
+/// `mds` starts, so that the run's working directory no longer exists. std changes into
+/// `gone` before it runs the closure below; were that order reversed, the spawn would fail
+/// rather than run somewhere else.
+#[cfg(unix)]
+fn run_where_the_working_directory_is_gone(
+    gone: &Path,
+    args: &[&str],
+    stdin: &[u8],
+) -> std::process::Output {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::process::CommandExt as _;
+
+    fs::create_dir(gone).unwrap();
+    let target =
+        std::ffi::CString::new(gone.as_os_str().as_bytes()).expect("a temporary path holds no NUL");
+    let mut cmd = mds_bin();
+    cmd.current_dir(gone)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `rmdir` is a thin wrapper around its system call
+    // that takes no lock and allocates nothing, and the path it reads was allocated before
+    // the fork. The closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::rmdir(target.as_ptr()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let _ = child.stdin.take().unwrap().write_all(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        !gone.exists(),
+        "control: the run's working directory was gone; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// `mds lint -` in a working directory that is gone fails closed in the words
+/// `mds build -` meets it in — `cannot determine current directory: <reason>`, `mds::io`,
+/// exit 2 — not as a base directory `.` that cannot be resolved (#390), with or without
+/// `--fix`; under `--format json` that failure is the one error document.
+///
+/// Controls: `mds build -` where the working directory is gone; the same stdin linted where
+/// it exists.
+///
+/// Unix-only: Windows cannot remove a directory that is a process's working directory.
+#[cfg(unix)]
+#[test]
+fn stdin_where_the_working_directory_is_gone_fails_in_the_words_build_uses() {
+    const CANNOT_DETERMINE: &str = "cannot determine current directory: ";
+    let tmp = tempfile::tempdir().unwrap();
+    let gone = |name: &str, args: &[&str]| {
+        run_where_the_working_directory_is_gone(&tmp.path().join(name), args, b"Hello!\n")
+    };
+    let build = gone("build", &["build", "-"]);
+    let build_stderr = String::from_utf8_lossy(&build.stderr).into_owned();
+    assert_eq!(
+        build.status.code(),
+        Some(2),
+        "control: build: {build_stderr}"
+    );
+    assert!(
+        build_stderr.contains("mds::io") && build_stderr.contains(CANNOT_DETERMINE),
+        "control: build fails in mds-core's words; stderr: {build_stderr}"
+    );
+    for args in [&["lint", "-"][..], &["lint", "--fix", "-"]] {
+        let human = gone(&args.join("-"), args);
+        assert_eq!(
+            (
+                human.status.code(),
+                String::from_utf8_lossy(&human.stdout).into_owned(),
+                String::from_utf8_lossy(&human.stderr).into_owned()
+            ),
+            (build.status.code(), String::new(), build_stderr.clone()),
+            "`mds {}` fails as `mds build -` does",
+            args.join(" ")
+        );
+    }
+    let json = gone("json", &["lint", "--format", "json", "-"]);
+    assert_eq!(json_exit(&json), JsonExit::error(2, "mds::io"), "json");
+    assert!(
+        error_message(&json).is_some_and(|m| m.starts_with(CANNOT_DETERMINE)),
+        "json: in the same words; got {:?}",
+        error_message(&json)
+    );
+
+    let here = lint_with_stdin(tmp.path(), &["--format", "json", "-"], b"Hello!\n");
+    assert_eq!(
+        json_exit(&here),
+        JsonExit {
+            exit: Some(0),
+            documents: Some(1),
+            code: None,
+            stderr: String::new(),
+        },
+        "control: where the working directory exists"
     );
 }

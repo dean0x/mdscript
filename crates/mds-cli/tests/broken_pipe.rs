@@ -1814,7 +1814,17 @@ fn stdin_over_the_cap_exits_3() {
             Stdio::piped(),
             Stdio::piped(),
         );
-        assert_exit_and_code(&run, &what, 3, "mds::resource_limit");
+        if args == lint_json {
+            // Reported in its one document, the error document on stdout (#309).
+            assert_eq!(run.code, Some(3), "`mds {what}`; stderr: {:?}", run.stderr);
+            assert!(
+                run.stdout.contains("\"code\":\"mds::resource_limit\""),
+                "`mds {what}` must report mds::resource_limit; stdout: {:?}",
+                run.stdout
+            );
+        } else {
+            assert_exit_and_code(&run, &what, 3, "mds::resource_limit");
+        }
     }
 }
 

@@ -77,7 +77,10 @@ pub(crate) trait ResultSink {
     fn clean(&mut self, input: &LintSource<'_>, findings: &mds::LintResult);
 
     /// The failure that stops a run before it lints anything, or before it lints its one
-    /// input, stdin or a file argument: config load, I/O, resolution, parse.
+    /// input, stdin or a file argument: config load, I/O, resolution, parse — stdin that
+    /// cannot be read or is over the size cap, a working directory that is gone, and the
+    /// refusal of stdin under `--fix --format json` among them. Under `--format json` it is
+    /// the run's one document (#309).
     ///
     /// `stdin_source` is stdin's text: a human frame then shows the source as
     /// [`STDIN_DISPLAY_LABEL`] instead of the `<source>` label core gives a string source
@@ -213,40 +216,33 @@ pub(crate) trait ResultSink {
     }
 
     /// A directory with nothing to lint: every `.mds` file under default-excluded
-    /// directories, or none at all (#204). Not `--quiet`: a silent run would read as a pass.
+    /// directories, or none at all (#204) — [`nothing_to_lint_message`] on stderr. Not
+    /// `--quiet`: a silent run would read as a pass.
     fn nothing_to_lint(&mut self, dir: &Path, walk: &WalkResult) {
-        if walk.excluded_by_default > 0 {
-            crate::output::ewriteln!(
-                "{} .mds file(s) found but all are under default-excluded directories \
-                 (hidden dirs, node_modules); nothing was linted",
-                walk.excluded_by_default
-            );
-        } else {
-            crate::output::ewriteln!(
-                "no .mds files found in {}; nothing was linted",
-                safe_path(dir)
-            );
-        }
+        crate::output::ewriteln!("{}", safe_inline(nothing_to_lint_message(dir, walk)));
     }
 
-    /// Stdin could not be read, or is over the size cap: an error on stderr, in either
-    /// format.
-    fn stdin_unreadable(&mut self, error: MdsError) {
-        eprint_error(error.into());
-    }
-
-    /// The usage error for `--fix --format json` on stdin: a plain message on stderr, in
-    /// either format.
-    fn stdin_fix_json_refused(&mut self) {
-        crate::output::ewriteln!(
-            "error: --fix --format json with stdin input is not supported; \
-             use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output"
-        );
-    }
-
-    /// A setup failure — the runtime variables, the input argument — on stderr.
+    /// A setup failure — the runtime variables, finding the input to lint — on stderr.
     fn setup_failed(&mut self, error: miette::Report) {
         eprint_error(error);
+    }
+}
+
+/// What a directory with nothing to lint says: how many `.mds` files the walk skipped under
+/// default-excluded directories, or that it found none (#204). The directory is escaped
+/// here, as a status line names it.
+fn nothing_to_lint_message(dir: &Path, walk: &WalkResult) -> String {
+    if walk.excluded_by_default > 0 {
+        format!(
+            "{} .mds file(s) found but all are under default-excluded directories \
+             (hidden dirs, node_modules); nothing was linted",
+            walk.excluded_by_default
+        )
+    } else {
+        format!(
+            "no .mds files found in {}; nothing was linted",
+            safe_path(dir)
+        )
     }
 }
 
@@ -351,7 +347,9 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, filename: &str, te
 // ── JSON ──────────────────────────────────────────────────────────────────────
 
 /// `--format json`: findings as one JSON document on stdout — each input's own, or, for a
-/// directory, one document for every entry.
+/// directory, one document for every entry — and a failure that stops the run as the error
+/// document instead, so every run prints exactly one (#309). `--fix --diff` writes its
+/// diffs to stdout before it.
 pub(crate) struct JsonSink {
     quiet: bool,
     /// A directory run's document, from [`ResultSink::start_document`] to
@@ -447,6 +445,26 @@ impl ResultSink for JsonSink {
         if let Some(files) = self.document.take() {
             emit_stdout(&json_line(&files_document(files, truncated)));
         }
+    }
+
+    /// The error document, `mds::io`, in the words the human report gives (#309).
+    fn nothing_to_lint(&mut self, dir: &Path, walk: &WalkResult) {
+        let error = MdsError::Io {
+            message: nothing_to_lint_message(dir, walk),
+        };
+        self.analysis_failure(&error, None);
+    }
+
+    /// The error document (#309). A failure that is not an `MdsError` — auto-detection
+    /// finding no `.mds` file in the working directory, or more than one — is `mds::io`,
+    /// as a directory with nothing to lint is.
+    fn setup_failed(&mut self, error: miette::Report) {
+        let error = error
+            .downcast::<MdsError>()
+            .unwrap_or_else(|report| MdsError::Io {
+                message: report.to_string(),
+            });
+        self.analysis_failure(&error, None);
     }
 }
 
