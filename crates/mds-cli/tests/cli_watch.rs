@@ -201,6 +201,7 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// - `watch_dir_mode_idle_tick_fires_under_event_flood`
 /// - `i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate`
 /// - `watch_help_example_src_poll_interval_500_self_heals`
+/// - `watch_dir_failed_rebuild_write_keeps_the_compiled_dependencies`
 ///
 /// Every other wait in this file is satisfied by an inotify event on a watch that was
 /// never lost, and keeps [`TIMEOUT`].
@@ -6453,9 +6454,9 @@ fn watch_refuses_at_startup_to_write_over_the_entry() {
 }
 
 /// A rebuild never writes over the entry either. When the startup compile fails, the
-/// output path is resolved without knowing the kind and falls back to the Markdown
-/// default — the entry itself here, or the `-o` path as given, which leads back to the
-/// entry out of a directory that does not exist yet; once the source is fixed, the
+/// kind is unknown, and a fix that compiles to Markdown takes the Markdown default —
+/// the entry itself here — or the `-o` path as given, which leads back to the entry out
+/// of a directory that does not exist yet; once the source is fixed, the
 /// rebuild refuses (`mds::io`, the entry named as typed), keeps watching, and the fixed
 /// source stays byte-identical, with no directory created. It used to overwrite it
 /// with the compiled output.
@@ -6943,6 +6944,51 @@ fn watch_failed_startup_write_keeps_the_compiled_dependencies() {
     drop(child);
 }
 
+/// A failed startup write warns about an explicit `-o` by the kind the compile produced,
+/// once (#257): the startup compile warns when the path's extension contradicts that kind,
+/// and the failed write adds nothing. It used to warn a second time measured against
+/// Markdown — twice for a Markdown output written to `-o out.json`, and once for a
+/// messages output, which `.json` names. The first session is the positive control for
+/// the second's absence.
+#[test]
+fn watch_failed_startup_write_warns_about_the_output_extension_once() {
+    // One session whose startup write to `-o out.json` fails: the warnings on stderr.
+    let warnings = |source: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat.mds"), source).unwrap();
+        std::fs::create_dir(dir.path().join("out.json")).unwrap();
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "chat.mds", "-o", "out.json"])
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        // Startup prints all it prints before it reports readiness, and a rebuild never
+        // prints the `-o` warning.
+        let stderr = tap.finish_text(&mut child);
+        assert!(
+            squash(&stderr).contains(&squash("cannot rename temp file to out.json:")),
+            "the startup write fails; stderr: {stderr}"
+        );
+        (
+            count_occurrences(&squash(&stderr), &squash("has extension '.json'")),
+            stderr,
+        )
+    };
+
+    let (count, stderr) = warnings("Hello\n");
+    assert_eq!(
+        count, 1,
+        "a Markdown output named .json is warned about once; stderr: {stderr}"
+    );
+    let (count, stderr) = warnings("@message user:\nHi\n@end\n");
+    assert_eq!(
+        count, 0,
+        "a messages output named .json is not warned about; stderr: {stderr}"
+    );
+}
+
 /// A startup compile that fails leaves the output's kind unknown, and the first rebuild
 /// that compiles routes the output by the kind it compiles to (#257): a template fixed
 /// into messages writes `chat.json` and never `chat.md`, below `--out-dir` too, and one
@@ -7043,6 +7089,61 @@ fn watch_failed_startup_compile_routes_by_the_kind_it_compiles_to() {
     );
 }
 
+/// After a failed startup compile, a route that is refused as the entry itself is not
+/// kept (#257, #425): a fix of a `type: mds` `.md` entry that compiles to Markdown would
+/// write over the entry and is refused, and a later edit that compiles to messages
+/// writes `page.json`. The refused route used to stay the session's, so that edit was
+/// refused too, and so was every later one.
+#[test]
+fn watch_route_refused_as_the_entry_is_not_kept() {
+    const MESSAGES: &str = "---\ntype: mds\n---\n@message user:\nWhat is 3+3?\n@end\n";
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    let json = dir.path().join("page.json");
+    std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    // Control: the startup compile fails.
+    wait_for_tap(&tap, "mds::syntax", TIMEOUT);
+
+    // Control: a fix that compiles to Markdown is refused — its route is the entry.
+    write_atomic(&src, TYPE_MDS_PAGE);
+    let refused = wait_for_tap(&tap, "output would overwrite the entry file", TIMEOUT);
+    assert!(
+        squash(&refused).contains(&entry_overwrite_refusal("page.md")),
+        "control: the Markdown route is refused; stderr: {refused}"
+    );
+
+    write_atomic(&src, MESSAGES);
+    // Refused rebuilds write nothing and print no `Recompiled`, so the first one is the
+    // write of page.json, which comes before it.
+    let written = wait_for_file_contains(&json, "What is 3+3?", TIMEOUT);
+    assert!(
+        written,
+        "a later compile to messages writes page.json; stderr: {}",
+        tap.text()
+    );
+    let stderr = wait_for_tap(&tap, "Recompiled", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(&squash(&format!(
+            "Recompiled {}",
+            Path::new(".").join("page.json").display()
+        ))),
+        "the rebuild names page.json as typed; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&src).unwrap(),
+        MESSAGES,
+        "the entry is untouched"
+    );
+    drop(child);
+}
+
 // ── A failed directory-watch startup write is retried (#257) ───────────────────────
 //
 // A directory watch compiles each source once at startup, and the content dedup holds
@@ -7120,6 +7221,69 @@ fn watch_dir_failed_startup_write_is_retried_on_the_next_rebuild() {
         0,
         "control: a save of the same bytes rewrites nothing; stderr: {stderr}"
     );
+}
+
+/// A directory rebuild whose write fails keeps the dependencies its compile reported
+/// (#257), as startup does: once the obstacle is gone, an edit to a file outside the
+/// watched directory, which the edit whose write failed began to import, rebuilds the
+/// source. The rebuild used to keep the dependencies of the compile before it, so that
+/// file's directory was never watched and its edits were never seen. `--poll-interval
+/// 100`: the idle tick arms a new dependency's directory and compares what it holds.
+#[test]
+fn watch_dir_failed_rebuild_write_keeps_the_compiled_dependencies() {
+    let base = tempfile::tempdir().unwrap();
+    let (root, shared) = (base.path().join("root"), base.path().join("shared"));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // A project root above both, so `../shared/` can be imported.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    let partial = shared.join("_x.mds");
+    std::fs::write(
+        &partial,
+        "@define greet():\nShared one\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    let (a, a_out) = (root.join("a.mds"), root.join("a.md"));
+    std::fs::write(&a, "Plain a\n").unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "root"])
+            .args(["--debounce", "0", "--poll-interval", "100"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&a_out, "Plain a", TIMEOUT),
+        "control: the startup writes a.md; stderr: {}",
+        tap.text()
+    );
+
+    // A directory at a.md, then an edit that imports the shared file: the rebuild
+    // compiles, and its write fails.
+    std::fs::remove_file(&a_out).unwrap();
+    std::fs::create_dir(&a_out).unwrap();
+    write_atomic(&a, "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n");
+    let failed = wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+    assert!(
+        squash(&failed).contains(&squash(&format!(
+            "cannot rename temp file to {}:",
+            Path::new("root").join("a.md").display()
+        ))),
+        "the rebuild's write of a.md fails; stderr: {failed}"
+    );
+
+    std::fs::remove_dir(&a_out).unwrap();
+    write_atomic(
+        &partial,
+        "@define greet():\nShared, edited\n@end\n\n@export greet\n",
+    );
+    assert!(
+        wait_for_file_contains(&a_out, "Shared, edited", TICK_TIMEOUT),
+        "an edit to the file the failed rebuild imported rebuilds a.md; stderr: {}",
+        tap.text()
+    );
+    drop(child);
 }
 
 /// A directory watch's startup compiles each source once (#257). A compile that panics

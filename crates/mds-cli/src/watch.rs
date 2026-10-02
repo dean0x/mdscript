@@ -1490,7 +1490,7 @@ enum OutputRoute {
     /// stdout (`-o -`).
     Decided(Option<WriteTarget>),
     /// The startup compile failed, so the output's kind is unknown: the route of each
-    /// kind, of which the first compile that succeeds takes its kind's.
+    /// kind, of which the first compile whose route is admitted takes its kind's.
     ByKind {
         markdown: Option<WriteTarget>,
         messages: Option<WriteTarget>,
@@ -1498,18 +1498,24 @@ enum OutputRoute {
 }
 
 impl OutputRoute {
-    /// The route an output of `kind` takes. The first call decides it, and every later
-    /// one keeps it whatever its kind.
-    fn decide(&mut self, kind: OutputKind) -> Option<WriteTarget> {
-        let route = match std::mem::replace(self, Self::Decided(None)) {
+    /// The route an output of `kind` takes: the decided one whatever the kind, or else
+    /// that kind's.
+    fn of(&self, kind: OutputKind) -> &Option<WriteTarget> {
+        match self {
             Self::Decided(route) => route,
             Self::ByKind { markdown, messages } => match kind {
                 OutputKind::Markdown => markdown,
                 OutputKind::Messages => messages,
             },
-        };
-        *self = Self::Decided(route.clone());
-        route
+        }
+    }
+
+    /// Decide the route an output of `kind` takes ([`Self::of`]): every later output
+    /// takes it whatever its kind. A decided route stays as it is.
+    fn decide(&mut self, kind: OutputKind) {
+        if let Self::ByKind { .. } = self {
+            *self = Self::Decided(self.of(kind).clone());
+        }
     }
 }
 
@@ -1532,7 +1538,7 @@ struct FileWatchState {
     last_mtimes: StampMap,
     /// Content-dedup map: what was last written, by where it was written.
     last_written: HashMap<OutputKey, String>,
-    /// Where every rebuild writes ([`OutputRoute::decide`]).
+    /// Where every rebuild writes ([`OutputRoute::of`], [`OutputRoute::decide`]).
     output: OutputRoute,
     /// Whether the entry file was missing on the previous liveness tick.
     entry_was_missing: bool,
@@ -1740,11 +1746,9 @@ fn rebuild_file(
     // same way, and watching continues.
     let entry = &ctx.entry;
     let routed = entry.compile(runtime_vars, ctx.quiet).and_then(|compiled| {
-        // After a failed startup compile, the first compile that succeeds decides the
-        // route by its kind, and this rebuild and every later one write there (#257).
-        let output_path = state.output.decide(compiled.kind);
+        let output_path = state.output.of(compiled.kind).clone();
         // #425: a rebuild never writes over the entry — reachable after a failed startup
-        // compile, which refuses no route: the route the kind decided here, or an
+        // compile, which refuses no route: the route of the compiled kind, or an
         // explicit `-o`, can be the entry. No `-o` extension warning (`&None`): startup
         // printed it for the path an explicit `-o` names, which every rebuild reuses.
         admit_output(
@@ -1755,6 +1759,10 @@ fn rebuild_file(
             ctx.quiet,
         )
         .map_err(miette::Error::from)?;
+        // After a failed startup compile, the first route admitted is decided by its
+        // kind, and this rebuild and every later one write there; a refused one is not
+        // kept (#257).
+        state.output.decide(compiled.kind);
         Ok((compiled, output_path))
     });
     let (compiled, output_path) = match routed {
@@ -2139,11 +2147,11 @@ fn run_watch_file(
             // watched).
             settle_startup_error(StartupInto::File, e, &entry.canonical);
             // The kind is unknown, and with it the route an output of that kind takes: the
-            // route of each kind is resolved now, and the first compile that succeeds takes
-            // its kind's (#257) — a `.json` output is never written to `.md`. A route that
-            // fails to resolve is refused here as after a successful compile (exit 2): no
-            // rebuild could write anywhere else. Nothing is written now, and every rebuild
-            // refuses and reports a route that is the entry (#425).
+            // route of each kind is resolved now, and the first compile whose route is
+            // admitted takes its kind's (#257) — a `.json` output is never written to
+            // `.md`. A route that fails to resolve is refused here as after a successful
+            // compile (exit 2): no rebuild could write anywhere else. Nothing is written
+            // now, and every rebuild refuses and reports a route that is the entry (#425).
             let route_of = |kind| {
                 resolve_output_path_for_kind(Some(entry.paths()), &output, &out_dir, &config, kind)
             };
@@ -2221,8 +2229,8 @@ fn run_watch_file(
     // consult this map before it is populated (guard 3 above).
     // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
     // initial_content is empty when the initial compile or write failed (above), and a
-    // failed compile leaves the route to the first compile that succeeds. In either case
-    // leave last_written empty so the next successful rebuild always writes.
+    // failed compile leaves the route to the first compile whose route is admitted. In
+    // either case leave last_written empty so the next successful rebuild always writes.
     let mut last_written: HashMap<OutputKey, String> = HashMap::new();
     if let (OutputRoute::Decided(written), false) = (&output_route, initial_content.is_empty()) {
         last_written.insert(OutputKey::of(written.as_ref()), initial_content);
@@ -2497,9 +2505,9 @@ struct LivenessState {
 /// per-affected-source incremental loop in `process_dir_batch` — collapsing the
 /// 2× duplicated compile→dedup→write block inside that function.
 ///
-/// `write_output_file`: when `true` the compiled content is written (non-partial sources).
-/// When `false` the graph is refreshed but no output file is created (used for partials
-/// and external-only deps where the caller decides skip/continue).
+/// A partial refreshes the graph and writes no output of its own; any other source's
+/// output is written when its content changed. A compile that succeeds records the
+/// dependencies it reported even when its write fails (#257).
 ///
 /// # Invariants preserved
 /// - Freshness rule: dep set recomputed from fresh `compile_to_content` output.
@@ -2606,7 +2614,14 @@ fn compile_one_source(
                         );
                         return true;
                     }
-                    Err(e) => Some(e),
+                    Err(e) => {
+                        // The compile succeeded: the dependencies it reported are the
+                        // source's now, as at startup, so an edit to one of them rebuilds
+                        // it — one outside the root included (#257). Nothing is recorded
+                        // as written, and the settle below marks the source errored.
+                        state.record_success(src, dep_paths, root, None, None);
+                        Some(e)
+                    }
                 }
             } else {
                 // Content unchanged — still refresh graph edges + known_files.
@@ -5313,9 +5328,10 @@ mod tests {
         );
     }
 
-    /// #257: after a failed startup compile the first kind a compile produces decides the
-    /// route, and every later one keeps it whatever its kind; a route decided at startup —
-    /// by the startup compile's kind, or an explicit `-o` — is never decided again.
+    /// #257: after a failed startup compile the route of each kind is the one an output of
+    /// that kind takes, and nothing is decided until a route is; then every later output
+    /// takes it whatever its kind. A route decided at startup — by the startup compile's
+    /// kind, or an explicit `-o` — is never decided again.
     #[test]
     fn output_route_is_decided_by_the_first_compiled_kind() {
         let target = |name: &str| Some(WriteTarget::as_typed(PathBuf::from(name)));
@@ -5325,22 +5341,27 @@ mod tests {
         };
 
         let mut route = by_kind();
-        assert_eq!(route.decide(OutputKind::Messages), target("chat.json"));
+        assert_eq!(route.of(OutputKind::Messages), &target("chat.json"));
+        assert_eq!(route.of(OutputKind::Markdown), &target("chat.md"));
+        assert_eq!(route, by_kind(), "the route of a kind decides nothing");
+        route.decide(OutputKind::Messages);
         assert_eq!(route, OutputRoute::Decided(target("chat.json")));
         assert_eq!(
-            route.decide(OutputKind::Markdown),
-            target("chat.json"),
+            route.of(OutputKind::Markdown),
+            &target("chat.json"),
             "kept whatever kind follows"
         );
 
-        // Control: a first compile to Markdown takes the Markdown route.
+        // Control: a first compile to Markdown decides the Markdown route.
         let mut route = by_kind();
-        assert_eq!(route.decide(OutputKind::Markdown), target("chat.md"));
+        route.decide(OutputKind::Markdown);
+        assert_eq!(route, OutputRoute::Decided(target("chat.md")));
 
         let mut route = OutputRoute::Decided(target("out.md"));
+        route.decide(OutputKind::Messages);
         assert_eq!(
-            route.decide(OutputKind::Messages),
-            target("out.md"),
+            route.of(OutputKind::Messages),
+            &target("out.md"),
             "a decided route is never decided again"
         );
     }
