@@ -1170,13 +1170,6 @@ impl CompileFailure {
             Self::Panicked => None,
         }
     }
-
-    /// Report the failure, unless the panic hook has.
-    fn report(self) {
-        if let Some(e) = self.unreported() {
-            eprint_error(e);
-        }
-    }
 }
 
 impl From<miette::Report> for CompileFailure {
@@ -1653,10 +1646,9 @@ fn handle_fs_event_file(
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output.
 /// - PF-004: all reads go through `compile_to_content`.
 /// - Error-settle: every failure — the vars file, the compile, the output route or its
-///   #425 refusal, the write — goes through [`settle_after_error`] or, for the compile and
-///   the route, [`settle_after_failure`], except a repeated stdout failure, which was
-///   reported already. A compile that panicked is settled the same way; the panic hook
-///   was its report (#389).
+///   #425 refusal, the write — goes through [`settle`], except a repeated stdout failure,
+///   which was reported already. A compile that panicked is settled the same way; the
+///   panic hook was its report (#389).
 /// - `last_written` records only content that was written, so a rebuild after a failed
 ///   write writes again even when its output has not changed (#157).
 /// - A recreated working directory is restored before anything is read
@@ -1688,7 +1680,7 @@ fn rebuild_file(
     }) {
         Ok(v) => v,
         Err(e) => {
-            settle_after_error(state, e);
+            settle(SettleInto::File(state), Some(e), Settle::Rebaseline);
             return ControlFlow::Continue(());
         }
     };
@@ -1721,7 +1713,11 @@ fn rebuild_file(
     let (compiled, output_path) = match routed {
         Ok(routed) => routed,
         Err(failure) => {
-            settle_after_failure(state, failure);
+            settle(
+                SettleInto::File(state),
+                failure.unreported(),
+                Settle::MarkErrored(&entry.canonical),
+            );
             return ControlFlow::Continue(());
         }
     };
@@ -1778,26 +1774,86 @@ fn rebuild_file(
         }
         // Not written: `last_written` keeps what was last written, so the next rebuild
         // writes again even when its output has not changed.
-        OutputWrite::Failed(Some(e)) => settle_after_error(state, e),
+        OutputWrite::Failed(Some(e)) => settle(
+            SettleInto::File(state),
+            Some(e),
+            Settle::MarkErrored(&ctx.entry.canonical),
+        ),
+        // A repeat of a stdout failure reported already (#157): neither reported nor
+        // settled again.
         OutputWrite::Failed(None) => {}
         OutputWrite::StdoutClosed => return ControlFlow::Break(StopReason::StdoutClosed),
     }
     ControlFlow::Continue(())
 }
 
-/// Report a failed file-mode rebuild and settle: snapshot the files of interest, so the
-/// tick gate does not re-fire on the same unchanged files (AC-R7/W6). Watching
-/// continues. Every failure [`rebuild_file`] meets ends here, except a repeated stdout
-/// failure, which is not reported again (#157).
-fn settle_after_error(state: &mut FileWatchState, e: miette::Report) {
-    settle_after_failure(state, CompileFailure::Error(e));
+// ── Settling a failure ────────────────────────────────────────────────────────
+
+/// How `mds watch` settles a failure it keeps watching through (#257): reading the vars
+/// file, a compile — a panic included (#389) — the output route, a write. The site where
+/// the failure happens picks the action and hands it to [`settle`] with the state to apply
+/// it to ([`SettleInto`]). Every failure site of both modes goes through it; only the
+/// repeat of a stdout failure reported already (#157) settles nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle<'a> {
+    /// Take the `(mtime, size)` baseline again, so the idle tick does not fire again on
+    /// files that have not changed since.
+    Rebaseline,
+    /// The source failed, and a later change must compile it again even when the source
+    /// itself has not changed. Directory mode records it as errored — re-seeded into every
+    /// batch that carries a real change — keeping the dependency set its last successful
+    /// compile recorded (#321); the batch takes the baseline once, at its end. File mode
+    /// compiles its one source again on every change anyway, so there it takes the
+    /// baseline again, as [`Settle::Rebaseline`] does.
+    MarkErrored(&'a Path),
 }
 
-/// [`settle_after_error`] for a failed compile, which the panic hook has reported when it
-/// panicked (#389): settled the same way, reported once.
-fn settle_after_failure(state: &mut FileWatchState, failure: CompileFailure) {
-    failure.report();
-    state.last_mtimes = snapshot_state(&state.foi);
+/// The state a [`Settle`] is applied to: a mode's, in a rebuild or at startup.
+enum SettleInto<'a> {
+    /// A file-mode rebuild.
+    File(&'a mut FileWatchState),
+    /// A directory-mode rebuild.
+    Dir(&'a mut DirWatchState),
+    /// File mode's startup. It records nothing: the session's first baseline is taken once
+    /// the startup compile is done, and is the one [`Settle::Rebaseline`] asks for.
+    FileStartup,
+    /// Directory mode's startup. As at file mode's, the baseline is the one taken once
+    /// every source has compiled; [`Settle::MarkErrored`] records the source as errored.
+    DirStartup(&'a mut DirWatchState),
+}
+
+/// Settle a failure `mds watch` keeps watching through (#257): report `failure`, then
+/// apply `how` to `into`. `failure` is `None` when there is nothing to report — a compile
+/// that panicked, which the panic hook reported (#389) — so a panic settles exactly as an
+/// error at the same site does, reported once.
+fn settle(into: SettleInto<'_>, failure: Option<miette::Report>, how: Settle<'_>) {
+    settle_reporting(into, failure, how, eprint_error);
+}
+
+/// [`settle`], with `report` doing the reporting: the session's error renderer there, a
+/// recorder in a test.
+fn settle_reporting(
+    into: SettleInto<'_>,
+    failure: Option<miette::Report>,
+    how: Settle<'_>,
+    report: impl FnOnce(miette::Report),
+) {
+    if let Some(e) = failure {
+        report(e);
+    }
+    match (into, how) {
+        (SettleInto::File(state), Settle::Rebaseline | Settle::MarkErrored(_)) => {
+            state.last_mtimes = snapshot_state(&state.foi);
+        }
+        (SettleInto::Dir(state), Settle::Rebaseline) => {
+            state.last_mtimes = snapshot_state(&state.tracked_set());
+        }
+        (SettleInto::Dir(state) | SettleInto::DirStartup(state), Settle::MarkErrored(src)) => {
+            state.record_error(src);
+        }
+        (SettleInto::FileStartup | SettleInto::DirStartup(_), Settle::Rebaseline)
+        | (SettleInto::FileStartup, Settle::MarkErrored(_)) => {}
+    }
 }
 
 /// A directory `mds watch` watches, as a message names it (#390). `root` is the directory
@@ -1988,9 +2044,11 @@ fn run_watch_file(
         CompileWriteOutcome::Failed(e) => {
             // Initial compile or write error: print and continue watching (entry dir
             // still watched).
-            if let Some(e) = e {
-                eprint_error(e);
-            }
+            settle(
+                SettleInto::FileStartup,
+                e,
+                Settle::MarkErrored(&entry.canonical),
+            );
             // Fall back: resolve output path with Markdown kind as a placeholder so we
             // know where to watch. This path may not match a later successful compile if
             // the template has @message blocks, and every rebuild reuses it
@@ -2374,7 +2432,7 @@ fn compile_one_source(
 ) -> bool {
     let root = watch_root.canonical.as_path();
     let t0 = Instant::now();
-    match watch_root.compile_source(src, runtime_vars.clone(), quiet) {
+    let failure = match watch_root.compile_source(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths = graph_keys(&compiled.dependencies);
 
@@ -2452,26 +2510,21 @@ fn compile_one_source(
                             Some(&out.path),
                             Some(compiled.content),
                         );
-                        true
+                        return true;
                     }
-                    Err(e) => {
-                        eprint_error(e);
-                        state.record_error(src);
-                        false
-                    }
+                    Err(e) => Some(e),
                 }
             } else {
                 // Content unchanged — still refresh graph edges + known_files.
                 state.record_success(src, dep_paths, root, None, None);
-                false
+                return false;
             }
         }
-        Err(failure) => {
-            failure.report();
-            state.record_error(src);
-            false
-        }
-    }
+        Err(failure) => failure.unreported(),
+    };
+    // The compile failed, or writing its output did: settled alike.
+    settle(SettleInto::Dir(state), failure, Settle::MarkErrored(src));
+    false
 }
 
 /// Return value from `dir_watch_startup` bundling the watcher, channel, state,
@@ -2705,10 +2758,9 @@ fn rebuild_dir_batch(
     }) {
         Ok(v) => v,
         Err(e) => {
-            eprint_error(e);
             // Re-baseline so the idle-tick content backstop does not report the same
             // change again and turn one unreadable vars file into per-tick error spam.
-            state.last_mtimes = snapshot_state(&state.tracked_set());
+            settle(SettleInto::Dir(state), Some(e), Settle::Rebaseline);
             return;
         }
     };
@@ -3058,16 +3110,24 @@ fn dir_watch_startup(
                     let ext = compiled.kind.extension();
                     let out = output_path_for(&key, watch_root.root_paths(), &output_base, ext);
                     if let Err(e) = write_output(Some(&out), &compiled.content, quiet, true) {
-                        eprint_error(e);
+                        settle(
+                            SettleInto::DirStartup(&mut state),
+                            Some(e),
+                            Settle::Rebaseline,
+                        );
                     } else {
                         state.last_written.insert(out.path, compiled.content);
                     }
                 }
             }
             Err(failure) => {
-                failure.report();
-                state.forward_deps.insert(key.clone(), vec![]);
-                state.errored.insert(key.clone());
+                // `key` is new to the graph — each source is compiled once here — so the
+                // errored source's dependency set is the empty one.
+                settle(
+                    SettleInto::DirStartup(&mut state),
+                    failure.unreported(),
+                    Settle::MarkErrored(&key),
+                );
                 state.known_files.insert(key);
             }
         }
@@ -3140,9 +3200,9 @@ fn dir_watch_startup(
                     }
                     state.last_written.insert(out.path, compiled.content);
                 }
-                Err(_) => {
-                    // Baseline compile failed — leave entry absent so next rebuild always writes.
-                }
+                // Baseline compile failed — leave entry absent so next rebuild always
+                // writes. Nothing to report: this pass only seeds the dedup map.
+                Err(_) => settle(SettleInto::DirStartup(&mut state), None, Settle::Rebaseline),
             }
         }
     }
@@ -3525,8 +3585,11 @@ fn process_dir_batch_incremental(
                     state.errored.remove(src);
                 }
                 Err(failure) => {
-                    failure.report();
-                    state.errored.insert(src.clone());
+                    settle(
+                        SettleInto::Dir(state),
+                        failure.unreported(),
+                        Settle::MarkErrored(src),
+                    );
                 }
             }
             continue;
@@ -5310,5 +5373,198 @@ mod tests {
             }
             other => panic!("want Failed(Some(mds::io)); got {other:?}"),
         }
+    }
+
+    /// Directory mode's state, empty.
+    fn empty_dir_state() -> DirWatchState {
+        DirWatchState {
+            forward_deps: HashMap::new(),
+            errored: HashSet::new(),
+            known_files: BTreeSet::new(),
+            last_written: HashMap::new(),
+            external_dep_dirs: BTreeSet::new(),
+            last_mtimes: HashMap::new(),
+        }
+    }
+
+    /// File mode's state watching `foi`, with no baseline taken.
+    fn file_state(foi: HashSet<PathBuf>) -> FileWatchState {
+        FileWatchState {
+            watched_dirs: BTreeSet::new(),
+            armed_dirs: BTreeSet::new(),
+            foi,
+            last_mtimes: HashMap::new(),
+            last_written: HashMap::new(),
+            entry_was_missing: false,
+            first_tick: false,
+            missing_watched_dirs: BTreeSet::new(),
+        }
+    }
+
+    /// A source and its dependency on disk, for the settle tests: `(dir, source, dependency)`.
+    fn source_and_dependency() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("page.mds");
+        let dep = dir.path().join("_dep.mds");
+        std::fs::write(&src, "Page.\n").unwrap();
+        std::fs::write(&dep, "Dep.\n").unwrap();
+        (dir, src, dep)
+    }
+
+    /// `Settle::Rebaseline` takes the `(mtime, size)` baseline again in a rebuild, over what
+    /// the mode watches, and records nothing else; at startup it takes none, the startup
+    /// baseline being still to come (#257).
+    #[test]
+    fn settle_rebaseline_takes_the_baseline_again_in_a_rebuild_only() {
+        let (_dir, src, dep) = source_and_dependency();
+
+        // File mode: over the files of interest.
+        let foi: HashSet<PathBuf> = [src.clone(), dep.clone()].into_iter().collect();
+        let mut file = file_state(foi.clone());
+        settle(SettleInto::File(&mut file), None, Settle::Rebaseline);
+        assert_eq!(file.last_mtimes, snapshot_state(&foi));
+        assert!(
+            file.last_mtimes
+                .get(&src)
+                .is_some_and(|stamp| stamp.0.is_some()),
+            "the baseline holds the source as it is on disk: {:?}",
+            file.last_mtimes
+        );
+
+        // Directory mode: over the tracked set — the sources and their dependencies.
+        let mut rebuild = empty_dir_state();
+        rebuild.known_files.insert(src.clone());
+        rebuild.forward_deps.insert(src.clone(), vec![dep.clone()]);
+        settle(SettleInto::Dir(&mut rebuild), None, Settle::Rebaseline);
+        assert_eq!(rebuild.last_mtimes, snapshot_state(&rebuild.tracked_set()));
+        assert!(
+            rebuild.last_mtimes.contains_key(&dep),
+            "the dependency is in the baseline: {:?}",
+            rebuild.last_mtimes
+        );
+        assert!(rebuild.errored.is_empty(), "nothing is marked errored");
+
+        // Directory startup: no baseline yet, nothing recorded — where the same call in a
+        // rebuild, above, took one.
+        let mut startup = empty_dir_state();
+        startup.known_files.insert(src.clone());
+        startup.forward_deps.insert(src.clone(), vec![dep.clone()]);
+        settle(
+            SettleInto::DirStartup(&mut startup),
+            None,
+            Settle::Rebaseline,
+        );
+        assert!(startup.last_mtimes.is_empty(), "{:?}", startup.last_mtimes);
+        assert!(startup.errored.is_empty(), "{:?}", startup.errored);
+    }
+
+    /// `Settle::MarkErrored` records a directory-mode source as errored, keeping the
+    /// dependency set its last successful compile recorded — the empty one for a source
+    /// new to the graph — in a rebuild and at startup, and takes no baseline: a rebuild's
+    /// batch takes it at its end. File mode has no errored set: it takes the baseline
+    /// again, as `Settle::Rebaseline` does (#257).
+    #[test]
+    fn settle_mark_errored_records_the_source_in_directory_mode() {
+        let (_dir, src, dep) = source_and_dependency();
+
+        // Directory rebuild: errored, the dependency set kept, no baseline.
+        let mut rebuild = empty_dir_state();
+        rebuild.known_files.insert(src.clone());
+        rebuild.forward_deps.insert(src.clone(), vec![dep.clone()]);
+        settle(
+            SettleInto::Dir(&mut rebuild),
+            None,
+            Settle::MarkErrored(&src),
+        );
+        assert!(rebuild.errored.contains(&src), "{:?}", rebuild.errored);
+        assert_eq!(rebuild.forward_deps.get(&src), Some(&vec![dep.clone()]));
+        assert!(rebuild.last_mtimes.is_empty(), "{:?}", rebuild.last_mtimes);
+
+        // Directory startup: a source new to the graph gets the empty dependency set.
+        let mut startup = empty_dir_state();
+        settle(
+            SettleInto::DirStartup(&mut startup),
+            None,
+            Settle::MarkErrored(&src),
+        );
+        assert!(startup.errored.contains(&src), "{:?}", startup.errored);
+        assert_eq!(startup.forward_deps.get(&src), Some(&vec![]));
+        assert!(startup.last_mtimes.is_empty(), "{:?}", startup.last_mtimes);
+
+        // File mode: the baseline again.
+        let foi: HashSet<PathBuf> = [src.clone(), dep.clone()].into_iter().collect();
+        let mut file = file_state(foi.clone());
+        settle(SettleInto::File(&mut file), None, Settle::MarkErrored(&src));
+        assert_eq!(file.last_mtimes, snapshot_state(&foi));
+        assert!(
+            file.last_mtimes.contains_key(&src),
+            "{:?}",
+            file.last_mtimes
+        );
+    }
+
+    /// A compile that panicked settles as its error does at the same site — the site picks
+    /// the action, whatever failed — and is not reported: the panic hook reported it
+    /// (#389, #257).
+    #[test]
+    fn a_panicked_compile_settles_as_an_error_does_and_is_not_reported() {
+        let (_dir, src, dep) = source_and_dependency();
+        let foi: HashSet<PathBuf> = [src.clone(), dep.clone()].into_iter().collect();
+        let failures = || {
+            [
+                (
+                    "an error",
+                    CompileFailure::from(miette::miette!("broken")),
+                    1,
+                ),
+                ("a panic", CompileFailure::Panicked, 0),
+            ]
+        };
+
+        for (what, failure, reports) in failures() {
+            let mut reported = Vec::new();
+            let mut state = empty_dir_state();
+            state.forward_deps.insert(src.clone(), vec![dep.clone()]);
+            settle_reporting(
+                SettleInto::Dir(&mut state),
+                failure.unreported(),
+                Settle::MarkErrored(&src),
+                |e| reported.push(e.to_string()),
+            );
+            assert!(state.errored.contains(&src), "{what}: marked errored");
+            assert_eq!(
+                state.forward_deps.get(&src),
+                Some(&vec![dep.clone()]),
+                "{what}"
+            );
+            assert_eq!(reported.len(), reports, "{what}: reported {reported:?}");
+        }
+
+        for (what, failure, reports) in failures() {
+            let mut reported = Vec::new();
+            let mut state = file_state(foi.clone());
+            settle_reporting(
+                SettleInto::File(&mut state),
+                failure.unreported(),
+                Settle::MarkErrored(&src),
+                |e| reported.push(e.to_string()),
+            );
+            assert_eq!(
+                state.last_mtimes,
+                snapshot_state(&foi),
+                "{what}: rebaselined"
+            );
+            assert_eq!(reported.len(), reports, "{what}: reported {reported:?}");
+        }
+
+        // The error is reported as it is, once.
+        let mut reported = Vec::new();
+        settle_reporting(
+            SettleInto::FileStartup,
+            CompileFailure::from(miette::miette!("broken")).unreported(),
+            Settle::MarkErrored(&src),
+            |e| reported.push(e.to_string()),
+        );
+        assert_eq!(reported, ["broken"]);
     }
 }
