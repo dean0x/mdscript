@@ -4680,8 +4680,7 @@ fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
     use std::os::unix::process::ExitStatusExt;
 
     // Large enough that the compile is still far from finished when the first outputs
-    // appear, small enough to stay a fast test. Dir-mode startup makes two full passes
-    // over this set, so the window is roughly twice what the first pass suggests.
+    // appear, small enough to stay a fast test.
     const SOURCES: usize = 1200;
     /// Number of published outputs that proves the startup compile is under way.
     /// Deliberately tiny relative to SOURCES so the signal lands with the overwhelming
@@ -5089,18 +5088,17 @@ fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
     );
 }
 
-// ── I9: dir-watch mode warns exactly ONCE — guards the :2185 double-print ────
+// ── I9: dir-watch mode warns exactly ONCE — at startup, never on a rebuild ────
 
 #[test]
 fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
     // I9: mds watch (dir mode) with --set x=1 --set x=2 must print the
     // duplicate-key warning exactly once — at startup — and NOT again on rebuilds.
     //
-    // dir_watch_startup calls build_runtime_vars twice (once at :2064 to emit,
-    // once at :2185 for the dedup baseline to discard).  This test is the SOLE
-    // mechanical guard that:
-    //   - the second call at :2185 does NOT also emit (double-print on startup), AND
-    //   - rebuild calls at :1914 do NOT emit (per-event growth).
+    // dir_watch_startup calls build_runtime_vars once, and emits; every rebuild
+    // calls it again.  This test is the SOLE mechanical guard that:
+    //   - startup emits once (no double-print on startup), AND
+    //   - rebuild calls do NOT emit (per-event growth).
     //
     // Dir mode prints a rebuild's warnings AFTER its `Recompiled` line, so the only
     // anchor that orders them is a later event: the order marker below. Mutation
@@ -5136,8 +5134,8 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
         "I9: rebuild after edit must complete"
     );
 
-    // Ordered anchor: every line of the startup — the dedup-baseline read included —
-    // and of the rebuild precedes the marker's diagnostic, so the count is final.
+    // Ordered anchor: every line of the startup and of the rebuild precedes the
+    // marker's diagnostic, so the count is final.
     write_atomic(&src, ORDER_MARKER_SOURCE);
     wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let final_stderr = stderr_tap.finish_text(&mut child);
@@ -5149,8 +5147,8 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
     assert_eq!(
         count_occurrences(&final_stderr, DUP_SET_WARNING),
         1,
-        "I9: the warning must appear exactly once — at startup (guards :2185), and \
-         not again on the rebuild (guards :1914); stderr:\n{final_stderr}"
+        "I9: the warning must appear exactly once — at startup, and not again on \
+         the rebuild; stderr:\n{final_stderr}"
     );
 }
 
@@ -5244,10 +5242,9 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 }
 
 /// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
-/// rebuild: once at startup (proving the dedup-baseline second read in
-/// `dir_watch_startup` does NOT double-print), and once more per subsequent rebuild
-/// (proving exactly one of `liveness_probe_dir` / `handle_fs_event_dir` emits, not
-/// both).
+/// rebuild: once at startup (proving `dir_watch_startup` does NOT double-print), and
+/// once more per subsequent rebuild (proving exactly one of `liveness_probe_dir` /
+/// `handle_fs_event_dir` emits, not both).
 ///
 /// Sampling hazard this test has to defend against: dir mode emits the warning AFTER
 /// the output write, so `wait_for_file_contains` returning tells you nothing about
@@ -5287,16 +5284,14 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
             .stdout(Stdio::null()),
     );
 
-    // No edits yet: the startup count must be exactly 1, proving the dedup-baseline
-    // second read in `dir_watch_startup` does not also emit. Dir-mode startup prints no
-    // line after that read, so this is a sample — a second print still in the pipe
-    // would be missed here — and the final count below is the exact check.
+    // No edits yet: the startup count must be exactly 1. This is a sample — a second
+    // print still in the pipe would be missed here — and the final count below is the
+    // exact check.
     let stderr_startup = wait_for_tap_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&stderr_startup, &expected),
         1,
-        "I17: dir-watch startup must emit the vars-file warning exactly once \
-         (guards the dedup-baseline second read in dir_watch_startup); \
+        "I17: dir-watch startup must emit the vars-file warning exactly once; \
          stderr:\n{stderr_startup}"
     );
 
@@ -5320,8 +5315,8 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
     assert_eq!(
         count_occurrences(&stderr_after_edit, &expected),
         2,
-        "I17: startup and the one rebuild warn exactly once each (guards the \
-         dedup-baseline second read, and a double-emit between liveness_probe_dir and \
+        "I17: startup and the one rebuild warn exactly once each (guards a \
+         double-emit at startup, and between liveness_probe_dir and \
          handle_fs_event_dir); stderr:\n{stderr_after_edit}"
     );
 }
@@ -7045,6 +7040,130 @@ fn watch_failed_startup_compile_routes_by_the_kind_it_compiles_to() {
     assert!(
         !dir.path().join("chat.json").exists() && !dir.path().join("out.json").exists(),
         "control: -o is never routed by the kind; stderr: {stderr}"
+    );
+}
+
+// ── A failed directory-watch startup write is retried (#257) ───────────────────────
+//
+// A directory watch compiles each source once at startup, and the content dedup holds
+// only the outputs that startup wrote. A source whose output could not be written is
+// marked failed, so the next rebuild with a real change compiles it and writes it, even
+// when its content never changed. The write fails on a directory standing at the output
+// path, as in the section above.
+
+/// A directory watch whose startup write of one source fails writes that output on the
+/// next rebuild once the obstacle is gone (#257), even when the save leaves the source's
+/// content unchanged. Startup used to record the unwritten content as written, so the
+/// content dedup skipped that output until the source's content itself changed.
+/// Control: a save of the same bytes to a source whose startup write succeeded rewrites
+/// nothing.
+#[test]
+fn watch_dir_failed_startup_write_is_retried_on_the_next_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("d");
+    std::fs::create_dir(&d).unwrap();
+    let (a, b) = (d.join("a.mds"), d.join("b.mds"));
+    let (a_out, b_out) = (d.join("a.md"), d.join("b.md"));
+    std::fs::write(&a, "Steady a\n").unwrap();
+    std::fs::write(&b, "Steady b\n").unwrap();
+    std::fs::create_dir(&a_out).unwrap();
+    // As `mds build d` names each output.
+    let shown = |name: &str| Path::new("d").join(name);
+    let recompiled = |stderr: &str, name: &str| {
+        count_occurrences(
+            &squash(stderr),
+            &squash(&format!("Recompiled {}", shown(name).display())),
+        )
+    };
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "d"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    let startup = wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+    assert!(
+        squash(&startup).contains(&squash(&format!(
+            "cannot rename temp file to {}:",
+            shown("a.md").display()
+        ))),
+        "the startup write of a.md fails; stderr: {startup}"
+    );
+    assert!(
+        wait_for_file_contains(&b_out, "Steady b", TIMEOUT),
+        "control: the startup writes b.md; stderr: {startup}"
+    );
+
+    std::fs::remove_dir(&a_out).unwrap();
+    write_atomic(&a, "Steady a\n");
+    assert!(
+        wait_for_file_contains(&a_out, "Steady a", TIMEOUT),
+        "a save of the unchanged source writes a.md once the obstacle is gone; stderr: {}",
+        tap.text()
+    );
+
+    // Control: the same bytes, saved to the source whose startup write succeeded.
+    write_atomic(&b, "Steady b\n");
+    // Ordered anchor: every rebuild before it has printed what it prints.
+    write_atomic(&d.join("m.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        recompiled(&stderr, "a.md"),
+        1,
+        "a.md is written once; stderr: {stderr}"
+    );
+    assert_eq!(
+        recompiled(&stderr, "b.md"),
+        0,
+        "control: a save of the same bytes rewrites nothing; stderr: {stderr}"
+    );
+}
+
+/// A directory watch's startup compiles each source once (#257). A compile that panics
+/// prints the internal-compiler-error text once (`MDS_TEST_PANIC=compile:a`, a debug
+/// build's trigger), so the texts on stderr count the startup's compiles of `a.mds`.
+/// Startup used to compile every source a second time to seed the content dedup, and
+/// printed the text twice. `--debounce 30000` holds a rebuild until thirty seconds after
+/// its last event — a late event for a source written before the spawn included — so the
+/// session is stopped before any rebuild compiles, and every text is the startup's.
+/// Control: the other source is compiled and written.
+#[cfg(debug_assertions)]
+#[test]
+fn watch_dir_startup_compiles_each_source_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("d");
+    std::fs::create_dir(&d).unwrap();
+    for name in ["a", "b"] {
+        std::fs::write(d.join(format!("{name}.mds")), format!("Hello {name}\n")).unwrap();
+    }
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .env("MDS_TEST_PANIC", "compile:a")
+            .args(["watch", "d", "--quiet"])
+            .args(["--debounce", "30000", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    // The startup writes its outputs before it reports readiness.
+    let b_md = std::fs::read_to_string(d.join("b.md")).ok();
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        b_md.as_deref(),
+        Some("Hello b\n"),
+        "control: the startup compiles and writes the other source; stderr: {stderr}"
+    );
+    assert!(
+        !d.join("a.md").exists(),
+        "a compile that panicked writes no output; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, "mds: internal compiler error"),
+        1,
+        "the startup compiles a.mds once; stderr: {stderr}"
     );
 }
 

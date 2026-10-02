@@ -1024,6 +1024,8 @@ followed by `Stopped watching (stdout closed).` on stderr (not under `--quiet`) 
 writes in a row it fails, and again if stdout fails anew after a write has landed; watching
 continues. The lost content is not recorded as written, so the next rebuild writes it
 again even when its output has not changed — saving the source unchanged retries it.
+Neither is an output file whose write fails — at a directory watch's startup too (#257) —
+so once the cause is gone a rebuild writes it even when the source has not changed.
 Once the session is live — its startup
 compile finished and every watch armed — an output failure, whether a rebuild's output
 file or stdout write or a stderr that fails other than by a closed pipe, is reported

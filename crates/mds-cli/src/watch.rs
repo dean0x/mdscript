@@ -2960,9 +2960,10 @@ fn handle_fs_event_dir(
 
 /// Perform all one-time startup work for directory-mode watch.
 ///
-/// Loads config, compiles all sources at startup, sets up the watcher +
-/// Ctrl+C handler, records the dedup baseline, seeds the mtime snapshot,
-/// and builds the context structs needed by the event loop.
+/// Loads config, compiles each source once and writes its output (the content
+/// dedup records only what was written), sets up the watcher + Ctrl+C handler,
+/// seeds the mtime snapshot, and builds the context structs needed by the event
+/// loop.
 ///
 /// Extracted from `run_watch_dir` to separate the ~186-line setup from the
 /// event loop — each half is independently readable and the startup can be
@@ -3180,11 +3181,14 @@ fn dir_watch_startup(
                     // here (#217).
                     let ext = compiled.kind.extension();
                     let out = output_path_for(&key, watch_root.root_paths(), &output_base, ext);
+                    // The content dedup holds only what was written: a source whose
+                    // write failed is errored instead, so the next rebuild with a real
+                    // change writes it even when its content has not changed (#257).
                     if let Err(e) = write_output(Some(&out), &compiled.content, quiet, true) {
                         settle(
                             SettleInto::DirStartup(&mut state),
                             Some(e),
-                            Settle::Rebaseline,
+                            Settle::MarkErrored(&key),
                         );
                     } else {
                         state.last_written.insert(out.path, compiled.content);
@@ -3225,56 +3229,6 @@ fn dir_watch_startup(
                 )),
                 safe_inline(notify_cause(&e))
             ));
-        }
-    }
-
-    // Build the dedup baseline for any source whose startup compile did not record
-    // one (partials are skipped above; a failed write leaves no entry).
-    // dir_watch_startup calls build_runtime_vars twice: once above (emit, including
-    // the #326 vars-file duplicate-key warnings) and once here (discard) — emitting
-    // at both sites would double-print every warning (both the --set/--set-string
-    // ones and the vars-file ones) on directory-watch startup. Test I17 is
-    // the mechanical guard on this.
-    {
-        let baseline_resolved = build_runtime_vars(RuntimeVarArgs {
-            vars: vars_path_typed.clone(),
-            set_vars: static_set_vars.clone(),
-            set_string_vars: static_set_string_vars.clone(),
-        })?;
-        // Flags and vars-file duplicates alike are already warned above at startup —
-        // discard here (this second read only rebuilds the dedup baseline).
-        let baseline_vars = baseline_resolved.vars;
-        for source in &all_files {
-            let key = graph_key(source);
-            if is_partial(source) {
-                continue; // Partials have no output path in last_written.
-            }
-            match watch_root.compile_source(
-                source,
-                baseline_vars.clone(),
-                true, /* quiet for baseline */
-            ) {
-                Ok(compiled) => {
-                    // Derive output path from the compiled kind (intrinsic extension).
-                    //
-                    // Invariant: same `key` over the same `all_files` walk as the startup
-                    // loop above — canonical and prefixed by `root` — so this dedup
-                    // baseline computes the same path by the same arm, and the
-                    // out-of-root flatten cannot fire here either (#217). It must agree
-                    // with the startup loop or the `contains_key` check below would miss
-                    // and every source would be rewritten on the first real event.
-                    let ext = compiled.kind.extension();
-                    let out = output_path_for(&key, watch_root.root_paths(), &output_base, ext);
-                    if state.last_written.contains_key(&out.path) {
-                        // Already recorded from startup compile — skip.
-                        continue;
-                    }
-                    state.last_written.insert(out.path, compiled.content);
-                }
-                // Baseline compile failed — leave entry absent so next rebuild always
-                // writes. Nothing to report: this pass only seeds the dedup map.
-                Err(_) => settle(SettleInto::DirStartup(&mut state), None, Settle::Rebaseline),
-            }
         }
     }
 
@@ -3356,10 +3310,9 @@ fn dir_watch_startup(
     //
     // See the matching note in `run_watch_file`. Dir mode is the worse case: an
     // installed handler only enqueues `Msg::Interrupt`, which nothing reads until
-    // `run_watch_dir`'s loop starts, and startup here makes TWO full passes over
-    // every source in the tree (the compile-and-write pass above, then the
-    // dedup-baseline pass). Installing before those passes means Ctrl+C during a
-    // large-tree startup is swallowed for their whole duration, and the tool writes
+    // `run_watch_dir`'s loop starts, and startup here compiles and writes every
+    // source in the tree. Installing before that pass means Ctrl+C during a
+    // large-tree startup is swallowed for its whole duration, and the tool writes
     // the remaining outputs and exits 0. Nothing above needs the handler.
     let tx_ctrlc = tx.clone();
     let _ = ctrlc::set_handler(move || {
