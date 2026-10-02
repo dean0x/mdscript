@@ -1645,8 +1645,9 @@ fn dir_build_with_a_template_error_and_a_failed_mkdir_exits_2() {
         Some(2),
         "a template error plus a failed mkdir must exit 2; stderr: {stderr}"
     );
+    // In the one wording of a failed write, naming the output (#160).
     assert!(
-        stderr.contains("mds::io") && stderr.contains("cannot create output directory"),
+        stderr.contains("mds::io") && stderr.contains("cannot write"),
         "the mkdir failure must be reported as mds::io; stderr: {stderr}"
     );
     assert!(

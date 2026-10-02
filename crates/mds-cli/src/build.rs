@@ -8,7 +8,8 @@ use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
-use crate::output::{Durability, WriteTarget};
+use crate::output::WriteTarget;
+use crate::write::{atomic_write_file, Durability, Parents};
 use mds::{
     effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
     STRING_SOURCE_MAP_LABEL,
@@ -373,6 +374,10 @@ pub(crate) fn compute_output_dir_path_for_kind(
 /// `sub/../dist/x.md`), as a config error names `mds.json` itself; rule 6 writes beside
 /// the input's `canonical` form and is shown beside its `typed` one (`./x.md` for a bare
 /// `x.mds`). `mds build` passes its input as typed in both forms ([`EntryPaths`]).
+///
+/// In every rule the write's anchor is the directory the output goes in — `-o`'s typed
+/// parent, `--out-dir` as typed, the `build.output_dir` directory, the input's directory —
+/// resolved by path when it is written (#160).
 pub(crate) fn resolve_output_path_for_kind(
     input: Option<EntryPaths<'_>>,
     output: &Option<String>,
@@ -417,14 +422,10 @@ pub(crate) fn resolve_output_path_for_kind(
             // Reject path traversal: `output_dir` must not contain `..` components
             // (exit 2). A forbidden character was already refused by `load_config`.
             crate::output::reject_output_dir_traversal(output_dir)?;
-            return Ok(Some(WriteTarget {
-                path: compute_output_dir_path_for_kind(&dir.join(output_dir), input_path, kind),
-                shown: compute_output_dir_path_for_kind(
-                    &shown_dir.join(output_dir),
-                    input_path,
-                    kind,
-                ),
-            }));
+            return Ok(Some(WriteTarget::new(
+                compute_output_dir_path_for_kind(&dir.join(output_dir), input_path, kind),
+                compute_output_dir_path_for_kind(&shown_dir.join(output_dir), input_path, kind),
+            )));
         }
     }
 
@@ -434,10 +435,10 @@ pub(crate) fn resolve_output_path_for_kind(
         Some(entry) => {
             let filename = derive_output_filename_for_kind(entry.canonical, kind);
             // effective_parent maps "" (bare filename) to "." — avoids PF-006.
-            Ok(Some(WriteTarget {
-                path: effective_parent(entry.canonical).join(&filename),
-                shown: effective_parent(entry.typed).join(filename),
-            }))
+            Ok(Some(WriteTarget::new(
+                effective_parent(entry.canonical).join(&filename),
+                effective_parent(entry.typed).join(filename),
+            )))
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
         None => Ok(None),
@@ -835,28 +836,28 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
 
 /// Write compiled output to a file or stdout.
 ///
-/// When `target` is `Some`, creates any missing parent directories, writes the
-/// compiled string to `target.path`, and prints `"Compiled to {target.shown}"` to stderr
-/// unless `quiet` or `announce` is false (#390).  When `target` is `None`,
-/// writes the compiled string to stdout with no trailing newline: a closed stdout is
-/// not an error (the reader is gone, so nothing more is written and the run keeps its
-/// verdict), any other stdout failure is `mds::io` (#157). This is where a
-/// single-file output's directory is created — [`resolve_output_path_for_kind`] creates
-/// nothing — so an output refused before the write leaves no directory behind (#425).
+/// When `target` is `Some`, writes the compiled string to `target.path`, creating the
+/// directories it goes in, and prints `"Compiled to {target.shown}"` to stderr unless
+/// `quiet` or `announce` is false (#390).  When `target` is `None`, writes the compiled
+/// string to stdout with no trailing newline: a closed stdout is not an error (the reader
+/// is gone, so nothing more is written and the run keeps its verdict), any other stdout
+/// failure is `mds::io` (#157). This is where a single-file output's directory is
+/// created — [`resolve_output_path_for_kind`] creates nothing — so an output refused
+/// before the write leaves no directory behind (#425).
 ///
 /// Set `announce = false` in watch-loop rebuilds so only the `"Recompiled …"`
 /// summary line is emitted (not a redundant `"Compiled to …"` line).
 /// Set `announce = true` for the initial/startup compile and for `mds build`.
 ///
-/// The file write goes through [`crate::output::atomic_write_file`] (#227): a crash or
-/// write error mid-way never leaves a truncated artifact — the previous output, if any,
-/// survives until the rename — and a symlink at the output path is refused. The parent
-/// directory is created first. The stdout arm writes and flushes the whole output at
-/// once ([`crate::output::write_stdout`]).
+/// The file write goes through [`atomic_write_file`] (#227, #160): a crash or write error
+/// mid-way never leaves a truncated artifact — the previous output, if any, survives until
+/// the rename — the anchor and the directories below it are created as needed, and a
+/// symlink below the anchor or at the output path is refused. The stdout arm writes and
+/// flushes the whole output at once ([`crate::output::write_stdout`]).
 ///
-/// Compiled artifacts are written with [`crate::output::Durability::RenameOnly`]: they
-/// are derived files a rebuild reproduces, and `F_FULLFSYNC` per artifact tripled a
-/// 500-template watch startup. Source rewrites (`fmt`, `lint --fix`) keep the fsync.
+/// Compiled artifacts are written with [`Durability::RenameOnly`]: they are derived files
+/// a rebuild reproduces, and `F_FULLFSYNC` per artifact tripled a 500-template watch
+/// startup. Source rewrites (`fmt`, `lint --fix`) keep the fsync.
 pub(crate) fn write_output(
     target: Option<&WriteTarget>,
     compiled: &str,
@@ -865,16 +866,7 @@ pub(crate) fn write_output(
 ) -> Result<()> {
     match target {
         Some(target) => {
-            if let Some(parent) = target.path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| output_dir_failure(target, &e))?;
-                }
-            }
-            // #227: temp-file + fsync + rename, so a failed or interrupted build leaves
-            // the previous artifact intact instead of a truncated one. The primitive
-            // owns the symlink refusal; the create_dir_all above stays here because the
-            // primitive deliberately does not create directories.
-            crate::output::atomic_write_file(target, compiled, Durability::RenameOnly)?;
+            atomic_write_file(target, compiled, Durability::RenameOnly, Parents::Create)?;
             if !quiet && announce {
                 crate::output::ewriteln!("Compiled to {}", crate::output::safe_path(&target.shown));
             }
@@ -882,18 +874,6 @@ pub(crate) fn write_output(
         None => crate::output::write_stdout(compiled.as_bytes()).into_batch_result()?,
     }
     Ok(())
-}
-
-/// The `mds::io` error for the directory of `output` that cannot be created (#157),
-/// naming it by the output's shown form (#390).
-fn output_dir_failure(output: &WriteTarget, e: &std::io::Error) -> MdsError {
-    MdsError::Io {
-        message: format!(
-            "cannot create output directory {}: {}",
-            crate::output::safe_path(effective_parent(&output.shown)),
-            crate::output::safe_inline(crate::output::io_cause(e))
-        ),
-    }
 }
 
 /// Scan the working directory for `.mds` files.
@@ -1096,8 +1076,9 @@ fn file_identity(path: &Path) -> Option<PathBuf> {
     Some(file)
 }
 
-/// The canonical path `dir` has once [`write_output`]'s `create_dir_all(dir)` has run,
-/// found without creating anything; `None` when not even the working directory
+/// The canonical path `dir` has once [`write_output`] has created it — the write creates
+/// an output's directory, its anchor, with `create_dir_all` (#160) — found without
+/// creating anything; `None` when not even the working directory
 /// resolves, which a write of `dir` could not get past either.
 ///
 /// An existing `dir` is canonicalized. Otherwise it is walked component by component, as
@@ -1730,10 +1711,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             // untrusted; see the `mds::SourceMap` rustdoc. The status
                             // line below is a diagnostic surface and IS escaped.
                             let map_json = sm.to_json();
-                            crate::output::atomic_write_file(
+                            atomic_write_file(
                                 &map,
                                 &map_json,
                                 Durability::RenameOnly,
+                                Parents::Create,
                             )?;
                             if !quiet {
                                 crate::output::ewriteln!(
@@ -1865,7 +1847,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     if let Some(ref sm) = source_map {
                         let map = out.sibling(map_path_for);
                         let map_json = sm.to_json();
-                        crate::output::atomic_write_file(&map, &map_json, Durability::RenameOnly)?;
+                        atomic_write_file(
+                            &map,
+                            &map_json,
+                            Durability::RenameOnly,
+                            Parents::Create,
+                        )?;
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Source map written to {}",
@@ -2069,17 +2056,6 @@ fn run_build_directory(
                 let ext = compiled.kind.extension();
                 let target = output_path_for(file, RootPaths::as_typed(dir), &output_base, ext);
 
-                // Ensure parent directory exists.
-                if let Some(parent) = target.path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            crate::output::eprint_io_failure(output_dir_failure(&target, &e));
-                            fail_count += 1;
-                            continue;
-                        }
-                    }
-                }
-
                 // Set `file` field for this output path (sources already relativized by core).
                 if let Some(ref mut sm) = compiled.source_map {
                     apply_source_map_file_label(sm, Some(&target.path), false);
@@ -2103,11 +2079,14 @@ fn run_build_directory(
 
                 // #227: the dir-mode twin of `write_output` — same atomic contract, but
                 // it accumulates per-file counters instead of returning early, so it is
-                // its own call site. Both are enforced by `tests/write_funnel.rs`.
-                match crate::output::atomic_write_file(
+                // its own call site. Both are enforced by `tests/write_funnel.rs`. The
+                // write creates the out-dir and the mirrored directories below it, and
+                // refuses a symlink among them (#160).
+                match atomic_write_file(
                     &target,
                     &final_content,
                     Durability::RenameOnly,
+                    Parents::Create,
                 ) {
                     Ok(()) => {
                         if wrote_empty {
@@ -2126,10 +2105,11 @@ fn run_build_directory(
                             if let Some(ref sm) = compiled.source_map {
                                 let map = target.sibling(map_path_for);
                                 let map_json = sm.to_json();
-                                if let Err(e) = crate::output::atomic_write_file(
+                                if let Err(e) = atomic_write_file(
                                     &map,
                                     &map_json,
                                     Durability::RenameOnly,
+                                    Parents::Create,
                                 ) {
                                     // The primitive's message already names the path —
                                     // re-prefixing it would print the path twice (#227).
@@ -2554,7 +2534,8 @@ mod tests {
     /// #390: an entry held in two forms, as `mds watch` holds it, has its default output
     /// written beside the canonical form and named beside the typed one — `./hello.md`
     /// for a bare name, `..` kept as typed — while `--out-dir` takes the name from the
-    /// canonical form and shows the out-dir as typed.
+    /// canonical form and shows the out-dir as typed. #160: each is anchored at the
+    /// directory it is written in.
     #[test]
     fn resolve_output_path_default_is_named_beside_the_entry_as_typed() {
         let resolve = |typed: &str, out_dir: Option<&str>| {
@@ -2572,17 +2553,19 @@ mod tests {
         };
         assert_eq!(
             resolve("hello.mds", None),
-            Some(WriteTarget {
-                path: PathBuf::from("/some/dir/hello.md"),
-                shown: PathBuf::from("./hello.md"),
-            })
+            Some(WriteTarget::below(
+                Path::new("/some/dir"),
+                Path::new("."),
+                Path::new("hello.md")
+            ))
         );
         assert_eq!(
             resolve("sub/../sub/hello.mds", None),
-            Some(WriteTarget {
-                path: PathBuf::from("/some/dir/hello.md"),
-                shown: PathBuf::from("sub/../sub/hello.md"),
-            })
+            Some(WriteTarget::below(
+                Path::new("/some/dir"),
+                Path::new("sub/../sub"),
+                Path::new("hello.md")
+            ))
         );
         assert_eq!(
             resolve("hello.mds", Some("out")),
@@ -2642,10 +2625,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            Some(WriteTarget {
-                path: Path::new("/project").join("build").join("hello.md"),
-                shown: Path::new("src/..").join("build").join("hello.md"),
-            })
+            Some(WriteTarget::below(
+                &Path::new("/project").join("build"),
+                &Path::new("src/..").join("build"),
+                Path::new("hello.md")
+            ))
         );
     }
 

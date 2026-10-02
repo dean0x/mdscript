@@ -84,11 +84,26 @@ input. The compiler enforces several defense-in-depth controls:
   derived from a lossy string. A root that is empty or not valid UTF-8 is treated
   as "no root" — entries degrade to basenames — so it can never make the
   containment check vacuous.
-- **Replace-by-rename writes**: `mds fmt`, `mds lint --fix`, `mds init`, and `mds
-  build`/`mds watch` outputs and `.map` sidecars are written to a same-directory
-  temp file and renamed over the target after a final symlink re-check (`mds-cli/src/output.rs`,
+- **Replace-by-rename writes, below an anchor**: `mds fmt`, `mds lint --fix`, `mds init`,
+  and `mds build`/`mds watch` outputs and `.map` sidecars are written to a
+  same-directory temp file and renamed over the target (`mds-cli/src/write.rs`,
   `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so a
-  crash never leaves a truncated target and a symlinked output path is refused.
+  crash never leaves a truncated target. Every write is made below an anchor —
+  `--out-dir` as typed, a directory argument's root, `build.output_dir`, or the typed
+  parent of a file argument or of `-o` — which is resolved by path, so a symlinked
+  anchor the user named is followed. Nothing below it is (#160): on Unix each
+  directory below the anchor is opened from the one above without following a
+  symlink (`openat` with `O_NOFOLLOW`), and the temp file is created
+  (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
+  descriptor, and renamed (`renameat`) in the last one, so a symlink below the anchor
+  — planted before the run or swapped in while a write runs — and a symlink at the
+  target are refused (`mds::io`, exit 2) and never written through.
+  **Windows residual**: the standard library has no descriptor-relative walk on
+  Windows. Each directory below the anchor is checked and refused when it is a
+  symlink or a junction, and the write then goes by path, so a directory that another
+  process replaces with a link between that check and the write is followed; a link
+  in place before the write is refused. Other reparse points, such as a cloud-sync
+  placeholder, are written to.
   `mds build` and `mds watch` refuse an output that is the entry file itself —
   however `-o`, `--out-dir`, `build.output_dir` or the default output name it —
   before anything is written or any directory created (`mds::io`, exit 2, #425).

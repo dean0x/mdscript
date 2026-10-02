@@ -324,8 +324,11 @@ const SITE_FLOORS: &[(&str, usize)] = &[
     ("lint.rs", 1),
     ("lint_sink.rs", 12),
     ("main.rs", 11),
-    ("output.rs", 6),
+    // 4 since the write primitive and its tests moved to `write.rs` (#160).
+    ("output.rs", 4),
     ("watch.rs", 18),
+    // The skip notices of the write primitive's tests, moved from `output.rs` (#160).
+    ("write.rs", 3),
 ];
 
 /// Files that print but have no [`SITE_FLOORS`] entry yet, each with the reason.
@@ -846,7 +849,7 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
 /// with every path it carries dropped (`output.rs`, #390). An error reaches a message
 /// only as one of these, escaped: `safe_inline(io_cause(&e))`. Bare, it reaches only
 /// [`CAUSE_ESCAPING_CALLS`], which escape the cause themselves.
-const CAUSE_PRODUCERS: &[&str] = &["io_cause", "notify_cause", "recheck_refusal"];
+const CAUSE_PRODUCERS: &[&str] = &["io_cause", "notify_cause"];
 
 /// Names taken to hold an error wherever they appear. [`error_names`] adds every name a
 /// file binds to one.
@@ -863,8 +866,9 @@ const MESSAGE_MACROS: &[&str] = &[
     "write!",
 ];
 
-/// Calls whose every argument is message text: `eprint_warning`'s warning, and
-/// `atomic_write_file`'s `io_error`, which takes the cause it shows after the file.
+/// Calls whose every argument is message text: `eprint_warning`'s warning, and the write
+/// primitive's `io_error` (`write.rs`), which takes the path it names and the cause it shows
+/// after it.
 const MESSAGE_CALLS: &[&str] = &["eprint_warning", "io_error"];
 
 /// The [`MESSAGE_CALLS`] that pass their cause through `safe_inline` themselves, so a
@@ -2196,7 +2200,7 @@ fn paths_become_text_only_in_the_listed_functions() {
 /// io, notify and tempfile errors name paths in their own text, absolute ones included —
 /// tempfile's `at path "…"`, notify's ` about [...]` (#390). A message shows such an error
 /// only as its cause, with the paths dropped and escaped: `safe_inline(io_cause(&e))`,
-/// `safe_inline(notify_cause(&e))`, or bare as the cause `atomic_write_file`'s `io_error`
+/// `safe_inline(notify_cause(&e))`, or bare as the cause the write primitive's `io_error`
 /// escapes itself. [`PATH_FREE_ERRORS`] lists the error values a message shows otherwise,
 /// each with its exact site count and why it names no path.
 #[test]
@@ -2246,9 +2250,10 @@ fn messages_interpolate_an_error_only_as_its_cause() {
         sinks >= 150,
         "non-vacuity: expected at least 150 message sinks across mds-cli/src, found {sinks}"
     );
+    // 23 since every write failure is worded once, in one place (#160).
     assert!(
-        causes >= 25,
-        "non-vacuity: expected at least 25 causes shown through {CAUSE_PRODUCERS:?}, found \
+        causes >= 23,
+        "non-vacuity: expected at least 23 causes shown through {CAUSE_PRODUCERS:?}, found \
          {causes}"
     );
     assert!(
@@ -2429,17 +2434,13 @@ fn the_cause_guard_flags_an_error_shown_with_its_paths() {
         fn c(e: notify::Error) { eprint_warning(&format!("warning: {}", safe_inline(notify_cause(&e)))); }
         fn d(e: std::io::Error) -> MdsError { io_error("cannot stat", io_cause(&e)) }
         fn f(e: tempfile::PersistError) -> MdsError { io_error("cannot rename", io_cause(&e.error)) }
-        fn g(e: MdsError) -> MdsError { io_error("cannot write", recheck_refusal(&e)) }
         fn h(e: std::io::Error) -> String { format!("kind: {}", e.kind()) }
         #[cfg(test)]
         mod tests { fn t(e: std::io::Error) -> String { format!("{e}") } }
     "#;
     let values = message_values(accepted);
     assert_eq!(values.raw, Vec::new());
-    assert_eq!(
-        values.causes, 6,
-        "each of a, b, c, d, f and g shows one cause"
-    );
+    assert_eq!(values.causes, 5, "each of a, b, c, d and f shows one cause");
 }
 
 #[test]

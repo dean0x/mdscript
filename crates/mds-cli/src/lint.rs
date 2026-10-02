@@ -80,10 +80,10 @@ use crate::build::{
 };
 use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
 use crate::output::{
-    atomic_write_file_in_one_wording, catch_compile, collect_mds_files_detailed, eprint_warning,
-    render_unified_diff, safe_inline, safe_path, Durability, Panicked, WriteTarget,
-    STDIN_DISPLAY_LABEL,
+    catch_compile, collect_mds_files_detailed, eprint_warning, render_unified_diff, safe_inline,
+    safe_path, Panicked, RootPaths, WriteTarget, STDIN_DISPLAY_LABEL,
 };
+use crate::write::{atomic_write_file, Durability, Parents};
 
 // AC-224-15: No local rule-name list. The single source of truth is
 // mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
@@ -146,9 +146,14 @@ pub(crate) enum LintSource<'a> {
     Stdin,
     /// `mds lint <file>`: the path as typed, and its file name.
     File { typed: &'a Path, name: &'a str },
-    /// A file under `mds lint <dir>`: the path the walk produced, and its key relative to
-    /// the directory argument (see [`relative_display`]).
-    DirEntry { path: &'a Path, key: &'a str },
+    /// A file under `mds lint <dir>`: the directory argument, the path the walk produced
+    /// below it, and its key relative to it (see [`relative_display`]). A `--fix` rewrite
+    /// is anchored at `root` (#160).
+    DirEntry {
+        root: &'a Path,
+        path: &'a Path,
+        key: &'a str,
+    },
 }
 
 impl<'a> LintSource<'a> {
@@ -1157,11 +1162,24 @@ fn lint_input<'a>(
     let outcome = if flags.check || flags.diff {
         preview_fix(&input, result, text, fix, flags)
     } else {
+        // A file argument's rewrite is anchored at its typed parent, a directory entry's at
+        // the directory argument (#160).
         match input {
             LintSource::Stdin => fix_stdin(result, text, fix),
-            LintSource::File { typed: path, .. } | LintSource::DirEntry { path, .. } => {
-                apply_fix(path, result, text, fix, flags.format)
-            }
+            LintSource::File { typed, .. } => apply_fix(
+                &WriteTarget::as_typed(typed.to_path_buf()),
+                result,
+                text,
+                fix,
+                flags.format,
+            ),
+            LintSource::DirEntry { root, path, .. } => apply_fix(
+                &WriteTarget::walked_below(RootPaths::as_typed(root), path),
+                result,
+                text,
+                fix,
+                flags.format,
+            ),
         }
     };
     FileReport {
@@ -1206,10 +1224,10 @@ fn preview_fix(
     }
 }
 
-/// `--fix`: rewrite the input's file at `path` with the fixed source. Stdin is a filter
+/// `--fix`: rewrite the input's file, `target`, with the fixed source. Stdin is a filter
 /// instead ([`fix_stdin`]).
 fn apply_fix(
-    path: &Path,
+    target: &WriteTarget,
     findings: mds::LintResult,
     text: String,
     fix: FixPipelineOutcome,
@@ -1247,10 +1265,11 @@ fn apply_fix(
         findings: residual,
         fixed: new_source,
     };
-    let fix = match atomic_write_file_in_one_wording(
-        &WriteTarget::as_typed(path.to_path_buf()),
+    let fix = match atomic_write_file(
+        target,
         &residual.fixed,
         Durability::Fsync,
+        Parents::Existing,
     ) {
         Ok(()) => Rewrite::Written { residual, partial },
         Err(error) => {
@@ -1781,7 +1800,7 @@ fn run_lint_directory(
     sink.start_document();
     let summary = keyed
         .iter()
-        .map(|(path, key)| render(lint_dir_entry(path, key, &ctx), sink))
+        .map(|(path, key)| render(lint_dir_entry(dir, path, key, &ctx), sink))
         .fold(DirSummary::default(), DirSummary::count);
 
     // The JSON document first, so consumers always receive it on stdout whatever the
@@ -1798,8 +1817,8 @@ fn run_lint_directory(
 /// Read and lint one entry of a directory, and report what it came to: [`lint_input`]'s
 /// report, or the entry's failure, which the rest of the tree does not stop for.
 ///
-/// `path` is the file the walk found, `key` its display key, computed once by
-/// [`run_lint_directory`] before the sort (#217).
+/// `root` is the directory argument, `path` the file the walk found below it, `key` its
+/// display key, computed once by [`run_lint_directory`] before the sort (#217).
 ///
 /// The entry's `mds.json` loads before the entry is read, as a file argument's does, so a
 /// configuration that cannot load is the entry's failure even when the file cannot be
@@ -1807,8 +1826,13 @@ fn run_lint_directory(
 /// next; JSON output reads it only to fix it ([`SourceText::Unread`]). Either way a read
 /// refused for size counts under "resource-limited", as `mds::lint`'s own refusal does
 /// ([`failure_tally`]).
-fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> FileReport<'a> {
-    let entry = move || LintSource::DirEntry { path, key };
+fn lint_dir_entry<'a>(
+    root: &'a Path,
+    path: &'a Path,
+    key: &'a str,
+    ctx: &LintDirCtx<'_>,
+) -> FileReport<'a> {
+    let entry = move || LintSource::DirEntry { root, path, key };
     let failed = move |error: MdsError, tally: FileTally| FileReport {
         input: entry(),
         capped: None,
@@ -1925,6 +1949,7 @@ mod tests {
         let result = LintResult::new(vec![diag_a, diag_b]);
 
         let input = LintSource::DirEntry {
+            root: Path::new("."),
             path: Path::new("overlap.mds"),
             key: "overlap.mds",
         };
@@ -1963,6 +1988,7 @@ mod tests {
             .expect("fixture source must lint");
 
         let input = LintSource::DirEntry {
+            root: Path::new("."),
             path: Path::new("sub/custom-label.mds"),
             key: "sub/custom-label.mds",
         };
@@ -2018,7 +2044,11 @@ mod tests {
         assert_eq!(file.lint_name(), "_p.mds");
         for key in ["_p.mds", "sub/_p.mds", "sub/deeper/_p.mds"] {
             let path = Path::new(key);
-            let entry = LintSource::DirEntry { path, key };
+            let entry = LintSource::DirEntry {
+                root: Path::new("."),
+                path,
+                key,
+            };
             assert_eq!(entry.lint_name(), "_p.mds", "the entry keyed {key:?}");
             assert_eq!(
                 path.file_name().and_then(OsStr::to_str),
@@ -2191,6 +2221,7 @@ mod tests {
     fn fix_pipeline_rejects_a_fix_that_would_change_compiled_output() {
         let config = mds::LintConfig::default();
         let input = LintSource::DirEntry {
+            root: Path::new("."),
             path: Path::new("output.mds"),
             key: "output.mds",
         };
@@ -2294,7 +2325,7 @@ mod tests {
         outcome: FixPipelineOutcome,
     ) -> (InputVerdict, Vec<serde_json::Value>) {
         let outcome = apply_fix(
-            path,
+            &crate::output::WriteTarget::as_typed(path.to_path_buf()),
             result,
             FIX_LEAVES_A_FINDING.to_string(),
             outcome,
@@ -2327,6 +2358,7 @@ mod tests {
         let writable = root.join("x.mds");
         std::fs::write(&writable, FIX_LEAVES_A_FINDING).unwrap();
         let input = LintSource::DirEntry {
+            root: Path::new("."),
             path: &writable,
             key: "x.mds",
         };
@@ -2355,6 +2387,7 @@ mod tests {
         // The target's directory is gone, so the temporary file cannot be created.
         let unwritable = root.join("gone").join("x.mds");
         let input = LintSource::DirEntry {
+            root: Path::new("."),
             path: &unwritable,
             key: "x.mds",
         };
@@ -2397,7 +2430,11 @@ mod tests {
         // directory run: its verdict, and the entries the directory's document then holds.
         let fix = |path: &Path, key: &str| {
             let linted = Linted {
-                input: LintSource::DirEntry { path, key },
+                input: LintSource::DirEntry {
+                    root: Path::new("."),
+                    path,
+                    key,
+                },
                 base_dir: &root,
                 config: Rc::clone(&config),
                 source: SourceText::Unread(path),
@@ -2465,6 +2502,7 @@ mod tests {
             std::fs::write(&path, "a".repeat(len - 1) + "\n").unwrap();
             let linted = Linted {
                 input: LintSource::DirEntry {
+                    root: Path::new("."),
                     path: &path,
                     key: "x.mds",
                 },
@@ -2676,7 +2714,11 @@ mod tests {
         // under `--format json` lints it with `flags`.
         let calls_with = |flags: LintFlags, path: &Path, key: &str, result: LintResult| {
             let linted = Linted {
-                input: LintSource::DirEntry { path, key },
+                input: LintSource::DirEntry {
+                    root: Path::new("."),
+                    path,
+                    key,
+                },
                 base_dir: &root,
                 config: Rc::clone(&config),
                 source: SourceText::Unread(path),
@@ -2963,6 +3005,7 @@ mod tests {
                 .with_file(key.as_str());
             let report = FileReport {
                 input: LintSource::DirEntry {
+                    root: Path::new("."),
                     path: &path,
                     key: &key,
                 },
@@ -3052,7 +3095,13 @@ mod tests {
             let left_at = SerializedSpan::new(0, AFTER_LINE.len());
             let (before, fix) = partial_fix(input.display_label(), left_at);
             let text = PARTIAL_BEFORE.to_string();
-            let outcome = apply_fix(&path, before, text, fix, LintFormat::Human);
+            let outcome = apply_fix(
+                &crate::output::WriteTarget::as_typed(path.clone()),
+                before,
+                text,
+                fix,
+                LintFormat::Human,
+            );
             let report = FileReport {
                 input,
                 capped: None,

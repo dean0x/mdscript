@@ -565,6 +565,7 @@ dependencies = [
  "mds-core",
  "miette",
  "notify",
+ "rustix",
  "serde",
  "serde_json",
  "similar",

@@ -4,7 +4,8 @@
 //!
 //! - [`OutputBase`] / [`resolve_output_base`] / [`output_path_for`]: directory-mode
 //!   path resolution used by watch and build-directory. Each output is a
-//!   [`WriteTarget`]: the path written, and the path a message shows (#390).
+//!   [`WriteTarget`]: the path written, the path a message shows (#390), and the anchor
+//!   [`crate::write::atomic_write_file`] writes it below (#160).
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
 //! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr choke point,
@@ -19,11 +20,6 @@
 //! - [`eprint_error`]: the CLI's error-report choke point — escapes every report's
 //!   message, help, and label text before miette renders it (CWE-150), then writes the
 //!   frame through `ewriteln!`.
-//! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and — since
-//!   #227 — by every `build` / `watch` output and `.map` sidecar; `lint --fix` writes
-//!   through the same write as [`atomic_write_file_in_one_wording`], which words every
-//!   failure `cannot write <file>: <cause>` (#309). The [`Durability`] argument says
-//!   whether the bytes are fsynced before the rename; atomicity does not depend on it.
 //! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
 //!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
@@ -1052,36 +1048,82 @@ pub(crate) enum OutputBase {
 
 /// One file the CLI writes, in the two forms fixed where its location is resolved —
 /// [`output_path_for`] in directory mode, `resolve_output_path_for_kind` for a single
-/// file (#390).
+/// file (#390) — and the anchor its write resolves by path (#160).
 ///
 /// `path` is where the bytes go. `shown` is the same file as the user named it: the path
 /// as typed, or the part below a directory they named — the directory argument,
 /// `--out-dir`, or the directory `mds.json` was reached by — joined to that directory as
 /// typed. A status line, a message the caller writes itself, and the error
-/// [`atomic_write_file`] raises writing it name the file by `shown` alone, so display
-/// never resolves a path again.
+/// [`crate::write::atomic_write_file`] raises writing it name the file by `shown` alone,
+/// so display never resolves a path again.
+///
+/// The last `below_anchor` components of `path` — and of `shown`, which ends in the same
+/// names — lie below the write's anchor: `--out-dir` as typed, a directory argument's
+/// root, the directory `mds.json`'s `build.output_dir` names, or the typed parent of a
+/// file argument or of `-o`. The write resolves the anchor by path, as the user named it,
+/// and refuses a symlink at any of those components instead of writing through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteTarget {
     pub(crate) path: PathBuf,
     pub(crate) shown: PathBuf,
+    below_anchor: usize,
 }
 
 impl WriteTarget {
     /// A file named exactly as it is written: a path the user typed, or one built from a
-    /// typed path alone, so its two forms are one.
+    /// typed path alone, so its two forms are one. Its anchor is its own directory.
     pub(crate) fn as_typed(path: PathBuf) -> Self {
+        Self::new(path.clone(), path)
+    }
+
+    /// A file written at `path` and named as `shown`, anchored at the directory it is in:
+    /// the typed parent of a file argument, of `-o`, or of a file-mode output's directory.
+    pub(crate) fn new(path: PathBuf, shown: PathBuf) -> Self {
         Self {
-            shown: path.clone(),
             path,
+            shown,
+            below_anchor: 1,
         }
     }
 
-    /// The file `edit` derives from this one, in both forms — the sidecar map beside an
-    /// output, say.
+    /// The file `rel` below the anchor `anchor`, named below `shown_anchor`, the same
+    /// directory as the user named it: a directory-mode output below `--out-dir` or the
+    /// directory argument, or a directory's entry its walk found. `rel` is relative; the
+    /// write refuses a `..` in it.
+    pub(crate) fn below(anchor: &Path, shown_anchor: &Path, rel: &Path) -> Self {
+        Self {
+            path: anchor.join(rel),
+            shown: shown_anchor.join(rel),
+            // `components` keeps a `.` only at the start, which a join drops.
+            below_anchor: rel
+                .components()
+                .filter(|c| *c != std::path::Component::CurDir)
+                .count(),
+        }
+    }
+
+    /// `file`, a path the walk of `root.walked` found, below that root as its anchor and
+    /// named below `root.typed`. A file not below the walked root has no typed form and is
+    /// anchored at its own directory.
+    pub(crate) fn walked_below(root: RootPaths<'_>, file: &Path) -> Self {
+        match file.strip_prefix(root.walked) {
+            Ok(rel) => Self::below(root.walked, root.typed, rel),
+            Err(_) => Self::as_typed(file.to_path_buf()),
+        }
+    }
+
+    /// How many of the last components of `path` lie below the anchor.
+    pub(crate) fn below_anchor(&self) -> usize {
+        self.below_anchor
+    }
+
+    /// The file `edit` derives from this one, in both forms and below the same anchor —
+    /// the sidecar map beside an output, say. `edit` changes the file name alone.
     pub(crate) fn sibling(&self, edit: impl Fn(&Path) -> PathBuf) -> Self {
         Self {
             path: edit(&self.path),
             shown: edit(&self.shown),
+            below_anchor: self.below_anchor,
         }
     }
 }
@@ -1235,8 +1277,8 @@ pub(crate) fn output_path_for(
 ) -> WriteTarget {
     match base {
         OutputBase::Dir { canonical, shown } => {
-            let (path, flattened) = mirrored_output(source, root.walked, canonical, ext);
-            let (shown, _) = mirrored_output(source, root.walked, shown, ext);
+            let (rel, flattened) = mirrored_output(source, root.walked, ext);
+            let target = WriteTarget::below(canonical, shown, &rel);
             if flattened {
                 // Invariant report, not gated on --quiet (like the depth-limit and
                 // stale-unlink warnings above). Emitted once per output-path computation:
@@ -1248,10 +1290,10 @@ pub(crate) fn output_path_for(
                      overwrite it)",
                     safe_path(source),
                     safe_path(root.walked),
-                    safe_path(&shown)
+                    safe_path(&target.shown)
                 ));
             }
-            WriteTarget { path, shown }
+            target
         }
         OutputBase::NextToSource => {
             output_stem_for(source, root, base).sibling(|stem| stem.with_extension(ext))
@@ -1259,45 +1301,48 @@ pub(crate) fn output_path_for(
     }
 }
 
-/// `source`'s output below the directory `d`, mirrored as [`mirror_stem`] mirrors it, and
-/// whether the mirror was flattened. [`output_path_for`] calls it once per form of the
-/// directory, so both forms name the same file below it.
-fn mirrored_output(source: &Path, root: &Path, d: &Path, ext: &str) -> (PathBuf, bool) {
-    let mirrored = mirror_stem(source, root, d);
+/// `source`'s output below the out-dir — the part below it, mirrored as [`mirror_stem`]
+/// mirrors it — and whether the mirror was flattened. [`output_path_for`] joins it to both
+/// forms of the out-dir, so both name the same file below it.
+fn mirrored_output(source: &Path, root: &Path, ext: &str) -> (PathBuf, bool) {
+    let mirrored = mirror_stem(source, root);
     let flattened = matches!(mirrored, MirroredStem::Flattened(_));
     let no_ext = mirrored.into_path();
-    // Invariant: `no_ext` was built by `mirror_stem` as `<something>/<stem>`, so
+    // Invariant: `no_ext` was built by `mirror_stem` as `[<dirs>/]<stem>`, so
     // `file_name()` is `Some`. The literal fallback exists because the previous
     // one — `source.as_os_str()` — could be absolute, and an absolute name makes
-    // the `join` below re-root out of the out-dir.
+    // a join re-root out of the out-dir.
     let mut name = no_ext
         .file_name()
         .unwrap_or_else(|| OsStr::new("output"))
         .to_os_string();
     name.push(".");
     name.push(ext);
-    let out = no_ext.parent().unwrap_or(d).join(&name);
-    // AC-M7 containment invariant: the output path must remain inside the out-dir.
-    // `mirror_stem` already guards the strip_prefix escape case by returning
-    // `d/<stem>` for out-of-root sources; the with-extension step cannot escape.
-    // The check here is a defence-in-depth belt-and-suspenders assertion, and it
-    // stays DEBUG-ONLY on purpose: the release fallback below is contained, so
-    // there is nothing for a release-time check to prevent.
-    if out.starts_with(d) {
+    let out = no_ext.parent().unwrap_or(Path::new("")).join(&name);
+    // AC-M7 containment invariant: the output path must remain inside the out-dir, so
+    // the part below it is names alone. `mirror_stem` already guards the strip_prefix
+    // escape case by returning a bare `<stem>` for out-of-root sources; the
+    // with-extension step cannot escape. The check here is a defence-in-depth assertion,
+    // and it stays DEBUG-ONLY on purpose: the release fallback below is contained, and the
+    // write refuses a `..` below its anchor whatever reaches it (#160).
+    if out
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
         return (out, flattened);
     }
     debug_assert!(
         false,
-        "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
+        "output_path_for: AC-M7 violated — output {out:?} is not below the out-dir"
     );
-    // Invariant: same as above — the join argument must be relative.
+    // Invariant: same as above — the name must be relative.
     let mut flat_name = source
         .file_stem()
         .unwrap_or_else(|| OsStr::new("output"))
         .to_os_string();
     flat_name.push(".");
     flat_name.push(ext);
-    (d.join(flat_name), flattened)
+    (PathBuf::from(flat_name), flattened)
 }
 
 // ── Directory traversal ───────────────────────────────────────────────────────
@@ -1581,23 +1626,23 @@ pub(crate) fn probe_and_remove_stale(
     })
 }
 
-/// Where a `Dir`-mode source landed.
+/// Where a `Dir`-mode source lands below the out-dir, without its extension.
 ///
-/// `Flattened` is the `strip_prefix` failure arm: contained by construction (the join
-/// argument is always a relative `OsStr`) but it abandons the subtree mirror, so two
-/// out-of-root sources with the same file name map to the same path. Unreachable from
-/// every live caller — see [`output_path_for`] — and the variant exists so the write
-/// oracle can *say* so instead of silently degrading (#217).
+/// `Flattened` is the `strip_prefix` failure arm: contained by construction (the stem is
+/// always a relative `OsStr`) but it abandons the subtree mirror, so two out-of-root
+/// sources with the same file name map to the same path. Unreachable from every live
+/// caller — see [`output_path_for`] — and the variant exists so the write oracle can
+/// *say* so instead of silently degrading (#217).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MirroredStem {
-    /// `source` was below `root`: its relative subtree is preserved under the out-dir.
+    /// `source` was below `root`: its relative subtree is preserved below the out-dir.
     Mirrored(PathBuf),
-    /// `source` was not below `root`: only its stem survives, joined to the out-dir.
+    /// `source` was not below `root`: only its stem survives, directly below the out-dir.
     Flattened(PathBuf),
 }
 
 impl MirroredStem {
-    /// The extension-less output path, whichever arm produced it.
+    /// The extension-less output path below the out-dir, whichever arm produced it.
     pub(crate) fn into_path(self) -> PathBuf {
         match self {
             Self::Mirrored(p) | Self::Flattened(p) => p,
@@ -1605,31 +1650,30 @@ impl MirroredStem {
     }
 }
 
-/// Compute the `Dir`-mode extension-less output stem for `source`, classified by
-/// whether the subtree mirror survived.
+/// Compute the `Dir`-mode extension-less output stem for `source`, relative to the
+/// out-dir, classified by whether the subtree mirror survived.
 ///
 /// Single source of truth for both [`output_base_no_ext`] (the silent probe oracle) and
 /// [`output_path_for`] (the write oracle that reports the flatten).
-fn mirror_stem(source: &Path, root: &Path, d: &Path) -> MirroredStem {
+fn mirror_stem(source: &Path, root: &Path) -> MirroredStem {
     match source.strip_prefix(root) {
         Ok(rel) => {
             // Invariant: `rel` is a non-empty RELATIVE path — `source` is a regular
             // `.mds` file strictly below `root` — so `file_stem()` is `Some`. For a
             // single-component `rel` (a bare file name) `parent()` is `Some("")`, not
-            // `None`, and `d.join("")` is `d`, so bare names land directly in the
-            // out-dir rather than re-rooting.
+            // `None`, so a bare name lands directly in the out-dir.
             let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
-            MirroredStem::Mirrored(d.join(rel.parent().unwrap_or(Path::new(""))).join(stem))
+            MirroredStem::Mirrored(rel.parent().unwrap_or(Path::new("")).join(stem))
         }
         Err(_) => {
-            // Invariant: the join argument must be relative, or `d.join` re-roots and
-            // the result leaves the out-dir entirely (`d.join("/") == "/"`).
-            // `file_stem()` is `None` only for `/`, `..` and a bare drive prefix —
-            // never a `.mds` file — and the fallback that used to stand here,
-            // `source.as_os_str()`, was exactly the absolute value that escapes. A
-            // literal is the only value guaranteed relative for every input.
+            // Invariant: the stem must be relative, or joining it re-roots and the result
+            // leaves the out-dir entirely (`d.join("/") == "/"`). `file_stem()` is `None`
+            // only for `/`, `..` and a bare drive prefix — never a `.mds` file — and the
+            // fallback that used to stand here, `source.as_os_str()`, was exactly the
+            // absolute value that escapes. A literal is the only value guaranteed relative
+            // for every input.
             let stem = source.file_stem().unwrap_or_else(|| OsStr::new("output"));
-            MirroredStem::Flattened(d.join(stem))
+            MirroredStem::Flattened(PathBuf::from(stem))
         }
     }
 }
@@ -1644,7 +1688,7 @@ fn mirror_stem(source: &Path, root: &Path, d: &Path) -> MirroredStem {
 /// is for probing the filesystem, not for a message.
 pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) -> PathBuf {
     match base {
-        OutputBase::Dir { canonical, .. } => mirror_stem(source, root, canonical).into_path(),
+        OutputBase::Dir { canonical, .. } => canonical.join(mirror_stem(source, root).into_path()),
         OutputBase::NextToSource => {
             // source.with_extension("") removes the existing extension.
             source.with_extension("")
@@ -1653,9 +1697,10 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
 }
 
 /// [`output_base_no_ext`] in both forms, fixed here as [`output_path_for`] fixes an
-/// output's (#390): `path` is the extension-less stem the filesystem is probed at; `shown`
-/// is the same stem below the out-dir's shown form, or — next to the source — below the
-/// directory argument as typed. `mds watch` names a deleted source's output by `shown`.
+/// output's (#390), below the same anchor (#160): `path` is the extension-less stem the
+/// filesystem is probed at; `shown` is the same stem below the out-dir's shown form, or —
+/// next to the source — below the directory argument as typed. `mds watch` names a
+/// deleted source's output by `shown`.
 ///
 /// Like [`output_base_no_ext`] it is a probe: it reports nothing, the flattened arm
 /// included.
@@ -1664,235 +1709,15 @@ pub(crate) fn output_stem_for(
     root: RootPaths<'_>,
     base: &OutputBase,
 ) -> WriteTarget {
-    let path = output_base_no_ext(source, root.walked, base);
-    let shown = match base {
-        OutputBase::Dir { shown, .. } => mirror_stem(source, root.walked, shown).into_path(),
-        OutputBase::NextToSource => root.shown_below(source).with_extension(""),
-    };
-    WriteTarget { path, shown }
-}
-
-// ── Atomic file write ─────────────────────────────────────────────────────────
-
-/// How hard [`atomic_write_file`] works to make the new bytes survive a crash.
-///
-/// Atomicity — a reader sees either the whole old file or the whole new one, never a
-/// truncated mix — is unconditional: it comes from the rename, not from the fsync. This
-/// knob only chooses whether the data is forced to stable storage *before* that rename.
-///
-/// The split exists because the two families of file MDS writes have different recovery
-/// costs, and on macOS `sync_all()` is `F_FULLFSYNC` — a full drive cache flush, ~7 ms
-/// per file. Measured on a 500-template `mds watch` startup (#227): 1.44 s → 4.69 s, and
-/// the `cli_watch` suite 4.2 s → 8.3 s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Durability {
-    /// `sync_all()` before the rename. For files whose content exists nowhere else:
-    /// `mds fmt` and `mds lint --fix` rewrite the user's hand-authored `.mds` source in
-    /// place, so bytes lost to a power failure are lost for good.
-    Fsync,
-    /// Rename only. For **derived** artifacts — compiled outputs and `.map` sidecars —
-    /// which are reproducible by re-running `mds build`. A crash can leave the previous
-    /// artifact or an unflushed new one; either way the fix is one rebuild, and paying
-    /// `F_FULLFSYNC` per file to avoid it costs more than it saves.
-    RenameOnly,
-}
-
-/// Write `content` to `target.path` atomically via a temp-file-then-rename cycle.
-///
-/// Centralising this helper in `output.rs` ensures both `fmt` and `lint --fix`
-/// route through the same write path (avoids PF-004 — a check enforced on the
-/// primary path silently absent on a sibling path).
-///
-/// This is the single write primitive for every file the CLI produces: `fmt` and
-/// `lint --fix` rewrites, and — since #227 — every `mds build` / `mds watch`
-/// artifact and `.map` sidecar. The parent directory must already exist; callers
-/// that need directories create them first.
-///
-/// Behaviour: the target is probed with `lstat`. A regular file is replaced
-/// (final-component symlink re-check, Unix mode preserved with `& 0o7777`). A
-/// symlink at the target — live or dangling — is refused rather than written
-/// through. An absent target is created with mode `0666 & !umask`, i.e. what
-/// `std::fs::write` produced. Any other stat failure is an error, never a silent
-/// mode guess (#225).
-///
-/// Safety properties:
-/// - Re-checks for symlink immediately before the write (TOCTOU guard, AC-F-21).
-/// - Temp file lives in the SAME directory as the target so the rename is
-///   always intra-filesystem (atomic on POSIX, near-atomic on Windows).
-/// - Calls `sync_all()` (not `flush()` — `flush()` is a no-op on unbuffered
-///   `File`) for crash durability before the rename, when `durability` is
-///   [`Durability::Fsync`]. Under [`Durability::RenameOnly`] the fsync is skipped;
-///   the rename — and therefore the atomicity — is unchanged. See [`Durability`]
-///   for which callers pick which and why.
-/// - Directory-level symlinks in the path are resolved, not rejected (the same
-///   rule `NativeFs::check_symlink` applies).
-///
-/// # Contract (#226)
-///
-/// This is replace-by-rename, not an in-place rewrite. The target path receives a
-/// NEW inode, so the write does NOT preserve hard links (other links keep the old
-/// content), ACLs, extended attributes (xattrs), or owner/group of the original
-/// file; only the permission bits are carried over (Unix). This applies to every
-/// path routed through this helper: `mds fmt` and `mds lint --fix` source
-/// rewrites and, under #227, `mds build` / `mds watch` compiled outputs and
-/// `.map` sidecars. Hard-link preservation is out of scope by construction (it
-/// would require truncate-in-place and forfeit crash safety); ACL/xattr/
-/// owner-group preservation is not planned — MDS only rewrites its own outputs
-/// and `.mds` sources.
-///
-/// # Errors
-///
-/// Every failure is `mds::io` (exit 2, #157). Its message names the step that failed —
-/// `cannot create temp file for <file>: <cause>`, say — and names the target by
-/// `target.shown`, the form the caller's status line names it by, never by
-/// `target.path`; the cause after it names no path ([`io_cause`]) (#390).
-pub(crate) fn atomic_write_file(
-    target: &WriteTarget,
-    content: &str,
-    durability: Durability,
-) -> std::result::Result<(), mds::MdsError> {
-    write_through_temp_file(target, content, durability, FailureWording::Step)
-}
-
-/// [`atomic_write_file`], with every failure worded `cannot write <file>: <cause>`,
-/// whichever step failed: `mds lint --fix` reports a rewrite that fails in this one
-/// wording in every mode, naming the file once (#309). The file and the cause are those
-/// [`atomic_write_file`] names.
-pub(crate) fn atomic_write_file_in_one_wording(
-    target: &WriteTarget,
-    content: &str,
-    durability: Durability,
-) -> std::result::Result<(), mds::MdsError> {
-    write_through_temp_file(target, content, durability, FailureWording::Write)
-}
-
-/// How [`write_through_temp_file`] words a failure, before the file and its cause.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureWording {
-    /// The step that failed: `cannot create temp file for`, `cannot rename temp file to`.
-    Step,
-    /// `cannot write`, whichever step failed.
-    Write,
-}
-
-/// The write [`atomic_write_file`] documents, its failures worded as `wording` says.
-fn write_through_temp_file(
-    target: &WriteTarget,
-    content: &str,
-    durability: Durability,
-    wording: FailureWording,
-) -> std::result::Result<(), mds::MdsError> {
-    use mds::{effective_parent, NativeFs};
-
-    let path = target.path.as_path();
-    // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
-    let parent = effective_parent(path);
-
-    // Every message names the file as the caller's status line does (#390), escaped and
-    // without a Windows verbatim prefix (#409).
-    let shown = safe_path(&target.shown);
-    let io_error = |step: &str, cause: String| {
-        let what = match wording {
-            FailureWording::Step => step,
-            FailureWording::Write => "cannot write",
-        };
-        mds::MdsError::Io {
-            message: format!("{what} {shown}: {}", safe_inline(cause)),
+    match base {
+        OutputBase::Dir { canonical, shown } => WriteTarget::below(
+            canonical,
+            shown,
+            &mirror_stem(source, root.walked).into_path(),
+        ),
+        OutputBase::NextToSource => {
+            WriteTarget::walked_below(root, source).sibling(|source| source.with_extension(""))
         }
-    };
-
-    // #227: `mds build` targets may not exist yet. Probe with lstat, which never
-    // follows a symlink: `Ok` means something is there (a regular file, or a
-    // symlink — live or dangling — which is refused below); `Err(NotFound)` means
-    // create a new file. Any other lstat failure is a hard error (#225: silently
-    // writing with a guessed mode was the defect, and a warning is not a decision).
-    let existing = match path.symlink_metadata() {
-        Ok(m) => Some(m),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_error("cannot stat", io_cause(&e))),
-    };
-
-    if let Some(m) = &existing {
-        if m.file_type().is_symlink() {
-            return Err(io_error("cannot write", SYMLINK_REFUSAL.to_owned()));
-        }
-        // Re-check for symlink right before writing (TOCTOU guard). Its error names
-        // `path`, so the refusal is worded here instead.
-        NativeFs::check_symlink(path).map_err(|e| io_error("cannot write", recheck_refusal(&e)))?;
-    }
-
-    // Mode to restore on Unix. The lstat result of a non-symlink IS the file's
-    // metadata, so there is no second stat call and no site left for the spurious
-    // metadata warning that fired on every first build (#225, #227).
-    // `None` = new file.
-    #[cfg(unix)]
-    let original_mode: Option<u32> = {
-        use std::os::unix::fs::PermissionsExt as _;
-        existing.as_ref().map(|m| m.permissions().mode())
-    };
-
-    // Temp file in same directory so rename is always intra-filesystem.
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".mds-tmp-").suffix(".tmp");
-    // New file: request 0666 and let the kernel apply the umask, so a first
-    // `mds build` creates the same mode `std::fs::write` did (typically 0644).
-    // `tempfile`'s default is 0600, which would make every fresh artifact
-    // owner-only.
-    #[cfg(unix)]
-    if original_mode.is_none() {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
-    }
-    // tempfile's error names the temporary file's absolute path; `io_cause` drops it.
-    let mut tmp = builder
-        .tempfile_in(parent)
-        .map_err(|e| io_error("cannot create temp file for", io_cause(&e)))?;
-
-    // Restore original permissions before writing; mask off file-type bits
-    // (high bits of st_mode) so only the permission bits reach from_mode.
-    #[cfg(unix)]
-    if let Some(mode) = original_mode {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode & 0o7777))
-            .map_err(|e| io_error("cannot set permissions on temp file for", io_cause(&e)))?;
-    }
-
-    // Written through the `File` itself: `NamedTempFile`'s own `Write` wraps an error in
-    // one that names the temporary file, which would leave `io_cause` the kind alone.
-    tmp.as_file_mut()
-        .write_all(content.as_bytes())
-        .map_err(|e| io_error("cannot write", io_cause(&e)))?;
-
-    // sync_all() flushes data + metadata to storage (flush() is a no-op on
-    // unbuffered File and provides no crash durability guarantee). Skipped for
-    // derived artifacts, which a rebuild reproduces — see `Durability`.
-    if durability == Durability::Fsync {
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| io_error("cannot fsync", io_cause(&e)))?;
-    }
-
-    // persist() atomically renames the temp file to the target path.
-    tmp.persist(path)
-        .map_err(|e| io_error("cannot rename temp file to", io_cause(&e.error)))?;
-
-    Ok(())
-}
-
-/// Why [`atomic_write_file`] refuses to replace a symlink at its target.
-const SYMLINK_REFUSAL: &str = "refusing to replace a symlink";
-
-/// Why the re-check right before a write refused its target, in words of its own: the
-/// error `NativeFs::check_symlink` raises names the path it was given, which may be a
-/// canonical one (#390). It raises three: a symlink that has appeared, a forbidden path
-/// character in the target's resolved path, and a target it cannot resolve.
-fn recheck_refusal(e: &mds::MdsError) -> String {
-    match e {
-        mds::MdsError::ImportError { .. } => SYMLINK_REFUSAL.to_owned(),
-        mds::MdsError::Io { .. } => {
-            "its resolved path contains a forbidden path character".to_owned()
-        }
-        _ => io_cause(&std::io::ErrorKind::NotFound.into()),
     }
 }
 
@@ -2687,25 +2512,25 @@ mod tests {
         }
     }
 
-    fn target(path: &str, shown: &str) -> WriteTarget {
-        WriteTarget {
-            path: PathBuf::from(path),
-            shown: PathBuf::from(shown),
-        }
+    /// The file `rel` below the anchor `anchor`, named below `shown_anchor` (#160).
+    fn target(anchor: &str, shown_anchor: &str, rel: &str) -> WriteTarget {
+        WriteTarget::below(Path::new(anchor), Path::new(shown_anchor), Path::new(rel))
     }
 
     /// #390: a directory-mode output is written below the out-dir's canonical form and
     /// named below its shown form — the same file below each; a map sidecar derives from
     /// both forms alike; and an output next to its source is named as the walk found it.
+    /// #160: each is anchored at the out-dir, or at the directory argument next to its
+    /// source, with the directories the mirror keeps below that anchor.
     #[test]
     fn an_output_is_written_below_the_canonical_out_dir_and_named_below_the_typed_one() {
         let source = Path::new("/root/sub/page.mds");
         let root = Path::new("/root");
         let out = output_path_for(source, RootPaths::as_typed(root), &out_base(), "md");
-        assert_eq!(out, target("/out/sub/page.md", "out/sub/page.md"));
+        assert_eq!(out, target("/out", "out", "sub/page.md"));
         assert_eq!(
             out.sibling(crate::build::map_path_for),
-            target("/out/sub/page.md.map", "out/sub/page.md.map")
+            target("/out", "out", "sub/page.md.map")
         );
         assert_eq!(
             output_path_for(
@@ -2714,7 +2539,7 @@ mod tests {
                 &OutputBase::NextToSource,
                 "md"
             ),
-            WriteTarget::as_typed(PathBuf::from("src/sub/page.md"))
+            target("src", "src", "sub/page.md")
         );
     }
 
@@ -2734,23 +2559,23 @@ mod tests {
 
         assert_eq!(
             output_path_for(source, root, &next_to, "md"),
-            target("/root/sub/page.md", "src/sub/page.md")
+            target("/root", "src", "sub/page.md")
         );
         assert_eq!(
             output_stem_for(source, root, &next_to),
-            target("/root/sub/page", "src/sub/page")
+            target("/root", "src", "sub/page")
         );
         assert_eq!(
             output_path_for(source, root, &out_base(), "json"),
-            target("/out/sub/page.json", "out/sub/page.json")
+            target("/out", "out", "sub/page.json")
         );
         assert_eq!(
             output_stem_for(source, root, &out_base()),
-            target("/out/sub/page", "out/sub/page")
+            target("/out", "out", "sub/page")
         );
         assert_eq!(
             output_stem_for(Path::new("/other/page.mds"), root, &next_to),
-            target("/other/page", "/other/page")
+            WriteTarget::as_typed(PathBuf::from("/other/page"))
         );
     }
 
@@ -2797,7 +2622,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let base = out_base();
         let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "json");
-        assert_eq!(result, target("/out/src/chat.json", "out/src/chat.json"));
+        assert_eq!(result, target("/out", "out", "src/chat.json"));
     }
 
     #[test]
@@ -2806,7 +2631,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let base = out_base();
         let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
-        assert_eq!(result, target("/out/src/page.md", "out/src/page.md"));
+        assert_eq!(result, target("/out", "out", "src/page.md"));
     }
 
     #[test]
@@ -2815,7 +2640,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
         let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
-        assert_eq!(result, target("/root/src/page.md", "/root/src/page.md"));
+        assert_eq!(result, target("/root", "/root", "src/page.md"));
     }
 
     #[test]
@@ -2824,7 +2649,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
         let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "json");
-        assert_eq!(result, target("/root/src/chat.json", "/root/src/chat.json"));
+        assert_eq!(result, target("/root", "/root", "src/chat.json"));
     }
 
     // T-CLI-21 (unit): ..‑containment guard (AC-M7) still holds.
@@ -2840,7 +2665,7 @@ mod tests {
             result.path.starts_with("/out"),
             "output must be inside /out; got {result:?}"
         );
-        assert_eq!(result, target("/out/page.md", "out/page.md"));
+        assert_eq!(result, target("/out", "out", "page.md"));
     }
 
     /// Body of the first `fn` whose header starts with `header`, brace-matched from the
@@ -2874,21 +2699,13 @@ mod tests {
     #[test]
     fn mirror_stem_classifies_out_of_root_as_flattened() {
         assert_eq!(
-            mirror_stem(
-                Path::new("/other/page.mds"),
-                Path::new("/root"),
-                Path::new("/out"),
-            ),
-            MirroredStem::Flattened(PathBuf::from("/out/page")),
+            mirror_stem(Path::new("/other/page.mds"), Path::new("/root")),
+            MirroredStem::Flattened(PathBuf::from("page")),
             "a source outside the root loses its subtree and must say so"
         );
         assert_eq!(
-            mirror_stem(
-                Path::new("/root/a/page.mds"),
-                Path::new("/root"),
-                Path::new("/out"),
-            ),
-            MirroredStem::Mirrored(PathBuf::from("/out/a/page")),
+            mirror_stem(Path::new("/root/a/page.mds"), Path::new("/root")),
+            MirroredStem::Mirrored(PathBuf::from("a/page")),
             "a source below the root keeps its subtree and must NOT be reported"
         );
     }
@@ -2915,7 +2732,7 @@ mod tests {
         );
         assert_eq!(
             output_path_for(source, RootPaths::as_typed(root), &base, "md"),
-            target("/out/output.md", "out/output.md"),
+            target("/out", "out", "output.md"),
             "the write oracle must not join an absolute stem"
         );
     }
@@ -4081,572 +3898,6 @@ mod tests {
         assert!(
             shown.starts_with("bad") && shown.ends_with("word"),
             "{shown:?}"
-        );
-    }
-
-    // ── atomic_write_file ─────────────────────────────────────────────────────
-
-    /// [`atomic_write_file`] of a file named as it is written.
-    fn write_as_typed(
-        path: &Path,
-        content: &str,
-        durability: Durability,
-    ) -> std::result::Result<(), mds::MdsError> {
-        atomic_write_file(
-            &WriteTarget::as_typed(path.to_path_buf()),
-            content,
-            durability,
-        )
-    }
-
-    /// An error writing a file names it by `shown`, never by `path`, and its cause names
-    /// no path (#390): tempfile's error creating its file names that file's absolute path,
-    /// and the cause is the error's kind alone. Control: the whole message is the one
-    /// expected, so the target is named.
-    ///
-    /// `#[cfg(unix)]`: a read-only directory is what makes the temporary file fail, and
-    /// Windows' read-only attribute does not stop a file being created in one (#147).
-    #[cfg(unix)]
-    #[test]
-    fn an_error_writing_names_the_file_as_shown_and_no_path_of_its_own() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let target = WriteTarget {
-            path: sub.join("locked.mds"),
-            shown: Path::new("out").join("locked.mds"),
-        };
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let probe = std::fs::write(sub.join("probe"), "");
-        let result = atomic_write_file(&target, "NEW", Durability::Fsync);
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if probe.is_ok() {
-            ewriteln!("running as root; a read-only directory does not stop the write");
-            return;
-        }
-
-        let err = result
-            .expect_err("a read-only directory must fail the write")
-            .to_string();
-        assert_eq!(
-            err,
-            format!(
-                "cannot create temp file for out/locked.mds: {}",
-                std::io::ErrorKind::PermissionDenied
-            )
-        );
-        let tmp = dir.path().display().to_string();
-        assert!(!err.contains(&tmp), "no path of the write's own: {err}");
-        assert!(!err.contains(".mds-tmp-"), "no temporary file: {err}");
-    }
-
-    /// `atomic_write_file_in_one_wording` words every failure `cannot write <file>:
-    /// <cause>`, with the file and the cause `atomic_write_file` names, whichever step
-    /// failed (#309): creating the temporary file, and refusing a symlink at the target.
-    /// Control: `atomic_write_file` names each step its own way.
-    ///
-    /// `#[cfg(unix)]`: a read-only directory is what makes the temporary file fail, and
-    /// Windows' read-only attribute does not stop a file being created in one (#147).
-    #[cfg(unix)]
-    #[test]
-    fn the_one_wording_names_the_file_and_the_cause_whichever_step_failed() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let locked = WriteTarget {
-            path: sub.join("locked.mds"),
-            shown: Path::new("out").join("locked.mds"),
-        };
-        let real = dir.path().join("real.mds");
-        std::fs::write(&real, "R").unwrap();
-        let link = WriteTarget {
-            path: dir.path().join("link.mds"),
-            shown: Path::new("out").join("link.mds"),
-        };
-        std::os::unix::fs::symlink(&real, &link.path).unwrap();
-
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let probe = std::fs::write(sub.join("probe"), "");
-        let message = |target: &WriteTarget, one_wording: bool| {
-            let written = if one_wording {
-                atomic_write_file_in_one_wording(target, "NEW", Durability::Fsync)
-            } else {
-                atomic_write_file(target, "NEW", Durability::Fsync)
-            };
-            written.map_err(|e| e.to_string())
-        };
-        let seen = [
-            message(&locked, true),
-            message(&link, true),
-            message(&locked, false),
-            message(&link, false),
-        ];
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if probe.is_ok() {
-            ewriteln!("running as root; a read-only directory does not stop the write");
-            return;
-        }
-
-        let denied = std::io::ErrorKind::PermissionDenied;
-        assert_eq!(
-            seen,
-            [
-                Err(format!("cannot write out/locked.mds: {denied}")),
-                Err(format!("cannot write out/link.mds: {SYMLINK_REFUSAL}")),
-                Err(format!(
-                    "cannot create temp file for out/locked.mds: {denied}"
-                )),
-                Err(format!("cannot write out/link.mds: {SYMLINK_REFUSAL}")),
-            ]
-        );
-        assert_eq!(
-            std::fs::read_to_string(&real).unwrap(),
-            "R",
-            "nothing was written through the link"
-        );
-    }
-
-    /// The re-check's refusal names no path, whichever error `NativeFs::check_symlink`
-    /// raised (#390). Controls: each error's own text names the path it was given.
-    #[test]
-    fn the_recheck_s_refusal_names_no_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real.md");
-        std::fs::write(&real, "R").unwrap();
-        let link = dir.path().join("link.md");
-        let missing = dir.path().join("missing.md");
-
-        let mut cases = vec![(
-            mds::NativeFs::check_symlink(&missing).expect_err("nothing to resolve"),
-            std::io::ErrorKind::NotFound.to_string(),
-        )];
-        if make_symlink(&real, &link) {
-            cases.push((
-                mds::NativeFs::check_symlink(&link).expect_err("a symlink"),
-                SYMLINK_REFUSAL.to_owned(),
-            ));
-        }
-        // A forbidden character in the resolved path: a name Windows cannot hold.
-        #[cfg(unix)]
-        {
-            let hostile = dir.path().join(format!("a{}b", '\x1b'));
-            std::fs::create_dir(&hostile).unwrap();
-            std::fs::write(hostile.join("x.md"), "X").unwrap();
-            let alias = dir.path().join("alias");
-            std::os::unix::fs::symlink(&hostile, &alias).unwrap();
-            cases.push((
-                mds::NativeFs::check_symlink(&alias.join("x.md"))
-                    .expect_err("a forbidden character in the resolved path"),
-                "its resolved path contains a forbidden path character".to_owned(),
-            ));
-        }
-        let needle = dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        for (error, expected) in cases {
-            assert!(error.to_string().contains(&needle), "control: {error}");
-            let refusal = recheck_refusal(&error);
-            assert!(!refusal.contains(&needle), "{refusal}");
-            assert_eq!(refusal, expected, "the refusal of {error}");
-        }
-    }
-
-    /// Names of leftover `.mds-tmp-*` entries directly inside `dir`.
-    fn temp_residue(dir: &Path) -> Vec<String> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(".mds-tmp-"))
-            .collect()
-    }
-
-    /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
-    ///
-    /// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
-    /// name and contract (#147): Unix needs no privilege; Windows needs Developer
-    /// Mode or an elevated process (GitHub's `windows-latest` runners have
-    /// Developer Mode enabled, so a failure there is a genuine regression and
-    /// must panic), and only the unprivileged local case — `CI` unset plus raw
-    /// OS error 1314 (`ERROR_PRIVILEGE_NOT_HELD`) — is a skip. Duplicated rather
-    /// than shared because this crate has no unit-test-scope helper module.
-    fn make_symlink(target: &Path, link: &Path) -> bool {
-        #[cfg(unix)]
-        let result = std::os::unix::fs::symlink(target, link);
-        #[cfg(windows)]
-        let result = if target.is_dir() {
-            std::os::windows::fs::symlink_dir(target, link)
-        } else {
-            std::os::windows::fs::symlink_file(target, link)
-        };
-
-        match result {
-            Ok(()) => true,
-            Err(err) => {
-                #[cfg(windows)]
-                {
-                    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
-                    if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
-                        && std::env::var_os("CI").is_none()
-                    {
-                        ewriteln!(
-                            "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
-                        );
-                        return false;
-                    }
-                }
-                panic!(
-                    "failed to create symlink {} -> {}: {err}",
-                    target.display(),
-                    link.display()
-                );
-            }
-        }
-    }
-
-    /// T-U1: `mds build` writes artifacts that do not exist yet (#227). The
-    /// primitive must create the target instead of failing the existence probe.
-    #[test]
-    fn atomic_write_file_creates_missing_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("fresh.md");
-        assert!(!target.exists(), "precondition: target must be absent");
-
-        write_as_typed(&target, "CREATED", Durability::Fsync)
-            .expect("writing an absent target must succeed");
-
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "CREATED");
-        let residue = temp_residue(dir.path());
-        assert!(
-            residue.is_empty(),
-            "no .mds-tmp- residue may survive a successful write; got {residue:?}"
-        );
-    }
-
-    /// T-U9: `Durability::RenameOnly` changes ONLY whether the temp file is fsynced.
-    /// Everything the callers rely on — the content, the mode of a freshly created
-    /// artifact, the symlink refusal, and leaving no temp residue — must be identical
-    /// to `Fsync` (#227). The fsync itself is not observable from a passing process;
-    /// what this pins is that skipping it did not quietly relax anything else.
-    #[test]
-    fn atomic_write_file_rename_only_matches_fsync_contract() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Fresh target: created, with the same content and mode as the Fsync sibling.
-        let quick = dir.path().join("quick.md");
-        let synced = dir.path().join("synced.md");
-        write_as_typed(&quick, "DERIVED", Durability::RenameOnly).unwrap();
-        write_as_typed(&synced, "DERIVED", Durability::Fsync).unwrap();
-        assert_eq!(std::fs::read_to_string(&quick).unwrap(), "DERIVED");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                std::fs::metadata(&quick).unwrap().permissions().mode() & 0o777,
-                std::fs::metadata(&synced).unwrap().permissions().mode() & 0o777,
-                "RenameOnly must not change the mode a fresh artifact is created with"
-            );
-        }
-
-        // Existing target: replaced, previous content gone.
-        write_as_typed(&quick, "REBUILT", Durability::RenameOnly).unwrap();
-        assert_eq!(std::fs::read_to_string(&quick).unwrap(), "REBUILT");
-
-        // Symlink target: still refused (the fsync is not what enforces this).
-        {
-            let real = dir.path().join("real.md");
-            std::fs::write(&real, "REAL").unwrap();
-            let link = dir.path().join("link.md");
-            if !make_symlink(&real, &link) {
-                return;
-            }
-            let err = write_as_typed(&link, "NEW", Durability::RenameOnly)
-                .expect_err("RenameOnly must still refuse a symlink target");
-            assert!(
-                err.to_string().contains("symlink"),
-                "the refusal must say why; got: {err}"
-            );
-            assert_eq!(std::fs::read_to_string(&real).unwrap(), "REAL");
-        }
-
-        let residue = temp_residue(dir.path());
-        assert!(
-            residue.is_empty(),
-            "RenameOnly must leave no .mds-tmp- residue; got {residue:?}"
-        );
-    }
-
-    /// T-U2: a freshly created artifact must carry the same mode `std::fs::write`
-    /// would have produced (`0666 & !umask`), not `tempfile`'s owner-only 0600.
-    /// The sibling control makes the assertion umask-independent.
-    ///
-    /// `#[cfg(unix)]`: Unix permission mode bits (`PermissionsExt::mode`) have no
-    /// Windows equivalent — the permission model differs (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_new_file_mode_matches_std_fs_write() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.md");
-        let ctl = dir.path().join("ctl.md");
-
-        write_as_typed(&out, "X", Durability::Fsync).unwrap();
-        std::fs::write(&ctl, "X").unwrap();
-
-        let mode_out = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
-        let mode_ctl = std::fs::metadata(&ctl).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode_out, mode_ctl,
-            "new-file mode must match std::fs::write; got 0{mode_out:o} vs control 0{mode_ctl:o}"
-        );
-    }
-
-    /// T-U3: an existing file keeps its mode across the replace-by-rename cycle.
-    ///
-    /// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_existing_mode_0640_preserved() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("src.mds");
-        std::fs::write(&target, "OLD").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
-
-        write_as_typed(&target, "NEW", Durability::Fsync).unwrap();
-
-        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(
-            mode, 0o640,
-            "existing mode must be preserved; got 0{mode:o}"
-        );
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
-    }
-
-    /// T-U4: a symlink at the target is refused, never written through. The
-    /// control writes the symlink's own target directly and must succeed, so the
-    /// refusal is not passing on an unrelated failure.
-    #[test]
-    fn atomic_write_file_refuses_live_symlink_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real.md");
-        let link = dir.path().join("link.md");
-        std::fs::write(&real, "REAL").unwrap();
-        if !make_symlink(&real, &link) {
-            return;
-        }
-
-        let err = write_as_typed(&link, "NEW", Durability::Fsync)
-            .expect_err("writing through a symlink must be refused");
-        assert!(
-            matches!(err, mds::MdsError::Io { .. }),
-            "a refused write is mds::io, exit 2 (#157); got {err:?}"
-        );
-        let err = err.to_string();
-        assert!(
-            err.contains("symlink"),
-            "expected a symlink refusal; got {err}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&real).unwrap(),
-            "REAL",
-            "the symlink's target must not be written through"
-        );
-        assert!(
-            std::fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "the symlink itself must survive the refusal"
-        );
-
-        // CONTROL: the same directory and content, addressed at the real file.
-        write_as_typed(&real, "NEW", Durability::Fsync)
-            .expect("writing the real file must succeed");
-        assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW");
-    }
-
-    /// T-U5: a dangling symlink is still a symlink — refuse it rather than
-    /// materialising the missing file it points at.
-    #[test]
-    fn atomic_write_file_refuses_dangling_symlink_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing.md");
-        let link = dir.path().join("link.md");
-        if !make_symlink(&missing, &link) {
-            return;
-        }
-
-        let err = write_as_typed(&link, "NEW", Durability::Fsync)
-            .expect_err("writing through a dangling symlink must be refused")
-            .to_string();
-        assert!(
-            err.contains("symlink"),
-            "expected a symlink refusal; got {err}"
-        );
-        assert!(
-            !missing.exists(),
-            "the dangling link's target must not be created"
-        );
-        assert!(
-            std::fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "the symlink itself must survive the refusal"
-        );
-    }
-
-    /// T-U6: a failed write leaves the original inode, bytes and mtime untouched
-    /// and drops the temp file. The control proves the same call succeeds once
-    /// the directory is writable again, and that success DOES replace the inode.
-    ///
-    /// `#[cfg(unix)]`: provokes the failure via chmod (Unix permission bits) and
-    /// asserts on `MetadataExt::ino()`, neither of which exists on Windows —
-    /// the read-only attribute there does not block creating files in a
-    /// directory, so the same setup would not provoke a write failure (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_failure_preserves_original_and_leaves_no_temp() {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let target = sub.join("locked.mds");
-        std::fs::write(&target, "OLD").unwrap();
-
-        let before = std::fs::metadata(&target).unwrap();
-        let (ino, mtime) = (before.ino(), before.modified().unwrap());
-
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let result = write_as_typed(&target, "NEW", Durability::Fsync);
-        // Restore before asserting so a failed assertion cannot leave an
-        // undeletable tempdir behind.
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let err = result
-            .expect_err("a read-only parent directory must fail the write")
-            .to_string();
-        assert!(
-            err.contains("locked.mds"),
-            "error must name the target; got {err}"
-        );
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD");
-        let after = std::fs::metadata(&target).unwrap();
-        assert_eq!(
-            after.ino(),
-            ino,
-            "a failed write must not replace the inode"
-        );
-        assert_eq!(
-            after.modified().unwrap(),
-            mtime,
-            "a failed write must not touch the mtime"
-        );
-        let residue = temp_residue(&sub);
-        assert!(
-            residue.is_empty(),
-            "failed write left temp residue: {residue:?}"
-        );
-
-        // CONTROL: writable again — the same call succeeds and swaps the inode.
-        write_as_typed(&target, "NEW", Durability::Fsync)
-            .expect("write must succeed once the dir is writable");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
-        assert_ne!(
-            std::fs::metadata(&target).unwrap().ino(),
-            ino,
-            "replace-by-rename must produce a new inode"
-        );
-    }
-
-    /// T-U7: a directory at the target is an error, not a clobber, and leaves no
-    /// temp file behind in the parent.
-    #[test]
-    fn atomic_write_file_directory_target_refused_without_residue() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("adir");
-        std::fs::create_dir(&target).unwrap();
-
-        // Named as shown (#390): the rename's error names neither the path written nor
-        // the temporary file.
-        let shown = Path::new("out").join("adir");
-        let err = atomic_write_file(
-            &WriteTarget {
-                path: target.clone(),
-                shown: shown.clone(),
-            },
-            "X",
-            Durability::Fsync,
-        )
-        .expect_err("a directory target must not be written")
-        .to_string();
-        let named = format!("cannot rename temp file to {}: ", safe_path(&shown));
-        assert!(
-            err.starts_with(&named),
-            "error must name the target as shown; got {err}"
-        );
-        let tmp = dir.path().display().to_string();
-        assert!(!err.contains(&tmp), "no path of the write's own: {err}");
-        assert!(!err.contains(".mds-tmp-"), "no temporary file: {err}");
-        assert!(target.is_dir(), "the directory must survive the refusal");
-        let residue = temp_residue(dir.path());
-        assert!(
-            residue.is_empty(),
-            "refused write left temp residue: {residue:?}"
-        );
-    }
-
-    /// T-U8: a stat failure that is NOT `NotFound` is a hard error — never a
-    /// warning followed by a write with a guessed mode (#225).
-    ///
-    /// `#[cfg(unix)]`: provokes the stat failure with a `0o000`-mode parent
-    /// directory; Windows' permission model does not block traversal the same
-    /// way, so this setup would not provoke the failure there (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_unreadable_parent_is_hard_error() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("nosearch");
-        std::fs::create_dir(&p).unwrap();
-        // Planted before the chmod so the root probe below has something to stat.
-        let probe = p.join("probe");
-        std::fs::write(&probe, "").unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        if std::fs::metadata(&probe).is_ok() {
-            // Root bypasses the mode bits; EACCES cannot be provoked here.
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-            ewriteln!("running as root; cannot exercise EACCES");
-            return;
-        }
-
-        let result = write_as_typed(&p.join("x.md"), "X", Durability::Fsync);
-        // Restore before asserting so tempdir cleanup always succeeds.
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let err = result
-            .expect_err("an unstattable target must be a hard error")
-            .to_string();
-        assert!(
-            err.contains("cannot stat"),
-            "expected a stat error; got {err}"
-        );
-        assert!(
-            err.contains("x.md"),
-            "error must name the target; got {err}"
         );
     }
 

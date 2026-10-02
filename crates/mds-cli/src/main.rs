@@ -12,6 +12,7 @@ mod lint;
 mod lint_sink;
 mod output;
 mod watch;
+mod write;
 
 use build::{
     build_runtime_vars, emit_duplicate_var_warnings, exit_code, parse_key_value, resolve_input,
@@ -489,11 +490,13 @@ Your items:
     // at `filename` (live under `--force`, dangling without it) is refused instead of
     // written through; `--force` replaces a regular file by rename with its mode
     // preserved. `RenameOnly` because the starter is a fixed public template a re-run
-    // reproduces.
-    output::atomic_write_file(
+    // reproduces. Anchored at the typed parent, which must exist: init creates no
+    // directory (#160).
+    write::atomic_write_file(
         &output::WriteTarget::as_typed(filename.clone()),
         starter,
-        output::Durability::RenameOnly,
+        write::Durability::RenameOnly,
+        write::Parents::Existing,
     )?;
     if !quiet {
         output::ewriteln!(

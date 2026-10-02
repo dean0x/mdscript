@@ -3319,8 +3319,8 @@ fn lint_write_failure_includes_filename_in_stderr() {
     )
     .unwrap();
 
-    // Make the parent directory read-only so temp-file creation fails.
-    // This triggers the "cannot create temp file for {path}" error path.
+    // Make the parent directory read-only so temp-file creation fails: the
+    // "cannot write {path}" error path.
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
     let out = lint_path(&target, &["--fix"]);
@@ -7794,13 +7794,13 @@ fn lint_in(cwd: &Path, input: &Path, extra_args: &[&str]) -> std::process::Outpu
 }
 
 /// The one wording of a fix `--fix` cannot write: the file as typed, then the cause — the
-/// kind alone of tempfile's error creating its temporary file, which names that file.
+/// operating system's refusal to create the temporary file, which names no file (#160).
 #[cfg(unix)]
 fn write_failure(typed: &Path) -> String {
     format!(
         "cannot write {}: {}",
         typed.display(),
-        std::io::ErrorKind::PermissionDenied
+        std::io::Error::from_raw_os_error(libc::EACCES)
     )
 }
 

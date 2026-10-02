@@ -32,9 +32,10 @@ use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::{
-    atomic_write_file, catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path,
-    stdout_failure, write_stdout, Durability, Panicked, StdoutOutcome, WriteTarget,
+    catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path, stdout_failure,
+    write_stdout, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
+use crate::write::{atomic_write_file, Durability, Parents};
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -170,11 +171,13 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
         if result.changed {
             // Atomic write preserves file permissions and avoids truncate-then-write
             // data loss on crash or full disk (avoids the issue fixed for lint by
-            // commit c5aa086 — both write paths now share the same helper).
+            // commit c5aa086 — both write paths now share the same helper). A file
+            // argument is anchored at its typed parent (#160).
             atomic_write_file(
                 &WriteTarget::as_typed(path.to_path_buf()),
                 &result.formatted,
                 Durability::Fsync,
+                Parents::Existing,
             )?;
             if !quiet {
                 crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
@@ -232,8 +235,9 @@ enum FileOutcome {
 ///
 /// `file` is the walk's path, below the directory argument as typed: the label of its
 /// error frames and of its `--diff` header, as a file argument typed that way is named
-/// (#390).
-fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
+/// (#390). Its rewrite is anchored at `root`, the directory argument, so a directory
+/// between the two that turned into a symlink after the walk is refused (#160).
+fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, quiet } = flags;
     let file_name = safe_path(file);
     let source = match read_source_file(file) {
@@ -290,9 +294,10 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         // data loss on crash or full disk — same guarantee as lint --fix (avoids
         // the divergence introduced after commit c5aa086 hardened the lint path).
         match atomic_write_file(
-            &WriteTarget::as_typed(file.to_path_buf()),
+            &WriteTarget::walked_below(RootPaths::as_typed(root), file),
             &result.formatted,
             Durability::Fsync,
+            Parents::Existing,
         ) {
             Ok(()) => {
                 if !quiet {
@@ -358,7 +363,7 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     let mut fail_count: usize = 0;
 
     for file in &files {
-        match format_one_file(file, flags) {
+        match format_one_file(dir, file, flags) {
             FileOutcome::Formatted | FileOutcome::WouldChange => changed_count += 1,
             FileOutcome::Unchanged | FileOutcome::NoChange => unchanged_count += 1,
             FileOutcome::Failed => fail_count += 1,

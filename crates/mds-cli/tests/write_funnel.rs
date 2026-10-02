@@ -1,20 +1,26 @@
-//! Write-funnel guard (#227): every artifact `mds` writes from production code must go
-//! through the single atomic choke point `crate::output::atomic_write_file`.
+//! Write-funnel guard (#227, #160): every artifact `mds` writes from production code must
+//! go through the single atomic choke point `crate::write::atomic_write_file`.
 //!
 //! # Why this exists
 //!
-//! `atomic_write_file` is temp-file + fsync + rename: a crash or a mid-write error never
-//! leaves a truncated artifact, and a symlink at the target is refused. A raw
-//! `std::fs::write` at any *one* remaining site silently forfeits all of that for the
-//! artifact it writes — and "did we remember every write site?" is an unbounded search
+//! `atomic_write_file` is temp-file + sync + rename below the write's anchor: a crash or a
+//! mid-write error never leaves a truncated artifact, nothing is written through a
+//! symlink below the anchor or at the target, and a replaced file keeps its mode. A raw
+//! `std::fs::write` — or a raw `create_dir_all`, `openat` or path-based
+//! `fs::set_permissions` — at any *one* remaining site silently forfeits all of that for
+//! the artifact it touches, and "did we remember every write site?" is an unbounded search
 //! that three reviewers can each answer differently. This test converts it into a
 //! machine-checked invariant: a raw write in `crates/mds-cli/src/**` is a failure unless
 //! it appears in [`ALLOWED_RAW_WRITES`] with a written justification.
 //!
+//! It also pins the tail of the primitive itself ([`primitive_pin_violations`]): the unix
+//! arm syncs the temporary file and then its directory, renames with `renameat` and
+//! restores a mode with `fchmod`; the Windows arm syncs the temporary file and persists it.
+//!
 //! # Scope and lexical limits (what this guard does NOT see)
 //!
-//! The scan is lexical. It matches the three needles in [`NEEDLES`] after masking comment
-//! and string-literal text and stripping `#[cfg(test)] mod … { … }` blocks (test code
+//! The scan is lexical. It matches the needles in [`NEEDLES`] after masking comment and
+//! string-literal text and stripping `#[cfg(test)] mod … { … }` blocks (test code
 //! legitimately writes fixtures with `std::fs::write`). It therefore does NOT catch:
 //!
 //! - `OpenOptions::new(…).write(true)` without `.create_new(` — a hand-opened `File` that
@@ -33,8 +39,19 @@ use std::path::{Path, PathBuf};
 
 /// Raw write entry points that must be funnelled. `std::fs::write(` contains
 /// `fs::write(`, so the short form matches both the qualified and imported spellings;
-/// `.create_new(` is a file a hand-built `OpenOptions` creates.
-const NEEDLES: &[&str] = &["fs::write(", "File::create(", ".create_new("];
+/// `.create_new(` is a file a hand-built `OpenOptions` creates; `create_dir_all(` creates
+/// directories by path, following any symlink in it; `openat(` is a descriptor-relative
+/// open the write primitive alone should make; `fs::set_permissions(` changes a mode by
+/// path, which a swapped component redirects (the primitive uses `fchmod` on its own
+/// descriptor).
+const NEEDLES: &[&str] = &[
+    "fs::write(",
+    "File::create(",
+    ".create_new(",
+    "create_dir_all(",
+    "openat(",
+    "fs::set_permissions(",
+];
 
 /// Production sites that may keep a raw write: `(file basename, needle, max hits, why)`.
 ///
@@ -42,13 +59,30 @@ const NEEDLES: &[&str] = &["fs::write(", "File::create(", ".create_new("];
 /// reported as dead by [`write_sites_are_funnelled`] and by
 /// [`every_allowlist_entry_is_live`], so a removed site cannot leave a stale licence
 /// behind for a future raw write to hide under.
-const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[(
-    "watch.rs",
-    ".create_new(",
-    1,
-    "test-only readiness marker: created new at <path>.tmp, never through an entry \
-     already there, then renamed — already atomic",
-)];
+const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "watch.rs",
+        ".create_new(",
+        1,
+        "test-only readiness marker: created new at <path>.tmp, never through an entry \
+         already there, then renamed — already atomic",
+    ),
+    (
+        "write.rs",
+        "create_dir_all(",
+        2,
+        "the primitive creates a missing anchor by path, as the user typed it, in its unix \
+         and its Windows arm (#160); nothing below the anchor is created this way",
+    ),
+    (
+        "write.rs",
+        "openat(",
+        5,
+        "the primitive's unix walk: the anchor (opened, then again once created), each \
+         directory below it without following a symlink (opened, then again once \
+         created), and the temporary file, created new without following one (#160)",
+    ),
+];
 
 #[test]
 fn write_sites_are_funnelled() {
@@ -76,17 +110,15 @@ fn write_sites_are_funnelled() {
         let raw = std::fs::read_to_string(file).expect("source must be readable");
         let code = strip_cfg_test_mods(&mask_comments_and_strings(&raw));
 
-        // Lexical pin for the durability tail of the primitive itself: the funnel is
-        // only worth enforcing while what sits at the end of it still fsyncs and renames.
-        if name == "output.rs" {
+        // Lexical pin for the tail of the primitive itself: the funnel is only worth
+        // enforcing while what sits at the end of it still syncs and renames.
+        if name == "write.rs" {
+            let pins = primitive_pin_violations(&code);
             assert!(
-                code.contains(".sync_all()"),
-                "output.rs must still call .sync_all() before the rename — the funnel \
-                 guard is pointless if the choke point stops being durable"
-            );
-            assert!(
-                code.contains(".persist("),
-                "output.rs must still finish the write with a .persist() rename"
+                pins.is_empty(),
+                "the write primitive's tail moved — the funnel guard is pointless if the \
+                 choke point stops being durable or anchored:\n{}",
+                pins.join("\n")
             );
             durability_pin_checked = true;
         }
@@ -116,7 +148,7 @@ fn write_sites_are_funnelled() {
 
     assert!(
         durability_pin_checked,
-        "non-vacuity: output.rs was never scanned — the walk did not reach the choke point"
+        "non-vacuity: write.rs was never scanned — the walk did not reach the choke point"
     );
 
     // Anti-rot: an allow-list entry whose site is gone would licence a future raw write.
@@ -137,8 +169,8 @@ fn write_sites_are_funnelled() {
     assert!(
         violations.is_empty(),
         "raw write sites outside the atomic funnel ({} found).\n{}\n\n\
-         Route the write through `crate::output::atomic_write_file` (and create the parent \
-         directory first — the primitive deliberately does not). If a site genuinely must \
+         Route the write through `crate::write::atomic_write_file` — `Parents::Create` \
+         makes it create the directories an output goes in. If a site genuinely must \
          stay raw, add it to ALLOWED_RAW_WRITES with a written justification.",
         violations.len(),
         violations.join("\n")
@@ -195,6 +227,137 @@ fn the_guard_flags_a_planted_raw_write() {
         1,
         "a planted create_new open in a plain fn must be flagged"
     );
+
+    // And the anchored write's own entry points (#160): a directory created by path, a
+    // descriptor-relative open, and a mode changed by path.
+    for planted in [
+        "fn f(p: &Path) { let _ = std::fs::create_dir_all(p); }",
+        "fn f(d: BorrowedFd, n: &OsStr) { let _ = rustix::fs::openat(d, n, OFlags::RDONLY, Mode::empty()); }",
+        "fn f(p: &Path) { let _ = std::fs::set_permissions(p, Permissions::from_mode(0o600)); }",
+    ] {
+        assert_eq!(scan_violation_count(planted), 1, "must be flagged: {planted}");
+    }
+    // A mode set through the file's own descriptor is not a path-based call.
+    assert_eq!(
+        scan_violation_count(
+            "fn f(file: &File, p: Permissions) { let _ = file.set_permissions(p); }"
+        ),
+        0,
+        "File::set_permissions works on the open file"
+    );
+}
+
+/// The primitive's tail, pinned on synthetic sources: a unix arm that syncs the temporary
+/// file and its directory, renames with `renameat` and restores a mode with `fchmod`, and
+/// a Windows arm that syncs the temporary file and persists it, pass; each one dropped,
+/// alone, fails.
+#[test]
+fn the_primitive_pins_flag_a_tail_that_stopped_syncing() {
+    let unix = |body: &str| {
+        format!("mod unix {{ fn w() {{ {body} }} }}\nmod windows {{ fn w() {{ t.as_file().sync_all(); t.persist(p); }} }}")
+    };
+    let complete =
+        unix("fs::fchmod(&f, m); f.sync_all(); fs::renameat(d, t, d, n); dir.sync_all();");
+    assert_eq!(primitive_pin_violations(&complete), Vec::<String>::new());
+
+    for (dropped, body) in [
+        (
+            "the directory sync",
+            "fs::fchmod(&f, m); f.sync_all(); fs::renameat(d, t, d, n);",
+        ),
+        (
+            "renameat",
+            "fs::fchmod(&f, m); f.sync_all(); std::fs::rename(t, n); dir.sync_all();",
+        ),
+        (
+            "fchmod",
+            "f.sync_all(); fs::renameat(d, t, d, n); dir.sync_all();",
+        ),
+    ] {
+        assert_eq!(
+            primitive_pin_violations(&unix(body)).len(),
+            1,
+            "dropping {dropped} must be flagged"
+        );
+    }
+    let windows = complete.replace("t.as_file().sync_all();", "");
+    assert_eq!(
+        primitive_pin_violations(&windows).len(),
+        1,
+        "the Windows sync"
+    );
+    let windows = complete.replace("t.persist(p);", "");
+    assert_eq!(
+        primitive_pin_violations(&windows).len(),
+        1,
+        "the Windows persist"
+    );
+    assert_eq!(
+        primitive_pin_violations("fn f() {}").len(),
+        2,
+        "a primitive with neither arm"
+    );
+}
+
+/// What the primitive's masked source `code` no longer does at its tail: one line per
+/// pin missed. The unix arm (`mod unix`) must call `.sync_all()` exactly twice — the
+/// temporary file before the rename and its directory after it, the durable tier's two
+/// syncs — rename with `renameat(` and restore a replaced file's mode with `fchmod(`;
+/// the Windows arm (`mod windows`) must call `.sync_all()` exactly once and `.persist(`.
+fn primitive_pin_violations(code: &str) -> Vec<String> {
+    let mut missed = Vec::new();
+    match module_block(code, "unix") {
+        Some(unix) => {
+            let syncs = count_occurrences(unix, ".sync_all()");
+            if syncs != 2 {
+                missed.push(format!(
+                    "  mod unix: {syncs} .sync_all() call(s); the temporary file and its \
+                     directory need one each"
+                ));
+            }
+            for (needle, why) in [
+                (
+                    "renameat(",
+                    "the rename relative to the directory it walked to",
+                ),
+                (
+                    "fchmod(",
+                    "the mode restored on the temporary file's own descriptor",
+                ),
+            ] {
+                if !unix.contains(needle) {
+                    missed.push(format!("  mod unix: no {needle}: {why}"));
+                }
+            }
+        }
+        None => missed.push("  no mod unix".to_owned()),
+    }
+    match module_block(code, "windows") {
+        Some(windows) => {
+            let syncs = count_occurrences(windows, ".sync_all()");
+            if syncs != 1 || !windows.contains(".persist(") {
+                missed.push(format!(
+                    "  mod windows: {syncs} .sync_all() call(s) and .persist( {}",
+                    if windows.contains(".persist(") {
+                        "present"
+                    } else {
+                        "missing"
+                    }
+                ));
+            }
+        }
+        None => missed.push("  no mod windows".to_owned()),
+    }
+    missed
+}
+
+/// The body of `mod name { … }` in already-masked source, brace-matched.
+fn module_block<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    let header = format!("mod {name} {{");
+    let start = code.find(&header)?;
+    let open = start + header.len() - 1;
+    let close = match_brace(code, open)?;
+    Some(&code[open..=close])
 }
 
 /// Anti-rot companion: every allow-list entry names a file that exists and still contains

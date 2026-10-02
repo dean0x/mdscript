@@ -6858,12 +6858,9 @@ fn watch_failed_startup_write_keeps_the_compiled_kinds_route() {
     let shown = Path::new(".").join("chat.json");
 
     let (child, tap) = watch(dir.path());
-    let startup = wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+    let startup = wait_for_tap(&tap, "cannot write", TIMEOUT);
     assert!(
-        squash(&startup).contains(&squash(&format!(
-            "cannot rename temp file to {}:",
-            shown.display()
-        ))),
+        squash(&startup).contains(&squash(&format!("cannot write {}:", shown.display()))),
         "the startup error names the .json output as typed; stderr: {startup}"
     );
 
@@ -6932,7 +6929,7 @@ fn watch_failed_startup_write_keeps_the_compiled_dependencies() {
             .stdout(Stdio::null()),
     );
     // Control: the startup write fails.
-    wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+    wait_for_tap(&tap, "cannot write", TIMEOUT);
 
     std::fs::remove_dir(&out).unwrap();
     write_atomic(&part, "@define who():\nPlanet\n@end\n\n@export who\n");
@@ -6968,7 +6965,7 @@ fn watch_failed_startup_write_warns_about_the_output_extension_once() {
         // prints the `-o` warning.
         let stderr = tap.finish_text(&mut child);
         assert!(
-            squash(&stderr).contains(&squash("cannot rename temp file to out.json:")),
+            squash(&stderr).contains(&squash("cannot write out.json:")),
             "the startup write fails; stderr: {stderr}"
         );
         (
@@ -7184,10 +7181,10 @@ fn watch_dir_failed_startup_write_is_retried_on_the_next_rebuild() {
             .args(["--debounce", "0", "--poll-interval", "0"])
             .stdout(Stdio::null()),
     );
-    let startup = wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+    let startup = wait_for_tap(&tap, "cannot write", TIMEOUT);
     assert!(
         squash(&startup).contains(&squash(&format!(
-            "cannot rename temp file to {}:",
+            "cannot write {}:",
             shown("a.md").display()
         ))),
         "the startup write of a.md fails; stderr: {startup}"
@@ -7264,10 +7261,10 @@ fn watch_dir_failed_rebuild_write_keeps_the_compiled_dependencies() {
     std::fs::remove_file(&a_out).unwrap();
     std::fs::create_dir(&a_out).unwrap();
     write_atomic(&a, "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n");
-    let failed = wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+    let failed = wait_for_tap(&tap, "cannot write", TIMEOUT);
     assert!(
         squash(&failed).contains(&squash(&format!(
-            "cannot rename temp file to {}:",
+            "cannot write {}:",
             Path::new("root").join("a.md").display()
         ))),
         "the rebuild's write of a.md fails; stderr: {failed}"

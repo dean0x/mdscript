@@ -321,8 +321,9 @@ fn source_map_lines_under_an_out_dir_name_the_out_dir_as_typed() {
     assert_eq!(leak(&stderr, dir.path()), None, "stderr: {stderr}");
 }
 
-/// An output directory that cannot be created is named as its output is: below
-/// `--out-dir` as typed, and below the directory `mds.json` was reached by.
+/// An output whose directory cannot be created is named as its `Compiled to` line would
+/// name it, in the one wording of a failed write (#160): below `--out-dir` as typed, and
+/// below the directory `mds.json` was reached by.
 #[test]
 fn an_output_directory_that_cannot_be_created_is_named_as_its_output_is() {
     let dir = scratch();
@@ -338,14 +339,14 @@ fn an_output_directory_that_cannot_be_created_is_named_as_its_output_is() {
         (
             dir.path(),
             &["build", "src", "--out-dir", "out"][..],
-            "out/sub",
+            "out/sub/page.md",
         ),
-        (proj.as_path(), &["build", "page.mds"][..], "./dist"),
+        (proj.as_path(), &["build", "page.mds"][..], "./dist/page.md"),
     ] {
         let out = run(cwd, args);
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
-        let expected = format!("cannot create output directory {}: ", native(shown));
+        let expected = format!("cannot write {}: ", native(shown));
         assert!(
             stderr.contains(&expected),
             "{args:?}: stderr must hold {expected:?}; got: {stderr}"
@@ -1745,10 +1746,10 @@ fn plant_symlink(root: &Path, rel: &str) {
 /// the cause after it names no path (#390): below a directory argument's `--out-dir` and
 /// below `mds.json` `build.output_dir`, where the write goes to the directory's canonical
 /// path, as well as under `-o`, below a file argument's `--out-dir` and beside the source
-/// — in `cannot write …`, in `could not remove stale output …`, and in
-/// `cannot create temp file for …`, whose cause is the error's kind alone where tempfile
-/// added the temporary file's absolute path to it. Each error's presence is the control
-/// for the absence of the scratch directory from the run's output.
+/// — in `cannot write …`, whichever step of the write failed (#160), and in `could not
+/// remove stale output …`; the cause is the operating system's, which names no file, the
+/// temporary one included. Each error's presence is the control for the absence of the
+/// scratch directory from the run's output.
 ///
 /// Unix-only: it plants symlinks and makes a directory read-only; the read-only arm is
 /// skipped with a reason where the mode does not stop a write (running as root).
@@ -1822,7 +1823,7 @@ fn an_error_writing_an_output_names_it_as_its_status_line_does() {
         assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
     }
 
-    // A temporary file in a read-only directory: tempfile's error names the file.
+    // A temporary file in a read-only directory: the write's own file is never named.
     std::fs::create_dir(root.join("ro")).unwrap();
     std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
     let _writable = Writable(root.join("ro"));
@@ -1835,8 +1836,8 @@ fn an_error_writing_an_output_names_it_as_its_status_line_does() {
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     let error = format!(
-        "cannot create temp file for ro/y.md: {}",
-        std::io::ErrorKind::PermissionDenied
+        "cannot write ro/y.md: {}",
+        std::io::Error::from_raw_os_error(libc::EACCES)
     );
     assert!(
         squash(&stderr).contains(&squash(&error)),
