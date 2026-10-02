@@ -1287,11 +1287,22 @@ type WrittenEntry = (Option<WriteTarget>, Vec<PathBuf>, String);
 enum CompileWriteOutcome {
     /// Compiled, routed and written.
     Written(WrittenEntry),
-    /// A failure — compile or write — that `mds watch` keeps watching through. `Some` is
-    /// the failure to report; `None` one reported already: a compile that panicked, which
-    /// the panic hook reported (#389), or a repeat of a stdout failure
+    /// The compile failed, so the output's kind is unknown — and with it the route an
+    /// output of that kind takes. `mds watch` keeps watching. `Some` is the failure to
+    /// report; `None` a compile that panicked, which the panic hook reported (#389).
+    CompileFailed(Option<miette::Report>),
+    /// Compiled and routed, but not written. The route the compiled kind decided and the
+    /// dependencies the compile reported stay the session's (#257): every rebuild writes
+    /// there and is triggered by them. `mds watch` keeps watching. `failure`: `Some` to
+    /// report; `None` a repeat of a stdout failure reported already
     /// ([`OutputWrite::Failed`]).
-    Failed(Option<miette::Report>),
+    WriteFailed {
+        /// Where the compiled kind is written; `None` is stdout (`-o -`).
+        output_path: Option<WriteTarget>,
+        /// Transitive dependency paths, as graph keys ([`graph_keys`]).
+        deps: Vec<PathBuf>,
+        failure: Option<miette::Report>,
+    },
     /// `-o -` and stdout's reader is gone: `mds watch` stops (#157).
     StdoutClosed,
 }
@@ -1364,8 +1375,9 @@ fn write_session_output(
 /// kind and the entry's two forms — written beside `entry.canonical`, named beside
 /// `entry.typed` (#390) — and write: file mode's startup compile.
 ///
-/// Returns a [`CompileWriteOutcome`]. Its `Failed` variant is a failure `mds watch`
-/// reports and keeps watching through: the compile, the write; `StdoutClosed` ends the
+/// Returns a [`CompileWriteOutcome`]. `CompileFailed` and `WriteFailed` are failures
+/// `mds watch` reports and keeps watching through — a failed write still carries the
+/// route and the dependencies its compile decided (#257); `StdoutClosed` ends the
 /// session before it goes live, with exit 0 (#157). The `Err` this function
 /// itself returns is an output route no rebuild can use, which ends `mds watch` at
 /// startup (exit 2), since every rebuild writes where startup resolved: a route that
@@ -1396,7 +1408,7 @@ fn compile_and_write(
 ) -> Result<CompileWriteOutcome> {
     let compiled = match entry.compile(runtime_vars, quiet) {
         Ok(compiled) => compiled,
-        Err(failure) => return Ok(CompileWriteOutcome::Failed(failure.unreported())),
+        Err(failure) => return Ok(CompileWriteOutcome::CompileFailed(failure.unreported())),
     };
     let output_path =
         resolve_output_path_for_kind(Some(entry.paths()), output, out_dir, config, compiled.kind)?;
@@ -1415,7 +1427,11 @@ fn compile_and_write(
                 graph_keys(&compiled.dependencies),
                 compiled.content,
             )),
-            OutputWrite::Failed(e) => CompileWriteOutcome::Failed(e),
+            OutputWrite::Failed(failure) => CompileWriteOutcome::WriteFailed {
+                output_path,
+                deps: graph_keys(&compiled.dependencies),
+                failure,
+            },
             OutputWrite::StdoutClosed => CompileWriteOutcome::StdoutClosed,
         },
     )
@@ -1442,7 +1458,8 @@ struct FileCompileCtx {
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
     /// Where every rebuild writes, resolved once at startup: from the startup compile's
-    /// kind (intrinsic extension), or the Markdown fallback of a failed startup compile.
+    /// kind (intrinsic extension), written or not, or the Markdown fallback of a failed
+    /// startup compile.
     /// `None` is stdout (`-o -`). A route that fails to resolve never gets here: it ends
     /// `mds watch` at startup.
     output_path: Option<WriteTarget>,
@@ -2041,21 +2058,38 @@ fn run_watch_file(
             stop_watching(quiet, StopReason::StdoutClosed);
             return Ok(());
         }
-        CompileWriteOutcome::Failed(e) => {
-            // Initial compile or write error: print and continue watching (entry dir
-            // still watched).
+        // Compiled and routed, but not written: report it and keep watching, with the
+        // route the compiled kind decided and the dependencies the compile reported — a
+        // `.json` output stays `.json`, and an edit to a dependency rebuilds (#257).
+        // Nothing was written, so the dedup map below stays empty and the next rebuild
+        // writes even when its output has not changed.
+        CompileWriteOutcome::WriteFailed {
+            output_path,
+            deps,
+            failure,
+        } => {
+            settle(
+                SettleInto::FileStartup,
+                failure,
+                Settle::MarkErrored(&entry.canonical),
+            );
+            (output_path, deps, String::new())
+        }
+        CompileWriteOutcome::CompileFailed(e) => {
+            // Initial compile error: print and continue watching (entry dir still
+            // watched).
             settle(
                 SettleInto::FileStartup,
                 e,
                 Settle::MarkErrored(&entry.canonical),
             );
-            // Fall back: resolve output path with Markdown kind as a placeholder so we
-            // know where to watch. This path may not match a later successful compile if
-            // the template has @message blocks, and every rebuild reuses it
-            // (`FileCompileCtx.output_path`) — so it can be the entry itself, which
-            // `rebuild_file` refuses to write over (#425). A route that fails to resolve
-            // is refused here as after a successful compile (exit 2): no rebuild could
-            // write anywhere else.
+            // Fall back: the kind is unknown, so resolve the output path with the Markdown
+            // kind as a placeholder to know where to watch. This path may not match a later
+            // successful compile if the template has @message blocks, and every rebuild
+            // reuses it (`FileCompileCtx.output_path`) — so it can be the entry itself,
+            // which `rebuild_file` refuses to write over (#425). A route that fails to
+            // resolve is refused here as after a successful compile (exit 2): no rebuild
+            // could write anywhere else.
             let fallback_path = resolve_output_path_for_kind(
                 Some(entry.paths()),
                 &output,
@@ -2129,8 +2163,8 @@ fn run_watch_file(
     // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
     let mut last_written: HashMap<OutputKey, String> = HashMap::new();
     if !initial_content.is_empty() {
-        // initial_content is empty only when the initial compile failed (error path above).
-        // In that case leave last_written empty so the next successful rebuild always writes.
+        // initial_content is empty when the initial compile or write failed (above). In
+        // that case leave last_written empty so the next successful rebuild always writes.
         last_written.insert(OutputKey::of(output_path.as_ref()), initial_content);
     }
 
@@ -5176,7 +5210,10 @@ mod tests {
         let (_written_path, deps, _content) =
             match compile_and_write(&watched, &Some(out_str), &None, &None, None, true).unwrap() {
                 CompileWriteOutcome::Written(result) => result,
-                CompileWriteOutcome::Failed(e) => panic!("compile_and_write failed: {e:?}"),
+                CompileWriteOutcome::CompileFailed(e) => panic!("the compile failed: {e:?}"),
+                CompileWriteOutcome::WriteFailed { failure, .. } => {
+                    panic!("the write failed: {failure:?}")
+                }
                 CompileWriteOutcome::StdoutClosed => {
                     panic!("compile_and_write writes a file here, never stdout")
                 }
@@ -5199,6 +5236,75 @@ mod tests {
         assert!(
             dep_names.iter().any(|n| n == "helper.mds"),
             "deps should contain helper.mds, got: {dep_names:?}"
+        );
+    }
+
+    /// #257: a write that fails after the compile succeeded keeps what the compile
+    /// decided — the route of its kind, `.json` for a messages template, and the
+    /// dependencies it reported — and reports the failure naming that output. Only a
+    /// compile that fails leaves the kind unknown.
+    #[test]
+    fn compile_and_write_tells_a_failed_write_from_a_failed_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("part.mds"),
+            "@define who():\nWorld\n@end\n\n@export who\n",
+        )
+        .unwrap();
+        let entry = dir.path().join("chat.mds");
+        std::fs::write(
+            &entry,
+            "@import \"./part.mds\" as p\n@message user:\nHello {{p.who()}}\n@end\n",
+        )
+        .unwrap();
+        // A directory at the output path: no write replaces it.
+        std::fs::create_dir(dir.path().join("chat.json")).unwrap();
+        let watched = WatchedPath {
+            canonical: mds::NativeFs::check_symlink(&entry).unwrap(),
+            typed: entry.clone(),
+            what: Watched::Entry,
+        };
+        let name = |path: &Path| path.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+
+        match compile_and_write(&watched, &None, &None, &None, None, true).unwrap() {
+            CompileWriteOutcome::WriteFailed {
+                output_path,
+                deps,
+                failure,
+            } => {
+                assert_eq!(
+                    written_path(&output_path).and_then(name).as_deref(),
+                    Some("chat.json"),
+                    "the route of the compiled kind"
+                );
+                let dep_names: Vec<_> = deps.iter().filter_map(|d| name(d)).collect();
+                assert!(
+                    dep_names.iter().any(|n| n == "part.mds"),
+                    "the dependencies the compile reported: {dep_names:?}"
+                );
+                let failure = failure.expect("a failed write is reported").to_string();
+                assert!(
+                    failure.contains("chat.json"),
+                    "the failure names the output: {failure}"
+                );
+            }
+            CompileWriteOutcome::CompileFailed(e) => panic!("the compile failed: {e:?}"),
+            CompileWriteOutcome::Written(_) => panic!("a directory is never written over"),
+            CompileWriteOutcome::StdoutClosed => panic!("the output is a file, never stdout"),
+        }
+        assert!(
+            !dir.path().join("chat.md").exists(),
+            "nothing is written on the Markdown route"
+        );
+
+        // Control: a compile that fails.
+        std::fs::write(&entry, "Hello {{name\n").unwrap();
+        assert!(
+            matches!(
+                compile_and_write(&watched, &None, &None, &None, None, true).unwrap(),
+                CompileWriteOutcome::CompileFailed(Some(_))
+            ),
+            "a failed compile is reported as one"
         );
     }
 

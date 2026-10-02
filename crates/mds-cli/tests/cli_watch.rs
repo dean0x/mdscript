@@ -6825,6 +6825,124 @@ fn watch_startup_route_refusal_controls() {
     drop(child);
 }
 
+// ── A failed startup write keeps what the compile decided (#257) ───────────────
+//
+// A startup compile that fails leaves the output's kind unknown, so the session takes
+// the Markdown route. A startup write that fails follows a compile that succeeded: the
+// route its kind decided and the dependencies it reported stay the session's. The write
+// fails on a directory standing at the output path, which no write replaces on any OS or
+// under any privilege; removing the directory removes the cause. `--poll-interval 0`
+// turns the idle tick off, so every rebuild is the test's own edit's and nothing
+// rediscovers what startup dropped.
+
+/// A messages template whose `.json` output cannot be written at startup keeps the
+/// `.json` route (#257): the startup error names `./chat.json` as typed, and once the
+/// obstacle is gone an edit writes `chat.json`; no `chat.md` is ever created. It used to
+/// take the Markdown route of a failed compile, and write the JSON into `chat.md`.
+/// Control: a startup compile that fails still takes the Markdown route.
+#[test]
+fn watch_failed_startup_write_keeps_the_compiled_kinds_route() {
+    let watch = |dir: &Path| {
+        spawn_ready(
+            mds_bin()
+                .current_dir(dir)
+                .args(["watch", "chat.mds"])
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("chat.mds");
+    let json = dir.path().join("chat.json");
+    let md = dir.path().join("chat.md");
+    std::fs::write(&src, "@message user:\nWhat is 2+2?\n@end\n").unwrap();
+    std::fs::create_dir(&json).unwrap();
+    // As `mds build chat.mds` names its output.
+    let shown = Path::new(".").join("chat.json");
+
+    let (child, tap) = watch(dir.path());
+    let startup = wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+    assert!(
+        squash(&startup).contains(&squash(&format!(
+            "cannot rename temp file to {}:",
+            shown.display()
+        ))),
+        "the startup error names the .json output as typed; stderr: {startup}"
+    );
+
+    std::fs::remove_dir(&json).unwrap();
+    write_atomic(&src, "@message user:\nWhat is 3+3?\n@end\n");
+    // The ordered anchor: a rebuild writes its output before it prints `Recompiled`.
+    let stderr = wait_for_tap(&tap, "Recompiled", TIMEOUT);
+    assert!(
+        !md.exists(),
+        "no Markdown output is ever created; chat.md holds {:?}; stderr: {stderr}",
+        std::fs::read_to_string(&md).ok()
+    );
+    assert!(
+        squash(&stderr).contains(&squash(&format!("Recompiled {}", shown.display()))),
+        "the rebuild writes the .json output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(&json).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&written).expect("the .json output is JSON");
+    assert!(
+        parsed.is_array() && written.contains("What is 3+3?"),
+        "chat.json holds the rebuilt messages: {written}"
+    );
+    drop(child);
+
+    // Control: a startup compile that fails leaves the kind unknown, so the session
+    // takes the Markdown route, which the first rebuild that compiles writes.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("chat.mds");
+    let md = dir.path().join("chat.md");
+    std::fs::write(&src, "Hello {{name\n").unwrap();
+    let (child, tap) = watch(dir.path());
+    wait_for_tap(&tap, "mds::syntax", TIMEOUT);
+    write_atomic(&src, "Hello fixed\n");
+    assert!(
+        wait_for_file_contains(&md, "Hello fixed", TIMEOUT),
+        "control: after a failed startup compile the rebuild writes chat.md; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// A failed startup write keeps the dependencies the compile reported (#257): once the
+/// obstacle is gone, an edit to the imported partial rebuilds the entry and writes it.
+/// They used to be dropped with the write, so with no idle tick to find them again only
+/// an edit to the entry itself rebuilt it.
+#[test]
+fn watch_failed_startup_write_keeps_the_compiled_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("part.mds");
+    let src = dir.path().join("page.mds");
+    let out = dir.path().join("page.md");
+    std::fs::write(&part, "@define who():\nWorld\n@end\n\n@export who\n").unwrap();
+    std::fs::write(&src, "@import \"./part.mds\" as p\nHello {{p.who()}}!\n").unwrap();
+    std::fs::create_dir(&out).unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.mds"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    // Control: the startup write fails.
+    wait_for_tap(&tap, "cannot rename temp file to", TIMEOUT);
+
+    std::fs::remove_dir(&out).unwrap();
+    write_atomic(&part, "@define who():\nPlanet\n@end\n\n@export who\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello Planet!", TIMEOUT),
+        "an edit to the imported partial rebuilds the entry; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
 // ── Streams: a gone stdout reader, a closed stderr, a failing write (#157) ──────
 //
 // A closed pipe — its reader gone — never changes how `mds watch` exits. With `-o -`,
