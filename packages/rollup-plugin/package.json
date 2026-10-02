@@ -46,7 +46,7 @@
   "devDependencies": {
     "@mdscript/mds": "file:../mds",
     "@types/node": "^26.2.0",
-    "rollup": "^4.62.4",
+    "rollup": "^4.63.1",
     "typescript": "^6.0.3"
   }
 }
