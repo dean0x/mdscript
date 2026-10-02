@@ -50,7 +50,7 @@
     "@mdscript/mds-napi": "^0.4.4"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.4.1",
     "typescript": "^6.0.3"
   }
 }
