@@ -42,7 +42,18 @@ pub(crate) trait ResultSink {
 
     /// An input's findings. `text` is the source they index, when it was read: an entry of a
     /// directory under `--format json` is not read to report its findings.
-    fn findings(&mut self, input: &LintSource<'_>, findings: &mds::LintResult, text: Option<&str>);
+    ///
+    /// `truncated` is whether the findings the input is left with stopped at the diagnostic
+    /// cap, the `truncated` of its JSON document (#309). It is these findings' own flag
+    /// except in a preview, which shows the input's own findings but is truncated only
+    /// when the findings its fix would leave are.
+    fn findings(
+        &mut self,
+        input: &LintSource<'_>,
+        findings: &mds::LintResult,
+        text: Option<&str>,
+        truncated: bool,
+    );
 
     /// An entry of a directory that could not be linted — or, under `--format json`, read to
     /// fix it. Not `--quiet`: it is an error.
@@ -74,12 +85,12 @@ pub(crate) trait ResultSink {
     /// A directory run starts linting its entries.
     fn start_document(&mut self);
 
-    /// A directory run has linted every entry; `truncated` when any entry's findings stopped
-    /// at the diagnostic cap.
+    /// A directory run has linted every entry; `truncated` when the findings any entry is
+    /// left with stopped at the diagnostic cap.
     fn end_document(&mut self, truncated: bool);
 
-    /// The diagnostic-cap notice, for a capped result under `--fix`. A directory's entry names
-    /// its file. `--quiet` suppresses it.
+    /// The diagnostic-cap notice, for an input whose own findings stopped at the cap, in
+    /// every mode (#309). A directory's entry names its file. `--quiet` suppresses it.
     fn cap_reached(&mut self, input: &LintSource<'_>) {
         if self.quiet() {
             return;
@@ -247,7 +258,13 @@ impl ResultSink for HumanSink {
 
     /// Each finding in its frame, named with the input's display label. `--quiet` suppresses
     /// warning- and info-severity findings; errors always show.
-    fn findings(&mut self, input: &LintSource<'_>, findings: &mds::LintResult, text: Option<&str>) {
+    fn findings(
+        &mut self,
+        input: &LintSource<'_>,
+        findings: &mds::LintResult,
+        text: Option<&str>,
+        _truncated: bool,
+    ) {
         for diag in &findings.diagnostics {
             render_diag_human(diag, self.quiet, input.display_label(), text);
         }
@@ -364,19 +381,20 @@ impl ResultSink for JsonSink {
         self.quiet
     }
 
-    /// Into the directory's document during a directory run; otherwise the input's own
-    /// document, on stdout.
+    /// Into the directory's document during a directory run, whose `truncated` comes at
+    /// [`ResultSink::end_document`]; otherwise the input's own document, on stdout.
     fn findings(
         &mut self,
         _input: &LintSource<'_>,
         findings: &mds::LintResult,
         _text: Option<&str>,
+        truncated: bool,
     ) {
         let files = files_of(findings);
         match self.document.as_mut() {
             Some(document) => document.extend(files),
             None => {
-                emit_stdout(&json_line(&files_document(files, findings.truncated)));
+                emit_stdout(&json_line(&files_document(files, truncated)));
             }
         }
     }

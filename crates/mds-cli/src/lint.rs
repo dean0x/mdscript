@@ -829,7 +829,8 @@ struct InputVerdict {
     tally: FileTally,
     /// A `--fix` preview found something to fix.
     would_fix: bool,
-    /// The findings stopped at the diagnostic cap.
+    /// The findings the input is left with stopped at the diagnostic cap
+    /// ([`Outcome::truncated`]).
     truncated: bool,
 }
 
@@ -884,7 +885,8 @@ impl DirSummary {
         self
     }
 
-    /// Whether any file's findings stopped at the diagnostic cap.
+    /// Whether the findings any file is left with stopped at the diagnostic cap: the
+    /// directory document's `truncated`.
     fn truncated(&self) -> bool {
         self.verdict.truncated
     }
@@ -913,8 +915,9 @@ fn analysis_failed(
 /// by [`lint_dir_entry`] — and shown by [`render`].
 struct FileReport<'a> {
     input: LintSource<'a>,
-    /// The findings stopped at the diagnostic cap.
-    truncated: bool,
+    /// The input's own findings stopped at the diagnostic cap, so [`render`] announces the
+    /// cap — whatever a fix leaves.
+    capped: bool,
     outcome: Outcome,
 }
 
@@ -955,6 +958,33 @@ enum Outcome {
         output: String,
         fix: FilterFix,
     },
+}
+
+impl Outcome {
+    /// Whether the findings the input is left with stopped at the diagnostic cap — its
+    /// JSON document's `truncated`, in every mode (#309): its own findings when nothing is
+    /// fixed, the findings a fix leaves, or — in a preview, which shows the input's own
+    /// findings — those its fix would leave. An input the output records as a failure is
+    /// left with no findings there, so it is never truncated.
+    fn truncated(&self) -> bool {
+        match self {
+            Outcome::Reported { findings, .. } | Outcome::Filtered { findings, .. } => {
+                findings.truncated
+            }
+            Outcome::Failed { .. } | Outcome::Panicked => false,
+            Outcome::Previewed { findings, fix, .. } => match fix {
+                PreviewFix::Pending { residual, .. } => residual.truncated,
+                PreviewFix::Refused { .. } | PreviewFix::Nothing => findings.truncated,
+            },
+            Outcome::Rewritten { findings, fix, .. } => match fix {
+                Rewrite::Refused { .. } | Rewrite::Unchanged => findings.truncated,
+                Rewrite::Written { residual, .. } => residual.findings.truncated,
+                Rewrite::WriteFailed { residual, .. } => residual
+                    .as_ref()
+                    .is_some_and(|residual| residual.findings.truncated),
+            },
+        }
+    }
 }
 
 /// What `--fix` would do, in a preview.
@@ -1037,7 +1067,7 @@ fn lint_input<'a>(
     // Every finding carries the input's name — each `diag.file`, hence the JSON
     // `files[].file` key — rather than the name `mds::lint` gave it.
     set_diag_display_path(&mut result, input.display_label());
-    let truncated = result.truncated;
+    let capped = result.truncated;
 
     if !flags.fix {
         let outcome = Outcome::Reported {
@@ -1046,7 +1076,7 @@ fn lint_input<'a>(
         };
         return FileReport {
             input,
-            truncated,
+            capped,
             outcome,
         };
     }
@@ -1061,7 +1091,7 @@ fn lint_input<'a>(
             };
             return FileReport {
                 input,
-                truncated,
+                capped,
                 outcome,
             };
         }
@@ -1086,7 +1116,7 @@ fn lint_input<'a>(
         Err(Panicked) => {
             return FileReport {
                 input,
-                truncated,
+                capped,
                 outcome: Outcome::Panicked,
             }
         }
@@ -1103,7 +1133,7 @@ fn lint_input<'a>(
     };
     FileReport {
         input,
-        truncated,
+        capped,
         outcome,
     }
 }
@@ -1244,7 +1274,8 @@ fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -
 /// Show `report` through `sink`, and return what the input came to (#309). The sink shows
 /// each part in its format; the order is decided here, per mode:
 ///
-/// - A capped result is announced first, under `--fix` only.
+/// - An input whose own findings stopped at the diagnostic cap announces it first, in every
+///   mode — a report, a preview, a fix, a failure (#309).
 /// - A preview shows its diff, `Would fix:` or `fix rejected:`, then the input's own
 ///   findings.
 /// - A rewrite that landed shows the findings the file is left with, rendered against the
@@ -1256,15 +1287,16 @@ fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -
 fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
     let FileReport {
         input,
-        truncated,
+        capped,
         outcome,
     } = report;
-    if truncated && !matches!(outcome, Outcome::Reported { .. }) {
+    if capped {
         sink.cap_reached(&input);
     }
+    let truncated = outcome.truncated();
     let (tally, would_fix) = match outcome {
         Outcome::Reported { findings, text } => {
-            sink.findings(&input, &findings, text.as_deref());
+            sink.findings(&input, &findings, text.as_deref(), truncated);
             sink.clean(&input, &findings);
             (tally_from_result(&findings), false)
         }
@@ -1308,7 +1340,7 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
                 }
                 PreviewFix::Nothing => (tally_from_result(&findings), false),
             };
-            sink.findings(&input, &findings, Some(&text));
+            sink.findings(&input, &findings, Some(&text), truncated);
             verdict
         }
         Outcome::Rewritten {
@@ -1318,22 +1350,22 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
         } => match fix {
             Rewrite::Refused { reason } => {
                 sink.fix_rejected(&input, &reason);
-                sink.findings(&input, &findings, Some(&text));
+                sink.findings(&input, &findings, Some(&text), truncated);
                 (tally_from_result(&findings), false)
             }
             Rewrite::Unchanged => {
-                sink.findings(&input, &findings, Some(&text));
+                sink.findings(&input, &findings, Some(&text), truncated);
                 sink.clean(&input, &findings);
                 (tally_from_result(&findings), false)
             }
             Rewrite::Written { residual, partial } => {
-                sink.findings(&input, &residual.findings, Some(&residual.fixed));
+                sink.findings(&input, &residual.findings, Some(&residual.fixed), truncated);
                 sink.fixed(&input, partial);
                 (tally_from_result(&residual.findings), false)
             }
             Rewrite::WriteFailed { error, residual } => {
                 if let Some(residual) = &residual {
-                    sink.findings(&input, &residual.findings, Some(&residual.fixed));
+                    sink.findings(&input, &residual.findings, Some(&residual.fixed), truncated);
                 }
                 sink.write_failed(&input, error);
                 (FileTally::Error, false)
@@ -1349,7 +1381,7 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
                 FilterFix::Refused { reason } => sink.fix_rejected(&input, &reason),
                 FilterFix::Unchanged => {}
             }
-            sink.findings(&input, &findings, Some(&output));
+            sink.findings(&input, &findings, Some(&output), truncated);
             sink.fixed_source(&output);
             (tally_from_result(&findings), false)
         }
@@ -1743,7 +1775,7 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
     let entry = move || LintSource::DirEntry { path, key };
     let failed = move |error: MdsError, tally: FileTally| FileReport {
         input: entry(),
-        truncated: false,
+        capped: false,
         outcome: Outcome::Failed { error, tally },
     };
 
@@ -1779,7 +1811,7 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
         Err(Panicked) => {
             return FileReport {
                 input: entry(),
-                truncated: false,
+                capped: false,
                 outcome: Outcome::Panicked,
             }
         }
@@ -1800,8 +1832,9 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
 mod tests {
     use super::{
         apply_fix, fix_stdin, lint_input, render, run_fix_pipeline, set_diag_display_path,
-        DirSummary, FileReport, FileTally, FixPipelineOutcome, InputVerdict, LintFlags, LintFormat,
-        LintSource, Linted, Outcome, ReverifyGate, SourceText,
+        DirSummary, FileReport, FileTally, FilterFix, FixPipelineOutcome, InputVerdict, LintFlags,
+        LintFormat, LintSource, Linted, Outcome, PreviewFix, Residual, ReverifyGate, Rewrite,
+        SourceText,
     };
     use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
     use crate::output::{safe_path, STDIN_DISPLAY_LABEL};
@@ -2233,7 +2266,7 @@ mod tests {
         sink.start_document();
         let report = FileReport {
             input,
-            truncated: false,
+            capped: false,
             outcome,
         };
         let verdict = render(report, &mut sink);
@@ -2310,14 +2343,15 @@ mod tests {
     }
 
     /// Under `--format json` a directory's entry is read only to fix it. When that read
-    /// fails, the failure is recorded as the entry and counts under "with errors", and a
-    /// capped result still marks the document truncated, as it does without `--fix`.
+    /// fails, the failure is recorded as the entry and counts under "with errors". The
+    /// entry holds no findings, so it does not mark the document truncated, though its
+    /// lint was capped (#309).
     ///
     /// The read follows a lint that read the same file, so no CLI run reaches it without a
     /// race; the capped result is crafted.
     ///
     /// Control: the same entry, readable and with nothing to fix, adds no entry, counts
-    /// clean and keeps the document truncated.
+    /// clean and marks the document truncated: the findings it is left with are its own.
     #[test]
     fn directory_json_fix_records_an_entry_it_cannot_read_as_a_failure() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2365,8 +2399,8 @@ mod tests {
             "an entry that cannot be read to fix counts under \"with errors\""
         );
         assert!(
-            verdict.truncated,
-            "the capped result still marks the document truncated"
+            !verdict.truncated,
+            "an entry recorded as a failure does not mark the document truncated"
         );
         assert_eq!(
             document,
@@ -2457,7 +2491,13 @@ mod tests {
             false
         }
 
-        fn findings(&mut self, input: &LintSource<'_>, findings: &LintResult, _: Option<&str>) {
+        fn findings(
+            &mut self,
+            input: &LintSource<'_>,
+            findings: &LintResult,
+            _: Option<&str>,
+            _: bool,
+        ) {
             let call = format!("findings ({})", findings.diagnostics.len());
             self.record(&call, input);
         }
@@ -2518,22 +2558,22 @@ mod tests {
         }
     }
 
-    /// Under `--fix` a capped result announces the cap before anything else its input shows
-    /// (#309) — for an entry of a directory under `--format json` whose read to fix it fails,
-    /// before its failure. The late-read test above reads the directory's document, which
-    /// shows the failure and the `truncated` flag but not this order; the calls `render`
-    /// makes do.
+    /// A capped result announces the cap before anything else its input shows (#309) — for
+    /// an entry of a directory under `--format json` whose read to fix it fails, before its
+    /// failure. The late-read test above reads the directory's document, which shows the
+    /// failure and the `truncated` flag but not this order; the calls `render` makes do.
     ///
     /// Controls: the same capped entry, readable with nothing to fix, announces the cap
-    /// before its findings; an uncapped entry whose read fails announces no cap.
+    /// before its findings, and so does its report without `--fix`; an uncapped entry whose
+    /// read fails announces no cap.
     #[test]
     fn a_capped_entry_that_cannot_be_read_announces_the_cap_before_its_failure() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let config = Rc::new(mds::LintConfig::default());
-        // The calls `render` makes to show the entry's report, linted to fix it as a
-        // directory run under `--format json` does.
-        let calls = |path: &Path, key: &str, result: LintResult| {
+        // The calls `render` makes to show the entry's report, linted as a directory run
+        // under `--format json` lints it with `flags`.
+        let calls_with = |flags: LintFlags, path: &Path, key: &str, result: LintResult| {
             let linted = Linted {
                 input: LintSource::DirEntry { path, key },
                 base_dir: &root,
@@ -2542,9 +2582,10 @@ mod tests {
                 result,
             };
             let mut sink = Recorder::default();
-            render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink);
+            render(lint_input(linted, flags, &None), &mut sink);
             sink.calls
         };
+        let calls = |path: &Path, key: &str, result| calls_with(DIR_JSON_FIX, path, key, result);
 
         let missing = root.join("gone.mds");
         let read_failure = code_of(
@@ -2565,11 +2606,172 @@ mod tests {
             ["cap reached x.mds", "findings (0) x.mds", "clean x.mds"],
             "control: a capped entry with nothing to fix announces the cap before its findings"
         );
+        let report = LintFlags {
+            fix: false,
+            ..DIR_JSON_FIX
+        };
+        assert_eq!(
+            calls_with(
+                report,
+                &readable,
+                "x.mds",
+                LintResult::new(vec![]).truncated()
+            ),
+            ["cap reached x.mds", "findings (0) x.mds", "clean x.mds"],
+            "a capped report announces the cap before its findings"
+        );
         assert_eq!(
             calls(&missing, "gone.mds", LintResult::new(vec![])),
             [format!("failed ({read_failure}) gone.mds")],
             "control: an uncapped result announces no cap"
         );
+    }
+
+    /// A JSON document's `truncated` is whether the findings an input is left with stopped
+    /// at the diagnostic cap (#309): its own when nothing is fixed, those a fix leaves — or,
+    /// in a preview, would leave — otherwise. An input recorded as a failure is left with no
+    /// findings in the output, so it is never truncated. Every outcome of an input whose own
+    /// findings were capped announces the cap first, whatever its `truncated`.
+    ///
+    /// Controls: an uncapped report, an uncapped residual and an uncapped filter are not
+    /// truncated, though the input's own findings were capped.
+    #[test]
+    fn truncated_is_the_residual_s_and_a_cap_is_announced_first_in_every_outcome() {
+        let capped = || LintResult::new(vec![]).truncated();
+        let uncapped = || LintResult::new(vec![]);
+        let fixed = |findings| Residual {
+            findings,
+            fixed: String::new(),
+        };
+        let unwritable = || MdsError::Io {
+            message: "unwritable".to_string(),
+        };
+        let previewed = |fix| Outcome::Previewed {
+            findings: capped(),
+            text: String::new(),
+            fix,
+        };
+        let pending = |residual| PreviewFix::Pending {
+            residual,
+            diff: None,
+            check: false,
+        };
+        let rewritten = |fix| Outcome::Rewritten {
+            findings: capped(),
+            text: String::new(),
+            fix,
+        };
+        let filtered = |findings, fix| Outcome::Filtered {
+            findings,
+            output: String::new(),
+            fix,
+        };
+        let refused = || "refused".to_string();
+        let cases = [
+            (
+                "report",
+                Outcome::Reported {
+                    findings: capped(),
+                    text: None,
+                },
+                true,
+            ),
+            (
+                "report, uncapped (control)",
+                Outcome::Reported {
+                    findings: uncapped(),
+                    text: None,
+                },
+                false,
+            ),
+            (
+                "failed",
+                Outcome::Failed {
+                    error: unwritable(),
+                    tally: FileTally::Error,
+                },
+                false,
+            ),
+            ("panicked", Outcome::Panicked, false),
+            ("preview, fix clears", previewed(pending(uncapped())), false),
+            (
+                "preview, fix leaves a cap",
+                previewed(pending(capped())),
+                true,
+            ),
+            (
+                "preview, refused",
+                previewed(PreviewFix::Refused { reason: refused() }),
+                true,
+            ),
+            ("preview, nothing", previewed(PreviewFix::Nothing), true),
+            (
+                "rewrite, refused",
+                rewritten(Rewrite::Refused { reason: refused() }),
+                true,
+            ),
+            ("rewrite, unchanged", rewritten(Rewrite::Unchanged), true),
+            (
+                "rewrite, written, uncapped (control)",
+                rewritten(Rewrite::Written {
+                    residual: fixed(uncapped()),
+                    partial: None,
+                }),
+                false,
+            ),
+            (
+                "rewrite, written",
+                rewritten(Rewrite::Written {
+                    residual: fixed(capped()),
+                    partial: Some((1, 2)),
+                }),
+                true,
+            ),
+            (
+                "rewrite, write failed, the failure is the entry",
+                rewritten(Rewrite::WriteFailed {
+                    error: unwritable(),
+                    residual: None,
+                }),
+                false,
+            ),
+            (
+                "rewrite, write failed",
+                rewritten(Rewrite::WriteFailed {
+                    error: unwritable(),
+                    residual: Some(fixed(capped())),
+                }),
+                true,
+            ),
+            (
+                "filter, fixed, uncapped (control)",
+                filtered(uncapped(), FilterFix::Fixed { partial: None }),
+                false,
+            ),
+            (
+                "filter, unchanged",
+                filtered(capped(), FilterFix::Unchanged),
+                true,
+            ),
+        ];
+        let typed = Path::new("x.mds");
+        let mut seen = Vec::new();
+        let mut expected = Vec::new();
+        for (what, outcome, truncated) in cases {
+            let report = FileReport {
+                input: LintSource::File {
+                    typed,
+                    name: "x.mds",
+                },
+                capped: true,
+                outcome,
+            };
+            let mut sink = Recorder::default();
+            let verdict = render(report, &mut sink);
+            seen.push((what, verdict.truncated, sink.calls.first().cloned()));
+            expected.push((what, truncated, Some("cap reached x.mds".to_string())));
+        }
+        assert_eq!(seen, expected);
     }
 
     /// The environment variable that makes a test run as the child [`in_a_child`] starts;
@@ -2636,7 +2838,7 @@ mod tests {
                     path: &path,
                     key: &key,
                 },
-                truncated: false,
+                capped: false,
                 outcome: Outcome::Reported {
                     findings: LintResult::new(vec![finding]),
                     text,
@@ -2725,7 +2927,7 @@ mod tests {
             let outcome = apply_fix(&input, &path, before, text, fix, LintFormat::Human);
             let report = FileReport {
                 input,
-                truncated: false,
+                capped: false,
                 outcome,
             };
             let verdict = render(report, &mut HumanSink::new(false));
@@ -2791,7 +2993,7 @@ mod tests {
             let outcome = fix_stdin(before, PARTIAL_BEFORE.to_string(), fix);
             let report = FileReport {
                 input: LintSource::Stdin,
-                truncated: false,
+                capped: false,
                 outcome,
             };
             let verdict = render(report, &mut HumanSink::new(false));

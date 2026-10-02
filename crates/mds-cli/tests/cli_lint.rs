@@ -5803,8 +5803,8 @@ fn cap_notice_honours_quiet_in_all_four_modes() {
 
     // ── Mode 4: directory, --format json (JSON result sink) ─────────────────────
     // --format json shows directory files through the JSON result sink, not the
-    // human one (Mode 3).  Its cap-notice gate (shown only under --fix and not
-    // --quiet) must also be tested;
+    // human one (Mode 3).  Its cap-notice gate (shown unless --quiet) must also be
+    // tested;
     // a regression that leaves it unguarded would pass Modes 1–3 and escape CI.
     // The same temp `dir` / `cap.mds` file is reused (not modified by --fix --check).
 
@@ -7406,4 +7406,264 @@ fn a_finding_left_by_a_fix_that_cannot_be_written_points_into_the_fixed_source()
         "a failed write",
     );
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+}
+
+// ── `truncated` and the diagnostic-cap notice (#309) ─────────────────────────
+//
+// A JSON document's `truncated` says whether the findings an input is left with stopped
+// at the diagnostic cap — its own findings in a report, the findings `--fix` leaves, or
+// those a preview's fix would leave — in every mode, for a file and a directory alike.
+// The cap notice says an input's own findings stopped at the cap: it prints in every
+// mode, a report included, before anything else about the input, and `--quiet`
+// suppresses it.
+//
+// Fixtures: one more unused frontmatter key than the cap — no fix removes one — and one
+// more empty `@if` block than the cap: `--fix` removes the 1,000 it is shown and leaves
+// the last.
+
+/// A report, and each `--fix` mode.
+const LINT_MODES: [&[&str]; 5] = [
+    &[],
+    &["--fix"],
+    &["--fix", "--check"],
+    &["--fix", "--diff"],
+    &["--fix", "--check", "--diff"],
+];
+
+/// One unused frontmatter key: one finding, under the cap.
+const UNDER_THE_CAP: &str = "---\nv0: 1\n---\nHello\n";
+
+/// One more unused frontmatter key than the diagnostic cap: an unfixable warning each.
+fn over_the_cap_unfixable() -> String {
+    use std::fmt::Write as _;
+    let mut source = String::from("---\n");
+    for i in 0..=mds::MAX_DIAGNOSTICS {
+        let _ = writeln!(source, "v{i}: 1");
+    }
+    source.push_str("---\nHello\n");
+    source
+}
+
+/// One more empty `@if` block than the diagnostic cap: a fixable warning each.
+fn over_the_cap_fixable() -> String {
+    let mut source = String::from("---\nflag: true\n---\n");
+    for _ in 0..=mds::MAX_DIAGNOSTICS {
+        source.push_str("@if flag:\n@end\n");
+    }
+    source
+}
+
+/// [`over_the_cap_fixable`] after `--fix`: the block the cap hid from the fix.
+const OVER_THE_CAP_FIXED: &str = "---\nflag: true\n---\n@if flag:\n@end\n";
+
+/// The diagnostic-cap notice for stdin or a file argument.
+fn cap_notice() -> String {
+    format!(
+        "diagnostic cap ({}) reached; further findings were suppressed — re-run --fix to \
+         continue",
+        mds::MAX_DIAGNOSTICS
+    )
+}
+
+/// The cap notice for the entry `d/x.mds` of a directory run, named with the platform's
+/// separator.
+fn entry_cap_notice() -> String {
+    format!(
+        "{}: {}",
+        "d/x.mds".replace('/', std::path::MAIN_SEPARATOR_STR),
+        cap_notice()
+    )
+}
+
+/// The first lines of `stderr`, for a failure message: a capped human report runs to
+/// hundreds of kilobytes.
+fn head_of(stderr: &str) -> Vec<&str> {
+    stderr.lines().take(3).collect()
+}
+
+/// The `truncated` flag of the JSON document a run printed last on stdout — after its
+/// diffs, under `--fix --diff`.
+fn truncated_of(out: &std::process::Output) -> bool {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document = stdout.lines().last().unwrap_or_else(|| {
+        panic!(
+            "no JSON document on stdout; stderr starts {:?}",
+            head_of(&String::from_utf8_lossy(&out.stderr))
+        )
+    });
+    let json: serde_json::Value = serde_json::from_str(document)
+        .unwrap_or_else(|e| panic!("stdout must end with the JSON document: {e}"));
+    json["truncated"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("the document has no `truncated` flag"))
+}
+
+/// No fix removes an unused key, so the findings each input is left with are its own,
+/// capped: `truncated` is true in every mode.
+///
+/// Control: one unused key is not truncated.
+#[test]
+fn truncated_is_true_for_a_capped_residual_in_every_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+
+    fs::write(&file, UNDER_THE_CAP).unwrap();
+    assert!(
+        !truncated_of(&lint_path(&file, &["--format", "json"])),
+        "control: one finding is not truncated"
+    );
+
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+    assert!(
+        truncated_of(&lint_stdin(&source, &["--format", "json"])),
+        "stdin, a report"
+    );
+    for mode in LINT_MODES {
+        let args = [mode, &["--format", "json"][..]].concat();
+        assert!(truncated_of(&lint_path(&file, &args)), "a file, {mode:?}");
+        assert!(
+            truncated_of(&lint_dir_in(tmp.path(), "d", &args)),
+            "a directory, {mode:?}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&file).unwrap(), source, "nothing to fix");
+}
+
+/// Once `--fix` clears a capped set of fixable findings — or a preview's fix would — the
+/// findings left are under the cap, so `truncated` is false, for a file and a directory
+/// alike, though a preview's document lists the input's own capped findings.
+///
+/// Control: the report fixes nothing, and is truncated.
+#[test]
+fn truncated_is_false_once_a_fix_clears_a_capped_fixable_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+    let source = over_the_cap_fixable();
+
+    let mut seen = Vec::new();
+    for mode in LINT_MODES {
+        let args = [mode, &["--format", "json"][..]].concat();
+        fs::write(&file, &source).unwrap();
+        seen.push(("a file", mode, truncated_of(&lint_path(&file, &args))));
+        fs::write(&file, &source).unwrap();
+        let dir = lint_dir_in(tmp.path(), "d", &args);
+        seen.push(("a directory", mode, truncated_of(&dir)));
+        if mode == ["--fix"] {
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                OVER_THE_CAP_FIXED,
+                "--fix removes the blocks it is shown"
+            );
+        }
+    }
+    let expected: Vec<_> = seen
+        .iter()
+        .map(|&(input, mode, _)| (input, mode, mode.is_empty()))
+        .collect();
+    assert_eq!(seen, expected, "truncated: the report's alone");
+}
+
+/// A report announces the cap of a capped input, as `--fix` does: once, first, before its
+/// findings, in either format, for stdin, a file and a directory's entry.
+///
+/// Control: an input under the cap announces none.
+#[test]
+fn a_report_announces_the_cap_first_in_every_input_and_format() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+
+    fs::write(&file, UNDER_THE_CAP).unwrap();
+    let control = lint_path(&file, &[]);
+    let stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        stderr.contains("[unused-variable]") && !stderr.contains("diagnostic cap"),
+        "control: the finding shows, and no cap; stderr: {stderr}"
+    );
+
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+    for format in ["human", "json"] {
+        let args = ["--format", format];
+        let runs = [
+            ("stdin", lint_stdin(&source, &args), cap_notice()),
+            ("a file", lint_path(&file, &args), cap_notice()),
+            (
+                "a directory",
+                lint_dir_in(tmp.path(), "d", &args),
+                entry_cap_notice(),
+            ),
+        ];
+        for (input, out, notice) in runs {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.lines().next(),
+                Some(notice.as_str()),
+                "{input}, {format}: the cap comes first; stderr starts {:?}",
+                head_of(&stderr)
+            );
+            assert_eq!(
+                stderr.matches("diagnostic cap").count(),
+                1,
+                "{input}, {format}: one notice"
+            );
+            assert_eq!(out.status.code(), Some(1), "{input}, {format}: warnings");
+        }
+    }
+}
+
+/// `--quiet` suppresses the cap notice in a report, as it does under `--fix`, and leaves
+/// the exit code alone.
+///
+/// Positive control: the same run without `--quiet` prints it.
+#[test]
+fn quiet_suppresses_the_cap_notice_in_a_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+
+    for format in ["human", "json"] {
+        let run = |input: &str, quiet: bool| {
+            let mut args = vec!["--format", format];
+            if quiet {
+                args.push("--quiet");
+            }
+            match input {
+                "stdin" => lint_stdin(&source, &args),
+                "a file" => lint_path(&file, &args),
+                _ => lint_dir_in(tmp.path(), "d", &args),
+            }
+        };
+        for input in ["stdin", "a file", "a directory"] {
+            let loud = run(input, false);
+            let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+            assert!(
+                loud_stderr.contains("diagnostic cap"),
+                "positive control ({input}, {format}): without --quiet the notice prints; \
+                 stderr starts {:?}",
+                head_of(&loud_stderr)
+            );
+            let quiet = run(input, true);
+            let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+            assert!(
+                !quiet_stderr.contains("diagnostic cap"),
+                "{input}, {format}: --quiet suppresses the notice; stderr starts {:?}",
+                head_of(&quiet_stderr)
+            );
+            assert_eq!(
+                quiet.status.code(),
+                loud.status.code(),
+                "{input}, {format}: --quiet leaves the exit code"
+            );
+        }
+    }
 }
