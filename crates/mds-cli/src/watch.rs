@@ -1836,11 +1836,13 @@ fn rebuild_file(
 
 // ── Settling a failure ────────────────────────────────────────────────────────
 
-/// How `mds watch` settles a failure it keeps watching through (#257): reading the vars
-/// file, a compile — a panic included (#389) — the output route, a write. The site where
-/// the failure happens picks the action and hands it to [`settle`] with the state to apply
-/// it to ([`SettleInto`]). Every failure site of both modes goes through it; only the
-/// repeat of a stdout failure reported already (#157) settles nothing.
+/// How `mds watch` settles a rebuild-time failure it keeps watching through (#257):
+/// reading the vars file, a compile — a panic included (#389) — the output route, a
+/// write. The site where the failure happens picks the action and hands it to [`settle`]
+/// with the state to apply it to ([`SettleInto`]). A startup failure settles through
+/// [`settle_startup_error`] instead: there is no baseline yet to take again, so
+/// [`Settle::Rebaseline`] has nothing to apply there. The repeat of a stdout failure
+/// reported already (#157) settles nothing, through neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settle<'a> {
     /// Take the `(mtime, size)` baseline again, so the idle tick does not fire again on
@@ -1855,24 +1857,18 @@ enum Settle<'a> {
     MarkErrored(&'a Path),
 }
 
-/// The state a [`Settle`] is applied to: a mode's, in a rebuild or at startup.
+/// The rebuild state a [`Settle`] is applied to.
 enum SettleInto<'a> {
     /// A file-mode rebuild.
     File(&'a mut FileWatchState),
     /// A directory-mode rebuild.
     Dir(&'a mut DirWatchState),
-    /// File mode's startup. It records nothing: the session's first baseline is taken once
-    /// the startup compile is done, and is the one [`Settle::Rebaseline`] asks for.
-    FileStartup,
-    /// Directory mode's startup. As at file mode's, the baseline is the one taken once
-    /// every source has compiled; [`Settle::MarkErrored`] records the source as errored.
-    DirStartup(&'a mut DirWatchState),
 }
 
-/// Settle a failure `mds watch` keeps watching through (#257): report `failure`, then
-/// apply `how` to `into`. `failure` is `None` when there is nothing to report — a compile
-/// that panicked, which the panic hook reported (#389) — so a panic settles exactly as an
-/// error at the same site does, reported once.
+/// Settle a rebuild-time failure `mds watch` keeps watching through (#257): report
+/// `failure`, then apply `how` to `into`. `failure` is `None` when there is nothing to
+/// report — a compile that panicked, which the panic hook reported (#389) — so a panic
+/// settles exactly as an error at the same site does, reported once.
 fn settle(into: SettleInto<'_>, failure: Option<miette::Report>, how: Settle<'_>) {
     settle_reporting(into, failure, how, eprint_error);
 }
@@ -1895,11 +1891,46 @@ fn settle_reporting(
         (SettleInto::Dir(state), Settle::Rebaseline) => {
             state.last_mtimes = snapshot_state(&state.tracked_set());
         }
-        (SettleInto::Dir(state) | SettleInto::DirStartup(state), Settle::MarkErrored(src)) => {
+        (SettleInto::Dir(state), Settle::MarkErrored(src)) => {
             state.record_error(src);
         }
-        (SettleInto::FileStartup | SettleInto::DirStartup(_), Settle::Rebaseline)
-        | (SettleInto::FileStartup, Settle::MarkErrored(_)) => {}
+    }
+}
+
+/// The startup state a failure (#257) settles into: file mode's startup records nothing —
+/// the session's first baseline is taken once the startup compile is done, the one
+/// [`Settle::Rebaseline`] asks for in a rebuild; directory mode's startup records the
+/// source as errored, keeping the dependency set its compile reported (empty for a source
+/// new to the graph).
+enum StartupInto<'a> {
+    /// File mode's startup.
+    File,
+    /// Directory mode's startup.
+    Dir(&'a mut DirWatchState),
+}
+
+/// Settle a startup failure `mds watch` keeps watching through (#257): report `failure`,
+/// then mark `src` errored in directory mode. `failure` is `None` for a compile that
+/// panicked, which the panic hook reported (#389). There is no [`Settle::Rebaseline`] at
+/// startup — the baseline is still to come — so `StartupInto` takes no `how`: a startup
+/// failure only ever means the source is errored.
+fn settle_startup_error(into: StartupInto<'_>, failure: Option<miette::Report>, src: &Path) {
+    settle_startup_error_reporting(into, failure, src, eprint_error);
+}
+
+/// [`settle_startup_error`], with `report` doing the reporting: the session's error
+/// renderer there, a recorder in a test.
+fn settle_startup_error_reporting(
+    into: StartupInto<'_>,
+    failure: Option<miette::Report>,
+    src: &Path,
+    report: impl FnOnce(miette::Report),
+) {
+    if let Some(e) = failure {
+        report(e);
+    }
+    if let StartupInto::Dir(state) = into {
+        state.record_error(src);
     }
 }
 
@@ -2100,21 +2131,13 @@ fn run_watch_file(
             deps,
             failure,
         } => {
-            settle(
-                SettleInto::FileStartup,
-                failure,
-                Settle::MarkErrored(&entry.canonical),
-            );
+            settle_startup_error(StartupInto::File, failure, &entry.canonical);
             (OutputRoute::Decided(output_path), deps, String::new())
         }
         CompileWriteOutcome::CompileFailed(e) => {
             // Initial compile error: print and continue watching (entry dir still
             // watched).
-            settle(
-                SettleInto::FileStartup,
-                e,
-                Settle::MarkErrored(&entry.canonical),
-            );
+            settle_startup_error(StartupInto::File, e, &entry.canonical);
             // The kind is unknown, and with it the route an output of that kind takes: the
             // route of each kind is resolved now, and the first compile that succeeds takes
             // its kind's (#257) — a `.json` output is never written to `.md`. A route that
@@ -3185,11 +3208,7 @@ fn dir_watch_startup(
                     // write failed is errored instead, so the next rebuild with a real
                     // change writes it even when its content has not changed (#257).
                     if let Err(e) = write_output(Some(&out), &compiled.content, quiet, true) {
-                        settle(
-                            SettleInto::DirStartup(&mut state),
-                            Some(e),
-                            Settle::MarkErrored(&key),
-                        );
+                        settle_startup_error(StartupInto::Dir(&mut state), Some(e), &key);
                     } else {
                         state.last_written.insert(out.path, compiled.content);
                     }
@@ -3198,11 +3217,7 @@ fn dir_watch_startup(
             Err(failure) => {
                 // `key` is new to the graph — each source is compiled once here — so the
                 // errored source's dependency set is the empty one.
-                settle(
-                    SettleInto::DirStartup(&mut state),
-                    failure.unreported(),
-                    Settle::MarkErrored(&key),
-                );
+                settle_startup_error(StartupInto::Dir(&mut state), failure.unreported(), &key);
                 state.known_files.insert(key);
             }
         }
@@ -5541,8 +5556,9 @@ mod tests {
     }
 
     /// `Settle::Rebaseline` takes the `(mtime, size)` baseline again in a rebuild, over what
-    /// the mode watches, and records nothing else; at startup it takes none, the startup
-    /// baseline being still to come (#257).
+    /// the mode watches, and records nothing else. There is no startup variant to apply it
+    /// to: the startup baseline is still to come, so `SettleInto` holds only the two
+    /// rebuild states (#257).
     #[test]
     fn settle_rebaseline_takes_the_baseline_again_in_a_rebuild_only() {
         let (_dir, src, dep) = source_and_dependency();
@@ -5572,26 +5588,13 @@ mod tests {
             rebuild.last_mtimes
         );
         assert!(rebuild.errored.is_empty(), "nothing is marked errored");
-
-        // Directory startup: no baseline yet, nothing recorded — where the same call in a
-        // rebuild, above, took one.
-        let mut startup = empty_dir_state();
-        startup.known_files.insert(src.clone());
-        startup.forward_deps.insert(src.clone(), vec![dep.clone()]);
-        settle(
-            SettleInto::DirStartup(&mut startup),
-            None,
-            Settle::Rebaseline,
-        );
-        assert!(startup.last_mtimes.is_empty(), "{:?}", startup.last_mtimes);
-        assert!(startup.errored.is_empty(), "{:?}", startup.errored);
     }
 
-    /// `Settle::MarkErrored` records a directory-mode source as errored, keeping the
-    /// dependency set its last successful compile recorded — the empty one for a source
-    /// new to the graph — in a rebuild and at startup, and takes no baseline: a rebuild's
-    /// batch takes it at its end. File mode has no errored set: it takes the baseline
-    /// again, as `Settle::Rebaseline` does (#257).
+    /// `Settle::MarkErrored` records a directory-mode source as errored in a rebuild,
+    /// keeping the dependency set its last successful compile recorded, and takes no
+    /// baseline: the batch takes it at its end. File mode has no errored set: it takes
+    /// the baseline again, as `Settle::Rebaseline` does. A directory-mode startup failure
+    /// settles the source the same way, through [`settle_startup_error`] (#257).
     #[test]
     fn settle_mark_errored_records_the_source_in_directory_mode() {
         let (_dir, src, dep) = source_and_dependency();
@@ -5609,17 +5612,6 @@ mod tests {
         assert_eq!(rebuild.forward_deps.get(&src), Some(&vec![dep.clone()]));
         assert!(rebuild.last_mtimes.is_empty(), "{:?}", rebuild.last_mtimes);
 
-        // Directory startup: a source new to the graph gets the empty dependency set.
-        let mut startup = empty_dir_state();
-        settle(
-            SettleInto::DirStartup(&mut startup),
-            None,
-            Settle::MarkErrored(&src),
-        );
-        assert!(startup.errored.contains(&src), "{:?}", startup.errored);
-        assert_eq!(startup.forward_deps.get(&src), Some(&vec![]));
-        assert!(startup.last_mtimes.is_empty(), "{:?}", startup.last_mtimes);
-
         // File mode: the baseline again.
         let foi: HashSet<PathBuf> = [src.clone(), dep.clone()].into_iter().collect();
         let mut file = file_state(foi.clone());
@@ -5630,6 +5622,21 @@ mod tests {
             "{:?}",
             file.last_mtimes
         );
+    }
+
+    /// A directory-mode startup failure settles the source as errored, same as
+    /// `Settle::MarkErrored` in a rebuild: a source new to the graph gets the empty
+    /// dependency set, and no baseline is taken — the startup baseline is still to come.
+    /// File mode's startup settle has no state to record into (#257).
+    #[test]
+    fn settle_startup_error_records_the_source_in_directory_mode() {
+        let (_dir, src, _dep) = source_and_dependency();
+
+        let mut startup = empty_dir_state();
+        settle_startup_error(StartupInto::Dir(&mut startup), None, &src);
+        assert!(startup.errored.contains(&src), "{:?}", startup.errored);
+        assert_eq!(startup.forward_deps.get(&src), Some(&vec![]));
+        assert!(startup.last_mtimes.is_empty(), "{:?}", startup.last_mtimes);
     }
 
     /// A compile that panicked settles as its error does at the same site — the site picks
@@ -5688,10 +5695,10 @@ mod tests {
 
         // The error is reported as it is, once.
         let mut reported = Vec::new();
-        settle_reporting(
-            SettleInto::FileStartup,
+        settle_startup_error_reporting(
+            StartupInto::File,
             CompileFailure::from(miette::miette!("broken")).unreported(),
-            Settle::MarkErrored(&src),
+            &src,
             |e| reported.push(e.to_string()),
         );
         assert_eq!(reported, ["broken"]);
