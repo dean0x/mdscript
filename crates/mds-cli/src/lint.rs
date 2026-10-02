@@ -228,20 +228,22 @@ pub(crate) fn run_lint(args: LintArgs) -> i32 {
     }
 }
 
-/// [`run_lint`] through `sink`: a lint-specific exit code, or 2 for a setup failure, which
-/// the sink shows.
+/// [`run_lint`] through `sink`: a lint-specific exit code, or the exit of a setup failure,
+/// which the sink shows — as for an analysis failure, 3 for a resource limit (a `--vars`
+/// file over the size cap, #309) and 2 for any other error.
 fn lint_through(args: LintArgs, sink: &mut impl ResultSink) -> i32 {
     match do_lint(args, sink) {
         Ok(code) => code,
         Err(e) => {
+            let code = e.downcast_ref::<MdsError>().map_or(2, mds_error_exit_code);
             sink.setup_failed(e);
-            2
+            code
         }
     }
 }
 
 /// Inner runner — the run's exit code; every setup error propagates as `Err`, which
-/// [`lint_through`] shows, exit 2.
+/// [`lint_through`] shows.
 fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
     let LintArgs {
         input,
@@ -277,8 +279,8 @@ fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
             // same mistake.  Downcast BEFORE any render call (`eprint_error`
             // consumes the report).  Shown as an analysis failure, it gives
             // --format json consumers the structured `mds::var_conflict` envelope.
-            // Every OTHER setup error deliberately keeps the blanket exit 2
-            // of `lint_through`.
+            // Every OTHER setup error exits through `lint_through`: 3 for a
+            // resource limit, 2 for any other.
             if let Some(mds_err @ MdsError::VarConflict { .. }) = e.downcast_ref::<MdsError>() {
                 sink.analysis_failure(mds_err, None);
                 return Ok(1);

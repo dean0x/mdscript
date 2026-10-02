@@ -19,10 +19,11 @@
 //! - [`eprint_error`]: the CLI's error-report choke point — escapes every report's
 //!   message, help, and label text before miette renders it (CWE-150), then writes the
 //!   frame through `ewriteln!`.
-//! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`,
-//!   and — since #227 — by every `build` / `watch` output and `.map` sidecar. The
-//!   [`Durability`] argument says whether the bytes are fsynced before the rename;
-//!   atomicity does not depend on it.
+//! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and — since
+//!   #227 — by every `build` / `watch` output and `.map` sidecar; `lint --fix` writes
+//!   through the same write as [`atomic_write_file_in_one_wording`], which words every
+//!   failure `cannot write <file>: <cause>` (#309). The [`Durability`] argument says
+//!   whether the bytes are fsynced before the rename; atomicity does not depend on it.
 //! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
 //!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!

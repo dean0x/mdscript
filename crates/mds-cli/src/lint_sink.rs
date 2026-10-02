@@ -34,7 +34,10 @@ use crate::output::{
 /// Where one `mds lint` run shows its results.
 ///
 /// The methods whose output depends on the format are required; the status lines and the
-/// stdout product, which read the same in both formats, are provided.
+/// stdout product, which read the same in both formats, are provided. So are
+/// [`ResultSink::nothing_to_lint`] and [`ResultSink::setup_failed`], whose provided forms
+/// are a human report's lines on stderr: [`JsonSink`] overrides both with the error
+/// document (#309).
 pub(crate) trait ResultSink {
     /// `--quiet`: the status lines about an input, and warning- and info-severity findings,
     /// are not shown.

@@ -8077,8 +8077,8 @@ fn size_report(cwd: &Path, input: &Path, format: &str, mode: &[&str]) -> SizeRep
 
 /// A file over the size cap is `mds::resource_limit`, exit 3, in every lint mode, as a
 /// file argument and as a directory's entry, in either format. A directory still lints
-/// its other files and counts the file under "resource-limited"; its human report read
-/// the file before linting it, counted it under "with errors" and exited 2.
+/// its other files and counts the file under "resource-limited" — where its human report
+/// used to count it under "with errors" and exit 2 (#309).
 ///
 /// Control: a file of exactly the cap passes the size gate in a report and under `--fix`,
 /// as a file argument and as a directory's entry, in either format.
@@ -8145,8 +8145,8 @@ fn a_file_over_the_size_cap_is_resource_limited_in_every_lint_mode() {
 /// A file over the size cap under an `mds.json` that cannot load reports the
 /// configuration's failure, `mds::io`, exit 2, in every arm: the file's configuration
 /// loads before the file is read, for a file argument and a directory's entry in either
-/// format. A directory's human report read the file first and reported
-/// `mds::resource_limit`, exit 3.
+/// format — where a directory's human report used to read the file first and report
+/// `mds::resource_limit`, exit 3 (#309).
 ///
 /// Control: under a valid `mds.json` the same file is `mds::resource_limit`, exit 3.
 #[test]
@@ -8191,6 +8191,61 @@ fn a_config_that_cannot_load_is_reported_before_a_file_over_the_size_cap() {
     assert_eq!(
         seen, expected,
         "(mds.json, input, format, mode, what it reported)"
+    );
+}
+
+/// A `--vars` file over the size cap is `mds::resource_limit`, exit 3, as a source over it
+/// is and as `mds build --vars` exits — under `--format human`, and under `--format json`
+/// as the run's one document, the error document (#309).
+///
+/// Control: a `--vars` file of exactly the cap loads, and the file is linted clean.
+#[test]
+fn a_vars_file_over_the_size_cap_exits_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("x.mds"), "Hello!\n").unwrap();
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (len, exit, code) in [
+        (mds::MAX_FILE_SIZE, 0, None),
+        (mds::MAX_FILE_SIZE + 1, 3, Some("mds::resource_limit")),
+    ] {
+        // `{"pad":"aa…a"}`, `len` bytes long.
+        let (head, tail) = ("{\"pad\":\"", "\"}");
+        let pad = usize::try_from(len).unwrap() - head.len() - tail.len();
+        fs::write(
+            tmp.path().join("vars.json"),
+            format!("{head}{}{tail}", "a".repeat(pad)),
+        )
+        .unwrap();
+
+        let human = lint_with_stdin(tmp.path(), &["--vars", "vars.json", "x.mds"], b"");
+        let human_code = String::from_utf8_lossy(&human.stderr)
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("mds::"))
+            .map(str::to_string);
+        seen.push((len, "human", human.status.code(), human_code, None));
+        expected.push((len, "human", Some(exit), code.map(str::to_string), None));
+
+        let json = lint_with_stdin(
+            tmp.path(),
+            &["--format", "json", "--vars", "vars.json", "x.mds"],
+            b"",
+        );
+        let json = json_exit(&json);
+        let rest = (json.documents, json.stderr);
+        seen.push((len, "json", json.exit, json.code, Some(rest)));
+        expected.push((
+            len,
+            "json",
+            Some(exit),
+            code.map(str::to_string),
+            Some((Some(1), String::new())),
+        ));
+    }
+    assert_eq!(
+        seen, expected,
+        "(vars file length, format, exit, error code, (documents, stderr))"
     );
 }
 
