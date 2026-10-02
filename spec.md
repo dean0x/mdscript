@@ -1709,7 +1709,7 @@ Rules default to the severities shown below — **not all rules default to `warn
 - **Structural-standalone** (gates Tier B `--fix`): a file with no `@import`, `@extends`, or use as a partial target. A file that triggers `unused-import` is, by definition, not structural-standalone.
 - **Compile-clean** (gates the output-equality reverify for Tier B): a file that compiles successfully without any runtime `--vars`. The reverify checks that removing the unused import or function produces byte-identical compiled output.
 
-**Tier A** fixes always apply (`--fix`) and are gated by a post-fix reverify (recompile-success + no-new-diagnostics + output byte-equality). **Tier B** fixes apply only when the file is structural-standalone. **Tier C** rules are report-only — never auto-fixed.
+**Tier A** fixes always apply (`--fix`) and are gated by a post-fix reverify (recompile-success + no-new-diagnostics + output byte-equality). The reverify lints the fixed source under the file's own name, so a partial's fixed source is checked as a partial and its findings compare with the original's (#309). **Tier B** fixes apply only when the file is structural-standalone. **Tier C** rules are report-only — never auto-fixed.
 
 ---
 

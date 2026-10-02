@@ -175,6 +175,21 @@ impl<'a> LintSource<'a> {
         }
     }
 
+    /// The name mds-core linted the input under, which decides whether it is a partial:
+    /// [`mds::STRING_SOURCE_MAP_LABEL`] for stdin (`mds::lint_str_with`'s name, never a
+    /// partial), and a file's file name — the last component of the path `mds::lint` was
+    /// given — for a file argument or a directory's entry. The [`ReverifyGate`] lints
+    /// every fix candidate under it (#309).
+    fn lint_name(&self) -> &'a str {
+        match *self {
+            Self::Stdin => mds::STRING_SOURCE_MAP_LABEL,
+            Self::File { name, .. } => name,
+            // The key joins the entry's path components below the directory argument
+            // with `/`, so its last segment is the path's file name.
+            Self::DirEntry { key, .. } => key.rsplit_once('/').map_or(key, |(_, name)| name),
+        }
+    }
+
     /// The path the input is read from, as the user reaches it: `-` for stdin, the path
     /// as typed for a file argument, the path the walk produced for a directory's entry.
     fn path(&self) -> &'a Path {
@@ -571,8 +586,11 @@ enum FixPipelineOutcome {
 /// The check every candidate source must pass before the fix pipeline accepts it, in
 /// `--fix` and its preview alike.
 ///
-/// [`verify`](Self::verify) refuses a candidate that `mds::lint_str_with` cannot lint —
-/// one that no longer resolves — and, when every planned edit is output-neutral
+/// [`verify`](Self::verify) lints each candidate with `mds::lint_str_named` under the
+/// name the original was linted under ([`LintSource::lint_name`]), so a partial's
+/// candidate is linted as a partial and its findings compare with the original's (#309).
+/// It refuses a candidate that cannot be linted — one that no longer resolves — and, when
+/// every planned edit is output-neutral
 /// (`mds::fix::is_output_neutral`) and the original source compiles, one whose compiled
 /// output differs from the original's. Otherwise it returns the candidate's findings, and
 /// `mds::fix::apply_fixes_incremental` refuses a candidate that has more findings than the
@@ -584,6 +602,8 @@ enum FixPipelineOutcome {
 /// on purpose — they turn plain `{x}` text into `{{x}}` interpolation — so a plan with any
 /// such edit skips the output check for every edit in it.
 struct ReverifyGate<'a> {
+    /// The name each candidate is linted under: the original's.
+    name: &'a str,
     base_dir: &'a Path,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     config: &'a mds::LintConfig,
@@ -593,10 +613,12 @@ struct ReverifyGate<'a> {
 }
 
 impl<'a> ReverifyGate<'a> {
-    /// The gate for `plan`'s candidates of `source`, which resolve against `base_dir`.
+    /// The gate for `plan`'s candidates of `source`, which are linted under `name` and
+    /// resolve against `base_dir`.
     fn new(
         plan: &mds::fix::FixPlan,
         source: &str,
+        name: &'a str,
         base_dir: &'a Path,
         runtime_vars: Option<HashMap<String, mds::Value>>,
         config: &'a mds::LintConfig,
@@ -611,6 +633,7 @@ impl<'a> ReverifyGate<'a> {
                 .map(|r| r.output)
                 .filter(|_| all_output_neutral);
         Self {
+            name,
             base_dir,
             runtime_vars,
             config,
@@ -622,11 +645,12 @@ impl<'a> ReverifyGate<'a> {
     /// calls it for the whole plan and, when that candidate is refused, for each edit on
     /// its own.
     fn verify(&self, candidate: &str) -> std::result::Result<mds::LintResult, MdsError> {
-        let residual = mds::lint_str_with(
+        let residual = mds::lint_str_named(
             candidate,
             Some(self.base_dir),
             self.runtime_vars.clone(),
             self.config,
+            self.name,
         )?;
         if let Some(original_output) = &self.original_output {
             match mds::compile_str_collecting_warnings(
@@ -657,7 +681,7 @@ impl<'a> ReverifyGate<'a> {
 ///
 /// `result` is `input`'s lint result, relabelled with [`LintSource::display_label`];
 /// every residual diagnostic gets the same label through [`set_diag_display_path`], in
-/// place of the internal name `mds::lint_str_with` gives a candidate. It becomes the
+/// place of the [`LintSource::lint_name`] the gate lints a candidate under. It becomes the
 /// JSON `files[].file` key once `to_canonical_json` applies
 /// `sanitize_control_chars_wire`. `base_dir` is what a candidate resolves against: the
 /// file's parent, or the working directory for stdin.
@@ -680,7 +704,14 @@ fn run_fix_pipeline(
     // Counted before the plan moves into `apply_fixes_incremental`, for the
     // "{applied} of {total}" summary of a partial fix.
     let total_edits = plan.edits.len();
-    let gate = ReverifyGate::new(&plan, source, base_dir, runtime_vars, config);
+    let gate = ReverifyGate::new(
+        &plan,
+        source,
+        input.lint_name(),
+        base_dir,
+        runtime_vars,
+        config,
+    );
     let outcome =
         mds::fix::apply_fixes_incremental(source, plan, result, |candidate| gate.verify(candidate));
 
@@ -1830,8 +1861,8 @@ mod tests {
     /// The residual the preview reads from `FixPipelineOutcome::Fixed` or
     /// `PartiallyFixed` must have every diagnostic's `file` field relabelled to the
     /// input's display label, as the write path's residual is.  Without the relabel the
-    /// residual leaks the internal `STRING_SOURCE_MAP_LABEL` basename that
-    /// `mds::lint_str_with` sets inside the reverify gate.
+    /// residual carries the name the reverify gate lints a candidate under: the entry's
+    /// file name `custom-label.mds`, not its key `sub/custom-label.mds`.
     ///
     /// The source carries one FIXABLE finding (empty-block on the bare `@if`) and
     /// one NON-fixable finding that survives the fix (unused-variable on the
@@ -1846,8 +1877,8 @@ mod tests {
             .expect("fixture source must lint");
 
         let input = LintSource::DirEntry {
-            path: Path::new("custom-label.mds"),
-            key: "custom-label.mds",
+            path: Path::new("sub/custom-label.mds"),
+            key: "sub/custom-label.mds",
         };
         let outcome = run_fix_pipeline(&input, &result, source, Path::new("."), None, &config);
 
@@ -1874,7 +1905,7 @@ mod tests {
                 for diag in &residual.diagnostics {
                     assert_eq!(
                         diag.file.as_deref(),
-                        Some("custom-label.mds"),
+                        Some("sub/custom-label.mds"),
                         "R1: every residual diagnostic must carry the caller-supplied \
                          display label"
                     );
@@ -1884,6 +1915,30 @@ mod tests {
                 "run_fix_pipeline must return Fixed or PartiallyFixed for a source with a \
                  fixable empty-block finding"
             ),
+        }
+    }
+
+    /// Each input's lint name is the name `mds::lint` or `mds::lint_str_with` linted it
+    /// under: the string label for stdin, and the file name — the path's last component,
+    /// whatever directories lead to it — for a file argument or a directory's entry.
+    #[test]
+    fn an_input_is_linted_under_its_file_name_and_stdin_under_the_string_label() {
+        assert_eq!(LintSource::Stdin.lint_name(), mds::STRING_SOURCE_MAP_LABEL);
+        let typed = Path::new("templates/_p.mds");
+        let file = LintSource::File {
+            typed,
+            name: "_p.mds",
+        };
+        assert_eq!(file.lint_name(), "_p.mds");
+        for key in ["_p.mds", "sub/_p.mds", "sub/deeper/_p.mds"] {
+            let path = Path::new(key);
+            let entry = LintSource::DirEntry { path, key };
+            assert_eq!(entry.lint_name(), "_p.mds", "the entry keyed {key:?}");
+            assert_eq!(
+                path.file_name().and_then(OsStr::to_str),
+                Some(entry.lint_name()),
+                "the name `mds::lint` takes from the path, for the entry keyed {key:?}"
+            );
         }
     }
 
@@ -1903,7 +1958,9 @@ mod tests {
             .output
     }
 
-    /// `source`'s findings and the fix plan `run_fix_pipeline` builds from them.
+    /// `source`'s findings and the fix plan `run_fix_pipeline` builds from them. The
+    /// source is linted as stdin is, under `mds::STRING_SOURCE_MAP_LABEL`, the name the
+    /// tests' gates lint its candidates under.
     fn lint_and_plan(source: &str, config: &mds::LintConfig) -> (LintResult, mds::fix::FixPlan) {
         let result = mds::lint_str_with(source, Some(Path::new(".")), None, config)
             .expect("fixture source must lint");
@@ -1934,7 +1991,14 @@ mod tests {
             "precondition: the plan must have edits, all output-neutral; got {:?}",
             plan.edits
         );
-        let gate = ReverifyGate::new(&plan, EMPTY_BLOCK_SOURCE, Path::new("."), None, &config);
+        let gate = ReverifyGate::new(
+            &plan,
+            EMPTY_BLOCK_SOURCE,
+            mds::STRING_SOURCE_MAP_LABEL,
+            Path::new("."),
+            None,
+            &config,
+        );
 
         let fixed = mds::fix::apply_plan_unchecked(EMPTY_BLOCK_SOURCE, &plan);
         assert_eq!(
@@ -1999,7 +2063,14 @@ mod tests {
             "precondition: the changed candidate must compile to different output"
         );
 
-        let gate = ReverifyGate::new(&plan, source, Path::new("."), None, &config);
+        let gate = ReverifyGate::new(
+            &plan,
+            source,
+            mds::STRING_SOURCE_MAP_LABEL,
+            Path::new("."),
+            None,
+            &config,
+        );
         if let Err(err) = gate.verify(&changed) {
             panic!("a plan with an output-changing edit must skip the output check; got: {err}");
         }
@@ -2010,7 +2081,14 @@ mod tests {
             !neutral_plan.edits.is_empty(),
             "precondition: the control plan must keep the output-neutral edit"
         );
-        let neutral_gate = ReverifyGate::new(&neutral_plan, source, Path::new("."), None, &config);
+        let neutral_gate = ReverifyGate::new(
+            &neutral_plan,
+            source,
+            mds::STRING_SOURCE_MAP_LABEL,
+            Path::new("."),
+            None,
+            &config,
+        );
         let err = neutral_gate
             .verify(&changed)
             .expect_err("control: an all-neutral plan must refuse the changed candidate");

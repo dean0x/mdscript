@@ -1178,7 +1178,7 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
 // Pins that after --fix in SINGLE-FILE mode, residual diagnostics in the JSON
 // output are keyed by the file's basename, NOT by "input.mds".
 //
-// The plan_and_apply_fixes reverify closure calls lint_str_with, which sets
+// The reverify gate used to lint each candidate with lint_str_with, which sets
 // diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").  Without set_diag_display_path
 // in the single-file Fixed/PartiallyFixed arms, `mds lint --fix --format json <file>`
 // emitted "input.mds" instead of the real basename.  Directory mode already had the
@@ -1233,8 +1233,8 @@ fn file_fix_json_residuals_keyed_by_filename_not_input_mds() {
 
 // ── Test (c): --fix --check on overlap-fix fixture → "Would fix" after coalescing ──
 //
-// Pins bug-5 / PF-004 fix for the check path: preview_fixes returns a
-// PreviewOutcome::WouldFix so --fix --check reports what would change.
+// Pins the bug-5 fix for the check path: the preview (`preview_fix`) returns a
+// pending fix, so --fix --check reports what would change.
 //
 // Fixture: lint_overlap_fix.mds — @if "x" == "x": with "hello" then-body and an
 // empty @else body. Two rules fire simultaneously:
@@ -1720,7 +1720,7 @@ fn frame_source_identity(rendered: &str) -> Option<String> {
 fn stdin_analysis_failure_labels_source_as_stdin() {
     // A source that fails the check gate: `@if` without a condition is a hard
     // syntax error, so lint_str_with returns Err and takes the
-    // emit_analysis_failure_json_or_stderr path.
+    // analysis-failure path (`analysis_failed`).
     let source = "@if\nbroken\n";
 
     // Human channel: the miette frame header must name <stdin>.
@@ -2609,14 +2609,14 @@ fn dir_fix_check_json_emits_parseable_json_before_exit_1() {
 // ── resolve-b2a: single-file --fix --check --format json emits JSON before exit ─
 //
 // Regression: `lint_one_file` called `std::process::exit(1)` inside the
-// `PreviewOutcome::WouldFix` + `check` arm WITHOUT first calling `emit_result`,
-// making the `emit_result` at the end of the preview block unreachable.  On exit,
+// would-fix + `check` preview arm WITHOUT first emitting the result, making the
+// emit at the end of the preview block unreachable.  On exit,
 // stdout was zero bytes — `JSON.parse("")` throws.  AC-F-14 was satisfied in
 // directory mode (the `any_would_fix` exit emits the envelope first at
 // run_lint_directory) but broken in single-file mode.
 //
-// Fix: call `emit_result(format, &result, quiet, named_source)` immediately before
-// `std::process::exit(1)` in the single-file WouldFix+check arm (mirroring dir mode).
+// Fix: emit the result immediately before `std::process::exit(1)` in the
+// single-file would-fix + check arm (mirroring dir mode).
 
 #[test]
 fn file_fix_check_json_emits_parseable_json_before_exit_1() {
@@ -2684,7 +2684,7 @@ fn stdin_fix_check_exits_1_and_writes_nothing_to_stdout() {
 
 // ── resolve-w2 #43: dir-mode and single-file-mode agree on --quiet for PartiallyFixed
 //
-// Regression: `lint_one_file_accumulating` destructured `LintFlags` without binding
+// Regression: the directory JSON path destructured `LintFlags` without binding
 // `quiet`, so `mds lint dir/ --fix --format json --quiet` emitted "partial fix:"
 // lines to stderr that the single-file equivalent suppressed. Three different message
 // texts across four call sites was the root cause. Refs: issue #173.
@@ -2816,7 +2816,7 @@ fn lint_fix_bare_filename_applies_fix() {
 /// Background: `MdsError::Syntax` embeds user-controlled source fragments via
 /// miette's NamedSource.  Before the fix, those fragments printed with raw ESC
 /// bytes intact, enabling terminal escape injection when linting untrusted repos.
-/// The fix sanitizes at the CLI render boundary in `emit_analysis_failure_json_or_stderr`.
+/// The fix sanitizes at the CLI render boundary, where an analysis failure is shown.
 #[test]
 fn lint_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
@@ -3400,7 +3400,7 @@ fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
 
 /// Regression gate (directory mode): when `atomic_write_file` fails,
 /// stderr must NOT contain "Fixed: <file>" — mirrors the single-file check
-/// above for the `lint_one_file_human` code path (lint.rs:1227).
+/// above for each directory entry (`lint_dir_entry`).
 ///
 /// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
 /// read-only attribute does not block creating files in a directory (#147).
@@ -3423,7 +3423,7 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
     // Make the inner directory read-only so temp-file creation fails on write.
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Run lint --fix on the directory (directory mode routes through lint_one_file_human).
+    // Run lint --fix on the directory (each entry goes through lint_dir_entry).
     let out = lint_path(&inner, &["--fix"]);
 
     let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
@@ -3438,13 +3438,13 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
     );
 }
 
-/// Regression gate (directory JSON mode): when `atomic_write_file` fails in
-/// `lint_one_file_accumulating`, stderr must NOT contain "Fixed: <file>" — mirrors
-/// the human-mode check above for the `lint_one_file_human` code path.
+/// Regression gate (directory JSON mode): when `atomic_write_file` fails for an
+/// entry, stderr must NOT contain "Fixed: <file>" — mirrors the human-mode check
+/// above.
 ///
-/// Code ordering is correct: `lint_one_file_accumulating` returns `FileTally::Error`
-/// at lint.rs:1537 before reaching the `eprintln!("Fixed: …")` at lint.rs:1541.
-/// This test provides the coverage that the code ordering is verified.
+/// Code ordering: a failed write is `Rewrite::WriteFailed`, decided before anything
+/// is shown, and the result sink announces `Fixed:` only for a written file.
+/// This test covers that ordering end to end.
 ///
 /// Positive control (PF-013/ADR-009): a writable directory run confirms "Fixed:"
 /// DOES appear so the absence assertion below cannot be vacuous.
@@ -3489,7 +3489,7 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
     // Make the inner directory read-only so temp-file creation fails on write.
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Run lint --fix --format json on the directory (routes through lint_one_file_accumulating).
+    // Run lint --fix --format json on the directory (each entry goes through lint_dir_entry).
     let out = lint_path(&inner, &["--fix", "--format", "json"]);
 
     let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
@@ -3506,8 +3506,8 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
 
 // ── resolve-b2a (F-14): dir JSON write failure must emit structured error, not stale result ─
 //
-// Regression: `lint_one_file_accumulating` called `accumulate_result_json(&residual, …)`
-// BEFORE `atomic_write_file`.  On write failure the residual (post-fix, zero-diagnostic)
+// Regression: the directory JSON path added the residual to the document BEFORE
+// `atomic_write_file`.  On write failure the residual (post-fix, zero-diagnostic)
 // result was already pushed to the envelope, so consumers parsed clean-looking JSON
 // while the process exited 2 and stderr said "Permission denied".  AC-F-14 requires the
 // JSON envelope to truthfully reflect what happened.
@@ -3524,8 +3524,8 @@ fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
 
     // ── Positive control (PF-013/ADR-009): writable dir → clean JSON, no error entry ──
     //
-    // After a successful fix the residual has zero diagnostics, so accumulate_result_json
-    // adds no file entry and files[] is empty — that is the correct/clean shape.
+    // After a successful fix the residual has zero diagnostics, so the document gets
+    // no file entry and files[] is empty — that is the correct/clean shape.
     // The critical positive-control signal is: exit 0 + "Fixed:" on stderr + no "error" key.
     {
         let dir = tempfile::tempdir().unwrap();
@@ -3621,7 +3621,7 @@ fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
 /// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
 /// `MdsError::Syntax`.
 ///
-/// Directory mode routes through `lint_one_file_human`, which previously called
+/// Directory mode's per-entry human path previously called
 /// `eprintln!("{:?}", miette::Report::from(e.clone()))` directly without sanitization.
 /// That path is now guarded by `crate::output::eprint_error` (avoids PF-004 parallel-path
 /// gap — the sibling that slipped past rounds 1 and 2).
@@ -4830,7 +4830,7 @@ fn unknown_rule_does_not_change_fix_behaviour() {
 ///
 /// The JSON arm is pinned by `unknown_rule_json_stdout_is_byte_identical_to_run_without_it`.
 /// Human format routes diagnostics through a completely different renderer
-/// (`render_result_human` → `eprint_error` → miette, on stderr) and writes nothing to
+/// (the human result sink → miette, on stderr) and writes nothing to
 /// stdout, so a JSON-only assertion proves nothing here — this arm has to be asserted
 /// separately (PF-007 reasoning applied within one surface: two output formats are two
 /// renderers).
@@ -5541,24 +5541,18 @@ fn lint_stdin_prints_no_directory_summary() {
 // ── D4 cross-mode parity: status messages honour --quiet in ALL four input modes ──
 //
 // PF-004 — an alternate output path can silently bypass a guard. Directory mode
-// has TWO separate emitters (lint_one_file_human for --format human, and
-// lint_one_file_accumulating for --format json), plus single-file mode and stdin mode.
-// That is eight `fix rejected:` call sites in lint.rs (cited by function + match arm
-// so the reference survives future line-number shifts):
-//   run_lint_stdin             apply  — FixFileOutcome::Rejected arm
-//   run_lint_stdin             preview — PreviewOutcome::Rejected arm
-//   run_lint_file              apply  — FixFileOutcome::Rejected arm
-//   run_lint_file              preview — PreviewOutcome::Rejected arm
-//   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm
-//   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm
-//   lint_one_file_human        apply  — FixFileOutcome::Rejected arm
-//   lint_one_file_human        preview — PreviewOutcome::Rejected arm
+// once had two separate emitters, one per format, plus single-file mode and stdin
+// mode: eight `fix rejected:` call sites. Every mode now reaches `fix rejected:` the
+// same way — `lint_input` turns a refused fix into `Rewrite::Refused` (a file's
+// `--fix`), `FilterFix::Refused` (stdin's) or `PreviewFix::Refused` (a preview), and
+// the format's result sink (`lint_sink.rs`) prints it — but the four modes still load
+// and name their input differently.
 // This test covers all four modes, each with its own paired positive control, so no
 // assertion can pass because the fix was never attempted rather than suppressed.
 
 /// Source with a single Tier A fix that the reverify gate rejects whole-file:
-/// removing the empty `@define` would orphan the `@export`, so `FixFileOutcome`
-/// is `Rejected` (not `PartiallyFixed`) and `fix rejected:` is emitted.
+/// removing the empty `@define` would orphan the `@export`, so the fix pipeline's
+/// outcome is `Rejected` (not `PartiallyFixed`) and `fix rejected:` is emitted.
 const FIX_REJECTED_SOURCE: &str = "\
 @define empty_fn():
 
@@ -5638,14 +5632,13 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
         "directory: --quiet must not move the exit code"
     );
 
-    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
-    // PF-004: --format json routes directory files through lint_one_file_accumulating,
-    // a separate emitter from lint_one_file_human (Mode 3).  This covers the two
-    // gated sites in that emitter:
-    //   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm  (--fix)
-    //   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm (--fix --check)
+    // ── Mode 4: directory, --format json (JSON result sink) ─────────────────────
+    // --format json shows directory files through the JSON result sink, not the human
+    // one (Mode 3).  This covers its two refusals:
+    //   apply   — Rewrite::Refused     (--fix)
+    //   preview — PreviewFix::Refused  (--fix --check)
 
-    // Apply path (lint_one_file_accumulating, FixFileOutcome::Rejected): --fix --format json.
+    // Apply path (Rewrite::Refused): --fix --format json.
     let loud_json = lint_path(dir.path(), &["--fix", "--format", "json"]);
     let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
     assert!(
@@ -5668,7 +5661,7 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
         "dir --format json --fix: --quiet must not move the exit code"
     );
 
-    // Preview path (lint_one_file_accumulating, PreviewOutcome::Rejected): --fix --check --format json.
+    // Preview path (PreviewFix::Refused): --fix --check --format json.
     let loud_json_check = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
     let loud_json_check_stderr = String::from_utf8_lossy(&loud_json_check.stderr);
     assert!(
@@ -5707,8 +5700,8 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
 // PF-004: the cap notice is emitted from four separate call sites:
 //   run_lint_stdin          (stdin mode)
 //   run_lint_file           (single-file mode)
-//   lint_one_file_human     (directory --format human, the default)
-//   lint_one_file_accumulating (directory --format json)
+//   run_lint_directory      (directory --format human, the default)
+//   run_lint_directory      (directory --format json)
 // Each mode must gate on !quiet independently — PF-004 (avoids #43/#173 divergence class).
 // PF-013 / ADR-009: each mode carries a paired positive control so the quiet
 // assertion cannot pass vacuously on an uncovered path.
@@ -5808,10 +5801,10 @@ fn cap_notice_honours_quiet_in_all_four_modes() {
         "directory: --quiet must not move the exit code"
     );
 
-    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
-    // PF-004: --format json routes directory files through lint_one_file_accumulating,
-    // a SEPARATE emitter from lint_one_file_human (Mode 3).  The cap-notice gate
-    // (`if fix && !quiet`) inside lint_one_file_accumulating must also be tested;
+    // ── Mode 4: directory, --format json (JSON result sink) ─────────────────────
+    // --format json shows directory files through the JSON result sink, not the
+    // human one (Mode 3).  Its cap-notice gate (shown only under --fix and not
+    // --quiet) must also be tested;
     // a regression that leaves it unguarded would pass Modes 1–3 and escape CI.
     // The same temp `dir` / `cap.mds` file is reused (not modified by --fix --check).
 
@@ -6470,8 +6463,8 @@ fn lint_directory_unreadable_file_forces_summary_under_quiet() {
 
 // ── D4 (PF-004): Fixed: and Would fix: honour --quiet in dir-mode JSON emitter ─
 //
-// Finding: lint_one_file_accumulating (JSON) was missing Fixed: and Would fix:
-// messages, creating a divergence from lint_one_file_human (PF-004 class).
+// Finding: the directory JSON path was missing Fixed: and Would fix: messages,
+// creating a divergence from the directory human path.
 // These tests verify: (a) the messages appear without --quiet (positive control per
 // PF-013/ADR-009), and (b) --quiet suppresses them.
 
@@ -6567,16 +6560,16 @@ fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
 //
 // PF-007: per-surface assertions cannot prove cross-surface parity.
 // The JSON-side test (dir_json_fix_emits_fixed_and_quiet_suppresses_it) cannot
-// substitute for this test — lint_one_file_human is a separate emitter from
-// lint_one_file_accumulating.
+// substitute for this test — the human result sink is a separate emitter from
+// the JSON one.
 // Mutation-verified: without this test, changing the human-mode gate at
 // lint.rs:1723 from `!quiet` to `true` leaves all prior tests passing.
 
 /// D4/PF-004: dir-mode `--fix` (human format, the default) emits `Fixed:` to stderr
 /// (positive), and `--quiet` suppresses it (negative).  Both arms per PF-013/ADR-009.
 ///
-/// PF-007: this is a separate emitter (`lint_one_file_human`) from the JSON-mode
-/// equivalent (`lint_one_file_accumulating`); a gate on one is not inherited by the
+/// This is a separate emitter (the human result sink) from the JSON-mode
+/// equivalent (the JSON result sink); a gate on one is not inherited by the
 /// other.  The JSON-mode equivalent is `dir_json_fix_emits_fixed_and_quiet_suppresses_it`.
 #[test]
 fn dir_human_fix_emits_fixed_and_quiet_suppresses_it() {
@@ -6862,8 +6855,8 @@ fn d1_dir_fix_diff_residual_error_exits_2() {
 #[test]
 fn d1_fix_diff_residual_clean_info_only_exits_1() {
     // The floor: a file whose only findings are info-severity but FIXABLE
-    // previously previewed as exit 0 under --fix --diff (exit_by_severity on the
-    // pre-fix result ignores Info).  R1 floors the preview at 1 whenever a fix
+    // previously previewed as exit 0 under --fix --diff (the exit by severity of
+    // the pre-fix result ignores Info).  R1 floors the preview at 1 whenever a fix
     // is pending, matching --check's "would change" contract.
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -7028,4 +7021,143 @@ fn lint_single_file_non_utf8_path_exits_2() {
         stderr.contains("not valid UTF-8"),
         "the diagnostic must say why; got: {stderr}"
     );
+}
+
+// ── #309: --fix re-verifies a fixed partial as a partial ──────────────────────
+//
+// A file whose name starts with `_` is a partial: `unused-function`, `unused-import`
+// and `unused-variable` stay quiet for it. `--fix` lints every candidate source again
+// before it accepts it, and must lint it under the file's own name. Under any other
+// name the candidate is no partial, a define the module neither exports nor calls
+// turns into an `unused-function` finding the original did not have, and the fix is
+// refused as one that adds a finding.
+//
+// Fixture: `_p.mds` holds an always-false `@if` block (a fixable `unreachable-branch`
+// error) and one `@define` nothing exports or calls; its wildcard `@export`, from a
+// sibling that defines nothing, makes the module's exports explicit, which
+// `unused-function` needs. `full.mds`, the same text under a name that is not a
+// partial, is the positive control.
+
+/// A partial's text: a dead `@if` block, a define nothing exports or calls, and the
+/// export that makes the module's exports explicit. One `@define` block only.
+const PARTIAL_WITH_AN_UNUSED_DEFINE: &str = "---\ngreeting: hello\n---\n\
+     @if \"x\" == \"y\":\ndead\n@end\n\
+     @define helper():\nhelp text\n@end\n\
+     @export * from \"./_lib.mds\"\n{{greeting}}\n";
+
+/// [`PARTIAL_WITH_AN_UNUSED_DEFINE`] with its unreachable branch fixed: the dead block
+/// is gone, and the define stays.
+const PARTIAL_WITH_AN_UNUSED_DEFINE_FIXED: &str = "---\ngreeting: hello\n---\n\
+     @define helper():\nhelp text\n@end\n\
+     @export * from \"./_lib.mds\"\n{{greeting}}\n";
+
+/// Run `mds lint [extra_args] <dir>` from the working directory `cwd`.
+fn lint_dir_in(cwd: &Path, dir: &str, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(extra_args)
+        .arg(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// Each finding of a directory's JSON report, as `"<files[].file> <rule>"`.
+fn findings_of(report: &std::process::Output) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be the JSON report: {e}; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&report.stdout),
+            String::from_utf8_lossy(&report.stderr)
+        )
+    });
+    let mut findings = Vec::new();
+    for entry in json["files"].as_array().expect("the report has files[]") {
+        let file = entry["file"].as_str().expect("each entry names its file");
+        for diag in entry["diagnostics"]
+            .as_array()
+            .expect("each entry has diagnostics[]")
+        {
+            let rule = diag["rule"].as_str().expect("each finding names its rule");
+            findings.push(format!("{file} {rule}"));
+        }
+    }
+    findings
+}
+
+#[test]
+fn fix_of_a_partial_in_a_directory_applies_and_reports_no_unused_function() {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["d", "c"] {
+        fs::create_dir(tmp.path().join(dir)).unwrap();
+        fs::write(tmp.path().join(dir).join("_lib.mds"), "Shared text.\n").unwrap();
+    }
+    let partial = tmp.path().join("d").join("_p.mds");
+    fs::write(&partial, PARTIAL_WITH_AN_UNUSED_DEFINE).unwrap();
+    let full = tmp.path().join("c").join("full.mds");
+    fs::write(&full, PARTIAL_WITH_AN_UNUSED_DEFINE).unwrap();
+
+    // Positive control: under a name that is not a partial, the same text reports the
+    // unused define, in JSON and in the human report — so the absence checks below
+    // cannot pass on nothing.
+    let control = lint_dir_in(tmp.path(), "c", &["--format", "json"]);
+    assert_eq!(
+        findings_of(&control),
+        ["full.mds unreachable-branch", "full.mds unused-function"],
+        "control: a file that is not a partial reports the unused define"
+    );
+    let control = lint_dir_in(tmp.path(), "c", &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("unused-function"),
+        "control: the human report names the unused define; stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // Before the fix the partial reports its dead block, and no unused define.
+    let before = lint_dir_in(tmp.path(), "d", &["--format", "json"]);
+    assert_eq!(
+        findings_of(&before),
+        ["_p.mds unreachable-branch"],
+        "the partial reports only its dead block before the fix"
+    );
+
+    let out = lint_dir_in(tmp.path(), "d", &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("fix rejected"),
+        "the fix of a partial must not be refused; stderr: {stderr}"
+    );
+    let fixed_line = format!(
+        "Fixed: {}",
+        "d/_p.mds".replace('/', std::path::MAIN_SEPARATOR_STR)
+    );
+    assert!(
+        stderr.contains(&fixed_line),
+        "the partial must be fixed ({fixed_line:?}); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unused-"),
+        "no unused-* finding may be reported for a partial; stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nothing is left to report once the dead block is gone; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        PARTIAL_WITH_AN_UNUSED_DEFINE_FIXED,
+        "the dead block is removed and the define kept"
+    );
+
+    // After the fix a report of the directory finds nothing at all.
+    let after = lint_dir_in(tmp.path(), "d", &["--format", "json"]);
+    assert_eq!(
+        findings_of(&after),
+        Vec::<String>::new(),
+        "the fixed partial reports nothing"
+    );
+    assert_eq!(after.status.code(), Some(0));
 }

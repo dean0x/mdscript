@@ -1836,9 +1836,9 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "lint.rs",
-                "let residual = mds::lint_str_with(",
+                "let residual = mds::lint_str_named(",
                 "std::fs::remove_file(self.base_dir).ok();\n        \
-                 let residual = mds::lint_str_with(",
+                 let residual = mds::lint_str_named(",
             ),
             "which calls `remove_file`",
             "a delete in a method the compile calls",
