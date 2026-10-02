@@ -89,15 +89,23 @@ input. The compiler enforces several defense-in-depth controls:
   same-directory temp file and renamed over the target (`mds-cli/src/write.rs`,
   `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so a
   crash never leaves a truncated target. Every write is made below an anchor —
-  `--out-dir` as typed, a directory argument's root, `build.output_dir`, or the typed
-  parent of a file argument or of `-o` — which is resolved by path, so a symlinked
-  anchor the user named is followed. Nothing below it is (#160): on Unix each
-  directory below the anchor is opened from the one above without following a
-  symlink (`openat` with `O_NOFOLLOW`), and the temp file is created
-  (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
+  the parent of a file argument or of `-o`, `--out-dir`, a directory argument's root,
+  or, for `build.output_dir`, the directory that contains `mds.json` — which is
+  resolved by path, so a symlinked anchor the user named is followed: as typed, or,
+  for a directory-mode `--out-dir` and the anchors `mds watch` derives from its
+  entry or directory argument, as resolved once when the run starts. Nothing below it
+  is (#160): on Unix each directory below the anchor is opened from the one above
+  without following a symlink (`openat` with `O_NOFOLLOW`), and the temp file is
+  created (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
   descriptor, and renamed (`renameat`) in the last one, so a symlink below the anchor
   — planted before the run or swapped in while a write runs — and a symlink at the
-  target are refused (`mds::io`, exit 2) and never written through.
+  target are refused (`mds::io`, exit 2) and never written through; one that appears
+  at the target during the write is replaced by the rename, not followed. On Unix a
+  FIFO, a socket or a device at the target is refused (`not a regular file`) without
+  being opened. `build.output_dir` comes from the repository, not from the user: it must be
+  a relative path (an absolute one is refused before anything is written), and its own
+  directories lie below the anchor, so a symlink committed there, such as
+  `dist -> ~/elsewhere`, is refused rather than followed.
   **Windows residual**: the standard library has no descriptor-relative walk on
   Windows. Each directory below the anchor is checked and refused when it is a
   symlink or a junction, and the write then goes by path, so a directory that another

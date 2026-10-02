@@ -919,8 +919,17 @@ mod resolved_output {
             "nothing is written into the hostile directory"
         );
 
-        // Control: a symlink to a clean directory works.
+        // Control: the refusal above is the hostile name's. A symlink to a clean directory
+        // passes the load, and the write refuses it as it refuses any symlink below the
+        // directory `mds.json` is in (#160); the clean directory itself is written.
         write_mds_json(dir.path(), "clean_link");
+        let (code, text) = run(dir.path(), &["build", "in.mds"]);
+        assert_eq!(code, Some(2), "got: {text}");
+        assert!(
+            text.contains("refusing to follow a symlink") && !text.contains("forbidden character"),
+            "got: {text}"
+        );
+        write_mds_json(dir.path(), "clean");
         let (code, text) = run(dir.path(), &["build", "in.mds"]);
         assert_eq!(code, Some(0), "got: {text}");
         assert!(dir.path().join("clean").join("in.md").is_file());

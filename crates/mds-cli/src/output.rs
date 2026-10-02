@@ -1001,19 +1001,32 @@ fn resolve_existing_prefix(path: &Path) -> std::result::Result<Option<PathBuf>, 
     Ok(absolute.ancestors().find_map(|a| a.canonicalize().ok()))
 }
 
-/// Refuse an `mds.json` `build.output_dir` with a `..` component: `mds::io`, exit 2.
+/// Refuse an `mds.json` `build.output_dir` that leaves the directory `mds.json` is in: an
+/// absolute one — a root or a drive prefix — or one with a `..` component. `mds::io`,
+/// exit 2, naming the value as written.
 ///
-/// The raw components are checked rather than a canonical form because the
-/// directory may not exist yet (it is created on the first write). Shared by the
-/// single-file (`resolve_output_path_for_kind`) and directory
-/// ([`resolve_output_base`]) resolvers so both refuse it identically.
-pub(crate) fn reject_output_dir_traversal(
-    output_dir: &str,
-) -> std::result::Result<(), mds::MdsError> {
-    let traversal = Path::new(output_dir)
-        .components()
-        .any(|c| c == std::path::Component::ParentDir);
-    if traversal {
+/// The value is the repository's, not a path the user typed, so it may only name a
+/// directory below `mds.json`'s own, which is where its writes are anchored (#160). The
+/// raw components are checked rather than a canonical form because the directory may not
+/// exist yet (it is created on the first write). Shared by the single-file
+/// (`resolve_output_path_for_kind`) and directory ([`resolve_output_base`]) resolvers so
+/// both refuse it identically.
+pub(crate) fn reject_output_dir_escape(output_dir: &str) -> std::result::Result<(), mds::MdsError> {
+    use std::path::Component;
+
+    let mut components = Path::new(output_dir).components();
+    if components
+        .clone()
+        .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+    {
+        return Err(mds::MdsError::Io {
+            message: format!(
+                "mds.json output_dir '{}' must be a relative path",
+                mds::escape_path_for_message(output_dir)
+            ),
+        });
+    }
+    if components.any(|c| c == Component::ParentDir) {
         return Err(mds::MdsError::Io {
             message: format!(
                 "mds.json output_dir '{}' must not contain '..' components",
@@ -1042,6 +1055,11 @@ pub(crate) enum OutputBase {
         /// `build.output_dir` below the directory `mds.json` was reached by. The form a
         /// status line names an output by.
         shown: PathBuf,
+        /// How many of the directory's own last components lie below the anchor its
+        /// writes are made below (#160): none for `--out-dir`, which is its own anchor,
+        /// resolved when the run starts; `build.output_dir`'s, below the directory
+        /// `mds.json` is in, so a symlink there is refused like any other below an anchor.
+        below_anchor: usize,
     },
     NextToSource,
 }
@@ -1058,10 +1076,13 @@ pub(crate) enum OutputBase {
 /// so display never resolves a path again.
 ///
 /// The last `below_anchor` components of `path` — and of `shown`, which ends in the same
-/// names — lie below the write's anchor: `--out-dir` as typed, a directory argument's
-/// root, the directory `mds.json`'s `build.output_dir` names, or the typed parent of a
-/// file argument or of `-o`. The write resolves the anchor by path, as the user named it,
-/// and refuses a symlink at any of those components instead of writing through it.
+/// names — lie below the write's anchor: the parent of a file argument or of `-o`,
+/// `--out-dir`, a directory argument's root, or, for `mds.json`'s `build.output_dir`, the
+/// directory `mds.json` is in, with `build.output_dir`'s own directories below it. The
+/// write resolves the anchor by path, in the form `path` holds it — as typed, or as
+/// resolved once when the run started: a directory-mode `--out-dir` ([`OutputBase::Dir`]'s
+/// `canonical`) and the entry's directory or directory argument of `mds watch` — and
+/// refuses a symlink at any of the components below it instead of writing through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteTarget {
     pub(crate) path: PathBuf,
@@ -1100,6 +1121,20 @@ impl WriteTarget {
                 .filter(|c| *c != std::path::Component::CurDir)
                 .count(),
         }
+    }
+
+    /// The file `rel` below a directory-mode out-dir, `dir` in its two forms, whose own last
+    /// `dir_below_anchor` components lie below the anchor too — none for `--out-dir`,
+    /// `build.output_dir`'s below the directory `mds.json` is in ([`OutputBase::Dir`]).
+    pub(crate) fn below_out_dir(
+        dir: &Path,
+        shown_dir: &Path,
+        dir_below_anchor: usize,
+        rel: &Path,
+    ) -> Self {
+        let mut target = Self::below(dir, shown_dir, rel);
+        target.below_anchor += dir_below_anchor;
+        target
     }
 
     /// `file`, a path the walk of `root.walked` found, below that root as its anchor and
@@ -1201,16 +1236,18 @@ pub(crate) fn canonicalize_out_dir(
 /// once (#390).
 ///
 /// Precedence (mirrors `resolve_output_path_for_kind` for file mode):
-/// 1. `--out-dir` → `Dir`: canonical per [`canonicalize_out_dir`], shown as typed.
-/// 2. `mds.json build.output_dir` → `Dir`: below the config directory, shown below the
-///    directory `mds.json` was reached by — rejects `..` components at startup
-///    (`mds::io`, exit 2).
+/// 1. `--out-dir` → `Dir`: canonical per [`canonicalize_out_dir`], shown as typed; the
+///    anchor of its writes.
+/// 2. `mds.json build.output_dir` → `Dir`: below the config directory, the anchor of its
+///    writes, shown below the directory `mds.json` was reached by — refuses an absolute
+///    value and `..` components at startup (`mds::io`, exit 2).
 /// 3. Default → `NextToSource`
 ///
 /// # Errors
 ///
 /// A relative `--out-dir` when the working directory cannot be determined
-/// ([`canonicalize_out_dir`]), and a `build.output_dir` with a `..` component.
+/// ([`canonicalize_out_dir`]), and a `build.output_dir` that is absolute or has a `..`
+/// component ([`reject_output_dir_escape`]).
 pub(crate) fn resolve_output_base(
     out_dir: Option<&PathBuf>,
     config: &Option<ProjectConfig>,
@@ -1219,6 +1256,7 @@ pub(crate) fn resolve_output_base(
         return Ok(OutputBase::Dir {
             canonical,
             shown: typed.clone(),
+            below_anchor: 0,
         });
     }
     if let Some(ProjectConfig {
@@ -1228,10 +1266,15 @@ pub(crate) fn resolve_output_base(
     }) = config
     {
         if let Some(ref output_dir) = config.build.output_dir {
-            reject_output_dir_traversal(output_dir)?;
+            reject_output_dir_escape(output_dir)?;
             return Ok(OutputBase::Dir {
                 canonical: dir.join(output_dir),
                 shown: shown_dir.join(output_dir),
+                // Names alone, once the refusal above has run; a `.` adds none.
+                below_anchor: Path::new(output_dir)
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .count(),
             });
         }
     }
@@ -1276,9 +1319,13 @@ pub(crate) fn output_path_for(
     ext: &str,
 ) -> WriteTarget {
     match base {
-        OutputBase::Dir { canonical, shown } => {
+        OutputBase::Dir {
+            canonical,
+            shown,
+            below_anchor,
+        } => {
             let (rel, flattened) = mirrored_output(source, root.walked, ext);
-            let target = WriteTarget::below(canonical, shown, &rel);
+            let target = WriteTarget::below_out_dir(canonical, shown, *below_anchor, &rel);
             if flattened {
                 // Invariant report, not gated on --quiet (like the depth-limit and
                 // stale-unlink warnings above). Emitted once per output-path computation:
@@ -1710,9 +1757,14 @@ pub(crate) fn output_stem_for(
     base: &OutputBase,
 ) -> WriteTarget {
     match base {
-        OutputBase::Dir { canonical, shown } => WriteTarget::below(
+        OutputBase::Dir {
             canonical,
             shown,
+            below_anchor,
+        } => WriteTarget::below_out_dir(
+            canonical,
+            shown,
+            *below_anchor,
             &mirror_stem(source, root.walked).into_path(),
         ),
         OutputBase::NextToSource => {
@@ -2509,6 +2561,7 @@ mod tests {
         OutputBase::Dir {
             canonical: PathBuf::from("/out"),
             shown: PathBuf::from("out"),
+            below_anchor: 0,
         }
     }
 
@@ -2582,15 +2635,21 @@ mod tests {
     /// #390: `resolve_output_base` fixes both forms of the out-dir: the canonical form is
     /// absolute, the shown form is the out-dir exactly as typed; `mds.json`'s
     /// `build.output_dir` is resolved below the config directory and shown below the
-    /// directory `mds.json` was reached by.
+    /// directory `mds.json` was reached by. #160: `--out-dir` is its writes' anchor, and
+    /// `build.output_dir`'s own directories lie below the config directory, theirs.
     #[test]
     fn the_out_dir_is_shown_as_typed_and_resolved_absolute() {
         let typed = PathBuf::from("out");
         match resolve_output_base(Some(&typed), &None).expect("a relative out-dir resolves") {
-            OutputBase::Dir { canonical, shown } => {
+            OutputBase::Dir {
+                canonical,
+                shown,
+                below_anchor,
+            } => {
                 assert!(canonical.is_absolute(), "canonical: {canonical:?}");
                 assert!(canonical.ends_with("out"), "canonical: {canonical:?}");
                 assert_eq!(shown, typed);
+                assert_eq!(below_anchor, 0);
             }
             other => panic!("want Dir; got {other:?}"),
         }
@@ -2607,12 +2666,52 @@ mod tests {
             shown_dir: PathBuf::from("src/.."),
         });
         match resolve_output_base(None, &config).expect("a config output_dir resolves") {
-            OutputBase::Dir { canonical, shown } => {
+            OutputBase::Dir {
+                canonical,
+                shown,
+                below_anchor,
+            } => {
                 assert_eq!(canonical, Path::new("/project").join("dist"));
                 assert_eq!(shown, Path::new("src/..").join("dist"));
+                assert_eq!(below_anchor, 1);
             }
             other => panic!("want Dir; got {other:?}"),
         }
+    }
+
+    /// #160: a directory-mode output below `mds.json`'s `build.output_dir` is anchored at
+    /// the directory `mds.json` is in, `build.output_dir`'s own directories below it — a
+    /// `.` adds none — and an absolute value is refused before it can name an anchor.
+    #[test]
+    fn a_build_output_dir_lies_below_the_config_directory() {
+        let config = |output_dir: &str| {
+            Some(ProjectConfig {
+                config: crate::build::MdsConfig {
+                    build: crate::build::BuildConfig {
+                        output_dir: Some(output_dir.to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                dir: PathBuf::from("/project"),
+                shown_dir: PathBuf::from("."),
+            })
+        };
+        let root = PathBuf::from("/project/src");
+        let source = root.join("sub").join("a.mds");
+        for (output_dir, rel) in [("dist", "dist/sub/a.md"), ("./a/b", "a/b/sub/a.md")] {
+            let base = resolve_output_base(None, &config(output_dir)).expect("relative");
+            assert_eq!(
+                output_path_for(&source, RootPaths::as_typed(&root), &base, "md"),
+                target("/project", ".", rel),
+                "{output_dir:?}"
+            );
+        }
+        let absolute = std::env::temp_dir().join("dist");
+        let refused = resolve_output_base(None, &config(absolute.to_str().unwrap()))
+            .expect_err("an absolute output_dir is refused")
+            .to_string();
+        assert!(refused.contains("must be a relative path"), "{refused}");
     }
 
     // T-CLI-21 (unit): output_path_for with "json" / "md" extensions.
@@ -5020,7 +5119,9 @@ mod tests {
                 "mds::io: {refused:?}"
             );
             match resolve_output_base(Some(&absolute), &None).expect("an absolute out-dir") {
-                OutputBase::Dir { canonical, shown } => {
+                OutputBase::Dir {
+                    canonical, shown, ..
+                } => {
                     assert_eq!(canonical, absolute, "control: resolved without one");
                     assert_eq!(shown, absolute, "control: shown as typed");
                 }

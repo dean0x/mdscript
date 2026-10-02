@@ -12,20 +12,25 @@
 //!
 //! # Below the anchor (#160)
 //!
-//! A [`WriteTarget`] names its file below an anchor: `--out-dir` as typed, a directory
-//! argument's root, the directory `mds.json`'s `build.output_dir` names, or the typed
-//! parent of a file argument or of `-o`. The anchor is resolved by path, as the user named
-//! it, so a symlinked anchor is followed (a symlinked directory argument is refused before
-//! anything is written, #413). Nothing below it is: each directory is opened from the one
-//! above it without following a symlink, and the file is created, checked and renamed in
-//! the last one. A symlink planted below the anchor, or swapped in while the write runs,
-//! is refused (`mds::io`, exit 2) by the path the user knows it by, and nothing is written
-//! through it. The walk is made for every write and nothing is held open between writes,
-//! so a directory replaced between two writes is the one the next write finds.
+//! A [`WriteTarget`] names its file below an anchor: the parent of a file argument or of
+//! `-o`, `--out-dir`, a directory argument's root, or — for `mds.json`'s
+//! `build.output_dir`, which the repository names and the user does not — the directory
+//! `mds.json` is in, with `build.output_dir`'s own directories below it. The anchor is
+//! resolved by path, in the form the run holds it — as typed, or, for a directory-mode
+//! `--out-dir` and the anchors `mds watch` derives from its entry or directory argument,
+//! as resolved once when the run started — so a symlinked anchor is followed (a
+//! symlinked directory argument is refused before anything is written, #413). Nothing
+//! below it is: each directory is opened from the one above it without following a
+//! symlink, and the file is created, checked and renamed in the last one. A symlink
+//! planted below the anchor, or swapped in while the write runs, is refused (`mds::io`,
+//! exit 2) by the path the user knows it by, and nothing is written through it. The walk
+//! is made for every write and nothing is held open between writes, so a directory
+//! replaced between two writes is the one the next write finds.
 //!
 //! On unix the walk is `openat(O_DIRECTORY | O_NOFOLLOW)` from the anchor's descriptor
 //! (`mkdirat` first for a directory an output needs), then `fstatat(AT_SYMLINK_NOFOLLOW)` on
-//! the target, the temporary file `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` beside it —
+//! the target — never an open of it, which a FIFO would block, and a FIFO, a socket or a
+//! device is refused — the temporary file `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` beside it —
 //! unlinked again if anything after that fails — `fchmod` to the mode of the file it
 //! replaces, the durability tier's syncs, and `renameat` (`mod unix`).
 //!
@@ -89,7 +94,8 @@ pub(crate) enum Parents {
 /// Write `content` to `target` atomically, below its anchor and through no symlink there
 /// (see the module docs).
 ///
-/// A symlink at the target itself — live or dangling — is refused rather than replaced.
+/// A symlink at the target itself — live or dangling — is refused rather than replaced,
+/// and so, on unix, is a FIFO, a socket or a device, which the write never opens.
 /// An existing file keeps its permission bits (unix); a new one is created with mode
 /// `0666 & !umask`, as `std::fs::write` creates one. `parents` says whether missing
 /// directories are created; `durability` whether the write is synced.
@@ -101,7 +107,8 @@ pub(crate) enum Parents {
 /// status line names it by, never by `target.path` (#390), and the cause naming no path
 /// ([`io_cause`]). A symlink refused below the anchor is named instead, below the anchor's
 /// shown form — `cannot write out/sub: refusing to follow a symlink` — and one at the
-/// target says `refusing to replace a symlink`.
+/// target says `refusing to replace a symlink`; a FIFO, a socket or a device there says
+/// `not a regular file`.
 pub(crate) fn atomic_write_file(
     target: &WriteTarget,
     content: &str,
@@ -114,12 +121,18 @@ pub(crate) fn atomic_write_file(
             io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
         }
         Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
+        #[cfg(unix)]
+        Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
         Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
     })
 }
 
 /// Why [`atomic_write_file`] refuses to replace a symlink at its target.
 const SYMLINK_REFUSAL: &str = "refusing to replace a symlink";
+
+/// Why [`atomic_write_file`] refuses to replace a FIFO, a socket or a device at its target.
+#[cfg(unix)]
+const NOT_A_REGULAR_FILE: &str = "not a regular file";
 
 /// Why [`atomic_write_file`] refuses a symlink at a directory below the anchor.
 const FOLLOW_REFUSAL: &str = "refusing to follow a symlink";
@@ -152,6 +165,9 @@ enum Failure {
     LinkBelowAnchor { depth: usize },
     /// The target itself is a symlink.
     LinkAtTarget,
+    /// The target itself is a FIFO, a socket or a device.
+    #[cfg(unix)]
+    NotARegularFile,
     /// Anything else.
     Io(std::io::Error),
 }
@@ -185,9 +201,14 @@ impl<'a> Below<'a> {
     /// # Errors
     ///
     /// "is a directory" when the last component is not a name (`.`, `..`, a root: a
-    /// directory, never a file), "invalid input" when one above it is not one, or when the
-    /// path has fewer components than the target says lie below its anchor.
+    /// directory, never a file) or the path ends in a separator, or in a separator and a
+    /// `.` (`out/`, `out/.`), which `Path::components` drops; "invalid input" when one above
+    /// it is not a name, or when the path has fewer components than the target says lie
+    /// below its anchor.
     fn of(target: &'a WriteTarget) -> std::io::Result<Self> {
+        if ends_as_a_directory(&target.path) {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
         let components: Vec<Component<'a>> = target.path.components().collect();
         let below = target.below_anchor();
         let above = components
@@ -215,6 +236,18 @@ impl<'a> Below<'a> {
             anchor.iter().collect()
         };
         Ok(Self { anchor, dirs, name })
+    }
+}
+
+/// Whether `path` ends in a separator, or in a separator and a `.`: the spelling of a
+/// directory, whatever the name before it.
+fn ends_as_a_directory(path: &Path) -> bool {
+    // A separator is ASCII on every platform, and no byte of a multi-byte character is.
+    let separator = |byte: &u8| std::path::is_separator(char::from(*byte));
+    match path.as_os_str().as_encoded_bytes() {
+        [.., last] if separator(last) => true,
+        [.., before, b'.'] => separator(before),
+        _ => false,
     }
 }
 
@@ -282,26 +315,51 @@ mod unix {
     ) -> Result<(), Failure> {
         let mut dir = open_anchor(&below.anchor, parents)?;
         for (depth, name) in below.dirs.iter().enumerate() {
-            let next = open_below(dir.as_fd(), name, parents).map_err(|e| {
-                if is_symlink(dir.as_fd(), name) {
-                    Failure::LinkBelowAnchor { depth }
-                } else {
-                    Failure::from(e)
-                }
-            })?;
+            let next = open_below(dir.as_fd(), name, parents)
+                .map_err(|errno| below_failure(dir.as_fd(), name, depth, errno))?;
             dir = next;
         }
         replace(dir, below.name, content, durability)
     }
 
     /// Open the anchor by path, creating it first when it is missing and `parents` says so.
+    ///
+    /// A missing anchor that cannot be created because a name on its path is taken has a
+    /// symlink that leads nowhere there (an existing file fails the open as not a directory
+    /// instead): it is reported as the missing directory it is, not as the name creating
+    /// it found.
     fn open_anchor(anchor: &Path, parents: Parents) -> Result<OwnedFd, Failure> {
         match fs::openat(CWD, anchor, ANCHOR, Mode::empty()) {
             Err(Errno::NOENT) if parents == Parents::Create => {
-                std::fs::create_dir_all(anchor)?;
+                std::fs::create_dir_all(anchor).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        Errno::NOENT.into()
+                    } else {
+                        e
+                    }
+                })?;
                 Ok(fs::openat(CWD, anchor, ANCHOR, Mode::empty())?)
             }
             opened => Ok(opened?),
+        }
+    }
+
+    /// What a failed open of the directory `name` in `dir`, `depth` levels below the
+    /// anchor, comes to: a symlink refusal when the open said `ELOOP` — which an
+    /// `O_NOFOLLOW` open of one name says for a symlink alone, even if the link is gone by
+    /// the time it could be looked at again — or when `name` is a symlink now (Linux can
+    /// say `ENOTDIR` for one opened `O_DIRECTORY`, as for a file); else the open's own
+    /// failure.
+    pub(super) fn below_failure(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        depth: usize,
+        errno: Errno,
+    ) -> Failure {
+        if errno == Errno::LOOP || is_symlink(dir, name) {
+            Failure::LinkBelowAnchor { depth }
+        } else {
+            Failure::from(errno)
         }
     }
 
@@ -333,11 +391,16 @@ mod unix {
         content: &[u8],
         durability: Durability,
     ) -> Result<(), Failure> {
+        // The target is looked at, never opened: a FIFO would block the open.
         let existing = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
-                return Err(Failure::LinkAtTarget)
-            }
-            Ok(stat) => Some(Mode::from_raw_mode(stat.st_mode)),
+            Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => Some(Mode::from_raw_mode(stat.st_mode)),
+                FileType::Symlink => return Err(Failure::LinkAtTarget),
+                // A directory has no mode a file should take: the rename below refuses to
+                // replace it, and the temporary file is unlinked again.
+                FileType::Directory => None,
+                _ => return Err(Failure::NotARegularFile),
+            },
             Err(Errno::NOENT) => None,
             Err(e) => return Err(e.into()),
         };
@@ -451,6 +514,10 @@ mod windows {
 
     use super::{Below, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
 
+    /// `ERROR_PATH_NOT_FOUND`: a directory that is not there, in the operating system's
+    /// words.
+    const PATH_NOT_FOUND: i32 = 3;
+
     /// Write `content` to `below.name`: refuse a symlink or a junction at any directory
     /// below the anchor, then replace the file by path (the residual the module docs
     /// describe).
@@ -461,7 +528,20 @@ mod windows {
         parents: Parents,
     ) -> Result<(), Failure> {
         if parents == Parents::Create {
-            std::fs::create_dir_all(&below.anchor)?;
+            // A name on the anchor's path taken by a link that leads nowhere — the anchor
+            // then resolves to nothing — is a directory that is not there, as on unix; a
+            // file there keeps the error creating the directory met.
+            std::fs::create_dir_all(&below.anchor).map_err(|e| {
+                let leads_nowhere = || {
+                    std::fs::metadata(&below.anchor)
+                        .is_err_and(|m| m.kind() == std::io::ErrorKind::NotFound)
+                };
+                if e.kind() == std::io::ErrorKind::AlreadyExists && leads_nowhere() {
+                    std::io::Error::from_raw_os_error(PATH_NOT_FOUND)
+                } else {
+                    e
+                }
+            })?;
         }
         let mut dir = below.anchor.clone();
         for (depth, name) in below.dirs.iter().enumerate() {
@@ -642,6 +722,39 @@ mod tests {
         );
     }
 
+    /// A target that ends in a separator, or in a separator and a `.`, names a directory,
+    /// though `Path::components` drops that ending and leaves the name before it: `out/` and
+    /// `out/.` are refused as a directory, never written as the file `out`. Controls: the
+    /// same names without the ending, and a name that merely ends in a dot, split.
+    #[test]
+    fn a_target_ending_in_a_separator_names_a_directory() {
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        for typed in [
+            "out/".to_owned(),
+            "out/.".to_owned(),
+            "out/./".to_owned(),
+            "sub/out/".to_owned(),
+            format!("out{sep}"),
+            format!("out{sep}."),
+        ] {
+            let target = WriteTarget::as_typed(PathBuf::from(&typed));
+            let kind = Below::of(&target).map(|_| ()).unwrap_err().kind();
+            assert_eq!(
+                kind,
+                std::io::ErrorKind::IsADirectory,
+                "{typed:?} names a directory"
+            );
+        }
+        for (typed, name) in [("out", "out"), ("sub/out", "out"), ("out.", "out.")] {
+            let target = WriteTarget::as_typed(PathBuf::from(typed));
+            assert_eq!(
+                Below::of(&target).unwrap().name,
+                OsStr::new(name),
+                "{typed:?}"
+            );
+        }
+    }
+
     /// A refused directory is named below the anchor's shown form, cut after the level the
     /// symlink was found at.
     #[test]
@@ -697,6 +810,51 @@ mod tests {
         std::os::unix::fs::symlink(&victim, anchor.join("a").join("b")).unwrap();
         std::fs::write(anchor.join("a/b/by-hand"), "x").unwrap();
         assert_eq!(entries(&victim), vec!["by-hand".to_owned()]);
+    }
+
+    /// A failed open of a directory below the anchor is a symlink refusal when the open
+    /// said `ELOOP` — a link swapped back for a directory before it could be looked at
+    /// again included — or when the name is a symlink, whatever the open said; any other
+    /// failure of a directory is the write's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_open_below_the_anchor_is_refused_when_it_met_a_symlink() {
+        use std::os::fd::AsFd as _;
+
+        use rustix::io::Errno;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
+        let fd = rustix::fs::open(
+            dir.path(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let failure =
+            |name: &str, errno| super::unix::below_failure(fd.as_fd(), OsStr::new(name), 3, errno);
+
+        assert!(
+            matches!(
+                failure("real", Errno::LOOP),
+                Failure::LinkBelowAnchor { depth: 3 }
+            ),
+            "ELOOP is a symlink, though a directory is there now"
+        );
+        assert!(
+            matches!(
+                failure("link", Errno::NOTDIR),
+                Failure::LinkBelowAnchor { depth: 3 }
+            ),
+            "a symlink there now is refused, whatever the open said"
+        );
+        for errno in [Errno::NOTDIR, Errno::ACCESS] {
+            assert!(
+                matches!(failure("real", errno), Failure::Io(_)),
+                "{errno:?} of a directory is the write's own failure"
+            );
+        }
     }
 
     /// A symlinked anchor is followed: the anchor is resolved by path, as the user typed it
@@ -817,6 +975,45 @@ mod tests {
             std::fs::read_to_string(anchor.join("a").join("b").join("x.md")).unwrap(),
             "X"
         );
+    }
+
+    /// An anchor that is a symlink leading nowhere is a directory that is not there: the
+    /// write says so, rather than the `File exists` creating it fails with, and creates
+    /// nothing where the link points. Control: once the link leads to a directory, the
+    /// write lands there.
+    #[test]
+    fn a_dangling_symlink_anchor_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        let nowhere = dir.path().join("nowhere");
+        // A directory link (Windows tells the kinds apart), then left leading nowhere.
+        std::fs::create_dir(&nowhere).unwrap();
+        if !make_symlink(&nowhere, &link) {
+            return;
+        }
+        std::fs::remove_dir(&nowhere).unwrap();
+        let target = WriteTarget::below(&link, Path::new("o"), Path::new("x.md"));
+
+        let err = atomic_write_file(&target, "X", Durability::RenameOnly, Parents::Create)
+            .expect_err("a dangling anchor cannot be written below")
+            .to_string();
+        #[cfg(unix)]
+        let missing = os_text(rustix::io::Errno::NOENT);
+        // `ERROR_PATH_NOT_FOUND`.
+        #[cfg(windows)]
+        let missing = std::io::Error::from_raw_os_error(3).to_string();
+        assert_eq!(
+            err,
+            format!("cannot write {}: {missing}", safe_path(&target.shown))
+        );
+        assert!(
+            !nowhere.exists(),
+            "nothing was created where the link points"
+        );
+
+        std::fs::create_dir(&nowhere).unwrap();
+        atomic_write_file(&target, "X", Durability::RenameOnly, Parents::Create).unwrap();
+        assert_eq!(std::fs::read_to_string(nowhere.join("x.md")).unwrap(), "X");
     }
 
     // ── The temporary file ───────────────────────────────────────────────────────

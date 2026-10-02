@@ -375,9 +375,11 @@ pub(crate) fn compute_output_dir_path_for_kind(
 /// the input's `canonical` form and is shown beside its `typed` one (`./x.md` for a bare
 /// `x.mds`). `mds build` passes its input as typed in both forms ([`EntryPaths`]).
 ///
-/// In every rule the write's anchor is the directory the output goes in — `-o`'s typed
-/// parent, `--out-dir` as typed, the `build.output_dir` directory, the input's directory —
-/// resolved by path when it is written (#160).
+/// The write's anchor is resolved by path when it is written (#160): in rules 2, 4 and 6
+/// it is the directory the output goes in — `-o`'s typed parent, `--out-dir` as typed, the
+/// input's directory; in rule 5 it is the config directory, with `build.output_dir`'s own
+/// directories below it, since the repository names them and the user does not. An
+/// absolute `build.output_dir` is refused.
 pub(crate) fn resolve_output_path_for_kind(
     input: Option<EntryPaths<'_>>,
     output: &Option<String>,
@@ -419,12 +421,15 @@ pub(crate) fn resolve_output_path_for_kind(
     }) = config
     {
         if let Some(ref output_dir) = config.build.output_dir {
-            // Reject path traversal: `output_dir` must not contain `..` components
-            // (exit 2). A forbidden character was already refused by `load_config`.
-            crate::output::reject_output_dir_traversal(output_dir)?;
-            return Ok(Some(WriteTarget::new(
-                compute_output_dir_path_for_kind(&dir.join(output_dir), input_path, kind),
-                compute_output_dir_path_for_kind(&shown_dir.join(output_dir), input_path, kind),
+            // Refuse an absolute `output_dir` and one with a `..` component (exit 2). A
+            // forbidden character was already refused by `load_config`.
+            crate::output::reject_output_dir_escape(output_dir)?;
+            // The repository names `output_dir`, the user does not: its directories lie
+            // below the config directory, the anchor, with the file (#160).
+            return Ok(Some(WriteTarget::below(
+                dir,
+                shown_dir,
+                &compute_output_dir_path_for_kind(Path::new(output_dir), input_path, kind),
             )));
         }
     }
@@ -2612,7 +2617,8 @@ mod tests {
     }
 
     /// #390: an output under `mds.json` `build.output_dir` is written below the canonical
-    /// config directory and named below the directory `mds.json` was reached by.
+    /// config directory and named below the directory `mds.json` was reached by. #160:
+    /// the config directory is the write's anchor, `build.output_dir` below it.
     #[test]
     fn resolve_output_path_config_output_dir_is_shown_below_the_directory_reached() {
         let result = resolve_output_path_for_kind(
@@ -2626,9 +2632,9 @@ mod tests {
         assert_eq!(
             result,
             Some(WriteTarget::below(
-                &Path::new("/project").join("build"),
-                &Path::new("src/..").join("build"),
-                Path::new("hello.md")
+                Path::new("/project"),
+                Path::new("src/.."),
+                &Path::new("build").join("hello.md")
             ))
         );
     }

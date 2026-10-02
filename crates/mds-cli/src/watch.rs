@@ -4046,6 +4046,7 @@ mod tests {
         OutputBase::Dir {
             canonical: d.clone(),
             shown: d,
+            below_anchor: 0,
         }
     }
 
@@ -4147,7 +4148,7 @@ mod tests {
         let d = tmp.path().join("out");
         let result = resolve_output_base(Some(&d), &project_config("dist")).unwrap();
         assert!(
-            matches!(result, OutputBase::Dir { ref canonical, ref shown }
+            matches!(result, OutputBase::Dir { ref canonical, ref shown, below_anchor: 0 }
                 if canonical == &d && shown == &d),
             "expected Dir({d:?}), got {result:?}"
         );

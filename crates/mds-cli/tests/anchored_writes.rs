@@ -1,11 +1,12 @@
 //! Every write stays below its anchor and never follows a symbolic link (#160).
 //!
-//! A write resolves its anchor by path — `--out-dir` as typed, a directory argument's
-//! root, or the typed parent of a file argument or of `-o` — so a symlinked anchor the user
-//! typed is still followed. Every directory BELOW the anchor is opened without following a
-//! symlink, so a link planted there, or swapped in while the run is going, is refused
-//! (`mds::io`, exit 2) by the path the user would know it by, and nothing is written
-//! through it.
+//! A write resolves its anchor by path — `--out-dir`, a directory argument's root, the
+//! parent of a file argument or of `-o`, or, for `mds.json`'s `build.output_dir`, the
+//! directory `mds.json` is in — so a symlinked anchor the user typed is still followed.
+//! Every directory BELOW the anchor — `build.output_dir`'s own included — is opened
+//! without following a symlink, so a link planted there, or swapped in while the run is
+//! going, is refused (`mds::io`, exit 2) by the path the user would know it by, and
+//! nothing is written through it.
 //!
 //! Each absence check here — nothing written through the link — sits beside the refusal
 //! that proves the write was attempted after the link was in place, and beside a write
@@ -147,8 +148,9 @@ fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
 }
 
 /// The anchor itself is resolved by path, as before (#160): a symlink the user typed as
-/// `--out-dir`, as the directory of `-o`, as a file argument's `--out-dir`, or reached as
-/// `mds.json`'s `build.output_dir`, is followed and written through.
+/// `--out-dir`, as the directory of `-o`, or as a file argument's `--out-dir`, is followed
+/// and written through. (`mds.json`'s `build.output_dir` is no path the user typed: a
+/// symlink there is refused, below.)
 #[cfg(unix)]
 #[test]
 fn a_symlinked_anchor_the_user_named_is_still_followed() {
@@ -157,39 +159,26 @@ fn a_symlinked_anchor_the_user_named_is_still_followed() {
     put(root, "src/sub/a.mds", "A\n");
     std::fs::create_dir(root.join("real")).unwrap();
     std::os::unix::fs::symlink("real", root.join("link")).unwrap();
-    put(root, "proj/mds.json", r#"{"build":{"output_dir":"dist"}}"#);
-    put(root, "proj/p.mds", "P\n");
-    std::fs::create_dir(root.join("proj-dist")).unwrap();
-    std::os::unix::fs::symlink("../proj-dist", root.join("proj/dist")).unwrap();
 
-    // (working directory, arguments, the line naming the output, where the bytes land)
-    for (cwd, args, line, landed) in [
+    // (arguments, the line naming the output, where the bytes land)
+    for (args, line, landed) in [
         (
-            ".",
             &["build", "src", "--out-dir", "link"][..],
             "Compiled to link/sub/a.md",
             "real/sub/a.md",
         ),
         (
-            ".",
             &["build", "src/sub/a.mds", "-o", "link/one.md"][..],
             "Compiled to link/one.md",
             "real/one.md",
         ),
         (
-            ".",
             &["build", "src/sub/a.mds", "--out-dir", "link"][..],
             "Compiled to link/a.md",
             "real/a.md",
         ),
-        (
-            "proj",
-            &["build", "p.mds"][..],
-            "Compiled to ./dist/p.md",
-            "proj-dist/p.md",
-        ),
     ] {
-        let out = run(&root.join(cwd), args);
+        let out = run(root, args);
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{args:?}: stderr: {stderr}");
         assert!(
@@ -202,6 +191,227 @@ fn a_symlinked_anchor_the_user_named_is_still_followed() {
             "{args:?}: {} was written",
             landed.display()
         );
+    }
+}
+
+/// An `-o` that ends in a separator, or in a separator and a `.`, names a directory: it is
+/// refused as one (`mds::io`, exit 2), and no file of the name before that ending is
+/// created, nor an existing one replaced. Control: the same directory with a file name
+/// below it is written.
+#[cfg(unix)]
+#[test]
+fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "page.mds", "Hello\n");
+    put(root, "other.md", "Other\n");
+
+    for typed in ["newdir/", "newdir/.", "other.md/"] {
+        let out = run(root, &["build", "page.mds", "-o", typed]);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{typed}: stderr: {stderr}");
+        let refusal = format!("cannot write {}: is a directory", native(typed));
+        assert!(
+            stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refusal)),
+            "{typed}: refused as a directory; stderr: {stderr}"
+        );
+    }
+    assert!(
+        !root.join("newdir").exists(),
+        "no file `newdir` was created"
+    );
+    assert_eq!(
+        read(&root.join("other.md")),
+        "Other\n",
+        "other.md was left alone"
+    );
+    // The entry itself, so spelled, is refused before any write is attempted.
+    let out = run(root, &["build", "page.mds", "-o", "page.mds/"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", text(&out.stderr));
+    assert_eq!(
+        read(&root.join("page.mds")),
+        "Hello\n",
+        "the entry was left alone"
+    );
+
+    // Control: the same route writes a file below that directory.
+    let out = run(root, &["build", "page.mds", "-o", "newdir/page.md"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", text(&out.stderr));
+    assert_eq!(read(&root.join(native("newdir/page.md"))), "Hello\n");
+}
+
+/// A FIFO at the output path is no file a write replaces: it is refused (`mds::io`, exit
+/// 2) without being opened — the run does not block on it — and left in place. Control:
+/// a regular file at the same path is replaced.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_output_path_is_refused_and_left_in_place() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "page.mds", "Hello\n");
+    let target = root.join("page.md");
+    let name = std::ffi::CString::new(target.as_os_str().as_bytes()).expect("no NUL in it");
+    // SAFETY: `name` is a NUL-terminated path in this test's own scratch directory.
+    assert_eq!(
+        unsafe { libc::mkfifo(name.as_ptr(), 0o644) },
+        0,
+        "create a FIFO"
+    );
+
+    let mut child = common::ChildGuard(
+        mds_bin()
+            .current_dir(root)
+            .args(["build", "page.mds", "-o", "page.md"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mds"),
+    );
+    let tap = common::tap_reader(child.0.stderr.take().expect("a piped stderr"));
+    // Bounded by TIMEOUT: a run that opened the FIFO would block until it is read.
+    let deadline = Instant::now() + TIMEOUT;
+    let code = loop {
+        if let Some(status) = child.0.try_wait().expect("poll the run") {
+            break status.code();
+        }
+        assert!(Instant::now() < deadline, "the run blocked on the FIFO");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("mds::io")
+            && squash(&stderr).contains(&squash("cannot write page.md: not a regular file")),
+        "stderr: {stderr}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&target)
+            .expect("the FIFO is still there")
+            .file_type()
+            .is_fifo(),
+        "the FIFO is left in place"
+    );
+
+    // Control: a regular file at the same path is replaced.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::write(&target, "Old\n").unwrap();
+    let out = run(root, &["build", "page.mds", "-o", "page.md"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", text(&out.stderr));
+    assert_eq!(read(&target), "Hello\n");
+}
+
+// ── `build.output_dir`: a directory the repository names ─────────────────────
+
+/// `mds.json`'s `build.output_dir` is the repository's, not a path the user typed: it is
+/// written below the directory `mds.json` is in, its own directories included, so a
+/// symlink committed at `dist` is refused — `mds build` of a file and of a directory, and
+/// `mds watch` of a directory — and the directory it points at is left alone. The
+/// refusal names the link below the directory `mds.json` was reached by, as an output is.
+#[cfg(unix)]
+#[test]
+fn a_symlink_committed_as_build_output_dir_is_refused() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "mds.json", r#"{"build":{"output_dir":"dist"}}"#);
+    put(root, "src/a.mds", "A\n");
+    std::fs::create_dir(root.join("victim")).unwrap();
+    std::os::unix::fs::symlink("victim", root.join("dist")).unwrap();
+
+    for args in [&["build", "src/a.mds"][..], &["build", "src"]] {
+        let out = run(root, args);
+        let stderr = text(&out.stderr);
+        assert_eq!(
+            entries(&root.join("victim")),
+            Vec::<String>::new(),
+            "{args:?}: nothing is written through the symlink; stderr: {stderr}"
+        );
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("mds::io")
+                && squash(&stderr).contains(&squash(&refused("src/../dist"))),
+            "{args:?}: the refusal names the link; stderr: {stderr}"
+        );
+    }
+
+    let (child, tap, _) = common::spawn_watch_ready(
+        mds_bin()
+            .current_dir(root)
+            .args(["watch", "src", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let mut child = common::ChildGuard(child);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        entries(&root.join("victim")),
+        Vec::<String>::new(),
+        "watch: nothing is written through the symlink; stderr: {stderr}"
+    );
+    assert!(
+        squash(&stderr).contains(&squash(&refused("src/../dist"))),
+        "watch: the refusal names the link; stderr: {stderr}"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("dist"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is left in place"
+    );
+}
+
+/// An absolute `build.output_dir` is refused before anything is written (`mds::io`, exit
+/// 2), naming `mds.json` and the value as written, in file and directory mode: the
+/// repository does not choose where outside it a build writes. Control: a relative one is
+/// written below the directory `mds.json` is in, its directories created.
+#[test]
+fn a_build_output_dir_must_be_relative() {
+    let dir = scratch();
+    let root = dir.path();
+    let project = root.join("proj");
+    let victim = root.join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    let absolute = victim.to_str().expect("a UTF-8 scratch path").to_owned();
+    let config = serde_json::json!({ "build": { "output_dir": absolute } }).to_string();
+    put(&project, "mds.json", &config);
+    put(&project, "src/a.mds", "A\n");
+
+    let refusal = format!("mds.json output_dir '{absolute}' must be a relative path");
+    for args in [&["build", "src/a.mds"][..], &["build", "src"]] {
+        let out = run(&project, args);
+        let stderr = text(&out.stderr);
+        assert_eq!(
+            entries(&victim),
+            Vec::<String>::new(),
+            "{args:?}: nothing is written there; stderr: {stderr}"
+        );
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refusal)),
+            "{args:?}: stderr: {stderr}"
+        );
+    }
+
+    // Control: a relative `build.output_dir`.
+    put(
+        &project,
+        "mds.json",
+        r#"{"build":{"output_dir":"out/nested"}}"#,
+    );
+    for args in [&["build", "src/a.mds"][..], &["build", "src"]] {
+        let written = project.join(native("out/nested/a.md"));
+        let _ = std::fs::remove_file(&written);
+        let out = run(&project, args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: stderr: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(read(&written), "A\n", "{args:?}");
     }
 }
 
