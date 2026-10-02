@@ -56,15 +56,22 @@ pub(crate) trait ResultSink {
     );
 
     /// An entry of a directory that could not be linted — or, under `--format json`, read to
-    /// fix it. Not `--quiet`: it is an error.
+    /// fix it — and an input whose `--fix` rewrite failed ([`ResultSink::write_failed`]).
+    /// Not `--quiet`: it is an error.
     fn failed(&mut self, input: &LintSource<'_>, error: MdsError);
 
     /// An input whose analysis panicked. The panic hook has printed the internal compiler
     /// error text and recorded the panic, so the run exits 101 (#389).
     fn panicked(&mut self, input: &LintSource<'_>);
 
-    /// A `--fix` rewrite of the input's file that failed. Not `--quiet`: it is an error.
-    fn write_failed(&mut self, input: &LintSource<'_>, error: MdsError);
+    /// A `--fix` rewrite of the input's file that failed: shown as [`ResultSink::failed`]
+    /// shows a failure, in the one wording the write gives it, `cannot write <file>:
+    /// <cause>`, for a file argument and a directory's entry alike (#309). Under
+    /// `--format json` it is the input's one record: a directory's entry, or a file
+    /// argument's error document. Not `--quiet`: it is an error.
+    fn write_failed(&mut self, input: &LintSource<'_>, error: MdsError) {
+        self.failed(input, error);
+    }
 
     /// `Clean:`, for an input with no findings — a file argument's human report says so.
     fn clean(&mut self, input: &LintSource<'_>, findings: &mds::LintResult);
@@ -282,20 +289,6 @@ impl ResultSink for HumanSink {
     /// Nothing: the panic hook's text is the one report of a panic.
     fn panicked(&mut self, _input: &LintSource<'_>) {}
 
-    /// A directory's entry: `error writing <path>: <error>`. A file argument: the error.
-    fn write_failed(&mut self, input: &LintSource<'_>, error: MdsError) {
-        match *input {
-            LintSource::DirEntry { path, .. } => crate::output::ewriteln!(
-                "error writing {}: {}",
-                safe_path(path),
-                safe_inline(&error)
-            ),
-            LintSource::Stdin | LintSource::File { .. } => {
-                eprint_error(miette::Report::from(error));
-            }
-        }
-    }
-
     /// `Clean:` names a file argument as typed, as `Fixed:` does (#390). Stdin and a
     /// directory's entries print none; a directory's summary counts its clean files.
     /// `--quiet` suppresses it.
@@ -404,7 +397,9 @@ impl ResultSink for JsonSink {
         }
     }
 
-    /// The failure is the entry's one record in the directory's document.
+    /// A directory's entry: the failure is its one record in the directory's document,
+    /// `{"file": …, "error": …}`. A file argument: the error document
+    /// `{"error": …, "version": 1}` on stdout, the run's one document.
     fn failed(&mut self, input: &LintSource<'_>, error: MdsError) {
         if let Some(document) = self.document.as_mut() {
             document.push(error_entry(input, &error));
@@ -429,20 +424,6 @@ impl ResultSink for JsonSink {
                     "error": internal_error(),
                 })));
             }
-        }
-    }
-
-    /// A directory's entry: the failure, in its own words, is the file's one record in the
-    /// document. A file argument: the error, on stderr.
-    fn write_failed(&mut self, input: &LintSource<'_>, error: MdsError) {
-        match self.document.as_mut() {
-            Some(document) => document.push(error_entry(
-                input,
-                &MdsError::Io {
-                    message: format!("{error}"),
-                },
-            )),
-            None => eprint_error(miette::Report::from(error)),
         }
     }
 

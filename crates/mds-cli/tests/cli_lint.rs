@@ -7732,3 +7732,273 @@ fn the_cap_notice_advises_re_running_fix_under_fix_alone() {
     assert_eq!(seen, expected, "the first stderr line of each run");
     assert_eq!(fs::read_to_string(&file).unwrap(), source, "nothing to fix");
 }
+
+// ── A fix that cannot be written (#309) ───────────────────────────────────────
+//
+// `--fix` reports a rewrite that fails in one wording in every mode — `cannot write
+// <file>: <cause>`, naming the file once, as typed, and then the cause, which names no
+// path — and never a result for the fix it could not write: under `--format json` the
+// failure is the input's one record, a file argument's error document or a directory
+// entry's error entry.
+//
+// Fixture: `ro/x.mds` in a read-only directory, beside `rw/x.mds` in a writable one, each
+// holding `A_WARNING_BELOW_A_DEAD_BLOCK`: its fix leaves a warning, so findings recorded
+// for the fix that failed would show.
+
+/// A directory made read-only (`0o555`) while this lives, so no file can be created in
+/// it; writable again on drop, so its tempdir can be removed.
+#[cfg(unix)]
+struct ReadOnlyDir(std::path::PathBuf);
+
+#[cfg(unix)]
+impl ReadOnlyDir {
+    /// `None`, after printing why the caller skips, when a file can still be created in
+    /// `dir` at mode `0o555`: running as euid 0, which the mode does not stop.
+    fn new(dir: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let guard = Self(dir.to_path_buf());
+        let probe = dir.join(".write-probe");
+        if fs::write(&probe, "").is_ok() {
+            let _ = fs::remove_file(&probe);
+            eprintln!(
+                "skipped: a file can be created in {} at mode 0o555 (running as euid 0?)",
+                dir.display()
+            );
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A tempdir holding `ro/x.mds` and `rw/x.mds`, each [`A_WARNING_BELOW_A_DEAD_BLOCK`],
+/// with `ro` read-only while the guard lives; `None` where that does not stop a write.
+#[cfg(unix)]
+fn a_fix_that_cannot_be_written() -> Option<(tempfile::TempDir, ReadOnlyDir)> {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["ro", "rw"] {
+        fs::create_dir(tmp.path().join(dir)).unwrap();
+        fs::write(
+            tmp.path().join(dir).join("x.mds"),
+            A_WARNING_BELOW_A_DEAD_BLOCK,
+        )
+        .unwrap();
+    }
+    let ro = ReadOnlyDir::new(&tmp.path().join("ro"))?;
+    Some((tmp, ro))
+}
+
+/// Run `mds lint [extra_args] <input>` from the working directory `cwd`.
+#[cfg(unix)]
+fn lint_in(cwd: &Path, input: &Path, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(extra_args)
+        .arg(input)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// The one wording of a fix `--fix` cannot write: the file as typed, then the cause — the
+/// kind alone of tempfile's error creating its temporary file, which names that file.
+#[cfg(unix)]
+fn write_failure(typed: &Path) -> String {
+    format!(
+        "cannot write {}: {}",
+        typed.display(),
+        std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// The failure a run reports for `typed`: under `--format json` the message of the error
+/// document or of the error entry on stdout; in a human report the first stderr line that
+/// names `typed`, without miette's `×` marker — `Fixed: <typed>` where the fix was
+/// written.
+#[cfg(unix)]
+fn failure_reported(out: &std::process::Output, typed: &Path) -> Option<String> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if let Ok(document) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        let entry_error = document["files"]
+            .as_array()
+            .and_then(|files| files.iter().find_map(|entry| entry.get("error")));
+        let error = document.get("error").or(entry_error)?;
+        return error["message"].as_str().map(str::to_string);
+    }
+    let typed = typed.display().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr.lines().find(|line| line.contains(&typed))?.trim();
+    Some(line.strip_prefix("× ").unwrap_or(line).to_string())
+}
+
+/// Under `--format json` a file argument whose fix cannot be written gets the error
+/// document, `{"error": …, "version": 1}` with the `mds::io` error, as the run's one
+/// document, and exits 2 — never the findings document of a fix that did not land.
+///
+/// Control: the same file in a writable directory is fixed, and its document lists the
+/// warning the fix left.
+#[cfg(unix)]
+#[test]
+fn a_file_fix_that_cannot_be_written_prints_the_io_error_document() {
+    let Some((tmp, _ro)) = a_fix_that_cannot_be_written() else {
+        return;
+    };
+    let typed = Path::new("ro").join("x.mds");
+    let out = lint_in(tmp.path(), &typed, &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout.lines().count(), 1, "one document; stdout: {stdout}");
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be a JSON document: {e}; stdout: {stdout}"));
+    let expected = serde_json::json!({
+        "version": 1,
+        "error": {
+            "code": "mds::io",
+            "message": write_failure(&typed),
+            "help": null,
+            "span": null,
+        },
+    });
+    assert_eq!(document, expected, "stderr: {stderr}");
+    assert_eq!(stderr, "", "the document is the one report of the failure");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(&typed)).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "nothing was written"
+    );
+
+    let typed = Path::new("rw").join("x.mds");
+    let out = lint_in(tmp.path(), &typed, &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("control: a JSON document: {e}; stdout: {stdout}"));
+    assert_eq!(
+        document["files"][0]["diagnostics"][0]["rule"], "redundant-else",
+        "control: the warning the fix left; stdout: {stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "control");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(&typed)).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK_FIXED,
+        "control: the fix was written"
+    );
+}
+
+/// Under `--format json` a directory's entry whose fix cannot be written is recorded as
+/// that failure alone — `{"file": …, "error": …}`, with no findings — though its fix
+/// leaves a warning a record made before the write would list.
+///
+/// Control: in a writable directory the entry lists the warning the fix left.
+#[cfg(unix)]
+#[test]
+fn a_directory_entry_whose_fix_cannot_be_written_is_recorded_as_that_failure_alone() {
+    let Some((tmp, _ro)) = a_fix_that_cannot_be_written() else {
+        return;
+    };
+    let typed = Path::new("ro").join("x.mds");
+    let out = lint_in(tmp.path(), Path::new("ro"), &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be a JSON document: {e}; stdout: {stdout}"));
+    let expected = serde_json::json!([{
+        "file": "x.mds",
+        "error": {
+            "code": "mds::io",
+            "message": write_failure(&typed),
+            "help": null,
+            "span": null,
+        },
+    }]);
+    assert_eq!(document["files"], expected, "stdout: {stdout}");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(&typed)).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "nothing was written"
+    );
+
+    let out = lint_in(tmp.path(), Path::new("rw"), &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("control: a JSON document: {e}; stdout: {stdout}"));
+    assert_eq!(
+        document["files"][0]["diagnostics"][0]["rule"], "redundant-else",
+        "control: the warning the fix left; stdout: {stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "control");
+}
+
+/// A fix that cannot be written is reported as `cannot write <file>: <cause>` for a file
+/// argument and for a directory's entry, in either format, naming the file once, as
+/// typed.
+///
+/// Control: in a writable directory every mode fixes the file and reports no failure; a
+/// human report's line naming the file is its `Fixed:` line.
+#[cfg(unix)]
+#[test]
+fn a_fix_that_cannot_be_written_is_reported_in_one_wording_in_every_mode() {
+    let Some((tmp, _ro)) = a_fix_that_cannot_be_written() else {
+        return;
+    };
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    let mut controls = Vec::new();
+    for dir in ["ro", "rw"] {
+        let typed = Path::new(dir).join("x.mds");
+        for (input, arg) in [("a file", typed.clone()), ("a directory", dir.into())] {
+            for format in ["human", "json"] {
+                fs::write(
+                    tmp.path().join("rw").join("x.mds"),
+                    A_WARNING_BELOW_A_DEAD_BLOCK,
+                )
+                .unwrap();
+                let out = lint_in(tmp.path(), &arg, &["--fix", "--format", format]);
+                let reported = failure_reported(&out, &typed);
+                let both = [out.stdout.as_slice(), out.stderr.as_slice()].concat();
+                let named = String::from_utf8_lossy(&both)
+                    .matches(typed.display().to_string().as_str())
+                    .count();
+                if dir == "ro" {
+                    seen.push((input, format, reported, named));
+                    expected.push((input, format, Some(write_failure(&typed)), 1));
+                } else {
+                    let fixed = fs::read_to_string(tmp.path().join(&typed)).unwrap();
+                    let status = (format == "human").then(|| format!("Fixed: {}", typed.display()));
+                    controls.push((input, format, reported, status, out.status.code(), fixed));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "(input, format, failure, times the file is named)"
+    );
+    for (input, format, reported, status, code, fixed) in controls {
+        assert_eq!(reported, status, "control, {input}, {format}: no failure");
+        assert_eq!(
+            code,
+            Some(1),
+            "control, {input}, {format}: the warning stays"
+        );
+        assert_eq!(
+            fixed, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED,
+            "control, {input}, {format}: the fix was written"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("ro").join("x.mds")).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "nothing was written"
+    );
+}

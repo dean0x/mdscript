@@ -1005,8 +1005,7 @@ resolve it against, and a working directory that auto-detection cannot list, are
   continue-on-error); a file whose `--diff` output a failing stdout lost counts as
   failed — `with errors` under `mds lint` (§7.5) — as a file whose rewrite fails does.
   The `mds.json` errors above are not in this list. A `mds lint --fix` rewrite that
-  fails is in it; it is reported as `mds::io` except in a directory run under
-  `--format human`, which prints `error writing <path>: …` instead.
+  fails is in it, reported as `mds::io` in every mode, in one wording (§7.5).
 - Stdin over the 10 MiB cap is `mds::resource_limit`, exit 3, under `build`, `check`,
   `fmt` and `lint`; exactly 10 MiB is accepted.
 - On Unix the Rust runtime treats EBADF on a standard stream — a descriptor that is
@@ -1291,6 +1290,16 @@ capped set and `"truncated"` is `false`. A report and a preview print
 writes its fix, the notice adds `— re-run --fix to continue`, since a re-run lints the fixed
 source past the findings the cap stopped.
 
+**A `--fix` rewrite that fails** is `mds::io`, worded `cannot write <file>: <cause>` for a
+file argument and for a directory's entry, in either format: the file once, as its
+`Fixed:` line would name it, then the cause, which names no path — whichever step of the
+write failed (#309). It counts under "with errors" and the run exits 2. A human report
+shows the findings the fix would have left, framed over the source it could not write, and
+then the error. Under `--format json` the failure is the input's one record and no
+findings are listed for it: a directory's entry is `{"file":…,"error":…}`, and a file
+argument's document is the error envelope `{"version":1,"error":…}` — never the success
+envelope of a fix that was not written.
+
 **Names in status lines:** `Clean:`, `Fixed:`, `Partially fixed:` and `Would fix:` name a
 file argument as typed — `mds lint docs/page.mds` prints `Clean: docs/page.mds`, and an
 absolute argument is shown as typed — and a directory's entry by the walk's path below the
@@ -1349,7 +1358,7 @@ Keys are in alphabetical order (BTreeMap serialization). Within each `files[].di
 
 **`lint_warnings` field (binding surfaces only):** The napi, WASM, and Python binding surfaces include an optional top-level `"lint_warnings"` key in the returned result object when non-fatal warnings were produced during linting (for example, unknown rule names in `mds.json`). In the JSON wire form (napi, WASM, and Python `to_dict()` / `to_json()`) the key is absent (not `null`, not `[]`) when no warnings occurred; on the Python live-object surface, `LintResult.lint_warnings` is a property that always exists and returns an empty list when no warnings occurred. In alphabetical key order `"lint_warnings"` sorts between `"files"` and `"truncated"`. The CLI does **not** include `"lint_warnings"` in its `--format json` stdout envelope — it writes warnings to stderr so the JSON stdout remains valid and parseable without modification.
 
-A file that produces a per-file analysis failure in directory mode (malformed config, I/O error) emits a `{"file":"…","error":{"code":"…","message":"…","help":"…","span":…}}` entry without a `"diagnostics"` key and contributes to exit code 2. A file whose analysis panicked emits the same entry with the error `{"code":"mds::internal","message":"internal compiler error","help":null,"span":null}`, counts under "with errors", and the run exits 101 (§5 "Panics on the CLI"). When a stdin source fails the check gate before linting begins, the CLI emits an analysis-failure envelope to stdout: `{"version":1,"error":{"code":"…","message":"…","help":"…","span":…}}`. This envelope carries no `"files"` or `"truncated"` key, and no `"file"` key (unlike the success envelope above). A JSON consumer MUST handle both the success envelope and the analysis-failure envelope and MUST NOT assume a `"file"` key is present in error results.
+A file that produces a per-file analysis failure in directory mode (malformed config, I/O error) emits a `{"file":"…","error":{"code":"…","message":"…","help":"…","span":…}}` entry without a `"diagnostics"` key and contributes to exit code 2. A file whose analysis panicked emits the same entry with the error `{"code":"mds::internal","message":"internal compiler error","help":null,"span":null}`, counts under "with errors", and the run exits 101 (§5 "Panics on the CLI"). When a stdin source fails the check gate before linting begins, the CLI emits an analysis-failure envelope to stdout: `{"version":1,"error":{"code":"…","message":"…","help":"…","span":…}}`. This envelope carries no `"files"` or `"truncated"` key, and no `"file"` key (unlike the success envelope above). A file argument whose `--fix` rewrite fails gets the same envelope with its `mds::io` error; a directory's entry whose rewrite fails is the error entry above (#309). A JSON consumer MUST handle both the success envelope and the analysis-failure envelope and MUST NOT assume a `"file"` key is present in error results.
 
 #### Sanitization invariant (v1)
 
@@ -1632,7 +1641,7 @@ A closed stdout or stderr pipe never changes any of these codes (§5 "Streams an
 |------|---------|
 | `0` | Clean — no warning- or error-severity findings |
 | `1` | Warning-severity findings only (no errors) |
-| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8); also an I/O failure (#157): a `--fix` rewrite that fails, a stdout write that fails other than by a closed pipe — which lifts a clean or warning-only run to 2 — and stdin that cannot be read or is not valid UTF-8, each `mds::io` except a rewrite failure in a directory run under `--format human` (`error writing <path>: …`) |
+| `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8); also an I/O failure (#157): a `--fix` rewrite that fails, a stdout write that fails other than by a closed pipe — which lifts a clean or warning-only run to 2 — and stdin that cannot be read or is not valid UTF-8, each `mds::io` (a rewrite failure in the one wording of §7.5) |
 | `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2) |
 | `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
 

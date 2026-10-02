@@ -77,7 +77,7 @@ use crate::build::{
 };
 use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
 use crate::output::{
-    atomic_write_file, catch_compile, collect_mds_files_detailed, eprint_warning,
+    atomic_write_file_in_one_wording, catch_compile, collect_mds_files_detailed, eprint_warning,
     render_unified_diff, safe_inline, safe_path, Durability, Panicked, WriteTarget,
     STDIN_DISPLAY_LABEL,
 };
@@ -1039,8 +1039,9 @@ enum Rewrite {
         partial: Option<(usize, usize)>,
     },
     /// The fixed source could not be written. `residual` is what it would have been left
-    /// with, shown before the failure — except in a directory's JSON document, which holds
-    /// one entry per file, its findings or its failure: there the failure is the entry.
+    /// with, shown before the failure in a human report. A JSON output records each input
+    /// once, its findings or its failure — a directory's entry, a file argument's document
+    /// — so there the failure is the record, and `residual` is `None` (#309).
     WriteFailed {
         error: MdsError,
         residual: Option<Residual>,
@@ -1151,7 +1152,7 @@ fn lint_input<'a>(
         match input {
             LintSource::Stdin => fix_stdin(result, text, fix),
             LintSource::File { typed: path, .. } | LintSource::DirEntry { path, .. } => {
-                apply_fix(&input, path, result, text, fix, flags.format)
+                apply_fix(path, result, text, fix, flags.format)
             }
         }
     };
@@ -1200,7 +1201,6 @@ fn preview_fix(
 /// `--fix`: rewrite the input's file at `path` with the fixed source. Stdin is a filter
 /// instead ([`fix_stdin`]).
 fn apply_fix(
-    input: &LintSource<'_>,
     path: &Path,
     findings: mds::LintResult,
     text: String,
@@ -1239,21 +1239,21 @@ fn apply_fix(
         findings: residual,
         fixed: new_source,
     };
-    let fix = match atomic_write_file(
+    let fix = match atomic_write_file_in_one_wording(
         &WriteTarget::as_typed(path.to_path_buf()),
         &residual.fixed,
         Durability::Fsync,
     ) {
         Ok(()) => Rewrite::Written { residual, partial },
         Err(error) => {
-            // A directory's JSON document holds one entry per file, so a rewrite that
-            // failed is recorded as the failure alone; every other output shows the
-            // findings the fix would have left, then the failure.
-            let one_entry =
-                format == LintFormat::Json && matches!(input, LintSource::DirEntry { .. });
+            // A JSON output records each input once — a directory's entry, a file
+            // argument's document — so a rewrite that failed is recorded as the failure
+            // alone (#309); a human report shows the findings the fix would have left,
+            // then the failure.
+            let failure_alone = format == LintFormat::Json;
             Rewrite::WriteFailed {
                 error,
-                residual: (!one_entry).then_some(residual),
+                residual: (!failure_alone).then_some(residual),
             }
         }
     };
@@ -2280,7 +2280,6 @@ mod tests {
         outcome: FixPipelineOutcome,
     ) -> (InputVerdict, Vec<serde_json::Value>) {
         let outcome = apply_fix(
-            &input,
             path,
             result,
             FIX_LEAVES_A_FINDING.to_string(),
@@ -2303,9 +2302,7 @@ mod tests {
     /// findings recorded before the write would sit beside it and describe a file that was
     /// never rewritten (#309).
     ///
-    /// The directory write-failure fixtures of the CLI tests fix their file completely, so
-    /// their residual adds no entry wherever it is recorded, and they cannot see the order.
-    /// This fix leaves a warning, which can.
+    /// This fix leaves a warning, so a record made before the write would show.
     ///
     /// Control: with a writable target the rewrite lands and the warning is recorded.
     #[test]
@@ -2786,7 +2783,7 @@ mod tests {
                 true,
             ),
             (
-                "rewrite, write failed, the failure is the entry",
+                "rewrite, write failed, the failure is the record",
                 rewritten(Rewrite::WriteFailed {
                     error: unwritable(),
                     residual: None,
@@ -2794,7 +2791,7 @@ mod tests {
                 false,
             ),
             (
-                "rewrite, write failed",
+                "rewrite, write failed, its findings shown",
                 rewritten(Rewrite::WriteFailed {
                     error: unwritable(),
                     residual: Some(fixed(capped())),
@@ -2982,7 +2979,7 @@ mod tests {
             let left_at = SerializedSpan::new(0, AFTER_LINE.len());
             let (before, fix) = partial_fix(input.display_label(), left_at);
             let text = PARTIAL_BEFORE.to_string();
-            let outcome = apply_fix(&input, &path, before, text, fix, LintFormat::Human);
+            let outcome = apply_fix(&path, before, text, fix, LintFormat::Human);
             let report = FileReport {
                 input,
                 capped: None,

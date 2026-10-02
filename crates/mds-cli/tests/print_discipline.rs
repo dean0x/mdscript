@@ -322,7 +322,7 @@ const SITE_FLOORS: &[(&str, usize)] = &[
     ("build.rs", 27),
     ("fmt.rs", 11),
     ("lint.rs", 1),
-    ("lint_sink.rs", 15),
+    ("lint_sink.rs", 14),
     ("main.rs", 11),
     ("output.rs", 6),
     ("watch.rs", 18),
@@ -901,20 +901,6 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
         "A `miette::Report` from `build::load_config`, turned into an `MdsError` for the \
          lint sinks: text this crate wrote, which names `mds.json` through `safe_path` \
          and its cause through `io_cause` or a path-free `serde_json` / UTF-8 error.",
-    ),
-    (
-        "lint_sink.rs",
-        "safe_inline(&error)",
-        1,
-        "An `MdsError` from `atomic_write_file`, whose text names the file as shown \
-         through `safe_path` and its cause through `io_cause` (#390).",
-    ),
-    (
-        "lint_sink.rs",
-        "error",
-        1,
-        "The same `atomic_write_file` error as the entry above, kept as the message of \
-         the file's record in the JSON document.",
     ),
     (
         "watch.rs",

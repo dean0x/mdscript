@@ -1741,13 +1741,45 @@ pub(crate) enum Durability {
 ///
 /// # Errors
 ///
-/// Every failure is `mds::io` (exit 2, #157). Its message names the target by
+/// Every failure is `mds::io` (exit 2, #157). Its message names the step that failed —
+/// `cannot create temp file for <file>: <cause>`, say — and names the target by
 /// `target.shown`, the form the caller's status line names it by, never by
-/// `target.path`, and the cause after it names no path ([`io_cause`]) (#390).
+/// `target.path`; the cause after it names no path ([`io_cause`]) (#390).
 pub(crate) fn atomic_write_file(
     target: &WriteTarget,
     content: &str,
     durability: Durability,
+) -> std::result::Result<(), mds::MdsError> {
+    write_through_temp_file(target, content, durability, FailureWording::Step)
+}
+
+/// [`atomic_write_file`], with every failure worded `cannot write <file>: <cause>`,
+/// whichever step failed: `mds lint --fix` reports a rewrite that fails in this one
+/// wording in every mode, naming the file once (#309). The file and the cause are those
+/// [`atomic_write_file`] names.
+pub(crate) fn atomic_write_file_in_one_wording(
+    target: &WriteTarget,
+    content: &str,
+    durability: Durability,
+) -> std::result::Result<(), mds::MdsError> {
+    write_through_temp_file(target, content, durability, FailureWording::Write)
+}
+
+/// How [`write_through_temp_file`] words a failure, before the file and its cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureWording {
+    /// The step that failed: `cannot create temp file for`, `cannot rename temp file to`.
+    Step,
+    /// `cannot write`, whichever step failed.
+    Write,
+}
+
+/// The write [`atomic_write_file`] documents, its failures worded as `wording` says.
+fn write_through_temp_file(
+    target: &WriteTarget,
+    content: &str,
+    durability: Durability,
+    wording: FailureWording,
 ) -> std::result::Result<(), mds::MdsError> {
     use mds::{effective_parent, NativeFs};
 
@@ -1758,8 +1790,14 @@ pub(crate) fn atomic_write_file(
     // Every message names the file as the caller's status line does (#390), escaped and
     // without a Windows verbatim prefix (#409).
     let shown = safe_path(&target.shown);
-    let io_error = |what: &str, cause: String| mds::MdsError::Io {
-        message: format!("{what} {shown}: {}", safe_inline(cause)),
+    let io_error = |step: &str, cause: String| {
+        let what = match wording {
+            FailureWording::Step => step,
+            FailureWording::Write => "cannot write",
+        };
+        mds::MdsError::Io {
+            message: format!("{what} {shown}: {}", safe_inline(cause)),
+        }
     };
 
     // #227: `mds build` targets may not exist yet. Probe with lstat, which never
@@ -4101,6 +4139,74 @@ mod tests {
         let tmp = dir.path().display().to_string();
         assert!(!err.contains(&tmp), "no path of the write's own: {err}");
         assert!(!err.contains(".mds-tmp-"), "no temporary file: {err}");
+    }
+
+    /// `atomic_write_file_in_one_wording` words every failure `cannot write <file>:
+    /// <cause>`, with the file and the cause `atomic_write_file` names, whichever step
+    /// failed (#309): creating the temporary file, and refusing a symlink at the target.
+    /// Control: `atomic_write_file` names each step its own way.
+    ///
+    /// `#[cfg(unix)]`: a read-only directory is what makes the temporary file fail, and
+    /// Windows' read-only attribute does not stop a file being created in one (#147).
+    #[cfg(unix)]
+    #[test]
+    fn the_one_wording_names_the_file_and_the_cause_whichever_step_failed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let locked = WriteTarget {
+            path: sub.join("locked.mds"),
+            shown: Path::new("out").join("locked.mds"),
+        };
+        let real = dir.path().join("real.mds");
+        std::fs::write(&real, "R").unwrap();
+        let link = WriteTarget {
+            path: dir.path().join("link.mds"),
+            shown: Path::new("out").join("link.mds"),
+        };
+        std::os::unix::fs::symlink(&real, &link.path).unwrap();
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = std::fs::write(sub.join("probe"), "");
+        let message = |target: &WriteTarget, one_wording: bool| {
+            let written = if one_wording {
+                atomic_write_file_in_one_wording(target, "NEW", Durability::Fsync)
+            } else {
+                atomic_write_file(target, "NEW", Durability::Fsync)
+            };
+            written.map_err(|e| e.to_string())
+        };
+        let seen = [
+            message(&locked, true),
+            message(&link, true),
+            message(&locked, false),
+            message(&link, false),
+        ];
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if probe.is_ok() {
+            ewriteln!("running as root; a read-only directory does not stop the write");
+            return;
+        }
+
+        let denied = std::io::ErrorKind::PermissionDenied;
+        assert_eq!(
+            seen,
+            [
+                Err(format!("cannot write out/locked.mds: {denied}")),
+                Err(format!("cannot write out/link.mds: {SYMLINK_REFUSAL}")),
+                Err(format!(
+                    "cannot create temp file for out/locked.mds: {denied}"
+                )),
+                Err(format!("cannot write out/link.mds: {SYMLINK_REFUSAL}")),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "R",
+            "nothing was written through the link"
+        );
     }
 
     /// The re-check's refusal names no path, whichever error `NativeFs::check_symlink`
