@@ -25,7 +25,7 @@ use std::path::Path;
 use mds::{MdsError, Severity};
 use serde_json::Value;
 
-use crate::lint::{DirSummary, LintSource};
+use crate::lint::{CapNotice, DirSummary, LintSource};
 use crate::output::{
     eprint_error, eprint_io_failure, relabel_stdin_error, safe_inline, safe_path, stdout_failure,
     write_stdout, StdoutOutcome, WalkResult, STDIN_DISPLAY_LABEL,
@@ -90,22 +90,27 @@ pub(crate) trait ResultSink {
     fn end_document(&mut self, truncated: bool);
 
     /// The diagnostic-cap notice, for an input whose own findings stopped at the cap, in
-    /// every mode (#309). A directory's entry names its file. `--quiet` suppresses it.
-    fn cap_reached(&mut self, input: &LintSource<'_>) {
+    /// every mode (#309); under `--fix` ([`CapNotice::RerunFix`]) it advises re-running
+    /// `--fix`. A directory's entry names its file. `--quiet` suppresses it.
+    fn cap_reached(&mut self, input: &LintSource<'_>, notice: CapNotice) {
         if self.quiet() {
             return;
         }
+        let cap_advice = match notice {
+            CapNotice::Plain => "",
+            CapNotice::RerunFix => " — re-run --fix to continue",
+        };
         match *input {
             LintSource::DirEntry { path, .. } => crate::output::ewriteln!(
-                "{}: diagnostic cap ({}) reached; further findings were suppressed — \
-                 re-run --fix to continue",
+                "{}: diagnostic cap ({}) reached; further findings were suppressed{}",
                 safe_path(path),
-                mds::MAX_DIAGNOSTICS
+                mds::MAX_DIAGNOSTICS,
+                cap_advice
             ),
             LintSource::Stdin | LintSource::File { .. } => crate::output::ewriteln!(
-                "diagnostic cap ({}) reached; further findings were suppressed — \
-                 re-run --fix to continue",
-                mds::MAX_DIAGNOSTICS
+                "diagnostic cap ({}) reached; further findings were suppressed{}",
+                mds::MAX_DIAGNOSTICS,
+                cap_advice
             ),
         }
     }

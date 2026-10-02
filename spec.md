@@ -1243,7 +1243,10 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 - After processing all files, emits one summary line to stderr:
   `N clean, N with warnings, N with errors, N resource-limited`
   Each file falls in exactly one bucket, so the four counts always sum to the number of
-  `.mds` files the walker collected.
+  `.mds` files the walker collected. A `--fix --check` or `--fix --diff` preview counts each
+  file as its fix would leave it: a file whose pending fix would clear every finding counts
+  as clean, though the preview shows the pending fix (`Would fix:` under `--check`, the
+  diff under `--diff`) and the file's own findings (#309).
   - "Clean" — no findings.
   - "With warnings" — warning-severity findings only.
   - "With errors" — error-severity lint findings **or** a per-file analysis failure
@@ -1283,7 +1286,10 @@ The `diagnostic cap (N) reached` notice is printed when an input's own findings 
 cap, in a report as well as under `--fix`, `--fix --check` and `--fix --diff`, before
 anything else about that input — a directory's entry prefixed with its path (#309). It
 describes the findings the input was linted with, so it also prints when `--fix` clears the
-capped set and `"truncated"` is `false`.
+capped set and `"truncated"` is `false`. A report and a preview print
+`diagnostic cap (1000) reached; further findings were suppressed`; under `--fix`, which
+writes its fix, the notice adds `— re-run --fix to continue`, since a re-run lints the fixed
+source past the findings the cap stopped.
 
 **Names in status lines:** `Clean:`, `Fixed:`, `Partially fixed:` and `Would fix:` name a
 file argument as typed — `mds lint docs/page.mds` prints `Clean: docs/page.mds`, and an

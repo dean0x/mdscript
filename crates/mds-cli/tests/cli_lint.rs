@@ -5697,7 +5697,8 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
 
 // ── D4 cross-mode parity: diagnostic-cap notice honours --quiet in all four modes ──
 //
-// PF-004: the cap notice is emitted from four separate call sites:
+// The cap notice once came from four separate call sites; every mode now reaches it
+// through `render`, from its own entry point:
 //   run_lint_stdin          (stdin mode)
 //   run_lint_file           (single-file mode)
 //   run_lint_directory      (directory --format human, the default)
@@ -7415,7 +7416,8 @@ fn a_finding_left_by_a_fix_that_cannot_be_written_points_into_the_fixed_source()
 // those a preview's fix would leave — in every mode, for a file and a directory alike.
 // The cap notice says an input's own findings stopped at the cap: it prints in every
 // mode, a report included, before anything else about the input, and `--quiet`
-// suppresses it.
+// suppresses it. Only under `--fix`, which writes its fix, does it advise re-running
+// `--fix`; a report and a preview write nothing a re-run would build on.
 //
 // Fixtures: one more unused frontmatter key than the cap — no fix removes one — and one
 // more empty `@if` block than the cap: `--fix` removes the 1,000 it is shown and leaves
@@ -7456,23 +7458,36 @@ fn over_the_cap_fixable() -> String {
 /// [`over_the_cap_fixable`] after `--fix`: the block the cap hid from the fix.
 const OVER_THE_CAP_FIXED: &str = "---\nflag: true\n---\n@if flag:\n@end\n";
 
-/// The diagnostic-cap notice for stdin or a file argument.
+/// The diagnostic-cap notice for stdin or a file argument in a report or a preview.
 fn cap_notice() -> String {
     format!(
-        "diagnostic cap ({}) reached; further findings were suppressed — re-run --fix to \
-         continue",
+        "diagnostic cap ({}) reached; further findings were suppressed",
         mds::MAX_DIAGNOSTICS
     )
 }
 
-/// The cap notice for the entry `d/x.mds` of a directory run, named with the platform's
+/// The cap notice under `--fix`: [`cap_notice`] and its advice to re-run `--fix`.
+fn cap_notice_under_fix() -> String {
+    format!("{} — re-run --fix to continue", cap_notice())
+}
+
+/// `notice` for the entry `d/x.mds` of a directory run, named with the platform's
 /// separator.
-fn entry_cap_notice() -> String {
+fn entry_cap_notice(notice: &str) -> String {
     format!(
-        "{}: {}",
-        "d/x.mds".replace('/', std::path::MAIN_SEPARATOR_STR),
-        cap_notice()
+        "{}: {notice}",
+        "d/x.mds".replace('/', std::path::MAIN_SEPARATOR_STR)
     )
+}
+
+/// The cap notice a run in `mode` gives stdin or a file argument: the advice to re-run
+/// `--fix` under `--fix` alone.
+fn cap_notice_in(mode: &[&str]) -> String {
+    if mode == ["--fix"] {
+        cap_notice_under_fix()
+    } else {
+        cap_notice()
+    }
 }
 
 /// The first lines of `stderr`, for a failure message: a capped human report runs to
@@ -7597,7 +7612,7 @@ fn a_report_announces_the_cap_first_in_every_input_and_format() {
             (
                 "a directory",
                 lint_dir_in(tmp.path(), "d", &args),
-                entry_cap_notice(),
+                entry_cap_notice(&cap_notice()),
             ),
         ];
         for (input, out, notice) in runs {
@@ -7666,4 +7681,54 @@ fn quiet_suppresses_the_cap_notice_in_a_report() {
             );
         }
     }
+}
+
+/// The cap notice advises re-running `--fix` under `--fix` alone, which writes its fix: a
+/// report and every preview write nothing, so their notice ends at the suppressed
+/// findings — for stdin, a file and a directory's entry, in either format.
+///
+/// Positive control: `--fix` gives the advice, so a notice without it is no absent line.
+#[test]
+fn the_cap_notice_advises_re_running_fix_under_fix_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for mode in LINT_MODES {
+        let notice = cap_notice_in(mode);
+        for format in ["human", "json"] {
+            let args = [mode, &["--format", format][..]].concat();
+            let file_run = lint_path(&file, &args);
+            let dir_run = lint_dir_in(tmp.path(), "d", &args);
+            for (input, out, notice) in [
+                ("a file", file_run, notice.clone()),
+                ("a directory", dir_run, entry_cap_notice(&notice)),
+            ] {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let first = stderr.lines().next().unwrap_or_default().to_string();
+                seen.push((input, mode, format, first));
+                expected.push((input, mode, format, notice));
+            }
+        }
+        // Stdin's `--fix --format json` is refused before it is linted; its human run
+        // fixes through the filter.
+        let stdin_run = lint_stdin(&source, mode);
+        let stderr = String::from_utf8_lossy(&stdin_run.stderr);
+        let first = stderr.lines().next().unwrap_or_default().to_string();
+        seen.push(("stdin", mode, "human", first));
+        expected.push(("stdin", mode, "human", notice));
+    }
+    assert!(
+        expected
+            .iter()
+            .any(|(_, _, _, notice)| notice.ends_with("re-run --fix to continue")),
+        "non-vacuity: the advice is expected somewhere"
+    );
+    assert_eq!(seen, expected, "the first stderr line of each run");
+    assert_eq!(fs::read_to_string(&file).unwrap(), source, "nothing to fix");
 }

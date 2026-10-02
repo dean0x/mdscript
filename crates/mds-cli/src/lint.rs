@@ -915,10 +915,34 @@ fn analysis_failed(
 /// by [`lint_dir_entry`] — and shown by [`render`].
 struct FileReport<'a> {
     input: LintSource<'a>,
-    /// The input's own findings stopped at the diagnostic cap, so [`render`] announces the
-    /// cap — whatever a fix leaves.
-    capped: bool,
+    /// When the input's own findings stopped at the diagnostic cap, the notice [`render`]
+    /// announces it with — whatever a fix leaves; `None` under the cap.
+    capped: Option<CapNotice>,
     outcome: Outcome,
+}
+
+/// The diagnostic-cap notice an input whose own findings stopped at the cap gets: whether
+/// it advises re-running `--fix` (#309).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CapNotice {
+    /// A report or a `--fix --check` / `--fix --diff` preview, which writes nothing: the
+    /// notice says the findings were suppressed, and no more.
+    Plain,
+    /// `--fix`, which writes its fix: a re-run lints the fixed source, past the findings
+    /// this run stopped at, so the notice advises it.
+    RerunFix,
+}
+
+impl CapNotice {
+    /// The notice for a run with `flags`: `--fix` without `--check` or `--diff` advises
+    /// re-running it.
+    fn for_mode(flags: LintFlags) -> Self {
+        if flags.fix && !flags.check && !flags.diff {
+            Self::RerunFix
+        } else {
+            Self::Plain
+        }
+    }
 }
 
 /// The findings an input has to show, and what `--fix` made of them.
@@ -1067,7 +1091,7 @@ fn lint_input<'a>(
     // Every finding carries the input's name — each `diag.file`, hence the JSON
     // `files[].file` key — rather than the name `mds::lint` gave it.
     set_diag_display_path(&mut result, input.display_label());
-    let capped = result.truncated;
+    let capped = result.truncated.then_some(CapNotice::for_mode(flags));
 
     if !flags.fix {
         let outcome = Outcome::Reported {
@@ -1275,7 +1299,8 @@ fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -
 /// each part in its format; the order is decided here, per mode:
 ///
 /// - An input whose own findings stopped at the diagnostic cap announces it first, in every
-///   mode — a report, a preview, a fix, a failure (#309).
+///   mode — a report, a preview, a fix, a failure (#309) — in the words its
+///   [`CapNotice`] picks.
 /// - A preview shows its diff, `Would fix:` or `fix rejected:`, then the input's own
 ///   findings.
 /// - A rewrite that landed shows the findings the file is left with, rendered against the
@@ -1290,8 +1315,8 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
         capped,
         outcome,
     } = report;
-    if capped {
-        sink.cap_reached(&input);
+    if let Some(notice) = capped {
+        sink.cap_reached(&input, notice);
     }
     let truncated = outcome.truncated();
     let (tally, would_fix) = match outcome {
@@ -1775,7 +1800,7 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
     let entry = move || LintSource::DirEntry { path, key };
     let failed = move |error: MdsError, tally: FileTally| FileReport {
         input: entry(),
-        capped: false,
+        capped: None,
         outcome: Outcome::Failed { error, tally },
     };
 
@@ -1811,7 +1836,7 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
         Err(Panicked) => {
             return FileReport {
                 input: entry(),
-                capped: false,
+                capped: None,
                 outcome: Outcome::Panicked,
             }
         }
@@ -1832,9 +1857,9 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
 mod tests {
     use super::{
         apply_fix, fix_stdin, lint_input, render, run_fix_pipeline, set_diag_display_path,
-        DirSummary, FileReport, FileTally, FilterFix, FixPipelineOutcome, InputVerdict, LintFlags,
-        LintFormat, LintSource, Linted, Outcome, PreviewFix, Residual, ReverifyGate, Rewrite,
-        SourceText,
+        CapNotice, DirSummary, FileReport, FileTally, FilterFix, FixPipelineOutcome, InputVerdict,
+        LintFlags, LintFormat, LintSource, Linted, Outcome, PreviewFix, Residual, ReverifyGate,
+        Rewrite, SourceText,
     };
     use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
     use crate::output::{safe_path, STDIN_DISPLAY_LABEL};
@@ -2266,7 +2291,7 @@ mod tests {
         sink.start_document();
         let report = FileReport {
             input,
-            capped: false,
+            capped: None,
             outcome,
         };
         let verdict = render(report, &mut sink);
@@ -2531,8 +2556,12 @@ mod tests {
             self.calls.push("end document".to_string());
         }
 
-        fn cap_reached(&mut self, input: &LintSource<'_>) {
-            self.record("cap reached", input);
+        fn cap_reached(&mut self, input: &LintSource<'_>, notice: CapNotice) {
+            let call = match notice {
+                CapNotice::Plain => "cap reached",
+                CapNotice::RerunFix => "cap reached, re-run --fix",
+            };
+            self.record(call, input);
         }
 
         fn fix_rejected(&mut self, input: &LintSource<'_>, _: &str) {
@@ -2563,8 +2592,10 @@ mod tests {
     /// failure. The late-read test above reads the directory's document, which shows the
     /// failure and the `truncated` flag but not this order; the calls `render` makes do.
     ///
+    /// Under `--fix` the notice advises re-running it; in a report or a preview it does not.
+    ///
     /// Controls: the same capped entry, readable with nothing to fix, announces the cap
-    /// before its findings, and so does its report without `--fix`; an uncapped entry whose
+    /// before its findings, and so do its report and its previews; an uncapped entry whose
     /// read fails announces no cap.
     #[test]
     fn a_capped_entry_that_cannot_be_read_announces_the_cap_before_its_failure() {
@@ -2594,7 +2625,7 @@ mod tests {
         assert_eq!(
             calls(&missing, "gone.mds", LintResult::new(vec![]).truncated()),
             [
-                "cap reached gone.mds".to_string(),
+                "cap reached, re-run --fix gone.mds".to_string(),
                 format!("failed ({read_failure}) gone.mds"),
             ],
         );
@@ -2603,9 +2634,36 @@ mod tests {
         std::fs::write(&readable, "Hello\n").unwrap();
         assert_eq!(
             calls(&readable, "x.mds", LintResult::new(vec![]).truncated()),
-            ["cap reached x.mds", "findings (0) x.mds", "clean x.mds"],
+            [
+                "cap reached, re-run --fix x.mds",
+                "findings (0) x.mds",
+                "clean x.mds"
+            ],
             "control: a capped entry with nothing to fix announces the cap before its findings"
         );
+        // Only `--fix` advises re-running it: a preview writes nothing.
+        for preview in [
+            LintFlags {
+                check: true,
+                ..DIR_JSON_FIX
+            },
+            LintFlags {
+                diff: true,
+                ..DIR_JSON_FIX
+            },
+        ] {
+            let calls = calls_with(
+                preview,
+                &readable,
+                "x.mds",
+                LintResult::new(vec![]).truncated(),
+            );
+            assert_eq!(
+                calls.first().map(String::as_str),
+                Some("cap reached x.mds"),
+                "a capped preview announces the plain cap notice first; calls: {calls:?}"
+            );
+        }
         let report = LintFlags {
             fix: false,
             ..DIR_JSON_FIX
@@ -2763,7 +2821,7 @@ mod tests {
                     typed,
                     name: "x.mds",
                 },
-                capped: true,
+                capped: Some(CapNotice::Plain),
                 outcome,
             };
             let mut sink = Recorder::default();
@@ -2838,7 +2896,7 @@ mod tests {
                     path: &path,
                     key: &key,
                 },
-                capped: false,
+                capped: None,
                 outcome: Outcome::Reported {
                     findings: LintResult::new(vec![finding]),
                     text,
@@ -2927,7 +2985,7 @@ mod tests {
             let outcome = apply_fix(&input, &path, before, text, fix, LintFormat::Human);
             let report = FileReport {
                 input,
-                capped: false,
+                capped: None,
                 outcome,
             };
             let verdict = render(report, &mut HumanSink::new(false));
@@ -2993,7 +3051,7 @@ mod tests {
             let outcome = fix_stdin(before, PARTIAL_BEFORE.to_string(), fix);
             let report = FileReport {
                 input: LintSource::Stdin,
-                capped: false,
+                capped: None,
                 outcome,
             };
             let verdict = render(report, &mut HumanSink::new(false));

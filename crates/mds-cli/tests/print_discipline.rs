@@ -546,6 +546,13 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "`usize` compile-time constant `mds::MAX_DIAGNOSTICS` (the per-file diagnostic cap).",
     ),
     (
+        "lint_sink.rs",
+        "cap_advice",
+        "`&'static str` bound in `cap_reached` from a `match` over `CapNotice` whose two \
+         arms are string literals: empty, or the fixed ASCII-and-em-dash advice to re-run \
+         `--fix` (#309). It carries no input text.",
+    ),
+    (
         "main.rs",
         "walk.excluded_by_default",
         "`usize` count of `.mds` files the default-exclusion walker skipped \
