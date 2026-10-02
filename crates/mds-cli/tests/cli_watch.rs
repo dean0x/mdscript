@@ -6825,21 +6825,22 @@ fn watch_startup_route_refusal_controls() {
     drop(child);
 }
 
-// ── A failed startup write keeps what the compile decided (#257) ───────────────
+// ── A failed startup compile or write: the route of the compiled kind (#257) ────
 //
-// A startup compile that fails leaves the output's kind unknown, so the session takes
-// the Markdown route. A startup write that fails follows a compile that succeeded: the
-// route its kind decided and the dependencies it reported stay the session's. The write
-// fails on a directory standing at the output path, which no write replaces on any OS or
-// under any privilege; removing the directory removes the cause. `--poll-interval 0`
-// turns the idle tick off, so every rebuild is the test's own edit's and nothing
-// rediscovers what startup dropped.
+// A startup compile that fails leaves the output's kind unknown, so the first rebuild
+// that compiles decides the route by its kind. A startup write that fails follows a
+// compile that succeeded: the route its kind decided and the dependencies it reported
+// stay the session's. The write fails on a directory standing at the output path, which
+// no write replaces on any OS or under any privilege; removing the directory removes
+// the cause. `--poll-interval 0` turns the idle tick off, so every rebuild is the test's
+// own edit's and nothing rediscovers what startup dropped.
 
 /// A messages template whose `.json` output cannot be written at startup keeps the
 /// `.json` route (#257): the startup error names `./chat.json` as typed, and once the
 /// obstacle is gone an edit writes `chat.json`; no `chat.md` is ever created. It used to
 /// take the Markdown route of a failed compile, and write the JSON into `chat.md`.
-/// Control: a startup compile that fails still takes the Markdown route.
+/// Control: after a startup compile that fails, a rebuild that compiles to Markdown
+/// writes `chat.md`.
 #[test]
 fn watch_failed_startup_write_keeps_the_compiled_kinds_route() {
     let watch = |dir: &Path| {
@@ -6872,7 +6873,11 @@ fn watch_failed_startup_write_keeps_the_compiled_kinds_route() {
 
     std::fs::remove_dir(&json).unwrap();
     write_atomic(&src, "@message user:\nWhat is 3+3?\n@end\n");
-    // The ordered anchor: a rebuild writes its output before it prints `Recompiled`.
+    // Anchored on the edit's own output: a late event for `chat.mds`, written before the
+    // spawn, can rebuild the startup text first — the failed write left the content
+    // dedup empty — so the first `Recompiled` need not be the edit's.
+    let rebuilt = wait_for_file_contains(&json, "What is 3+3?", TIMEOUT);
+    // A rebuild writes its output before it prints `Recompiled`.
     let stderr = wait_for_tap(&tap, "Recompiled", TIMEOUT);
     assert!(
         !md.exists(),
@@ -6887,13 +6892,13 @@ fn watch_failed_startup_write_keeps_the_compiled_kinds_route() {
     let parsed: serde_json::Value =
         serde_json::from_str(&written).expect("the .json output is JSON");
     assert!(
-        parsed.is_array() && written.contains("What is 3+3?"),
+        rebuilt && parsed.is_array() && written.contains("What is 3+3?"),
         "chat.json holds the rebuilt messages: {written}"
     );
     drop(child);
 
-    // Control: a startup compile that fails leaves the kind unknown, so the session
-    // takes the Markdown route, which the first rebuild that compiles writes.
+    // Control: a startup compile that fails leaves the kind unknown, so the first
+    // rebuild that compiles routes by its kind: Markdown, `chat.md`.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("chat.mds");
     let md = dir.path().join("chat.md");
@@ -6941,6 +6946,106 @@ fn watch_failed_startup_write_keeps_the_compiled_dependencies() {
         tap.text()
     );
     drop(child);
+}
+
+/// A startup compile that fails leaves the output's kind unknown, and the first rebuild
+/// that compiles routes the output by the kind it compiles to (#257): a template fixed
+/// into messages writes `chat.json` and never `chat.md`, below `--out-dir` too, and one
+/// fixed into Markdown writes `chat.md` and never `chat.json`. It used to keep the
+/// Markdown route all session, and wrote the JSON into `chat.md`. Control: an explicit
+/// `-o` names the output whatever its kind, so the JSON goes to the file it names.
+#[test]
+fn watch_failed_startup_compile_routes_by_the_kind_it_compiles_to() {
+    const MESSAGES: &str = "@message user:\nWhat is 3+3?\n@end\n";
+    const MARKDOWN: &str = "Hello fixed\n";
+    // One session whose startup compile fails, then `fixed` saved over the entry: the
+    // directory, and stderr up to the first `Recompiled` — a rebuild writes its output
+    // before it prints that line.
+    let session = |args: &[&str], fixed: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("chat.mds");
+        std::fs::write(&src, "Hello {{name\n").unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "chat.mds"])
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        wait_for_tap(&tap, "mds::syntax", TIMEOUT);
+        write_atomic(&src, fixed);
+        let stderr = wait_for_tap(&tap, "Recompiled", TIMEOUT);
+        drop(child);
+        (dir, stderr)
+    };
+    let recompiled = |stderr: &str, shown: &Path| {
+        squash(stderr).contains(&squash(&format!("Recompiled {}", shown.display())))
+    };
+
+    // Messages, beside the entry.
+    let (dir, stderr) = session(&[], MESSAGES);
+    let md = dir.path().join("chat.md");
+    assert!(
+        !md.exists(),
+        "a template fixed into messages never writes chat.md; it holds {:?}; stderr: {stderr}",
+        std::fs::read_to_string(&md).ok()
+    );
+    assert!(
+        recompiled(&stderr, &Path::new(".").join("chat.json")),
+        "the rebuild names the .json output as typed; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("chat.json")).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&written).expect("the .json output is JSON");
+    assert!(
+        parsed.is_array() && written.contains("What is 3+3?"),
+        "chat.json holds the messages: {written}"
+    );
+
+    // Messages, below `--out-dir`.
+    let (dir, stderr) = session(&["--out-dir", "out"], MESSAGES);
+    assert!(
+        recompiled(&stderr, &Path::new("out").join("chat.json")),
+        "under --out-dir the rebuild writes the .json output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("out").join("chat.json")).unwrap();
+    assert!(
+        written.contains("What is 3+3?"),
+        "out/chat.json holds the messages: {written}"
+    );
+
+    // Control: Markdown, beside the entry — `chat.md` is written where it applies.
+    let (dir, stderr) = session(&[], MARKDOWN);
+    assert!(
+        recompiled(&stderr, &Path::new(".").join("chat.md")),
+        "control: the rebuild names the .md output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("chat.md")).unwrap();
+    assert!(
+        written.contains("Hello fixed"),
+        "control: chat.md holds the Markdown: {written}"
+    );
+    assert!(
+        !dir.path().join("chat.json").exists(),
+        "a template fixed into Markdown never writes chat.json; stderr: {stderr}"
+    );
+
+    // Control: an explicit `-o` is the route whatever the kind.
+    let (dir, stderr) = session(&["-o", "out.md"], MESSAGES);
+    assert!(
+        recompiled(&stderr, Path::new("out.md")),
+        "control: the rebuild writes the -o output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("out.md")).unwrap();
+    assert!(
+        written.contains("What is 3+3?"),
+        "control: out.md holds the messages: {written}"
+    );
+    assert!(
+        !dir.path().join("chat.json").exists() && !dir.path().join("out.json").exists(),
+        "control: -o is never routed by the kind; stderr: {stderr}"
+    );
 }
 
 // ── Streams: a gone stdout reader, a closed stderr, a failing write (#157) ──────

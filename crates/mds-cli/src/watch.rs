@@ -1457,12 +1457,6 @@ struct FileCompileCtx {
     vars_path_typed: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
-    /// Where every rebuild writes, resolved once at startup: from the startup compile's
-    /// kind (intrinsic extension), written or not, or the Markdown fallback of a failed
-    /// startup compile.
-    /// `None` is stdout (`-o -`). A route that fails to resolve never gets here: it ends
-    /// `mds watch` at startup.
-    output_path: Option<WriteTarget>,
     quiet: bool,
 }
 
@@ -1487,6 +1481,38 @@ impl OutputKey {
     }
 }
 
+/// Where file mode writes its output, resolved at startup (#257). A route that fails to
+/// resolve never gets here: it ends `mds watch` at startup.
+#[derive(Debug, PartialEq, Eq)]
+enum OutputRoute {
+    /// Every rebuild writes here: the route of the kind the startup compile produced,
+    /// written or not, or the path an explicit `-o` names whatever the kind. `None` is
+    /// stdout (`-o -`).
+    Decided(Option<WriteTarget>),
+    /// The startup compile failed, so the output's kind is unknown: the route of each
+    /// kind, of which the first compile that succeeds takes its kind's.
+    ByKind {
+        markdown: Option<WriteTarget>,
+        messages: Option<WriteTarget>,
+    },
+}
+
+impl OutputRoute {
+    /// The route an output of `kind` takes. The first call decides it, and every later
+    /// one keeps it whatever its kind.
+    fn decide(&mut self, kind: OutputKind) -> Option<WriteTarget> {
+        let route = match std::mem::replace(self, Self::Decided(None)) {
+            Self::Decided(route) => route,
+            Self::ByKind { markdown, messages } => match kind {
+                OutputKind::Markdown => markdown,
+                OutputKind::Messages => messages,
+            },
+        };
+        *self = Self::Decided(route.clone());
+        route
+    }
+}
+
 /// Mutable loop state for single-file watch mode.
 ///
 /// Groups the per-loop variables that are updated on every rebuild or liveness tick,
@@ -1506,6 +1532,8 @@ struct FileWatchState {
     last_mtimes: StampMap,
     /// Content-dedup map: what was last written, by where it was written.
     last_written: HashMap<OutputKey, String>,
+    /// Where every rebuild writes ([`OutputRoute::decide`]).
+    output: OutputRoute,
     /// Whether the entry file was missing on the previous liveness tick.
     entry_was_missing: bool,
     /// True on the very first tick; forces a reconcile to close the startup race window.
@@ -1712,11 +1740,13 @@ fn rebuild_file(
     // same way, and watching continues.
     let entry = &ctx.entry;
     let routed = entry.compile(runtime_vars, ctx.quiet).and_then(|compiled| {
-        let output_path = ctx.output_path.clone();
-        // #425: a rebuild never writes over the entry — reachable when a failed startup
-        // compile left the Markdown default in place as the output path. No `-o`
-        // extension warning (`&None`): startup printed it for the path every rebuild
-        // reuses.
+        // After a failed startup compile, the first compile that succeeds decides the
+        // route by its kind, and this rebuild and every later one write there (#257).
+        let output_path = state.output.decide(compiled.kind);
+        // #425: a rebuild never writes over the entry — reachable after a failed startup
+        // compile, which refuses no route: the route the kind decided here, or an
+        // explicit `-o`, can be the entry. No `-o` extension warning (`&None`): startup
+        // printed it for the path an explicit `-o` names, which every rebuild reuses.
         admit_output(
             written_path(&output_path),
             entry.paths(),
@@ -2050,8 +2080,10 @@ fn run_watch_file(
     // the entry file itself (#425): refused at startup, exit 2, before anything is
     // written. A compile or write error is reported, and watching continues.
     let startup = compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet)?;
-    let (output_path, initial_deps, initial_content) = match startup {
-        CompileWriteOutcome::Written(result) => result,
+    let (output_route, initial_deps, initial_content) = match startup {
+        CompileWriteOutcome::Written((output_path, deps, content)) => {
+            (OutputRoute::Decided(output_path), deps, content)
+        }
         // stdout's reader is gone before the session went live: it stops here, and its
         // verdict is 0 — a closed pipe never changes the exit code (#157).
         CompileWriteOutcome::StdoutClosed => {
@@ -2073,7 +2105,7 @@ fn run_watch_file(
                 failure,
                 Settle::MarkErrored(&entry.canonical),
             );
-            (output_path, deps, String::new())
+            (OutputRoute::Decided(output_path), deps, String::new())
         }
         CompileWriteOutcome::CompileFailed(e) => {
             // Initial compile error: print and continue watching (entry dir still
@@ -2083,32 +2115,36 @@ fn run_watch_file(
                 e,
                 Settle::MarkErrored(&entry.canonical),
             );
-            // Fall back: the kind is unknown, so resolve the output path with the Markdown
-            // kind as a placeholder to know where to watch. This path may not match a later
-            // successful compile if the template has @message blocks, and every rebuild
-            // reuses it (`FileCompileCtx.output_path`) — so it can be the entry itself,
-            // which `rebuild_file` refuses to write over (#425). A route that fails to
-            // resolve is refused here as after a successful compile (exit 2): no rebuild
-            // could write anywhere else.
-            let fallback_path = resolve_output_path_for_kind(
-                Some(entry.paths()),
-                &output,
-                &out_dir,
-                &config,
-                OutputKind::Markdown,
-            )?;
-            // Nothing is written now. Every rebuild reuses this path, and refuses and
-            // reports one that is the entry (#425), so the refusal is dropped here:
-            // admitting the fallback only decides whether the `-o` extension warning,
-            // which announces a write, is printed — never for a fallback that is the entry.
-            let _ = admit_output(
-                written_path(&fallback_path),
-                entry.paths(),
-                &output,
-                OutputKind::Markdown,
-                quiet,
-            );
-            (fallback_path, vec![], String::new())
+            // The kind is unknown, and with it the route an output of that kind takes: the
+            // route of each kind is resolved now, and the first compile that succeeds takes
+            // its kind's (#257) — a `.json` output is never written to `.md`. A route that
+            // fails to resolve is refused here as after a successful compile (exit 2): no
+            // rebuild could write anywhere else. Nothing is written now, and every rebuild
+            // refuses and reports a route that is the entry (#425).
+            let route_of = |kind| {
+                resolve_output_path_for_kind(Some(entry.paths()), &output, &out_dir, &config, kind)
+            };
+            let markdown = route_of(OutputKind::Markdown)?;
+            let route = if output.is_some() {
+                // An explicit `-o` names the route whatever the kind. Its refusal is
+                // dropped here: admitting it only decides whether the `-o` extension
+                // warning, which announces a write, is printed — never for an output that
+                // is the entry.
+                let _ = admit_output(
+                    written_path(&markdown),
+                    entry.paths(),
+                    &output,
+                    OutputKind::Markdown,
+                    quiet,
+                );
+                OutputRoute::Decided(markdown)
+            } else {
+                OutputRoute::ByKind {
+                    markdown,
+                    messages: route_of(OutputKind::Messages)?,
+                }
+            };
+            (route, vec![], String::new())
         }
     };
 
@@ -2161,11 +2197,12 @@ fn run_watch_file(
     // Record the dedup baseline. The event loop has not started, so nothing can
     // consult this map before it is populated (guard 3 above).
     // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
+    // initial_content is empty when the initial compile or write failed (above), and a
+    // failed compile leaves the route to the first compile that succeeds. In either case
+    // leave last_written empty so the next successful rebuild always writes.
     let mut last_written: HashMap<OutputKey, String> = HashMap::new();
-    if !initial_content.is_empty() {
-        // initial_content is empty when the initial compile or write failed (above). In
-        // that case leave last_written empty so the next successful rebuild always writes.
-        last_written.insert(OutputKey::of(output_path.as_ref()), initial_content);
+    if let (OutputRoute::Decided(written), false) = (&output_route, initial_content.is_empty()) {
+        last_written.insert(OutputKey::of(written.as_ref()), initial_content);
     }
 
     let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
@@ -2212,6 +2249,7 @@ fn run_watch_file(
         foi,
         last_mtimes,
         last_written,
+        output: output_route,
         entry_was_missing,
         first_tick: true,
         missing_watched_dirs,
@@ -2227,7 +2265,6 @@ fn run_watch_file(
         vars_path_typed,
         static_set_vars,
         static_set_string_vars,
-        output_path,
         quiet,
     };
 
@@ -5308,6 +5345,38 @@ mod tests {
         );
     }
 
+    /// #257: after a failed startup compile the first kind a compile produces decides the
+    /// route, and every later one keeps it whatever its kind; a route decided at startup —
+    /// by the startup compile's kind, or an explicit `-o` — is never decided again.
+    #[test]
+    fn output_route_is_decided_by_the_first_compiled_kind() {
+        let target = |name: &str| Some(WriteTarget::as_typed(PathBuf::from(name)));
+        let by_kind = || OutputRoute::ByKind {
+            markdown: target("chat.md"),
+            messages: target("chat.json"),
+        };
+
+        let mut route = by_kind();
+        assert_eq!(route.decide(OutputKind::Messages), target("chat.json"));
+        assert_eq!(route, OutputRoute::Decided(target("chat.json")));
+        assert_eq!(
+            route.decide(OutputKind::Markdown),
+            target("chat.json"),
+            "kept whatever kind follows"
+        );
+
+        // Control: a first compile to Markdown takes the Markdown route.
+        let mut route = by_kind();
+        assert_eq!(route.decide(OutputKind::Markdown), target("chat.md"));
+
+        let mut route = OutputRoute::Decided(target("out.md"));
+        assert_eq!(
+            route.decide(OutputKind::Messages),
+            target("out.md"),
+            "a decided route is never decided again"
+        );
+    }
+
     /// #417: the watched entry is compiled by the typed path while that path leads to the
     /// canonical entry's directory, and refused — naming the path as typed, never the
     /// canonical one — once it leads into another directory. A typed path that no longer
@@ -5501,6 +5570,7 @@ mod tests {
             foi,
             last_mtimes: HashMap::new(),
             last_written: HashMap::new(),
+            output: OutputRoute::Decided(None),
             entry_was_missing: false,
             first_tick: false,
             missing_watched_dirs: BTreeSet::new(),
