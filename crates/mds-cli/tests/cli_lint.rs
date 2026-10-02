@@ -8002,3 +8002,211 @@ fn a_fix_that_cannot_be_written_is_reported_in_one_wording_in_every_mode() {
         "nothing was written"
     );
 }
+
+// ── A source file over the size cap (#309) ────────────────────────────────────
+//
+// A file over the 10 MiB cap is `mds::resource_limit`, exit 3, in every lint mode: a file
+// argument or a directory's entry, `--format human` or `--format json`, a report, `--fix`
+// or a preview. A directory reports it as that entry's failure, still lints its other
+// files, counts it under "resource-limited" — never "with errors" — and exits with its
+// worst file's code, 3.
+//
+// Fixture: `d/big.mds`, `a`s ending in a newline, beside `d/warn.mds`, whose one warning
+// no fix removes.
+
+/// A tempdir holding `d/warn.mds` and `d/big.mds`, `len` bytes long.
+fn a_tree_with_a_file_of(len: u64) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    fs::create_dir(&dir).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.join("warn.mds")).unwrap();
+    let len = usize::try_from(len).unwrap();
+    fs::write(dir.join("big.mds"), "a".repeat(len - 1) + "\n").unwrap();
+    tmp
+}
+
+/// What a run over [`a_tree_with_a_file_of`] reported.
+#[derive(Debug, PartialEq)]
+struct SizeReport {
+    exit: Option<i32>,
+    /// The code of the error reported for `big.mds`: under `--format json` the error
+    /// document's or the entry's; in a human report the code line of the first error that
+    /// is not a lint finding.
+    error: Option<String>,
+    /// A directory's summary line.
+    summary: Option<String>,
+    /// `warn.mds`'s warning is reported.
+    rest_linted: bool,
+}
+
+/// Run `mds lint <mode> --format <format> <input>` in `cwd`, and read what it reported.
+fn size_report(cwd: &Path, input: &Path, format: &str, mode: &[&str]) -> SizeReport {
+    let out = mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(mode)
+        .args(["--format", format])
+        .arg(input)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let summary = stderr
+        .lines()
+        .find(|line| line.ends_with(" resource-limited"))
+        .map(str::to_string);
+    let (error, rest_linted) = if format == "json" {
+        // A preview's diff would come first: the document is the last line.
+        let document: serde_json::Value = stdout
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .unwrap_or_else(|| panic!("a JSON document on stdout; got {stdout:?}"));
+        let entry = |name: &str| {
+            document["files"]
+                .as_array()
+                .and_then(|files| files.iter().find(|entry| entry["file"] == name))
+                .cloned()
+        };
+        let error = document
+            .get("error")
+            .cloned()
+            .or_else(|| entry("big.mds").map(|entry| entry["error"].clone()));
+        let rest_linted = entry("warn.mds")
+            .is_some_and(|entry| entry["diagnostics"][0]["rule"] == "unused-variable");
+        let code = error.and_then(|error| error["code"].as_str().map(str::to_string));
+        (code, rest_linted)
+    } else {
+        let code = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("mds::") && !line.starts_with("mds::lint::"))
+            .map(str::to_string);
+        (code, stderr.contains("[unused-variable]"))
+    };
+    SizeReport {
+        exit: out.status.code(),
+        error,
+        summary,
+        rest_linted,
+    }
+}
+
+/// A file over the size cap is `mds::resource_limit`, exit 3, in every lint mode, as a
+/// file argument and as a directory's entry, in either format. A directory still lints
+/// its other files and counts the file under "resource-limited"; its human report read
+/// the file before linting it, counted it under "with errors" and exited 2.
+///
+/// Control: a file of exactly the cap passes the size gate in a report and under `--fix`,
+/// as a file argument and as a directory's entry, in either format.
+#[test]
+fn a_file_over_the_size_cap_is_resource_limited_in_every_lint_mode() {
+    let file = Path::new("d").join("big.mds");
+    let inputs = [("a file", file.as_path()), ("a directory", Path::new("d"))];
+
+    let over = a_tree_with_a_file_of(mds::MAX_FILE_SIZE + 1);
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (input, arg) in inputs {
+        let in_dir = input == "a directory";
+        for format in ["human", "json"] {
+            for mode in LINT_MODES {
+                let report = size_report(over.path(), arg, format, mode);
+                seen.push((input, format, mode, report));
+                let report = SizeReport {
+                    exit: Some(3),
+                    error: Some("mds::resource_limit".to_string()),
+                    summary: in_dir.then(|| {
+                        "0 clean, 1 with warnings, 0 with errors, 1 resource-limited".into()
+                    }),
+                    rest_linted: in_dir,
+                };
+                expected.push((input, format, mode, report));
+            }
+        }
+    }
+    assert_eq!(seen, expected, "(input, format, mode, what it reported)");
+    assert_eq!(
+        fs::metadata(over.path().join(&file)).unwrap().len(),
+        mds::MAX_FILE_SIZE + 1,
+        "nothing was written"
+    );
+
+    let at = a_tree_with_a_file_of(mds::MAX_FILE_SIZE);
+    let mut controls = Vec::new();
+    let mut expected = Vec::new();
+    for (input, arg) in inputs {
+        let in_dir = input == "a directory";
+        for format in ["human", "json"] {
+            for mode in [&[][..], &["--fix"]] {
+                let report = size_report(at.path(), arg, format, mode);
+                controls.push((input, format, mode, report));
+                let report = SizeReport {
+                    exit: Some(i32::from(in_dir)),
+                    error: None,
+                    summary: in_dir.then(|| {
+                        "1 clean, 1 with warnings, 0 with errors, 0 resource-limited".into()
+                    }),
+                    rest_linted: in_dir,
+                };
+                expected.push((input, format, mode, report));
+            }
+        }
+    }
+    assert_eq!(
+        controls, expected,
+        "control, (input, format, mode, what it reported)"
+    );
+}
+
+/// A file over the size cap under an `mds.json` that cannot load reports the
+/// configuration's failure, `mds::io`, exit 2, in every arm: the file's configuration
+/// loads before the file is read, for a file argument and a directory's entry in either
+/// format. A directory's human report read the file first and reported
+/// `mds::resource_limit`, exit 3.
+///
+/// Control: under a valid `mds.json` the same file is `mds::resource_limit`, exit 3.
+#[test]
+fn a_config_that_cannot_load_is_reported_before_a_file_over_the_size_cap() {
+    let file = Path::new("d").join("big.mds");
+    let inputs = [("a file", file.as_path()), ("a directory", Path::new("d"))];
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (config, valid) in [("{", false), ("{}", true)] {
+        let tree = a_tree_with_a_file_of(mds::MAX_FILE_SIZE + 1);
+        fs::write(tree.path().join("d").join("mds.json"), config).unwrap();
+        for (input, arg) in inputs {
+            let in_dir = input == "a directory";
+            for format in ["human", "json"] {
+                for mode in [&[][..], &["--fix"]] {
+                    let report = size_report(tree.path(), arg, format, mode);
+                    seen.push((config, input, format, mode, report));
+                    let report = if valid {
+                        SizeReport {
+                            exit: Some(3),
+                            error: Some("mds::resource_limit".to_string()),
+                            summary: in_dir.then(|| {
+                                "0 clean, 1 with warnings, 0 with errors, 1 resource-limited".into()
+                            }),
+                            rest_linted: in_dir,
+                        }
+                    } else {
+                        SizeReport {
+                            exit: Some(2),
+                            error: Some("mds::io".to_string()),
+                            summary: in_dir.then(|| {
+                                "0 clean, 0 with warnings, 2 with errors, 0 resource-limited".into()
+                            }),
+                            rest_linted: false,
+                        }
+                    };
+                    expected.push((config, input, format, mode, report));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "(mds.json, input, format, mode, what it reported)"
+    );
+}

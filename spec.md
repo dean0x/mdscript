@@ -1007,7 +1007,9 @@ resolve it against, and a working directory that auto-detection cannot list, are
   The `mds.json` errors above are not in this list. A `mds lint --fix` rewrite that
   fails is in it, reported as `mds::io` in every mode, in one wording (§7.5).
 - Stdin over the 10 MiB cap is `mds::resource_limit`, exit 3, under `build`, `check`,
-  `fmt` and `lint`; exactly 10 MiB is accepted.
+  `fmt` and `lint`; exactly 10 MiB is accepted. Under `mds lint` a source file over the
+  cap is `mds::resource_limit` too, as a file argument or a directory's entry, in every
+  mode and format; a directory still lints its other files and exits 3 (§7.5).
 - On Unix the Rust runtime treats EBADF on a standard stream — a descriptor that is
   not open for the direction used — as success: a write to it is dropped, and a read
   from it is end of input. Such a stream is therefore not reported as a failure.
@@ -1238,6 +1240,9 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 
 - Lints every `.mds` file recursively (including `_`-prefixed partials).
 - Accumulate-and-continue: per-file errors do not abort the run.
+- Each file's nearest `mds.json` loads before the file is read, in either format, as for
+  a file argument: a configuration that cannot load is the file's failure (`mds::io`,
+  "with errors") even when the file is also unreadable or over the size cap (#309).
 - Before any file is linted, every entry is named relative to the lint root; a path that is not valid UTF-8 or that escapes the lint root is an I/O error (`mds::io`, exit 2) for the whole run — no lossy or absolute `file` key is ever emitted. The message names the path escaped as a status line names one, so a newline or other forbidden character in the name shows as its `\uXXXX` literal (#390).
 - After processing all files, emits one summary line to stderr:
   `N clean, N with warnings, N with errors, N resource-limited`
@@ -1254,9 +1259,12 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
     fails other than by a closed pipe (§5 "Streams and I/O failures"; `mds fmt <dir>`
     counts such a file as failed, §7.4). These populations are deliberately merged,
     matching the way `mds build`'s "failed" count merges them.
-  - "Resource-limited" — files where `mds::lint` returned `MdsError::ResourceLimit`
-    (for example, exceeding `MAX_BLOCKS_PER_MODULE`). These are counted here, never
-    under "with errors".
+  - "Resource-limited" — files refused with `mds::resource_limit`: a source over the
+    10 MiB file cap, in every mode and format, or one over another documented limit (for
+    example, exceeding `MAX_BLOCKS_PER_MODULE`). These are counted here, never under
+    "with errors"; the file's failure is reported as the entry's, and the directory exits
+    3. Before v0.5.0, `--format human` counted a source over the file cap under "with
+    errors" and exited 2 (#309).
 - Under `--quiet`, the summary is suppressed when the worst outcome is warnings only
   (mirrors `mds fmt`'s contract).  When any file is in the error or resource-limited
   bucket, the summary is always emitted so the non-zero exit is never unexplained.
@@ -1642,7 +1650,7 @@ A closed stdout or stderr pipe never changes any of these codes (§5 "Streams an
 | `0` | Clean — no warning- or error-severity findings |
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, or a directory entry whose path is not valid UTF-8); also an I/O failure (#157): a `--fix` rewrite that fails, a stdout write that fails other than by a closed pipe — which lifts a clean or warning-only run to 2 — and stdin that cannot be read or is not valid UTF-8, each `mds::io` (a rewrite failure in the one wording of §7.5) |
-| `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2) |
+| `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2); a source file over 10 MiB in every mode and format, a directory's entry included (changed in v0.5.0 for a directory under `--format human`; previously exit 2, #309) |
 | `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
 
 The code-by-code classification behind these tables is the "Error Codes" registry in §5.

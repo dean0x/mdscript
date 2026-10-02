@@ -813,8 +813,8 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
     }
 }
 
-/// The tally of an input `mds::lint` refused: resource-limited for
-/// `mds::resource_limit`, "with errors" for any other refusal.
+/// The tally of an input refused before it had findings — its source read or `mds::lint`:
+/// resource-limited for `mds::resource_limit`, "with errors" for any other refusal.
 fn failure_tally(e: &MdsError) -> FileTally {
     if matches!(e, MdsError::ResourceLimit { .. }) {
         FileTally::ResourceLimit
@@ -1110,10 +1110,8 @@ fn lint_input<'a>(
     let text = match source.read() {
         Ok(text) => text,
         Err(error) => {
-            let outcome = Outcome::Failed {
-                error,
-                tally: FileTally::Error,
-            };
+            let tally = failure_tally(&error);
+            let outcome = Outcome::Failed { error, tally };
             return FileReport {
                 input,
                 capped,
@@ -1656,7 +1654,8 @@ impl<'a> LintDirCtx<'a> {
 /// "With errors" covers both error-severity lint findings AND per-file analysis failures
 /// (read error, config error, lint call failure) — the same conflation `mds build`'s
 /// "failed" bucket makes (D3-a).  "Resource-limited" counts files where `mds::lint`
-/// returned `MdsError::ResourceLimit` — distinct from lint findings.  A file whose own
+/// returned `MdsError::ResourceLimit`, as the read of a source over the size cap does
+/// (#309) — distinct from lint findings.  A file whose own
 /// output failed also counts "with errors": a `--fix` rewrite that fails, or a diff a
 /// failing stdout lost (#157) — as `mds fmt <dir>` counts either one failed.
 ///
@@ -1791,26 +1790,18 @@ fn run_lint_directory(
 /// `path` is the file the walk found, `key` its display key, computed once by
 /// [`run_lint_directory`] before the sort (#217).
 ///
-/// The two formats load in different orders. Human output renders every finding in its
-/// source, so it reads the source first: an unreadable entry fails before its `mds.json`
-/// is loaded, and counts under "with errors" even when it is over the size cap, where
-/// `mds::lint` would count it resource-limited. JSON output reads it only to fix it
-/// ([`SourceText::Unread`]).
+/// The entry's `mds.json` loads before the entry is read, as a file argument's does, so a
+/// configuration that cannot load is the entry's failure even when the file cannot be
+/// read either. Human output renders every finding in its source, so it reads the source
+/// next; JSON output reads it only to fix it ([`SourceText::Unread`]). Either way a read
+/// refused for size counts under "resource-limited", as `mds::lint`'s own refusal does
+/// ([`failure_tally`]).
 fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> FileReport<'a> {
     let entry = move || LintSource::DirEntry { path, key };
     let failed = move |error: MdsError, tally: FileTally| FileReport {
         input: entry(),
         capped: None,
         outcome: Outcome::Failed { error, tally },
-    };
-
-    let source = if ctx.flags.format == LintFormat::Json {
-        SourceText::Unread(path)
-    } else {
-        match read_source_file(path) {
-            Ok(text) => SourceText::Read(text),
-            Err(e) => return failed(e, FileTally::Error),
-        }
     };
 
     // A bare file name has the parent "", which `effective_parent` maps to ".".
@@ -1820,6 +1811,18 @@ fn lint_dir_entry<'a>(path: &'a Path, key: &'a str, ctx: &LintDirCtx<'_>) -> Fil
     let config = match ctx.config_for(base_dir) {
         Ok(config) => config,
         Err(e) => return failed(e, FileTally::Error),
+    };
+
+    let source = if ctx.flags.format == LintFormat::Json {
+        SourceText::Unread(path)
+    } else {
+        match read_source_file(path) {
+            Ok(text) => SourceText::Read(text),
+            Err(e) => {
+                let tally = failure_tally(&e);
+                return failed(e, tally);
+            }
+        }
     };
     // A panic in the analysis fails this entry alone, and the rest of the tree goes on
     // (#389).
@@ -2427,6 +2430,65 @@ mod tests {
         assert_eq!(
             document,
             vec![serde_json::json!({ "file": "gone.mds", "error": expected })]
+        );
+    }
+
+    /// Under `--format json` a directory's entry that is over the size cap when it is read
+    /// to fix is recorded as that failure, `mds::resource_limit`, and counts under
+    /// "resource-limited" — not "with errors" — as it does when `mds::lint` refuses it
+    /// (#309).
+    ///
+    /// The read follows a lint that read the same file within the cap, so no CLI run
+    /// reaches it without a race; the lint result is crafted.
+    ///
+    /// Control: the same entry at exactly the cap is read, has nothing to fix and counts
+    /// clean.
+    #[test]
+    fn directory_json_fix_counts_an_entry_over_the_size_cap_as_resource_limited() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = Rc::new(mds::LintConfig::default());
+        let path = root.join("x.mds");
+        let fix = |len: u64| {
+            let len = usize::try_from(len).unwrap();
+            std::fs::write(&path, "a".repeat(len - 1) + "\n").unwrap();
+            let linted = Linted {
+                input: LintSource::DirEntry {
+                    path: &path,
+                    key: "x.mds",
+                },
+                base_dir: &root,
+                config: Rc::clone(&config),
+                source: SourceText::Unread(&path),
+                result: LintResult::new(vec![]),
+            };
+            let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
+            sink.start_document();
+            let verdict = render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink);
+            (verdict, sink.document().to_vec())
+        };
+
+        let (verdict, document) = fix(mds::MAX_FILE_SIZE);
+        assert!(
+            verdict.tally == FileTally::Clean,
+            "control: read within the cap, nothing to fix"
+        );
+        assert!(document.is_empty(), "control: no entry; got {document:?}");
+
+        let (verdict, document) = fix(mds::MAX_FILE_SIZE + 1);
+        assert!(
+            verdict.tally == FileTally::ResourceLimit,
+            "an entry over the size cap counts under \"resource-limited\""
+        );
+        assert_eq!(
+            document.len(),
+            1,
+            "the failure is the entry; got {document:?}"
+        );
+        assert_eq!(document[0]["file"], "x.mds", "got {document:?}");
+        assert_eq!(
+            document[0]["error"]["code"], "mds::resource_limit",
+            "got {document:?}"
         );
     }
 
