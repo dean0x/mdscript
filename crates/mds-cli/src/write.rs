@@ -87,12 +87,16 @@
 //! removed, and anything else that is not a regular file is left unopened. On unix the
 //! file is then opened in that directory (`openat(O_NOFOLLOW | O_NONBLOCK)`), `fstat` must
 //! find a regular file, the caller's proof reads it, and `fstatat(AT_SYMLINK_NOFOLLOW)`
-//! must find the same device and inode at the name before `unlinkat` removes it from the
-//! directory the walk opened: a file put in its place after it was opened is left. Only
-//! one put there in the instant between that look and the removal is removed instead.
-//! Windows checks each directory below the anchor as a write does, and removes by path:
-//! the file is closed after its proof and then removed by its name, so one put there in
-//! between is removed instead.
+//! must find at the name the stamp `fstat` gave — the same device and inode, size, and
+//! modification and status-change times, as a rewrite compares — before `unlinkat`
+//! removes it from the directory the walk opened: a file put in its place after it was
+//! opened is left, and so is the same file written over after the proof read it. Only one
+//! put there, or an edit made, in the instant between that look and the removal is
+//! removed instead, as is an edit that keeps the file's size and times on a filesystem
+//! whose clock is coarser than the time it takes. Windows checks each directory below the
+//! anchor as a write does, and removes by path: the file is closed after its proof,
+//! looked at again by path — the same size, and modification and creation times — and
+//! then removed by its name, so one put there in between is removed instead.
 //!
 //! # Contract (#226)
 //!
@@ -846,8 +850,9 @@ mod unix {
     /// a regular file `proof` accepts, and only while the name is still that file (#160).
     /// It is looked at without following a symlink first, so anything but a regular file
     /// is never opened; then opened without following one, and never waiting on a FIFO
-    /// put in its place; its device and inode, from the file opened, must be the name's
-    /// again, looked at once `proof` has read it, before it is unlinked.
+    /// put in its place; its [`Stamp`], taken of the file opened before `proof` reads it,
+    /// must be the name's again, looked at once `proof` has read it, before it is
+    /// unlinked.
     pub(super) fn remove(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
@@ -879,14 +884,17 @@ mod unix {
         if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
             return Err(Failure::NotARegularFile);
         }
+        // Taken of the file opened before `proof` reads it, so an edit made while or after
+        // it is read changes it too.
+        let stamp = Stamp::of(&opened);
         if !proof(&mut file).map_err(Failure::Unreadable)? {
             return Ok(Removal::Kept);
         }
         drop(file);
-        // The file proven must still be the one at the name: another put there since is
-        // left as it is.
+        // The file proven must still be the one at the name, unchanged: another put there
+        // since, or the same file written over after it was read, is left as it is.
         match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(now) if (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino) => {}
+            Ok(now) if Stamp::of(&now) == stamp => {}
             Ok(_) => return Err(Failure::Changed),
             Err(Errno::NOENT) => return Ok(Removal::Missing),
             Err(e) => return Err(e.into()),
@@ -1399,7 +1407,8 @@ mod windows {
 
     /// Remove `below.name`, in the directory [`walk`] checks — creating none — once it is
     /// a regular file `proof` accepts, refusing a symlink or a junction there; the file is
-    /// closed again before it is removed by path (the residual the module docs describe).
+    /// closed again, looked at by path for the [`Stamp`] it was opened with, and removed
+    /// by path (the residual the module docs describe).
     pub(super) fn remove(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
@@ -1420,13 +1429,25 @@ mod windows {
             Err(e) if no_such_name(&e) => return Ok(Removal::Missing),
             Err(e) => return Err(Failure::Unreadable(e)),
         }
-        let proven = match std::fs::File::open(&target) {
-            Ok(mut file) => proof(&mut file).map_err(Failure::Unreadable)?,
+        let mut file = match std::fs::File::open(&target) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Missing),
             Err(e) => return Err(Failure::Unreadable(e)),
         };
-        if !proven {
+        // Taken of the file opened before `proof` reads it, so an edit made while or after
+        // it is read changes it too.
+        let stamp = Stamp::of(&file.metadata().map_err(Failure::Unreadable)?);
+        if !proof(&mut file).map_err(Failure::Unreadable)? {
             return Ok(Removal::Kept);
+        }
+        drop(file);
+        // The file proven must still be at the name, unchanged: one written over after it
+        // was read, or another put there with another size or other times, is left.
+        match std::fs::symlink_metadata(&target) {
+            Ok(now) if now.is_file() && Stamp::of(&now) == stamp => {}
+            Ok(_) => return Err(Failure::Changed),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Missing),
+            Err(e) => return Err(e.into()),
         }
         match std::fs::remove_file(&target) {
             Ok(()) => Ok(Removal::Removed),
@@ -2796,6 +2817,46 @@ mod tests {
 
         assert_eq!(remove_proven(&target, |_| Ok(true)), Ok(Removal::Removed));
         assert!(!file.exists(), "control: the file proven is removed");
+    }
+
+    /// A file edited in place — the same file, written over — after its proof read it is
+    /// not removed: the removal is refused, and the edit is left (#160). Control: the same
+    /// proof, with no edit, removes the file.
+    #[test]
+    fn an_edit_made_in_place_after_the_proof_read_it_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.json");
+        let target = to_remove(dir.path(), "x.json");
+        let read_then = |edit: Option<&'static str>| {
+            let path = path.clone();
+            move |file: &mut std::fs::File| {
+                let mut read = String::new();
+                std::io::Read::read_to_string(file, &mut read)?;
+                if let Some(edit) = edit {
+                    std::fs::write(&path, edit)?;
+                }
+                Ok(read == "mds bytes")
+            }
+        };
+
+        std::fs::write(&path, "mds bytes").unwrap();
+        let edited = remove_proven(&target, read_then(Some("the user's edit, longer")));
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("the user's edit, longer"),
+            "the edit is left"
+        );
+        assert_eq!(
+            edited,
+            Err(NotRemoved::Failed(CHANGED_WHILE_CHECKED.to_owned()))
+        );
+
+        std::fs::write(&path, "mds bytes").unwrap();
+        assert_eq!(
+            remove_proven(&target, read_then(None)),
+            Ok(Removal::Removed)
+        );
+        assert!(!path.exists(), "control: the file proven is removed");
     }
 
     /// A removal whose anchor is not the directory its caller checked is refused before

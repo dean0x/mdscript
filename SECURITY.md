@@ -145,7 +145,12 @@ input. The compiler enforces several defense-in-depth controls:
   through a symlink nor one at the file, and, in `mds watch`, only below the out-dir it
   checked: on Unix the file is opened in the directory the walk reached without
   following a symlink, proven, and unlinked (`unlinkat`) from that directory only while
-  its name is still the device and inode opened. `mds watch` removes an output — of a
+  its name is still the file opened, unchanged — the same device and inode, size, and
+  modification and status-change times, so the same file written over after the proof
+  read it is kept; the residuals are a rewrite's: a change in the instant between that
+  last look and the removal, and on a filesystem whose clock is coarser than the time
+  between the read and an edit (one-second timestamps, say), an edit that keeps the
+  file's size. `mds watch` removes an output — of a
   deleted source, or of the old kind after a change of kind — only when the session
   wrote that file and it still holds exactly the bytes written (#160): a file it did not
   write, hand-written or left by another run, and one changed since are kept with a
@@ -168,9 +173,11 @@ input. The compiler enforces several defense-in-depth controls:
   symlink or a junction, and the write — or the removal — then goes by path, so a
   directory that another process replaces with a link between that check and the
   write is followed; a link
-  in place before the write is refused. A file to be removed is proven, closed again
-  and then removed by its name, so a file another process puts at that name in between
-  is removed in its place. The anchor `mds watch` checked is compared by
+  in place before the write is refused. A file to be removed is proven, closed again,
+  looked at by path — the same size, and modification and creation times, or it is
+  kept — and then removed by its name, so a file another process puts at that name
+  after that look, or one with the same size and times, is removed in its place. The
+  anchor `mds watch` checked is compared by
   path there, just before that walk, so a link swapped onto the out-dir's path after
   the comparison is followed too. Other reparse points, such as a cloud-sync
   placeholder, are written to.
