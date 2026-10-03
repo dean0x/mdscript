@@ -1085,6 +1085,20 @@ impl OutDirAnchor {
     }
 }
 
+/// The out-dir as it is now (#160), for a session with none treated as
+/// [`OutDirNow::Unchanged`]: one the typed path leads elsewhere from refuses the write
+/// below; a new one holds nothing the dedup could skip, so `last_written` is cleared.
+fn check_out_dir<K>(
+    anchor: Option<&mut OutDirAnchor>,
+    last_written: &mut HashMap<K, String>,
+) -> OutDirNow {
+    let now = anchor.map_or(OutDirNow::Unchanged, OutDirAnchor::check);
+    if now == OutDirNow::New {
+        last_written.clear();
+    }
+    now
+}
+
 // ── Watched paths ─────────────────────────────────────────────────────────────
 
 /// What a [`WatchedPath`] is: it decides how the typed form is resolved and how a
@@ -1905,15 +1919,7 @@ fn rebuild_file(
     // The content-dedup key: where the output is written.
     let output_key = OutputKey::of(output_path.as_ref());
 
-    // The out-dir as it is now (#160): one the typed path leads elsewhere from refuses
-    // the write below; a new one holds nothing the dedup could skip.
-    let out_dir = state
-        .out_dir
-        .as_mut()
-        .map_or(OutDirNow::Unchanged, OutDirAnchor::check);
-    if out_dir == OutDirNow::New {
-        state.last_written.clear();
-    }
+    let out_dir = check_out_dir(state.out_dir.as_mut(), &mut state.last_written);
 
     // Content-based dedup: skip write + summary line when unchanged.
     let content_changed = state
@@ -2709,15 +2715,7 @@ fn compile_one_source(
             let ext = compiled.kind.extension();
             let out = output_path_for(src, watch_root.root_paths(), output_base, ext);
 
-            // The out-dir as it is now (#160): one the typed path leads elsewhere from
-            // refuses the write below; a new one holds nothing the dedup could skip.
-            let out_dir = state
-                .out_dir
-                .as_mut()
-                .map_or(OutDirNow::Unchanged, OutDirAnchor::check);
-            if out_dir == OutDirNow::New {
-                state.last_written.clear();
-            }
+            let out_dir = check_out_dir(state.out_dir.as_mut(), &mut state.last_written);
 
             // Content-based dedup: skip write when content unchanged.
             let content_changed = state
