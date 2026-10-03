@@ -8264,6 +8264,17 @@ fn recompiled_below_out(stderr: &str, config: bool, name: &str) -> usize {
     )
 }
 
+/// Wait until the session has rebuilt every event queued so far: `source` is given a
+/// compile that fails naming `__<name>__`, and the wait ends once that diagnostic is on
+/// `tap`. A late or repeated event for an earlier save — which, rebuilt after the out-dir
+/// is deleted, would write into the recreated one and add a rebuild to the count — is
+/// handled by then. The failed compile writes nothing. Each barrier takes a name of its
+/// own, since one save can be reported more than once.
+fn settle_queued_events(tap: &StderrTap, source: &Path, name: &str) {
+    write_atomic(source, format!("Barrier {{{{__{name}__}}}}\n"));
+    wait_for_tap(tap, &format!("undefined variable '__{name}__'"), TIMEOUT);
+}
+
 /// An out-dir deleted while `mds watch` runs is recreated by the next write below it,
 /// and the outputs the session wrote there are written again: a save that leaves an
 /// output unchanged rewrites it into the recreated directory rather than skipping it as
@@ -8288,6 +8299,7 @@ fn watch_recreates_a_deleted_out_dir_and_writes_its_outputs_again() {
             tap.text()
         );
 
+        settle_queued_events(&tap, &src.join("a.mds"), "first_barrier");
         std::fs::remove_dir_all(&out).unwrap();
         write_atomic(&src.join("a.mds"), "A two\n");
         assert!(
@@ -8297,11 +8309,13 @@ fn watch_recreates_a_deleted_out_dir_and_writes_its_outputs_again() {
             tap.text()
         );
 
-        // What the session wrote into the deleted directory is gone with it: a save of
-        // the same bytes writes it again.
+        // What the session wrote into the deleted directory is gone with it: a save that
+        // compiles to the bytes last written writes them again (a barrier's failed
+        // compile writes nothing, so they are still the ones last written).
         let (saved, text, output) = if args[1] == "src" {
             (src.join("b.mds"), "B one\n", out.join("b.md"))
         } else {
+            settle_queued_events(&tap, &src.join("a.mds"), "second_barrier");
             std::fs::remove_dir_all(&out).unwrap();
             (src.join("a.mds"), "A two\n", out.join("a.md"))
         };
@@ -8353,6 +8367,7 @@ fn watch_writes_into_a_new_directory_made_in_place_of_the_out_dir() {
             tap.text()
         );
 
+        settle_queued_events(&tap, &src.join("a.mds"), "first_barrier");
         std::fs::rename(&out, &moved).unwrap();
         std::fs::create_dir(&out).unwrap();
         let mut rebuilds = 0;
@@ -8470,9 +8485,12 @@ fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
     }
 }
 
-/// An out-dir replaced by a symlink while `mds watch` runs — the path the user typed now
-/// leads into another directory — is refused as a retargeted one is, and nothing lands
-/// in that directory. Control: a real directory made back in its place is written into.
+/// An out-dir replaced by a symlink while `mds watch` runs is refused, and nothing lands
+/// in the directory the link leads to: `--out-dir`, the path the user typed, now leads
+/// there and is refused as a retargeted one is; `build.output_dir`'s own directories lie
+/// below the directory `mds.json` is in, the anchor, so the link is refused as any
+/// symlink below an anchor is, named below the directory `mds.json` was reached by.
+/// Control: a real directory made back in its place is written into.
 ///
 /// Unix-only: it makes a directory symlink; the rule itself is platform-independent.
 #[cfg(unix)]
@@ -8480,11 +8498,8 @@ fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
 fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
     use std::os::unix::fs::symlink;
 
-    for args in [
-        &["watch", "src/a.mds", "--out-dir", "out"][..],
-        &["watch", "src", "--out-dir", "out"],
-    ] {
-        let base = out_dir_session_base(false);
+    for (args, config) in OUT_DIR_SESSIONS {
+        let base = out_dir_session_base(config);
         let base = base.path();
         let (source, out, victim) = (
             base.join("src").join("a.mds"),
@@ -8508,11 +8523,19 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
         std::fs::remove_dir_all(&out).unwrap();
         symlink("victim", &out).unwrap();
         write_atomic(&source, "A two\n");
-        let refusal = out_dir_moved_refusal(&Path::new("out").join("a.md"));
+        let refusal = if config {
+            squash(&format!(
+                "mds::io × cannot write {}: refusing to follow a symlink",
+                Path::new("src").join("..").join("out").display()
+            ))
+        } else {
+            out_dir_moved_refusal(&Path::new("out").join("a.md"))
+        };
         let refused = poll_tap_until(&tap, TIMEOUT, |text| squash(text).contains(&refusal));
         assert!(
             refused.is_ok(),
-            "{args:?}: the write is refused, naming the output as typed; stderr: {refused:?}"
+            "{args:?}: the write is refused, naming the path as the user knows it; \
+             stderr: {refused:?}"
         );
         assert_eq!(
             names_in(&victim),

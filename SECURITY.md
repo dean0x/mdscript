@@ -94,11 +94,15 @@ input. The compiler enforces several defense-in-depth controls:
   resolved by path, so a symlinked anchor the user named is followed: as typed, or,
   for a directory-mode `--out-dir` and the anchors `mds watch` derives from its
   entry or directory argument, as resolved once when the run starts. `mds watch`
-  writes only below the out-dir it resolved at startup: a write whose out-dir, as the
-  user named it, now leads to a different directory — a symlink retargeted, the
-  out-dir replaced by a link — is refused (`mds::io`, restart to follow it) rather
-  than followed, while a deleted out-dir is created again at the same path. Nothing below it
-  is (#160): on Unix each directory below the anchor is opened from the one above
+  checks its out-dir before each write below it: a write whose out-dir, as the user
+  named it, now leads to a different directory than at startup — a symlink
+  retargeted, the out-dir replaced by a link — is refused (`mds::io`, restart to
+  follow it) rather than followed, while a deleted out-dir is created again at the
+  same path. The check precedes the write: `--out-dir` is the anchor of the writes
+  below it, so a link swapped in between the two can still lead that one write
+  elsewhere, and the next check refuses it; `build.output_dir`'s own directories lie
+  below the anchor, where a link is refused either way. Nothing below the anchor is
+  followed (#160): on Unix each directory below the anchor is opened from the one above
   without following a symlink (`openat` with `O_NOFOLLOW`), and the temp file is
   created (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
   descriptor, and renamed (`renameat`) in the last one, so a symlink below the anchor
