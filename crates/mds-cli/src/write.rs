@@ -128,6 +128,11 @@
 //! looked at again by path — the same size, and modification and creation times — and
 //! then removed by its name, so one put there in between is removed instead.
 //!
+//! A directory build learns whether anything has a stale output's name from the write of
+//! the output beside it, which looks there, in the directory it went in, before it closes
+//! it ([`write_compiled_and_look`]): a name nothing has needs no removal, and no walk is
+//! made for one; anything there goes through [`remove_proven`].
+//!
 //! # Contract (#226)
 //!
 //! This is replace-by-rename, not an in-place rewrite. The target receives a NEW inode, so
@@ -244,6 +249,7 @@ pub(crate) fn atomic_write_file(
     parents: Parents,
 ) -> std::result::Result<(), mds::MdsError> {
     write_below_anchor(target, content, durability, parents, Commit::Replace(None))
+        .map(drop)
         .map_err(|failure| worded(target, failure))
 }
 
@@ -272,6 +278,15 @@ pub(crate) fn write_compiled(
     content: &str,
     inputs: &Inputs,
 ) -> std::result::Result<(), mds::MdsError> {
+    write_compiled_in(target, content, inputs).map(drop)
+}
+
+/// [`write_compiled`], giving back the directory the output went in — on unix still open.
+fn write_compiled_in(
+    target: &WriteTarget,
+    content: &str,
+    inputs: &Inputs,
+) -> std::result::Result<imp::Dir, mds::MdsError> {
     write_below_anchor(
         target,
         content,
@@ -283,6 +298,46 @@ pub(crate) fn write_compiled(
         },
     )
     .map_err(|failure| worded(target, failure))
+}
+
+/// Write a compiled output as [`write_compiled`] does, then look at `beside`, a file in the
+/// same directory — a directory build's stale output, the other kind's of the same name —
+/// in that directory as the write's walk opened it, before it is closed: without following
+/// a symlink, and opening nothing (#160). Where nothing has its name there is nothing to
+/// prove or remove, and the second walk a removal makes is not needed; where something
+/// has it, or the look cannot tell, the caller removes it through [`remove_proven`], whose
+/// own walk and checks are made as for any removal. A `beside` that is not in the
+/// directory the output went in is not looked at, and is [`Beside::Something`].
+///
+/// # Errors
+///
+/// As [`write_compiled`]; nothing is looked at when the write fails.
+pub(crate) fn write_compiled_and_look(
+    target: &WriteTarget,
+    content: &str,
+    inputs: &Inputs,
+    beside: &WriteTarget,
+) -> std::result::Result<Beside, mds::MdsError> {
+    let dir = write_compiled_in(target, content, inputs)?;
+    Ok(match (Below::of(target), Below::of(beside)) {
+        (Ok(written), Ok(beside))
+            if written.anchor == beside.anchor && written.dirs == beside.dirs =>
+        {
+            imp::look(&dir, beside.name)
+        }
+        _ => Beside::Something,
+    })
+}
+
+/// What [`write_compiled_and_look`] found at the name it looked at beside its output.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Beside {
+    /// Nothing had the name.
+    Nothing,
+    /// Something had it — a file, a symlink, a directory, anything — or the look could not
+    /// tell: the caller deals with it.
+    Something,
 }
 
 /// The files a run reads — its entry, the modules its compile imported, the `--vars` file
@@ -358,12 +413,12 @@ pub(crate) fn create_new(
     durability: Durability,
     parents: Parents,
 ) -> std::result::Result<(), NotCreated> {
-    write_below_anchor(target, content, durability, parents, Commit::New).map_err(|failure| {
-        match failure {
+    write_below_anchor(target, content, durability, parents, Commit::New)
+        .map(drop)
+        .map_err(|failure| match failure {
             Failure::Exists => NotCreated::Exists,
             failure => NotCreated::Failed(worded(target, failure)),
-        }
-    })
+        })
 }
 
 /// Why [`create_new`], or [`write_over_own`], did not write its file.
@@ -408,7 +463,7 @@ pub(crate) fn write_over_own(
             pause_before_replace();
             imp::replace_held(held, content.as_bytes(), durability)
         }
-        None => write_below_anchor(target, content, durability, parents, Commit::New),
+        None => write_below_anchor(target, content, durability, parents, Commit::New).map(drop),
     };
     written.map_err(|failure| match failure {
         Failure::Exists | Failure::Changed | Failure::LinkAtTarget | Failure::NotARegularFile => {
@@ -419,14 +474,15 @@ pub(crate) fn write_over_own(
 }
 
 /// [`atomic_write_file`], [`write_compiled`] and [`create_new`] share this: resolve
-/// `target` below its anchor, then write through it as `commit` says.
+/// `target` below its anchor, then write through it as `commit` says; the directory the
+/// file went in is given back — on unix still open, for its caller to close.
 fn write_below_anchor(
     target: &WriteTarget,
     content: &str,
     durability: Durability,
     parents: Parents,
     commit: Commit<'_, &imp::Stamp>,
-) -> std::result::Result<(), Failure> {
+) -> std::result::Result<imp::Dir, Failure> {
     let below = Below::of(target)?;
     let anchor = target.checked_anchor();
     imp::write(
@@ -923,8 +979,8 @@ mod unix {
     use rustix::io::Errno;
 
     use super::{
-        Below, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal, TEMP_PREFIX,
-        TEMP_SUFFIX,
+        Below, Beside, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal,
+        TEMP_PREFIX, TEMP_SUFFIX,
     };
 
     /// The anchor: a directory, resolved by path — through a symlink the user named.
@@ -973,7 +1029,12 @@ mod unix {
     /// clash is another writer's file or a leftover, and sixteen in a row is not chance.
     pub(super) const MAX_TEMP_ATTEMPTS: usize = 16;
 
-    /// Write `content` to `below.name` in the directory [`walk`] opens, as `commit` says.
+    /// The directory a write's file went in: the descriptor its walk opened, closed when it
+    /// drops.
+    pub(super) type Dir = OwnedFd;
+
+    /// Write `content` to `below.name` in the directory [`walk`] opens, as `commit` says,
+    /// and give that directory back.
     pub(super) fn write(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
@@ -981,9 +1042,18 @@ mod unix {
         durability: Durability,
         parents: Parents,
         commit: Commit<'_, &Stamp>,
-    ) -> Result<(), Failure> {
+    ) -> Result<Dir, Failure> {
         let dir = walk(below, anchor, parents)?;
         replace(dir, below.name, content, durability, commit)
+    }
+
+    /// Whether anything has `name` in `dir`, looked at without following a symlink: only a
+    /// name nothing has is [`Beside::Nothing`]; a failed look is [`Beside::Something`].
+    pub(super) fn look(dir: &Dir, name: &OsStr) -> Beside {
+        match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => Beside::Nothing,
+            _ => Beside::Something,
+        }
     }
 
     /// Open the directory `below.name` is in: the anchor by path — and, when `anchor`
@@ -1095,7 +1165,7 @@ mod unix {
         durability: Durability,
     ) -> Result<(), Failure> {
         let commit = Commit::Replace(Some(&held.stamp));
-        replace(held.dir, &held.name, content, durability, commit)
+        replace(held.dir, &held.name, content, durability, commit).map(drop)
     }
 
     /// Remove `below.name` from the directory [`walk`] opens — creating none — once it is
@@ -1248,14 +1318,14 @@ mod unix {
     /// says: renamed over the file there — when it stamps the file a rewrite read, only if
     /// the file there still holds it, and for an output only if it is no MDS module, each
     /// looked at just before the rename ([`ready_to_replace`]) — or given the name only
-    /// where nothing has it ([`commit_new`]).
+    /// where nothing has it ([`commit_new`]); and give `dir` back.
     fn replace(
         dir: OwnedFd,
         name: &OsStr,
         content: &[u8],
         durability: Durability,
         commit: Commit<'_, &Stamp>,
-    ) -> Result<(), Failure> {
+    ) -> Result<Dir, Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
         let existing = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => match (FileType::from_raw_mode(stat.st_mode), commit) {
@@ -1298,9 +1368,9 @@ mod unix {
             }
         }
         if durability == Durability::Fsync {
-            sync_directory(dir)?;
+            return Ok(sync_directory(dir)?);
         }
-        Ok(())
+        Ok(dir)
     }
 
     /// Whether the rename over `name` in `dir` may go on, as `commit` says, looked at just
@@ -1585,13 +1655,15 @@ mod unix {
     /// `File::sync_all` is `F_FULLFSYNC` on Apple platforms, which a filesystem may refuse
     /// for a directory (`ENOTSUP`, `EOPNOTSUPP`, `EINVAL`); a plain `fsync` is the fallback
     /// for those. A filesystem that refuses that too cannot sync a directory: the rename
-    /// has landed, so the write stands. Any other failure is the write's.
-    fn sync_directory(dir: OwnedFd) -> std::io::Result<()> {
+    /// has landed, so the write stands. Any other failure is the write's. The directory is
+    /// given back.
+    fn sync_directory(dir: OwnedFd) -> std::io::Result<OwnedFd> {
         let dir = File::from(dir);
         settle_directory_sync(
             || dir.sync_all(),
             || fs::fsync(&dir).map_err(std::io::Error::from),
-        )
+        )?;
+        Ok(OwnedFd::from(dir))
     }
 
     /// The directory sync's outcome, from `full`, the sync asked for first, and `plain`,
@@ -1624,24 +1696,27 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::io::Write as _;
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
     use super::{
-        Below, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal, TEMP_PREFIX,
-        TEMP_SUFFIX,
+        Below, Beside, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal,
+        TEMP_PREFIX, TEMP_SUFFIX,
     };
 
     /// `ERROR_PATH_NOT_FOUND`: a directory that is not there, in the operating system's
     /// words.
     const PATH_NOT_FOUND: i32 = 3;
 
+    /// The directory a write's file went in, by path.
+    pub(super) type Dir = PathBuf;
+
     /// Write `content` to `below.name`, in the directory [`walk`] checks, by path (the
     /// residual the module docs describe), as `commit` says, refusing a symlink at the
-    /// target.
+    /// target; and give that directory back.
     pub(super) fn write(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
@@ -1649,7 +1724,7 @@ mod windows {
         durability: Durability,
         parents: Parents,
         commit: Commit<'_, &Stamp>,
-    ) -> Result<(), Failure> {
+    ) -> Result<Dir, Failure> {
         let dir = walk(below, anchor, parents)?;
         let target = dir.join(below.name);
         match (std::fs::symlink_metadata(&target), commit) {
@@ -1659,7 +1734,18 @@ mod windows {
             (Err(e), _) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
-        replace(&dir, &target, content, durability, commit)
+        replace(&dir, &target, content, durability, commit)?;
+        Ok(dir)
+    }
+
+    /// Whether anything has `name` in `dir`, looked at by path without following a
+    /// symlink: only a name nothing has is [`Beside::Nothing`]; a failed look is
+    /// [`Beside::Something`].
+    pub(super) fn look(dir: &Dir, name: &OsStr) -> Beside {
+        match std::fs::symlink_metadata(dir.join(name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Beside::Nothing,
+            _ => Beside::Something,
+        }
     }
 
     /// A file as a rewrite read it, by path (#160): its size and the times it was last
@@ -3172,6 +3258,52 @@ mod tests {
             "{}\n",
             "left as it is"
         );
+    }
+
+    /// A compiled output's write looks at a file beside it, in the directory it went in
+    /// (#160): nothing there is [`Beside::Nothing`]; a file, a directory and, on unix, a
+    /// dangling symlink there are [`Beside::Something`], each left as it is. A file named
+    /// in another directory is not looked at, and is something. The output is written in
+    /// every case.
+    #[test]
+    fn a_compiled_output_s_write_looks_at_the_file_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let target = WriteTarget::new(path("a.md"), PathBuf::from("a.md"));
+        let look = |beside: &WriteTarget| {
+            write_compiled_and_look(&target, "X", &Inputs::default(), beside)
+                .map_err(|e| e.to_string())
+        };
+        let named = |name: &str| target.sibling(|file| file.with_file_name(name));
+
+        assert_eq!(look(&named("a.json")), Ok(Beside::Nothing), "nothing there");
+        std::fs::write(path("a.json"), "[]\n").unwrap();
+        assert_eq!(look(&named("a.json")), Ok(Beside::Something), "a file");
+        assert_eq!(
+            std::fs::read_to_string(path("a.json")).unwrap(),
+            "[]\n",
+            "left as it is"
+        );
+        std::fs::create_dir(path("d.json")).unwrap();
+        assert_eq!(look(&named("d.json")), Ok(Beside::Something), "a directory");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(path("gone"), path("l.json")).unwrap();
+            assert_eq!(
+                look(&named("l.json")),
+                Ok(Beside::Something),
+                "a dangling symlink"
+            );
+        }
+        std::fs::create_dir(path("sub")).unwrap();
+        std::fs::write(path("sub").join("e.json"), "[]\n").unwrap();
+        let elsewhere = WriteTarget::new(path("sub").join("e.json"), PathBuf::from("e.json"));
+        assert_eq!(
+            look(&elsewhere),
+            Ok(Beside::Something),
+            "another directory is not looked at"
+        );
+        assert_eq!(std::fs::read_to_string(path("a.md")).unwrap(), "X");
     }
 
     /// On unix an input is told by its device and inode (#425): a hard link to it is that

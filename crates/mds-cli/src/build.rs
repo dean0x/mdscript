@@ -9,7 +9,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use crate::output::WriteTarget;
-use crate::write::{write_compiled, Inputs, NotRemoved, Removal};
+use crate::write::{write_compiled, write_compiled_and_look, Beside, Inputs, NotRemoved, Removal};
 use mds::{
     effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
     STRING_SOURCE_MAP_LABEL,
@@ -2048,7 +2048,7 @@ fn run_build_directory(
 ) -> Result<()> {
     use crate::output::{
         collect_mds_files_detailed, is_partial, output_base_no_ext, output_path_for,
-        probe_and_remove_stale, resolve_output_base, OutputBase, RootPaths,
+        probe_and_remove_stale, resolve_output_base, stale_output, OutputBase, RootPaths,
     };
 
     const MAX_DEPTH: usize = 64;
@@ -2183,9 +2183,19 @@ fn run_build_directory(
                 // its own call site. Both are enforced by `tests/write_funnel.rs`. The
                 // write creates the out-dir and the mirrored directories below it, and
                 // refuses a symlink among them (#160) and an MDS module at the output
-                // (#425): that file fails, and the build goes on with the next.
-                match write_compiled(&target, &final_content, &inputs) {
-                    Ok(()) => {
+                // (#425): that file fails, and the build goes on with the next. Below an
+                // out-dir it also looks at the other kind's output of the same name, in the
+                // directory it wrote in, for the stale-output cleanup below (#160).
+                let stale = matches!(output_base, OutputBase::Dir { .. })
+                    .then(|| stale_output(&target, compiled.kind));
+                let written = match &stale {
+                    Some(stale) => {
+                        write_compiled_and_look(&target, &final_content, &inputs, stale).map(Some)
+                    }
+                    None => write_compiled(&target, &final_content, &inputs).map(|()| None),
+                };
+                match written {
+                    Ok(beside) => {
                         if wrote_empty {
                             empty_count += 1;
                         }
@@ -2224,8 +2234,9 @@ fn run_build_directory(
                         // looked at below an out-dir only: next to the source that name
                         // can be a hand-authored file's, or another source's output, one
                         // this run wrote included — `a.b.mds` and `a.mds` both name
-                        // theirs `a.md` or `a.json` there.
-                        if matches!(output_base, OutputBase::Dir { .. }) {
+                        // theirs `a.md` or `a.json` there. A name the write found nothing
+                        // at is passed over: there is nothing to prove or remove.
+                        if beside == Some(Beside::Something) {
                             // The output itself was built, so the file is not counted as
                             // failed; a failed removal still lifts the exit code (#157).
                             if let Err(e) = probe_and_remove_stale(&target, compiled.kind, quiet) {

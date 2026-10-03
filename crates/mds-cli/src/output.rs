@@ -1678,6 +1678,13 @@ pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
 
 // ── Stale-output cleanup ──────────────────────────────────────────────────────
 
+/// The stale output beside `written`, the output of a source that compiled to `kind`: the
+/// other kind's output of the same name (#160), which [`probe_and_remove_stale`] deals
+/// with — `out/a.b.md`'s is `out/a.b.json`.
+pub(crate) fn stale_output(written: &WriteTarget, kind: OutputKind) -> WriteTarget {
+    written.sibling(|path| path.with_extension(kind.stale_extension()))
+}
+
 /// After a directory build wrote `written`, the output of a source that compiled to
 /// `kind`, deal with the other kind's output of the same name that an earlier build left
 /// when the source compiled to that kind (#160). It is named from the output written —
@@ -1705,7 +1712,7 @@ pub(crate) fn probe_and_remove_stale(
     kind: OutputKind,
     quiet: bool,
 ) -> std::result::Result<(), mds::MdsError> {
-    let stale = written.sibling(|path| path.with_extension(kind.stale_extension()));
+    let stale = stale_output(written, kind);
     match kind {
         OutputKind::Markdown => remove_stale_messages(&stale, quiet),
         OutputKind::Messages => {
