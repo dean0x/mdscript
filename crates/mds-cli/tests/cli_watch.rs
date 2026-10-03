@@ -5096,8 +5096,9 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
     // I9: mds watch (dir mode) with --set x=1 --set x=2 must print the
     // duplicate-key warning exactly once — at startup — and NOT again on rebuilds.
     //
-    // dir_watch_startup calls build_runtime_vars once, and emits; every rebuild
-    // calls it again.  This test is the SOLE mechanical guard that:
+    // The directory startup compile (`dir_startup::startup_compile`) calls
+    // build_runtime_vars once, and emits; every rebuild calls it again.  This test
+    // is the SOLE mechanical guard that:
     //   - startup emits once (no double-print on startup), AND
     //   - rebuild calls do NOT emit (per-event growth).
     //
@@ -5243,7 +5244,8 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 }
 
 /// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
-/// rebuild: once at startup (proving `dir_watch_startup` does NOT double-print), and
+/// rebuild: once at startup (proving the directory startup compile,
+/// `dir_startup::startup_compile`, does NOT double-print), and
 /// once more per subsequent rebuild (proving exactly one of `liveness_probe_dir` /
 /// `handle_fs_event_dir` emits, not both).
 ///

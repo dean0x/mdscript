@@ -2158,8 +2158,9 @@ fn handle_fs_event_file(
 }
 
 /// Compile `entry`, compare with last-written content, resync watches, and write
-/// if changed.  Called from both the idle-tick and the FS-event branch of
-/// `run_watch_file` — the single canonical implementation of the
+/// if changed.  Called from both the idle-tick and the FS-event arm of file mode's live
+/// session (`file_startup::FileSession`'s `on_tick` and `on_message`) — the single
+/// canonical implementation of the
 /// compile→dedup→resync→write→settle sequence for single-file mode.
 ///
 /// `ctx` holds compile-time constants; `state` holds all mutable loop state;

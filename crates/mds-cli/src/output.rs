@@ -1248,10 +1248,10 @@ impl<'a> RootPaths<'a> {
 
 /// Resolve `out_dir` to an absolute, canonicalized path for reliable `starts_with` checks.
 ///
-/// [`resolve_output_base`] calls it for the `--out-dir` of `run_build_directory` and
-/// `dir_watch_startup`. A relative path is resolved against the working directory; the
-/// result is then canonicalized (falls back to the absolute form when the directory does
-/// not yet exist).
+/// [`resolve_output_base`] calls it for the `--out-dir` of `run_build_directory` and of
+/// a directory watch's startup (`dir_startup::arm_pre_read`). A relative path is resolved
+/// against the working directory; the result is then canonicalized (falls back to the
+/// absolute form when the directory does not yet exist).
 ///
 /// # Errors
 ///
