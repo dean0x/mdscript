@@ -152,14 +152,16 @@ input. The compiler enforces several defense-in-depth controls:
   between the read and an edit (one-second timestamps, say), an edit that keeps the
   file's size. `mds watch` removes an output — of a
   deleted source, or of the old kind after a change of kind — only when the session
-  wrote that file and it still holds exactly the bytes written (#160): a file it did not
-  write, hand-written or left by another run, and one changed since are kept with a
+  last wrote that file for that source and it still holds exactly the bytes written
+  (#160): a file it did not write, hand-written or left by another run, one it wrote for
+  another source of the same output name, and one changed since are kept with a
   notice. The proof is the content, so a file holding exactly those bytes is removed as
   the session's own. After a change of kind, `mds watch` writes the new kind's output
   only where nothing has that name at the commit — the same never-replacing commit as
-  `mds init` — or over the file the session wrote there while it still holds exactly
-  those bytes, by the same stamped replace as `mds fmt` (#160): anything else there,
-  hand-written, left by another run or changed since, is kept with a notice.
+  `mds init` — or over the file the session wrote there for that source while it still
+  holds exactly those bytes, by the same stamped replace as `mds fmt` (#160): anything
+  else there, hand-written, left by another run, written for another source or changed
+  since, is kept with a notice.
   `mds build <dir>` removes the stale `.json` of a source whose kind
   changed below an out-dir only — beside its sources, where another source's output
   can have that name, it looks at none — and only when it holds exactly what mds

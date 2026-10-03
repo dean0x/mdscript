@@ -1098,10 +1098,10 @@ impl OutDirAnchor {
 
 /// The out-dir as it is now (#160), for a session with none treated as
 /// [`OutDirNow::Unchanged`]: one the typed path leads elsewhere from refuses the write
-/// below; a new one holds nothing the dedup could skip, so `last_written` is cleared.
-fn check_out_dir<K>(
+/// below; a new one holds nothing the session wrote, so `last_written` is cleared.
+fn check_out_dir<K, V>(
     anchor: Option<&mut OutDirAnchor>,
-    last_written: &mut HashMap<K, String>,
+    last_written: &mut HashMap<K, V>,
 ) -> OutDirNow {
     let now = anchor.map_or(OutDirNow::Unchanged, OutDirAnchor::check);
     if now == OutDirNow::New {
@@ -1133,42 +1133,91 @@ enum Retirement {
     KindChanged,
 }
 
-/// Retire `out`, an output its source no longer has (#160). `written` is what this
-/// session last wrote there, if it wrote there at all, and `now` what the out-dir check
-/// made before this found.
+/// What a directory-mode session wrote at one of its output paths, and for which source
+/// (#160): what a later write of the same may skip, the bytes a removal or a replace asks
+/// the file to still hold, and whose output the file is — beside their sources `a.b.mds`
+/// and `a.mds` both name theirs `a.md` or `a.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrittenOutput {
+    /// The source the output was written for.
+    source: PathBuf,
+    /// The bytes written.
+    content: String,
+}
+
+/// What a session's record says of the file at one of its output paths, for the source a
+/// removal or a write after a change of kind is made for (#160).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Record<'a> {
+    /// No record: the session never wrote there, not since the out-dir was made, or the
+    /// file it wrote is gone.
+    Unwritten,
+    /// The session last wrote there for another source.
+    OtherSource,
+    /// The session last wrote these bytes there for this source.
+    Own(&'a str),
+}
+
+impl<'a> Record<'a> {
+    /// The record of a file-mode session, whose one source is the entry: what it last
+    /// wrote there, if anything.
+    fn of_entry(written: Option<&'a String>) -> Self {
+        written.map_or(Self::Unwritten, |content| Self::Own(content))
+    }
+}
+
+/// Retire `out`, an output its source no longer has (#160). `record` is what this
+/// session's record says of the file there for that source, and `now` what the out-dir
+/// check made before this found.
 ///
-/// The file is removed only if this session wrote it and it still holds exactly those
-/// bytes, and only as every deletion below the out-dir is made: below the directory that
-/// check found ([`below_checked_out_dir`]) — one the typed path leads elsewhere from
-/// refuses the removal — through no symlink and only as a regular file
-/// ([`remove_proven`]). A file this session did not write, or one changed since it was
-/// written, is kept, with one notice saying which (none under `--quiet`). A file that is
-/// not there is not mentioned.
+/// The file is removed only if this session wrote it for that source and it still holds
+/// exactly those bytes, and only as every deletion below the out-dir is made: below the
+/// directory that check found ([`below_checked_out_dir`]) — one the typed path leads
+/// elsewhere from refuses the removal — through no symlink and only as a regular file
+/// ([`remove_proven`]). A file this session did not write, one it wrote for another
+/// source, and one changed since it was written are kept, with one notice saying which
+/// (none under `--quiet`). A file that is not there is not mentioned.
+///
+/// Returns whether the file is gone — removed, or not there — so that the record of it
+/// can go too; a file kept, or one whose removal failed, keeps its record.
+#[must_use]
 fn retire_output(
     out: &WriteTarget,
     anchor: Option<&OutDirAnchor>,
     now: OutDirNow,
-    written: Option<String>,
+    record: Record<'_>,
     why: Retirement,
     quiet: bool,
-) {
+) -> bool {
     if !out.path.exists() {
-        return;
+        return true;
     }
-    let Some(written) = written else {
-        if !quiet {
-            crate::output::ewriteln!(
-                "Kept {}: not written by this session",
-                safe_path(&out.shown)
-            );
+    let written = match record {
+        Record::Own(written) => written,
+        Record::Unwritten => {
+            if !quiet {
+                crate::output::ewriteln!(
+                    "Kept {}: not written by this session",
+                    safe_path(&out.shown)
+                );
+            }
+            return false;
         }
-        return;
+        Record::OtherSource => {
+            if !quiet {
+                crate::output::ewriteln!(
+                    "Kept {}: not written by this source",
+                    safe_path(&out.shown)
+                );
+            }
+            return false;
+        }
     };
     let removal = match now {
         OutDirNow::Elsewhere => Err(NotRemoved::out_dir_moved()),
         OutDirNow::Unchanged | OutDirNow::New => {
             remove_proven(&below_checked_out_dir(anchor, out), |file| {
-                holds_exactly(file, &written)
+                holds_exactly(file, written)
             })
         }
     };
@@ -1177,6 +1226,7 @@ fn retire_output(
             if let (Retirement::SourceDeleted, false) = (why, quiet) {
                 crate::output::ewriteln!("Removed {} (source deleted)", safe_path(&out.shown));
             }
+            true
         }
         Ok(Removal::Kept) => {
             if !quiet {
@@ -1185,56 +1235,63 @@ fn retire_output(
                     safe_path(&out.shown)
                 );
             }
+            false
         }
-        Ok(Removal::Missing) => {}
-        Err(not_removed) => match why {
-            Retirement::SourceDeleted => eprint_warning(&format!(
-                "warning: could not remove {}: {}",
-                safe_path(&out.shown),
-                safe_inline(not_removed.cause())
-            )),
-            Retirement::KindChanged => eprint_warning(&format!(
-                "warning: could not remove stale output {}: {}",
-                safe_path(&out.shown),
-                safe_inline(not_removed.cause())
-            )),
-        },
+        Ok(Removal::Missing) => true,
+        Err(not_removed) => {
+            match why {
+                Retirement::SourceDeleted => eprint_warning(&format!(
+                    "warning: could not remove {}: {}",
+                    safe_path(&out.shown),
+                    safe_inline(not_removed.cause())
+                )),
+                Retirement::KindChanged => eprint_warning(&format!(
+                    "warning: could not remove stale output {}: {}",
+                    safe_path(&out.shown),
+                    safe_inline(not_removed.cause())
+                )),
+            }
+            false
+        }
     }
 }
 
 /// Write `content` to `out`, the output of a source's new kind after a change of kind
-/// (#160) — `written`, what this session last wrote there, if it wrote there at all —
-/// only where nothing is, or over the file this session wrote there while it still holds
-/// exactly that ([`write_over_own`]), as an output is written: below the directory the
-/// caller's out-dir check found, with the directories it goes in created. Anything else
-/// there — a file this session did not write, one changed since, a symlink, a directory —
-/// is kept, with one notice saying which (none under `--quiet`, and none when `told`: the
-/// rebuild of the same source just before kept the same content), and nothing is written:
-/// `Ok(false)`, so a later save tries again. The output of the old kind is the caller's
-/// to retire, and only once the new one is written.
+/// (#160) — `record`, what this session's record says of the file there for that source
+/// — only where nothing is, or over the file this session wrote there for that source
+/// while it still holds exactly those bytes ([`write_over_own`]), as an output is
+/// written: below the directory the caller's out-dir check found, with the directories it
+/// goes in created. Anything else there — a file this session did not write, one it wrote
+/// for another source, one changed since, a symlink, a directory — is kept, with one
+/// notice saying which (none under `--quiet`, and none when `told`: the rebuild of the
+/// same source just before kept the same content), and nothing is written: `Ok(false)`,
+/// so a later save tries again. The output of the old kind is the caller's to retire, and
+/// only once the new one is written.
 fn write_after_change_of_kind(
     out: &WriteTarget,
-    written: Option<&str>,
+    record: Record<'_>,
     content: &str,
     told: bool,
     quiet: bool,
 ) -> std::result::Result<bool, MdsError> {
-    match write_over_own(
-        out,
-        written,
-        content,
-        Durability::RenameOnly,
-        Parents::Create,
-    ) {
+    let own = match record {
+        Record::Own(written) => Some(written),
+        Record::Unwritten | Record::OtherSource => None,
+    };
+    match write_over_own(out, own, content, Durability::RenameOnly, Parents::Create) {
         Ok(()) => Ok(true),
         Err(NotCreated::Exists) => {
             if !told && !quiet {
-                match written {
-                    Some(_) => crate::output::ewriteln!(
+                match record {
+                    Record::Own(_) => crate::output::ewriteln!(
                         "Kept {}: changed since it was written; not overwritten",
                         safe_path(&out.shown)
                     ),
-                    None => crate::output::ewriteln!(
+                    Record::OtherSource => crate::output::ewriteln!(
+                        "Kept {}: not written by this source; not overwritten",
+                        safe_path(&out.shown)
+                    ),
+                    Record::Unwritten => crate::output::ewriteln!(
                         "Kept {}: not written by this session; not overwritten",
                         safe_path(&out.shown)
                     ),
@@ -1826,7 +1883,10 @@ struct FileWatchState {
     foi: HashSet<PathBuf>,
     /// Snapshot of `(mtime, size)` used by the liveness probe (reconcile rule).
     last_mtimes: StampMap,
-    /// Content-dedup map: what was last written, by where it was written.
+    /// What this session last wrote, by where it wrote it: what a later write may skip as
+    /// unchanged, and the bytes a removal or a write after a change of kind asks the file
+    /// to still hold (#160). An entry goes with its file, so a file kept — changed, or a
+    /// removal that failed — stays the session's.
     last_written: HashMap<OutputKey, String>,
     /// Where this session last wrote its output, if it has: a rebuild whose route is
     /// another — a change of kind — writes only where nothing is, or over its own file
@@ -2088,11 +2148,19 @@ fn rebuild_file(
 
     let out_dir = check_out_dir(state.out_dir.as_mut(), &mut state.last_written);
 
-    // Content-based dedup: skip write + summary line when unchanged.
-    let content_changed = state
-        .last_written
-        .get(&output_key)
-        .is_none_or(|prev| *prev != compiled.content);
+    // A change of kind (#160): the route is not the one this session last wrote to, so
+    // the file there is written over only if it is the session's own.
+    let kind_changed = state
+        .written_to
+        .as_ref()
+        .is_some_and(|key| *key != output_key);
+    // Content-based dedup: skip write + summary line when unchanged — never after a change
+    // of kind, whose write is decided by the file there whatever the record of it holds.
+    let content_changed = kind_changed
+        || state
+            .last_written
+            .get(&output_key)
+            .is_none_or(|prev| *prev != compiled.content);
 
     // #326: re-report the vars-file duplicate-key warnings exactly when an
     // observable rebuild happens (same gate as the "Recompiled" line below),
@@ -2121,19 +2189,13 @@ fn rebuild_file(
     if !content_changed {
         return ControlFlow::Continue(());
     }
-    // A change of kind (#160): the route is not the one this session last wrote to, so
-    // the file there is written over only if it is the session's own.
-    let kind_changed = state
-        .written_to
-        .as_ref()
-        .is_some_and(|key| *key != output_key);
     let written = match (out_dir, output_path.as_ref()) {
         (OutDirNow::Elsewhere, Some(target)) => OutputWrite::Failed(Some(miette::Report::new(
             crate::write::out_dir_moved(target),
         ))),
         (_, Some(target)) if kind_changed => match write_after_change_of_kind(
             &below_checked_out_dir(state.out_dir.as_ref(), target),
-            state.last_written.get(&output_key).map(String::as_str),
+            Record::of_entry(state.last_written.get(&output_key)),
             &compiled.content,
             kept_before.as_ref() == Some(&compiled.content),
             ctx.quiet,
@@ -2175,18 +2237,27 @@ fn rebuild_file(
             if let Some(anchor) = &mut state.out_dir {
                 anchor.written();
             }
-            // A change of kind (#160): the other kind's output is retired only if this
-            // session wrote it, and removed only while it holds what was written.
-            if let Some(stale) = state.output.other_than(compiled.kind).cloned() {
-                if let Some(written) = state.last_written.remove(&OutputKey::of(Some(&stale))) {
-                    retire_output(
-                        &stale,
-                        state.out_dir.as_ref(),
-                        out_dir,
-                        Some(written),
-                        Retirement::KindChanged,
-                        ctx.quiet,
-                    );
+            // A change of kind (#160): the output this session last wrote, the other
+            // kind's, is retired — removed only if the session wrote it and it holds what
+            // was written, else kept with a notice. The record of it goes only with the
+            // file, so one kept stays the session's, changed or restored.
+            if let Some(stale) = state
+                .output
+                .other_than(compiled.kind)
+                .filter(|_| kind_changed)
+                .cloned()
+            {
+                let stale_key = OutputKey::of(Some(&stale));
+                let gone = retire_output(
+                    &stale,
+                    state.out_dir.as_ref(),
+                    out_dir,
+                    Record::of_entry(state.last_written.get(&stale_key)),
+                    Retirement::KindChanged,
+                    ctx.quiet,
+                );
+                if gone {
+                    state.last_written.remove(&stale_key);
                 }
             }
         }
@@ -2737,9 +2808,13 @@ struct DirWatchState {
     errored: HashSet<PathBuf>,
     /// Last-seen collected `.mds` set for reconcile/rename detection.
     known_files: BTreeSet<PathBuf>,
-    /// Content-dedup map keyed by the path each output is written to (`WriteTarget.path`):
-    /// what this session last wrote there, and so the proof a removal asks for (#160).
-    last_written: HashMap<PathBuf, String>,
+    /// By the path each output is written to (`WriteTarget.path`): what this session last
+    /// wrote there and for which source — what a later write for that source may skip as
+    /// unchanged, the proof a removal or a write after a change of kind asks for, and
+    /// whose output the file is (#160). An entry goes when its file is removed, another
+    /// source's write replaces it, or its source is forgotten; a file kept stays its
+    /// source's.
+    last_written: HashMap<PathBuf, WrittenOutput>,
     /// The output each source last had written this session, by source: where a deleted
     /// source's outputs are looked for (#160). A source with no entry — a partial, a
     /// dependency outside the root, one never written — has none to remove.
@@ -2791,12 +2866,43 @@ impl DirWatchState {
         }
     }
 
-    /// `content` was written to `out`, the output of `src`: what a later write may skip as
-    /// unchanged and a removal asks the file to still hold, and where the source's
-    /// outputs are once it is deleted (#160).
+    /// `content` was written to `out`, the output of `src`: what a later write for `src`
+    /// may skip as unchanged and a removal asks the file to still hold, recorded as
+    /// `src`'s — whichever source the session wrote there for before — and where the
+    /// source's outputs are once it is deleted (#160).
     fn wrote(&mut self, src: &Path, out: &WriteTarget, content: String) {
-        self.last_written.insert(out.path.clone(), content);
+        let written = WrittenOutput {
+            source: src.to_path_buf(),
+            content,
+        };
+        self.last_written.insert(out.path.clone(), written);
         self.outputs.insert(src.to_path_buf(), out.clone());
+    }
+
+    /// What the session's record says of the file at `path` for `src` (#160).
+    fn record(&self, path: &Path, src: &Path) -> Record<'_> {
+        match self.last_written.get(path) {
+            None => Record::Unwritten,
+            Some(written) if written.source == src => Record::Own(&written.content),
+            Some(_) => Record::OtherSource,
+        }
+    }
+
+    /// Retire `out`, an output `src` no longer has ([`retire_output`]), and drop the
+    /// record of it once the file is gone, if the record was `src`'s (#160).
+    fn retire(
+        &mut self,
+        src: &Path,
+        out: &WriteTarget,
+        now: OutDirNow,
+        why: Retirement,
+        quiet: bool,
+    ) {
+        let record = self.record(&out.path, src);
+        let own = matches!(record, Record::Own(_));
+        if retire_output(out, self.out_dir.as_ref(), now, record, why, quiet) && own {
+            self.last_written.remove(&out.path);
+        }
     }
 
     /// Record a compile error for `src`, **keeping** whatever dep set the last
@@ -2849,14 +2955,25 @@ impl DirWatchState {
         self.known_files.remove(src);
     }
 
-    /// Remove all state for `src`, a source that is gone: its graph records, and the
-    /// record of its output with what was written there, so nothing written for it is
-    /// this session's to remove any more (#160). The output is the one recorded when it
-    /// was written, never one guessed from the source's path: a dependency outside the
-    /// root has none (#217).
+    /// Remove all state for `src`, a source that is gone: its graph records, the record of
+    /// where its output is, and the records of what the session wrote for it, so nothing
+    /// written for it is this session's to remove any more (#160) — a file another source
+    /// was written to since keeps that source's record. The outputs are the ones recorded
+    /// when they were written, never ones guessed from the source's path: a dependency
+    /// outside the root has none (#217). A source's records are only ever at its outputs
+    /// of the two kinds.
     fn forget(&mut self, src: &Path) {
         if let Some(out) = self.outputs.remove(src) {
-            self.last_written.remove(&out.path);
+            for kind in [OutputKind::Markdown, OutputKind::Messages] {
+                let path = out.path.with_extension(kind.extension());
+                if self
+                    .last_written
+                    .get(&path)
+                    .is_some_and(|written| written.source == src)
+                {
+                    self.last_written.remove(&path);
+                }
+            }
         }
         self.kept.remove(src);
         self.forget_graph(src);
@@ -2864,27 +2981,20 @@ impl DirWatchState {
 
     /// Retire the outputs of `src`, a deleted source, and forget it (#160): the output it
     /// was last written to and the other kind's beside it, each removed only if this
-    /// session wrote it and it is unchanged, or else kept ([`retire_output`]). A source
-    /// that is there again — unlinked and created anew within the batch, as an editor's
-    /// save, a branch checkout or `git stash` does — keeps its output and its state: the
-    /// event that created it rebuilds it.
+    /// session wrote it for `src` and it is unchanged, or else kept ([`retire_output`]) —
+    /// one the session last wrote for another source is that source's. A source that is
+    /// there again — unlinked and created anew within the batch, as an editor's save, a
+    /// branch checkout or `git stash` does — keeps its output and its state: the event that
+    /// created it rebuilds it.
     fn retire_deleted(&mut self, src: &Path, quiet: bool) {
         if src.exists() {
             return;
         }
         if let Some(out) = self.outputs.get(src).cloned() {
             let now = check_out_dir(self.out_dir.as_mut(), &mut self.last_written);
-            for ext in ["md", "json"] {
-                let candidate = out.sibling(|path| path.with_extension(ext));
-                let written = self.last_written.remove(&candidate.path);
-                retire_output(
-                    &candidate,
-                    self.out_dir.as_ref(),
-                    now,
-                    written,
-                    Retirement::SourceDeleted,
-                    quiet,
-                );
+            for kind in [OutputKind::Markdown, OutputKind::Messages] {
+                let candidate = out.sibling(|path| path.with_extension(kind.extension()));
+                self.retire(src, &candidate, now, Retirement::SourceDeleted, quiet);
             }
         }
         self.forget(src);
@@ -2981,28 +3091,29 @@ fn compile_one_source(
 
             let out_dir = check_out_dir(state.out_dir.as_mut(), &mut state.last_written);
 
-            // Content-based dedup: skip write when content unchanged.
-            let content_changed = state
-                .last_written
-                .get(&out.path)
-                .is_none_or(|prev| *prev != compiled.content);
+            // A change of kind (#160): the output this session last wrote for `src` is
+            // the other kind's, so the file at `out` is written over only if it is the
+            // session's own, written for `src`.
+            let previous = state
+                .outputs
+                .get(src)
+                .filter(|last| last.path != out.path)
+                .cloned();
+            // Content-based dedup: skip the write when the session last wrote the same
+            // there for `src` — never after a change of kind, whose write is decided by the
+            // file there whatever the record of it holds.
+            let content_changed = previous.is_some()
+                || state.record(&out.path, src) != Record::Own(&compiled.content);
 
             if content_changed {
-                // A change of kind (#160): the output this session last wrote for `src` is
-                // the other kind's, so the file at `out` is written over only if it is the
-                // session's own.
-                let kind_changed = state
-                    .outputs
-                    .get(src)
-                    .is_some_and(|last| last.path != out.path);
                 let written = match out_dir {
                     OutDirNow::Elsewhere => {
                         Err(miette::Report::new(crate::write::out_dir_moved(&out)))
                     }
-                    OutDirNow::Unchanged | OutDirNow::New if kind_changed => {
+                    OutDirNow::Unchanged | OutDirNow::New if previous.is_some() => {
                         write_after_change_of_kind(
                             &below_checked_out_dir(state.out_dir.as_ref(), &out),
-                            state.last_written.get(&out.path).map(String::as_str),
+                            state.record(&out.path, src),
                             &compiled.content,
                             kept_before.as_ref() == Some(&compiled.content),
                             quiet,
@@ -3039,26 +3150,18 @@ fn compile_one_source(
                                 elapsed
                             );
                         }
-                        // A change of kind (#160): the other kind's output beside `out` —
-                        // named from `out` itself, so `a.b.mds`'s is `a.b.md`, never the
-                        // `a.md` written for `a.mds` — is retired only if this session
-                        // wrote it, and removed only while it holds what was written. A
-                        // hand-written `notes.md` beside `notes.mds`, which now compiles
-                        // to `notes.json`, is never touched. The removal, below the
-                        // directory the write's check found, triggers no rebuild: it is
-                        // no `.mds` file. A rebuild's failure never changes how the
-                        // session exits, so one to remove it stays a warning (#157).
-                        let stale = out
-                            .sibling(|path| path.with_extension(compiled.kind.stale_extension()));
-                        if let Some(written) = state.last_written.remove(&stale.path) {
-                            retire_output(
-                                &stale,
-                                state.out_dir.as_ref(),
-                                out_dir,
-                                Some(written),
-                                Retirement::KindChanged,
-                                quiet,
-                            );
+                        // A change of kind (#160): the output the session last wrote for
+                        // `src`, the other kind's, is retired — removed only if the
+                        // session's record says it wrote it for `src` and it still holds
+                        // what was written, else kept with a notice: one the session wrote
+                        // for another source (beside its sources `a.b.mds` and `a.mds` both
+                        // name theirs `a.md`), or one in an out-dir made since, is not
+                        // `src`'s. The removal, below the directory the write's check
+                        // found, triggers no rebuild: it is no `.mds` file. A rebuild's
+                        // failure never changes how the session exits, so one to remove
+                        // it stays a warning (#157).
+                        if let Some(previous) = &previous {
+                            state.retire(src, previous, out_dir, Retirement::KindChanged, quiet);
                         }
 
                         state.record_success(
@@ -5470,9 +5573,13 @@ mod tests {
             last_mtimes: HashMap::new(),
         };
         state.known_files.insert(victim.clone());
-        state
-            .last_written
-            .insert(victim_out.clone(), "Victim.\n".to_string());
+        state.last_written.insert(
+            victim_out.clone(),
+            WrittenOutput {
+                source: victim.clone(),
+                content: "Victim.\n".to_string(),
+            },
+        );
         state.errored.insert(ghost.clone());
         state
             .external_dep_dirs

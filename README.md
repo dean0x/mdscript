@@ -211,16 +211,19 @@ shared partial rebuilds **all transitive importers** automatically.
   `<name>.md` (both modes; an explicit `-o` keeps its path). A hand-written `todo.json`
   beside `todo.mds`, or an output you edited, is kept, with
   `Kept <file>: not written by this session` or `Kept <file>: changed since it was written`.
+  Each file is the output of the source it was last written for: beside their sources
+  `a.b.mds` and `a.mds` both write `a.md`, and deleting one keeps the `a.md` written for
+  the other, with `Kept <file>: not written by this source`.
   A partial has no output, so a `_p.md` beside a deleted `_p.mds` is left as it is, and
   nothing is printed for it.
   A save that unlinks the source and creates it again within one batch — some editors,
   `git checkout`, `git stash` — is an edit and removes nothing.
 - **Change of kind**: when an edit changes the template's kind mid-session, the new kind's
-  output is written only where nothing is, or over the file this session wrote there while
-  it is unchanged (both modes). A hand-written `chat.md` beside `chat.mds` is never
-  overwritten: it is kept with `Kept <file>: not written by this session; not
-  overwritten`, the old output stays as it was, and the next save tries again. The startup
-  write, and `-o`, write over whatever is there, as `mds build` does.
+  output is written only where nothing is, or over the file this session wrote there for
+  that template while it is unchanged (both modes). A hand-written `chat.md` beside
+  `chat.mds` is never overwritten: it is kept with `Kept <file>: not written by this
+  session; not overwritten`, the old output stays as it was, and the next save tries
+  again. The startup write, and `-o`, write over whatever is there, as `mds build` does.
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
