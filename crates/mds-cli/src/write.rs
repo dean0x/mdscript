@@ -78,8 +78,9 @@
 //! ([`mds::check_module_type`]), which a template may import — and a file the run reads
 //! ([`Inputs`]): its entry, the modules its compile imported, the `--vars` file and the
 //! `mds.json` in force. Just before the rename the file at the target is looked at in the
-//! directory the write is in, without following a symlink. A regular `.md` file there is
-//! read as opened in that directory — on unix `openat(O_NOFOLLOW | O_NONBLOCK)` from the
+//! directory the write is in, without following a symlink. A regular `.md` file there —
+//! the name's extension taken in any case, which on a case-insensitive volume names a
+//! `.md` file — is read as opened in that directory — on unix `openat(O_NOFOLLOW | O_NONBLOCK)` from the
 //! walk's descriptor, never by path — up to [`mds::MAX_FILE_SIZE`] bytes, and only when it
 //! starts with a frontmatter fence; one that cannot be read is refused, since nothing tells
 //! it is no module. Any regular file there is compared, on unix by its device and inode,
@@ -249,9 +250,10 @@ pub(crate) fn atomic_write_file(
 ///
 /// As [`atomic_write_file`]; and a module at the target, or a regular `.md` file there that
 /// cannot be read to tell, and a file the run reads, are refused before the rename —
-/// `cannot write <file>: refusing to replace an MDS module`, the read's cause, or `cannot
-/// write <file>: refusing to replace a file this run reads` — and left as they are, with
-/// no temporary file left behind.
+/// `cannot write <file>: refusing to replace an MDS module`, `cannot write <file>: cannot
+/// tell whether it is an MDS module: <cause>` with the read's cause, or `cannot write
+/// <file>: refusing to replace a file this run reads` — and left as they are, with no
+/// temporary file left behind.
 pub(crate) fn write_compiled(
     target: &WriteTarget,
     content: &str,
@@ -539,7 +541,7 @@ fn not_removed(target: &WriteTarget, failure: Failure) -> NotRemoved {
         Failure::Exists => NotRemoved::Failed(cause(&std::io::ErrorKind::AlreadyExists.into())),
         Failure::Module => NotRemoved::Failed(MODULE_REFUSAL.to_owned()),
         Failure::Input => NotRemoved::Failed(INPUT_REFUSAL.to_owned()),
-        Failure::Io(e) => NotRemoved::Failed(cause(&e)),
+        Failure::UnreadMarkdown(e) | Failure::Io(e) => NotRemoved::Failed(cause(&e)),
     }
 }
 
@@ -565,6 +567,13 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
         Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
         Failure::Module => io_error(&target.shown, MODULE_REFUSAL.to_owned()),
         Failure::Input => io_error(&target.shown, INPUT_REFUSAL.to_owned()),
+        Failure::UnreadMarkdown(e) => mds::MdsError::Io {
+            message: format!(
+                "cannot write {}: {MODULE_UNKNOWN}: {}",
+                safe_path(&target.shown),
+                safe_inline(io_cause(&e))
+            ),
+        },
         Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
         // Only a removal's look at its file, or its proof's read, fails as unreadable.
         Failure::Unreadable(e) | Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
@@ -586,6 +595,10 @@ const MODULE_REFUSAL: &str = "refusing to replace an MDS module";
 
 /// Why [`write_compiled`] refuses to replace one of the files the run reads (#425).
 const INPUT_REFUSAL: &str = "refusing to replace a file this run reads";
+
+/// Why [`write_compiled`] refuses to replace a `.md` file it cannot read, before the
+/// read's cause: nothing tells it is no MDS module (#425).
+const MODULE_UNKNOWN: &str = "cannot tell whether it is an MDS module";
 
 /// Why [`remove_proven`] leaves a file whose name, by the time it was to be removed, was
 /// another file's than the one its proof read.
@@ -649,6 +662,9 @@ enum Failure {
     Module,
     /// An output's target is one of the files the run reads ([`write_compiled`], #425).
     Input,
+    /// An output's target, a `.md` file, could not be opened or read to tell whether it
+    /// is an MDS module ([`write_compiled`], #425).
+    UnreadMarkdown(std::io::Error),
     /// The target itself is a FIFO, a socket or a device — or, for a removal, a
     /// directory.
     NotARegularFile,
@@ -737,10 +753,13 @@ fn ends_as_a_directory(path: &Path) -> bool {
     }
 }
 
-/// Whether `name` is a `.md` file's: the only name an MDS module an output could take has
-/// (#425).
+/// Whether `name` can be a `.md` file's: the only name an MDS module an output could take
+/// has (#425). The extension is taken in any case, since on a case-insensitive volume
+/// `LIB.MD` is the file `lib.md`, which mds-core judges by its name on disk.
 fn names_markdown(name: &OsStr) -> bool {
-    Path::new(name).extension().is_some_and(|ext| ext == "md")
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
 /// Whether `file`, opened at a `.md` file's name ([`names_markdown`]) of `size` bytes, is
@@ -753,8 +772,8 @@ fn is_mds_module(file: &mut std::fs::File, size: u64) -> std::io::Result<bool> {
     /// The longest frontmatter fence: `---` and a CRLF.
     const FENCE: &[u8] = b"---\r\n";
     /// The key mds-core's check is given: it judges a `.md` key by the source alone, so
-    /// this one stands for the file's own name, which the caller has checked is a `.md`
-    /// file's — and no path becomes text.
+    /// this one stands for the file's own name, which the caller has checked can be a
+    /// `.md` file's — and no path becomes text.
     const MARKDOWN_KEY: &str = "module.md";
     let fence = u64::try_from(FENCE.len()).unwrap_or(u64::MAX);
     let mut head = mds::read_at_most(file, fence, 0)?;
@@ -1229,21 +1248,24 @@ mod unix {
     /// Whether `name` in `dir`, a regular file a moment ago, is an MDS module (#425):
     /// opened in `dir` — never by path — without following a symlink, and read there, that
     /// [`super::is_mds_module`] takes for one. Gone since, a symlink or anything else that
-    /// is no regular file by then is none; a file that cannot be opened or read is an
-    /// error.
+    /// is no regular file by then is none; a file that cannot be opened or read is
+    /// [`Failure::UnreadMarkdown`].
     fn is_a_module(dir: BorrowedFd<'_>, name: &OsStr) -> Result<bool, Failure> {
-        let mut file = match open_to_read(dir, name) {
-            Ok(file) => file,
-            // Gone since the look, or a symlink put there since: no module to replace.
-            Err(Errno::NOENT | Errno::LOOP) => return Ok(false),
-            Err(e) => return Err(e.into()),
+        let judge = || -> std::io::Result<bool> {
+            let mut file = match open_to_read(dir, name) {
+                Ok(file) => file,
+                // Gone since the look, or a symlink put there since: no module to replace.
+                Err(Errno::NOENT | Errno::LOOP) => return Ok(false),
+                Err(e) => return Err(e.into()),
+            };
+            let opened = fs::fstat(&file)?;
+            if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
+                return Ok(false);
+            }
+            let size = u64::try_from(opened.st_size).unwrap_or(0);
+            super::is_mds_module(&mut file, size)
         };
-        let opened = fs::fstat(&file)?;
-        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
-            return Ok(false);
-        }
-        let size = u64::try_from(opened.st_size).unwrap_or(0);
-        Ok(super::is_mds_module(&mut file, size)?)
+        judge().map_err(Failure::UnreadMarkdown)
     }
 
     /// Write `content` to `file` and, in the [`Durability::Fsync`] tier, sync it; then
@@ -1761,15 +1783,18 @@ mod windows {
 
     /// Whether `target`, a regular file a moment ago, is an MDS module (#425): opened and
     /// read by path, that [`super::is_mds_module`] takes for one. Gone since is none; a
-    /// file that cannot be opened or read is an error.
+    /// file that cannot be opened or read is [`Failure::UnreadMarkdown`].
     fn is_a_module(target: &Path) -> Result<bool, Failure> {
-        let mut file = match std::fs::File::open(target) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
+        let judge = || -> std::io::Result<bool> {
+            let mut file = match std::fs::File::open(target) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            let size = file.metadata()?.len();
+            super::is_mds_module(&mut file, size)
         };
-        let size = file.metadata()?.len();
-        Ok(super::is_mds_module(&mut file, size)?)
+        judge().map_err(Failure::UnreadMarkdown)
     }
 
     /// The directory `below.name` is in: the anchor, created first when `parents` says
@@ -2704,10 +2729,12 @@ mod tests {
     // ── Never over an MDS module (#425) ─────────────────────────────────────────
 
     /// An output is never written over an MDS module (#425): a `.md` file that declares
-    /// `type: mds` — bare, quoted, or with CRLF lines — is refused, named as shown, and
-    /// left as it is, with no temporary file. Controls: a `.md` file with no frontmatter,
-    /// one that declares another `type`, one with `type: mds` below another key only, a
-    /// `.mds` file that declares `type: mds`, and a name nothing has are each written.
+    /// `type: mds` — bare, quoted, or with CRLF lines, and named with its extension in
+    /// another case, which on a case-insensitive volume is a `.md` file's name — is
+    /// refused, named as shown, and left as it is, with no temporary file. Controls: a
+    /// `.md` file with no frontmatter, one that declares another `type`, one with
+    /// `type: mds` below another key only, a `.mds` file that declares `type: mds`, and a
+    /// name nothing has are each written.
     #[test]
     fn an_output_is_never_written_over_an_mds_module() {
         let dir = tempfile::tempdir().unwrap();
@@ -2725,6 +2752,8 @@ mod tests {
             ("m.md", "---\ntype: mds\n---\nM\n"),
             ("q.md", "---\ntype: \"mds\"\n---\nQ\n"),
             ("crlf.md", "---\r\ntype: 'mds'\r\n---\r\nC\r\n"),
+            ("UP.MD", "---\ntype: mds\n---\nU\n"),
+            ("mixed.Md", "---\ntype: mds\n---\nX\n"),
         ] {
             std::fs::write(dir.path().join(name), module).unwrap();
             assert_eq!(
@@ -2917,6 +2946,76 @@ mod tests {
             Ok(()),
             "control: a copy is another file"
         );
+    }
+
+    /// A `.md` file at an output's target that cannot be read is refused (#425): nothing
+    /// tells it is no MDS module. `locked.md`, at mode 0o000, is refused, named as shown,
+    /// with the read's cause, and left as it is, with no temporary file. Controls: the same
+    /// file, readable again, is written; and `locked.json` at mode 0o000 — a name no
+    /// module has, so the write never opens it — is written. Skipped, with a reason, where
+    /// mode 0o000 does not stop a read (running as root).
+    #[cfg(unix)]
+    #[test]
+    fn an_output_is_never_written_over_a_markdown_file_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let shown = |name: &str| PathBuf::from("out").join(name);
+        let write = |name: &str| {
+            write_compiled(
+                &WriteTarget::new(path(name), shown(name)),
+                "X",
+                &Inputs::default(),
+            )
+            .map_err(|e| e.to_string())
+        };
+        let set_mode = |name: &str, mode: u32| {
+            std::fs::set_permissions(path(name), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        std::fs::write(path("locked.md"), "notes\n").unwrap();
+        std::fs::write(path("locked.json"), "{}\n").unwrap();
+        set_mode("locked.md", 0o000);
+        set_mode("locked.json", 0o000);
+        let Err(denied) = std::fs::File::open(path("locked.md")) else {
+            crate::output::ewriteln!("running as root; mode 0o000 does not stop a read");
+            return;
+        };
+
+        let refused = write("locked.md");
+        set_mode("locked.md", 0o644);
+        assert_eq!(
+            refused,
+            Err(format!(
+                "cannot write {}: {MODULE_UNKNOWN}: {}",
+                shown("locked.md").display(),
+                io_cause(&denied)
+            ))
+        );
+        assert_eq!(
+            std::fs::read_to_string(path("locked.md")).unwrap(),
+            "notes\n",
+            "left as it is"
+        );
+        assert_eq!(
+            temp_residue(dir.path()),
+            Vec::<String>::new(),
+            "no temporary file"
+        );
+
+        assert_eq!(
+            write("locked.md"),
+            Ok(()),
+            "control: readable, it is written"
+        );
+        assert_eq!(std::fs::read_to_string(path("locked.md")).unwrap(), "X");
+        assert_eq!(
+            write("locked.json"),
+            Ok(()),
+            "control: a .json file is never opened"
+        );
+        set_mode("locked.json", 0o644);
+        assert_eq!(std::fs::read_to_string(path("locked.json")).unwrap(), "X");
     }
 
     /// Each step of a new file's commit puts the file where nothing is, and never over a

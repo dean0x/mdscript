@@ -3187,6 +3187,48 @@ mod module_overwrite {
         );
     }
 
+    /// `-o` naming an MDS module in another case is refused too (#425): on a
+    /// case-insensitive volume `LIB.MD`, `Lib.Md` and `lib.MD` are the module `lib.md`,
+    /// which mds-core imports as one by its name on disk — refused, `mds::io`, exit 2,
+    /// naming the output as typed, the module left as it is. It used to be replaced, exit
+    /// 0. Control: `NOTES.MD` names `notes.md`, which is no module, and writes it.
+    /// Skipped, with a reason, on a case-sensitive volume, where those names are other
+    /// files.
+    #[test]
+    fn build_never_writes_over_an_mds_module_named_in_another_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.mds"), "Hello A\n").unwrap();
+        std::fs::write(root.join("lib.md"), MODULE).unwrap();
+        std::fs::write(root.join("notes.md"), "notes\n").unwrap();
+        if !root.join("LIB.MD").exists() {
+            eprintln!("skipped: {} is case-sensitive", root.display());
+            return;
+        }
+
+        for name in ["LIB.MD", "Lib.Md", "lib.MD"] {
+            let (code, stderr) = build_in(root, &["a.mds", "-o", name]);
+            assert_eq!(code, Some(2), "build a.mds -o {name}: stderr: {stderr}");
+            assert!(
+                refuses(&stderr, Path::new(name), MODULE_CAUSE),
+                "build a.mds -o {name}: the module is refused by name; stderr: {stderr}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("lib.md")).unwrap(),
+                MODULE,
+                "build a.mds -o {name}: the module is left as it is"
+            );
+        }
+
+        let (code, stderr) = build_in(root, &["a.mds", "-o", "NOTES.MD"]);
+        assert_eq!(code, Some(0), "control: stderr: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md")).unwrap(),
+            "Hello A\n",
+            "control: NOTES.MD writes notes.md; stderr: {stderr}"
+        );
+    }
+
     /// A `.md` file that is no MDS module is written over as before (#425): one without
     /// frontmatter, one whose frontmatter declares another `type`, one that declares
     /// `type: mds` only below another key, and one with `type: mds` in its body alone.
