@@ -3262,6 +3262,78 @@ mod module_overwrite {
             "Hello A\n"
         );
     }
+
+    /// The `--vars` file that makes `gen.mds`'s output an MDS module: `{{fm}}` becomes
+    /// frontmatter declaring `type: mds`.
+    const GEN_VARS: &str = r#"{"fm":"---\ntype: mds\n---"}"#;
+
+    /// A template whose output is itself an MDS module rewrites it (#425): `gen.mds`,
+    /// whose `{{fm}}` the `--vars` file fills with frontmatter declaring `type: mds`,
+    /// writes the module `gen.md`, and the build after an edit writes it again, exit 0 —
+    /// an output that is a module may replace one. It used to be refused, exit 2. A module
+    /// written by hand at `gen.md` is replaced the same way. Controls: `plain.mds`, whose
+    /// output is no module, is still refused over it; and `app.mds`, whose output is a
+    /// module too, is refused over `lib.md`, the module it imports — a file the run reads —
+    /// and writes `other.md`, beginning with that frontmatter.
+    #[test]
+    fn build_rewrites_its_own_output_that_declares_type_mds() {
+        const INPUT_CAUSE: &str = "refusing to replace a file this run reads";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let text = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+        std::fs::write(root.join("v.json"), GEN_VARS).unwrap();
+        std::fs::write(root.join("gen.mds"), "{{fm}}\nBody one\n").unwrap();
+        let gen = ["gen.mds", "--vars", "v.json"];
+
+        let (code, stderr) = build_in(root, &gen);
+        assert_eq!(code, Some(0), "first build: stderr: {stderr}");
+        assert_eq!(text("gen.md"), "---\ntype: mds\n---\nBody one\n");
+
+        std::fs::write(root.join("gen.mds"), "{{fm}}\nBody two\n").unwrap();
+        let (code, stderr) = build_in(root, &gen);
+        assert_eq!(code, Some(0), "the build after an edit: stderr: {stderr}");
+        assert_eq!(text("gen.md"), "---\ntype: mds\n---\nBody two\n");
+
+        std::fs::write(root.join("gen.md"), MODULE).unwrap();
+        let (code, stderr) = build_in(root, &gen);
+        assert_eq!(
+            code,
+            Some(0),
+            "over a module written by hand: stderr: {stderr}"
+        );
+        assert_eq!(text("gen.md"), "---\ntype: mds\n---\nBody two\n");
+
+        // Control: an output that is no module is refused over the same module.
+        std::fs::write(root.join("plain.mds"), "Plain\n").unwrap();
+        let (code, stderr) = build_in(root, &["plain.mds", "-o", "gen.md"]);
+        assert_eq!(code, Some(2), "control: stderr: {stderr}");
+        assert!(
+            refuses(&stderr, Path::new("gen.md"), MODULE_CAUSE),
+            "control: the module is refused by name; stderr: {stderr}"
+        );
+        assert_eq!(text("gen.md"), "---\ntype: mds\n---\nBody two\n");
+
+        // Control: a module output is never written over a module the run imports.
+        std::fs::write(root.join("lib.md"), "---\ntype: mds\n---\nShared\n").unwrap();
+        std::fs::write(
+            root.join("app.mds"),
+            "@import \"./lib.md\" as l\n{{fm}}\nApp\n",
+        )
+        .unwrap();
+        let (code, stderr) = build_in(root, &["app.mds", "--vars", "v.json", "-o", "lib.md"]);
+        assert_eq!(code, Some(2), "control: stderr: {stderr}");
+        assert!(
+            refuses(&stderr, Path::new("lib.md"), INPUT_CAUSE),
+            "control: the imported module is refused as a file the run reads; stderr: {stderr}"
+        );
+        assert_eq!(text("lib.md"), "---\ntype: mds\n---\nShared\n");
+        let (code, stderr) = build_in(root, &["app.mds", "--vars", "v.json", "-o", "other.md"]);
+        assert_eq!(code, Some(0), "control: stderr: {stderr}");
+        assert!(
+            text("other.md").starts_with("---\ntype: mds\n---\n"),
+            "control: app.mds's output is a module; stderr: {stderr}"
+        );
+    }
 }
 
 // ── #425: an output never replaces a file the run reads ──────────────────────

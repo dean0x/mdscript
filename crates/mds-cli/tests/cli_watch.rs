@@ -10147,6 +10147,95 @@ fn watch_never_writes_over_an_mds_module() {
     }
 }
 
+/// A template whose output is itself an MDS module rewrites it in `mds watch` (#425), in
+/// file mode and in directory mode: `gen.mds`, whose `{{fm}}` the `--vars` file fills with
+/// frontmatter declaring `type: mds`, writes the module `gen.md` at startup, and the
+/// rebuild an edit makes writes it again, with no refusal — an output that is a module may
+/// replace one. The rebuild used to be refused, so the session could never update its own
+/// output. Control: an edit that makes the output no module is refused over the module,
+/// which is kept; the next edit that makes it a module again writes it. At Ctrl+C the
+/// session exits 0.
+#[test]
+fn watch_rewrites_its_own_output_that_declares_type_mds() {
+    const CAUSE: &str = "refusing to replace an MDS module";
+    const GENERATED: &str = "---\ntype: mds\n---\nBody two\n";
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[
+            ("gen.mds", "{{fm}}\nBody one\n"),
+            ("v.json", r#"{"fm":"---\ntype: mds\n---"}"#),
+        ]);
+        let notes = base.path().join("notes");
+        let (src, md) = (notes.join("gen.mds"), notes.join("gen.md"));
+        let shown_md = below(shown_dir, "gen.md");
+        let vars = below(shown_dir, "v.json");
+        let mut session: Vec<&str> = args
+            .iter()
+            .map(|&arg| if arg == "chat.mds" { "gen.mds" } else { arg })
+            .collect();
+        session.extend(["--vars", vars.as_str()]);
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(&session)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&md, "Body one", TIMEOUT),
+            "{mode}: the startup writes the module gen.md; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&src, "{{fm}}\nBody two\n");
+        assert!(
+            wait_for_file_contains(&md, "Body two", TIMEOUT),
+            "{mode}: the rebuild writes its own module output again; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(text_of(&md).as_deref(), Some(GENERATED), "{mode}");
+        assert_eq!(
+            refusals(&tap.text(), &shown_md, CAUSE),
+            0,
+            "{mode}: nothing is refused; stderr: {}",
+            tap.text()
+        );
+
+        // Control: an output that is no module is refused over the module.
+        write_atomic(&src, "Plain\n");
+        let seen = poll_tap_until(&tap, TIMEOUT, |seen| refusals(seen, &shown_md, CAUSE) > 0);
+        assert!(
+            seen.is_ok(),
+            "{mode}: control: an output that is no module is refused; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(GENERATED),
+            "{mode}: control: the module is kept; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, "{{fm}}\nBody three\n");
+        assert!(
+            wait_for_file_contains(&md, "Body three", TIMEOUT),
+            "{mode}: a module output again is written; stderr: {}",
+            tap.text()
+        );
+
+        #[cfg(unix)]
+        {
+            interrupt(&child);
+            let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{mode}: a refused write does not change the Ctrl+C exit; stderr: {}",
+                tap.text()
+            );
+        }
+        drop(tap.finish_text(&mut child));
+    }
+}
+
 // ── #425: an output never replaces a file the run reads ──────────────────────
 
 /// An output a session must never write, over a file it reads: the source that compiles

@@ -2626,6 +2626,58 @@ fn dir_build_never_writes_over_an_mds_module() {
     }
 }
 
+/// A directory build writes an output that is itself an MDS module over a module (#425),
+/// but never over the module its source imports, a file the run reads: `gen.mds`, whose
+/// `{{fm}}` the `--vars` file fills with frontmatter declaring `type: mds`, replaces the
+/// module `src/gen.md`; `lib.mds`, which imports `./lib.md` and makes a module too, is
+/// refused over it, `mds::io`, and `lib.md` is left as it was; the build exits 2. It used
+/// to refuse both as modules.
+#[test]
+fn dir_build_writes_a_module_output_over_a_module_but_never_over_its_import() {
+    const LIB: &str = "---\ntype: mds\n---\nShared\n";
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(
+        base.path().join("v.json"),
+        r#"{"fm":"---\ntype: mds\n---"}"#,
+    )
+    .unwrap();
+    fs::write(src.join("gen.mds"), "{{fm}}\nBody\n").unwrap();
+    fs::write(src.join("gen.md"), MODULE).unwrap();
+    fs::write(
+        src.join("lib.mds"),
+        "@import \"./lib.md\" as l\n{{fm}}\nLib\n",
+    )
+    .unwrap();
+    fs::write(src.join("lib.md"), LIB).unwrap();
+
+    let (code, stderr) = build_in(base.path(), &["src", "--vars", "v.json"]);
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert_eq!(
+        fs::read_to_string(src.join("gen.md")).unwrap(),
+        "---\ntype: mds\n---\nBody\n",
+        "a module output replaces the module; stderr: {stderr}"
+    );
+    assert!(
+        refuses(
+            &stderr,
+            &Path::new("src").join("lib.md"),
+            "refusing to replace a file this run reads"
+        ),
+        "the imported module is refused by name; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(src.join("lib.md")).unwrap(),
+        LIB,
+        "the imported module is left as it was; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 built, 1 failed"),
+        "the build goes on with the other source; stderr: {stderr}"
+    );
+}
+
 /// A directory build never writes an output over a file the run reads (#425), beside its
 /// sources or below `--out-dir`: the `--vars` file at the output of the messages template
 /// `chat.mds`, and the `mds.json` in force at the output of `mds.mds`, are each refused,

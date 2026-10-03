@@ -195,7 +195,9 @@ input. The compiler enforces several defense-in-depth controls:
   Unix by device and inode, on Windows by canonical path, so a hard link to an input
   is written over there. A module, a `.md` file that cannot be read to tell, and a
   file the run reads are refused and left as they are (`mds::io`, #425). One put
-  there in the instant between that look and the rename is replaced.
+  there in the instant between that look and the rename is replaced. An output that
+  itself declares `type: mds` — a module a template generates — replaces a module,
+  its own or one written by hand, though never a file the run reads.
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 
