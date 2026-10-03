@@ -137,6 +137,7 @@
 //! would require truncate-in-place and forfeit crash safety); ACL/xattr/owner-group
 //! preservation is not planned — MDS only rewrites its own outputs and `.mds` sources.
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -288,10 +289,20 @@ pub(crate) fn write_compiled(
 /// and the `mds.json` in force — which [`write_compiled`] never writes an output over
 /// (#425). Each is held by its path and looked up again by every write, so the file there
 /// then is the one compared: an editor that saves by replacing the file leaves no stale
-/// identity behind.
+/// identity behind. One can be held as a search instead ([`Inputs::and_found_from`]), made
+/// only by a write that meets a file at its target.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Inputs {
     files: Vec<PathBuf>,
+    found: Option<Found>,
+}
+
+/// An input found from a path rather than named — the `mds.json` nearest a directory run's
+/// source (#425): the file `find` finds from `from`, if any.
+#[derive(Debug, Clone)]
+struct Found {
+    from: PathBuf,
+    find: fn(&Path) -> Option<PathBuf>,
 }
 
 impl Inputs {
@@ -299,7 +310,33 @@ impl Inputs {
     pub(crate) fn new(files: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
             files: files.into_iter().collect(),
+            found: None,
         }
+    }
+
+    /// These inputs and the file `find` finds from `from`. The search is made only by a
+    /// write that meets a file at its target, and then at that moment, after the files
+    /// named: where nothing is, nothing is replaced, so nothing needs to be found.
+    pub(crate) fn and_found_from(self, from: &Path, find: fn(&Path) -> Option<PathBuf>) -> Self {
+        Self {
+            found: Some(Found {
+                from: from.to_path_buf(),
+                find,
+            }),
+            ..self
+        }
+    }
+
+    /// Each input's path: the files named, then the one found, searched for only once
+    /// every file named has been taken.
+    fn paths(&self) -> impl Iterator<Item = Cow<'_, Path>> {
+        let named = self.files.iter().map(|file| Cow::Borrowed(file.as_path()));
+        let found = self
+            .found
+            .iter()
+            .filter_map(|found| (found.find)(&found.from))
+            .map(Cow::Owned);
+        named.chain(found)
     }
 }
 
@@ -1312,8 +1349,8 @@ mod unix {
     /// Whether the file `stat` describes is one of `inputs`: the same device and inode as
     /// the file each names now, looked up through a symlink as the run read it.
     fn is_an_input(inputs: &Inputs, stat: &fs::Stat) -> bool {
-        inputs.files.iter().any(|file| {
-            fs::stat(file.as_path())
+        inputs.paths().any(|file| {
+            fs::stat(&*file)
                 .is_ok_and(|input| input.st_dev == stat.st_dev && input.st_ino == stat.st_ino)
         })
     }
@@ -1863,8 +1900,7 @@ mod windows {
             Err(e) => return Err(e.into()),
         };
         Ok(inputs
-            .files
-            .iter()
+            .paths()
             .any(|file| std::fs::canonicalize(file).is_ok_and(|file| file == target)))
     }
 
@@ -3084,6 +3120,58 @@ mod tests {
             "control: no inputs"
         );
         assert_eq!(std::fs::read_to_string(&vars).unwrap(), "X");
+    }
+
+    /// An input found from a path rather than named — the `mds.json` nearest a directory
+    /// run's source (#425) — is searched for only by a write that meets a file at its
+    /// target, and a file found there is refused as any input is, and left as it is. A new
+    /// file is written without the search: nothing is there to replace. Control: a file at
+    /// the target that is no input is searched for once, and written over.
+    #[test]
+    fn an_input_found_from_a_path_is_searched_for_only_when_a_file_is_at_the_target() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEARCHES: AtomicUsize = AtomicUsize::new(0);
+        fn beside(from: &Path) -> Option<PathBuf> {
+            SEARCHES.fetch_add(1, Ordering::SeqCst);
+            Some(from.with_file_name("mds.json"))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let inputs = Inputs::default().and_found_from(&path("page.mds"), beside);
+        let write = |name: &str| {
+            write_compiled(
+                &WriteTarget::new(path(name), PathBuf::from(name)),
+                "X",
+                &inputs,
+            )
+            .map_err(|e| e.to_string())
+        };
+        let searches = || SEARCHES.load(Ordering::SeqCst);
+
+        assert_eq!(write("page.md"), Ok(()));
+        assert_eq!(searches(), 0, "a new file is written without the search");
+        assert_eq!(
+            write("page.md"),
+            Ok(()),
+            "control: no input is written over"
+        );
+        assert_eq!(
+            searches(),
+            1,
+            "control: a file at the target is searched for"
+        );
+        std::fs::write(path("mds.json"), "{}\n").unwrap();
+        assert_eq!(
+            write("mds.json"),
+            Err(format!("cannot write mds.json: {INPUT_REFUSAL}"))
+        );
+        assert_eq!(searches(), 2);
+        assert_eq!(
+            std::fs::read_to_string(path("mds.json")).unwrap(),
+            "{}\n",
+            "left as it is"
+        );
     }
 
     /// On unix an input is told by its device and inode (#425): a hard link to it is that

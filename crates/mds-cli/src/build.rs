@@ -303,17 +303,22 @@ fn config_dir(start: &Path) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-/// `reads`, the files a directory run reads, and the `mds.json` nearest `source` — the one
-/// `mds build <source>` or `mds watch <source>` would hold in force, found as
-/// [`load_config`] finds it — for [`compile_inputs`] (#425). A directory run reads one
-/// `mds.json`, from its directory argument upward, and never reads one nearer a source;
-/// but an output never replaces it either, as it would not in file mode.
-pub(crate) fn source_reads(reads: &[PathBuf], source: &Path) -> Vec<PathBuf> {
-    reads
-        .iter()
-        .cloned()
-        .chain(config_dir(source).map(|(dir, _)| dir.join("mds.json")))
-        .collect()
+/// The inputs of `source`, a directory run's, which its output is never written over
+/// (#425): [`compile_inputs`]'s — `source`, the modules its compile imported
+/// (`dependencies`) and `reads`, the files the whole run reads — and the `mds.json` nearest
+/// `source`, the one `mds build <source>` or `mds watch <source>` would hold in force,
+/// found as [`load_config`] finds it. A directory run reads one `mds.json`, from its
+/// directory argument upward, and never reads one nearer a source; but an output never
+/// replaces it either, as it would not in file mode. That one is searched for only by a
+/// write that meets a file at its output, and then at that moment
+/// ([`Inputs::and_found_from`]): where nothing is, nothing is replaced.
+pub(crate) fn source_inputs(source: &Path, dependencies: &[String], reads: &[PathBuf]) -> Inputs {
+    compile_inputs(Some(source), dependencies, reads).and_found_from(source, nearest_config)
+}
+
+/// The `mds.json` nearest `source`, found as [`load_config`] finds it, if any.
+fn nearest_config(source: &Path) -> Option<PathBuf> {
+    config_dir(source).map(|(dir, _)| dir.join("mds.json"))
 }
 
 // ── Output path resolution ────────────────────────────────────────────────────
@@ -2031,7 +2036,7 @@ fn file_name_of(output: &WriteTarget) -> String {
 /// No output is written over a file the run reads (#425): the source it was compiled
 /// from, the modules that compile imported, the `--vars` file `vars` came from, the
 /// `mds.json` in force ([`compile_inputs`]) and the `mds.json` nearest that source
-/// ([`source_reads`]).
+/// ([`source_inputs`]).
 fn run_build_directory(
     dir: &Path,
     out_dir: Option<PathBuf>,
@@ -2149,11 +2154,7 @@ fn run_build_directory(
         match compiled {
             Ok(Ok(mut compiled)) => {
                 let ext = compiled.kind.extension();
-                let inputs = compile_inputs(
-                    Some(file),
-                    &compiled.dependencies,
-                    &source_reads(&reads, file),
-                );
+                let inputs = source_inputs(file, &compiled.dependencies, &reads);
                 let target = output_path_for(file, RootPaths::as_typed(dir), &output_base, ext);
 
                 // Set `file` field for this output path (sources already relativized by core).
