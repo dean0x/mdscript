@@ -863,7 +863,8 @@ mod unix {
                 FileType::Symlink => return Err(Failure::LinkAtTarget),
                 _ => return Err(Failure::NotARegularFile),
             },
-            Err(Errno::NOENT) => return Ok(Removal::Missing),
+            // A name too long for the file system names no file: none can be there.
+            Err(Errno::NOENT | Errno::NAMETOOLONG) => return Ok(Removal::Missing),
             Err(e) => return Err(Failure::Unreadable(e.into())),
         }
         let mut file = match open_to_read(dir.as_fd(), name) {
@@ -1412,7 +1413,9 @@ mod windows {
             Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
             Ok(meta) if !meta.is_file() => return Err(Failure::NotARegularFile),
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Missing),
+            // A name the file system cannot hold — too long (`ERROR_FILENAME_EXCED_RANGE`)
+            // or not a name it accepts (`ERROR_INVALID_NAME`) — names no file.
+            Err(e) if no_such_name(&e) => return Ok(Removal::Missing),
             Err(e) => return Err(Failure::Unreadable(e)),
         }
         let proven = match std::fs::File::open(&target) {
@@ -1437,6 +1440,16 @@ mod windows {
             e.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
         ) || e.raw_os_error() == Some(PATH_NOT_FOUND)
+    }
+
+    /// Whether `e`, from the look at a file to be removed, says no file has its name: none
+    /// is there, or the file system cannot hold the name, which std reports as
+    /// `InvalidFilename`.
+    fn no_such_name(e: &std::io::Error) -> bool {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename
+        )
     }
 
     /// Put `content` at `target` in `dir`, by way of a temporary file beside it, as
@@ -2624,6 +2637,45 @@ mod tests {
         });
         assert_eq!(removal, Ok(Removal::Kept));
         assert!(asked, "control: the proof is asked of a file that is there");
+    }
+
+    /// A file whose name is too long for the file system is not there: no file can have
+    /// it, so it is nothing to remove and the proof is never asked (#160) — on Windows, a
+    /// name std reports as `InvalidFilename` too. Control: a name of the most bytes a
+    /// name may have, of a file that is there, is removed.
+    #[test]
+    fn a_name_too_long_for_the_file_system_is_nothing_to_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let too_long = format!("{}.json", "x".repeat(300));
+        let removal = remove_proven(&to_remove(dir.path(), &too_long), |_| {
+            panic!("there is no file to prove")
+        });
+        assert_eq!(removal, Ok(Removal::Missing));
+
+        let longest = format!("{}.json", "y".repeat(250));
+        std::fs::write(dir.path().join(&longest), "x").unwrap();
+        assert_eq!(
+            remove_proven(&to_remove(dir.path(), &longest), |_| Ok(true)),
+            Ok(Removal::Removed),
+            "control"
+        );
+    }
+
+    /// Only the file's own name is looked past: a directory on its way whose name is too
+    /// long for the file system is an error, as any other failure to reach the file is
+    /// (#160).
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_name_too_long_on_the_way_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = format!("{}/x.json", "d".repeat(300));
+        let removal = remove_proven(&to_remove(dir.path(), &rel), |_| {
+            panic!("there is no file to prove")
+        });
+        assert_eq!(
+            removal,
+            Err(NotRemoved::Failed(os_text(rustix::io::Errno::NAMETOOLONG)))
+        );
     }
 
     /// A symlink below the anchor is never removed through, and one at the file — live or

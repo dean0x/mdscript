@@ -934,6 +934,50 @@ fn dir_build_out_dir_partial_removes_nothing() {
     );
 }
 
+/// #160: a stale output whose name is too long for the file system is no file: a Markdown
+/// source with a 251-byte stem writes `out/<stem>.md` (254 bytes), and its other kind's
+/// `out/<stem>.json` (256 bytes) cannot exist, so the build has nothing to look at there
+/// and exits 0. Control: with a 250-byte stem, `<stem>.json` fits, and the stale `.json`
+/// the first build wrote is removed once the source compiles to Markdown.
+#[cfg(unix)]
+#[test]
+fn dir_build_out_dir_a_stale_name_too_long_for_the_file_system_is_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (long, fits) = ("y".repeat(251), "z".repeat(250));
+    put(root, &format!("src/{long}.mds"), MARKDOWN);
+    put(root, &format!("src/{fits}.mds"), MESSAGES);
+
+    let first = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert_eq!(first.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        read(root, &format!("out/{long}.md")).as_deref(),
+        Some(MARKDOWN),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, &format!("out/{fits}.json")).as_deref(),
+        Some(MESSAGES_OUTPUT),
+        "control: the first build writes the messages output; stderr: {stderr}"
+    );
+
+    put(root, &format!("src/{fits}.mds"), MARKDOWN);
+    let second = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(second.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        read(root, &format!("out/{fits}.json")),
+        None,
+        "control: the stale .json mds wrote is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        kept_lines(&second),
+        Vec::<String>::new(),
+        "stderr: {stderr}"
+    );
+}
+
 // ── T-CLI: empty dir build exits one (#204) ──────────────────────────────────
 
 /// #204 reversal: until v0.4.3 this test was `dir_build_empty_dir_exits_zero` and
