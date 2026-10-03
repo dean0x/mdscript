@@ -150,7 +150,12 @@ input. The compiler enforces several defense-in-depth controls:
   wrote that file and it still holds exactly the bytes written (#160): a file it did not
   write, hand-written or left by another run, and one changed since are kept with a
   notice. The proof is the content, so a file holding exactly those bytes is removed as
-  the session's own.
+  the session's own. `mds build <dir>` removes the stale `.json` of a source whose kind
+  changed only when it holds exactly what mds writes for a messages output — read
+  no further than 10 MiB, parsed and written back to the same bytes — and never a stale
+  `.md`: anything else at that name, a symlink, a FIFO or a directory included, is kept
+  with a warning (#160). The proof is the content here too: a file holding exactly a
+  messages output, copied there by hand, is removed as mds's own.
   **Windows residual**: the standard library has no descriptor-relative walk on
   Windows. Each directory below the anchor is checked and refused when it is a
   symlink or a junction, and the write — or the removal — then goes by path, so a

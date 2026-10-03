@@ -1746,10 +1746,11 @@ fn plant_symlink(root: &Path, rel: &str) {
 /// the cause after it names no path (#390): below a directory argument's `--out-dir` and
 /// below `mds.json` `build.output_dir`, where the write goes to the directory's canonical
 /// path, as well as under `-o`, below a file argument's `--out-dir` and beside the source
-/// — in `cannot write …`, whichever step of the write failed (#160), and in `could not
-/// remove stale output …`; the cause is the operating system's, which names no file, the
-/// temporary one included. Each error's presence is the control for the absence of the
-/// scratch directory from the run's output.
+/// — in `cannot write …`, whichever step of the write failed (#160), and in the warning
+/// that keeps a stale output of the other kind, `kept stale output …`; the cause is the
+/// operating system's, which names no file, the temporary one included. Each line's
+/// presence is the control for the absence of the scratch directory from the run's
+/// output.
 ///
 /// Unix-only: it plants symlinks and makes a directory read-only; the read-only arm is
 /// skipped with a reason where the mode does not stop a write (running as root).
@@ -1796,9 +1797,9 @@ fn an_error_writing_an_output_names_it_as_its_status_line_does() {
         assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
     }
 
-    // A stale `x.md` that is a directory, which no file removal removes, beside the
-    // `x.json` a messages template writes now: below `--out-dir` and below
-    // `build.output_dir`.
+    // A stale `x.md` that is a directory beside the `x.json` a messages template writes
+    // now, below `--out-dir` and below `build.output_dir`: kept, with a warning that names
+    // it as the status line names the output (#160).
     put(root, "msrc/x.mds", "@message user:\nHi\n@end\n");
     put(root, "stale/x.md/keep", "keep\n");
     put(root, "proj/msrc/x.mds", "@message user:\nHi\n@end\n");
@@ -1810,15 +1811,16 @@ fn an_error_writing_an_output_names_it_as_its_status_line_does() {
     ] {
         let out = run(&root.join(cwd), args);
         let stderr = text(&out.stderr);
-        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: stderr: {stderr}");
         assert!(
             stderr.contains(&format!("Compiled to {shown}.json\n")),
             "{args:?}: the status line names the output as typed; stderr: {stderr}"
         );
-        let error = format!("could not remove stale output {shown}.md: ");
+        let warning =
+            format!("warning: kept stale output {shown}.md: mds never removes a Markdown file\n");
         assert!(
-            squash(&stderr).contains(&squash(&error)),
-            "{args:?}: the error names the stale output as typed, {error:?}; stderr: {stderr}"
+            stderr.contains(&warning),
+            "{args:?}: the warning names the stale output as typed, {warning:?}; stderr: {stderr}"
         );
         assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
     }

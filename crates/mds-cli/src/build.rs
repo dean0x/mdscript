@@ -960,19 +960,24 @@ pub(crate) struct CompileOutput {
 fn serialize_output(output: CompiledOutput) -> Result<String> {
     match output {
         CompiledOutput::Markdown(s) => Ok(s),
-        CompiledOutput::Messages(msgs) => {
-            let mut json = serde_json::to_string_pretty(&msgs).map_err(|e| {
-                miette::miette!(
-                    "failed to serialize messages to JSON: {}",
-                    crate::output::safe_inline(&e)
-                )
-            })?;
-            json.push('\n');
-            Ok(json)
-        }
+        CompiledOutput::Messages(msgs) => messages_json(&msgs).map_err(|e| {
+            miette::miette!(
+                "failed to serialize messages to JSON: {}",
+                crate::output::safe_inline(&e)
+            )
+        }),
         // `CompiledOutput` is `#[non_exhaustive]`; update this match when new variants land.
         _ => unreachable!("unknown CompiledOutput variant"),
     }
+}
+
+/// `messages` as a messages output is written: `serde_json`'s pretty form and a newline.
+/// A directory build writes a stale `.json` back through it to show that mds wrote the
+/// file before it removes it (#160).
+pub(crate) fn messages_json(messages: &[impl serde::Serialize]) -> serde_json::Result<String> {
+    let mut json = serde_json::to_string_pretty(messages)?;
+    json.push('\n');
+    Ok(json)
 }
 
 /// Compile `input` and return the content + kind + deps WITHOUT writing any output.
@@ -1471,7 +1476,9 @@ pub(crate) fn verify_then_delete_map(
             Ok(())
         }
         Err(NotRemoved::Unreadable(cause)) => Err(error("cannot read", &cause)),
-        Err(NotRemoved::Failed(cause)) => Err(error("could not remove", &cause)),
+        Err(refused @ (NotRemoved::Link | NotRemoved::Failed(_))) => {
+            Err(error("could not remove", refused.cause()))
+        }
     }
 }
 
@@ -1910,21 +1917,23 @@ fn file_name_of(output: &WriteTarget) -> String {
 /// `mds watch <dir>` deliberately does NOT error on any of the three.
 ///
 /// **I/O failures (#157):** an output directory that cannot be created, an output or
-/// `.map` sidecar that cannot be written, and a stale sibling that cannot be removed are
-/// each reported as one `mds::io` error through [`crate::output::eprint_io_failure`],
-/// which records it for the exit code, so the run exits 2 while the other files are
-/// still built. A compile that fails is reported through
-/// [`crate::output::eprint_file_failure`], which records it the same way when it is an
-/// I/O or file-system failure — a source that cannot be read, say. All but the stale
-/// sibling count their file as failed; its file was built. A run whose failures are
+/// `.map` sidecar that cannot be written, and a stale sibling that cannot be read or
+/// whose proven removal fails are each reported as one `mds::io` error through
+/// [`crate::output::eprint_io_failure`], which records it for the exit code, so the run
+/// exits 2 while the other files are still built. A compile that fails is reported
+/// through [`crate::output::eprint_file_failure`], which records it the same way when it
+/// is an I/O or file-system failure — a source that cannot be read, say. All but the
+/// stale sibling count their file as failed; its file was built. A run whose failures are
 /// only template errors or resource limits exits 1.
 ///
 /// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
 /// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
 /// output is placed next to its source (AC-FUNC-19).
 ///
-/// Stale-output cleanup: after writing, probes for the wrong-extension sibling and
-/// deletes it to handle format flips (md↔json) across builds.
+/// Stale-output cleanup: after writing an output, looks at the other kind's output of
+/// the same name, left when the source compiled to that kind, and removes it only when
+/// mds provably wrote it — a stale `.md` never — keeping anything else with a warning
+/// ([`crate::output::probe_and_remove_stale`], #160).
 fn run_build_directory(
     dir: &Path,
     out_dir: Option<PathBuf>,
@@ -1936,7 +1945,7 @@ fn run_build_directory(
 ) -> Result<()> {
     use crate::output::{
         collect_mds_files_detailed, is_partial, output_base_no_ext, output_path_for,
-        output_stem_for, probe_and_remove_stale, resolve_output_base, OutputBase, RootPaths,
+        probe_and_remove_stale, resolve_output_base, OutputBase, RootPaths,
     };
 
     const MAX_DEPTH: usize = 64;
@@ -2120,29 +2129,21 @@ fn run_build_directory(
                             }
                         }
 
-                        // Stale-output cleanup: remove the wrong-extension sibling only
-                        // if this tool wrote it (i.e. it appears in written_this_run from
-                        // a previous iteration, or matches a prior build's output).
-                        // For a kind-flip (template switched markdown↔messages between
-                        // two runs), the stale sibling won't be in written_this_run yet.
-                        // We still want to clean it up in that case — the legitimate
-                        // format-flip cleanup. Gate: the stale path must either be in
-                        // written_this_run (already written this run — shouldn't happen
-                        // but safe), OR the output_base is Dir (separate output tree,
-                        // no hand-authored sibling risk). In NextToSource mode and the
-                        // stale path was not written by us this run, skip to protect
-                        // hand-authored files.
-                        let base_no_ext =
-                            output_stem_for(file, RootPaths::as_typed(dir), &output_base);
-                        let stale_path = base_no_ext
-                            .path
-                            .with_extension(compiled.kind.stale_extension());
-                        let safe_to_delete = matches!(output_base, OutputBase::Dir { .. })
+                        // Stale-output cleanup (#160): the other kind's output of the
+                        // name just written — left by a build when the source compiled
+                        // to that kind — is removed only when mds provably wrote it, and
+                        // a stale `.md` never (see `probe_and_remove_stale`). Below an
+                        // out-dir every output is looked at; next to the source only one
+                        // this run wrote, so a hand-authored file of that name is never
+                        // touched.
+                        let stale_path =
+                            target.path.with_extension(compiled.kind.stale_extension());
+                        let looked_at = matches!(output_base, OutputBase::Dir { .. })
                             || written_this_run.contains(&stale_path);
-                        if safe_to_delete {
+                        if looked_at {
                             // The output itself was built, so the file is not counted as
-                            // failed; the failed removal still lifts the exit code (#157).
-                            if let Err(e) = probe_and_remove_stale(&base_no_ext, compiled.kind) {
+                            // failed; a failed removal still lifts the exit code (#157).
+                            if let Err(e) = probe_and_remove_stale(&target, compiled.kind, quiet) {
                                 crate::output::eprint_io_failure(e);
                             }
                         }

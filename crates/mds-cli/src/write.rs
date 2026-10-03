@@ -361,11 +361,13 @@ pub(crate) enum Removal {
 pub(crate) enum NotRemoved {
     /// Not a regular file — a directory, a FIFO, a socket or a device: never opened.
     NotAFile,
+    /// A symlink, live or dangling: refused, never followed — mds writes none.
+    Link,
     /// It could not be looked at or read, so nothing is known of it: the cause, escaped.
     Unreadable(String),
-    /// Refused — a symlink at it or below the anchor, an anchor that is not the directory
-    /// checked, another file at its name by the time it was to go — or the removal
-    /// failed: the cause, escaped.
+    /// Refused — a symlink below the anchor, an anchor that is not the directory checked,
+    /// another file at its name by the time it was to go — or the removal failed: the
+    /// cause, escaped.
     Failed(String),
 }
 
@@ -382,6 +384,7 @@ impl NotRemoved {
     pub(crate) fn cause(&self) -> &str {
         match self {
             Self::NotAFile => NOT_A_REGULAR_FILE,
+            Self::Link => SYMLINK_REMOVAL_REFUSAL,
             Self::Unreadable(cause) | Self::Failed(cause) => cause,
         }
     }
@@ -399,7 +402,7 @@ fn not_removed(target: &WriteTarget, failure: Failure) -> NotRemoved {
             "{FOLLOW_REFUSAL} at {}",
             safe_path(&shown_directory(target, depth))
         )),
-        Failure::LinkAtTarget => NotRemoved::Failed(SYMLINK_REMOVAL_REFUSAL.to_owned()),
+        Failure::LinkAtTarget => NotRemoved::Link,
         // Only a new file's commit meets a file at its name; a removal never does.
         Failure::Exists => NotRemoved::Failed(cause(&std::io::ErrorKind::AlreadyExists.into())),
         Failure::Io(e) => NotRemoved::Failed(cause(&e)),
@@ -2469,9 +2472,11 @@ mod tests {
             Err(NotRemoved::Failed(format!("{FOLLOW_REFUSAL} at o/sub")))
         );
         for link in ["real/live.json", "real/gone.json"] {
+            let removal = remove_proven(&to_remove(&anchor, link), |_| Ok(true));
+            assert_eq!(removal, Err(NotRemoved::Link), "{link}");
             assert_eq!(
-                remove_proven(&to_remove(&anchor, link), |_| Ok(true)),
-                Err(NotRemoved::Failed(SYMLINK_REMOVAL_REFUSAL.to_owned())),
+                removal.unwrap_err().cause(),
+                SYMLINK_REMOVAL_REFUSAL,
                 "{link}"
             );
         }

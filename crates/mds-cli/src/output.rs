@@ -7,7 +7,8 @@
 //!   [`WriteTarget`]: the path written, the path a message shows (#390), and the anchor
 //!   [`crate::write::atomic_write_file`] writes it below (#160).
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
-//! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
+//! - [`probe_and_remove_stale`]: a directory build's stale-output cleanup after a change of
+//!   kind, which removes only a `.json` mds provably wrote (#160).
 //! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr choke point,
 //!   which never panics — a closed pipe or a failed write becomes sticky [`OutputState`]
 //!   instead (#157). [`write_stdout`] writes a command's product and reports a
@@ -36,7 +37,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use miette::Result;
 
 use crate::build::{OutputKind, ProjectConfig};
-use crate::write::DirIdentity;
+use crate::write::{DirIdentity, NotRemoved, Removal};
 
 // ── Streams and the exit funnel (#157) ───────────────────────────────────────
 
@@ -1677,41 +1678,116 @@ pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
 
 // ── Stale-output cleanup ──────────────────────────────────────────────────────
 
-/// Probe for BOTH possible output siblings and unlink the one that does NOT match `kind`.
+/// After a directory build wrote `written`, the output of a source that compiled to
+/// `kind`, deal with the other kind's output of the same name that an earlier build left
+/// when the source compiled to that kind (#160). It is named from the output written —
+/// `out/a.b.md`'s is `out/a.b.json` — never from the source's name, which for `a.b.mds`
+/// would name `a.mds`'s output.
 ///
-/// Called after writing a compiled output to clean up a stale sibling from a previous
-/// format flip (e.g. a file that used to emit `x.md` but now emits `x.json`).
+/// - A stale `.json` is removed only while it holds exactly what mds writes for a
+///   messages output ([`holds_messages_output`]), and only as every removal is made
+///   ([`crate::write::remove_proven`]): below the output's anchor, through no symlink
+///   there, and only as a regular file. Anything else at its name — another file, a
+///   symlink, a directory, a FIFO — is kept, with one warning.
+/// - A stale `.md` is never removed — nothing in Markdown shows that mds wrote it — and
+///   is kept, as is anything else at its name, with one warning.
 ///
-/// If neither sibling exists the function is a no-op, and a removal that succeeds is
-/// silent: stale cleanup is a housekeeping detail. The removal goes through
-/// [`crate::write::remove_proven`] (#160): below the stem's anchor, through no symlink
-/// there, and only of a regular file. A wrong-extension file that exists but is not
-/// removed — refused, not a regular file, or the removal failed — is an `mds::io` error
-/// the caller reports (#157); nothing is printed here.
+/// A removal is silent, as is a name nothing has; `quiet` silences the warnings, which
+/// name the file by its `shown` form (#390).
 ///
-/// `base_no_ext` is the output's path WITHOUT extension (e.g. `/out/foo` for a source
-/// `foo.mds`) in both of [`output_stem_for`]'s forms. The function constructs
-/// `with_extension("md")` and `with_extension("json")` of it and removes the one that
-/// contradicts `kind`; its error names that file by the `shown` form (#390).
+/// # Errors
 ///
-/// AC-FUNC-23 (watch format-flip) and the equivalent dir-build stale-cleanup both
-/// call this function so the probe-and-unlink logic is shared.
+/// `mds::io`, for the caller to report (#157), naming the stale `.json` as shown: one
+/// that cannot be looked at or read, so nothing is known of it, and a proven one that is
+/// not removed — refused (a symlink below the anchor, say) or the removal failed.
 pub(crate) fn probe_and_remove_stale(
-    base_no_ext: &WriteTarget,
+    written: &WriteTarget,
     kind: OutputKind,
+    quiet: bool,
 ) -> std::result::Result<(), mds::MdsError> {
-    let stale_ext = kind.stale_extension();
-    let stale = base_no_ext.sibling(|base| base.with_extension(stale_ext));
-    match crate::write::remove_proven(&stale, |_| Ok(true)) {
-        Ok(_) => Ok(()),
-        Err(not_removed) => Err(mds::MdsError::Io {
-            message: format!(
-                "could not remove stale output {}: {}",
-                safe_path(&stale.shown),
-                not_removed.cause()
-            ),
-        }),
+    let stale = written.sibling(|path| path.with_extension(kind.stale_extension()));
+    match kind {
+        OutputKind::Markdown => remove_stale_messages(&stale, quiet),
+        OutputKind::Messages => {
+            if !quiet && std::fs::symlink_metadata(&stale.path).is_ok() {
+                eprint_warning(&format!(
+                    "warning: kept stale output {}: mds never removes a Markdown file",
+                    safe_path(&stale.shown)
+                ));
+            }
+            Ok(())
+        }
     }
+}
+
+/// Remove `stale`, the `.json` of a source that now compiles to Markdown, only while it
+/// holds exactly what mds writes for a messages output; keep anything else with one
+/// warning (none under `quiet`). See [`probe_and_remove_stale`].
+fn remove_stale_messages(
+    stale: &WriteTarget,
+    quiet: bool,
+) -> std::result::Result<(), mds::MdsError> {
+    let proof = |file: &mut std::fs::File| {
+        let size = file.metadata()?.len();
+        holds_messages_output(file, size, mds::MAX_FILE_SIZE)
+    };
+    let not_removed = match crate::write::remove_proven(stale, proof) {
+        Ok(Removal::Removed | Removal::Missing) => return Ok(()),
+        Ok(Removal::Kept) | Err(NotRemoved::NotAFile | NotRemoved::Link) => {
+            if !quiet {
+                eprint_warning(&format!(
+                    "warning: kept stale output {}: not proven to be written by mds",
+                    safe_path(&stale.shown)
+                ));
+            }
+            return Ok(());
+        }
+        Err(not_removed) => not_removed,
+    };
+    let what = match not_removed {
+        NotRemoved::Unreadable(_) => "cannot read",
+        _ => "could not remove",
+    };
+    Err(mds::MdsError::Io {
+        message: format!(
+            "{what} stale output {}: {}",
+            safe_path(&stale.shown),
+            not_removed.cause()
+        ),
+    })
+}
+
+/// One message as a messages output holds it: the fields of [`mds::Message`], in the
+/// order they are written, and no other.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WrittenMessage {
+    role: String,
+    content: String,
+}
+
+/// Whether `reader` holds exactly what mds writes for a messages output (#160): a JSON
+/// array of messages that, written back as a messages output is written
+/// ([`crate::build::messages_json`]), gives the same bytes — so neither its shape nor its
+/// text differs from a file mds wrote. `size` is the reader's length, which sizes the
+/// read; no more than `cap` bytes are read, and a reader that holds more holds no
+/// messages output.
+fn holds_messages_output(
+    reader: &mut impl std::io::Read,
+    size: u64,
+    cap: u64,
+) -> std::io::Result<bool> {
+    if size > cap {
+        return Ok(false);
+    }
+    let bytes = mds::read_at_most(reader, cap.saturating_add(1), size)?;
+    if bytes.len() as u64 > cap {
+        return Ok(false);
+    }
+    let Ok(messages) = serde_json::from_slice::<Vec<WrittenMessage>>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(crate::build::messages_json(&messages).is_ok_and(|written| written.as_bytes() == bytes))
 }
 
 /// Where a `Dir`-mode source lands below the out-dir, without its extension.
@@ -1768,8 +1844,8 @@ fn mirror_stem(source: &Path, root: &Path) -> MirroredStem {
 
 /// Return the path stem (path without extension) for a compiled source.
 ///
-/// The `path` of [`output_stem_for`], whose result is the `base_no_ext` argument to
-/// [`probe_and_remove_stale`].
+/// The `path` of [`output_stem_for`]: a directory build takes the directory its output
+/// lands in — a source map's base — from it.
 ///
 /// For `Dir` mode this defers to [`mirror_stem`] so the stem is always computed
 /// consistently with [`output_path_for`], below the directory's canonical form: the stem
@@ -1787,8 +1863,8 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
 /// [`output_base_no_ext`] in both forms, fixed here as [`output_path_for`] fixes an
 /// output's (#390), below the same anchor (#160): `path` is the extension-less stem the
 /// filesystem is probed at; `shown` is the same stem below the out-dir's shown form, or —
-/// next to the source — below the directory argument as typed. `mds watch` names a
-/// deleted source's output by `shown`.
+/// next to the source — below the directory argument as typed. [`output_path_for`]
+/// names an output next to its source from it.
 ///
 /// Like [`output_base_no_ext`] it is a probe: it reports nothing, the flattened arm
 /// included.
@@ -2637,27 +2713,134 @@ mod tests {
         );
     }
 
+    /// What mds writes for the messages template `@message user:` / `Hi` / `@end`.
+    const HI: &str = "[\n  {\n    \"role\": \"user\",\n    \"content\": \"Hi\"\n  }\n]\n";
+
+    /// What a build writes for the messages template `source` — compiled as a build
+    /// compiles it — in `dir`.
+    fn compiled_messages(dir: &Path, source: &str) -> String {
+        let path = dir.join("chat.mds");
+        std::fs::write(&path, source).unwrap();
+        let compiled =
+            crate::build::compile_to_content(&path, None, true, mds::CompileOptions::default())
+                .unwrap();
+        assert_eq!(compiled.kind, OutputKind::Messages, "{source:?}");
+        compiled.content
+    }
+
+    /// Whether `bytes` is proven a messages output mds wrote, read no further than `cap`.
+    fn proven(bytes: &[u8], cap: u64) -> bool {
+        holds_messages_output(&mut &bytes[..], bytes.len() as u64, cap).unwrap()
+    }
+
+    /// #160: a messages output is proven one mds wrote by its exact bytes, and by nothing
+    /// less: the same messages formatted or escaped another way, a field more, fewer or in
+    /// another order, another shape, bytes that are not UTF-8, and one byte over the cap
+    /// are not. Control: what a build writes — a message's quotes, tab and non-ASCII
+    /// characters as it escapes them — is.
+    #[test]
+    fn a_messages_output_is_proven_only_by_the_bytes_mds_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            compiled_messages(dir.path(), "@message user:\nHi\n@end\n"),
+            HI
+        );
+        let escaped = compiled_messages(
+            dir.path(),
+            "@message system:\nSay \"hi\"\tthen go\n@end\n@message user:\nCaf\u{e9} \u{2014} 1 < 2\n@end\n",
+        );
+        for (name, output) in [("HI", HI), ("escaped", escaped.as_str())] {
+            assert!(
+                proven(output.as_bytes(), mds::MAX_FILE_SIZE),
+                "control: {name} {output:?}"
+            );
+        }
+
+        let backslash = '\\';
+        let not_written_by_mds: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "compact",
+                b"[{\"role\":\"user\",\"content\":\"Hi\"}]\n".to_vec(),
+            ),
+            ("no final newline", HI.trim_end_matches('\n').into()),
+            ("CRLF", HI.replace('\n', "\r\n").into()),
+            (
+                "a byte-order mark",
+                [&b"\xEF\xBB\xBF"[..], HI.as_bytes()].concat(),
+            ),
+            (
+                "another escape",
+                HI.replace("\"Hi\"", &format!("\"H{backslash}u0069\""))
+                    .into(),
+            ),
+            (
+                "a field more",
+                HI.replace("\"Hi\"\n", "\"Hi\",\n    \"name\": \"x\"\n")
+                    .into(),
+            ),
+            (
+                "a field fewer",
+                HI.replace(",\n    \"content\": \"Hi\"", "").into(),
+            ),
+            (
+                "fields in another order",
+                b"[\n  {\n    \"content\": \"Hi\",\n    \"role\": \"user\"\n  }\n]\n".to_vec(),
+            ),
+            ("content not a string", HI.replace("\"Hi\"", "1").into()),
+            (
+                "an object",
+                b"{\n  \"role\": \"user\",\n  \"content\": \"Hi\"\n}\n".to_vec(),
+            ),
+            ("strings", b"[\n  \"Hi\"\n]\n".to_vec()),
+            ("null", b"null\n".to_vec()),
+            ("empty", Vec::new()),
+            ("a raw control character", HI.replace("Hi", "H\u{1}").into()),
+        ];
+        for (name, bytes) in not_written_by_mds {
+            assert!(!proven(&bytes, mds::MAX_FILE_SIZE), "{name}: {bytes:?}");
+        }
+        let mut not_utf8 = HI.as_bytes().to_vec();
+        let at = HI.find("Hi").unwrap() + 1;
+        not_utf8[at] = 0xFF;
+        assert!(!proven(&not_utf8, mds::MAX_FILE_SIZE), "not UTF-8");
+
+        let size = HI.len() as u64;
+        assert!(
+            proven(HI.as_bytes(), size),
+            "control: a file of exactly the cap"
+        );
+        assert!(!proven(HI.as_bytes(), size - 1), "one byte over the cap");
+        assert!(
+            !holds_messages_output(&mut HI.as_bytes(), size + 1, size).unwrap(),
+            "a size over the cap"
+        );
+        assert!(
+            !holds_messages_output(&mut HI.as_bytes(), 1, size - 1).unwrap(),
+            "a reader holding more than the cap whatever its size said"
+        );
+    }
+
     /// #160: a stale output whose directory below the anchor is a symlink is not removed
-    /// through it: the removal is refused (`mds::io`), naming the stale output and the
-    /// link as shown, and the file of that name where the link leads is left. Control: the
-    /// same stale output below a real directory is removed.
+    /// through it, though it holds exactly what mds writes: the removal is refused
+    /// (`mds::io`), naming the stale output and the link as shown, and the file of that
+    /// name where the link leads is left. Control: the same stale output below a real
+    /// directory is removed.
     #[cfg(unix)]
     #[test]
     fn a_stale_output_is_never_removed_through_a_symlink_below_its_anchor() {
-        const HAND: &str = "{\"hand\": \"written\"}";
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path().join("out");
         std::fs::create_dir_all(anchor.join("real")).unwrap();
         std::fs::create_dir(dir.path().join("victim")).unwrap();
         std::os::unix::fs::symlink("../victim", anchor.join("sub")).unwrap();
         let victim = dir.path().join("victim/x.json");
-        std::fs::write(&victim, HAND).unwrap();
+        std::fs::write(&victim, HI).unwrap();
 
-        let stem = WriteTarget::below(&anchor, Path::new("out"), Path::new("sub/x"));
-        let result = probe_and_remove_stale(&stem, OutputKind::Markdown);
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("sub/x.md"));
+        let result = probe_and_remove_stale(&written, OutputKind::Markdown, true);
         assert_eq!(
             std::fs::read_to_string(&victim).ok().as_deref(),
-            Some(HAND),
+            Some(HI),
             "nothing is removed through the symlink"
         );
         match result {
@@ -2671,10 +2854,52 @@ mod tests {
 
         // Control: below a real directory, the stale output is removed.
         let real = anchor.join("real/x.json");
-        std::fs::write(&real, HAND).unwrap();
-        let stem = WriteTarget::below(&anchor, Path::new("out"), Path::new("real/x"));
-        assert!(probe_and_remove_stale(&stem, OutputKind::Markdown).is_ok());
+        std::fs::write(&real, HI).unwrap();
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("real/x.md"));
+        assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
         assert!(!real.exists(), "control: the stale output is removed");
+    }
+
+    /// #160, #157: a stale output proven mds's whose removal fails is an `mds::io` error
+    /// naming it as shown, and the file is left; a build reports it and exits 2. Control:
+    /// once its directory is writable again, it is removed.
+    ///
+    /// Unix-only: a mode makes the directory read-only; skipped where it does not (as
+    /// root).
+    #[cfg(unix)]
+    #[test]
+    fn a_proven_stale_output_that_cannot_be_removed_is_an_io_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir(&anchor).unwrap();
+        let stale = anchor.join("x.json");
+        std::fs::write(&stale, HI).unwrap();
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("x.md"));
+        let mode = |mode| std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(mode));
+        mode(0o555).unwrap();
+        if std::fs::write(anchor.join(".probe"), "").is_ok() {
+            mode(0o755).unwrap();
+            ewriteln!("skipped: out is writable at mode 0o555 (running as root?)");
+            return;
+        }
+        let result = probe_and_remove_stale(&written, OutputKind::Markdown, true);
+        mode(0o755).unwrap();
+
+        match result {
+            Err(mds::MdsError::Io { message }) => assert_eq!(
+                message,
+                format!(
+                    "could not remove stale output out/x.json: {}",
+                    std::io::Error::from(rustix::io::Errno::ACCESS)
+                )
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&stale).ok().as_deref(), Some(HI));
+        assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
+        assert!(!stale.exists(), "control: the stale output is removed");
     }
 
     /// #390: a root walked in another form than it was typed in — `mds watch` walks the
