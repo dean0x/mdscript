@@ -98,10 +98,14 @@ input. The compiler enforces several defense-in-depth controls:
   named it, now leads to a different directory than at startup — a symlink
   retargeted, the out-dir replaced by a link — is refused (`mds::io`, restart to
   follow it) rather than followed, while a deleted out-dir is created again at the
-  same path. The check precedes the write: `--out-dir` is the anchor of the writes
-  below it, so a link swapped in between the two can still lead that one write
-  elsewhere, and the next check refuses it; `build.output_dir`'s own directories lie
-  below the anchor, where a link is refused either way. Nothing below the anchor is
+  same path. The check goes by path, and so does the write's open of its anchor, so
+  the check also finds the directory the write is anchored at — the out-dir, the
+  nearest directory above it once it has been deleted (the out-dir is then created
+  below that one without following a symlink), or, for `build.output_dir`, the
+  directory that contains `mds.json` — and the write refuses an anchor it opens that
+  is another directory: on Unix compared on the descriptor it opened, so a link
+  swapped onto the path between the check and the write is refused rather than
+  followed. Nothing below the anchor is
   followed (#160): on Unix each directory below the anchor is opened from the one above
   without following a symlink (`openat` with `O_NOFOLLOW`), and the temp file is
   created (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
@@ -118,7 +122,9 @@ input. The compiler enforces several defense-in-depth controls:
   Windows. Each directory below the anchor is checked and refused when it is a
   symlink or a junction, and the write then goes by path, so a directory that another
   process replaces with a link between that check and the write is followed; a link
-  in place before the write is refused. Other reparse points, such as a cloud-sync
+  in place before the write is refused. The anchor `mds watch` checked is compared by
+  path there, just before that walk, so a link swapped onto the out-dir's path after
+  the comparison is followed too. Other reparse points, such as a cloud-sync
   placeholder, are written to.
   `mds build` and `mds watch` refuse an output that is the entry file itself —
   however `-o`, `--out-dir`, `build.output_dir` or the default output name it —

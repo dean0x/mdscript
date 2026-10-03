@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use miette::Result;
 
 use crate::build::{OutputKind, ProjectConfig};
+use crate::write::DirIdentity;
 
 // ── Streams and the exit funnel (#157) ───────────────────────────────────────
 
@@ -1083,11 +1084,16 @@ pub(crate) enum OutputBase {
 /// resolved once when the run started: a directory-mode `--out-dir` ([`OutputBase::Dir`]'s
 /// `canonical`) and the entry's directory or directory argument of `mds watch` — and
 /// refuses a symlink at any of the components below it instead of writing through it.
+/// A write `mds watch` makes below its out-dir also names the directory its anchor must
+/// be ([`WriteTarget::below_checked_anchor`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteTarget {
     pub(crate) path: PathBuf,
     pub(crate) shown: PathBuf,
     below_anchor: usize,
+    /// The directory the write must find its anchor to be, when its caller has just
+    /// checked which one that is; `None`: whatever directory the anchor's path leads to.
+    checked_anchor: Option<DirIdentity>,
 }
 
 impl WriteTarget {
@@ -1104,6 +1110,7 @@ impl WriteTarget {
             path,
             shown,
             below_anchor: 1,
+            checked_anchor: None,
         }
     }
 
@@ -1120,6 +1127,7 @@ impl WriteTarget {
                 .components()
                 .filter(|c| *c != std::path::Component::CurDir)
                 .count(),
+            checked_anchor: None,
         }
     }
 
@@ -1152,6 +1160,36 @@ impl WriteTarget {
         self.below_anchor
     }
 
+    /// The same file below `dir`, the directory its anchor is as its caller resolved and
+    /// checked it — `mds watch`'s out-dir, or the directory `mds.json` is in — written only
+    /// if the directory the write opens as its anchor is `identity` (#160). The last
+    /// `missing` components of `dir`, which were not there when it was checked, lie below
+    /// the anchor too: the write opens the directory above them, the one checked, and
+    /// creates them below it without following a symlink. Named as before.
+    pub(crate) fn below_checked_anchor(
+        &self,
+        dir: &Path,
+        missing: usize,
+        identity: DirIdentity,
+    ) -> Self {
+        let above = self
+            .path
+            .components()
+            .count()
+            .saturating_sub(self.below_anchor);
+        Self {
+            path: dir.join(self.path.components().skip(above).collect::<PathBuf>()),
+            shown: self.shown.clone(),
+            below_anchor: self.below_anchor + missing,
+            checked_anchor: Some(identity),
+        }
+    }
+
+    /// The directory the write must find its anchor to be, if its caller checked it.
+    pub(crate) fn checked_anchor(&self) -> Option<DirIdentity> {
+        self.checked_anchor
+    }
+
     /// The file `edit` derives from this one, in both forms and below the same anchor —
     /// the sidecar map beside an output, say. `edit` changes the file name alone.
     pub(crate) fn sibling(&self, edit: impl Fn(&Path) -> PathBuf) -> Self {
@@ -1159,6 +1197,7 @@ impl WriteTarget {
             path: edit(&self.path),
             shown: edit(&self.shown),
             below_anchor: self.below_anchor,
+            checked_anchor: self.checked_anchor,
         }
     }
 }

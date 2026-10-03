@@ -87,6 +87,7 @@ use crate::output::{
     output_stem_for, probe_and_remove_stale, resolve_output_base, safe_inline, safe_path,
     stdout_failure, write_stdout, OutputBase, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
+use crate::write::DirIdentity;
 
 // ── Public args struct ────────────────────────────────────────────────────────
 
@@ -965,36 +966,6 @@ impl WorkingDir {
 
 // ── The out-dir during a session (#160) ───────────────────────────────────────
 
-/// One directory as the filesystem tells it from another at the same path: its device
-/// and inode on unix, with its birth time where the filesystem keeps one, since a
-/// directory made where a deleted one was can be given the freed inode; its creation time
-/// alone on Windows, where std gives no file index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DirIdentity {
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    created: Option<std::time::SystemTime>,
-}
-
-impl DirIdentity {
-    /// The directory at `path`, through a symlink; `None` when there is none.
-    fn of(path: &Path) -> Option<Self> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-
-        let meta = std::fs::metadata(path).ok().filter(|meta| meta.is_dir())?;
-        Some(Self {
-            #[cfg(unix)]
-            dev: meta.dev(),
-            #[cfg(unix)]
-            ino: meta.ino(),
-            created: meta.created().ok(),
-        })
-    }
-}
-
 /// What a write finds where the out-dir was ([`OutDirAnchor::check`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutDirNow {
@@ -1023,16 +994,44 @@ enum OutDirNow {
 /// next write compares; none of the outputs the session wrote is in it, so the content
 /// dedup is cleared and none is skipped as written already. Nothing is held open between
 /// writes.
+///
+/// The check is by path, and so is the write's open of its anchor, so a link swapped onto
+/// the path between the two would lead the open elsewhere: the check also finds the
+/// directory the write is anchored at — `resolved`, or the nearest directory above it
+/// that is there when it is missing — and the write is made only if the anchor it opens
+/// is that directory ([`below_checked_out_dir`]).
 struct OutDirAnchor {
     /// The path the user named: `--out-dir` as typed, or the directory `mds.json` was
     /// reached by.
     typed: PathBuf,
-    /// Where `typed` led when the session started, as a write would create it.
+    /// Where `typed` led when the session started, as a write would create it: the
+    /// directory a write below the out-dir is anchored at.
     resolved: PathBuf,
     /// The directory outputs are written below: `resolved`, or `build.output_dir` below it.
     out_dir: PathBuf,
     /// The directory the session last saw at `out_dir`; `None` while there was none.
     identity: Option<DirIdentity>,
+    /// Where the last check found the directory the next write is anchored at; `None`
+    /// before the first check and after one that refused the write.
+    checked: Option<CheckedAnchor>,
+}
+
+/// The directory a write below the out-dir is anchored at, as [`OutDirAnchor::check`]
+/// found it: `resolved` itself, or — when it is missing, and the write is to create it —
+/// the nearest directory above it that is there, `missing` levels up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckedAnchor {
+    missing: usize,
+    identity: DirIdentity,
+}
+
+impl CheckedAnchor {
+    /// `dir`, or the nearest directory above it that is there; `None` when none is.
+    fn find(dir: &Path) -> Option<Self> {
+        dir.ancestors().enumerate().find_map(|(missing, at)| {
+            DirIdentity::of(at).map(|identity| Self { missing, identity })
+        })
+    }
 }
 
 impl OutDirAnchor {
@@ -1058,13 +1057,23 @@ impl OutDirAnchor {
             resolved,
             out_dir,
             identity,
+            checked: None,
         })
     }
 
     /// What the out-dir is now ([`OutDirNow`]). A directory that is not the one last seen
     /// becomes the one the next check compares.
+    ///
+    /// The directory the write is anchored at is found first and the path the user named
+    /// resolved after: a link swapped in before then changes where that path leads, and
+    /// one swapped in after it leads the write's open to another directory than the one
+    /// found here, which the write refuses.
     fn check(&mut self) -> OutDirNow {
-        if resolve_dir_as_created(&self.typed).as_ref() != Some(&self.resolved) {
+        self.checked = CheckedAnchor::find(&self.resolved);
+        if self.checked.is_none()
+            || resolve_dir_as_created(&self.typed).as_ref() != Some(&self.resolved)
+        {
+            self.checked = None;
             return OutDirNow::Elsewhere;
         }
         let now = DirIdentity::of(&self.out_dir);
@@ -1097,6 +1106,19 @@ fn check_out_dir<K>(
         last_written.clear();
     }
     now
+}
+
+/// `target`, a write below the out-dir after a check that admitted it, made below the
+/// directory that check found and only if the anchor the write opens is that directory
+/// (#160): a link swapped onto the path in between is refused, not followed. A session
+/// with no out-dir writes `target` as it is.
+fn below_checked_out_dir(anchor: Option<&OutDirAnchor>, target: &WriteTarget) -> WriteTarget {
+    match anchor.and_then(|anchor| Some((anchor, anchor.checked?))) {
+        Some((anchor, CheckedAnchor { missing, identity })) => {
+            target.below_checked_anchor(&anchor.resolved, missing, identity)
+        }
+        None => target.clone(),
+    }
 }
 
 // ── Watched paths ─────────────────────────────────────────────────────────────
@@ -1958,7 +1980,14 @@ fn rebuild_file(
         (OutDirNow::Elsewhere, Some(target)) => OutputWrite::Failed(Some(miette::Report::new(
             crate::write::out_dir_moved(target),
         ))),
-        _ => write_session_output(output_path.as_ref(), &compiled.content, ctx.quiet, false),
+        (_, target) => write_session_output(
+            target
+                .map(|target| below_checked_out_dir(state.out_dir.as_ref(), target))
+                .as_ref(),
+            &compiled.content,
+            ctx.quiet,
+            false,
+        ),
     };
     match written {
         OutputWrite::Written => {
@@ -2728,9 +2757,12 @@ fn compile_one_source(
                     OutDirNow::Elsewhere => {
                         Err(miette::Report::new(crate::write::out_dir_moved(&out)))
                     }
-                    OutDirNow::Unchanged | OutDirNow::New => {
-                        write_output(Some(&out), &compiled.content, quiet, false)
-                    }
+                    OutDirNow::Unchanged | OutDirNow::New => write_output(
+                        Some(&below_checked_out_dir(state.out_dir.as_ref(), &out)),
+                        &compiled.content,
+                        quiet,
+                        false,
+                    ),
                 };
                 match written {
                     Ok(()) => {
@@ -5986,6 +6018,7 @@ mod tests {
             OutDirNow::Elsewhere,
             "a directory that is there"
         );
+        assert_eq!(anchor.checked, None, "a refused write is anchored nowhere");
         assert_eq!(
             below.check(),
             OutDirNow::Elsewhere,
@@ -6040,5 +6073,66 @@ mod tests {
         assert_eq!(chosen.out_dir, dir.join("flag"), "--out-dir first");
         assert!(OutDirAnchor::record(None, Some(&config(None))).is_none());
         assert!(OutDirAnchor::record(None, None).is_none());
+
+        // The writes are anchored at the directory `mds.json` is in, `dist` deleted or not.
+        let config_dir = Some(CheckedAnchor {
+            missing: 0,
+            identity: DirIdentity::of(&dir).expect("a directory"),
+        });
+        assert_eq!(anchor.checked, config_dir);
+        std::fs::create_dir(dir.join("dist")).unwrap();
+        anchor.check();
+        assert_eq!(anchor.checked, config_dir);
+    }
+
+    /// A check finds the directory the next write below the out-dir is anchored at (#160):
+    /// the out-dir itself, or — once it is deleted, for the write to create it again — the
+    /// nearest directory above it. The write is given that directory to expect, below it
+    /// the file, named as before; a session with no out-dir writes its target as it is.
+    #[test]
+    fn a_check_finds_the_directory_the_next_write_is_anchored_at() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().canonicalize().unwrap();
+        let out = root.join("out");
+        std::fs::create_dir(&out).unwrap();
+        let mut anchor = OutDirAnchor::record(Some(&out), None).expect("an out-dir");
+        assert_eq!(anchor.checked, None, "nothing found before a check");
+        let target = WriteTarget::new(out.join("a.md"), PathBuf::from("o/a.md"));
+        let written = |anchor: &OutDirAnchor| {
+            let checked = below_checked_out_dir(Some(anchor), &target);
+            (
+                checked.path.clone(),
+                checked.shown.clone(),
+                checked.below_anchor(),
+                checked.checked_anchor(),
+            )
+        };
+
+        assert_eq!(anchor.check(), OutDirNow::Unchanged);
+        assert_eq!(
+            written(&anchor),
+            (
+                out.join("a.md"),
+                PathBuf::from("o/a.md"),
+                1,
+                DirIdentity::of(&out)
+            ),
+            "the out-dir"
+        );
+
+        std::fs::remove_dir(&out).unwrap();
+        assert_eq!(anchor.check(), OutDirNow::New);
+        assert_eq!(
+            written(&anchor),
+            (
+                out.join("a.md"),
+                PathBuf::from("o/a.md"),
+                2,
+                DirIdentity::of(&root)
+            ),
+            "deleted: the directory above it, the out-dir below it"
+        );
+
+        assert_eq!(below_checked_out_dir(None, &target), target, "no out-dir");
     }
 }

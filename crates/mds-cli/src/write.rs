@@ -21,7 +21,9 @@
 //! as resolved once when the run started — so a symlinked anchor is followed (a
 //! symlinked directory argument is refused before anything is written, #413); `mds
 //! watch` refuses a write whose out-dir, as the user named it, now leads to another
-//! directory before the write is made ([`out_dir_moved`]). Nothing
+//! directory ([`out_dir_moved`]), and names the directory its check found to the write,
+//! which refuses an anchor it opens that is not that one — on unix by the descriptor it
+//! opened ([`DirIdentity`]). Nothing
 //! below it is: each directory is opened from the one above it without following a
 //! symlink, and the file is created, checked and renamed in the last one. A symlink
 //! planted below the anchor, or swapped in while the write runs, is refused (`mds::io`,
@@ -39,8 +41,9 @@
 //! Windows has no descriptor-relative walk in std: each directory below the anchor is
 //! checked with `symlink_metadata` and refused when it is a symlink or a junction — the
 //! name-surrogate reparse points std's `is_symlink` reports; a cloud-sync placeholder is
-//! not one and stays writable — and the write then goes by path (`mod windows`). A
-//! directory swapped for a link between that check and the write is followed: the
+//! not one and stays writable — and the write then goes by path (`mod windows`); the
+//! anchor `mds watch` checked is compared by path too, just before the walk. A
+//! directory swapped for a link between those checks and the write is followed: the
 //! residual SECURITY.md and spec §7.2 document.
 //!
 //! # Contract (#226)
@@ -94,6 +97,43 @@ pub(crate) enum Parents {
     Existing,
 }
 
+/// One directory as the filesystem tells it from another at the same path: its device
+/// and inode on unix, with its birth time where the filesystem keeps one, since a
+/// directory made where a deleted one was can be given the freed inode; its creation time
+/// alone on Windows, where std gives no file index. `mds watch` checks its out-dir by it
+/// before each write below it, and the write is made only in the directory the check
+/// found ([`WriteTarget::below_checked_anchor`], #160).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    created: Option<std::time::SystemTime>,
+}
+
+impl DirIdentity {
+    /// The directory at `path`, through a symlink; `None` when there is none.
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok().filter(|meta| meta.is_dir())?;
+        Some(Self::of_metadata(&meta))
+    }
+
+    /// The directory `meta` describes.
+    fn of_metadata(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            #[cfg(unix)]
+            dev: meta.dev(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+            created: meta.created().ok(),
+        }
+    }
+}
+
 /// Write `content` to `target` atomically, below its anchor and through no symlink there
 /// (see the module docs).
 ///
@@ -111,7 +151,9 @@ pub(crate) enum Parents {
 /// ([`io_cause`]). A symlink refused below the anchor is named instead, below the anchor's
 /// shown form — `cannot write out/sub: refusing to follow a symlink` — and one at the
 /// target says `refusing to replace a symlink`; a FIFO, a socket or a device there says
-/// `not a regular file`.
+/// `not a regular file`; an anchor that is not the directory the caller checked
+/// ([`WriteTarget::below_checked_anchor`]) is refused as [`out_dir_moved`] words it,
+/// before anything below it is opened.
 pub(crate) fn atomic_write_file(
     target: &WriteTarget,
     content: &str,
@@ -119,14 +161,18 @@ pub(crate) fn atomic_write_file(
     parents: Parents,
 ) -> std::result::Result<(), mds::MdsError> {
     let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
-    imp::write(&below, content.as_bytes(), durability, parents).map_err(|failure| match failure {
-        Failure::LinkBelowAnchor { depth } => {
-            io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
+    let anchor = target.checked_anchor();
+    imp::write(&below, anchor, content.as_bytes(), durability, parents).map_err(|failure| {
+        match failure {
+            Failure::AnchorMoved => out_dir_moved(target),
+            Failure::LinkBelowAnchor { depth } => {
+                io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
+            }
+            Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
+            #[cfg(unix)]
+            Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
+            Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
         }
-        Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
-        #[cfg(unix)]
-        Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
-        Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
     })
 }
 
@@ -176,6 +222,8 @@ fn shown_directory(target: &WriteTarget, depth: usize) -> PathBuf {
 /// What failed in a write, before it is worded.
 #[derive(Debug)]
 enum Failure {
+    /// The anchor opened is not the directory the caller checked.
+    AnchorMoved,
     /// The directory `depth` levels below the anchor is a symlink.
     LinkBelowAnchor { depth: usize },
     /// The target itself is a symlink.
@@ -289,7 +337,7 @@ mod unix {
     use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, CWD};
     use rustix::io::Errno;
 
-    use super::{Below, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
+    use super::{Below, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
 
     /// The anchor: a directory, resolved by path — through a symlink the user named.
     const ANCHOR: OFlags = OFlags::RDONLY
@@ -320,15 +368,20 @@ mod unix {
     /// clash is another writer's file or a leftover, and sixteen in a row is not chance.
     pub(super) const MAX_TEMP_ATTEMPTS: usize = 16;
 
-    /// Write `content` to `below.name`: open the anchor by path, then each directory below
-    /// it from the one above without following a symlink, and replace the file in the last.
+    /// Write `content` to `below.name`: open the anchor by path — and, when `anchor` names
+    /// the directory it must be, refuse another — then each directory below it from the
+    /// one above without following a symlink, and replace the file in the last.
     pub(super) fn write(
         below: &Below<'_>,
+        anchor: Option<DirIdentity>,
         content: &[u8],
         durability: Durability,
         parents: Parents,
     ) -> Result<(), Failure> {
         let mut dir = open_anchor(&below.anchor, parents)?;
+        if let Some(checked) = anchor {
+            dir = opened_as_checked(dir, checked)?;
+        }
         for (depth, name) in below.dirs.iter().enumerate() {
             let next = open_below(dir.as_fd(), name, parents)
                 .map_err(|errno| below_failure(dir.as_fd(), name, depth, errno))?;
@@ -356,6 +409,19 @@ mod unix {
                 Ok(fs::openat(CWD, anchor, ANCHOR, Mode::empty())?)
             }
             opened => Ok(opened?),
+        }
+    }
+
+    /// `dir`, the anchor as opened, when it is the directory `checked`: one the caller
+    /// checked a moment before, by path, so a link swapped onto that path since then has
+    /// led the open to another directory, which is refused before anything below it is
+    /// opened.
+    fn opened_as_checked(dir: OwnedFd, checked: DirIdentity) -> Result<OwnedFd, Failure> {
+        let dir = File::from(dir);
+        if DirIdentity::of_metadata(&dir.metadata()?) == checked {
+            Ok(OwnedFd::from(dir))
+        } else {
+            Err(Failure::AnchorMoved)
         }
     }
 
@@ -547,17 +613,19 @@ mod windows {
     use std::io::Write as _;
     use std::path::Path;
 
-    use super::{Below, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
+    use super::{Below, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
 
     /// `ERROR_PATH_NOT_FOUND`: a directory that is not there, in the operating system's
     /// words.
     const PATH_NOT_FOUND: i32 = 3;
 
-    /// Write `content` to `below.name`: refuse a symlink or a junction at any directory
+    /// Write `content` to `below.name`: refuse an anchor that is not the directory
+    /// `anchor` names, when it names one, and a symlink or a junction at any directory
     /// below the anchor, then replace the file by path (the residual the module docs
-    /// describe).
+    /// describe: each is looked at by path, before the write).
     pub(super) fn write(
         below: &Below<'_>,
+        anchor: Option<DirIdentity>,
         content: &[u8],
         durability: Durability,
         parents: Parents,
@@ -577,6 +645,9 @@ mod windows {
                     e
                 }
             })?;
+        }
+        if anchor.is_some_and(|checked| DirIdentity::of(&below.anchor) != Some(checked)) {
+            return Err(Failure::AnchorMoved);
         }
         let mut dir = below.anchor.clone();
         for (depth, name) in below.dirs.iter().enumerate() {
@@ -957,6 +1028,97 @@ mod tests {
             std::fs::read_to_string(real.join("sub").join("x.md")).unwrap(),
             "X"
         );
+    }
+
+    /// A write `mds watch` makes below its out-dir names the directory its check found
+    /// there, and an anchor the write opens that is another directory — the out-dir
+    /// swapped between the check and the write, here a sibling's identity named instead
+    /// — is refused with the out-dir refusal, the file named as shown, and nothing is
+    /// written or created below it (#160). Control: the identity of the directory opened
+    /// writes.
+    ///
+    /// `#[cfg(unix)]`: two directories made a moment apart are told apart by their inode
+    /// there; Windows has their creation times alone, which can be equal.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_whose_anchor_is_not_the_directory_checked_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let other = dir.path().join("other");
+        for made in [&out, &other] {
+            std::fs::create_dir(made).unwrap();
+        }
+        let identity = |of: &Path| DirIdentity::of(of).expect("a directory");
+        let target = WriteTarget::below(&out, Path::new("o"), Path::new("sub/x.md"));
+
+        let swapped = target.below_checked_anchor(&out, 0, identity(&other));
+        let err = atomic_write_file(&swapped, "X", Durability::RenameOnly, Parents::Create)
+            .expect_err("the anchor opened is not the directory checked")
+            .to_string();
+        assert_eq!(
+            err,
+            format!("cannot write {}: {OUT_DIR_MOVED}", safe_path(&target.shown))
+        );
+        assert_eq!(
+            entries(&out),
+            Vec::<String>::new(),
+            "nothing is written or created below it"
+        );
+
+        let checked = target.below_checked_anchor(&out, 0, identity(&out));
+        atomic_write_file(&checked, "X", Durability::RenameOnly, Parents::Create).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("sub").join("x.md")).unwrap(),
+            "X"
+        );
+    }
+
+    /// An out-dir the check found missing is written below the directory above it, the
+    /// one checked, and created there without following a symlink (#160): a write that
+    /// opens another directory as that anchor is refused and creates nothing, and a
+    /// symlink put where the out-dir is to be made is refused, its target left empty.
+    /// Control: the directory checked, opened, gets the out-dir and the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_out_dir_is_made_below_the_directory_checked_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let other = dir.path().join("other");
+        let victim = dir.path().join("victim");
+        for made in [&base, &other, &victim] {
+            std::fs::create_dir(made).unwrap();
+        }
+        let identity = |of: &Path| DirIdentity::of(of).expect("a directory");
+        let out = base.join("out");
+        let target = WriteTarget::below(&out, Path::new("o"), Path::new("x.md"));
+        let write = |anchor: &Path| {
+            let checked = target.below_checked_anchor(&out, 1, identity(anchor));
+            atomic_write_file(&checked, "X", Durability::RenameOnly, Parents::Create)
+        };
+
+        let err = write(&other)
+            .expect_err("not the directory checked")
+            .to_string();
+        assert_eq!(
+            err,
+            format!("cannot write {}: {OUT_DIR_MOVED}", safe_path(&target.shown))
+        );
+        assert!(!out.exists(), "nothing is created");
+
+        std::os::unix::fs::symlink(&victim, &out).unwrap();
+        let err = write(&base)
+            .expect_err("a link where the out-dir goes")
+            .to_string();
+        assert_eq!(err, format!("cannot write o: {FOLLOW_REFUSAL}"));
+        assert_eq!(
+            entries(&victim),
+            Vec::<String>::new(),
+            "nothing lands there"
+        );
+        std::fs::remove_file(&out).unwrap();
+
+        write(&base).unwrap();
+        assert_eq!(std::fs::read_to_string(out.join("x.md")).unwrap(), "X");
     }
 
     /// A bounded swap loop (#160): while a thread swaps a directory below the anchor
