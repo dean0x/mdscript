@@ -6181,6 +6181,23 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    /// Runs `driver` on a worker thread and waits at most 5s for its result, so a driver
+    /// that lost its bound fails the test by name rather than hanging the test binary.
+    ///
+    /// The worker is deliberately not joined on the timeout path: it is stuck because
+    /// its bound is gone, and joining it would bring the hang back. A worker waiting on
+    /// the watch channel ends once the test unwinds and drops the channel's sender.
+    fn within_5s<T: Send + 'static>(what: &str, driver: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // The test may already have given up; the send failing is fine.
+            let _ = done_tx.send(driver());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("{what} did not return within 5s ({e:?})"))
+    }
+
     /// Replays [`TickClock::recv_next`] on a channel that is never empty: every poll
     /// that is not `Due` takes a message, and handling one moves the clock on by
     /// `per_message`. Returns when each tick came due before `until`, as offsets.
@@ -6316,6 +6333,74 @@ mod tests {
             matches!(clock.recv_next(&rx, None), Err(mpsc::RecvError)),
             "a closed channel must report Disconnected rather than tick forever"
         );
+    }
+
+    /// The driver serves a due tick before it takes a waiting message (#319). The
+    /// schedule has already re-armed when it reports the tick due, so a driver that took
+    /// the message first would lose that tick, and a channel that is never empty would
+    /// starve the probe again.
+    ///
+    /// The schedule is built already due, with an interval of an hour: the second call
+    /// cannot find another tick due however slow the runner is.
+    #[test]
+    fn tick_clock_serves_a_due_tick_before_a_waiting_message() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        tx.send(Msg::Interrupt).expect("send failed");
+        let mut clock = TickClock {
+            schedule: TickSchedule::Every {
+                interval: Duration::from_secs(3_600),
+                next: Instant::now(),
+            },
+        };
+
+        assert!(
+            matches!(clock.recv_next(&rx, None), Ok(Wake::Tick)),
+            "a due tick must be served before the message waiting in the channel"
+        );
+        assert!(
+            matches!(
+                clock.recv_next(&rx, None),
+                Ok(Wake::Message(Msg::Interrupt))
+            ),
+            "positive control: the waiting message is delivered next, not lost"
+        );
+        drop(tx);
+    }
+
+    /// When the driver's wait for a message runs out, it serves the tick and re-arms one
+    /// interval from that instant. Without the re-arm the deadline stays in the past,
+    /// and the next call reports a second tick at once.
+    ///
+    /// A lower bound only: `t1` is read before the clock starts, the wait cannot run out
+    /// before the first deadline (`t1 + interval` at the earliest), and the re-arm adds
+    /// one interval to the instant it ran out. The sender stays alive, so the driver
+    /// runs under [`within_5s`]: one whose wait never ran out fails by name.
+    #[test]
+    fn tick_clock_rearms_when_its_wait_runs_out() {
+        let interval = ms(50);
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let t1 = Instant::now();
+        let (wake, clock, _rx) = within_5s("an idle tick", move || {
+            let mut clock = TickClock::new(Some(interval));
+            (clock.recv_next(&rx, None), clock, rx)
+        });
+
+        assert!(
+            matches!(wake, Ok(Wake::Tick)),
+            "an idle channel's wait runs out at the tick"
+        );
+        let TickSchedule::Every { next, .. } = clock.schedule else {
+            panic!("a clock started with an interval keeps it");
+        };
+        assert!(
+            next >= t1 + interval * 2,
+            "the next tick must come due one interval after the wait ran out, not at the \
+             deadline that has just passed: due {:?} after the clock started, expected at \
+             least {:?}",
+            next - t1,
+            interval * 2
+        );
+        drop(tx);
     }
 
     // ── Empty-file hold (#380) ───────────────────────────────────────────────
@@ -6878,6 +6963,59 @@ mod tests {
         );
     }
 
+    /// The driver stops at the message limit: it asks the window after every message,
+    /// so a flood queued faster than the window can close ends the window at the limit,
+    /// and the rest of the flood stays queued for the next one.
+    ///
+    /// No timing: the 60s window and its 600s cap cannot close during the test, and the
+    /// sender is dropped before the drain, so a driver that did not stop at the limit
+    /// would drain the whole flood and end `Disconnected` rather than wait the window
+    /// out. A read and a watch error sit inside the first 10 000 messages: exactly 2 000
+    /// stay queued only if the driver counts both of them.
+    #[test]
+    fn debounce_driver_stops_at_the_message_limit_with_the_rest_still_queued() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        for _ in 2..MAX_DEBOUNCE_MESSAGES {
+            tx.send(modify_event("/w/same.mds")).expect("send failed");
+        }
+        tx.send(Msg::Fs(Ok(read_event("/w/read.mds"))))
+            .expect("send failed");
+        let watch_error = notify::Error::generic("a planted watch error");
+        tx.send(Msg::Fs(Err(watch_error))).expect("send failed");
+        for _ in 0..2_000 {
+            tx.send(modify_event("/w/later.mds")).expect("send failed");
+        }
+        drop(tx);
+
+        let outcome = drain_debounce(&rx, 60_000);
+
+        assert_eq!(
+            outcome.end,
+            DebounceEnd::Closed(WindowEnd::MessageLimit),
+            "{} queued messages must end the window at the message limit",
+            MAX_DEBOUNCE_MESSAGES + 2_000
+        );
+        assert_eq!(
+            outcome.paths,
+            BTreeSet::from([PathBuf::from("/w/same.mds")]),
+            "only the content events drained before the limit contribute a path"
+        );
+        let left: Vec<Msg> = rx.try_iter().collect();
+        assert_eq!(
+            left.len(),
+            2_000,
+            "the content events, the read and the watch error all count toward the \
+             limit, and every message after it stays queued"
+        );
+        assert!(
+            left.iter().all(|msg| matches!(
+                msg,
+                Msg::Fs(Ok(event)) if event.paths == [PathBuf::from("/w/later.mds")]
+            )),
+            "positive control: the messages still queued are the flood after the limit"
+        );
+    }
+
     /// A dropped sender ends the window at once rather than waiting it out.
     ///
     /// The sender lives as long as the watcher, so a disconnect means the watcher is
@@ -6908,14 +7046,16 @@ mod tests {
 
     /// The one real-clock test: both drivers read `Instant::now()` and wait on a real
     /// channel. Lower bounds only — a slow runner can make a wait longer, never shorter
-    /// — and the synthetic tests above pin every exact instant.
+    /// — and the synthetic tests above pin every exact instant. Each driver call runs
+    /// under [`within_5s`], and the sender stays alive throughout, so a driver that lost
+    /// its bound fails here instead of hanging.
     #[test]
     fn debounce_and_tick_drivers_run_on_the_real_clock() {
         let (tx, rx) = mpsc::channel::<Msg>();
         tx.send(modify_event("/w/a.mds")).expect("send failed");
 
         let t0 = Instant::now();
-        let outcome = drain_debounce(&rx, 20);
+        let (outcome, rx) = within_5s("drain_debounce", move || (drain_debounce(&rx, 20), rx));
         assert!(
             t0.elapsed() >= ms(20),
             "a 20ms window must wait at least 20ms; got {:?}",
@@ -6934,9 +7074,11 @@ mod tests {
         assert_eq!(outcome.paths.len(), 1, "the queued event is drained");
 
         let t1 = Instant::now();
-        let mut clock = TickClock::new(Some(ms(50)));
+        let (wake, rx) = within_5s("an idle tick", move || {
+            (TickClock::new(Some(ms(50))).recv_next(&rx, None), rx)
+        });
         assert!(
-            matches!(clock.recv_next(&rx, None), Ok(Wake::Tick)),
+            matches!(wake, Ok(Wake::Tick)),
             "an idle channel must produce a tick"
         );
         assert!(
@@ -6946,17 +7088,14 @@ mod tests {
         );
 
         // `--poll-interval 0`: no tick, yet a held rebuild's deadline still wakes the loop
-        // (#380) — and not before it. A message sent long after the deadline bounds the
-        // wait: a driver that blocked for a message instead fails here, not hangs.
-        let late = tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(5));
-            let _ = late.send(Msg::Interrupt);
-        });
+        // (#380) — and not before it. A driver that blocked for a message instead fails
+        // here by name.
         let t2 = Instant::now();
-        let mut clock = TickClock::new(None);
+        let (wake, _rx) = within_5s("a held rebuild's deadline", move || {
+            (TickClock::new(None).recv_next(&rx, Some(t2 + ms(30))), rx)
+        });
         assert!(
-            matches!(clock.recv_next(&rx, Some(t2 + ms(30))), Ok(Wake::HoldDue)),
+            matches!(wake, Ok(Wake::HoldDue)),
             "a held rebuild's deadline must wake an idle loop with no tick"
         );
         assert!(
