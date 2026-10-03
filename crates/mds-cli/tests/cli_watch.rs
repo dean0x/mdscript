@@ -8276,9 +8276,12 @@ fn watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports() {
 /// startup compile fails, so every rebuild that compiles is refused (#425); its refusal
 /// used to come before the rebuild watched what the compile read. A second refused edit
 /// to the entry is the barrier, as in
-/// [`watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports`]. A refused
-/// rebuild is reported for every event it runs on, and one save can make several, so
-/// `--debounce 100` gathers each save's events into one rebuild: once a save's refusal
+/// [`watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports`]: directory mode
+/// watches the new directory once the rebuild has reported, and on macOS watching a
+/// directory restarts the event stream, which misses an edit made in that instant — so
+/// the barrier is saved again, at most three times, until a save of it is refused. A
+/// refused rebuild is reported for every event it runs on, and one save can make several,
+/// so `--debounce 100` gathers each save's events into one rebuild: once a save's refusal
 /// is on stderr, nothing of it is left to rebuild after the next edit.
 #[test]
 fn watch_arms_the_directory_of_a_dependency_a_refused_rebuild_imports() {
@@ -8342,9 +8345,22 @@ fn watch_arms_the_directory_of_a_dependency_a_refused_rebuild_imports() {
 
         write_atomic(&entry, import);
         let seen = refused_after(seen, "the edit that adds the import");
-        let barrier = format!("{import}Barrier\n");
-        write_atomic(&entry, &barrier);
-        let seen = refused_after(seen, "the barrier edit");
+        let mut barrier = None;
+        for attempt in 1..=3 {
+            let text = format!("{import}Barrier {attempt}\n");
+            write_atomic(&entry, &text);
+            if poll_tap_until(&tap, TIMEOUT, |now| refused(now) > seen).is_ok() {
+                barrier = Some(text);
+                break;
+            }
+        }
+        let barrier = barrier.unwrap_or_else(|| {
+            panic!(
+                "{mode}: no save of the barrier edit is refused; stderr: {}",
+                tap.text()
+            )
+        });
+        let seen = refused(&tap.text());
 
         write_atomic(&shared.join("y.mds"), "Y two\n");
         refused_after(
