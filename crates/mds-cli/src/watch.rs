@@ -1604,15 +1604,134 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
                 what: Watched::Entry,
             },
             output,
-            out_dir,
-            vars,
-            set_vars,
-            set_string_vars,
-            clear,
-            debounce,
-            quiet,
-            tick_opt,
+            SessionArgs {
+                out_dir,
+                vars,
+                set_vars,
+                set_string_vars,
+                clear,
+                debounce_ms: debounce,
+                quiet,
+                tick: tick_opt,
+            },
         )
+    }
+}
+
+/// What a watch session runs with besides what it watches, as `mds watch`'s options give
+/// it (#256).
+struct SessionArgs {
+    /// `--out-dir`.
+    out_dir: Option<PathBuf>,
+    /// `--vars`, as typed.
+    vars: Option<PathBuf>,
+    /// `--set`'s values.
+    set_vars: Vec<(String, String)>,
+    /// `--set-string`'s values.
+    set_string_vars: Vec<(String, String)>,
+    /// `--clear`.
+    clear: bool,
+    /// `--debounce`, in milliseconds.
+    debounce_ms: u64,
+    /// `--quiet`.
+    quiet: bool,
+    /// The idle tick's interval; `None` when `--poll-interval 0` turned it off.
+    tick: Option<Duration>,
+}
+
+// ── Live session ──────────────────────────────────────────────────────────────
+
+/// The live half of a watch session (#256): going live, the watch loop, and the session's
+/// last status line. A mode's startup hands [`live::run_session`] the channel its watcher
+/// sends on and a [`live::Session`] — what a tick and a message do — once every watch it
+/// can arm is armed and every baseline taken. Going live is reached only through
+/// [`live::run_session`], which runs the loop straight after it.
+mod live {
+    use std::ops::ControlFlow;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{emit_ready_marker, stop_watching, Msg, StopReason, TickClock};
+
+    /// What a live watch session does when the loop wakes it: each says whether the
+    /// session goes on or stops, and why.
+    pub(super) trait Session {
+        /// Whether the session runs under `--quiet`, which leaves out its last status line.
+        fn is_quiet(&self) -> bool;
+
+        /// The idle tick came due ([`TickClock`]): the liveness probe (reconcile rule).
+        fn on_tick(&mut self) -> ControlFlow<StopReason>;
+
+        /// A message arrived — a filesystem event, or Ctrl+C. `rx` is the channel it came
+        /// on, which a debounce window drains.
+        fn on_message(&mut self, msg: Msg, rx: &mpsc::Receiver<Msg>) -> ControlFlow<StopReason>;
+    }
+
+    /// Go live ([`go_live`]), watch until `session` stops, then print its last status line
+    /// ([`stop_watching`]). `tx` is the sender the watcher was armed with, kept until the
+    /// loop has ended.
+    pub(super) fn run_session(
+        tx: mpsc::Sender<Msg>,
+        rx: mpsc::Receiver<Msg>,
+        tick: Option<Duration>,
+        mut session: impl Session,
+    ) {
+        go_live(&tx);
+        let why = watch_loop(&rx, tick, &mut session);
+        stop_watching(session.is_quiet(), why);
+    }
+
+    /// The session is live: Ctrl+C is wired, every watched directory is armed and every
+    /// baseline captured.
+    ///
+    /// From here on a rebuild's output failure is reported as it happens and never changes
+    /// how the session exits: the exit funnel applies its watch-session rule (#157). Only
+    /// then is the readiness marker written, so a test that sees the marker sees a live
+    /// session.
+    fn go_live(tx: &mpsc::Sender<Msg>) {
+        // ── Ctrl+C: install LAST, immediately before the loop that can service it ──
+        //
+        // Installing a handler converts SIGINT from "terminate now" into "enqueue
+        // `Msg::Interrupt`", and that message is only ever read by the watch loop. So
+        // every instruction between `set_handler` and the loop is a stretch of startup
+        // during which Ctrl+C does nothing at all — the process keeps compiling and keeps
+        // writing output, then exits 0 as if the user had never pressed it. Repeat
+        // presses do not help; only SIGKILL does. The cost scales with the size of the
+        // startup compile, so the handler is installed once startup is done, with nothing
+        // but the loop after it. Nothing before it needs the handler: arming the watcher
+        // only needs the sender, which is cloned here just as well.
+        let tx_ctrlc = tx.clone();
+        let _ = ctrlc::set_handler(move || {
+            crate::output::panic_in_handler("ctrlc");
+            let _ = tx_ctrlc.send(Msg::Interrupt);
+        });
+
+        // Every dir is armed and every baseline captured — the watch is now live.
+        crate::output::note_watch_session_live();
+        emit_ready_marker();
+    }
+
+    /// The watch loop: one event batch, or one idle tick, at a time. It is bounded: it ends
+    /// on Ctrl+C, on the channel closing, or when a tick or a message ends the session
+    /// (stdout's reader gone), and returns why.
+    fn watch_loop(
+        rx: &mpsc::Receiver<Msg>,
+        tick: Option<Duration>,
+        session: &mut impl Session,
+    ) -> StopReason {
+        let mut clock = TickClock::new(tick);
+        loop {
+            let next = match clock.recv_next(rx) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break StopReason::Interrupted,
+                Ok(None) => session.on_tick(),
+                Ok(Some(msg)) => session.on_message(msg, rx),
+                // Unreachable: recv_timeout returns Ok(None) for Timeout, not an Err.
+                Err(mpsc::RecvTimeoutError::Timeout) => ControlFlow::Continue(()),
+            };
+            if let ControlFlow::Break(why) = next {
+                break why;
+            }
+        }
     }
 }
 
@@ -2422,403 +2541,614 @@ fn vars_dir_paths<'a>(
 /// (#417), `mds.json` is looked up from it at startup (#413), and every status line
 /// names the entry and its output by it (#390), so they name the files as the user
 /// reaches them; `entry.canonical` is its canonical form, which everything else uses.
-#[allow(clippy::too_many_arguments)]
-fn run_watch_file(
-    entry: WatchedPath,
-    output: Option<String>,
-    out_dir: Option<PathBuf>,
-    vars: Option<PathBuf>,
-    set_vars: Vec<(String, String)>,
-    set_string_vars: Vec<(String, String)>,
-    clear: bool,
-    debounce_ms: u64,
-    quiet: bool,
-    tick: Option<Duration>,
-) -> Result<()> {
-    let working_dir = WorkingDir::record();
-    // #326: keep the --vars argument as the user typed it, separately from the
-    // canonicalized form below. `vars_path` (canonical) is used for everything that
-    // must match notify's canonicalized event paths (dirs_to_watch, files_of_interest,
-    // event matching); `vars_path_typed` is used only for `RuntimeVarArgs.vars`, so the
-    // vars-file duplicate-key warning (D4: "{path} = the --vars arg as typed") displays
-    // and reads through the same path the user gave — reading a valid, possibly
-    // symlinked path is fine either way, only the DISPLAYED text differs.
-    let vars_path_typed = vars.clone();
-    // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
-    // Also rejects a symlinked vars file at startup (build parity — PF-004).
-    let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
-
-    // Build runtime vars from the set_vars statics (vars file is reloaded each rebuild).
-    let static_set_vars = set_vars;
-    let static_set_string_vars = set_string_vars;
-
-    if !quiet {
-        crate::output::ewriteln!("Watching {}", safe_path(&entry.typed));
-    }
-
-    // ── Arm before publish (startup race) ─────────────────────────────────────
-    //
-    // GUARANTEED for the entry and the vars file: the directory watch is armed and
-    // the `(mtime, size)` baseline captured strictly BEFORE either is first read.
-    // Both are knowable from the command line, so both happen below, ahead of
-    // `build_runtime_vars` (reads vars) and `compile_and_write` (reads the entry).
-    //
-    // NOT guaranteed for dependencies. A dep only becomes known when the compile
-    // reports it, so a dep whose directory is not the entry's or the vars file's is
-    // armed — and has its baseline taken — only *after* the compile has already read
-    // it (see the post-compile arming loop and the baseline merge further down). An
-    // edit to such a dep inside that window is still invisible to both detectors.
-    // Deps that happen to sit in an already-armed directory are covered by the OS
-    // watch from the start; cross-directory deps are the residual, and are what
-    // `MDS_TEST_READY` exists to let the integration suite synchronise past.
-    //
-    // The watcher used to be created *after* the initial compile so the dedup
-    // baseline was recorded "before any FSEvents arrive". That ordering left a
-    // window — output written → watcher armed → baseline snapshotted — in which an
-    // edit generated no event at all: inotify was not yet armed, so there was
-    // nothing to deliver it to. A user who saved during startup saw no rebuild.
-    //
-    // Whether that was *late* or *permanent* was decided by the liveness probe, and
-    // NOT by the poisoned baseline: `liveness_probe_file` returns `recovery ||
-    // changed`, and `recovery` is true on `first_tick` unconditionally — so on an
-    // idle tree the first tick rebuilt and the edit was recovered regardless of what
-    // the baseline held. What made it permanent is that the tick may never arrive:
-    // `recv_timeout` restarts its deadline on every message, so a steady stream of
-    // irrelevant events in the watched tree starves the probe indefinitely. That
-    // starvation is tracked separately as #319; closing this window is what stops it
-    // being reachable from a normal startup.
-    //
-    // Arming first means the watcher may observe the compile's own reads and the
-    // startup output write. Three pre-existing guards cover that, and each is
-    // still load-bearing here:
-    //   1. `is_content_event` drops every `Access(_)` event, which is exactly
-    //      what a source-file *read* produces on Linux (IN_OPEN / IN_ACCESS /
-    //      IN_CLOSE_NOWRITE). The startup compile can no longer busy-loop itself.
-    //   2. `event_is_relevant` filters to `files_of_interest` — entry, deps and
-    //      the vars file. The startup output write (and the temp sibling that
-    //      `atomic_write_file` renames over it) is never in that set.
-    //   3. `last_written` content-dedup is seeded below, before the event loop
-    //      begins. Queued events are only *processed* inside the loop, so any
-    //      event that survives guards 1 and 2 recompiles to identical content
-    //      and is suppressed without a write or a status line.
-    // Worst case is therefore one redundant compile that dedups to no write.
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_fs = tx.clone();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            crate::output::panic_in_handler("notify");
-            let _ = tx_fs.send(Msg::Fs(res));
-        },
-        notify::Config::default(),
-    )
-    .map_err(|e| {
-        miette::miette!(
-            "failed to initialize file watcher: {}",
-            safe_inline(notify_cause(&e))
-        )
-    })?;
-
-    // Arm the directories that are knowable before any read: the entry's parent
-    // and the vars file's parent. Dependency dirs are unknown until the compile
-    // reports them and are armed immediately afterwards.
-    //
-    // Best-effort here — a dir that is missing or fails to arm is re-attempted by
-    // the post-compile loop below, which owns the hard-error contract for the
-    // full dir set. Splitting it this way keeps startup failure messages identical
-    // to the pre-reorder behaviour.
-    let mut watched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    for dir in dirs_to_watch(&entry.canonical, &[], vars_path.as_deref()) {
-        if dir.exists() && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
-            watched_dirs.insert(dir);
-        }
-    }
-
-    // Capture the entry/vars baseline BEFORE the first read of either. Both
-    // `build_runtime_vars` (reads the vars file) and `compile_and_write` (reads
-    // the entry) come after this point, so an edit landing during startup leaves
-    // this snapshot strictly older than the file — and the liveness probe sees it.
-    let mut pre_mtimes = snapshot_state(&files_of_interest(
-        &entry.canonical,
-        &[],
-        vars_path.as_deref(),
-    ));
-    let entry_was_missing = !entry.canonical.exists();
-
-    // Initial compile: compile first, derive output path from kind (compile-then-route).
-    // For explicit -o / --out-dir the path is determined by the flag.
-    // For the default case (no explicit flag), the path depends on the output kind, which
-    // is only known after compilation — so we compile first, then derive.
-    let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path_typed.clone(),
-        set_vars: static_set_vars.clone(),
-        set_string_vars: static_set_string_vars.clone(),
-    })?;
-    emit_duplicate_var_warnings(&resolved, quiet);
-    let runtime_vars = resolved.vars;
-
-    // Load project config (for output_dir) — used if no explicit -o / --out-dir. By the
-    // typed path, so a config error names `mds.json` as the input reaches it
-    // (`./mds.json`), never by its canonical absolute path (#413); the config
-    // directory it returns is canonical either way.
-    let config = load_config(&entry.typed)?;
-
-    // Initial compile: returns (output_path, deps, content).
-    // content is captured here so the baseline block below can reuse it without
-    // recompiling (issue 3 — avoids a redundant second compile at startup).
-    // The outer `?` is an output route no rebuild can use — one that fails to resolve, or
-    // the entry file itself (#425): refused at startup, exit 2, before anything is
-    // written. A compile or write error is reported, and watching continues.
-    // The files every compile reads besides the entry's own: the `--vars` file and the
-    // `mds.json` in force, which no output is written over (#425).
-    let reads = run_reads(vars_path.as_deref(), config.as_ref());
-    let startup = compile_and_write(
-        &entry,
-        &output,
-        &out_dir,
-        &config,
-        &reads,
-        runtime_vars,
-        quiet,
-    )?;
-    // The route each output takes: an explicit `-o` names one whatever the kind; without
-    // it, the route of each kind is resolved now and every output takes its own kind's
-    // (#257, #160) — after a startup compile that failed, whose kind is unknown, and when
-    // an edit changes the kind — so a `.json` output is never written to `.md`. A route
-    // that fails to resolve is refused here, exit 2: no rebuild could write anywhere
-    // else. Every rebuild refuses and reports a route that is the entry (#425).
-    let route_of =
-        |kind| resolve_output_path_for_kind(Some(entry.paths()), &output, &out_dir, &config, kind);
-    // What the startup wrote and where, if it wrote, and the dependencies its compile
-    // reported.
-    let (initial_written, initial_deps) = match startup {
-        CompileWriteOutcome::Written((output_path, deps, content)) => {
-            (Some((output_path, content)), deps)
-        }
+///
+/// Startup runs in phases whose order the types enforce (#256, [`file_startup`]):
+/// [`file_startup::arm_pre_read`] arms the watches and takes the baseline before anything
+/// is read, [`file_startup::startup_compile`] compiles and writes once,
+/// [`file_startup::arm_deps_and_seed`] arms the dependencies' directories and seeds what
+/// every rebuild reads, and [`file_startup::Seeded::go_live`] goes live and watches until
+/// the session stops.
+fn run_watch_file(entry: WatchedPath, output: Option<String>, args: SessionArgs) -> Result<()> {
+    let quiet = args.quiet;
+    let armed = file_startup::arm_pre_read(entry, output, args)?;
+    let compiled = match file_startup::startup_compile(&armed)? {
+        ControlFlow::Continue(compiled) => compiled,
         // stdout's reader is gone before the session went live: it stops here, and its
         // verdict is 0 — a closed pipe never changes the exit code (#157).
-        CompileWriteOutcome::StdoutClosed => {
-            stop_watching(quiet, StopReason::StdoutClosed);
+        ControlFlow::Break(why) => {
+            stop_watching(quiet, why);
             return Ok(());
         }
-        // Compiled and routed, but not written: report it and keep watching, with the
-        // dependencies the compile reported — an edit to one rebuilds (#257). Nothing was
-        // written, so the dedup map below stays empty and the next rebuild writes even
-        // when its output has not changed.
-        CompileWriteOutcome::WriteFailed { deps, failure } => {
-            settle_startup_error(StartupInto::File, failure, &entry.canonical);
-            (None, deps)
-        }
-        CompileWriteOutcome::CompileFailed(e) => {
-            // Initial compile error: print and continue watching (entry dir still
-            // watched). Nothing is written now.
-            settle_startup_error(StartupInto::File, e, &entry.canonical);
-            if output.is_some() {
-                // An explicit `-o` names the route whatever the kind. Its refusal is
-                // dropped here: admitting it only decides whether the `-o` extension
-                // warning, which announces a write, is printed — never for an output that
-                // is the entry.
-                let _ = admit_output(
-                    written_path(&route_of(OutputKind::Markdown)?),
-                    entry.paths(),
-                    &output,
-                    OutputKind::Markdown,
-                    quiet,
-                );
-            }
-            (None, vec![])
-        }
     };
-    let output_route = if output.is_some() {
-        OutputRoute::Named(route_of(OutputKind::Markdown)?)
-    } else {
-        OutputRoute::ByKind {
-            markdown: route_of(OutputKind::Markdown)?,
-            messages: route_of(OutputKind::Messages)?,
-        }
+    file_startup::arm_deps_and_seed(armed, compiled)?.go_live();
+    Ok(())
+}
+
+/// File mode's startup, in phases whose order the types enforce (#256).
+///
+/// Each phase takes the token only the phase before it makes, and every token's fields are
+/// private to this module, so nothing outside it can make one: an
+/// [`Armed`](file_startup::Armed) comes only from [`file_startup::arm_pre_read`], a
+/// [`Compiled`](file_startup::Compiled) only from [`file_startup::startup_compile`] given an
+/// `Armed`, a [`Seeded`](file_startup::Seeded) only from [`file_startup::arm_deps_and_seed`]
+/// given both, and the session goes live only from a `Seeded`
+/// ([`file_startup::Seeded::go_live`]). That is the order the session's change detection
+/// rests on: the directories of the entry and the `--vars` file armed, and their
+/// `(mtime, size)` baseline taken, before either is read; a dependency's baseline taken and
+/// its directory armed once the compile reports it; Ctrl+C wired last, with nothing but the
+/// loop after it.
+mod file_startup {
+    use std::collections::{BTreeSet, HashMap};
+    use std::ops::ControlFlow;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use miette::Result;
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
+    use crate::build::{
+        admit_output, build_runtime_vars, emit_duplicate_var_warnings, load_config,
+        resolve_output_path_for_kind, run_reads, OutputKind, ProjectConfig, RuntimeVarArgs,
+    };
+    use crate::output::{notify_cause, safe_inline, safe_path, WriteTarget};
+
+    use super::{
+        baseline_path, canonicalize_vars_path, compile_and_write, dirs_to_watch, files_of_interest,
+        handle_fs_event_file, live, liveness_probe_file, rebuild_file, settle_startup_error,
+        shown_watched_dir, snapshot_state, startup_race_probe, vars_dir_paths, written_path,
+        CompileWriteOutcome, FileCompileCtx, FileEventAction, FileWatchState, Msg, OutDirAnchor,
+        OutputKey, OutputRoute, SessionArgs, StampMap, StartupInto, StopReason, WatchedPath,
+        WorkingDir,
     };
 
-    // Baseline the dependencies the compile just reported, before anything else runs.
-    //
-    // The entry and vars baselines above precede their own reads; a dependency's cannot,
-    // because the compile is what discovers the dependency exists. Taking it here rather
-    // than with the post-compile snapshot below shrinks the window in which an edit to a
-    // dependency is invisible to the baseline from "the rest of startup" to the gap
-    // between the compile returning and this loop. `baseline_path` keeps the older of
-    // any two entries.
-    //
-    // HONEST SCOPE: this is defence in depth and has **no measured observable effect**
-    // today. `liveness_probe_file` returns `recovery || changed` with `recovery`
-    // including `first_tick`, so file mode's first tick rebuilds unconditionally and
-    // recovers such an edit whatever the baseline says — an arm with this loop removed
-    // still passed the covering test 10/10. What it buys is that `last_mtimes` means
-    // what its name says, so the probe stays correct if that unconditional first-tick
-    // rebuild is ever removed. Directory mode has no such fallback, which is why the
-    // equivalent capture there is load-bearing and measured (#321).
-    for dep in &initial_deps {
-        baseline_path(dep, &mut pre_mtimes);
+    /// The session's first watches armed and its first baseline taken, before anything is
+    /// read: made only by [`arm_pre_read`].
+    pub(super) struct Armed {
+        /// The watched entry, as typed and canonical ([`super::Watched::Entry`]).
+        entry: WatchedPath,
+        /// `-o` as text; `None` without it.
+        output: Option<String>,
+        out_dir: Option<PathBuf>,
+        /// The working directory at startup, which every rebuild restores first.
+        working_dir: WorkingDir,
+        /// The `--vars` file, canonical: what notify names its events by (#326).
+        vars_path: Option<PathBuf>,
+        /// The `--vars` file as typed, which it is read and named by (#326).
+        vars_path_typed: Option<PathBuf>,
+        static_set_vars: Vec<(String, String)>,
+        static_set_string_vars: Vec<(String, String)>,
+        quiet: bool,
+        clear: bool,
+        debounce_ms: u64,
+        tick: Option<Duration>,
+        /// The channel the watcher sends on — and Ctrl+C, once the session is live.
+        tx: mpsc::Sender<Msg>,
+        rx: mpsc::Receiver<Msg>,
+        watcher: RecommendedWatcher,
+        /// The directories armed so far: the entry's and the `--vars` file's that exist
+        /// and could be armed.
+        watched_dirs: BTreeSet<PathBuf>,
+        /// The entry's and the `--vars` file's `(mtime, size)`, taken before either is read.
+        pre_mtimes: StampMap,
+        /// Whether the entry was missing before its first read.
+        entry_was_missing: bool,
     }
 
-    // The startup output is now published — the positive-control injection point.
-    startup_race_probe();
+    /// The startup compile done, and its output written when it could be: made only by
+    /// [`startup_compile`].
+    pub(super) struct Compiled {
+        /// The `mds.json` in force, looked up from the entry as typed.
+        config: Option<ProjectConfig>,
+        /// The files every compile reads besides the entry's own (#425).
+        reads: Vec<PathBuf>,
+        /// Where every output is written ([`OutputRoute`]).
+        output_route: OutputRoute,
+        /// What the startup wrote and where, if it wrote.
+        initial_written: Option<(Option<WriteTarget>, String)>,
+        /// The dependencies the startup compile reported, as graph keys.
+        initial_deps: Vec<PathBuf>,
+    }
 
-    // Arm the dependency directories the compile just reported. Dirs already armed
-    // above are skipped; anything still unarmed — including a pre-arm attempt that
-    // failed — is a hard startup error, as it was before the reorder.
-    let init_dirs = dirs_to_watch(&entry.canonical, &initial_deps, vars_path.as_deref());
-    let unarmed: Vec<PathBuf> = init_dirs.difference(&watched_dirs).cloned().collect();
-    for dir in unarmed {
-        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
-            Ok(()) => {
+    /// Every directory armed and every baseline taken, with what every rebuild reads: made
+    /// only by [`arm_deps_and_seed`].
+    pub(super) struct Seeded {
+        /// The sender the watcher was armed with, which Ctrl+C is wired to.
+        tx: mpsc::Sender<Msg>,
+        rx: mpsc::Receiver<Msg>,
+        tick: Option<Duration>,
+        session: FileSession,
+    }
+
+    /// A file-mode session once live ([`live::Session`]): what every rebuild reads, the
+    /// watcher, the loop state, and how messages are coalesced.
+    struct FileSession {
+        ctx: FileCompileCtx,
+        watcher: RecommendedWatcher,
+        state: FileWatchState,
+        debounce_ms: u64,
+        clear: bool,
+    }
+
+    /// Record the working directory, check the `--vars` file and say what is watched; then
+    /// arm the directories of the entry and the `--vars` file and take their baseline,
+    /// before either is read.
+    pub(super) fn arm_pre_read(
+        entry: WatchedPath,
+        output: Option<String>,
+        args: SessionArgs,
+    ) -> Result<Armed> {
+        // Build runtime vars from the set_vars statics (vars file is reloaded each rebuild).
+        let SessionArgs {
+            out_dir,
+            vars,
+            set_vars: static_set_vars,
+            set_string_vars: static_set_string_vars,
+            clear,
+            debounce_ms,
+            quiet,
+            tick,
+        } = args;
+        let working_dir = WorkingDir::record();
+        // #326: keep the --vars argument as the user typed it, separately from the
+        // canonicalized form below. `vars_path` (canonical) is used for everything that
+        // must match notify's canonicalized event paths (dirs_to_watch, files_of_interest,
+        // event matching); `vars_path_typed` is used only for `RuntimeVarArgs.vars`, so
+        // the vars-file duplicate-key warning ("{path} = the --vars arg as typed")
+        // displays and reads through the same path the user gave — reading a valid,
+        // possibly symlinked path is fine either way, only the DISPLAYED text differs.
+        let vars_path_typed = vars.clone();
+        // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on
+        // macOS). Also rejects a symlinked vars file at startup (build parity).
+        let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
+
+        if !quiet {
+            crate::output::ewriteln!("Watching {}", safe_path(&entry.typed));
+        }
+
+        // ── Arm before publish (startup race) ─────────────────────────────────
+        //
+        // GUARANTEED for the entry and the vars file: the directory watch is armed and
+        // the `(mtime, size)` baseline captured strictly BEFORE either is first read.
+        // Both are knowable from the command line, so both happen here, ahead of
+        // `build_runtime_vars` (reads vars) and `compile_and_write` (reads the entry),
+        // which [`startup_compile`] runs given the [`Armed`] this returns.
+        //
+        // NOT guaranteed for dependencies. A dep only becomes known when the compile
+        // reports it, so a dep whose directory is not the entry's or the vars file's is
+        // armed — and has its baseline taken — only *after* the compile has already read
+        // it (see the post-compile arming loop and the baseline merge in
+        // [`arm_deps_and_seed`]). An edit to such a dep inside that window is still
+        // invisible to both detectors. Deps that happen to sit in an already-armed
+        // directory are covered by the OS watch from the start; cross-directory deps are
+        // the residual, and are what `MDS_TEST_READY` exists to let the integration suite
+        // synchronise past.
+        //
+        // The watcher used to be created *after* the initial compile so the dedup
+        // baseline was recorded "before any FSEvents arrive". That ordering left a
+        // window — output written → watcher armed → baseline snapshotted — in which an
+        // edit generated no event at all: inotify was not yet armed, so there was
+        // nothing to deliver it to. A user who saved during startup saw no rebuild.
+        //
+        // Whether that was *late* or *permanent* was decided by the liveness probe, and
+        // NOT by the poisoned baseline: `liveness_probe_file` returns `recovery ||
+        // changed`, and `recovery` is true on `first_tick` unconditionally — so on an
+        // idle tree the first tick rebuilt and the edit was recovered regardless of what
+        // the baseline held. What made it permanent is that the tick may never arrive:
+        // `recv_timeout` restarts its deadline on every message, so a steady stream of
+        // irrelevant events in the watched tree starves the probe indefinitely. That
+        // starvation is tracked separately as #319; closing this window is what stops it
+        // being reachable from a normal startup.
+        //
+        // Arming first means the watcher may observe the compile's own reads and the
+        // startup output write. Three pre-existing guards cover that, and each is
+        // still load-bearing here:
+        //   1. `is_content_event` drops every `Access(_)` event, which is exactly
+        //      what a source-file *read* produces on Linux (IN_OPEN / IN_ACCESS /
+        //      IN_CLOSE_NOWRITE). The startup compile can no longer busy-loop itself.
+        //   2. `event_is_relevant` filters to `files_of_interest` — entry, deps and
+        //      the vars file. The startup output write (and the temp sibling that
+        //      `atomic_write_file` renames over it) is never in that set.
+        //   3. `last_written` content-dedup is seeded by [`arm_deps_and_seed`], before
+        //      the event loop begins. Queued events are only *processed* inside the
+        //      loop, so any event that survives guards 1 and 2 recompiles to identical
+        //      content and is suppressed without a write or a status line.
+        // Worst case is therefore one redundant compile that dedups to no write.
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let tx_fs = tx.clone();
+        let mut watcher = RecommendedWatcher::new(
+            move |res| {
+                crate::output::panic_in_handler("notify");
+                let _ = tx_fs.send(Msg::Fs(res));
+            },
+            notify::Config::default(),
+        )
+        .map_err(|e| {
+            miette::miette!(
+                "failed to initialize file watcher: {}",
+                safe_inline(notify_cause(&e))
+            )
+        })?;
+
+        // Arm the directories that are knowable before any read: the entry's parent
+        // and the vars file's parent. Dependency dirs are unknown until the compile
+        // reports them and are armed immediately afterwards.
+        //
+        // Best-effort here — a dir that is missing or fails to arm is re-attempted by
+        // the post-compile loop in [`arm_deps_and_seed`], which owns the hard-error
+        // contract for the full dir set. Splitting it this way keeps startup failure
+        // messages identical to the pre-reorder behaviour.
+        let mut watched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        for dir in dirs_to_watch(&entry.canonical, &[], vars_path.as_deref()) {
+            if dir.exists() && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
                 watched_dirs.insert(dir);
             }
-            Err(e) => {
-                let vars = vars_dir_paths(vars_path.as_deref(), vars_path_typed.as_deref());
-                return Err(miette::miette!(
-                    "failed to watch directory {}: {}\n\
-                     hint: on Linux you may need to increase fs.inotify.max_user_watches",
-                    safe_path(&shown_watched_dir(&dir, entry.dir_paths(), vars)),
-                    safe_inline(notify_cause(&e))
-                ));
+        }
+
+        // Capture the entry/vars baseline BEFORE the first read of either. Both
+        // `build_runtime_vars` (reads the vars file) and `compile_and_write` (reads
+        // the entry) come after this point, so an edit landing during startup leaves
+        // this snapshot strictly older than the file — and the liveness probe sees it.
+        let pre_mtimes = snapshot_state(&files_of_interest(
+            &entry.canonical,
+            &[],
+            vars_path.as_deref(),
+        ));
+        let entry_was_missing = !entry.canonical.exists();
+
+        Ok(Armed {
+            entry,
+            output,
+            out_dir,
+            working_dir,
+            vars_path,
+            vars_path_typed,
+            static_set_vars,
+            static_set_string_vars,
+            quiet,
+            clear,
+            debounce_ms,
+            tick,
+            tx,
+            rx,
+            watcher,
+            watched_dirs,
+            pre_mtimes,
+            entry_was_missing,
+        })
+    }
+
+    /// The startup compile, once [`arm_pre_read`] has armed what it reads, and its write.
+    /// A compile or write error is reported, and watching continues. `Break` when stdout's
+    /// reader is gone: the session stops.
+    pub(super) fn startup_compile(armed: &Armed) -> Result<ControlFlow<StopReason, Compiled>> {
+        let Armed {
+            entry,
+            output,
+            out_dir,
+            vars_path,
+            vars_path_typed,
+            static_set_vars,
+            static_set_string_vars,
+            quiet,
+            ..
+        } = armed;
+        let quiet = *quiet;
+
+        // Initial compile: compile first, derive output path from kind (compile-then-route).
+        // For explicit -o / --out-dir the path is determined by the flag.
+        // For the default case (no explicit flag), the path depends on the output kind,
+        // which is only known after compilation — so we compile first, then derive.
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: vars_path_typed.clone(),
+            set_vars: static_set_vars.clone(),
+            set_string_vars: static_set_string_vars.clone(),
+        })?;
+        emit_duplicate_var_warnings(&resolved, quiet);
+        let runtime_vars = resolved.vars;
+
+        // Load project config (for output_dir) — used if no explicit -o / --out-dir. By
+        // the typed path, so a config error names `mds.json` as the input reaches it
+        // (`./mds.json`), never by its canonical absolute path (#413); the config
+        // directory it returns is canonical either way.
+        let config = load_config(&entry.typed)?;
+
+        // Initial compile: returns (output_path, deps, content).
+        // content is captured here so the baseline block in [`arm_deps_and_seed`] can
+        // reuse it without recompiling (issue 3 — avoids a redundant second compile at
+        // startup). The outer `?` is an output route no rebuild can use — one that fails
+        // to resolve, or the entry file itself (#425): refused at startup, exit 2, before
+        // anything is written. A compile or write error is reported, and watching
+        // continues.
+        // The files every compile reads besides the entry's own: the `--vars` file and the
+        // `mds.json` in force, which no output is written over (#425).
+        let reads = run_reads(vars_path.as_deref(), config.as_ref());
+        let startup =
+            compile_and_write(entry, output, out_dir, &config, &reads, runtime_vars, quiet)?;
+        // The route each output takes: an explicit `-o` names one whatever the kind;
+        // without it, the route of each kind is resolved now and every output takes its
+        // own kind's (#257, #160) — after a startup compile that failed, whose kind is
+        // unknown, and when an edit changes the kind — so a `.json` output is never
+        // written to `.md`. A route that fails to resolve is refused here, exit 2: no
+        // rebuild could write anywhere else. Every rebuild refuses and reports a route
+        // that is the entry (#425).
+        let route_of = |kind| {
+            resolve_output_path_for_kind(Some(entry.paths()), output, out_dir, &config, kind)
+        };
+        // What the startup wrote and where, if it wrote, and the dependencies its compile
+        // reported.
+        let (initial_written, initial_deps) = match startup {
+            CompileWriteOutcome::Written((output_path, deps, content)) => {
+                (Some((output_path, content)), deps)
             }
+            // stdout's reader is gone before the session went live: it stops, and its
+            // verdict is 0 — a closed pipe never changes the exit code (#157).
+            CompileWriteOutcome::StdoutClosed => {
+                return Ok(ControlFlow::Break(StopReason::StdoutClosed));
+            }
+            // Compiled and routed, but not written: report it and keep watching, with the
+            // dependencies the compile reported — an edit to one rebuilds (#257). Nothing
+            // was written, so the dedup map stays empty and the next rebuild writes even
+            // when its output has not changed.
+            CompileWriteOutcome::WriteFailed { deps, failure } => {
+                settle_startup_error(StartupInto::File, failure, &entry.canonical);
+                (None, deps)
+            }
+            CompileWriteOutcome::CompileFailed(e) => {
+                // Initial compile error: print and continue watching (entry dir still
+                // watched). Nothing is written now.
+                settle_startup_error(StartupInto::File, e, &entry.canonical);
+                if output.is_some() {
+                    // An explicit `-o` names the route whatever the kind. Its refusal is
+                    // dropped here: admitting it only decides whether the `-o` extension
+                    // warning, which announces a write, is printed — never for an output
+                    // that is the entry.
+                    let _ = admit_output(
+                        written_path(&route_of(OutputKind::Markdown)?),
+                        entry.paths(),
+                        output,
+                        OutputKind::Markdown,
+                        quiet,
+                    );
+                }
+                (None, vec![])
+            }
+        };
+        let output_route = if output.is_some() {
+            OutputRoute::Named(route_of(OutputKind::Markdown)?)
+        } else {
+            OutputRoute::ByKind {
+                markdown: route_of(OutputKind::Markdown)?,
+                messages: route_of(OutputKind::Messages)?,
+            }
+        };
+
+        Ok(ControlFlow::Continue(Compiled {
+            config,
+            reads,
+            output_route,
+            initial_written,
+            initial_deps,
+        }))
+    }
+
+    /// Take the baseline of the dependencies the startup compile reported and arm their
+    /// directories — one that cannot be armed ends the session at startup — then seed what
+    /// every rebuild reads: the content-dedup map, the files of interest and the merged
+    /// baseline.
+    pub(super) fn arm_deps_and_seed(armed: Armed, compiled: Compiled) -> Result<Seeded> {
+        let Armed {
+            entry,
+            output,
+            out_dir,
+            working_dir,
+            vars_path,
+            vars_path_typed,
+            static_set_vars,
+            static_set_string_vars,
+            quiet,
+            clear,
+            debounce_ms,
+            tick,
+            tx,
+            rx,
+            mut watcher,
+            mut watched_dirs,
+            mut pre_mtimes,
+            entry_was_missing,
+        } = armed;
+        let Compiled {
+            config,
+            reads,
+            output_route,
+            initial_written,
+            initial_deps,
+        } = compiled;
+
+        // Baseline the dependencies the compile just reported, before anything else runs.
+        //
+        // The entry and vars baselines precede their own reads ([`arm_pre_read`]); a
+        // dependency's cannot, because the compile is what discovers the dependency
+        // exists. Taking it here rather than with the post-compile snapshot below shrinks
+        // the window in which an edit to a dependency is invisible to the baseline from
+        // "the rest of startup" to the gap between the compile returning and this loop.
+        // `baseline_path` keeps the older of any two entries.
+        //
+        // HONEST SCOPE: this is defence in depth and has **no measured observable effect**
+        // today. `liveness_probe_file` returns `recovery || changed` with `recovery`
+        // including `first_tick`, so file mode's first tick rebuilds unconditionally and
+        // recovers such an edit whatever the baseline says — an arm with this loop removed
+        // still passed the covering test 10/10. What it buys is that `last_mtimes` means
+        // what its name says, so the probe stays correct if that unconditional first-tick
+        // rebuild is ever removed. Directory mode has no such fallback, which is why the
+        // equivalent capture there is load-bearing and measured (#321).
+        for dep in &initial_deps {
+            baseline_path(dep, &mut pre_mtimes);
+        }
+
+        // The startup output is now published — the positive-control injection point.
+        startup_race_probe();
+
+        // Arm the dependency directories the compile just reported. Dirs already armed by
+        // [`arm_pre_read`] are skipped; anything still unarmed — including a pre-arm
+        // attempt that failed — is a hard startup error, as it was before the reorder.
+        let init_dirs = dirs_to_watch(&entry.canonical, &initial_deps, vars_path.as_deref());
+        let unarmed: Vec<PathBuf> = init_dirs.difference(&watched_dirs).cloned().collect();
+        for dir in unarmed {
+            match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    watched_dirs.insert(dir);
+                }
+                Err(e) => {
+                    let vars = vars_dir_paths(vars_path.as_deref(), vars_path_typed.as_deref());
+                    return Err(miette::miette!(
+                        "failed to watch directory {}: {}\n\
+                         hint: on Linux you may need to increase fs.inotify.max_user_watches",
+                        safe_path(&shown_watched_dir(&dir, entry.dir_paths(), vars)),
+                        safe_inline(notify_cause(&e))
+                    ));
+                }
+            }
+        }
+
+        // Record the dedup baseline. The event loop has not started, so nothing can
+        // consult this map before it is populated (guard 3 in [`arm_pre_read`]).
+        // Reuse the content the startup wrote (issue 3 — no second compile needed), an
+        // empty one included: what the startup wrote is the session's, as a rebuild's is
+        // (#160). When the initial compile or write failed nothing was written:
+        // last_written stays empty, so the next successful rebuild writes, and is no
+        // change of kind.
+        let mut last_written: HashMap<OutputKey, String> = HashMap::new();
+        let written_to = initial_written.map(|(written, content)| {
+            let key = OutputKey::of(written.as_ref());
+            last_written.insert(key.clone(), content);
+            key
+        });
+
+        let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
+
+        // Build pre-loop FileWatchState (mtime snapshot + edge-trigger seeds).
+        let missing_watched_dirs: BTreeSet<PathBuf> = {
+            let desired = dirs_to_watch(&entry.canonical, &[], vars_path.as_deref())
+                .union(&watched_dirs)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            desired.into_iter().filter(|d| !d.exists()).collect()
+        };
+
+        // Merge the two baselines. Dependencies are only discovered by the compile, so
+        // theirs is captured now; the entry/vars entries taken before the compile
+        // overwrite the fresh ones because they are strictly older. That is what makes
+        // an edit landing anywhere inside the startup window still register as a
+        // difference on the first liveness tick.
+        let mut last_mtimes = snapshot_state(&foi);
+        // Witness for the assertion below. The merge DIRECTION is the load-bearing part:
+        // only the pre-compile pair predates an edit that landed during startup, so
+        // inverting the merge (or switching to an `or_insert`-style one that keeps the
+        // value already present) silently restores the lost-save bug while every test
+        // still passes. `entry.canonical` is inserted verbatim by `files_of_interest`, so
+        // this lookup hits. The previous assertion here compared the key sets of
+        // `files_of_interest(entry, &[], vars)` and `files_of_interest(entry, &deps, vars)`
+        // — a subset relation those two calls guarantee by construction, so it could
+        // never fail and guarded nothing.
+        let entry_pre = pre_mtimes.get(&entry.canonical).copied();
+        last_mtimes.extend(pre_mtimes);
+        debug_assert_eq!(
+            last_mtimes.get(&entry.canonical).copied(),
+            entry_pre,
+            "baseline merge inverted: the entry's pre-compile (mtime, size) must survive \
+             the merge with the post-compile snapshot, or an edit made during startup can \
+             never register as a difference"
+        );
+
+        let state = FileWatchState {
+            // armed_dirs mirrors watched_dirs at startup: all dirs that were successfully
+            // registered in the loop above are considered armed (reconcile rule idle-O(1)
+            // fix).
+            armed_dirs: watched_dirs.clone(),
+            watched_dirs,
+            foi,
+            last_mtimes,
+            last_written,
+            written_to,
+            kept: None,
+            output: output_route,
+            // After the startup write, so the directory it made is the one the first
+            // rebuild compares; `-o` names its own path, which no out-dir is below.
+            out_dir: if output.is_some() {
+                None
+            } else {
+                OutDirAnchor::record(out_dir.as_deref(), config.as_ref())
+            },
+            entry_was_missing,
+            first_tick: true,
+            missing_watched_dirs,
+        };
+
+        // What every rebuild and liveness tick reads, fixed for the session.
+        let ctx = FileCompileCtx {
+            entry,
+            working_dir,
+            vars_path,
+            vars_path_typed,
+            reads,
+            static_set_vars,
+            static_set_string_vars,
+            quiet,
+        };
+
+        Ok(Seeded {
+            tx,
+            rx,
+            tick,
+            session: FileSession {
+                ctx,
+                watcher,
+                state,
+                debounce_ms,
+                clear,
+            },
+        })
+    }
+
+    impl Seeded {
+        /// Every watch armed and every baseline taken: go live — Ctrl+C wired last — and
+        /// watch until the session stops ([`live::run_session`]).
+        pub(super) fn go_live(self) {
+            let Seeded {
+                tx,
+                rx,
+                tick,
+                session,
+            } = self;
+            live::run_session(tx, rx, tick, session);
         }
     }
 
-    // Record the dedup baseline. The event loop has not started, so nothing can
-    // consult this map before it is populated (guard 3 above).
-    // Reuse the content the startup wrote (issue 3 — no second compile needed), an empty
-    // one included: what the startup wrote is the session's, as a rebuild's is (#160).
-    // When the initial compile or write failed (above) nothing was written: last_written
-    // stays empty, so the next successful rebuild writes, and is no change of kind.
-    let mut last_written: HashMap<OutputKey, String> = HashMap::new();
-    let written_to = initial_written.map(|(written, content)| {
-        let key = OutputKey::of(written.as_ref());
-        last_written.insert(key.clone(), content);
-        key
-    });
+    impl live::Session for FileSession {
+        fn is_quiet(&self) -> bool {
+            self.ctx.quiet
+        }
 
-    let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
-
-    // Build pre-loop FileWatchState (mtime snapshot + edge-trigger seeds).
-    let missing_watched_dirs: BTreeSet<PathBuf> = {
-        let desired = dirs_to_watch(&entry.canonical, &[], vars_path.as_deref())
-            .union(&watched_dirs)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        desired.into_iter().filter(|d| !d.exists()).collect()
-    };
-
-    // Merge the two baselines. Dependencies are only discovered by the compile, so
-    // theirs is captured now; the entry/vars entries taken before the compile
-    // overwrite the fresh ones because they are strictly older. That is what makes
-    // an edit landing anywhere inside the startup window still register as a
-    // difference on the first liveness tick.
-    let mut last_mtimes = snapshot_state(&foi);
-    // Witness for the assertion below. The merge DIRECTION is the load-bearing part:
-    // only the pre-compile pair predates an edit that landed during startup, so
-    // inverting the merge (or switching to an `or_insert`-style one that keeps the
-    // value already present) silently restores the lost-save bug while every test
-    // still passes. `entry.canonical` is inserted verbatim by `files_of_interest`, so this
-    // lookup hits. The previous assertion here compared the key sets of
-    // `files_of_interest(entry, &[], vars)` and `files_of_interest(entry, &deps, vars)`
-    // — a subset relation those two calls guarantee by construction, so it could
-    // never fail and guarded nothing.
-    let entry_pre = pre_mtimes.get(&entry.canonical).copied();
-    last_mtimes.extend(pre_mtimes);
-    debug_assert_eq!(
-        last_mtimes.get(&entry.canonical).copied(),
-        entry_pre,
-        "baseline merge inverted: the entry's pre-compile (mtime, size) must survive \
-         the merge with the post-compile snapshot, or an edit made during startup can \
-         never register as a difference"
-    );
-
-    let mut state = FileWatchState {
-        // armed_dirs mirrors watched_dirs at startup: all dirs that were successfully
-        // registered in the loop above are considered armed (reconcile rule idle-O(1) fix).
-        armed_dirs: watched_dirs.clone(),
-        watched_dirs,
-        foi,
-        last_mtimes,
-        last_written,
-        written_to,
-        kept: None,
-        output: output_route,
-        // After the startup write, so the directory it made is the one the first rebuild
-        // compares; `-o` names its own path, which no out-dir is below.
-        out_dir: if output.is_some() {
-            None
-        } else {
-            OutDirAnchor::record(out_dir.as_deref(), config.as_ref())
-        },
-        entry_was_missing,
-        first_tick: true,
-        missing_watched_dirs,
-    };
-
-    // Build compile-time context (replaces the 7 individual constant args previously
-    // threaded through rebuild_file / liveness_probe_file — removes both
-    // #[allow(clippy::too_many_arguments)] suppressions).
-    let ctx = FileCompileCtx {
-        entry,
-        working_dir,
-        vars_path,
-        vars_path_typed,
-        reads,
-        static_set_vars,
-        static_set_string_vars,
-        quiet,
-    };
-
-    // ── Ctrl+C: install LAST, immediately before the loop that can service it ──
-    //
-    // Installing a handler converts SIGINT from "terminate now" into "enqueue
-    // `Msg::Interrupt`", and that message is only ever read by the event loop below.
-    // So every instruction between `set_handler` and the loop is a stretch of
-    // startup during which Ctrl+C does nothing at all — the process keeps compiling
-    // and keeps writing output, then exits 0 as if the user had never pressed it.
-    // Repeat presses do not help; only SIGKILL does. The cost scales with the size
-    // of the startup compile, so this must stay below it. Nothing above needs the
-    // handler: arming the watcher only needs `tx`, which is cloned here just as well.
-    let tx_ctrlc = tx.clone();
-    let _ = ctrlc::set_handler(move || {
-        crate::output::panic_in_handler("ctrlc");
-        let _ = tx_ctrlc.send(Msg::Interrupt);
-    });
-
-    // Every dir is armed and every baseline captured — the watch is now live.
-    go_live();
-
-    // ── Watch loop ────────────────────────────────────────────────────────────
-    // The outer loop processes one event batch at a time and is bounded:
-    // it terminates on Interrupt, Disconnected, or a rebuild that finds stdout's
-    // reader gone.
-    let mut clock = TickClock::new(tick);
-    let why = loop {
-        let next = match clock.recv_next(&rx) {
-            Err(mpsc::RecvTimeoutError::Disconnected) => break StopReason::Interrupted,
-            Ok(None) => {
-                // Idle tick — run liveness probe (reconcile rule).
-                if liveness_probe_file(&ctx, &mut watcher, &mut state) {
-                    rebuild_file(&ctx, &mut watcher, &mut state)
-                } else {
-                    ControlFlow::Continue(())
-                }
+        fn on_tick(&mut self) -> ControlFlow<StopReason> {
+            // Idle tick — run liveness probe (reconcile rule).
+            if liveness_probe_file(&self.ctx, &mut self.watcher, &mut self.state) {
+                rebuild_file(&self.ctx, &mut self.watcher, &mut self.state)
+            } else {
+                ControlFlow::Continue(())
             }
-            Ok(Some(msg)) => match handle_fs_event_file(msg, &state.foi, &rx, debounce_ms, clear) {
+        }
+
+        fn on_message(&mut self, msg: Msg, rx: &mpsc::Receiver<Msg>) -> ControlFlow<StopReason> {
+            match handle_fs_event_file(msg, &self.state.foi, rx, self.debounce_ms, self.clear) {
                 FileEventAction::Skip => ControlFlow::Continue(()),
                 FileEventAction::Stop => ControlFlow::Break(StopReason::Interrupted),
-                FileEventAction::Rebuild => rebuild_file(&ctx, &mut watcher, &mut state),
-            },
-            // Unreachable: recv_timeout returns Ok(None) for Timeout, not an Err.
-            Err(mpsc::RecvTimeoutError::Timeout) => ControlFlow::Continue(()),
-        };
-        if let ControlFlow::Break(why) = next {
-            break why;
+                FileEventAction::Rebuild => {
+                    rebuild_file(&self.ctx, &mut self.watcher, &mut self.state)
+                }
+            }
         }
-    };
-
-    stop_watching(ctx.quiet, why);
-    Ok(())
+    }
 }
 
 // ── Directory watch ───────────────────────────────────────────────────────────
