@@ -2754,7 +2754,8 @@ mod tests {
     /// less: the same messages formatted or escaped another way, a field more, fewer or in
     /// another order, another shape, bytes that are not UTF-8, and one byte over the cap
     /// are not. Control: what a build writes — a message's quotes, tab and non-ASCII
-    /// characters as it escapes them — is.
+    /// characters as it escapes them, and the empty array of a template whose messages are
+    /// all empty — is.
     #[test]
     fn a_messages_output_is_proven_only_by_the_bytes_mds_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -2766,7 +2767,14 @@ mod tests {
             dir.path(),
             "@message system:\nSay \"hi\"\tthen go\n@end\n@message user:\nCaf\u{e9} \u{2014} 1 < 2\n@end\n",
         );
-        for (name, output) in [("HI", HI), ("escaped", escaped.as_str())] {
+        // A messages template whose only message has an empty body has none to write.
+        let none = compiled_messages(dir.path(), "@message user:\n  \n@end\n");
+        assert_eq!(none, "[]\n", "mds writes an empty messages output");
+        for (name, output) in [
+            ("HI", HI),
+            ("escaped", escaped.as_str()),
+            ("none", none.as_str()),
+        ] {
             assert!(
                 proven(output.as_bytes(), mds::MAX_FILE_SIZE),
                 "control: {name} {output:?}"
