@@ -90,7 +90,9 @@
 //! must find the same device and inode at the name before `unlinkat` removes it from the
 //! directory the walk opened: a file put in its place after it was opened is left. Only
 //! one put there in the instant between that look and the removal is removed instead.
-//! Windows checks each directory below the anchor as a write does, and removes by path.
+//! Windows checks each directory below the anchor as a write does, and removes by path:
+//! the file is closed after its proof and then removed by its name, so one put there in
+//! between is removed instead.
 //!
 //! # Contract (#226)
 //!

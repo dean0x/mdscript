@@ -166,7 +166,9 @@ input. The compiler enforces several defense-in-depth controls:
   symlink or a junction, and the write — or the removal — then goes by path, so a
   directory that another process replaces with a link between that check and the
   write is followed; a link
-  in place before the write is refused. The anchor `mds watch` checked is compared by
+  in place before the write is refused. A file to be removed is proven, closed again
+  and then removed by its name, so a file another process puts at that name in between
+  is removed in its place. The anchor `mds watch` checked is compared by
   path there, just before that walk, so a link swapped onto the out-dir's path after
   the comparison is followed too. Other reparse points, such as a cloud-sync
   placeholder, are written to.
