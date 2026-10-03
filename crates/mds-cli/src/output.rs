@@ -1744,17 +1744,34 @@ fn remove_stale_messages(
         }
         Err(not_removed) => not_removed,
     };
+    Err(stale_removal_error(
+        "stale output",
+        &stale.shown,
+        &not_removed,
+    ))
+}
+
+/// Word `not_removed`, a [`crate::write::remove_proven`] refusal already decided to be an
+/// error rather than a kept file, as `mds::io`: "cannot read `<noun>` …" when nothing is
+/// known of the file, "could not remove `<noun>` …" otherwise. Shared by the stale-output
+/// removal above and `build::verify_then_delete_map`'s stale map, so the two wordings
+/// cannot drift apart (#160).
+pub(crate) fn stale_removal_error(
+    noun: &str,
+    shown: &Path,
+    not_removed: &NotRemoved,
+) -> mds::MdsError {
     let what = match not_removed {
         NotRemoved::Unreadable(_) => "cannot read",
         _ => "could not remove",
     };
-    Err(mds::MdsError::Io {
+    mds::MdsError::Io {
         message: format!(
-            "{what} stale output {}: {}",
-            safe_path(&stale.shown),
+            "{what} {noun} {}: {}",
+            safe_path(shown),
             not_removed.cause()
         ),
-    })
+    }
 }
 
 /// One message as a messages output holds it: the fields of [`mds::Message`], in the

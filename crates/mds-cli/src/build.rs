@@ -1448,12 +1448,6 @@ pub(crate) fn verify_then_delete_map(
     expected_basename: &str,
     quiet: bool,
 ) -> Result<(), MdsError> {
-    let error = |what: &str, cause: &str| MdsError::Io {
-        message: format!(
-            "{what} stale map {}: {cause}",
-            crate::output::safe_path(&map.shown)
-        ),
-    };
     let proof = |file: &mut std::fs::File| has_sidecar_head(file, expected_basename);
     match crate::write::remove_proven(map, proof) {
         Ok(Removal::Removed) => {
@@ -1475,10 +1469,11 @@ pub(crate) fn verify_then_delete_map(
             }
             Ok(())
         }
-        Err(NotRemoved::Unreadable(cause)) => Err(error("cannot read", &cause)),
-        Err(refused @ (NotRemoved::Link | NotRemoved::Failed(_))) => {
-            Err(error("could not remove", refused.cause()))
-        }
+        Err(not_removed) => Err(crate::output::stale_removal_error(
+            "stale map",
+            &map.shown,
+            &not_removed,
+        )),
     }
 }
 
