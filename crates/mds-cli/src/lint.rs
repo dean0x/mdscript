@@ -8,33 +8,24 @@
 //! - `-` (stdin): read from stdin, report diagnostics to stderr, exit by severity.
 //!   With `--fix`: fixed source → stdout, diagnostics → stderr.
 //!
+//! Each input is a [`LintSource`], which gives it the names lint shows for it.
+//!
 //! # Channel discipline
 //!
 //! - Human diagnostics → **stderr** via miette Report.
-//! - `--format json` output → **stdout** only (single JSON object, trailing newline).
+//! - `--format json` output → **stdout** only: exactly one JSON object, with a trailing
+//!   newline, on every exit but a usage error clap reports — the findings document, or the
+//!   error document of a failure that stops the run; `--fix --diff` writes its diffs
+//!   first (#309).
 //! - `--quiet` suppresses warning+info human diagnostics and summaries, NOT errors.
 //!
-//! # `--quiet` status-message contract (#216, decision D4)
+//! # Results
 //!
-//! Every *status* message on stderr is gated on `!quiet` wherever it is emitted.
-//! Per-mode scope (PF-015: scoped claim rather than vacuously-true absolute).
-//! Directory mode has two separate emitters (`lint_one_file_human` for --format
-//! human and `lint_one_file_accumulating` for --format json), giving four emitter
-//! sites in total. `Partially fixed:`, `Would fix:`, `fix rejected:`, and the
-//! diagnostic-cap notice are gated at all four sites (single-file, directory-human,
-//! directory-JSON, stdin). `Fixed:` is emitted in single-file and both directory
-//! modes (both human and JSON); stdin emits `Partially fixed:` but no `Fixed:` —
-//! the fixed source on stdout is the signal. `Clean:` is single-file mode only;
-//! the directory summary is directory mode only.
-//! PF-004: these are separate emitters; a gate on one is not inherited by the others
-//! (the #43/#173 divergence class).
-//!
-//! Two messages deliberately bypass `--quiet` because they signal a silent-CI-green-pass
-//! hazard rather than status: the all-excluded diagnostic in [`run_lint_directory`] and
-//! the directory summary when any file is in the error or resource-limited bucket.
-//! A third emitter also bypasses `--quiet`: `output::collect_mds_files_inner`'s
-//! depth-limit warning (fires on trees deeper than MAX_DEPTH=64) accepts no quiet
-//! parameter — documented limitation per AC-Q05/PF-015, mirroring `build.rs`.
+//! Linting an input prints nothing: [`lint_input`] works out a [`FileReport`] (#173), and
+//! [`render`] shows it through the format's [`ResultSink`] (`lint_sink.rs`), which holds
+//! every status line and document lint shows for its inputs (#309). A run's exit code is
+//! [`run_lint`]'s return value, which `main` exits with. `tests/print_discipline.rs` holds
+//! lint's writer-macro calls, stdout writes and exits out of this file.
 //!
 //! # Diagnostic path anchors (directory-mode divergence, R3 / CWE-209)
 //!
@@ -54,7 +45,7 @@
 //! The two anchors differ, but both are safe: neither surface ever shows an
 //! absolute path (basename fallback outside the root).
 //!
-//! # Exit codes (via direct `std::process::exit`, NEVER via `exit_code()`)
+//! # Exit codes (returned by [`run_lint`] for `main`'s exit funnel, never `main`'s `exit_code()`)
 //!
 //! - 0: clean (no Warn/Error findings)
 //! - 1: warning-severity findings only, no errors
@@ -63,10 +54,20 @@
 //! - 3: ResourceLimit
 //!
 //! With `--fix`, residual post-fix findings determine the exit code.
+//!
+//! A closed stdout or stderr never changes the code. A stdout write that fails for
+//! another reason — the JSON report, a diff, the fixed source — is reported once as
+//! `mds::io`, and the funnel lifts the code to at least 2; in directory mode a file whose
+//! diff it lost counts under "with errors" (#157).
+//!
+//! A panic ends the run with 101 through the funnel (#389). A panic in an entry's
+//! analysis — `mds::lint` on a directory's entry, or the fix pipeline — fails that input
+//! alone: a directory counts it under "with errors" and goes on to its other entries.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -75,17 +76,22 @@ use miette::Result;
 
 use crate::build::{
     build_runtime_vars, emit_duplicate_var_warnings, ensure_existing_mds_file, load_config,
-    read_stdin, resolve_input, RuntimeVarArgs,
+    read_stdin, resolve_input, ProjectConfig, RuntimeVarArgs,
 };
+use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
-    relabel_stdin_error, render_unified_diff, safe_file_display, safe_inline, safe_path,
-    Durability, STDIN_DISPLAY_LABEL,
+    catch_compile, collect_mds_files_detailed, eprint_warning, render_unified_diff, safe_inline,
+    safe_path, Panicked, RootPaths, WriteTarget, STDIN_DISPLAY_LABEL,
 };
+use crate::write::{read_stamped, replace_if_unchanged, Durability};
 
 // AC-224-15: No local rule-name list. The single source of truth is
 // mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
 // No rule-name string literals from the registry appear in this directory.
+
+/// Why `mds lint --fix --format json -` is refused (`mds::io`, exit 2).
+const STDIN_FIX_JSON_REFUSAL: &str = "--fix --format json with stdin input is not supported; \
+     use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output";
 
 pub(crate) struct LintArgs {
     pub(crate) input: Option<PathBuf>,
@@ -119,23 +125,131 @@ struct LintFlags {
     format: LintFormat,
 }
 
-/// Entry point for `mds lint`. Always returns `Ok(())`; exits are via
-/// `std::process::exit()` for lint-specific codes, or via the outer `run()`
-/// error handler for setup failures (which also exit 2 via this function's catch).
-pub(crate) fn run_lint(args: LintArgs) -> Result<()> {
-    match do_lint(args) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Route through the single render choke point (avoids PF-004 /
-            // architecture-6: hand-rolled sanitize_control_chars bypass).
-            eprint_error(e);
-            std::process::exit(2);
+/// One input of `mds lint`, and the names lint shows for it (#173).
+///
+/// Stdin, a file argument and each file of a directory get their names here, so the
+/// three modes cannot drift into three conventions:
+///
+/// - [`display_label`](Self::display_label) — the name the input's diagnostics carry:
+///   each `diag.file`, hence the JSON `files[].file` key, and the name a human
+///   diagnostic frame renders the source under.
+/// - [`diff_label`](Self::diff_label) — the name a `--fix --diff` header shows.
+///
+/// The status lines that name the input — `Clean:`, `Fixed:`, `Partially fixed:`,
+/// `Would fix:`, and in a directory run `fix rejected:` and the cap notice — show the
+/// same text as the diff header, the path as typed or walked (#390), but the result sink
+/// (`lint_sink.rs`) spells it inside the writer macro, as [`STDIN_DISPLAY_LABEL`] or
+/// `safe_path` of the path, because the print-discipline guard accepts only an escape call
+/// or an allowlisted name there.
+pub(crate) enum LintSource<'a> {
+    /// `mds lint -`: the source comes from stdin and has no path.
+    Stdin,
+    /// `mds lint <file>`: the path as typed, and its file name.
+    File { typed: &'a Path, name: &'a str },
+    /// A file under `mds lint <dir>`: the directory argument, the path the walk produced
+    /// below it, and its key relative to it (see [`relative_display`]). A `--fix` rewrite
+    /// is anchored at `root` (#160).
+    DirEntry {
+        root: &'a Path,
+        path: &'a Path,
+        key: &'a str,
+    },
+}
+
+impl<'a> LintSource<'a> {
+    /// A file argument, named by its file name.
+    ///
+    /// `mds::io` when the path has no file name in UTF-8, which cannot happen once
+    /// `mds::lint` has accepted the path: [`ensure_existing_mds_file`] accepted it, so it
+    /// ends in a file name with the `.mds` extension, and `mds::lint` refuses a path that
+    /// is not valid UTF-8 before it reads anything. [`read_source_file`] is not enough:
+    /// it validates the canonical path it opens, not the path as typed.
+    fn file(typed: &'a Path) -> std::result::Result<Self, MdsError> {
+        let name = typed
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| MdsError::Io {
+                message: format!(
+                    "path has no UTF-8 file name: {}",
+                    mds::escape_path_for_message(&typed.to_string_lossy())
+                ),
+            })?;
+        Ok(Self::File { typed, name })
+    }
+
+    /// The name the input's diagnostics carry: [`STDIN_DISPLAY_LABEL`] for stdin, the
+    /// file name of a file argument, the root-relative key of a directory entry.
+    pub(crate) fn display_label(&self) -> &'a str {
+        match *self {
+            Self::Stdin => STDIN_DISPLAY_LABEL,
+            Self::File { name, .. } => name,
+            Self::DirEntry { key, .. } => key,
+        }
+    }
+
+    /// The name mds-core linted the input under, which decides whether it is a partial:
+    /// [`mds::STRING_SOURCE_MAP_LABEL`] for stdin (`mds::lint_str_with`'s name, never a
+    /// partial), and a file's file name — the last component of the path `mds::lint` was
+    /// given — for a file argument or a directory's entry. The [`ReverifyGate`] lints
+    /// every fix candidate under it (#309).
+    fn lint_name(&self) -> &'a str {
+        match *self {
+            Self::Stdin => mds::STRING_SOURCE_MAP_LABEL,
+            Self::File { name, .. } => name,
+            // The key joins the entry's path components below the directory argument
+            // with `/`, so its last segment is the path's file name.
+            Self::DirEntry { key, .. } => key.rsplit_once('/').map_or(key, |(_, name)| name),
+        }
+    }
+
+    /// The path the input is read from, as the user reaches it: `-` for stdin, the path
+    /// as typed for a file argument, the path the walk produced for a directory's entry.
+    fn path(&self) -> &'a Path {
+        match *self {
+            Self::Stdin => Path::new("-"),
+            Self::File { typed, .. } => typed,
+            Self::DirEntry { path, .. } => path,
+        }
+    }
+
+    /// The name a unified-diff header shows, escaped for a terminal:
+    /// [`STDIN_DISPLAY_LABEL`] for stdin, otherwise the path as typed or walked.
+    fn diff_label(&self) -> Cow<'a, str> {
+        match *self {
+            Self::Stdin => Cow::Borrowed(STDIN_DISPLAY_LABEL),
+            Self::File { typed, .. } => Cow::Owned(safe_path(typed)),
+            Self::DirEntry { path, .. } => Cow::Owned(safe_path(path)),
         }
     }
 }
 
-/// Inner runner — all setup errors propagate as `Err`; `run_lint` catches and exits 2.
-fn do_lint(args: LintArgs) -> Result<()> {
+/// Entry point for `mds lint`: run it, showing its results through the format's
+/// [`ResultSink`], and return the exit code, which `main` exits with (#309).
+pub(crate) fn run_lint(args: LintArgs) -> i32 {
+    let quiet = args.quiet;
+    match args.format {
+        LintFormat::Human => lint_through(args, &mut HumanSink::new(quiet)),
+        LintFormat::Json => lint_through(args, &mut JsonSink::new(quiet)),
+    }
+}
+
+/// [`run_lint`] through `sink`: a lint-specific exit code, or the exit of a setup failure,
+/// which the sink shows — as for an analysis failure, 3 for a resource limit (a `--vars`
+/// file over the size cap, #309) and 2 for any other error.
+fn lint_through(args: LintArgs, sink: &mut impl ResultSink) -> i32 {
+    match do_lint(args, sink) {
+        Ok(code) => code,
+        Err(e) => {
+            let code = e.downcast_ref::<MdsError>().map_or(2, mds_error_exit_code);
+            sink.setup_failed(e);
+            code
+        }
+    }
+}
+
+/// Inner runner — the run's exit code; every setup error propagates as `Err`, which
+/// [`lint_through`] shows.
+fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
     let LintArgs {
         input,
         fix,
@@ -163,19 +277,18 @@ fn do_lint(args: LintArgs) -> Result<()> {
     }) {
         Ok(r) => r,
         Err(e) => {
-            // R4 carve-out — scope: EXACTLY this one variant, nothing wider.
+            // Scope: EXACTLY this one variant, nothing wider.
             // A --set/--set-string collision is a usage error over runtime
             // VARIABLES, not an analysis failure: build/check/watch exit 1 for
             // it via `exit_code()`, so lint must not blanket-exit 2 for the
             // same mistake.  Downcast BEFORE any render call (`eprint_error`
-            // consumes the report).  Routing through
-            // emit_analysis_failure_json_or_stderr also gives --format json
-            // consumers the structured `mds::var_conflict` envelope (AC-F-14).
-            // Every OTHER setup error deliberately keeps the blanket exit 2
-            // in run_lint's catch.
+            // consumes the report).  Shown as an analysis failure, it gives
+            // --format json consumers the structured `mds::var_conflict` envelope.
+            // Every OTHER setup error exits through `lint_through`: 3 for a
+            // resource limit, 2 for any other.
             if let Some(mds_err @ MdsError::VarConflict { .. }) = e.downcast_ref::<MdsError>() {
-                emit_analysis_failure_json_or_stderr(mds_err, format, None);
-                std::process::exit(1);
+                sink.analysis_failure(mds_err, None);
+                return Ok(1);
             }
             return Err(e);
         }
@@ -185,48 +298,44 @@ fn do_lint(args: LintArgs) -> Result<()> {
 
     let (input, _auto_detected) = resolve_input(input, "lint")?;
 
-    // USAGE ERROR: --fix + --format json + stdin (AC-F-22b).
-    // DELIBERATE EXCEPTION (AC-F-14): the JSON envelope is deferred for this 3-way combo;
-    // it stays a plain stderr usage message. All other top-level analysis failures route
-    // through emit_analysis_failure_json_or_stderr when --format json is active.
+    // `mds lint --fix -` is a filter, whose product is the source on stdout, so
+    // `--format json` refuses it — shown as an analysis failure, the error document being
+    // the run's one document (#309). Stdin is not read.
     if fix && format == LintFormat::Json && input == Path::new("-") {
-        eprintln!(
-            "error: --fix --format json with stdin input is not supported; \
-             use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output"
-        );
-        std::process::exit(2);
+        let refusal = MdsError::Io {
+            message: STDIN_FIX_JSON_REFUSAL.to_string(),
+        };
+        return Ok(analysis_failed(sink, &refusal, None));
     }
 
     // Stdin mode.
     if input == Path::new("-") {
-        return run_lint_stdin(flags, runtime_vars);
+        return Ok(run_lint_stdin(flags, runtime_vars, sink));
     }
 
     // Directory mode.
     if input.is_dir() {
         // #413: the one directory-argument check every directory-mode subcommand makes
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`). A
-        // refusal is an analysis failure: the JSON envelope in --format json mode
-        // (AC-F-14), exit 2.
-        return match crate::input::resolve_directory_argument(&input) {
-            Ok(_) => run_lint_directory(&input, flags, runtime_vars),
+        // refusal is an analysis failure: the JSON envelope in --format json mode, exit 2.
+        return Ok(match crate::input::resolve_directory_argument(&input) {
+            Ok(_) => run_lint_directory(&input, flags, runtime_vars, sink),
             Err(mds_err) => {
-                emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-                std::process::exit(2);
+                sink.analysis_failure(&mds_err, None);
+                2
             }
-        };
+        });
     }
 
     // Single-file mode.
     // Check existence first, then extension (C4/F6): a non-existent path must report
     // mds::file_not_found, not mds::not_mds, regardless of the extension.
-    // Route through emit_analysis_failure_json_or_stderr so --format json produces the
-    // correct error envelope (L-CLI-JSON4 / AC-F-14). Do NOT use `?` here.
+    // Shown as an analysis failure, so --format json produces the error envelope. Do NOT
+    // use `?` here.
     if let Err(mds_err) = ensure_existing_mds_file(&input) {
-        emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-        std::process::exit(mds_error_exit_code(&mds_err));
+        return Ok(analysis_failed(sink, &mds_err, None));
     }
-    run_lint_file(&input, flags, runtime_vars)
+    Ok(run_lint_file(&input, flags, runtime_vars, sink))
 }
 
 // ── Config helpers ────────────────────────────────────────────────────────────
@@ -251,7 +360,9 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     let config_opt = load_config(dir)?;
     match config_opt {
         None => Ok(mds::LintConfig::default()),
-        Some((mds_config, _config_dir)) => {
+        Some(ProjectConfig {
+            config: mds_config, ..
+        }) => {
             // into_core_config returns (config, Option<UnknownRuleNames>) in one step —
             // structurally forcing the caller to handle the unknowns report so detection
             // cannot be accidentally skipped (review finding at config.rs:104).
@@ -311,12 +422,10 @@ fn emit_unknown_rule_warning(unknown: &mds::UnknownRuleNames, quiet: bool) {
 /// This function replaces the field with the caller-supplied relative path so
 /// the JSON output uses distinct, navigable paths.
 ///
-/// **AD-211-4 (stdin relabel):** also used for stdin mode — called with
-/// `STDIN_DISPLAY_LABEL` immediately after every `mds::lint_str_with` call so
-/// that `diag.file` in the JSON wire output reads `"<stdin>"` rather than the
-/// internal VFS key `"input.mds"` (`STRING_SOURCE_MAP_LABEL`).
-///
-/// Call this immediately after every `mds::lint` / `mds::lint_str_with` call.
+/// [`lint_input`] calls this on every input's findings, and [`run_fix_pipeline`] on every
+/// residual, with the input's [`LintSource::display_label`]. For stdin that is `<stdin>`, so `diag.file` in
+/// the JSON wire output reads `"<stdin>"` rather than the internal VFS key
+/// `"input.mds"` (`STRING_SOURCE_MAP_LABEL`).
 fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
     for diag in &mut result.diagnostics {
         diag.file = Some(display.to_string());
@@ -341,7 +450,7 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
 /// keeping array position consistent with the emitted key order (AC-P1-10).
 /// Error-only entries (`{"file": …, "error": …}`) bypass `to_canonical_json`
 /// and therefore its own `sanitize_control_chars_wire` pass; they are instead
-/// pre-sanitized at the push site via `file_key` — so both diagnostic and
+/// pre-sanitized by the result sink's `error_entry` — so both diagnostic and
 /// error-only entry types carry identically-sanitized `file` values (ADR-008).
 ///
 /// Forward slashes (`/`, 0x2F) are used instead of
@@ -362,8 +471,8 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
     let escapes = || MdsError::Io {
         message: format!(
             "path escapes lint root {}: {}",
-            root.display(),
-            path.display()
+            safe_path(root),
+            safe_path(path)
         ),
     };
     let rel = path.strip_prefix(root).map_err(|_| escapes())?;
@@ -377,8 +486,10 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
         };
         // Same wording as `read_source_file`'s non-UTF-8 rejection, which is what a
         // per-file read of this entry would have produced before the run-level check.
+        // Escaped: every key is built before any entry is read, so no per-file refusal
+        // of a forbidden character stands in front of this message (#390).
         let name = name.to_str().ok_or_else(|| MdsError::Io {
-            message: format!("path is not valid UTF-8: {}", path.display()),
+            message: format!("path is not valid UTF-8: {}", safe_path(path)),
         })?;
         if !out.is_empty() {
             out.push('/');
@@ -394,8 +505,8 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
 ///
 /// Shared by `mds lint` and `mds fmt`, which both need the RAW source text rather
 /// than a compiled result. Returns `MdsError` (not `miette::Error`) so callers can
-/// feed the error into `emit_analysis_failure_json_or_stderr` without downcasting
-/// (AC-F-14).
+/// show the error as an analysis failure — the JSON envelope under `--format json` —
+/// without downcasting.
 pub(crate) fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
     let canonical = NativeFs::check_symlink(path)?;
     read_canonical_source(&canonical, path)
@@ -409,76 +520,11 @@ pub(crate) fn read_source_file(path: &Path) -> std::result::Result<String, MdsEr
 /// it is reported, not swallowed (PF-004) — `mds::io`, exit 2.
 fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<String, MdsError> {
     let path_str = canonical.to_str().ok_or_else(|| MdsError::Io {
-        message: format!("path is not valid UTF-8: {}", path.display()),
+        message: format!("path is not valid UTF-8: {}", safe_path(path)),
     })?;
     let fs = NativeFs::new();
     fs.anchor_base_dir(&effective_parent(canonical).display().to_string())?;
     fs.read(path_str)
-}
-
-// ── stdout write ──────────────────────────────────────────────────────────────
-
-/// Write `s` to stdout, treating a broken pipe as a clean early exit rather
-/// than an error — matches Unix filter conventions (e.g. `mds lint --fix - | head
-/// -n1` closing the pipe early must not surface as a crash or failure).
-/// Flushes explicitly so a fixed source not ending in `\n` is never silently
-/// truncated before the `std::process::exit` that may follow immediately.
-fn write_stdout(s: &str) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    if let Err(e) = stdout.write_all(s.as_bytes()) {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
-        }
-        return Err(miette::miette!("cannot write to stdout: {e}"));
-    }
-    if let Err(e) = stdout.flush() {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(miette::miette!("cannot flush stdout: {e}"));
-        }
-    }
-    Ok(())
-}
-
-// ── Human diagnostic rendering ────────────────────────────────────────────────
-
-/// Render one lint diagnostic to stderr. All user-controlled text — message, help,
-/// filename, and source — is sanitized at the input boundary so miette renders from
-/// safe inputs; the frame itself is not post-processed (PF-014).
-///
-/// `--quiet` suppresses Warn and Info; Error always renders.
-/// `named_source`: `(filename, source_text)` pair for span context rendering.
-///
-/// Sanitization strategy (PF-014):
-/// - message/help: HUMAN-mode `sanitize_control_chars` → \\uXXXX escapes. `\n` is
-///   preserved so a multi-line diagnostic frame keeps rendering.
-/// - filename + source: `mds::named_source_for_render`, the shared boundary
-///   `MdsError::at()` and the formatter also use — WIRE-mode escaping for the
-///   single-line filename, byte-length-preserving neutralization for the span-indexed
-///   source so miette's byte-offset slices stay valid.
-///
-/// The rendered miette frame is NOT post-processed, so miette's own SGR colour codes
-/// are never corrupted.
-fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: (&str, &str)) {
-    if quiet && matches!(diag.severity, Severity::Info | Severity::Warn) {
-        return;
-    }
-    // Sanitize message and help at the input boundary via the core method.
-    // fix_removals/fix_edits are set to None inside sanitized_for_render to avoid
-    // unnecessary allocations (architecture-3 / rust-1).
-    let sanitized = diag.sanitized_for_render();
-    let (filename, src) = named_source;
-    let report = miette::Report::from(sanitized)
-        .with_source_code(mds::named_source_for_render(filename, src));
-    eprint_error(report);
-}
-
-/// Render all diagnostics in a `LintResult` to stderr.
-///
-/// `named_source` is forwarded to `render_diag_human` for span context rendering.
-fn render_result_human(result: &mds::LintResult, quiet: bool, named_source: (&str, &str)) {
-    for diag in &result.diagnostics {
-        render_diag_human(diag, quiet, named_source);
-    }
 }
 
 // ── Exit code helpers ─────────────────────────────────────────────────────────
@@ -517,34 +563,18 @@ fn mds_error_exit_code(err: &MdsError) -> i32 {
     }
 }
 
-/// Exit the process with the severity-derived lint exit code when non-zero;
-/// no-op for clean (`exit == 0`) results.
+// ── Fix pipeline ──────────────────────────────────────────────────────────────
+
+/// What the `--fix` pipeline made of one input's findings (#173).
 ///
-/// Exit codes: 0 clean / 1 warn-only / 2 error-or-analysis-failure / 3 resource-limit.
-fn exit_by_severity(result: &mds::LintResult) {
-    let exit = result_exit_code(result);
-    if exit != 0 {
-        std::process::exit(exit);
-    }
-}
-
-/// Exit code for a preview (`--fix --check` / `--fix --diff`) that WOULD change
-/// the file: `max(1, residual severity)` (R1, binding rule).
-///
-/// The floor of 1 signals "fixes pending" (the `--check` CI contract); residual
-/// error-severity findings that `--fix` could not remove raise it to 2, so the
-/// preview never reports success-shaped exit codes for a tree the real `--fix`
-/// would leave failing.  The residual can never EXCEED the pre-fix severity —
-/// the reverify gate refuses edits that add findings — so the pre-fix body the
-/// preview emits and the residual-derived exit cannot contradict each other.
-fn preview_exit_code(residual: &mds::LintResult) -> i32 {
-    result_exit_code(residual).max(1)
-}
-
-// ── Fix pipeline helpers ──────────────────────────────────────────────────────
-
-/// Outcome of the `--fix` pipeline for one file.
-enum FixFileOutcome {
+/// `--fix` and its preview (`--fix --check` / `--fix --diff`) read the same outcome of the
+/// same pipeline, so they cannot disagree about what a fix would do. `--fix` writes the
+/// source of `Fixed` and `PartiallyFixed`; the preview reads either of them as "would
+/// fix", shows the would-be source in `--diff`, and takes its exit code from the residual
+/// ([`InputVerdict::exit_code`]). After `Rejected` and `NothingToFix`, the findings the
+/// pipeline was given stand.
+enum FixPipelineOutcome {
+    /// Every planned edit applied.
     Fixed {
         new_source: String,
         residual: mds::LintResult,
@@ -554,130 +584,159 @@ enum FixFileOutcome {
     /// Produced when `apply_fixes_incremental` falls back to the per-edit path and not
     /// all edits pass. The `new_source` is the partially-fixed text; `residual` carries
     /// remaining diagnostics (from the last successful per-edit reverify).
-    /// `applied_count` / `total_count` are used for the summary line.
+    /// `applied_count` / `total_count` are used for the `--fix` summary line.
     PartiallyFixed {
         new_source: String,
         residual: mds::LintResult,
         applied_count: usize,
         total_count: usize,
     },
-    Rejected {
-        reason: String,
-        original: mds::LintResult,
-    },
-    NothingToFix {
-        original: mds::LintResult,
-    },
+    /// No edit applied: the plan was refused (e.g. an overlap), or every candidate was.
+    /// Carries the human-readable reason.
+    Rejected { reason: String },
+    /// No fixable edit, and no overlap.
+    NothingToFix,
 }
 
-/// Run the `--fix` pipeline for a single file's lint result.
+/// The check every candidate source must pass before the fix pipeline accepts it, in
+/// `--fix` and its preview alike.
 ///
-/// `base_dir` is the file's parent (for reverify recompile).
+/// [`verify`](Self::verify) lints each candidate with `mds::lint_str_named` under the
+/// name the original was linted under ([`LintSource::lint_name`]), so a partial's
+/// candidate is linted as a partial and its findings compare with the original's (#309).
+/// It refuses a candidate that cannot be linted — one that no longer resolves — and, when
+/// every planned edit is output-neutral
+/// (`mds::fix::is_output_neutral`) and the original source compiles, one whose compiled
+/// output differs from the original's. Otherwise it returns the candidate's findings, and
+/// `mds::fix::apply_fixes_incremental` refuses a candidate that has more findings than the
+/// original for a rule the plan does not target.
 ///
-/// `display_label` is the caller-supplied display path (relative, forward-slash-normalised)
-/// written into every `diag.file` in residual results via `set_diag_display_path`; it
-/// becomes the `files[].file` wire key after `to_canonical_json` applies
-/// `sanitize_control_chars_wire`.  This is the value that appears in the JSON wire output
-/// and must be pre-sanitized by the caller for error-envelope entries that bypass
-/// `to_canonical_json`.
-///
-/// ## Reverify gate (AC-F-20)
-///
-/// The reverify closure checks three conditions:
-/// 1. Recompile-success — fixed source must still compile.
-/// 2. No-new-untargeted-diagnostics — edit must not introduce new problems.
-/// 3. Output byte-equality — when the original source is standalone-compilable,
-///    compiled output of the fixed source must be byte-identical to the original.
-///
-/// If the original source does not compile (e.g. missing runtime vars), the
-/// output-diff is skipped — conditions 1 and 2 still apply, and Tier B is
-/// already suggestion-only (non-standalone) in that scenario.
-fn plan_and_apply_fixes(
-    result: mds::LintResult,
-    source: &str,
-    base_dir: &Path,
-    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
-    config: &mds::LintConfig,
-    display_label: &str,
-) -> FixFileOutcome {
-    let is_standalone = result.is_standalone;
-    let plan = mds::fix::plan_fixes_with_options(&result, source, is_standalone);
+/// When the original does not compile (e.g. it needs runtime vars) the output check is
+/// skipped; the other checks still apply, and Tier B is already suggestion-only for such
+/// a source (it is not standalone). `legacy-interpolation` edits change compiled output
+/// on purpose — they turn plain `{x}` text into `{{x}}` interpolation — so a plan with any
+/// such edit skips the output check for every edit in it.
+struct ReverifyGate<'a> {
+    /// The name each candidate is linted under: the original's.
+    name: &'a str,
+    base_dir: &'a Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    config: &'a mds::LintConfig,
+    /// The original source's compiled output when the output check applies; `None` when
+    /// the plan changes output on purpose or the original does not compile.
+    original_output: Option<mds::CompiledOutput>,
+}
 
-    // Treat overlap_rejected as "something to do" — don't short-circuit as NothingToFix
-    // when edits were rejected due to overlap.  The incremental fallback (per-edit retry)
-    // handles individual edits that survive the overlap check.
-    if plan.edits.is_empty() && !plan.overlap_rejected {
-        return FixFileOutcome::NothingToFix { original: result };
+impl<'a> ReverifyGate<'a> {
+    /// The gate for `plan`'s candidates of `source`, which are linted under `name` and
+    /// resolve against `base_dir`.
+    fn new(
+        plan: &mds::fix::FixPlan,
+        source: &str,
+        name: &'a str,
+        base_dir: &'a Path,
+        runtime_vars: Option<HashMap<String, mds::Value>>,
+        config: &'a mds::LintConfig,
+    ) -> Self {
+        let all_output_neutral = plan
+            .edits
+            .iter()
+            .all(|e| mds::fix::is_output_neutral(&e.rule));
+        let original_output =
+            mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
+                .ok()
+                .map(|r| r.output)
+                .filter(|_| all_output_neutral);
+        Self {
+            name,
+            base_dir,
+            runtime_vars,
+            config,
+            original_output,
+        }
     }
 
-    // Capture total edit count before moving plan into apply_fixes_incremental.
-    // Used to compute the "{applied} of {total}" summary for PartiallyFixed output.
-    let total_edits = plan.edits.len();
-
-    // `legacy-interpolation` edits intentionally change compiled output (they migrate
-    // `{x}` plain-text to `{{x}}` interpolation).  When the plan contains any such
-    // edit, the output byte-equality gate below must be skipped — it only applies to
-    // output-neutral fixes (dup-import removal, empty-block removal, etc.).
-    let all_output_neutral = plan
-        .edits
-        .iter()
-        .all(|e| mds::fix::is_output_neutral(&e.rule));
-
-    // AC-F-20 output-delta baseline: compile the original source once.
-    // If it fails (e.g. missing runtime vars at eval time), skip the output-diff —
-    // existing gates (recompile-success, no-new-diagnostics) still apply.
-    let original_output =
-        mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
-            .ok()
-            .map(|r| r.output);
-
-    let base_dir_owned = base_dir.to_path_buf();
-    let config_clone = config.clone();
-    // apply_fixes_incremental requires F: Fn (not FnOnce) — the reverify closure
-    // may be called up to plan.edits.len()+1 times (batch attempt + per-edit fallback).
-    // All captured variables are either borrowed (&) or cloned inside, so the closure
-    // satisfies Fn without any extra effort.
-    let outcome = mds::fix::apply_fixes_incremental(source, plan, &result, |fixed| {
-        let residual = mds::lint_str_with(
-            fixed,
-            Some(&base_dir_owned),
-            runtime_vars.clone(),
-            &config_clone,
+    /// The candidate's findings, or the reason it is refused. `apply_fixes_incremental`
+    /// calls it for the whole plan and, when that candidate is refused, for each edit on
+    /// its own.
+    fn verify(&self, candidate: &str) -> std::result::Result<mds::LintResult, MdsError> {
+        let residual = mds::lint_str_named(
+            candidate,
+            Some(self.base_dir),
+            self.runtime_vars.clone(),
+            self.config,
+            self.name,
         )?;
-
-        // AC-F-20 output byte-equality gate: refuse if the fix changes compiled output.
-        // Skipped when the plan contains any output-changing rule (currently only
-        // `legacy-interpolation`) — those fixes intentionally alter compiled output
-        // and the gate would always reject them.
-        if all_output_neutral {
-            if let Some(ref orig_out) = original_output {
-                match mds::compile_str_collecting_warnings(
-                    fixed,
-                    Some(&base_dir_owned),
-                    runtime_vars.clone(),
-                ) {
-                    Ok(fixed_compile) if fixed_compile.output != *orig_out => {
-                        return Err(MdsError::Io {
-                            message: "lint --fix would change compiled output; \
-                                      edit reverted to preserve template semantics"
-                                .to_string(),
-                        });
-                    }
-                    _ => {} // outputs match, or fixed source didn't compile (lint_str_with caught it)
+        if let Some(original_output) = &self.original_output {
+            match mds::compile_str_collecting_warnings(
+                candidate,
+                Some(self.base_dir),
+                self.runtime_vars.clone(),
+            ) {
+                Ok(compiled) if compiled.output != *original_output => {
+                    return Err(MdsError::Io {
+                        message: "lint --fix would change compiled output; \
+                                  edit reverted to preserve template semantics"
+                            .to_string(),
+                    });
                 }
+                // Same output, or the candidate does not compile (the lint above refused
+                // that already).
+                _ => {}
             }
         }
-
         Ok(residual)
-    });
+    }
+}
+
+/// Run the fix pipeline over `input`'s findings: plan the edits, pass the candidates
+/// through the [`ReverifyGate`], and apply the edits it accepts to `source` in memory.
+/// Nothing is written here: `--fix` writes the outcome's source, and its preview shows
+/// it (see [`FixPipelineOutcome`]).
+///
+/// `result` is `input`'s lint result, relabelled with [`LintSource::display_label`];
+/// every residual diagnostic gets the same label through [`set_diag_display_path`], in
+/// place of the [`LintSource::lint_name`] the gate lints a candidate under. It becomes the
+/// JSON `files[].file` key once `to_canonical_json` applies
+/// `sanitize_control_chars_wire`. `base_dir` is what a candidate resolves against: the
+/// file's parent, or the working directory for stdin.
+fn run_fix_pipeline(
+    input: &LintSource<'_>,
+    result: &mds::LintResult,
+    source: &str,
+    base_dir: &Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    config: &mds::LintConfig,
+) -> FixPipelineOutcome {
+    let plan = mds::fix::plan_fixes_with_options(result, source, result.is_standalone);
+
+    // An overlap clears the plan's edits, yet it is not "nothing to fix":
+    // `apply_fixes_incremental` reports it as a rejection.
+    if plan.edits.is_empty() && !plan.overlap_rejected {
+        return FixPipelineOutcome::NothingToFix;
+    }
+
+    // Counted before the plan moves into `apply_fixes_incremental`, for the
+    // "{applied} of {total}" summary of a partial fix.
+    let total_edits = plan.edits.len();
+    let gate = ReverifyGate::new(
+        &plan,
+        source,
+        input.lint_name(),
+        base_dir,
+        runtime_vars,
+        config,
+    );
+    let outcome =
+        mds::fix::apply_fixes_incremental(source, plan, result, |candidate| gate.verify(candidate));
 
     match outcome {
         mds::fix::FixOutcome::Fixed {
             source: new_source,
             mut residual,
         } => {
-            set_diag_display_path(&mut residual, display_label);
-            FixFileOutcome::Fixed {
+            set_diag_display_path(&mut residual, input.display_label());
+            FixPipelineOutcome::Fixed {
                 new_source,
                 residual,
             }
@@ -687,148 +746,700 @@ fn plan_and_apply_fixes(
             mut residual,
             rejected,
         } => {
-            set_diag_display_path(&mut residual, display_label);
-            FixFileOutcome::PartiallyFixed {
+            set_diag_display_path(&mut residual, input.display_label());
+            FixPipelineOutcome::PartiallyFixed {
                 new_source,
                 residual,
                 applied_count: total_edits - rejected.len(),
                 total_count: total_edits,
             }
         }
-        mds::fix::FixOutcome::Rejected { source: _, reason } => FixFileOutcome::Rejected {
-            reason,
-            original: result,
-        },
-        mds::fix::FixOutcome::NothingToFix => FixFileOutcome::NothingToFix { original: result },
-        // FixOutcome is #[non_exhaustive]: a wildcard arm is required when
-        // matching from outside mds-core.  New variants added in future
-        // releases should be plumbed here; until then, treat them as no-ops.
-        _ => FixFileOutcome::NothingToFix { original: result },
+        mds::fix::FixOutcome::Rejected { reason, .. } => FixPipelineOutcome::Rejected { reason },
+        mds::fix::FixOutcome::NothingToFix => FixPipelineOutcome::NothingToFix,
+        // `FixOutcome` is `#[non_exhaustive]`, so a match outside mds-core needs a
+        // wildcard arm. A new variant counts as nothing to fix until it is plumbed here.
+        _ => FixPipelineOutcome::NothingToFix,
     }
 }
 
-/// Outcome of the preview fix pipeline (`--fix --check` / `--fix --diff`).
-///
-/// Distinguishes "would fix", "rejected by reverify gate", and "nothing to fix"
-/// so that callers can surface rejection reasons in `--fix --check` output
-/// (PF-004: preview must use the same gated pipeline as apply and be equally honest
-/// about outcomes).
-enum PreviewOutcome {
-    /// At least one edit would be applied.  Carries the would-be fixed source
-    /// (for `--diff` rendering) and the residual post-fix [`mds::LintResult`]
-    /// (for the R1 preview exit code — `preview_exit_code(&residual)`).
-    WouldFix {
-        fixed: String,
-        residual: mds::LintResult,
+// ── One input ─────────────────────────────────────────────────────────────────
+
+/// An input lint has read and linted, for [`lint_input`].
+struct Linted<'a> {
+    input: LintSource<'a>,
+    /// What a fixed source resolves against: the file's parent, or the working directory
+    /// for stdin.
+    base_dir: &'a Path,
+    config: Rc<mds::LintConfig>,
+    source: SourceText<'a>,
+    /// The findings, still named as `mds::lint` or `mds::lint_str_with` named them.
+    result: mds::LintResult,
+}
+
+/// An input's source text, or the file to read it from once it is needed.
+enum SourceText<'a> {
+    Read(String),
+    /// An entry of a directory under `--format json`. `mds::lint` reads the file itself,
+    /// so the text is read only to fix it (see [`lint_input`]).
+    Unread(&'a Path),
+}
+
+impl SourceText<'_> {
+    /// The text, when it has been read.
+    fn into_text(self) -> Option<String> {
+        match self {
+            Self::Read(text) => Some(text),
+            Self::Unread(_) => None,
+        }
+    }
+
+    /// The text, read now when it was not read before.
+    fn read(self) -> std::result::Result<String, MdsError> {
+        match self {
+            Self::Read(text) => Ok(text),
+            Self::Unread(path) => read_source_file(path),
+        }
+    }
+}
+
+/// An input's exit-code category: what it leaves behind — its findings, the residual
+/// `--fix` leaves or would leave, or its failure. A directory's summary counts one per
+/// file, and the directory exits with the worst.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum FileTally {
+    #[default]
+    Clean = 0,
+    WarnOnly = 1,
+    Error = 2,
+    ResourceLimit = 3,
+}
+
+impl FileTally {
+    fn exit_code(self) -> i32 {
+        self as i32
+    }
+}
+
+fn tally_from_result(result: &mds::LintResult) -> FileTally {
+    match result_exit_code(result) {
+        2 => FileTally::Error,
+        1 => FileTally::WarnOnly,
+        _ => FileTally::Clean,
+    }
+}
+
+/// The tally of an input refused before it had findings — its source read or `mds::lint`:
+/// resource-limited for `mds::resource_limit`, "with errors" for any other refusal.
+fn failure_tally(e: &MdsError) -> FileTally {
+    if matches!(e, MdsError::ResourceLimit { .. }) {
+        FileTally::ResourceLimit
+    } else {
+        FileTally::Error
+    }
+}
+
+/// What one input came to — or, merged, a whole directory.
+#[derive(Clone, Copy, Default)]
+struct InputVerdict {
+    tally: FileTally,
+    /// A `--fix` preview found something to fix.
+    would_fix: bool,
+    /// The findings the input is left with stopped at the diagnostic cap
+    /// ([`Outcome::truncated`]).
+    truncated: bool,
+}
+
+impl InputVerdict {
+    /// The exit code of a run over this input alone: its tally's, raised to 1 when a
+    /// preview would fix something — the `--fix --check` CI contract. A residual error the
+    /// fix could not remove keeps it at 2, so a preview never reports success for a file
+    /// the real `--fix` would leave failing. The residual never exceeds the findings the
+    /// preview shows, because the fix pipeline refuses an edit that adds findings.
+    fn exit_code(self) -> i32 {
+        let code = self.tally.exit_code();
+        if self.would_fix {
+            code.max(1)
+        } else {
+            code
+        }
+    }
+
+    /// Both verdicts as one: the worse tally, and a pending fix or a cap in either.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            tally: self.tally.max(other.tally),
+            would_fix: self.would_fix || other.would_fix,
+            truncated: self.truncated || other.truncated,
+        }
+    }
+}
+
+/// A directory run's summary, folded from its files' verdicts (#309): how many files came
+/// to each tally — the counts its summary line shows — and the verdict of the whole run.
+/// Every file adds exactly one verdict, so the counts add up to the files linted.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DirSummary {
+    pub(crate) clean_count: usize,
+    pub(crate) warn_file_count: usize,
+    pub(crate) error_file_count: usize,
+    pub(crate) limit_file_count: usize,
+    verdict: InputVerdict,
+}
+
+impl DirSummary {
+    /// The summary with one more file's verdict counted.
+    fn count(mut self, verdict: InputVerdict) -> Self {
+        // Exhaustive: a new tally is a compile error here, never a file left uncounted.
+        match verdict.tally {
+            FileTally::Clean => self.clean_count += 1,
+            FileTally::WarnOnly => self.warn_file_count += 1,
+            FileTally::Error => self.error_file_count += 1,
+            FileTally::ResourceLimit => self.limit_file_count += 1,
+        }
+        self.verdict = self.verdict.merge(verdict);
+        self
+    }
+
+    /// Whether the findings any file is left with stopped at the diagnostic cap: the
+    /// directory document's `truncated`.
+    fn truncated(&self) -> bool {
+        self.verdict.truncated
+    }
+
+    /// The directory's exit code: the worst file's tally, raised to 1 when a preview would
+    /// fix any file ([`InputVerdict::exit_code`]).
+    fn exit_code(&self) -> i32 {
+        self.verdict.exit_code()
+    }
+}
+
+/// Show `error`, which stops a run over stdin or a file argument before its input is
+/// linted, and return the run's exit code. `stdin_source` relabels a stdin source, as
+/// [`ResultSink::analysis_failure`] describes.
+fn analysis_failed(
+    sink: &mut impl ResultSink,
+    error: &MdsError,
+    stdin_source: Option<&str>,
+) -> i32 {
+    sink.analysis_failure(error, stdin_source);
+    mds_error_exit_code(error)
+}
+
+/// What linting one input came to, as plain data (#309): worked out without printing
+/// anything by [`lint_input`] — or, for an entry of a directory that could not be linted,
+/// by [`lint_dir_entry`] — and shown by [`render`].
+struct FileReport<'a> {
+    input: LintSource<'a>,
+    /// When the input's own findings stopped at the diagnostic cap, the notice [`render`]
+    /// announces it with — whatever a fix leaves; `None` under the cap.
+    capped: Option<CapNotice>,
+    outcome: Outcome,
+}
+
+/// The diagnostic-cap notice an input whose own findings stopped at the cap gets: whether
+/// it advises re-running `--fix` (#309).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CapNotice {
+    /// A report or a `--fix --check` / `--fix --diff` preview, which writes nothing: the
+    /// notice says the findings were suppressed, and no more.
+    Plain,
+    /// `--fix`, which writes its fix: a re-run lints the fixed source, past the findings
+    /// this run stopped at, so the notice advises it.
+    RerunFix,
+}
+
+impl CapNotice {
+    /// The notice for a run with `flags`: `--fix` without `--check` or `--diff` advises
+    /// re-running it.
+    fn for_mode(flags: LintFlags) -> Self {
+        if flags.fix && !flags.check && !flags.diff {
+            Self::RerunFix
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+/// The findings an input has to show, and what `--fix` made of them.
+enum Outcome {
+    /// Without `--fix`: the input's findings, and the text they index when it was read — an
+    /// entry of a directory under `--format json` is not read to report its findings.
+    Reported {
+        findings: mds::LintResult,
+        text: Option<String>,
     },
-    /// Every edit was refused by the reverify gate (overlap or recompile failure);
-    /// contains the human-readable rejection reason.
-    Rejected(String),
-    /// No fixable edits exist or the plan is empty with no overlap.
-    NothingToFix,
+    /// An entry of a directory that could not be linted — or, under `--format json`, read to
+    /// fix it — and the tally it counts under.
+    Failed { error: MdsError, tally: FileTally },
+    /// The input's analysis panicked: `mds::lint` on an entry of a directory, or the fix
+    /// pipeline on any input. The panic hook reported it, and the run will exit 101
+    /// (#389); the input counts under "with errors".
+    Panicked,
+    /// `--fix --check` / `--fix --diff`: the input's findings, the text they index, and what
+    /// `--fix` would do. The findings shown stay the input's own: what is wrong now.
+    Previewed {
+        findings: mds::LintResult,
+        text: String,
+        fix: PreviewFix,
+    },
+    /// `--fix` on a file argument or an entry of a directory: the input's findings, the text
+    /// they index — the text as it was read — and what became of its file, which carries the
+    /// findings a fix leaves together with the fixed text they index.
+    Rewritten {
+        findings: mds::LintResult,
+        text: String,
+        fix: Rewrite,
+    },
+    /// `mds lint --fix -`, a filter: the source it emits — fixed, or as given — the findings
+    /// that source is left with, and what the fix did.
+    Filtered {
+        findings: mds::LintResult,
+        output: String,
+        fix: FilterFix,
+    },
 }
 
-/// Run the fix pipeline in preview mode (for `--fix --check` / `--fix --diff`).
-///
-/// Routes through the same gated pipeline as the write path — plan, reverify, and
-/// apply — but does NOT write to disk.  Returns [`PreviewOutcome::WouldFix`] with
-/// the would-be fixed source AND the residual post-fix result when at least one
-/// edit would be applied; [`PreviewOutcome::Rejected`] with the rejection reason
-/// when the reverify gate refused every edit; [`PreviewOutcome::NothingToFix`]
-/// when the plan is empty.
-///
-/// `display_label` mirrors the `plan_and_apply_fixes` contract: it is written
-/// into every residual `diag.file` via `set_diag_display_path` so the residual
-/// carries the same display path as the write path's residual would (R1) —
-/// without it the residual would leak the basename / `STRING_SOURCE_MAP_LABEL`
-/// that `mds::lint_str_with` sets internally.
-///
-/// ADR-004 / PF-004: preview must use the same gated pipeline as apply so that
-/// `--diff` shows exactly what `--fix` would write, and the preview exit code
-/// reflects what a real `--fix` run would leave behind (R1:
-/// `max(1 if fixes pending, residual severity)` — see [`preview_exit_code`]).
-/// The `Rejected` variant gives `--fix --check` the same honesty as `--fix`
-/// (which prints "fix rejected: …" on refusal).
-fn preview_fixes(
-    result: &mds::LintResult,
-    source: &str,
-    base_dir: &Path,
-    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
-    config: &mds::LintConfig,
-    display_label: &str,
-) -> PreviewOutcome {
-    let is_standalone = result.is_standalone;
-    let plan = mds::fix::plan_fixes_with_options(result, source, is_standalone);
+impl Outcome {
+    /// Whether the findings the input is left with stopped at the diagnostic cap — its
+    /// JSON document's `truncated`, in every mode (#309): its own findings when nothing is
+    /// fixed, the findings a fix leaves, or — in a preview, which shows the input's own
+    /// findings — those its fix would leave. An input the output records as a failure is
+    /// left with no findings there, so it is never truncated.
+    fn truncated(&self) -> bool {
+        match self {
+            Outcome::Reported { findings, .. } | Outcome::Filtered { findings, .. } => {
+                findings.truncated
+            }
+            Outcome::Failed { .. } | Outcome::Panicked => false,
+            Outcome::Previewed { findings, fix, .. } => match fix {
+                PreviewFix::Pending { residual, .. } => residual.truncated,
+                PreviewFix::Refused { .. } | PreviewFix::Nothing => findings.truncated,
+            },
+            Outcome::Rewritten { findings, fix, .. } => match fix {
+                Rewrite::Refused { .. } | Rewrite::Unchanged => findings.truncated,
+                Rewrite::Written { residual, .. } => residual.findings.truncated,
+                Rewrite::WriteFailed { residual, .. } => residual
+                    .as_ref()
+                    .is_some_and(|residual| residual.findings.truncated),
+            },
+        }
+    }
+}
 
-    if plan.edits.is_empty() && !plan.overlap_rejected {
-        return PreviewOutcome::NothingToFix;
+/// What `--fix` would do, in a preview.
+enum PreviewFix {
+    /// A fix is pending: the residual it would leave, its diff under `--diff`, and whether
+    /// `--check` announces it.
+    Pending {
+        residual: mds::LintResult,
+        diff: Option<String>,
+        check: bool,
+    },
+    /// The reverify gate refused the fix.
+    Refused { reason: String },
+    /// Nothing to fix.
+    Nothing,
+}
+
+/// What `--fix` did to an input's file.
+enum Rewrite {
+    /// The reverify gate refused the fix; the findings stand.
+    Refused { reason: String },
+    /// Nothing to fix; the findings stand.
+    Unchanged,
+    /// The fixed source was written. `residual` is what it is left with; `partial` holds the
+    /// applied and planned edit counts when not every edit applied.
+    Written {
+        residual: Residual,
+        partial: Option<(usize, usize)>,
+    },
+    /// The fixed source could not be written. `residual` is what it would have been left
+    /// with, shown before the failure in a human report. A JSON output records each input
+    /// once, its findings or its failure — a directory's entry, a file argument's document
+    /// — so there the failure is the record, and `residual` is `None` (#309).
+    WriteFailed {
+        error: MdsError,
+        residual: Option<Residual>,
+    },
+}
+
+/// The findings a fixed source is left with, and that source: the text their spans index
+/// (#309). They are shown over it, never over the source as it was read, where a removed
+/// block would move every finding below it.
+struct Residual {
+    findings: mds::LintResult,
+    fixed: String,
+}
+
+/// What `mds lint --fix -` did to the source.
+enum FilterFix {
+    /// Fixed; `partial` holds the applied and planned edit counts when not every edit
+    /// applied.
+    Fixed { partial: Option<(usize, usize)> },
+    /// The reverify gate refused the fix; the source goes out as given.
+    Refused { reason: String },
+    /// Nothing to fix; the source goes out as given.
+    Unchanged,
+}
+
+/// Lint one input — stdin, a file argument or an entry of a directory — the one way every
+/// mode shares (#173), and work out what it came to without printing anything (#309):
+/// name its findings for the input, then report them, or run them through
+/// [`run_fix_pipeline`] and preview `--fix` ([`preview_fix`]), apply it ([`apply_fix`]) or
+/// filter stdin through it ([`fix_stdin`]). [`render`] shows the report.
+///
+/// Each mode loads its input in its own order before this, and acts on the verdict
+/// [`render`] returns: stdin and a file argument exit with [`InputVerdict::exit_code`], a
+/// directory counts it in its summary.
+fn lint_input<'a>(
+    linted: Linted<'a>,
+    flags: LintFlags,
+    runtime_vars: &Option<HashMap<String, mds::Value>>,
+) -> FileReport<'a> {
+    let Linted {
+        input,
+        base_dir,
+        config,
+        source,
+        mut result,
+    } = linted;
+
+    // Every finding carries the input's name — each `diag.file`, hence the JSON
+    // `files[].file` key — rather than the name `mds::lint` gave it.
+    set_diag_display_path(&mut result, input.display_label());
+    let capped = result.truncated.then_some(CapNotice::for_mode(flags));
+
+    if !flags.fix {
+        let outcome = Outcome::Reported {
+            findings: result,
+            text: source.into_text(),
+        };
+        return FileReport {
+            input,
+            capped,
+            outcome,
+        };
     }
 
-    // Same output-neutral check as plan_and_apply_fixes: skip the equality gate when
-    // the plan contains any output-changing rule (e.g. legacy-interpolation).
-    let all_output_neutral = plan
-        .edits
-        .iter()
-        .all(|e| mds::fix::is_output_neutral(&e.rule));
-
-    let original_output =
-        mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
-            .ok()
-            .map(|r| r.output);
-
-    let base_dir_owned = base_dir.to_path_buf();
-    let config_clone = config.clone();
-    let outcome = mds::fix::apply_fixes_incremental(source, plan, result, |fixed| {
-        let residual = mds::lint_str_with(
-            fixed,
-            Some(&base_dir_owned),
-            runtime_vars.clone(),
-            &config_clone,
-        )?;
-
-        // Output byte-equality gate — skipped for output-changing rules.
-        if all_output_neutral {
-            if let Some(ref orig_out) = original_output {
-                match mds::compile_str_collecting_warnings(
-                    fixed,
-                    Some(&base_dir_owned),
-                    runtime_vars.clone(),
-                ) {
-                    Ok(fixed_compile) if fixed_compile.output != *orig_out => {
-                        return Err(MdsError::Io {
-                            message: "lint --fix would change compiled output; \
-                                      edit reverted to preserve template semantics"
-                                .to_string(),
-                        });
-                    }
-                    _ => {}
-                }
+    // An entry of a directory under `--format json` is read only now, to fix it.
+    let text = match source.read() {
+        Ok(text) => text,
+        Err(error) => {
+            let tally = failure_tally(&error);
+            let outcome = Outcome::Failed { error, tally };
+            return FileReport {
+                input,
+                capped,
+                outcome,
+            };
+        }
+    };
+    // The fix pipeline lints its candidate again. A panic in it fails this input alone:
+    // a directory's other entries go on (#389).
+    let fix = catch_compile(
+        input.path(),
+        AssertUnwindSafe(|| {
+            run_fix_pipeline(
+                &input,
+                &result,
+                &text,
+                base_dir,
+                runtime_vars.clone(),
+                &config,
+            )
+        }),
+    );
+    let fix = match fix {
+        Ok(fix) => fix,
+        Err(Panicked) => {
+            return FileReport {
+                input,
+                capped,
+                outcome: Outcome::Panicked,
             }
         }
-
-        Ok(residual)
-    });
-
-    match outcome {
-        mds::fix::FixOutcome::Fixed {
-            source: new_source,
-            mut residual,
+    };
+    let outcome = if flags.check || flags.diff {
+        preview_fix(&input, result, text, fix, flags)
+    } else {
+        // A file argument's rewrite is anchored at its typed parent, a directory entry's at
+        // the directory argument (#160).
+        match input {
+            LintSource::Stdin => fix_stdin(result, text, fix),
+            LintSource::File { typed, .. } => apply_fix(
+                &WriteTarget::as_typed(typed.to_path_buf()),
+                result,
+                text,
+                fix,
+                flags.format,
+            ),
+            LintSource::DirEntry { root, path, .. } => apply_fix(
+                &WriteTarget::walked_below(RootPaths::as_typed(root), path),
+                result,
+                text,
+                fix,
+                flags.format,
+            ),
         }
-        | mds::fix::FixOutcome::PartiallyFixed {
-            source: new_source,
-            mut residual,
+    };
+    FileReport {
+        input,
+        capped,
+        outcome,
+    }
+}
+
+/// `--fix --check` / `--fix --diff`: what `--fix` would do, with nothing written. A pending
+/// fix carries its diff when `--diff` asked for one.
+fn preview_fix(
+    input: &LintSource<'_>,
+    findings: mds::LintResult,
+    text: String,
+    fix: FixPipelineOutcome,
+    flags: LintFlags,
+) -> Outcome {
+    let fix = match fix {
+        FixPipelineOutcome::Fixed {
+            new_source,
+            residual,
+        }
+        | FixPipelineOutcome::PartiallyFixed {
+            new_source,
+            residual,
             ..
-        } => {
-            set_diag_display_path(&mut residual, display_label);
-            PreviewOutcome::WouldFix {
-                fixed: new_source,
-                residual,
+        } => PreviewFix::Pending {
+            diff: flags
+                .diff
+                .then(|| render_unified_diff(&text, &new_source, &input.diff_label())),
+            residual,
+            check: flags.check,
+        },
+        FixPipelineOutcome::Rejected { reason } => PreviewFix::Refused { reason },
+        FixPipelineOutcome::NothingToFix => PreviewFix::Nothing,
+    };
+    Outcome::Previewed {
+        findings,
+        text,
+        fix,
+    }
+}
+
+/// `--fix`: rewrite the input's file, `target`, with the fixed source. Stdin is a filter
+/// instead ([`fix_stdin`]).
+fn apply_fix(
+    target: &WriteTarget,
+    findings: mds::LintResult,
+    text: String,
+    fix: FixPipelineOutcome,
+    format: LintFormat,
+) -> Outcome {
+    let (new_source, residual, partial) = match fix {
+        FixPipelineOutcome::Fixed {
+            new_source,
+            residual,
+        } => (new_source, residual, None),
+        FixPipelineOutcome::PartiallyFixed {
+            new_source,
+            residual,
+            applied_count,
+            total_count,
+        } => (new_source, residual, Some((applied_count, total_count))),
+        FixPipelineOutcome::Rejected { reason } => {
+            let fix = Rewrite::Refused { reason };
+            return Outcome::Rewritten {
+                findings,
+                text,
+                fix,
+            };
+        }
+        FixPipelineOutcome::NothingToFix => {
+            let fix = Rewrite::Unchanged;
+            return Outcome::Rewritten {
+                findings,
+                text,
+                fix,
+            };
+        }
+    };
+    let residual = Residual {
+        findings: residual,
+        fixed: new_source,
+    };
+    // Only over the bytes the fix was made from, in the directory they were read in (#160).
+    let fix = match read_stamped(target, &text)
+        .and_then(|read| replace_if_unchanged(read, &residual.fixed, Durability::Fsync))
+    {
+        Ok(()) => Rewrite::Written { residual, partial },
+        Err(error) => {
+            // A JSON output records each input once — a directory's entry, a file
+            // argument's document — so a rewrite that failed is recorded as the failure
+            // alone (#309); a human report shows the findings the fix would have left,
+            // then the failure.
+            let failure_alone = format == LintFormat::Json;
+            Rewrite::WriteFailed {
+                error,
+                residual: (!failure_alone).then_some(residual),
             }
         }
-        mds::fix::FixOutcome::Rejected { reason, .. } => PreviewOutcome::Rejected(reason),
-        mds::fix::FixOutcome::NothingToFix => PreviewOutcome::NothingToFix,
-        // FixOutcome is #[non_exhaustive]: wildcard required from outside mds-core.
-        _ => PreviewOutcome::NothingToFix,
+    };
+    Outcome::Rewritten {
+        findings,
+        text,
+        fix,
+    }
+}
+
+/// `mds lint --fix -`, a filter: the fixed source goes to stdout — the source as given
+/// when nothing was fixed — and the findings it is left with to stderr, rendered against
+/// it. Always human, as `--fix --format json` refuses stdin.
+fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -> Outcome {
+    let (output, findings, fix) = match fix {
+        FixPipelineOutcome::Fixed {
+            new_source,
+            residual,
+        } => (new_source, residual, FilterFix::Fixed { partial: None }),
+        FixPipelineOutcome::PartiallyFixed {
+            new_source,
+            residual,
+            applied_count,
+            total_count,
+        } => (
+            new_source,
+            residual,
+            FilterFix::Fixed {
+                partial: Some((applied_count, total_count)),
+            },
+        ),
+        FixPipelineOutcome::Rejected { reason } => (text, findings, FilterFix::Refused { reason }),
+        FixPipelineOutcome::NothingToFix => (text, findings, FilterFix::Unchanged),
+    };
+    Outcome::Filtered {
+        findings,
+        output,
+        fix,
+    }
+}
+
+/// Show `report` through `sink`, and return what the input came to (#309). The sink shows
+/// each part in its format; the order is decided here, per mode:
+///
+/// - An input whose own findings stopped at the diagnostic cap announces it first, in every
+///   mode — a report, a preview, a fix, a failure (#309) — in the words its
+///   [`CapNotice`] picks.
+/// - A preview shows its diff, `Would fix:` or `fix rejected:`, then the input's own
+///   findings.
+/// - A rewrite that landed shows the findings the file is left with, rendered against the
+///   fixed source, then `Fixed:` — never before, so no line claims a fix the file did not
+///   get. One that failed shows those findings, where the output keeps them, rendered
+///   against the source it failed to write, then the failure.
+/// - The stdin filter shows its status line, then its findings, rendered against the
+///   source it emits, then that source.
+fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
+    let FileReport {
+        input,
+        capped,
+        outcome,
+    } = report;
+    if let Some(notice) = capped {
+        sink.cap_reached(&input, notice);
+    }
+    let truncated = outcome.truncated();
+    let (tally, would_fix) = match outcome {
+        Outcome::Reported { findings, text } => {
+            sink.findings(&input, &findings, text.as_deref(), truncated);
+            sink.clean(&input, &findings);
+            (tally_from_result(&findings), false)
+        }
+        Outcome::Failed { error, tally } => {
+            sink.failed(&input, error);
+            (tally, false)
+        }
+        Outcome::Panicked => {
+            sink.panicked(&input);
+            (FileTally::Error, false)
+        }
+        Outcome::Previewed {
+            findings,
+            text,
+            fix,
+        } => {
+            let verdict = match fix {
+                PreviewFix::Pending {
+                    residual,
+                    diff,
+                    check,
+                } => {
+                    let diff_lost = diff.is_some_and(|diff| sink.diff(&diff));
+                    if check {
+                        sink.would_fix(&input);
+                    }
+                    // A diff a failing stdout lost counts the input under "with errors", as
+                    // a rewrite that fails does (#157). A run over stdin or a file exits 2
+                    // either way: the failure is recorded, and the exit funnel lifts the
+                    // code to 2.
+                    let tally = if diff_lost {
+                        FileTally::Error
+                    } else {
+                        tally_from_result(&residual)
+                    };
+                    (tally, true)
+                }
+                PreviewFix::Refused { reason } => {
+                    sink.fix_rejected(&input, &reason);
+                    (tally_from_result(&findings), false)
+                }
+                PreviewFix::Nothing => (tally_from_result(&findings), false),
+            };
+            sink.findings(&input, &findings, Some(&text), truncated);
+            verdict
+        }
+        Outcome::Rewritten {
+            findings,
+            text,
+            fix,
+        } => match fix {
+            Rewrite::Refused { reason } => {
+                sink.fix_rejected(&input, &reason);
+                sink.findings(&input, &findings, Some(&text), truncated);
+                (tally_from_result(&findings), false)
+            }
+            Rewrite::Unchanged => {
+                sink.findings(&input, &findings, Some(&text), truncated);
+                sink.clean(&input, &findings);
+                (tally_from_result(&findings), false)
+            }
+            Rewrite::Written { residual, partial } => {
+                sink.findings(&input, &residual.findings, Some(&residual.fixed), truncated);
+                sink.fixed(&input, partial);
+                (tally_from_result(&residual.findings), false)
+            }
+            Rewrite::WriteFailed { error, residual } => {
+                if let Some(residual) = &residual {
+                    sink.findings(&input, &residual.findings, Some(&residual.fixed), truncated);
+                }
+                sink.write_failed(&input, error);
+                (FileTally::Error, false)
+            }
+        },
+        Outcome::Filtered {
+            findings,
+            output,
+            fix,
+        } => {
+            match fix {
+                FilterFix::Fixed { partial } => sink.fixed(&input, partial),
+                FilterFix::Refused { reason } => sink.fix_rejected(&input, &reason),
+                FilterFix::Unchanged => {}
+            }
+            sink.findings(&input, &findings, Some(&output), truncated);
+            sink.fixed_source(&output);
+            (tally_from_result(&findings), false)
+        }
+    };
+    InputVerdict {
+        tally,
+        would_fix,
+        truncated,
     }
 }
 
@@ -837,182 +1448,50 @@ fn preview_fixes(
 fn run_lint_stdin(
     flags: LintFlags,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
-) -> Result<()> {
-    // Bind all five flags explicitly — `..` would silently drop unbound flags to
-    // their defaults, which breaks `--fix --check` semantics (avoids PF-004).
-    let LintFlags {
-        fix,
-        check,
-        diff,
-        quiet,
-        format,
-    } = flags;
-
-    let source = read_stdin()?;
+    sink: &mut impl ResultSink,
+) -> i32 {
+    let source = match read_stdin() {
+        Ok(source) => source,
+        // #157: stdin over the cap is `mds::resource_limit` (exit 3), one that cannot be
+        // read or is not UTF-8 `mds::io` (exit 2) — as for every other command.
+        Err(e) => return analysis_failed(sink, &e, None),
+    };
+    // A working directory that cannot be determined — deleted while the process is in it
+    // — fails closed in the words a stdin compile meets it in (#390), before `"."` names it.
+    if let Err(e) = crate::output::current_dir() {
+        return analysis_failed(sink, &e, Some(&source));
+    }
     // The working directory, as the caller did not type it: `"."` anchors at it and is
     // what a refusal of it shows (see `read_stdin`).
     let cwd = Path::new(".");
-    // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(cwd, quiet) {
+    // mds.json load/parse failure → the JSON envelope in --format json mode.
+    let config = match load_lint_config(cwd, flags.quiet) {
         Ok(c) => c,
         Err(e) => {
             let mds_err = MdsError::Io {
                 message: format!("{e}"),
             };
-            // AD-211-5: config errors (MdsError::Io) carry no embedded NamedSource,
-            // so the relabel is a no-op here. Passed anyway so the envelope rule holds
-            // for EVERY stdin failure path — a future error variant routed here that
-            // does carry a source inherits the sentinel instead of needing a new call.
-            emit_analysis_failure_json_or_stderr(&mds_err, format, Some(&source));
-            std::process::exit(2);
+            // Config errors (MdsError::Io) carry no embedded NamedSource, so the relabel
+            // is a no-op here. Passed anyway so the envelope rule holds for EVERY stdin
+            // failure path — a future error variant routed here that does carry a source
+            // inherits the sentinel instead of needing a new call.
+            return analysis_failed(sink, &mds_err, Some(&source));
         }
     };
 
-    let mut result = match mds::lint_str_with(&source, Some(cwd), runtime_vars.clone(), &config) {
+    let result = match mds::lint_str_with(&source, Some(cwd), runtime_vars.clone(), &config) {
         Ok(r) => r,
-        Err(e) => {
-            // AD-211-5: relabel <source> → <stdin> in the rendered failure envelope.
-            emit_analysis_failure_json_or_stderr(&e, format, Some(&source));
-            std::process::exit(mds_error_exit_code(&e));
-        }
+        // Relabel <source> → <stdin> in the rendered failure.
+        Err(e) => return analysis_failed(sink, &e, Some(&source)),
     };
-
-    // AD-211-4 / AD-211-1: relabel diag.file from STRING_SOURCE_MAP_LABEL →
-    // STDIN_DISPLAY_LABEL at the CLI output boundary.  fix.rs never reads diag.file
-    // (verified: zero reads in fix.rs), so this relabel is safe upstream of both
-    // preview_fixes and plan_and_apply_fixes.  This single call ensures
-    // "files[].file" emits "<stdin>" across all code paths (AC-P1-01); for the
-    // write path, plan_and_apply_fixes relabels its internally produced residual
-    // before returning.
-    set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
-
-    // D4 (AD-216-11): status message, not an error — suppress under --quiet.
-    // PF-004: stdin is a separate emitter from file/directory mode; the cap notice
-    // must reach this path too (avoids the #43/#173 divergence class).
-    if result.truncated && fix && !quiet {
-        eprintln!(
-            "diagnostic cap ({}) reached; further findings were suppressed — \
-             re-run --fix to continue",
-            mds::MAX_DIAGNOSTICS
-        );
-    }
-
-    if fix {
-        // ── Preview path: --fix --check and/or --fix --diff (never writes source) ───
-        // Mirrors run_lint_file's preview path so stdin honours --check / --diff the
-        // same way file targets do (PF-004: same gated pipeline as the write path).
-        if check || diff {
-            let preview = preview_fixes(
-                &result,
-                &source,
-                cwd,
-                runtime_vars.clone(),
-                &config,
-                STDIN_DISPLAY_LABEL,
-            );
-            // AD-211-1: pass STDIN_DISPLAY_LABEL so span context renders "<stdin>", not
-            // the internal STRING_SOURCE_MAP_LABEL ("input.mds").
-            let named_source = if format == LintFormat::Human {
-                Some((STDIN_DISPLAY_LABEL, source.as_str()))
-            } else {
-                None
-            };
-            match preview {
-                // ONE arm for both --check and --diff (R1): the emitted body stays
-                // PRE-fix — the preview reports what is wrong NOW — and the exit
-                // code comes from the residual, floored at 1 because a fix is
-                // pending.  Emit-before-exit: diagnostics render before the exit
-                // (the old --check arm exited without rendering them).
-                PreviewOutcome::WouldFix {
-                    ref fixed,
-                    ref residual,
-                } => {
-                    if diff {
-                        let diff_str = render_unified_diff(&source, fixed, STDIN_DISPLAY_LABEL);
-                        let _ = write_stdout(&diff_str);
-                    }
-                    if check && !quiet {
-                        eprintln!("Would fix: {STDIN_DISPLAY_LABEL}");
-                    }
-                    emit_result(format, &result, quiet, named_source);
-                    std::process::exit(preview_exit_code(residual));
-                }
-                PreviewOutcome::Rejected(ref reason) => {
-                    if !quiet {
-                        eprintln!("fix rejected: {}", safe_inline(reason));
-                    }
-                }
-                PreviewOutcome::NothingToFix => {}
-            }
-            // When nothing would change / fix rejected: render diagnostics of the
-            // original result and exit by severity.
-            emit_result(format, &result, quiet, named_source);
-            exit_by_severity(&result);
-            return Ok(());
-        }
-
-        // ── Write path: apply fixes, emit fixed source to stdout ─────────────────
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            cwd,
-            runtime_vars,
-            &config,
-            STDIN_DISPLAY_LABEL,
-        );
-        let (output_src, diag_result) = match fix_outcome {
-            FixFileOutcome::Fixed {
-                new_source,
-                residual,
-            } => (new_source, residual),
-            FixFileOutcome::PartiallyFixed {
-                new_source,
-                residual,
-                applied_count,
-                total_count,
-            } => {
-                if !quiet {
-                    eprintln!(
-                        "Partially fixed: {STDIN_DISPLAY_LABEL} ({applied_count} of {total_count} fixes applied)"
-                    );
-                }
-                (new_source, residual)
-            }
-            FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-11): "fix rejected" is a status message — the safety
-                // gate fired and the original diagnostics are unmodified.  Suppress under
-                // --quiet, matching this function's own `PreviewOutcome::Rejected` arm and
-                // the directory-mode emitters in `lint_one_file_accumulating` /
-                // `lint_one_file_human`.  PF-004: stdin is a separate emitter from
-                // directory mode and must not bypass the gate (the #43/#173 divergence
-                // class).  Exit code is unaffected; error-severity residual diagnostics
-                // still print through `render_result_human`.
-                if !quiet {
-                    eprintln!("fix rejected: {}", safe_inline(&reason));
-                }
-                (source, original)
-            }
-            FixFileOutcome::NothingToFix { original } => (source, original),
-        };
-        // Stdin diagnostics: pass source text for span context rendering.
-        // AD-211-1: use STDIN_DISPLAY_LABEL so source frame header reads "<stdin>".
-        let named_source = (STDIN_DISPLAY_LABEL, output_src.as_str());
-        render_result_human(&diag_result, quiet, named_source);
-        let _ = write_stdout(&output_src);
-        exit_by_severity(&diag_result);
-        return Ok(());
-    }
-
-    // Report-only mode: pass stdin source for span context rendering.
-    // AD-211-1: use STDIN_DISPLAY_LABEL so span source frame reads "<stdin>".
-    let named_source = if format == LintFormat::Human {
-        Some((STDIN_DISPLAY_LABEL, source.as_str()))
-    } else {
-        None
+    let linted = Linted {
+        input: LintSource::Stdin,
+        base_dir: cwd,
+        config: Rc::new(config),
+        source: SourceText::Read(source),
+        result,
     };
-    emit_result(format, &result, quiet, named_source);
-    exit_by_severity(&result);
-    Ok(())
+    render(lint_input(linted, flags, &runtime_vars), sink).exit_code()
 }
 
 // ── Single-file mode ──────────────────────────────────────────────────────────
@@ -1021,180 +1500,45 @@ fn run_lint_file(
     path: &Path,
     flags: LintFlags,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
-) -> Result<()> {
-    let LintFlags {
-        fix,
-        check,
-        diff,
-        quiet,
-        format,
-    } = flags;
-
+    sink: &mut impl ResultSink,
+) -> i32 {
     // effective_parent maps "" (bare filename) to "." — avoids PF-006.
     let base_dir = effective_parent(path);
-    // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(base_dir, quiet) {
+    // mds.json load/parse failure → the JSON envelope in --format json mode.
+    let config = match load_lint_config(base_dir, flags.quiet) {
         Ok(c) => c,
         Err(e) => {
             let mds_err = MdsError::Io {
                 message: format!("{e}"),
             };
-            emit_analysis_failure_json_or_stderr(&mds_err, format, None);
-            std::process::exit(2);
+            return analysis_failed(sink, &mds_err, None);
         }
     };
-    // File read failure (not found, symlink, I/O) → JSON envelope in --format json mode (AC-F-14).
+    // File read failure (not found, symlink, I/O) → the JSON envelope in --format json mode.
     let source = match read_source_file(path) {
         Ok(s) => s,
-        Err(e) => {
-            emit_analysis_failure_json_or_stderr(&e, format, None);
-            std::process::exit(mds_error_exit_code(&e));
-        }
+        Err(e) => return analysis_failed(sink, &e, None),
     };
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("<file>");
 
-    let mut result = match mds::lint(path, runtime_vars.clone(), &config) {
+    let result = match mds::lint(path, runtime_vars.clone(), &config) {
         Ok(r) => r,
-        Err(e) => {
-            emit_analysis_failure_json_or_stderr(&e, format, None);
-            std::process::exit(mds_error_exit_code(&e));
-        }
+        Err(e) => return analysis_failed(sink, &e, None),
     };
-    // Remap the basename-only `file` label that mds::lint() sets → the display
-    // filename so all four FixFileOutcome arms carry a consistent label.
-    // Matches the explicit relabel in lint_one_file_accumulating and
-    // lint_one_file_human; without this call the Rejected and NothingToFix
-    // arms rely on mds::lint independently deriving the same basename — correct
-    // today, but a silent coupling that would break if the two derivations ever
-    // diverged.  Centralising the relabel here is the explicit invariant:
-    // every FixFileOutcome carries `filename` as its display path.
-    set_diag_display_path(&mut result, filename);
-
-    // D4 (AD-216-11): status message, not an error — suppress under --quiet
-    // (the global `--quiet` help text: "Suppress status and diagnostic output; errors
-    // always print").  PF-004: single-file mode is a separate emitter from directory
-    // mode; gating only the directory copy would re-create the #43/#173 divergence.
-    if result.truncated && fix && !quiet {
-        eprintln!(
-            "diagnostic cap ({}) reached; further findings were suppressed — \
-             re-run --fix to continue",
-            mds::MAX_DIAGNOSTICS
-        );
-    }
-
-    // Named source for span rendering: (display filename, source text).
-    let named_source = Some((filename, source.as_str()));
-
-    // ── Write path: --fix without preview ────────────────────────────────────
-    if fix && !check && !diff {
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, runtime_vars, &config, filename);
-        match fix_outcome {
-            FixFileOutcome::Fixed {
-                new_source,
-                residual,
-            } => {
-                emit_result(format, &residual, quiet, named_source);
-                atomic_write_file(path, &new_source, Durability::Fsync)?;
-                if !quiet {
-                    eprintln!("Fixed: {}", safe_path(path));
-                }
-                exit_by_severity(&residual);
-            }
-            FixFileOutcome::PartiallyFixed {
-                new_source,
-                residual,
-                applied_count,
-                total_count,
-            } => {
-                emit_result(format, &residual, quiet, named_source);
-                atomic_write_file(path, &new_source, Durability::Fsync)?;
-                // Print status AFTER write succeeds so "Partially fixed:" never
-                // precedes "error writing" for a file that was never modified.
-                if !quiet {
-                    eprintln!(
-                        "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
-                        safe_path(path)
-                    );
-                }
-                exit_by_severity(&residual);
-            }
-            FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-11): status message — suppress under --quiet,
-                // matching this function's own `PreviewOutcome::Rejected` arm and the
-                // directory-mode emitters.  PF-004: single-file mode is a separate
-                // emitter and must honour the same gate.
-                if !quiet {
-                    eprintln!("fix rejected: {}", safe_inline(&reason));
-                }
-                emit_result(format, &original, quiet, named_source);
-                exit_by_severity(&original);
-            }
-            FixFileOutcome::NothingToFix { original } => {
-                emit_result(format, &original, quiet, named_source);
-                if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
-                    eprintln!("Clean: {}", safe_file_display(filename));
-                }
-                exit_by_severity(&original);
-            }
-        }
-        return Ok(());
-    }
-
-    // ── Preview path: --fix --check and/or --fix --diff ─────────────────
-    // Route preview through the same gated pipeline as the write path.
-    // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
-    // a diff or check result could misrepresent what --fix would actually do.
-    if fix && (check || diff) {
-        let preview = preview_fixes(&result, &source, base_dir, runtime_vars, &config, filename);
-        match preview {
-            // ONE arm for both --check and --diff (R1): the emitted body stays
-            // PRE-fix — the preview reports what is wrong NOW — and the exit code
-            // comes from the residual, floored at 1 because a fix is pending.
-            PreviewOutcome::WouldFix {
-                ref fixed,
-                ref residual,
-            } => {
-                if diff {
-                    let label = safe_path(path);
-                    let diff_str = render_unified_diff(&source, fixed, &label);
-                    let _ = write_stdout(&diff_str);
-                }
-                if check && !quiet {
-                    eprintln!("Would fix: {}", safe_path(path));
-                }
-                // AC-F-14 emit-before-exit: emit the (pre-fix) result BEFORE the
-                // exit so consumers always receive parseable output regardless of
-                // exit code.  Mirrors directory mode, which emits the envelope
-                // before its preview-floor exit.
-                emit_result(format, &result, quiet, named_source);
-                std::process::exit(preview_exit_code(residual));
-            }
-            PreviewOutcome::Rejected(ref reason) => {
-                // Surface the rejection reason so --fix --check is as honest as --fix.
-                if !quiet {
-                    eprintln!("fix rejected: {}", safe_inline(reason));
-                }
-            }
-            PreviewOutcome::NothingToFix => {}
-        }
-        // When nothing would change / fix rejected: render diagnostics and exit
-        // by severity.
-        emit_result(format, &result, quiet, named_source);
-        exit_by_severity(&result);
-        return Ok(());
-    }
-
-    // ── Report-only mode (no --fix) ───────────────────────────────────────────
-    emit_result(format, &result, quiet, named_source);
-    if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
-        eprintln!("Clean: {}", safe_file_display(filename));
-    }
-    exit_by_severity(&result);
-    Ok(())
+    // Named only after `mds::lint` accepted the path, which refuses a path that is not
+    // UTF-8 first: the name is UTF-8 here, and every refusal is `mds::lint`'s own (see
+    // `LintSource::file`).
+    let input = match LintSource::file(path) {
+        Ok(input) => input,
+        Err(e) => return analysis_failed(sink, &e, None),
+    };
+    let linted = Linted {
+        input,
+        base_dir,
+        config: Rc::new(config),
+        source: SourceText::Read(source),
+        result,
+    };
+    render(lint_input(linted, flags, &runtime_vars), sink).exit_code()
 }
 
 // ── Directory mode ────────────────────────────────────────────────────────────
@@ -1202,8 +1546,8 @@ fn run_lint_file(
 /// Compile-time context for directory-mode lint.
 ///
 /// Groups the parameters resolved once at the start of a directory lint run and
-/// threaded into every per-file call — removes the `#[allow(clippy::too_many_arguments)]`
-/// suppressions on `lint_one_file_accumulating` and `lint_one_file_human`
+/// threaded into every entry's load — keeps the per-entry functions within clippy's
+/// argument limit without an `#[allow(clippy::too_many_arguments)]`
 /// (issue #6 / zero-warnings policy). Pattern mirrors `FileCompileCtx` / `DirWatchCtx`
 /// in watch.rs.
 ///
@@ -1274,7 +1618,11 @@ impl<'a> LintDirCtx<'a> {
                     .insert(base_dir.to_path_buf(), Rc::clone(&rc));
                 Ok(rc)
             }
-            Some((mds_config, config_dir)) => {
+            Some(ProjectConfig {
+                config: mds_config,
+                dir: config_dir,
+                ..
+            }) => {
                 // Fast path 2: a different base_dir already resolved to this same
                 // config directory (e.g. a/file.mds and b/file.mds both governed by
                 // root/mds.json). Return the cached config without emitting a
@@ -1323,29 +1671,6 @@ impl<'a> LintDirCtx<'a> {
     }
 }
 
-/// Aggregate exit-code category for directory mode.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum FileTally {
-    Clean = 0,
-    WarnOnly = 1,
-    Error = 2,
-    ResourceLimit = 3,
-}
-
-impl FileTally {
-    fn exit_code(self) -> i32 {
-        self as i32
-    }
-}
-
-fn tally_from_result(result: &mds::LintResult) -> FileTally {
-    match result_exit_code(result) {
-        2 => FileTally::Error,
-        1 => FileTally::WarnOnly,
-        _ => FileTally::Clean,
-    }
-}
-
 /// Lint every `.mds` file under `dir`, INCLUDING `_`-prefixed partials.
 ///
 /// Accumulate-and-continue past per-file failures. Exit = max severity across files.
@@ -1357,7 +1682,10 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
 /// "With errors" covers both error-severity lint findings AND per-file analysis failures
 /// (read error, config error, lint call failure) — the same conflation `mds build`'s
 /// "failed" bucket makes (D3-a).  "Resource-limited" counts files where `mds::lint`
-/// returned `MdsError::ResourceLimit` — distinct from lint findings.
+/// returned `MdsError::ResourceLimit`, as the read of a source over the size cap does
+/// (#309) — distinct from lint findings.  A file whose own
+/// output failed also counts "with errors": a `--fix` rewrite that fails, or a diff a
+/// failing stdout lost (#157) — as `mds fmt <dir>` counts either one failed.
 ///
 /// **Summary / quiet contract (AD-216-6):** the summary is suppressed under `--quiet`
 /// unless at least one file is in the `error` or `resource-limited` bucket.  Warn-only
@@ -1385,44 +1713,26 @@ fn run_lint_directory(
     dir: &Path,
     flags: LintFlags,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
-) -> Result<()> {
+    sink: &mut impl ResultSink,
+) -> i32 {
     const MAX_DEPTH: usize = 64;
-    let LintFlags { quiet, format, .. } = flags;
 
-    // A6/D20: config is now discovered per-file (each file walks up to its nearest
-    // mds.json). The single root config load is removed; base_dir_cache and
-    // config_dir_cache in LintDirCtx amortise repeated loads for files in the same
-    // directory and across subdirectories sharing one root mds.json.
+    // Config is discovered per file (each file walks up to its nearest mds.json):
+    // base_dir_cache and config_dir_cache in LintDirCtx amortise repeated loads for files
+    // in the same directory and across subdirectories sharing one root mds.json.
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
-    let files = walk.files;
 
-    // AD-216-9: neither early exit below emits a summary — the per-file loop never
-    // runs, so all four counters stay at zero and there is nothing meaningful to
-    // print.  Both diagnostics bypass --quiet and exit 2 (lint's usage-error code;
-    // build/check/fmt use 1): the all-excluded arm, and since #204 the empty-tree
-    // arm — a silent non-zero exit here would be a bug, and a silent ZERO exit on an
-    // empty tree was the CI green-pass hole #204 closes.
-    if files.is_empty() {
-        if walk.excluded_by_default > 0 {
-            // Always emit — not suppressed by --quiet (avoids silent CI green pass).
-            // Exit 2: usage error consistent with lint's exit-code table.
-            eprintln!(
-                "{} .mds file(s) found but all are under default-excluded directories \
-                 (hidden dirs, node_modules); nothing was linted",
-                walk.excluded_by_default
-            );
-            std::process::exit(2);
-        }
-        // #204: an empty tree is "nothing to lint", not success (mirrors build.rs).
-        // Emitted even under --quiet.  Exit 2 is lint's usage-error code (module doc),
-        // matching the all-excluded arm above; build/check/fmt use 1.
-        eprintln!(
-            "no .mds files found in {}; nothing was linted",
-            safe_path(dir)
-        );
-        std::process::exit(2);
+    // Nothing to lint emits no summary — no file was linted, so there is nothing
+    // meaningful to count. Either diagnostic — under --format json the error document —
+    // bypasses --quiet and exits 2 (lint's usage-error code; build/check/fmt use 1): every
+    // file under default-excluded directories, and since #204 an empty tree — a silent
+    // ZERO exit on an empty tree was the CI green-pass hole #204 closes.
+    if walk.files.is_empty() {
+        sink.nothing_to_lint(dir, &walk);
+        return 2;
     }
+    let files = walk.files;
 
     // #217: compute every display key BEFORE the sort, so a path that cannot be
     // named relative to `dir` fails the whole run instead of contributing a lossy
@@ -1431,18 +1741,13 @@ fn run_lint_directory(
     //     only fails later would already have been built and compared here;
     //   * before the per-file loop — nothing is linted, so no `files[]` entry can
     //     carry a key that names no file under `dir`.
-    // The failure is NOT propagated with `?`: the caller returns `miette::Result`,
-    // and a bare `?` would render a human diagnostic and drop the JSON
-    // analysis-failure envelope that `--format json` consumers parse.  Same shape
-    // as the symlinked-root rejection at the top of `run_lint`.
+    // The failure is shown as an analysis failure, so `--format json` consumers get the
+    // JSON envelope they parse.  Same shape as the directory-argument refusal in `do_lint`.
     let mut keyed: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
     for p in files {
         match relative_display(&p, dir) {
             Ok(display) => keyed.push((p, display)),
-            Err(e) => {
-                emit_analysis_failure_json_or_stderr(&e, format, None);
-                std::process::exit(mds_error_exit_code(&e));
-            }
+            Err(e) => return analysis_failed(sink, &e, None),
         }
     }
 
@@ -1481,21 +1786,6 @@ fn run_lint_directory(
         )
     });
 
-    let mut max_tally = FileTally::Clean;
-    let mut json_files: Vec<serde_json::Value> = Vec::new();
-    let mut any_truncated = false;
-
-    let mut any_would_fix = false;
-
-    // AD-216-3/5: four counters for the directory summary, one per FileTally variant.
-    // Names are file-unique (print_discipline.rs limit 2, :106-110): `clean_count`,
-    // `warn_file_count`, `error_file_count`, `limit_file_count` — none reuse an already-
-    // exempted name from another summary line in this file.
-    let mut clean_count: usize = 0;
-    let mut warn_file_count: usize = 0;
-    let mut error_file_count: usize = 0;
-    let mut limit_file_count: usize = 0;
-
     let ctx = LintDirCtx {
         flags,
         runtime_vars: &runtime_vars,
@@ -1503,610 +1793,116 @@ fn run_lint_directory(
         config_dir_cache: RefCell::new(HashMap::new()),
     };
 
-    for (file, display_path) in &keyed {
-        let tally = if format == LintFormat::Json {
-            lint_one_file_accumulating(
-                file,
-                display_path,
-                &ctx,
-                &mut json_files,
-                &mut any_truncated,
-                &mut any_would_fix,
-            )
-        } else {
-            lint_one_file_human(
-                file,
-                display_path,
-                &ctx,
-                &mut any_truncated,
-                &mut any_would_fix,
-            )
-        };
-        // AD-216-5: exhaustive match — a future FileTally variant becomes a compile
-        // error here rather than being silently uncounted in the summary.
-        match tally {
-            FileTally::Clean => clean_count += 1,
-            FileTally::WarnOnly => warn_file_count += 1,
-            FileTally::Error => error_file_count += 1,
-            FileTally::ResourceLimit => limit_file_count += 1,
+    // Each entry comes to exactly one report and one verdict, and the summary is their
+    // fold: its counts add up to the entries by construction.
+    sink.start_document();
+    let summary = keyed
+        .iter()
+        .map(|(path, key)| render(lint_dir_entry(dir, path, key, &ctx), sink))
+        .fold(DirSummary::default(), DirSummary::count);
+
+    // The JSON document first, so consumers always receive it on stdout whatever the
+    // exit code (issue #36); then the summary, on stderr, in both formats.
+    sink.end_document(summary.truncated());
+    sink.summary(&summary);
+
+    // Exit = the worst file's tally, raised to 1 when a preview would fix any file. In a
+    // preview the tallies are the residuals', so a tree whose fixes would leave
+    // error-severity findings behind exits 2 even though every file "would fix".
+    summary.exit_code()
+}
+
+/// Read and lint one entry of a directory, and report what it came to: [`lint_input`]'s
+/// report, or the entry's failure, which the rest of the tree does not stop for.
+///
+/// `root` is the directory argument, `path` the file the walk found below it, `key` its
+/// display key, computed once by [`run_lint_directory`] before the sort (#217).
+///
+/// The entry's `mds.json` loads before the entry is read, as a file argument's does, so a
+/// configuration that cannot load is the entry's failure even when the file cannot be
+/// read either. Human output renders every finding in its source, so it reads the source
+/// next; JSON output reads it only to fix it ([`SourceText::Unread`]). Either way a read
+/// refused for size counts under "resource-limited", as `mds::lint`'s own refusal does
+/// ([`failure_tally`]).
+fn lint_dir_entry<'a>(
+    root: &'a Path,
+    path: &'a Path,
+    key: &'a str,
+    ctx: &LintDirCtx<'_>,
+) -> FileReport<'a> {
+    let entry = move || LintSource::DirEntry { root, path, key };
+    let failed = move |error: MdsError, tally: FileTally| FileReport {
+        input: entry(),
+        capped: None,
+        outcome: Outcome::Failed { error, tally },
+    };
+
+    // A bare file name has the parent "", which `effective_parent` maps to ".".
+    let base_dir = effective_parent(path);
+    // Each file's nearest mds.json, cached per directory; one that fails to load fails
+    // this entry only.
+    let config = match ctx.config_for(base_dir) {
+        Ok(config) => config,
+        Err(e) => return failed(e, FileTally::Error),
+    };
+
+    let source = if ctx.flags.format == LintFormat::Json {
+        SourceText::Unread(path)
+    } else {
+        match read_source_file(path) {
+            Ok(text) => SourceText::Read(text),
+            Err(e) => {
+                let tally = failure_tally(&e);
+                return failed(e, tally);
+            }
         }
-        if tally > max_tally {
-            max_tally = tally;
-        }
-    }
-    // AD-216-5: dev-only tripwire for the four-counter partition invariant (avoids PF-005
-    // in intent, not in substance — debug_assert_eq! compiles away in release mode).
-    // A future early-continue in the per-file loop would silently undercount in shipped
-    // binaries; release consequence: a miscounted status line or spurious --quiet
-    // suppression, never data corruption.
-    debug_assert_eq!(
-        clean_count + warn_file_count + error_file_count + limit_file_count,
-        keyed.len(),
-        "AD-216-5: FileTally partition invariant violated"
+    };
+    // A panic in the analysis fails this entry alone, and the rest of the tree goes on
+    // (#389).
+    let linted = catch_compile(
+        path,
+        AssertUnwindSafe(|| mds::lint(path, ctx.runtime_vars.clone(), &config)),
     );
-
-    // Emit JSON envelope BEFORE any early exit so consumers always receive parseable
-    // output regardless of exit code (AC-F-14 / issue #36).
-    if format == LintFormat::Json {
-        let json = serde_json::json!({
-            "version": 1,
-            "files": json_files,
-            "truncated": any_truncated,
-        });
-        let _ = write_stdout(&format!(
-            "{}\n",
-            serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
-        ));
-    }
-
-    // AD-216-7: emit the summary AFTER the JSON envelope (so consumers always get a
-    // parseable JSON object on stdout) and BEFORE the --fix --check exit (so a
-    // --fix --check run that would exit 1 still prints the summary on the way out).
-    //
-    // AD-216-6: suppress under --quiet unless error- or resource-limited files are
-    // present.  Warn-only runs are silent under --quiet (D1-a — mirrors fmt.rs:342:
-    // `changed_count` does not force the summary under --quiet).
-    //
-    // AD-216-8: emitted in both human and JSON format modes.  --format governs the
-    // machine-readable channel (stdout); the summary is status output (stderr) and is
-    // governed only by --quiet.
-    //
-    // AD-216-4: format — `{clean} clean, {warn} with warnings, {error} with errors,
-    // {limit} resource-limited`.  Fixed arity, comma-separated.  Lint uses
-    // deliberately distinct vocabulary from the sibling subcommands (`build`/`check`/
-    // `fmt` all end in "N failed"): the four-bucket partition expresses distinct failure
-    // modes (warn-only vs error vs resource-limit) not captured by a single "failed"
-    // count.  The format is pinned by spec §7.5 and tests.
-    if !quiet || error_file_count > 0 || limit_file_count > 0 {
-        eprintln!(
-            "{clean_count} clean, {warn_file_count} with warnings, \
-             {error_file_count} with errors, {limit_file_count} resource-limited"
-        );
-    }
-
-    // R1 preview exit rule: exit = max(residual severity across files, 1 if any
-    // file would fix).  In preview mode (--fix --check / --fix --diff) the
-    // per-file tallies feeding max_tally are RESIDUAL-derived (see the preview
-    // arms in lint_one_file_accumulating / lint_one_file_human), so a tree whose
-    // fixes would leave error-severity findings behind exits 2 even though every
-    // file "would fix".  The former `if flags.check && any_would_fix { exit(1) }`
-    // early exit SHADOWED max_tally — residual errors exited 1.
-    // `any_would_fix` can only be set in preview mode, so no mode guard is needed.
-    let mut exit = max_tally.exit_code();
-    if any_would_fix {
-        exit = exit.max(1);
-    }
-    if exit != 0 {
-        std::process::exit(exit);
-    }
-    Ok(())
-}
-
-/// Lint one file in directory mode, accumulating results into a JSON array.
-fn lint_one_file_accumulating(
-    file: &Path,
-    display_path: &str,
-    ctx: &LintDirCtx<'_>,
-    json_files: &mut Vec<serde_json::Value>,
-    any_truncated: &mut bool,
-    any_would_fix: &mut bool,
-) -> FileTally {
-    // Bind quiet so the PartiallyFixed arm can honour it (issue #43 / #173).
-    let LintFlags {
-        fix,
-        check,
-        diff,
-        quiet,
-        ..
-    } = ctx.flags;
-
-    // `display_path` is the lint-root-relative key computed once by
-    // `run_lint_directory`'s pre-pass (#217) — it is never recomputed here, so a
-    // path this helper could not name has already failed the whole run.  It is
-    // navigable and unique across the whole directory tree (not just basenames)
-    // and normalised to forward slashes.  `to_canonical_json` then sanitizes the
-    // key via `sanitize_control_chars_wire`; `run_lint_directory` sorts on that
-    // same sanitized string, so emitted array order and emitted file key order
-    // are consistent for all inputs including control-byte filenames (AC-P1-10).
-    //
-    // Error-only entries (`{"file": …, "error": …}`) bypass `to_canonical_json`
-    // and therefore bypass its `sanitize_control_chars_wire` pass.  Pre-sanitize
-    // here so the `file` key in error entries is treated identically to the `file`
-    // key in diagnostic entries — hostile filenames cannot inject control, bidi,
-    // or separator characters into either entry type (spec.md §lint-json `file`
-    // contract; ADR-008).
-    let file_key = mds::sanitize_control_chars_wire(display_path).into_owned();
-
-    // `source` is only consumed in the fix branch (below); the report-only/JSON
-    // path does not need it — mds::lint() reads the file independently (I-06).
-    // effective_parent maps "" (bare filename) to "." — avoids PF-006.
-    let base_dir = effective_parent(file);
-
-    // A6: per-file config discovery — load (and cache) the nearest mds.json for
-    // this file's directory. A config-load failure is a per-file error; the rest
-    // of the tree continues linting.
-    let config = match ctx.config_for(base_dir) {
-        Ok(c) => c,
-        Err(ref e) => {
-            json_files.push(serde_json::json!({
-                "file": file_key,
-                "error": e.serialize()
-            }));
-            return FileTally::Error;
+    let result = match linted {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            let tally = failure_tally(&e);
+            return failed(e, tally);
+        }
+        Err(Panicked) => {
+            return FileReport {
+                input: entry(),
+                capped: None,
+                outcome: Outcome::Panicked,
+            }
         }
     };
-
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
-        Ok(r) => r,
-        Err(ref e) => {
-            json_files.push(serde_json::json!({
-                "file": file_key,
-                "error": e.serialize()
-            }));
-            return if matches!(e, MdsError::ResourceLimit { .. }) {
-                FileTally::ResourceLimit
-            } else {
-                FileTally::Error
-            };
-        }
+    let linted = Linted {
+        input: entry(),
+        base_dir,
+        config,
+        source,
+        result,
     };
-    // Remap basename-only file field → relative display path.
-    set_diag_display_path(&mut result, display_path);
-
-    if result.truncated {
-        *any_truncated = true;
-        // D4 (AD-216-11): this is a status message, not an error — suppress
-        // under --quiet (main.rs:30 "Suppress status and diagnostic output").
-        if fix && !quiet {
-            eprintln!(
-                "{}: diagnostic cap ({}) reached; further findings were suppressed — \
-                 re-run --fix to continue",
-                safe_path(file),
-                mds::MAX_DIAGNOSTICS
-            );
-        }
-    }
-
-    if fix && !check && !diff {
-        // Read source here only (not earlier) — the report-only path does not need
-        // it. On a read error at this point (rare: lint just succeeded above),
-        // surface the same error format as other per-file I/O failures and bail.
-        let source = match read_source_file(file) {
-            Ok(s) => s,
-            Err(e) => {
-                // Per-file I/O failure in directory mode: accumulate structured error (AC-F-14).
-                json_files.push(serde_json::json!({
-                    "file": file_key,
-                    "error": e.serialize()
-                }));
-                return FileTally::Error;
-            }
-        };
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            &config,
-            display_path,
-        );
-        match fix_outcome {
-            FixFileOutcome::Fixed {
-                new_source,
-                residual,
-            } => {
-                // Write first (AC-F-14): on failure push a structured error entry so
-                // the JSON envelope truthfully reflects what happened rather than
-                // accumulating the clean post-fix result before the write is attempted.
-                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
-                    json_files.push(serde_json::json!({
-                        "file": file_key,
-                        "error": MdsError::Io { message: format!("{e}") }.serialize()
-                    }));
-                    return FileTally::Error;
-                }
-                accumulate_result_json(&residual, json_files);
-                // PF-004: parity with lint_one_file_human — same quiet gate, same text.
-                if !quiet {
-                    eprintln!("Fixed: {}", safe_path(file));
-                }
-                tally_from_result(&residual)
-            }
-            FixFileOutcome::PartiallyFixed {
-                new_source,
-                residual,
-                applied_count,
-                total_count,
-            } => {
-                // Write first (AC-F-14 + print-after-write): on failure push a
-                // structured error entry; only accumulate and print on success.
-                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
-                    json_files.push(serde_json::json!({
-                        "file": file_key,
-                        "error": MdsError::Io { message: format!("{e}") }.serialize()
-                    }));
-                    return FileTally::Error;
-                }
-                accumulate_result_json(&residual, json_files);
-                // Unified message + quiet guard (#173).
-                if !quiet {
-                    eprintln!(
-                        "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
-                        safe_path(file)
-                    );
-                }
-                tally_from_result(&residual)
-            }
-            FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-11): "fix rejected" is a status message — the safety
-                // gate fired, the original diagnostics remain unmodified.  Suppress under
-                // --quiet (main.rs:30).  The residual lint findings (and the exit code)
-                // are unaffected: this message describes the --fix attempt, not the findings.
-                if !quiet {
-                    eprintln!(
-                        "{}: fix rejected: {}",
-                        safe_path(file),
-                        safe_inline(&reason)
-                    );
-                }
-                accumulate_result_json(&original, json_files);
-                tally_from_result(&original)
-            }
-            FixFileOutcome::NothingToFix { original } => {
-                accumulate_result_json(&original, json_files);
-                tally_from_result(&original)
-            }
-        }
-    } else if fix && (check || diff) {
-        // Directory-mode preview — route through gated pipeline.
-        let source = match read_source_file(file) {
-            Ok(s) => s,
-            Err(e) => {
-                json_files.push(serde_json::json!({
-                    "file": file_key,
-                    "error": e.serialize()
-                }));
-                return FileTally::Error;
-            }
-        };
-        // R1: in the WouldFix arm the per-file tally comes from the RESIDUAL
-        // (what a real --fix would leave behind); the JSON body stays PRE-fix.
-        // run_lint_directory floors the aggregate exit at 1 via any_would_fix.
-        let tally = match preview_fixes(
-            &result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            &config,
-            display_path,
-        ) {
-            PreviewOutcome::WouldFix {
-                ref fixed,
-                ref residual,
-            } => {
-                *any_would_fix = true;
-                if diff {
-                    let label = safe_path(file);
-                    let diff_str = render_unified_diff(&source, fixed, &label);
-                    let _ = write_stdout(&diff_str);
-                }
-                // PF-004: parity with lint_one_file_human — same quiet gate, same text.
-                if check && !quiet {
-                    eprintln!("Would fix: {}", safe_path(file));
-                }
-                tally_from_result(residual)
-            }
-            PreviewOutcome::Rejected(ref reason) => {
-                // D4 (AD-216-11): status message — suppress under --quiet.
-                if !quiet {
-                    eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
-                }
-                tally_from_result(&result)
-            }
-            PreviewOutcome::NothingToFix => tally_from_result(&result),
-        };
-        accumulate_result_json(&result, json_files);
-        tally
-    } else {
-        accumulate_result_json(&result, json_files);
-        tally_from_result(&result)
-    }
-}
-
-/// Lint one file in directory mode, rendering diagnostics to stderr (human mode).
-fn lint_one_file_human(
-    file: &Path,
-    display_path: &str,
-    ctx: &LintDirCtx<'_>,
-    any_truncated: &mut bool,
-    any_would_fix: &mut bool,
-) -> FileTally {
-    let LintFlags {
-        fix,
-        check,
-        diff,
-        quiet,
-        ..
-    } = ctx.flags;
-
-    // `display_path` is the lint-root-relative key computed once by
-    // `run_lint_directory`'s pre-pass (#217), normalised to forward slashes and
-    // identical to the unsanitized base used by that pre-pass's sort (AC-P1-10).
-    // Human rendering shows the real filename bytes rather than sanitized
-    // `\uXXXX` escapes.
-
-    let source = match read_source_file(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprint_error(miette::Report::from(e));
-            return FileTally::Error;
-        }
-    };
-
-    // effective_parent maps "" (bare filename) to "." — avoids PF-006.
-    let base_dir = effective_parent(file);
-
-    // A6: per-file config discovery — load (and cache) the nearest mds.json for
-    // this file's directory. A config-load failure is a per-file error; the rest
-    // of the tree continues linting.
-    let config = match ctx.config_for(base_dir) {
-        Ok(c) => c,
-        Err(e) => {
-            eprint_error(miette::Report::from(e));
-            return FileTally::Error;
-        }
-    };
-
-    // Named source for span rendering: relative display path + source text.
-    let named_source = (display_path, source.as_str());
-
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
-        Ok(r) => r,
-        Err(ref e) => {
-            eprint_error(miette::Report::from(e.clone()));
-            return if matches!(e, MdsError::ResourceLimit { .. }) {
-                FileTally::ResourceLimit
-            } else {
-                FileTally::Error
-            };
-        }
-    };
-    // Remap basename-only file field → relative display path.
-    set_diag_display_path(&mut result, display_path);
-
-    if result.truncated {
-        *any_truncated = true;
-        // D4 (AD-216-11): this is a status message, not an error — suppress
-        // under --quiet (main.rs:30 "Suppress status and diagnostic output").
-        if fix && !quiet {
-            eprintln!(
-                "{}: diagnostic cap ({}) reached; further findings were suppressed — \
-                 re-run --fix to continue",
-                safe_path(file),
-                mds::MAX_DIAGNOSTICS
-            );
-        }
-    }
-
-    if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            &config,
-            display_path,
-        );
-        match fix_outcome {
-            FixFileOutcome::Fixed {
-                new_source,
-                residual,
-            } => {
-                render_result_human(&residual, quiet, named_source);
-                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
-                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
-                    return FileTally::Error;
-                }
-                if !quiet {
-                    eprintln!("Fixed: {}", safe_path(file));
-                }
-                tally_from_result(&residual)
-            }
-            FixFileOutcome::PartiallyFixed {
-                new_source,
-                residual,
-                applied_count,
-                total_count,
-            } => {
-                render_result_human(&residual, quiet, named_source);
-                if let Err(e) = atomic_write_file(file, &new_source, Durability::Fsync) {
-                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
-                    return FileTally::Error;
-                }
-                // Print status AFTER write succeeds so "Partially fixed:" never
-                // precedes "error writing" for a file that was never modified.
-                // Unified message + quiet guard (#173).
-                if !quiet {
-                    eprintln!(
-                        "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
-                        safe_path(file)
-                    );
-                }
-                tally_from_result(&residual)
-            }
-            FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-11): "fix rejected" is a status message — the safety
-                // gate fired, the original diagnostics remain unmodified.  Suppress under
-                // --quiet (main.rs:30).
-                if !quiet {
-                    eprintln!(
-                        "{}: fix rejected: {}",
-                        safe_path(file),
-                        safe_inline(&reason)
-                    );
-                }
-                render_result_human(&original, quiet, named_source);
-                tally_from_result(&original)
-            }
-            FixFileOutcome::NothingToFix { original } => {
-                render_result_human(&original, quiet, named_source);
-                tally_from_result(&original)
-            }
-        }
-    } else if fix && (check || diff) {
-        // Directory-mode preview — route through gated pipeline.
-        // R1: in the WouldFix arm the per-file tally comes from the RESIDUAL
-        // (what a real --fix would leave behind); the rendered body stays
-        // PRE-fix.  run_lint_directory floors the aggregate exit at 1 via
-        // any_would_fix.
-        let tally = match preview_fixes(
-            &result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            &config,
-            display_path,
-        ) {
-            PreviewOutcome::WouldFix {
-                ref fixed,
-                ref residual,
-            } => {
-                *any_would_fix = true;
-                if diff {
-                    let label = safe_path(file);
-                    let diff_str = render_unified_diff(&source, fixed, &label);
-                    let _ = write_stdout(&diff_str);
-                }
-                if check && !quiet {
-                    eprintln!("Would fix: {}", safe_path(file));
-                }
-                tally_from_result(residual)
-            }
-            PreviewOutcome::Rejected(ref reason) => {
-                if !quiet {
-                    eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
-                }
-                tally_from_result(&result)
-            }
-            PreviewOutcome::NothingToFix => tally_from_result(&result),
-        };
-        render_result_human(&result, quiet, named_source);
-        tally
-    } else {
-        render_result_human(&result, quiet, named_source);
-        tally_from_result(&result)
-    }
-}
-
-// ── Shared emit helpers ───────────────────────────────────────────────────────
-
-/// Emit a `LintResult` to the appropriate channel based on format.
-///
-/// `named_source` is forwarded to human rendering for span context; ignored in JSON mode.
-fn emit_result(
-    format: LintFormat,
-    result: &mds::LintResult,
-    quiet: bool,
-    named_source: Option<(&str, &str)>,
-) {
-    if format == LintFormat::Json {
-        let json = result.to_canonical_json();
-        let _ = write_stdout(&format!(
-            "{}\n",
-            serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
-        ));
-    } else {
-        render_result_human(
-            result,
-            quiet,
-            named_source.expect("Human format requires named_source"),
-        );
-    }
-}
-
-/// AD-211-5 (2026-08-12 ruling): this envelope is the single CLI choke-point for
-/// **lint's** analysis failures (config load, IO, resolution, parse).  When
-/// `stdin_source` is `Some(source_text)` the embedded source identity in the rendered
-/// output is replaced with [`STDIN_DISPLAY_LABEL`], so every CLI diagnostic context
-/// for stdin input uses the uniform sentinel instead of the core's internal
-/// `SOURCE_LABEL` (`"<source>"`) that `resolve_source_intrinsic` embeds in `MdsError`
-/// spans.
-///
-/// **State it as a rule about this envelope, not about stdin:** every
-/// `MdsError` reaching this function for a stdin run labels its source `<stdin>`.
-/// Any error later routed here — a config rejection, a new IO failure — inherits
-/// that label instead of inventing a second convention.
-///
-/// The JSON leg needs no relabel and takes none: `MdsError::serialize()` emits
-/// `code` / `message` / `help` / `span`, and no `MdsError` `Display` template
-/// interpolates `ctx.file_str`, so the source identity never reaches
-/// `error.message`.  `cli_lint.rs::stdin_analysis_failure_labels_source_as_stdin`
-/// pins that on both channels rather than leaving it as an assumption.
-///
-/// For errors from a file source, pass `stdin_source: None`; the error's embedded
-/// `NamedSource` (which already carries the correct filename) is used as-is.
-///
-/// JSON format → stdout envelope; human → stderr via miette.
-fn emit_analysis_failure_json_or_stderr(
-    e: &MdsError,
-    format: LintFormat,
-    stdin_source: Option<&str>,
-) {
-    if format == LintFormat::Json {
-        let envelope = serde_json::json!({
-            "version": 1,
-            "error": e.serialize()
-        });
-        let _ = write_stdout(&format!(
-            "{}\n",
-            serde_json::to_string(&envelope).expect("canonical lint JSON is always serializable")
-        ));
-    } else {
-        // Route through the single render choke point (avoids PF-004 /
-        // architecture-6: hand-rolled sanitize_control_chars bypass).
-        let report = match stdin_source {
-            Some(src) => relabel_stdin_error(e, src),
-            None => miette::Report::from(e.clone()),
-        };
-        eprint_error(report);
-    }
-}
-
-/// Extract and accumulate per-file JSON entries from a `LintResult` into `json_files`.
-fn accumulate_result_json(result: &mds::LintResult, json_files: &mut Vec<serde_json::Value>) {
-    let inner = result.to_canonical_json();
-    if let Some(arr) = inner["files"].as_array() {
-        json_files.extend(arr.iter().cloned());
-    }
+    lint_input(linted, ctx.flags, ctx.runtime_vars)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::{preview_fixes, PreviewOutcome};
-    use mds::{FixLineSpan, LintDiagnostic, LintResult, Severity};
-    use std::path::Path;
+    use super::{
+        apply_fix, fix_stdin, lint_input, render, run_fix_pipeline, set_diag_display_path,
+        CapNotice, DirSummary, FileReport, FileTally, FilterFix, FixPipelineOutcome, InputVerdict,
+        LintFlags, LintFormat, LintSource, Linted, Outcome, PreviewFix, Residual, ReverifyGate,
+        Rewrite, SourceText,
+    };
+    use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
+    use crate::output::{safe_path, STDIN_DISPLAY_LABEL};
+    use mds::{FixLineSpan, LintDiagnostic, LintResult, MdsError, SerializedSpan, Severity};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
     /// ISS-13: CLI-level genuine partial overlaps are structurally impossible with
     /// the current 10 rules.  Every pair of real-rule fix spans is either disjoint
@@ -2116,7 +1912,7 @@ mod tests {
     /// through the CLI binary.
     ///
     /// This unit test covers rejection surfacing at the deepest level reachable from
-    /// the CLI crate: `preview_fixes` with a crafted `LintResult` whose `fix_removals`
+    /// the CLI crate: `run_fix_pipeline` with a crafted `LintResult` whose `fix_removals`
     /// produce the same genuine partial overlap used in the mds-core ISS-02 regression
     /// test (fix.rs: `a4_partial_overlap_still_rejected_after_dedup`).
     ///
@@ -2126,12 +1922,12 @@ mod tests {
     ///   Edit B: FixLineSpan::range_inclusive(6, 12) → ByteEdit [6,  18)
     ///   A.end=12 > B.start=6, B.end=18 > A.end=12 → partial overlap → overlap_rejected.
     ///
-    /// `preview_fixes` must return `PreviewOutcome::Rejected` — the rejection must be
+    /// `run_fix_pipeline` must return `FixPipelineOutcome::Rejected` — the rejection must be
     /// surfaced (not silently swallowed as `NothingToFix`).  This pins PF-004: the
     /// preview path uses the same gated pipeline as the write path and is equally
     /// honest about overlap refusals.
     #[test]
-    fn preview_fixes_surfaces_rejected_on_overlap() {
+    fn fix_pipeline_surfaces_rejected_on_overlap() {
         let source = "line0\nline1\nline2\n";
         // Edit A covers bytes [0, 12): line0 start through line1 end (inclusive).
         let diag_a = LintDiagnostic::new("duplicate-import", Severity::Error, "a")
@@ -2150,27 +1946,32 @@ mod tests {
             ]);
         let result = LintResult::new(vec![diag_a, diag_b]);
 
-        let outcome = preview_fixes(
+        let input = LintSource::DirEntry {
+            root: Path::new("."),
+            path: Path::new("overlap.mds"),
+            key: "overlap.mds",
+        };
+        let outcome = run_fix_pipeline(
+            &input,
             &result,
             source,
             Path::new("."),
             None,
             &mds::LintConfig::default(),
-            "overlap.mds",
         );
 
         assert!(
-            matches!(outcome, PreviewOutcome::Rejected(_)),
-            "preview_fixes must return Rejected for an overlap_rejected plan, \
-             not NothingToFix or WouldFix (PF-004 — preview must be as honest as apply)"
+            matches!(outcome, FixPipelineOutcome::Rejected { .. }),
+            "run_fix_pipeline must return Rejected for an overlap_rejected plan, not \
+             NothingToFix, Fixed or PartiallyFixed (preview must be as honest as apply)"
         );
     }
 
-    /// R1: the residual carried by `PreviewOutcome::WouldFix` must have every
-    /// diagnostic's `file` field relabelled to the caller-supplied display label,
-    /// mirroring the `plan_and_apply_fixes` contract.  Without the relabel the
-    /// residual leaks the internal `STRING_SOURCE_MAP_LABEL` basename that
-    /// `mds::lint_str_with` sets inside the reverify closure.
+    /// The residual the preview reads from `FixPipelineOutcome::Fixed` or
+    /// `PartiallyFixed` must have every diagnostic's `file` field relabelled to the
+    /// input's display label, as the write path's residual is.  Without the relabel the
+    /// residual carries the name the reverify gate lints a candidate under: the entry's
+    /// file name `custom-label.mds`, not its key `sub/custom-label.mds`.
     ///
     /// The source carries one FIXABLE finding (empty-block on the bare `@if`) and
     /// one NON-fixable finding that survives the fix (unused-variable on the
@@ -2178,23 +1979,22 @@ mod tests {
     /// assertion cannot pass vacuously (PF-013), and a non-vacuity guard asserts
     /// the expected rule survived.
     #[test]
-    fn preview_fixes_would_fix_relabels_residual_display_path() {
+    fn fix_pipeline_would_fix_relabels_residual_display_path() {
         let source = "---\nunused_key: value\n---\n\n@if \"a\" == \"a\":\n@end\n\nHello\n";
         let config = mds::LintConfig::default();
         let result = mds::lint_str_with(source, Some(Path::new(".")), None, &config)
             .expect("fixture source must lint");
 
-        let outcome = preview_fixes(
-            &result,
-            source,
-            Path::new("."),
-            None,
-            &config,
-            "custom-label.mds",
-        );
+        let input = LintSource::DirEntry {
+            root: Path::new("."),
+            path: Path::new("sub/custom-label.mds"),
+            key: "sub/custom-label.mds",
+        };
+        let outcome = run_fix_pipeline(&input, &result, source, Path::new("."), None, &config);
 
         match outcome {
-            PreviewOutcome::WouldFix { ref residual, .. } => {
+            FixPipelineOutcome::Fixed { ref residual, .. }
+            | FixPipelineOutcome::PartiallyFixed { ref residual, .. } => {
                 assert!(
                     !residual.diagnostics.is_empty(),
                     "non-vacuity (PF-013): the unused-variable finding must survive the fix"
@@ -2215,17 +2015,1198 @@ mod tests {
                 for diag in &residual.diagnostics {
                     assert_eq!(
                         diag.file.as_deref(),
-                        Some("custom-label.mds"),
+                        Some("sub/custom-label.mds"),
                         "R1: every residual diagnostic must carry the caller-supplied \
                          display label"
                     );
                 }
             }
             _ => panic!(
-                "preview_fixes must return WouldFix for a source with a fixable \
-                 empty-block finding"
+                "run_fix_pipeline must return Fixed or PartiallyFixed for a source with a \
+                 fixable empty-block finding"
             ),
         }
+    }
+
+    /// Each input's lint name is the name `mds::lint` or `mds::lint_str_with` linted it
+    /// under: the string label for stdin, and the file name — the path's last component,
+    /// whatever directories lead to it — for a file argument or a directory's entry.
+    #[test]
+    fn an_input_is_linted_under_its_file_name_and_stdin_under_the_string_label() {
+        assert_eq!(LintSource::Stdin.lint_name(), mds::STRING_SOURCE_MAP_LABEL);
+        let typed = Path::new("templates/_p.mds");
+        let file = LintSource::File {
+            typed,
+            name: "_p.mds",
+        };
+        assert_eq!(file.lint_name(), "_p.mds");
+        for key in ["_p.mds", "sub/_p.mds", "sub/deeper/_p.mds"] {
+            let path = Path::new(key);
+            let entry = LintSource::DirEntry {
+                root: Path::new("."),
+                path,
+                key,
+            };
+            assert_eq!(entry.lint_name(), "_p.mds", "the entry keyed {key:?}");
+            assert_eq!(
+                path.file_name().and_then(OsStr::to_str),
+                Some(entry.lint_name()),
+                "the name `mds::lint` takes from the path, for the entry keyed {key:?}"
+            );
+        }
+    }
+
+    /// The source the reverify-gate tests share: an empty `@if` block (a fixable,
+    /// output-neutral `empty-block` finding) above a line of text.
+    const EMPTY_BLOCK_SOURCE: &str = "@if \"a\" == \"a\":\n@end\n\nHello\n";
+
+    /// The gate's refusal of a candidate that would change the compiled output.
+    const OUTPUT_CHANGED: &str =
+        "lint --fix would change compiled output; edit reverted to preserve template semantics";
+
+    /// `source`'s compiled output, resolved against the working directory like the
+    /// tests' gates.
+    fn compiled(source: &str) -> mds::CompiledOutput {
+        mds::compile_str_collecting_warnings(source, Some(Path::new(".")), None)
+            .expect("fixture source must compile")
+            .output
+    }
+
+    /// `source`'s findings and the fix plan `run_fix_pipeline` builds from them. The
+    /// source is linted as stdin is, under `mds::STRING_SOURCE_MAP_LABEL`, the name the
+    /// tests' gates lint its candidates under.
+    fn lint_and_plan(source: &str, config: &mds::LintConfig) -> (LintResult, mds::fix::FixPlan) {
+        let result = mds::lint_str_with(source, Some(Path::new(".")), None, config)
+            .expect("fixture source must lint");
+        let plan = mds::fix::plan_fixes_with_options(&result, source, result.is_standalone);
+        (result, plan)
+    }
+
+    /// When every planned edit is output-neutral, the gate refuses a candidate that
+    /// compiles to different output, with the `mds::io` message a `fix rejected:` line
+    /// quotes.
+    ///
+    /// No known `mds lint --fix` input reaches this refusal end to end, so the candidate
+    /// is crafted. It still lints, which leaves the output check as the only check that
+    /// can refuse it.
+    ///
+    /// Control: the plan's own fix compiles to the same output and is accepted, so the
+    /// gate does not refuse every candidate.
+    #[test]
+    fn reverify_gate_refuses_a_candidate_that_changes_compiled_output() {
+        let config = mds::LintConfig::default();
+        let (_, plan) = lint_and_plan(EMPTY_BLOCK_SOURCE, &config);
+        assert!(
+            !plan.edits.is_empty()
+                && plan
+                    .edits
+                    .iter()
+                    .all(|e| mds::fix::is_output_neutral(&e.rule)),
+            "precondition: the plan must have edits, all output-neutral; got {:?}",
+            plan.edits
+        );
+        let gate = ReverifyGate::new(
+            &plan,
+            EMPTY_BLOCK_SOURCE,
+            mds::STRING_SOURCE_MAP_LABEL,
+            Path::new("."),
+            None,
+            &config,
+        );
+
+        let fixed = mds::fix::apply_plan_unchecked(EMPTY_BLOCK_SOURCE, &plan);
+        assert_eq!(
+            compiled(&fixed),
+            compiled(EMPTY_BLOCK_SOURCE),
+            "precondition: the plan's own fix must keep the compiled output"
+        );
+        if let Err(err) = gate.verify(&fixed) {
+            panic!("control: the gate must accept an output-identical candidate; got: {err}");
+        }
+
+        let changed = EMPTY_BLOCK_SOURCE.replace("Hello", "Goodbye");
+        if let Err(err) = mds::lint_str_with(&changed, Some(Path::new(".")), None, &config) {
+            panic!(
+                "precondition: the changed candidate must lint, so that only the output \
+                 check can refuse it; got: {err}"
+            );
+        }
+        assert_ne!(
+            compiled(&changed),
+            compiled(EMPTY_BLOCK_SOURCE),
+            "precondition: the changed candidate must compile to different output"
+        );
+        let err = gate
+            .verify(&changed)
+            .expect_err("the gate must refuse a candidate that changes the compiled output");
+        assert!(
+            matches!(err, mds::MdsError::Io { .. }),
+            "the refusal must be an Io error; got: {err:?}"
+        );
+        assert_eq!(err.to_string(), OUTPUT_CHANGED);
+        assert_eq!(
+            miette::Diagnostic::code(&err)
+                .map(|code| code.to_string())
+                .as_deref(),
+            Some("mds::io")
+        );
+    }
+
+    /// A plan with any edit that changes output on purpose (`legacy-interpolation`)
+    /// skips the output check for every candidate: one that changes the output is
+    /// accepted as long as it lints.
+    ///
+    /// Control: the same candidate against the plan's output-neutral edits alone is
+    /// refused, so the acceptance comes from the output-changing edit.
+    #[test]
+    fn reverify_gate_skips_the_output_check_for_a_plan_that_changes_output() {
+        let source = "@if \"a\" == \"a\":\n@end\n\nHello {name}\n";
+        let config = mds::LintConfig::default();
+        let neutral = |e: &mds::fix::ByteEdit| mds::fix::is_output_neutral(&e.rule);
+        let (_, plan) = lint_and_plan(source, &config);
+        assert!(
+            plan.edits.iter().any(neutral) && !plan.edits.iter().all(neutral),
+            "precondition: the plan must mix output-neutral and output-changing edits; \
+             got {:?}",
+            plan.edits
+        );
+        let changed = source.replace("Hello", "Goodbye");
+        assert_ne!(
+            compiled(&changed),
+            compiled(source),
+            "precondition: the changed candidate must compile to different output"
+        );
+
+        let gate = ReverifyGate::new(
+            &plan,
+            source,
+            mds::STRING_SOURCE_MAP_LABEL,
+            Path::new("."),
+            None,
+            &config,
+        );
+        if let Err(err) = gate.verify(&changed) {
+            panic!("a plan with an output-changing edit must skip the output check; got: {err}");
+        }
+
+        let (_, mut neutral_plan) = lint_and_plan(source, &config);
+        neutral_plan.edits.retain(neutral);
+        assert!(
+            !neutral_plan.edits.is_empty(),
+            "precondition: the control plan must keep the output-neutral edit"
+        );
+        let neutral_gate = ReverifyGate::new(
+            &neutral_plan,
+            source,
+            mds::STRING_SOURCE_MAP_LABEL,
+            Path::new("."),
+            None,
+            &config,
+        );
+        let err = neutral_gate
+            .verify(&changed)
+            .expect_err("control: an all-neutral plan must refuse the changed candidate");
+        assert_eq!(err.to_string(), OUTPUT_CHANGED);
+    }
+
+    /// The gate's refusal reaches the pipeline's outcome as `Rejected`, and its words
+    /// reach the reason `fix rejected:` prints. The `LintResult` is crafted, as in the
+    /// overlap test above: an output-neutral `empty-block` removal aimed at the `Hello`
+    /// line, which no real rule plans.
+    ///
+    /// Control: the real findings of the same source are fixed.
+    #[test]
+    fn fix_pipeline_rejects_a_fix_that_would_change_compiled_output() {
+        let config = mds::LintConfig::default();
+        let input = LintSource::DirEntry {
+            root: Path::new("."),
+            path: Path::new("output.mds"),
+            key: "output.mds",
+        };
+
+        let (real, _) = lint_and_plan(EMPTY_BLOCK_SOURCE, &config);
+        let outcome = run_fix_pipeline(
+            &input,
+            &real,
+            EMPTY_BLOCK_SOURCE,
+            Path::new("."),
+            None,
+            &config,
+        );
+        assert!(
+            matches!(outcome, FixPipelineOutcome::Fixed { .. }),
+            "control: the real empty-block fix must apply"
+        );
+
+        let hello = EMPTY_BLOCK_SOURCE
+            .find("Hello")
+            .expect("the fixture has a Hello line");
+        let crafted = LintResult::new(vec![LintDiagnostic::new(
+            "empty-block",
+            Severity::Warn,
+            "crafted",
+        )
+        .with_fix_removals(vec![FixLineSpan::range_inclusive(hello, hello)])]);
+        match run_fix_pipeline(
+            &input,
+            &crafted,
+            EMPTY_BLOCK_SOURCE,
+            Path::new("."),
+            None,
+            &config,
+        ) {
+            FixPipelineOutcome::Rejected { reason } => assert_eq!(
+                reason,
+                format!(
+                    "could not verify fix — the edited source did not re-parse cleanly \
+                     ({OUTPUT_CHANGED}); leaving the file unchanged"
+                )
+            ),
+            _ => panic!(
+                "run_fix_pipeline must return Rejected for a fix that would change the \
+                 compiled output, not Fixed, PartiallyFixed or NothingToFix"
+            ),
+        }
+    }
+
+    /// `mds lint --fix --format json --quiet <dir>`, for one entry of the directory:
+    /// `--quiet` keeps the status lines off the test's stderr, and the tests read the
+    /// directory's JSON document.
+    const DIR_JSON_FIX: LintFlags = LintFlags {
+        fix: true,
+        check: false,
+        diff: false,
+        quiet: true,
+        format: LintFormat::Json,
+    };
+
+    /// A source whose fix leaves a finding: the empty `@if` block is removed, and the
+    /// unreferenced frontmatter key stays an `unused-variable` warning.
+    const FIX_LEAVES_A_FINDING: &str =
+        "---\nunused_key: value\n---\n\n@if \"a\" == \"a\":\n@end\n\nHello\n";
+
+    /// `FIX_LEAVES_A_FINDING`'s findings, named for `input` as a directory run names them,
+    /// and what the fix pipeline makes of them: a fix that leaves a finding.
+    fn fix_leaving_a_finding(input: &LintSource<'_>) -> (LintResult, FixPipelineOutcome) {
+        let config = mds::LintConfig::default();
+        let mut result =
+            mds::lint_str_with(FIX_LEAVES_A_FINDING, Some(Path::new(".")), None, &config)
+                .expect("fixture source must lint");
+        set_diag_display_path(&mut result, input.display_label());
+        let outcome = run_fix_pipeline(
+            input,
+            &result,
+            FIX_LEAVES_A_FINDING,
+            Path::new("."),
+            None,
+            &config,
+        );
+        match &outcome {
+            FixPipelineOutcome::Fixed { residual, .. }
+            | FixPipelineOutcome::PartiallyFixed { residual, .. } => assert!(
+                !residual.diagnostics.is_empty(),
+                "precondition: the fix must leave a finding"
+            ),
+            _ => panic!("precondition: the empty-block finding must be fixed"),
+        }
+        (result, outcome)
+    }
+
+    /// `--fix` of `input`, an entry of a directory under `--format json`, whose file is at
+    /// `path`: [`apply_fix`] rewrites it, and [`render`] shows the report through a JSON sink
+    /// in the middle of a directory run. The entry's verdict, and the entries the
+    /// directory's document then holds.
+    fn fix_in_a_json_directory(
+        input: LintSource<'_>,
+        path: &Path,
+        result: LintResult,
+        outcome: FixPipelineOutcome,
+    ) -> (InputVerdict, Vec<serde_json::Value>) {
+        let outcome = apply_fix(
+            &crate::output::WriteTarget::as_typed(path.to_path_buf()),
+            result,
+            FIX_LEAVES_A_FINDING.to_string(),
+            outcome,
+            DIR_JSON_FIX.format,
+        );
+        let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
+        sink.start_document();
+        let report = FileReport {
+            input,
+            capped: None,
+            outcome,
+        };
+        let verdict = render(report, &mut sink);
+        (verdict, sink.document().to_vec())
+    }
+
+    /// A directory's JSON document records a rewritten file's remaining findings only once
+    /// the rewrite has landed. When the rewrite fails, the failure is the file's one entry:
+    /// findings recorded before the write would sit beside it and describe a file that was
+    /// never rewritten (#309).
+    ///
+    /// This fix leaves a warning, so a record made before the write would show.
+    ///
+    /// Control: with a writable target the rewrite lands and the warning is recorded.
+    #[test]
+    fn directory_json_fix_records_a_failed_rewrite_as_its_only_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        let writable = root.join("x.mds");
+        std::fs::write(&writable, FIX_LEAVES_A_FINDING).unwrap();
+        let input = LintSource::DirEntry {
+            root: Path::new("."),
+            path: &writable,
+            key: "x.mds",
+        };
+        let (result, outcome) = fix_leaving_a_finding(&input);
+        let (verdict, document) = fix_in_a_json_directory(input, &writable, result, outcome);
+        let rewritten = std::fs::read_to_string(&writable).unwrap();
+        assert!(
+            !rewritten.contains("@if"),
+            "control: the rewrite must land; got {rewritten:?}"
+        );
+        assert!(
+            verdict.tally == FileTally::WarnOnly,
+            "control: the file counts by the warning the fix left"
+        );
+        assert_eq!(
+            document.len(),
+            1,
+            "control: one entry, the remaining warning; got {document:?}"
+        );
+        assert_eq!(document[0]["file"], "x.mds");
+        assert_eq!(
+            document[0]["diagnostics"][0]["rule"], "unused-variable",
+            "control: got {document:?}"
+        );
+
+        // The target's directory is gone, so the temporary file cannot be created.
+        let unwritable = root.join("gone").join("x.mds");
+        let input = LintSource::DirEntry {
+            root: Path::new("."),
+            path: &unwritable,
+            key: "x.mds",
+        };
+        let (result, outcome) = fix_leaving_a_finding(&input);
+        let (verdict, document) = fix_in_a_json_directory(input, &unwritable, result, outcome);
+        assert!(!unwritable.exists(), "precondition: nothing was written");
+        assert!(
+            verdict.tally == FileTally::Error,
+            "a failed rewrite counts under \"with errors\""
+        );
+        assert_eq!(
+            document.len(),
+            1,
+            "the failure must be the file's only entry; got {document:?}"
+        );
+        assert_eq!(document[0]["file"], "x.mds");
+        assert_eq!(document[0]["error"]["code"], "mds::io", "got {document:?}");
+        assert!(
+            document[0].get("diagnostics").is_none(),
+            "no findings for a file that was not rewritten; got {document:?}"
+        );
+    }
+
+    /// Under `--format json` a directory's entry is read only to fix it. When that read
+    /// fails, the failure is recorded as the entry and counts under "with errors". The
+    /// entry holds no findings, so it does not mark the document truncated, though its
+    /// lint was capped (#309).
+    ///
+    /// The read follows a lint that read the same file, so no CLI run reaches it without a
+    /// race; the capped result is crafted.
+    ///
+    /// Control: the same entry, readable and with nothing to fix, adds no entry, counts
+    /// clean and marks the document truncated: the findings it is left with are its own.
+    #[test]
+    fn directory_json_fix_records_an_entry_it_cannot_read_as_a_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = Rc::new(mds::LintConfig::default());
+        // The entry linted, reported and shown through a JSON sink in the middle of a
+        // directory run: its verdict, and the entries the directory's document then holds.
+        let fix = |path: &Path, key: &str| {
+            let linted = Linted {
+                input: LintSource::DirEntry {
+                    root: Path::new("."),
+                    path,
+                    key,
+                },
+                base_dir: &root,
+                config: Rc::clone(&config),
+                source: SourceText::Unread(path),
+                result: LintResult::new(vec![]).truncated(),
+            };
+            let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
+            sink.start_document();
+            let verdict = render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink);
+            (verdict, sink.document().to_vec())
+        };
+
+        let readable = root.join("x.mds");
+        std::fs::write(&readable, "Hello\n").unwrap();
+        let (verdict, document) = fix(&readable, "x.mds");
+        assert!(
+            verdict.tally == FileTally::Clean,
+            "control: nothing to fix and no findings"
+        );
+        assert!(
+            verdict.truncated,
+            "control: a capped result marks the document truncated"
+        );
+        assert!(
+            document.is_empty(),
+            "control: no findings, no entry; got {document:?}"
+        );
+
+        let missing = root.join("gone.mds");
+        let expected = super::read_source_file(&missing)
+            .expect_err("precondition: the file must not read")
+            .serialize();
+        let (verdict, document) = fix(&missing, "gone.mds");
+        assert!(
+            verdict.tally == FileTally::Error,
+            "an entry that cannot be read to fix counts under \"with errors\""
+        );
+        assert!(
+            !verdict.truncated,
+            "an entry recorded as a failure does not mark the document truncated"
+        );
+        assert_eq!(
+            document,
+            vec![serde_json::json!({ "file": "gone.mds", "error": expected })]
+        );
+    }
+
+    /// Under `--format json` a directory's entry that is over the size cap when it is read
+    /// to fix is recorded as that failure, `mds::resource_limit`, and counts under
+    /// "resource-limited" — not "with errors" — as it does when `mds::lint` refuses it
+    /// (#309).
+    ///
+    /// The read follows a lint that read the same file within the cap, so no CLI run
+    /// reaches it without a race; the lint result is crafted.
+    ///
+    /// Control: the same entry at exactly the cap is read, has nothing to fix and counts
+    /// clean.
+    #[test]
+    fn directory_json_fix_counts_an_entry_over_the_size_cap_as_resource_limited() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = Rc::new(mds::LintConfig::default());
+        let path = root.join("x.mds");
+        let fix = |len: u64| {
+            let len = usize::try_from(len).unwrap();
+            std::fs::write(&path, "a".repeat(len - 1) + "\n").unwrap();
+            let linted = Linted {
+                input: LintSource::DirEntry {
+                    root: Path::new("."),
+                    path: &path,
+                    key: "x.mds",
+                },
+                base_dir: &root,
+                config: Rc::clone(&config),
+                source: SourceText::Unread(&path),
+                result: LintResult::new(vec![]),
+            };
+            let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
+            sink.start_document();
+            let verdict = render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink);
+            (verdict, sink.document().to_vec())
+        };
+
+        let (verdict, document) = fix(mds::MAX_FILE_SIZE);
+        assert!(
+            verdict.tally == FileTally::Clean,
+            "control: read within the cap, nothing to fix"
+        );
+        assert!(document.is_empty(), "control: no entry; got {document:?}");
+
+        let (verdict, document) = fix(mds::MAX_FILE_SIZE + 1);
+        assert!(
+            verdict.tally == FileTally::ResourceLimit,
+            "an entry over the size cap counts under \"resource-limited\""
+        );
+        assert_eq!(
+            document.len(),
+            1,
+            "the failure is the entry; got {document:?}"
+        );
+        assert_eq!(document[0]["file"], "x.mds", "got {document:?}");
+        assert_eq!(
+            document[0]["error"]["code"], "mds::resource_limit",
+            "got {document:?}"
+        );
+    }
+
+    /// A directory's summary is the fold of its files' verdicts (#309): each verdict is
+    /// counted exactly once, under its tally, and the run takes the worst tally, a pending
+    /// fix and a cap from any file.
+    ///
+    /// Controls: nothing folded counts nothing and exits 0; a pending fix alone raises a
+    /// clean tree to 1.
+    #[test]
+    fn directory_summary_counts_each_verdict_once() {
+        let verdict = |tally, would_fix, truncated| InputVerdict {
+            tally,
+            would_fix,
+            truncated,
+        };
+        let counts = |s: &DirSummary| {
+            (
+                s.clean_count,
+                s.warn_file_count,
+                s.error_file_count,
+                s.limit_file_count,
+            )
+        };
+
+        let summary = [
+            verdict(FileTally::Clean, false, false),
+            verdict(FileTally::WarnOnly, true, false),
+            verdict(FileTally::Error, false, true),
+            verdict(FileTally::Clean, false, false),
+            verdict(FileTally::ResourceLimit, false, false),
+        ]
+        .into_iter()
+        .fold(DirSummary::default(), DirSummary::count);
+        assert_eq!(counts(&summary), (2, 1, 1, 1));
+        assert!(
+            summary.truncated(),
+            "one capped file marks the run truncated"
+        );
+        assert_eq!(
+            summary.exit_code(),
+            3,
+            "the worst tally is resource-limited"
+        );
+
+        let empty = DirSummary::default();
+        assert_eq!(counts(&empty), (0, 0, 0, 0), "control: nothing counted");
+        assert!(!empty.truncated());
+        assert_eq!(empty.exit_code(), 0, "control: nothing to fail");
+
+        let pending = [verdict(FileTally::Clean, true, false)]
+            .into_iter()
+            .fold(DirSummary::default(), DirSummary::count);
+        assert_eq!(counts(&pending), (1, 0, 0, 0));
+        assert_eq!(
+            pending.exit_code(),
+            1,
+            "control: a preview that would fix a clean file exits 1"
+        );
+    }
+
+    /// `error`'s diagnostic code, such as `mds::io`.
+    fn code_of(error: &MdsError) -> String {
+        miette::Diagnostic::code(error)
+            .map(|code| code.to_string())
+            .unwrap_or_default()
+    }
+
+    /// A result sink that shows nothing and records each call [`render`] makes of it, in
+    /// order, naming the input by its display label.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Vec<String>,
+    }
+
+    impl Recorder {
+        fn record(&mut self, call: &str, input: &LintSource<'_>) {
+            self.calls.push(format!("{call} {}", input.display_label()));
+        }
+    }
+
+    impl ResultSink for Recorder {
+        fn quiet(&self) -> bool {
+            false
+        }
+
+        fn findings(
+            &mut self,
+            input: &LintSource<'_>,
+            findings: &LintResult,
+            _: Option<&str>,
+            _: bool,
+        ) {
+            let call = format!("findings ({})", findings.diagnostics.len());
+            self.record(&call, input);
+        }
+
+        fn failed(&mut self, input: &LintSource<'_>, error: MdsError) {
+            let call = format!("failed ({})", code_of(&error));
+            self.record(&call, input);
+        }
+
+        fn panicked(&mut self, input: &LintSource<'_>) {
+            self.record("panicked", input);
+        }
+
+        fn write_failed(&mut self, input: &LintSource<'_>, _: MdsError) {
+            self.record("write failed", input);
+        }
+
+        fn clean(&mut self, input: &LintSource<'_>, _: &LintResult) {
+            self.record("clean", input);
+        }
+
+        fn analysis_failure(&mut self, _: &MdsError, _: Option<&str>) {
+            self.calls.push("analysis failure".to_string());
+        }
+
+        fn start_document(&mut self) {
+            self.calls.push("start document".to_string());
+        }
+
+        fn end_document(&mut self, _: bool) {
+            self.calls.push("end document".to_string());
+        }
+
+        fn cap_reached(&mut self, input: &LintSource<'_>, notice: CapNotice) {
+            let call = match notice {
+                CapNotice::Plain => "cap reached",
+                CapNotice::RerunFix => "cap reached, re-run --fix",
+            };
+            self.record(call, input);
+        }
+
+        fn fix_rejected(&mut self, input: &LintSource<'_>, _: &str) {
+            self.record("fix rejected", input);
+        }
+
+        fn would_fix(&mut self, input: &LintSource<'_>) {
+            self.record("would fix", input);
+        }
+
+        fn fixed(&mut self, input: &LintSource<'_>, partial: Option<(usize, usize)>) {
+            let call = format!("fixed {partial:?}");
+            self.record(&call, input);
+        }
+
+        fn diff(&mut self, _: &str) -> bool {
+            self.calls.push("diff".to_string());
+            false
+        }
+
+        fn fixed_source(&mut self, _: &str) {
+            self.calls.push("fixed source".to_string());
+        }
+    }
+
+    /// A capped result announces the cap before anything else its input shows (#309) — for
+    /// an entry of a directory under `--format json` whose read to fix it fails, before its
+    /// failure. The late-read test above reads the directory's document, which shows the
+    /// failure and the `truncated` flag but not this order; the calls `render` makes do.
+    ///
+    /// Under `--fix` the notice advises re-running it; in a report or a preview it does not.
+    ///
+    /// Controls: the same capped entry, readable with nothing to fix, announces the cap
+    /// before its findings, and so do its report and its previews; an uncapped entry whose
+    /// read fails announces no cap.
+    #[test]
+    fn a_capped_entry_that_cannot_be_read_announces_the_cap_before_its_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = Rc::new(mds::LintConfig::default());
+        // The calls `render` makes to show the entry's report, linted as a directory run
+        // under `--format json` lints it with `flags`.
+        let calls_with = |flags: LintFlags, path: &Path, key: &str, result: LintResult| {
+            let linted = Linted {
+                input: LintSource::DirEntry {
+                    root: Path::new("."),
+                    path,
+                    key,
+                },
+                base_dir: &root,
+                config: Rc::clone(&config),
+                source: SourceText::Unread(path),
+                result,
+            };
+            let mut sink = Recorder::default();
+            render(lint_input(linted, flags, &None), &mut sink);
+            sink.calls
+        };
+        let calls = |path: &Path, key: &str, result| calls_with(DIR_JSON_FIX, path, key, result);
+
+        let missing = root.join("gone.mds");
+        let read_failure = code_of(
+            &super::read_source_file(&missing).expect_err("precondition: the file must not read"),
+        );
+        assert_eq!(
+            calls(&missing, "gone.mds", LintResult::new(vec![]).truncated()),
+            [
+                "cap reached, re-run --fix gone.mds".to_string(),
+                format!("failed ({read_failure}) gone.mds"),
+            ],
+        );
+
+        let readable = root.join("x.mds");
+        std::fs::write(&readable, "Hello\n").unwrap();
+        assert_eq!(
+            calls(&readable, "x.mds", LintResult::new(vec![]).truncated()),
+            [
+                "cap reached, re-run --fix x.mds",
+                "findings (0) x.mds",
+                "clean x.mds"
+            ],
+            "control: a capped entry with nothing to fix announces the cap before its findings"
+        );
+        // Only `--fix` advises re-running it: a preview writes nothing.
+        for preview in [
+            LintFlags {
+                check: true,
+                ..DIR_JSON_FIX
+            },
+            LintFlags {
+                diff: true,
+                ..DIR_JSON_FIX
+            },
+        ] {
+            let calls = calls_with(
+                preview,
+                &readable,
+                "x.mds",
+                LintResult::new(vec![]).truncated(),
+            );
+            assert_eq!(
+                calls.first().map(String::as_str),
+                Some("cap reached x.mds"),
+                "a capped preview announces the plain cap notice first; calls: {calls:?}"
+            );
+        }
+        let report = LintFlags {
+            fix: false,
+            ..DIR_JSON_FIX
+        };
+        assert_eq!(
+            calls_with(
+                report,
+                &readable,
+                "x.mds",
+                LintResult::new(vec![]).truncated()
+            ),
+            ["cap reached x.mds", "findings (0) x.mds", "clean x.mds"],
+            "a capped report announces the cap before its findings"
+        );
+        assert_eq!(
+            calls(&missing, "gone.mds", LintResult::new(vec![])),
+            [format!("failed ({read_failure}) gone.mds")],
+            "control: an uncapped result announces no cap"
+        );
+    }
+
+    /// A JSON document's `truncated` is whether the findings an input is left with stopped
+    /// at the diagnostic cap (#309): its own when nothing is fixed, those a fix leaves — or,
+    /// in a preview, would leave — otherwise. An input recorded as a failure is left with no
+    /// findings in the output, so it is never truncated. Every outcome of an input whose own
+    /// findings were capped announces the cap first, whatever its `truncated`.
+    ///
+    /// Controls: an uncapped report, an uncapped residual and an uncapped filter are not
+    /// truncated, though the input's own findings were capped.
+    #[test]
+    fn truncated_is_the_residual_s_and_a_cap_is_announced_first_in_every_outcome() {
+        let capped = || LintResult::new(vec![]).truncated();
+        let uncapped = || LintResult::new(vec![]);
+        let fixed = |findings| Residual {
+            findings,
+            fixed: String::new(),
+        };
+        let unwritable = || MdsError::Io {
+            message: "unwritable".to_string(),
+        };
+        let previewed = |fix| Outcome::Previewed {
+            findings: capped(),
+            text: String::new(),
+            fix,
+        };
+        let pending = |residual| PreviewFix::Pending {
+            residual,
+            diff: None,
+            check: false,
+        };
+        let rewritten = |fix| Outcome::Rewritten {
+            findings: capped(),
+            text: String::new(),
+            fix,
+        };
+        let filtered = |findings, fix| Outcome::Filtered {
+            findings,
+            output: String::new(),
+            fix,
+        };
+        let refused = || "refused".to_string();
+        let cases = [
+            (
+                "report",
+                Outcome::Reported {
+                    findings: capped(),
+                    text: None,
+                },
+                true,
+            ),
+            (
+                "report, uncapped (control)",
+                Outcome::Reported {
+                    findings: uncapped(),
+                    text: None,
+                },
+                false,
+            ),
+            (
+                "failed",
+                Outcome::Failed {
+                    error: unwritable(),
+                    tally: FileTally::Error,
+                },
+                false,
+            ),
+            ("panicked", Outcome::Panicked, false),
+            ("preview, fix clears", previewed(pending(uncapped())), false),
+            (
+                "preview, fix leaves a cap",
+                previewed(pending(capped())),
+                true,
+            ),
+            (
+                "preview, refused",
+                previewed(PreviewFix::Refused { reason: refused() }),
+                true,
+            ),
+            ("preview, nothing", previewed(PreviewFix::Nothing), true),
+            (
+                "rewrite, refused",
+                rewritten(Rewrite::Refused { reason: refused() }),
+                true,
+            ),
+            ("rewrite, unchanged", rewritten(Rewrite::Unchanged), true),
+            (
+                "rewrite, written, uncapped (control)",
+                rewritten(Rewrite::Written {
+                    residual: fixed(uncapped()),
+                    partial: None,
+                }),
+                false,
+            ),
+            (
+                "rewrite, written",
+                rewritten(Rewrite::Written {
+                    residual: fixed(capped()),
+                    partial: Some((1, 2)),
+                }),
+                true,
+            ),
+            (
+                "rewrite, write failed, the failure is the record",
+                rewritten(Rewrite::WriteFailed {
+                    error: unwritable(),
+                    residual: None,
+                }),
+                false,
+            ),
+            (
+                "rewrite, write failed, its findings shown",
+                rewritten(Rewrite::WriteFailed {
+                    error: unwritable(),
+                    residual: Some(fixed(capped())),
+                }),
+                true,
+            ),
+            (
+                "filter, fixed, uncapped (control)",
+                filtered(uncapped(), FilterFix::Fixed { partial: None }),
+                false,
+            ),
+            (
+                "filter, unchanged",
+                filtered(capped(), FilterFix::Unchanged),
+                true,
+            ),
+        ];
+        let typed = Path::new("x.mds");
+        let mut seen = Vec::new();
+        let mut expected = Vec::new();
+        for (what, outcome, truncated) in cases {
+            let report = FileReport {
+                input: LintSource::File {
+                    typed,
+                    name: "x.mds",
+                },
+                capped: Some(CapNotice::Plain),
+                outcome,
+            };
+            let mut sink = Recorder::default();
+            let verdict = render(report, &mut sink);
+            seen.push((what, verdict.truncated, sink.calls.first().cloned()));
+            expected.push((what, truncated, Some("cap reached x.mds".to_string())));
+        }
+        assert_eq!(seen, expected);
+    }
+
+    /// The environment variable that makes a test run as the child [`in_a_child`] starts;
+    /// its value names what the child shows.
+    const CHILD: &str = "MDS_LINT_TEST_CHILD";
+
+    /// What the test `name` writes to stdout and to stderr when it runs as a child with
+    /// `scenario`: this test binary again, running that one test, with [`CHILD`] set to
+    /// `scenario`.
+    ///
+    /// The sinks print through the CLI's writer to the process's own stdout and stderr,
+    /// which the test harness does not capture, so a test that reads what [`render`] shows
+    /// runs it in a child and reads the child's streams. The child's stdout also holds the
+    /// harness's report, which must say the one test ran and passed.
+    fn in_a_child(name: &str, scenario: &OsStr) -> (String, String) {
+        let binary = std::env::current_exe().expect("the test binary's path");
+        let run = std::process::Command::new(binary)
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, scenario)
+            .env("NO_COLOR", "1")
+            .env_remove("FORCE_COLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .output()
+            .expect("the child runs");
+        let product = String::from_utf8(run.stdout).expect("the child's stdout is UTF-8");
+        let shown = String::from_utf8(run.stderr).expect("the child's stderr is UTF-8");
+        assert!(
+            run.status.success() && product.contains("1 passed"),
+            "the child `{name}` ({scenario:?}) must run that one test and pass; status {:?}\n\
+             stdout:\n{product}\nstderr:\n{shown}",
+            run.status
+        );
+        (product, shown)
+    }
+
+    /// A human report whose finding comes without its source text shows the finding without
+    /// a snippet (#309): no panic, and neither the file's name nor any source text — with no
+    /// source there is no frame header to name the file. No human run lints an input it has
+    /// not read, but the report's shape allows it (an entry of a directory under
+    /// `--format json` is not read to report its findings).
+    ///
+    /// Control: the same finding with its text is framed under the file's name, over its
+    /// source, so the two needles are ones the frame shows when it can.
+    #[test]
+    fn a_human_finding_without_its_text_shows_no_file_name_and_no_snippet() {
+        const NAME: &str =
+            "lint::tests::a_human_finding_without_its_text_shows_no_file_name_and_no_snippet";
+        const FILE_NAME: &str = "frame-name-sentinel";
+        const SOURCE_TEXT: &str = "source-text-sentinel";
+        const MESSAGE: &str = "a finding shown without its text";
+        if let Some(scenario) = std::env::var_os(CHILD) {
+            let text = match scenario.to_str() {
+                Some("with text") => Some(format!("{SOURCE_TEXT}\n")),
+                Some("without text") => None,
+                _ => panic!("unknown scenario {scenario:?}"),
+            };
+            let key = format!("{FILE_NAME}.mds");
+            let path = Path::new("walked").join(&key);
+            let finding = LintDiagnostic::new("empty-block", Severity::Error, MESSAGE)
+                .with_span(SerializedSpan::new(0, SOURCE_TEXT.len()))
+                .with_file(key.as_str());
+            let report = FileReport {
+                input: LintSource::DirEntry {
+                    root: Path::new("."),
+                    path: &path,
+                    key: &key,
+                },
+                capped: None,
+                outcome: Outcome::Reported {
+                    findings: LintResult::new(vec![finding]),
+                    text,
+                },
+            };
+            let verdict = render(report, &mut HumanSink::new(false));
+            assert!(
+                verdict.tally == FileTally::Error,
+                "the error-severity finding counts"
+            );
+            return;
+        }
+
+        let (_, framed) = in_a_child(NAME, OsStr::new("with text"));
+        for needle in [MESSAGE, FILE_NAME, SOURCE_TEXT] {
+            assert!(
+                framed.contains(needle),
+                "control: a frame over its text shows {needle:?}; got:\n{framed}"
+            );
+        }
+        let (_, bare) = in_a_child(NAME, OsStr::new("without text"));
+        assert!(
+            bare.contains(MESSAGE),
+            "the finding still shows; got:\n{bare}"
+        );
+        assert!(
+            !bare.contains(FILE_NAME),
+            "no source, so no frame header names the file; got:\n{bare}"
+        );
+        assert!(!bare.contains(SOURCE_TEXT), "no snippet; got:\n{bare}");
+    }
+
+    /// The source both partial-fix tests fix.
+    const PARTIAL_BEFORE: &str = "before-fix-sentinel\n";
+    /// What their partial fix makes of [`PARTIAL_BEFORE`].
+    const PARTIAL_AFTER: &str = "after-fix-sentinel\n";
+    /// The message of the finding their partial fix leaves.
+    const PARTIAL_LEFT: &str = "a finding the partial fix left";
+    /// The message of a finding their partial fix removes.
+    const PARTIAL_REMOVED: &str = "a finding the partial fix removed";
+
+    /// An input's findings before a partial fix, and the fix, both named `label`: one of two
+    /// edits applied, the source rewritten to [`PARTIAL_AFTER`], and one warning left, at
+    /// `left_at` in that source.
+    ///
+    /// Built here rather than reached through a source, so the tests pin how [`render`]
+    /// shows a partial fix whichever edits produce one; `cli_lint.rs` reaches one end to end
+    /// and checks the counts' wording.
+    fn partial_fix(label: &str, left_at: SerializedSpan) -> (LintResult, FixPipelineOutcome) {
+        let left = || {
+            LintDiagnostic::new("empty-block", Severity::Warn, PARTIAL_LEFT)
+                .with_file(label)
+                .with_span(left_at.clone())
+        };
+        let removed =
+            LintDiagnostic::new("empty-block", Severity::Warn, PARTIAL_REMOVED).with_file(label);
+        let before = LintResult::new(vec![removed, left()]);
+        let fix = FixPipelineOutcome::PartiallyFixed {
+            new_source: PARTIAL_AFTER.to_string(),
+            residual: LintResult::new(vec![left()]),
+            applied_count: 1,
+            total_count: 2,
+        };
+        (before, fix)
+    }
+
+    /// `mds lint --fix <file>` whose fix applies in part writes the partly fixed source,
+    /// shows the finding it leaves — not the one it removed — framed over the source it
+    /// wrote rather than the source it read, and then, as the run's last line,
+    /// `Partially fixed: <path> (1 of 2 fixes applied)` (#309).
+    #[test]
+    fn a_partial_fix_of_a_file_is_announced_after_the_findings_it_leaves() {
+        const NAME: &str =
+            "lint::tests::a_partial_fix_of_a_file_is_announced_after_the_findings_it_leaves";
+        const AFTER_LINE: &str = "after-fix-sentinel";
+        const BEFORE_LINE: &str = "before-fix-sentinel";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = PathBuf::from(path);
+            let input = LintSource::File {
+                typed: &path,
+                name: "partial.mds",
+            };
+            let left_at = SerializedSpan::new(0, AFTER_LINE.len());
+            let (before, fix) = partial_fix(input.display_label(), left_at);
+            let text = PARTIAL_BEFORE.to_string();
+            let outcome = apply_fix(
+                &crate::output::WriteTarget::as_typed(path.clone()),
+                before,
+                text,
+                fix,
+                LintFormat::Human,
+            );
+            let report = FileReport {
+                input,
+                capped: None,
+                outcome,
+            };
+            let verdict = render(report, &mut HumanSink::new(false));
+            assert!(
+                verdict.tally == FileTally::WarnOnly,
+                "the file counts by the warning the fix left"
+            );
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("partial.mds");
+        std::fs::write(&path, PARTIAL_BEFORE).unwrap();
+        let (_, shown) = in_a_child(NAME, path.as_os_str());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            PARTIAL_AFTER,
+            "precondition: the partly fixed source was written"
+        );
+
+        let announced = format!(
+            "Partially fixed: {} (1 of 2 fixes applied)",
+            safe_path(&path)
+        );
+        assert_eq!(
+            shown.lines().last(),
+            Some(announced.as_str()),
+            "the last line names the file and the counts; got:\n{shown}"
+        );
+        assert_eq!(
+            shown.matches("Partially fixed:").count(),
+            1,
+            "announced once; got:\n{shown}"
+        );
+        assert!(
+            shown.contains(PARTIAL_LEFT) && shown.contains(AFTER_LINE),
+            "the finding the fix left shows before the announcement, framed over the \
+             written source; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(BEFORE_LINE),
+            "not framed over the source as read; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(PARTIAL_REMOVED),
+            "the finding the fix removed does not show; got:\n{shown}"
+        );
+    }
+
+    /// `mds lint --fix -` whose fix applies in part announces it first —
+    /// `Partially fixed: <stdin> (1 of 2 fixes applied)`, the one status line stdin shows for
+    /// a fix — then the finding it leaves, framed over the source it emits rather than the
+    /// source it was given, and it emits that source on stdout (#309).
+    #[test]
+    fn a_partial_fix_of_stdin_is_announced_before_the_findings_it_leaves() {
+        const NAME: &str =
+            "lint::tests::a_partial_fix_of_stdin_is_announced_before_the_findings_it_leaves";
+        const AFTER_LINE: &str = "after-fix-sentinel";
+        const BEFORE_LINE: &str = "before-fix-sentinel";
+        if std::env::var_os(CHILD).is_some() {
+            let left_at = SerializedSpan::new(0, AFTER_LINE.len());
+            let (before, fix) = partial_fix(STDIN_DISPLAY_LABEL, left_at);
+            let outcome = fix_stdin(before, PARTIAL_BEFORE.to_string(), fix);
+            let report = FileReport {
+                input: LintSource::Stdin,
+                capped: None,
+                outcome,
+            };
+            let verdict = render(report, &mut HumanSink::new(false));
+            assert!(
+                verdict.tally == FileTally::WarnOnly,
+                "stdin counts by the warning the fix left"
+            );
+            return;
+        }
+
+        let (product, shown) = in_a_child(NAME, OsStr::new("stdin"));
+        let announced = format!("Partially fixed: {STDIN_DISPLAY_LABEL} (1 of 2 fixes applied)");
+        assert_eq!(
+            shown.lines().next(),
+            Some(announced.as_str()),
+            "the first line names stdin and the counts; got:\n{shown}"
+        );
+        assert_eq!(
+            shown.matches("Partially fixed:").count(),
+            1,
+            "announced once; got:\n{shown}"
+        );
+        assert!(
+            shown.contains(PARTIAL_LEFT) && shown.contains(AFTER_LINE),
+            "the finding the fix left follows, framed over the emitted source; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(BEFORE_LINE),
+            "not framed over the source as given; got:\n{shown}"
+        );
+        assert!(
+            !shown.contains(PARTIAL_REMOVED),
+            "the finding the fix removed does not show; got:\n{shown}"
+        );
+        assert!(
+            product.contains(PARTIAL_AFTER),
+            "the partly fixed source goes to stdout; got:\n{product}"
+        );
     }
 
     /// #217: a path that is not under the lint root must be an `Io` error, never a
@@ -2327,6 +3308,100 @@ mod tests {
                 .expect("a valid-UTF-8 entry must still produce a display key"),
             "ok.mds",
             "control: the valid-UTF-8 key must be byte-identical to the pre-#217 output"
+        );
+    }
+
+    /// #390: `path is not valid UTF-8` names the path escaped, as every path in a message
+    /// is. A directory walk builds the key of every entry before any of them is read, so
+    /// no per-file refusal of a forbidden character stands in front of this message for a
+    /// walked name: one that is not valid UTF-8 and also holds a newline (or ESC) would
+    /// otherwise put the raw byte into the error text.
+    ///
+    /// Both bytes and their escaped forms are built at run time from numbers, so neither
+    /// a control byte nor an escape sequence appears in this file.
+    ///
+    /// Positive controls: the path's own text carries the raw byte, so the vector reaches
+    /// the message; an ordinary name that is not UTF-8 keeps its text, U+FFFD included.
+    ///
+    /// `#[cfg(unix)]`: builds the name with `OsStrExt` (arbitrary bytes), as
+    /// `relative_display_rejects_non_utf8_component` does.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_escaped_in_its_message() {
+        use super::{read_canonical_source, relative_display};
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        let root = Path::new("/lint-root");
+        let lossy = char::REPLACEMENT_CHARACTER;
+        for control in [0x0a_u8, 0x1b] {
+            let raw = [0xff, b'a', control, b'b', b'.', b'm', b'd', b's'];
+            let hostile = root.join(OsStr::from_bytes(&raw));
+            let raw_char = char::from(control);
+            assert!(
+                hostile.to_string_lossy().contains(raw_char),
+                "control: the hostile path must carry the raw byte 0x{control:02X}"
+            );
+            let expected = format!(
+                "path is not valid UTF-8: /lint-root/{lossy}a{}u{control:04X}b.mds",
+                '\\'
+            );
+            let walked = relative_display(&hostile, root)
+                .expect_err("a non-UTF-8 entry name must not produce a display key")
+                .to_string();
+            let read = read_canonical_source(&hostile, &hostile)
+                .expect_err("a non-UTF-8 path must not be read")
+                .to_string();
+            for message in [walked, read] {
+                assert_eq!(
+                    message, expected,
+                    "the path must be shown escaped, never with the raw byte 0x{control:02X}"
+                );
+            }
+        }
+
+        let plain = root.join(OsStr::from_bytes(&[0xff, b'.', b'm', b'd', b's']));
+        assert_eq!(
+            relative_display(&plain, root)
+                .expect_err("a non-UTF-8 entry name must not produce a display key")
+                .to_string(),
+            format!("path is not valid UTF-8: /lint-root/{lossy}.mds"),
+            "control: an ordinary name that is not UTF-8 keeps its text"
+        );
+    }
+
+    /// #390: `path escapes lint root` names the root and the path escaped. The walk cannot
+    /// produce such a path, so this guards the text, not a reachable vector. Both control
+    /// characters are built at run time.
+    ///
+    /// Positive control: an ordinary pair keeps its text.
+    #[test]
+    fn a_path_outside_the_lint_root_is_escaped_in_its_message() {
+        use super::relative_display;
+        use std::path::Path;
+
+        let (lf, esc) = (char::from(0x0a_u8), char::from(0x1b_u8));
+        let root = format!("/lint{esc}root");
+        let path = format!("/other{lf}x.mds");
+        let message = relative_display(Path::new(&path), Path::new(&root))
+            .expect_err("a path outside the lint root must not produce a display key")
+            .to_string();
+        assert_eq!(
+            message,
+            format!(
+                "path escapes lint root /lint{}u001Broot: /other{}u000Ax.mds",
+                '\\', '\\'
+            ),
+            "the root and the path must be shown escaped"
+        );
+
+        assert_eq!(
+            relative_display(Path::new("/other/x.mds"), Path::new("/lint-root"))
+                .expect_err("a path outside the lint root must not produce a display key")
+                .to_string(),
+            "path escapes lint root /lint-root: /other/x.mds",
+            "control: an ordinary pair keeps its text"
         );
     }
 

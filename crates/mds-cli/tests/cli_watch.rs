@@ -5,7 +5,11 @@
 //!   test's first edit cannot land in a window the watcher is blind to.
 //! - Spawn `mds watch … --debounce 0` (immediate rebuild, no debounce delay).
 //! - Poll output file content with a bounded `wait_for_file_contains`.
-//! - Poll stderr with `wait_for_stderr_contains` when testing error / status messages.
+//! - Poll stderr with `common::wait_for_tap` / `wait_for_tap_count` when testing error /
+//!   status messages. Both PANIC on timeout, naming the caller's line and what the tap
+//!   held. A count or an absence is taken only after an ordered anchor — a line the
+//!   watcher writes after everything being counted (`common::ORDER_MARKER_SOURCE`) —
+//!   and read back with `finish_text`.
 //! - A RAII `ChildGuard` kills+waits the child on drop so tests never leave orphans.
 //!
 //! Every wait carries one of three bounds, and which one is a claim about the mechanism
@@ -32,9 +36,13 @@
 
 mod common;
 use common::{
-    dup_vars_file_warning, make_symlink, mds_bin, spawn_watch_ready, spawn_watch_unsynchronized,
-    write_atomic, ChildGuard, StderrTap, StdoutTap,
+    closed_pipe, count_occurrences, dup_vars_file_warning, make_symlink, mds_bin, poll_tap_until,
+    spawn_watch_ready, spawn_watch_ready_stderr_untapped, spawn_watch_unsynchronized, tap_reader,
+    wait_for_tap, wait_for_tap_count, write_atomic, ChildGuard, StderrTap, StdoutTap,
+    ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
 };
+#[cfg(unix)]
+use common::{full_file, limit_file_growth, spawn_watch_ready_at};
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -95,6 +103,7 @@ fn spawn_unsynchronized_piped_stdout(cmd: &mut Command) -> (ChildGuard, StderrTa
 }
 
 /// Poll `path` until its content contains `needle`, or `timeout` elapses.
+#[track_caller]
 fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -114,6 +123,7 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
 /// it is the test's own contribution to how late its edit lands inside the window it is
 /// trying to hit — a 50ms poll spends a quarter of the `startup-race-probe` window
 /// before the edit is even attempted.
+#[track_caller]
 fn wait_for_file_contains_tight(path: &Path, needle: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -136,6 +146,7 @@ fn squash(s: &str) -> String {
 }
 
 /// Poll `path` until it no longer exists, or `timeout` elapses.
+#[track_caller]
 fn wait_for_file_gone(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -190,6 +201,7 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// - `watch_dir_mode_idle_tick_fires_under_event_flood`
 /// - `i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate`
 /// - `watch_help_example_src_poll_interval_500_self_heals`
+/// - `watch_dir_failed_rebuild_write_keeps_the_compiled_dependencies`
 ///
 /// Every other wait in this file is satisfied by an inotify event on a watch that was
 /// never lost, and keeps [`TIMEOUT`].
@@ -205,6 +217,98 @@ const TICK_TIMEOUT: Duration = Duration::from_secs(8);
 /// the startup compile plus the `startup-race-probe` delay when that feature is on.
 /// Neither is a post-readiness latency, so [`TIMEOUT`] does not apply.
 const STARTUP_WINDOW_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ── The pipe-tap waits fail at the caller (#381) ────────────────────────────
+//
+// No panic hook is installed anywhere here: `cargo test` runs this whole binary in one
+// process, and a hook is process-global. `catch_unwind` alone hands back the message.
+
+/// A bound for waits that are EXPECTED to time out: short, so the self-tests stay fast.
+const SELF_TEST_TIMEOUT: Duration = Duration::from_millis(60);
+
+/// A tap over text that is already complete: its drain thread reaches EOF at once.
+fn tap_of(text: &str) -> StderrTap {
+    tap_reader(std::io::Cursor::new(text.as_bytes().to_vec()))
+}
+
+/// Run `f`, which must panic, and return the panic's message.
+fn panic_message_of<T>(f: impl FnOnce() -> T) -> String {
+    let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(_) => panic!("expected a panic, but the call returned"),
+        Err(payload) => payload,
+    };
+    // `panic!` with arguments carries a `String`; a bare literal carries a `&str`.
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .expect("panic payload is a string")
+}
+
+/// `wait_for_tap` panics when its needle never appears, naming the CALLER's line —
+/// not a line in `common/mod.rs` — and what the tap held.
+#[test]
+fn wait_for_tap_panics_at_the_caller_naming_what_it_saw() {
+    let tap = tap_of("alpha\nbeta\n");
+    assert_eq!(
+        wait_for_tap(&tap, "beta", TIMEOUT),
+        "alpha\nbeta\n",
+        "control: a needle that is there returns the whole text"
+    );
+
+    let call_line = std::cell::Cell::new(0);
+    let message = panic_message_of(|| {
+        call_line.set(line!() + 1);
+        wait_for_tap(&tap, "gamma", SELF_TEST_TIMEOUT)
+    });
+    let caller = format!("{}:{}:", file!(), call_line.get());
+    assert!(
+        message.contains(&caller),
+        "the message must name the caller {caller}; got:\n{message}"
+    );
+    assert!(
+        message.contains("\"gamma\"") && message.contains("alpha\nbeta\n"),
+        "the message must name the needle and what the tap held; got:\n{message}"
+    );
+}
+
+/// `wait_for_tap_count` panics short of its count, naming the caller's line and the
+/// count it saw.
+#[test]
+fn wait_for_tap_count_panics_at_the_caller_naming_the_count_it_saw() {
+    let tap = tap_of("Recompiled a\nRecompiled b\n");
+    let _ = wait_for_tap_count(&tap, "Recompiled ", 2, TIMEOUT);
+
+    let call_line = std::cell::Cell::new(0);
+    let message = panic_message_of(|| {
+        call_line.set(line!() + 1);
+        wait_for_tap_count(&tap, "Recompiled ", 3, SELF_TEST_TIMEOUT)
+    });
+    let caller = format!("{}:{}:", file!(), call_line.get());
+    assert!(
+        message.contains(&caller),
+        "the message must name the caller {caller}; got:\n{message}"
+    );
+    assert!(
+        message.contains("at least 3 occurrences") && message.contains("saw 2"),
+        "the message must name the count wanted and the count seen; got:\n{message}"
+    );
+}
+
+/// `poll_tap_until` never panics: a condition met hands back the text as `Ok`, one
+/// that times out hands back the last text seen as `Err`.
+#[test]
+fn poll_tap_until_reports_a_timeout_as_data() {
+    let tap = tap_of("alpha\n");
+    assert_eq!(
+        poll_tap_until(&tap, TIMEOUT, |text| text.contains("alpha")),
+        Ok("alpha\n".to_string())
+    );
+    assert_eq!(
+        poll_tap_until(&tap, SELF_TEST_TIMEOUT, |text| text.contains("omega")),
+        Err("alpha\n".to_string())
+    );
+}
 
 // ── T-I14: Invalid combinations rejected at startup ────────────────────────
 
@@ -320,12 +424,8 @@ fn watch_rebuild_names_the_entry_as_typed() {
     );
 
     write_atomic(&src, "Hello again!\n");
-    let needle = format!("not an MDS file: {typed}");
-    let stderr = wait_for_stderr_contains_str(&stderr_tap, &needle, TIMEOUT);
-    assert!(
-        stderr.contains(&needle),
-        "the rebuild names the entry as typed; stderr: {stderr}"
-    );
+    // The rebuild names the entry as typed.
+    let stderr = wait_for_tap(&stderr_tap, &format!("not an MDS file: {typed}"), TIMEOUT);
     // Squashed: miette wraps a long absolute path across lines.
     let canonical = src.canonicalize().unwrap();
     assert!(
@@ -384,7 +484,7 @@ fn watch_entry_through_a_retargeted_directory_is_refused() {
     std::fs::remove_file(&link).unwrap();
     symlink("b", &link).unwrap();
     write_atomic(&watched, "Hello A2\n");
-    let stderr = wait_for_stderr_contains_str(&stderr_tap, "watched entry now resolves", TIMEOUT);
+    let stderr = wait_for_tap(&stderr_tap, "watched entry now resolves", TIMEOUT);
     assert!(
         squash(&stderr).contains(
             "mds::io×watchedentrynowresolvestoadifferentfile:\"link/page.mds\";\
@@ -490,7 +590,7 @@ fn watch_compile_error_keeps_watcher_alive() {
     std::fs::write(&src, "---\nname: Alice\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let (mut child, _stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
             .stdout(Stdio::null()),
@@ -502,10 +602,10 @@ fn watch_compile_error_keeps_watcher_alive() {
         "initial compile should succeed"
     );
 
-    // Introduce a compile error.
+    // Introduce a compile error, and wait for the rebuild to report it: the diagnostic
+    // survives `-q`, so its appearance is the event the liveness check below needs.
     write_atomic(&src, "Hello {{undefined_var_xyz}}!\n");
-    // Give the watcher time to attempt rebuild.
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_tap(&stderr_tap, "undefined_var_xyz", TIMEOUT);
 
     // Process should still be alive.
     // (try_wait returns None = still running, Some = exited)
@@ -1098,6 +1198,12 @@ fn watch_invalid_path_startup_error() {
 ///  (b) REMOVE import → helper changes no longer rebuild entry
 ///
 /// This test covers case (b).
+///
+/// A rebuild whose output does not change is silent — no write, no `Recompiled` — and
+/// the entry renders the same text whether or not the helper is still tracked. So once
+/// it drops the import, the entry `@include`s an empty module: every compile of it
+/// prints the "produced empty output" warning, which makes the rebuild the helper edit
+/// must NOT cause visible.
 #[test]
 fn watch_import_removal_stops_tracking_dep() {
     let dir = tempfile::tempdir().unwrap();
@@ -1110,6 +1216,10 @@ fn watch_import_removal_stops_tracking_dep() {
     )
     .unwrap();
 
+    // An empty module: an `@include` of it adds no text and warns on every compile.
+    std::fs::write(dir.path().join("empty.mds"), "").unwrap();
+    let include_warning = "@include of 'e' produced empty output";
+
     // Entry that imports helper initially.
     let entry = dir.path().join("entry.mds");
     std::fs::write(
@@ -1119,9 +1229,19 @@ fn watch_import_removal_stops_tracking_dep() {
     .unwrap();
     let out = dir.path().join("entry.md");
 
-    let (child, _stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
-            .args(["watch", entry.to_str().unwrap(), "--debounce", "0", "-q"])
+            .args([
+                "watch",
+                entry.to_str().unwrap(),
+                "--debounce",
+                "0",
+                // No idle tick: its first-tick recompile would print the warning
+                // counted below on a schedule of its own.
+                "--poll-interval",
+                "0",
+                // No -q: the warning that makes a compile visible is a status line.
+            ])
             .stdout(Stdio::null()),
     );
 
@@ -1142,34 +1262,56 @@ fn watch_import_removal_stops_tracking_dep() {
         "editing helper while imported should trigger a rebuild"
     );
 
-    // STEP 2 (removal direction): rewrite entry to remove the @import.
-    // The entry now produces static output that does NOT reference helper.
-    write_atomic(&entry, "Static content\n");
+    // STEP 2 (removal direction): rewrite entry to remove the @import. What it renders
+    // does NOT reference helper; the empty module's warning marks each of its compiles.
+    write_atomic(
+        &entry,
+        "@import \"./empty.mds\" as e\n@include e\nStatic content\n",
+    );
     assert!(
         wait_for_file_contains(&out, "Static content", TIMEOUT),
         "removing @import should rebuild entry with static content"
     );
+    // Positive control: a compile of this entry shows on stderr.
+    wait_for_tap(&stderr_tap, include_warning, TIMEOUT);
 
-    // Capture last-known mtime/content before the helper edit.
+    // SETTLE WINDOW, deliberately a fixed sleep: one edit can reach the watcher as
+    // several events, and each recompiles the entry and warns again. No event marks the
+    // last of them, and the baseline below must hold every one.
+    std::thread::sleep(Duration::from_millis(500));
+    let warnings_before = count_occurrences(&stderr_tap.text(), include_warning);
     let content_before = std::fs::read_to_string(&out).unwrap();
 
-    // STEP 3: Edit helper again — entry output must NOT change because the dep
-    // was removed from the watch set after the resync in step 2.
+    // STEP 3: Edit helper again — the entry must NOT be rebuilt, because the dep was
+    // removed from the watch set after the resync in step 2.
     write_atomic(
         &helper,
         "@define greet(name):\nBye {{name}}!\n@end\n\n@export greet\n",
     );
 
-    // Wait long enough for any spurious rebuild to materialize (500ms >> debounce 0).
+    // NEGATIVE WINDOW, deliberately a fixed sleep: 500ms is far beyond the debounce-0
+    // rebuild latency, so a rebuild the helper edit caused has compiled the entry as it
+    // is now. The marker below replaces the entry, and a rebuild that read the marker
+    // instead would print nothing this test counts.
     std::thread::sleep(Duration::from_millis(500));
-
-    let content_after = std::fs::read_to_string(&out).unwrap();
     assert_eq!(
-        content_before, content_after,
+        std::fs::read_to_string(&out).unwrap(),
+        content_before,
         "after removing @import, editing helper must NOT change entry output"
     );
 
-    drop(child);
+    // Ordered anchor, and the positive anchor for the window: the watcher still handles
+    // the entry's events, and anything a helper-triggered rebuild printed precedes the
+    // marker's diagnostic, so the count read back is final.
+    write_atomic(&entry, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = stderr_tap.finish_text(&mut child);
+    assert_eq!(
+        count_occurrences(&stderr, include_warning),
+        warnings_before,
+        "after removing @import, editing helper must NOT rebuild the entry; \
+         stderr:\n{stderr}"
+    );
 }
 
 // ── AC-F7: Dir mode vars-recompile-all ────────────────────────────────────
@@ -1263,29 +1405,22 @@ fn watch_quiet_keeps_errors_visible() {
     // Introduce a compile error (reference an undefined variable with no frontmatter default).
     write_atomic(&src, "Hello {{__undefined_xyz__}}!\n");
 
-    // Give the watcher time to attempt rebuild and emit error.
-    std::thread::sleep(Duration::from_millis(500));
+    // The error must reach stderr despite -q: under quiet mode status messages are
+    // suppressed but error diagnostics are not. The wait is the assertion, and it is
+    // also what orders the liveness check below after the rebuild.
+    //
+    // It waits on the CONTENT of the diagnostic, not merely on stderr being non-empty.
+    // Non-emptiness is satisfied by any byte from any source, so it stops being a test
+    // of this behaviour the moment anything else writes to the stream — which is
+    // exactly what happened when the readiness handshake was a stderr marker line.
+    // Naming the undefined variable ties the wait to the error we provoked.
+    wait_for_tap(&stderr_tap, "__undefined_xyz__", TIMEOUT);
 
     // Process must still be alive — watcher stays up after compile errors.
     let still_running = child.0.try_wait().unwrap().is_none();
     assert!(
         still_running,
         "watcher must stay alive after a compile error even under -q"
-    );
-
-    // Verify error output appeared on stderr despite -q.
-    // Under quiet mode, status messages are suppressed but error diagnostics are not.
-    //
-    // Assert on the CONTENT of the diagnostic, not merely that stderr is non-empty.
-    // Non-emptiness is satisfied by any byte from any source, so it stops being a test
-    // of this behaviour the moment anything else writes to the stream — which is
-    // exactly what happened when the readiness handshake was a stderr marker line.
-    // Naming the undefined variable ties the assertion to the error we provoked.
-    let stderr_str = stderr_tap.text();
-    assert!(
-        stderr_str.contains("__undefined_xyz__"),
-        "stderr must carry the compile error naming the undefined variable even under \
-         -q; got:\n{stderr_str}"
     );
 
     // Fix the error — watcher should recover.
@@ -1424,8 +1559,18 @@ fn watch_debounce_single_rebuild_from_burst() {
          window is entitled to close mid-burst; largest gap was {max_gap:?}"
     );
 
-    // WAIT ONLY — the assertion is the count below, taken from the joined tap.
-    wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", TIMEOUT);
+    // The count below is exact only once every rebuild the burst caused has written its
+    // line. The final state of the burst is published by the last of those rebuilds —
+    // under a window that split the burst, an earlier one publishes an intermediate
+    // state — so wait for it, then write the order marker: its diagnostic reaches
+    // stderr after every line of every earlier rebuild. The marker's compile fails, so
+    // the output keeps the burst's final state.
+    assert!(
+        wait_for_file_contains(&out, "Burst v12!", TIMEOUT),
+        "the burst's final state must be published"
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr = stderr_tap.finish_text(&mut child);
 
     assert_eq!(
@@ -1448,6 +1593,142 @@ fn watch_debounce_single_rebuild_from_burst() {
     );
 }
 
+/// Env var naming a file a skipping test appends one line to (#397).
+///
+/// A skip is an early return, which libtest counts as a pass, and libtest shows no
+/// stderr of a passing test — so without this file a skip is invisible in a CI log.
+/// The watch soak workflow sets it per iteration and tallies skipped iterations
+/// separately from passed ones.
+const SKIP_LOG_ENV: &str = "MDS_TEST_SKIP_LOG";
+
+/// Report that `test` skipped, where a passing run cannot hide it: on stderr, as one
+/// line appended to the file [`SKIP_LOG_ENV`] names, and — under GitHub Actions — as a
+/// warning in the job summary.
+///
+/// # Panics
+/// Panics if [`SKIP_LOG_ENV`] is set and the line cannot be appended: whoever set it is
+/// counting skips, and a skip it cannot see would read as a pass.
+fn record_skip(test: &str, reason: &str) {
+    use std::io::Write as _;
+    eprintln!("{test}: {reason}");
+    if let Some(path) = std::env::var_os(SKIP_LOG_ENV) {
+        let path = std::path::PathBuf::from(path);
+        let appended = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .and_then(|mut log| writeln!(log, "{test}: {reason}"));
+        if let Err(e) = appended {
+            panic!(
+                "{SKIP_LOG_ENV}={}: cannot record the skip: {e}",
+                path.display()
+            );
+        }
+    }
+    // Best effort: the job summary is a convenience, the skip log is the record.
+    if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut summary) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(summary_path)
+        {
+            let _ = writeln!(summary, ":warning: {test} skipped: {reason}");
+        }
+    }
+}
+
+/// The writer thread's record of one attempt of the cap test.
+struct WriterTrace {
+    /// When the writer started.
+    started: Instant,
+    /// When each write completed, in order (at most the writer's 2000 iterations).
+    writes: Vec<Instant>,
+}
+
+/// Where one attempt's write cadence went (#397): the gaps between completed writes —
+/// the first measured from the writer's start, as the precondition has always measured
+/// it — and where the first rebuild fell among them.
+///
+/// `max_gap` is the metric the harness precondition judges. It spans the whole stream,
+/// while only the gaps before the first rebuild can let a quiet period end on its own;
+/// `max_gap_before_rebuild` records that part separately, so a skip says which of the
+/// two the runner actually failed.
+struct GapBreakdown {
+    writes: usize,
+    span: Duration,
+    max_gap: Duration,
+    median_gap: Duration,
+    p99_gap: Duration,
+    gaps_at_or_over_window: usize,
+    /// When the stderr poll first saw a rebuild, after the writer started (up to one
+    /// poll late); `None` when no rebuild was seen within the poll's bound.
+    rebuild_seen_after: Option<Duration>,
+    /// The largest gap that ended before the rebuild was seen.
+    max_gap_before_rebuild: Option<Duration>,
+}
+
+impl GapBreakdown {
+    fn of(trace: &WriterTrace, rebuild_seen: Option<Instant>, window: Duration) -> Self {
+        let mut previous = trace.started;
+        let mut gaps: Vec<(Instant, Duration)> = Vec::with_capacity(trace.writes.len());
+        for &at in &trace.writes {
+            gaps.push((at, at.duration_since(previous)));
+            previous = at;
+        }
+        let mut sorted: Vec<Duration> = gaps.iter().map(|&(_, gap)| gap).collect();
+        sorted.sort_unstable();
+        let rank = |per_mille: usize| -> Duration {
+            sorted
+                .get((sorted.len().saturating_sub(1) * per_mille) / 1000)
+                .copied()
+                .unwrap_or_default()
+        };
+        GapBreakdown {
+            writes: trace.writes.len(),
+            span: trace
+                .writes
+                .last()
+                .map_or(Duration::ZERO, |&last| last.duration_since(trace.started)),
+            max_gap: sorted.last().copied().unwrap_or_default(),
+            median_gap: rank(500),
+            p99_gap: rank(990),
+            gaps_at_or_over_window: sorted.iter().filter(|&&gap| gap >= window).count(),
+            rebuild_seen_after: rebuild_seen.map(|at| at.duration_since(trace.started)),
+            max_gap_before_rebuild: rebuild_seen.map(|seen| {
+                gaps.iter()
+                    .filter(|&&(at, _)| at <= seen)
+                    .map(|&(_, gap)| gap)
+                    .max()
+                    .unwrap_or_default()
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for GapBreakdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} writes over {:?}; gaps: max {:?}, median {:?}, p99 {:?}, {} at or over the \
+             window; ",
+            self.writes,
+            self.span,
+            self.max_gap,
+            self.median_gap,
+            self.p99_gap,
+            self.gaps_at_or_over_window
+        )?;
+        match (self.rebuild_seen_after, self.max_gap_before_rebuild) {
+            (Some(after), Some(gap)) => write!(
+                f,
+                "first rebuild seen {after:?} after the writer started, largest gap \
+                 before it {gap:?}"
+            ),
+            _ => write!(f, "no rebuild seen"),
+        }
+    }
+}
+
 /// The cap rebuilds a file that is never left alone (#379).
 ///
 /// A quiet period that can always be extended is unbounded: a writer that never
@@ -1467,13 +1748,17 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
     // bounded number of times, gated ONLY on that precondition — every behaviour
     // assertion below still fails hard on the first conclusive attempt, so a real
     // regression is never retried or skipped away. If the cadence is still
-    // unsustainable after every attempt, the test SKIPS (prints a `SKIPPED
-    // (inconclusive harness)` line and, when running under GitHub Actions, appends a
-    // warning to the job summary) rather than failing the required check — see #397,
-    // which tracks root-causing the cadence problem on loaded runners.
+    // unsustainable after every attempt, the test SKIPS rather than failing the
+    // required check: it prints a `SKIPPED (inconclusive harness)` line, appends it to
+    // the file `MDS_TEST_SKIP_LOG` names (the watch soak counts those), and under
+    // GitHub Actions adds a warning to the job summary — see #397, which tracks
+    // root-causing the cadence problem on loaded runners. Every attempt logs its gap
+    // breakdown on stderr, so a failing run shows the cadence of each one.
+    const TEST: &str = "watch_debounce_cap_rebuilds_while_writes_never_stop";
     const MAX_ATTEMPTS: u32 = 6;
     const WINDOW: Duration = Duration::from_millis(200);
 
+    let mut max_gaps: Vec<Duration> = Vec::with_capacity(MAX_ATTEMPTS as usize);
     for attempt in 1..=MAX_ATTEMPTS {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("hot.mds");
@@ -1503,9 +1788,9 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
         let writer_flag = std::sync::Arc::clone(&writing);
         let writer_src = src.clone();
         let writer = std::thread::spawn(move || {
-            let stop_at = Instant::now() + Duration::from_secs(3);
-            let mut max_gap = Duration::ZERO;
-            let mut last = Instant::now();
+            let started = Instant::now();
+            let stop_at = started + Duration::from_secs(3);
+            let mut writes = Vec::with_capacity(2_000);
             // Doubly bounded: <= 3s of wall clock AND <= 2000 iterations.
             for i in 1..=2_000u32 {
                 if Instant::now() >= stop_at {
@@ -1515,20 +1800,28 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
                     &writer_src,
                     format!("---\nname: v{i}\n---\nHot {{{{name}}}}!\n"),
                 );
-                let now = Instant::now();
-                max_gap = max_gap.max(now.duration_since(last));
-                last = now;
+                writes.push(Instant::now());
                 std::thread::sleep(Duration::from_millis(5));
             }
             writer_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-            max_gap
+            WriterTrace { started, writes }
         });
 
         // The cap is 2s; allow the compile that follows it to land inside the bound.
-        wait_for_stderr_contains_str(&stderr_tap, "Recompiled ", Duration::from_millis(3500));
+        // Non-panicking on purpose: "no rebuild by then" is decided below, after the
+        // harness precondition, so an inconclusive attempt is retried rather than failed.
+        let rebuild_seen = poll_tap_until(&stderr_tap, Duration::from_millis(3500), |text| {
+            text.contains("Recompiled ")
+        })
+        .ok()
+        .map(|_| Instant::now());
         let rebuilt_while_writing = writing.load(std::sync::atomic::Ordering::SeqCst);
 
-        let max_gap = writer.join().expect("writer thread panicked");
+        let trace = writer.join().expect("writer thread panicked");
+        let breakdown = GapBreakdown::of(&trace, rebuild_seen, WINDOW);
+        eprintln!("{TEST}: attempt {attempt}/{MAX_ATTEMPTS}: {breakdown}");
+        let max_gap = breakdown.max_gap;
+        max_gaps.push(max_gap);
 
         // Harness precondition, checked before any behaviour assertion: if the writer
         // thread could not sustain a sub-window cadence, this run cannot tell a cap
@@ -1542,24 +1835,16 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
             // Every attempt was inconclusive: the runner is too loaded to exercise the
             // cap deterministically. Skip rather than fail the required check — no
             // product behaviour was ever exercised — and leave a trail so this shows up
-            // in the run summary instead of silently vanishing. See #397.
-            eprintln!(
-                "SKIPPED (inconclusive harness): writer gap {max_gap:?} >= {WINDOW:?} on \
-                 all {MAX_ATTEMPTS} attempts"
+            // in the run summary and the soak's tally instead of silently vanishing.
+            // See #397.
+            record_skip(
+                TEST,
+                &format!(
+                    "SKIPPED (inconclusive harness): writer gap {max_gap:?} >= {WINDOW:?} on \
+                     all {MAX_ATTEMPTS} attempts (largest gap per attempt: {max_gaps:?}); \
+                     last attempt: {breakdown}"
+                ),
             );
-            if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
-                use std::io::Write as _;
-                if let Ok(mut summary) = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(summary_path)
-                {
-                    let _ = writeln!(
-                        summary,
-                        ":warning: watch cap test skipped — runner could not sustain cadence"
-                    );
-                }
-            }
             return;
         }
 
@@ -1675,7 +1960,11 @@ fn watch_startup_no_spurious_recompile() {
     // Let the watcher idle for 1.5s — any synthetic FS events would fire within this window.
     std::thread::sleep(Duration::from_millis(1500));
 
-    // Stop the child and collect all stderr.
+    // Ordered anchor: the watcher was still handling events, and everything it printed
+    // during the window precedes the marker's diagnostic. Its compile fails, so it adds
+    // no status line of its own.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr_str = stderr_tap.finish_text(&mut child);
 
     // There must be exactly ONE "Compiled to" message (the initial compile).
@@ -1708,7 +1997,7 @@ fn watch_stdout_no_duplicate_write_on_startup() {
     // Use a distinctive marker so we can count occurrences.
     std::fs::write(&src, "UNIQUE_MARKER_XYZ\n").unwrap();
 
-    let (mut child, _stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
+    let (mut child, stderr_tap, stdout_tap) = spawn_ready_piped_stdout(
         mds_bin()
             .args([
                 "watch",
@@ -1724,6 +2013,12 @@ fn watch_stdout_no_duplicate_write_on_startup() {
 
     // Let the watcher run long enough to capture initial compile + any spurious second write.
     std::thread::sleep(Duration::from_millis(1500));
+
+    // Ordered anchor: the watcher was still handling events, and it wrote anything it
+    // published during the window to stdout before the marker's diagnostic reached
+    // stderr. The marker's compile fails, so it publishes nothing.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
 
     // Stop the child and collect all stdout. `finish_text` reaps the child and then
     // joins the drain, so no flush sleep is needed to make the snapshot complete.
@@ -1799,7 +2094,11 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
     // Let the watcher idle for 1.5s — synthetic FSEvents would fire within this window.
     std::thread::sleep(Duration::from_millis(1500));
 
-    // Stop the child and collect all stderr.
+    // Ordered anchor: the watcher was still handling events, and everything it printed
+    // during the window precedes the marker's diagnostic. Its compile fails, so it adds
+    // no status line of its own.
+    write_atomic(&dir.path().join("a.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr_str = stderr_tap.finish_text(&mut child);
 
     // There must be ZERO "Recompiled" lines — no rebuild without edits.
@@ -1880,10 +2179,18 @@ fn watch_single_status_line_per_rebuild() {
         "after editing, output should contain Status v1!"
     );
 
-    // Idle a bit to let any trailing events flush.
+    // NEGATIVE WINDOW, deliberately a fixed sleep: a truncate+write pair the debounce
+    // failed to coalesce would show up as a second rebuild within one 100ms window of
+    // the first, and no event marks the end of "no second rebuild". 500ms lets every
+    // trailing event of this edit close its own window before the anchor below is
+    // written, so the anchor cannot coalesce with them and hide one.
     std::thread::sleep(Duration::from_millis(500));
 
-    // Stop the child and collect all stderr.
+    // Positive anchor: the order marker's diagnostic reaches stderr after every line an
+    // earlier rebuild wrote, so the counts below cover the whole edit. Its compile
+    // fails, so it adds no status line of its own.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr_str = stderr_tap.finish_text(&mut child);
 
     // Exactly ONE "Recompiled" line (the real edit).
@@ -2262,6 +2569,11 @@ fn watch_file_mode_idle_no_recompile_across_ticks() {
     // Idle for 2.5s (≥2 ticks at 100ms poll-interval — well above the minimum).
     std::thread::sleep(Duration::from_millis(2500));
 
+    // Ordered anchor: the watcher was still handling events — a zero from a stalled
+    // loop would be vacuous — and everything it printed while idle precedes the
+    // marker's diagnostic. Its compile fails, so it neither writes nor announces.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -2331,6 +2643,11 @@ fn watch_dir_mode_idle_no_recompile_across_ticks() {
     // Idle for 2.5s (≥2 ticks at 100ms).
     std::thread::sleep(Duration::from_millis(2500));
 
+    // Ordered anchor: the watcher was still handling events — a zero from a stalled
+    // loop would be vacuous — and everything it printed while idle precedes the
+    // marker's diagnostic. Its compile fails, so it neither writes nor announces.
+    write_atomic(&dir.path().join("a.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -2620,11 +2937,8 @@ fn watch_does_not_follow_a_working_directory_recreated_as_a_symlink() {
     symlink("other", &proj).unwrap();
     write_atomic(&entry, "Edited\n");
 
-    let stderr = wait_for_stderr_contains_str(&tap, "out.md: ", TIMEOUT);
-    assert!(
-        stderr.contains("out.md: "),
-        "the rebuild cannot write out.md in the dead working directory; stderr: {stderr}"
-    );
+    // The rebuild cannot write out.md in the dead working directory.
+    let stderr = wait_for_tap(&tap, "out.md: ", TIMEOUT);
     assert!(
         !other.join("out.md").exists(),
         "nothing is written through the link; stderr: {stderr}"
@@ -2665,13 +2979,18 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     // Delete the entry file (parent intact).
     std::fs::remove_file(&src).unwrap();
 
+    // The delete is reported: wait for its first error, so the baseline below holds at
+    // least the error the delete itself produced rather than whatever had been sampled.
+    wait_for_tap(&stderr_tap, "file not found", TIMEOUT);
+
     // Scale-invariant error bound (guards against once-per-tick re-firing — the watcher self-trigger pitfall): run two equal idle windows and assert
     // the error count does NOT grow in the second window.  A per-tick implementation would
     // accumulate one error per tick across BOTH windows; the fix settles quickly after the
     // initial native-event errors and is then silent.
     //
-    // Window 1 — ≥5 ticks at 100ms: native FS delete events + at most 1 liveness-probe
-    // error may appear.
+    // Window 1 — SETTLE WINDOW, deliberately a fixed sleep: ≥5 ticks at 100ms for the
+    // rest of the delete's native events and at most 1 liveness-probe error. How many of
+    // those arrive varies by platform, so no event marks the end of the settling.
     std::thread::sleep(Duration::from_millis(500));
     let count_w1 = {
         let bytes = stderr_tap.bytes();
@@ -2679,8 +2998,10 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
         s.matches("file not found").count() + s.matches("No such file").count()
     };
 
-    // Window 2 — another ≥5 ticks: nothing changed, so error-settle must keep the
-    // count frozen.  Any increase proves the watcher is still firing per-tick.
+    // Window 2 — NEGATIVE WINDOW, deliberately a fixed sleep: another ≥5 ticks with
+    // nothing changed, so error-settle must keep the count frozen. Any increase proves
+    // the watcher is still firing per-tick. Its positive anchor is the recovery below:
+    // the recreated entry is compiled, so the watcher was running its ticks all along.
     std::thread::sleep(Duration::from_millis(500));
     let count_w2 = {
         let bytes = stderr_tap.bytes();
@@ -2967,7 +3288,7 @@ fn watch_dir_mode_create_missing_partial_heals_importer() {
 
     let out_dir = dir.path().join("out");
 
-    let (child, _stderr_tap) = spawn_ready(
+    let (child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2983,9 +3304,10 @@ fn watch_dir_mode_create_missing_partial_heals_importer() {
             .stdout(Stdio::null()),
     );
 
-    // Initial compile must fail (missing partial), so main.md may not appear.
-    // Give the watcher time to attempt the initial compile.
-    std::thread::sleep(Duration::from_millis(500));
+    // Initial compile must fail (missing partial), so main.md may not appear. The
+    // startup compile precedes readiness; its reported error (diagnostics survive -q)
+    // is the control that the importer really started out broken.
+    wait_for_tap(&stderr_tap, "mds::file_not_found", TIMEOUT);
 
     // Now create the previously-missing partial.
     let partial = dir.path().join("_missing.mds");
@@ -3133,7 +3455,13 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     // A per-tick implementation would fire continuously; error-settle means it fires once at
     // startup and then goes silent.
     //
-    // Window 1 — ≥5 ticks at 100ms (~500ms): initial startup error may appear here.
+    // The startup compile of bad.mds, which precedes readiness, reported its error: the
+    // baseline below holds at least that one rather than whatever had been sampled.
+    wait_for_tap(&stderr_tap, "undefined variable", TIMEOUT);
+
+    // Window 1 — SETTLE WINDOW, deliberately a fixed sleep: ≥5 ticks at 100ms (~500ms)
+    // for anything the first ticks report about the startup error. No event marks the
+    // end of that settling.
     std::thread::sleep(Duration::from_millis(500));
     let count_w1 = {
         let bytes = stderr_tap.bytes();
@@ -3142,14 +3470,23 @@ fn watch_dir_mode_persistent_error_bounded_count() {
         s.matches("undefined variable").count()
     };
 
-    // Window 2 — another ≥5 ticks: nothing changed, error-settle must keep count frozen.
-    // Any increase here proves the watcher is still firing per-tick (the bug).
+    // Window 2 — NEGATIVE WINDOW, deliberately a fixed sleep: another ≥5 ticks with
+    // nothing changed; error-settle must keep the count frozen. Any increase here proves
+    // the watcher is still firing per-tick (the bug).
     std::thread::sleep(Duration::from_millis(500));
     let count_w2 = {
         let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         s.matches("undefined variable").count()
     };
+
+    // Positive anchor for the window: a real edit that keeps bad.mds broken is still
+    // reported, so an error during the window would have reached stderr too.
+    write_atomic(
+        &dir.path().join("bad.mds"),
+        "Hello again {{__undefined_xyz__}}!\n",
+    );
+    wait_for_tap_count(&stderr_tap, "undefined variable", count_w2 + 1, TIMEOUT);
 
     // Watcher must still be alive.
     let still_running = child.0.try_wait().unwrap().is_none();
@@ -3620,6 +3957,11 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
     // (reconcile rule) must emit zero "Recompiled" lines during this window.
     std::thread::sleep(Duration::from_millis(600));
 
+    // Ordered anchor: the watcher was still handling events — a zero from a stalled
+    // loop would be vacuous — and everything it printed while idle precedes the
+    // marker's diagnostic. Its compile fails, so it neither writes nor announces.
+    write_atomic(&dir.path().join("file_0001.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr_str = stderr_tap.finish_text(&mut child);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -3866,8 +4208,8 @@ fn watch_dir_skips_symlinked_source_file() {
 // ── ESC-injection: watch initial-compile-error stderr sanitization ────────────
 
 /// T-Watch-ESC [AC-F-W1]: the `eprint_error` call at the non-loop
-/// initial-compile-error path in `run_watch_file` (watch.rs line ~937) must
-/// sanitize any raw control bytes before writing to stderr.
+/// startup-compile-error path (`file_startup::startup_compile`, through
+/// `settle_startup_error`) must sanitize any raw control bytes before writing to stderr.
 ///
 /// Vector: a `.mds` file containing a raw ESC byte (U+001B) in an unclosed
 /// `@define` — guaranteed syntax error — so the initial compile fails and
@@ -4339,8 +4681,7 @@ fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
     use std::os::unix::process::ExitStatusExt;
 
     // Large enough that the compile is still far from finished when the first outputs
-    // appear, small enough to stay a fast test. Dir-mode startup makes two full passes
-    // over this set, so the window is roughly twice what the first pass suggests.
+    // appear, small enough to stay a fast test.
     const SOURCES: usize = 1200;
     /// Number of published outputs that proves the startup compile is under way.
     /// Deliberately tiny relative to SOURCES so the signal lands with the overwhelming
@@ -4444,9 +4785,10 @@ fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
     );
 }
 
-/// File mode: same property. The gate is the `Watching …` line, which `run_watch_file`
-/// prints before it creates the watcher and therefore before the startup compile; the
-/// entry imports enough partials that the compile is still running when SIGINT lands.
+/// File mode: same property. The gate is the `Watching …` line, which
+/// `file_startup::arm_pre_read` prints before it creates the watcher and therefore before
+/// the startup compile; the entry imports enough partials that the compile is still
+/// running when SIGINT lands.
 ///
 /// `#[cfg(unix)]`: sends SIGINT via `libc::kill` and asserts termination-by-signal
 /// via `ExitStatusExt::signal()`; Windows has no signal-death `ExitStatus` (#147).
@@ -4528,16 +4870,13 @@ fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
     );
 }
 
-/// Bounded wait for a child that has already been signalled.
+/// Bounded wait for a child that is expected to exit: signalled, or ending its session
+/// on its own.
 ///
-/// A **bound, not a synchroniser**: a signalled child exits in milliseconds, and one
-/// that has not exited by the deadline is the defect the caller is asserting against.
-/// `what` names the arm so the panic is self-describing.
-///
-/// `#[cfg(unix)]`: a helper, not a test — its only caller,
-/// `watch_readiness_handshake_makes_ctrl_c_exit_deterministic`, is itself
-/// `#[cfg(unix)]` because it signals SIGINT, which has no Windows analogue (#147).
-#[cfg(unix)]
+/// A **bound, not a synchroniser**: such a child exits in milliseconds, and one that
+/// has not exited by the deadline is the defect the caller is asserting against. `what`
+/// names the arm so the panic is self-describing.
+#[track_caller]
 fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -4555,13 +4894,14 @@ fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::p
 /// Two arms, the same signal, opposite verdicts:
 ///
 /// - **CONTROL.** [`spawn_unsynchronized`], with SIGINT gated on the `Watching …`
-///   line. `run_watch_file` prints that line before it even creates the watcher, and
-///   therefore long before `ctrlc::set_handler`, so the signal lands in the
-///   pre-handler window where the default disposition still applies: death by SIGINT.
+///   line. `file_startup::arm_pre_read` prints that line before it even creates the
+///   watcher, and therefore long before `live::go_live` calls `ctrlc::set_handler`, so
+///   the signal lands in the pre-handler window where the default disposition still
+///   applies: death by SIGINT.
 ///   If this arm ever exits cleanly, the window is no longer being hit and the
 ///   treatment arm below proves nothing.
 /// - **TREATMENT.** [`spawn_ready`], with SIGINT sent the instant the handshake
-///   returns. `set_handler` precedes `emit_ready_marker` in `run_watch_file`, so once
+///   returns. `set_handler` precedes `emit_ready_marker` in `live::go_live`, so once
 ///   the marker exists the handler provably does too: exit 0 and `Stopped watching.`.
 ///
 /// `N = 20` is a live discriminator, not a rate bound — a single clean control exit
@@ -4668,7 +5008,7 @@ fn watch_readiness_handshake_makes_ctrl_c_exit_deterministic() {
             status.success(),
             "treatment arm, iteration {iteration}: after the readiness handshake the \
              ctrl-c handler provably exists (`set_handler` precedes \
-             `emit_ready_marker` in `run_watch_file`), so SIGINT must exit 0; got \
+             `emit_ready_marker` in `live::go_live`), so SIGINT must exit 0; got \
              {status:?}; stderr:\n{}",
             tap.text()
         );
@@ -4683,81 +5023,25 @@ fn watch_readiness_handshake_makes_ctrl_c_exit_deterministic() {
 
 // ── I8: file-watch mode warns exactly ONCE across two edits (#200) ──────────
 
-/// Count non-overlapping occurrences of `needle` in `haystack`.
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    let mut count = 0;
-    let mut start = 0;
-    while let Some(pos) = haystack[start..].find(needle) {
-        count += 1;
-        start += pos + needle.len();
-    }
-    count
-}
-
 /// Pinned --set duplicate-key warning string (issue #200, spec §7.2).
 const DUP_SET_WARNING: &str =
     "warning: variable 'x' is set more than once by --set; the last value wins";
-
-/// Wait until the stderr tap contains the given needle, or timeout elapses.
-///
-/// Polls the shared StderrTap at 20ms intervals; returns the final contents.
-fn wait_for_stderr_contains_str(tap: &StderrTap, needle: &str, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let text = tap.text();
-        if text.contains(needle) || Instant::now() >= deadline {
-            return text;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Wait until the stderr tap holds at least `n` occurrences of `needle`.
-///
-/// Returns the tap's contents as soon as the count is reached. Unlike
-/// [`wait_for_stderr_contains_str`], which returns the text on timeout and so lets the
-/// caller's assertion report the shortfall as if it were a final answer, this one
-/// PANICS on timeout and names the count it actually saw.
-///
-/// Why a count and not "contains": a stderr line the watcher emits AFTER the output
-/// write has no ordering relationship with the output file the test waited on.
-/// Dir-mode emits the duplicate-vars-key warning after the write (watch.rs
-/// `handle_fs_event_dir`), so a snapshot taken the instant `wait_for_file_contains`
-/// returns can legitimately be one warning short — or, if the previous rebuild's
-/// warning has not been sampled yet, one long. Waiting for the expected count first
-/// turns the assertion that follows into a genuine over-count check instead of a race.
-fn wait_for_stderr_count(tap: &StderrTap, needle: &str, n: usize, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    // Bounded by `timeout`: at most timeout / 20ms iterations.
-    loop {
-        let text = tap.text();
-        let seen = count_occurrences(&text, needle);
-        if seen >= n {
-            return text;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "expected at least {n} occurrences of {needle:?} within {timeout:?}; \
-             saw {seen}; stderr was:\n{text}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
 
 #[test]
 fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
     // I8: mds watch (file mode) with --set x=1 --set x=2 must print the
     // duplicate-key warning exactly once — at startup — not on every rebuild.
     //
-    // Negative controls (manually verified during development — see commit body):
-    //   - Adding emit to watch.rs:935 → count rises to ≥ 3 across two edits.
-    //   - Adding emit to watch.rs:1914 → count grows per event batch.
+    // Every count here is taken behind an ordered anchor, never from a snapshot of a
+    // live pipe: a warning a rebuild printed but the tap had not copied yet would make
+    // a snapshot read "still 1". Mutation control: an extra emit in `rebuild_file`
+    // raises the count and fails this test (recorded when the anchors were added, #381).
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("t.mds");
     std::fs::write(&src, "version 1").unwrap();
     let out = dir.path().join("t.md");
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4772,14 +5056,8 @@ fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
             .stdout(Stdio::null()),
     );
 
-    // Wait for the startup warning to appear.
-    let stderr_after_start = wait_for_stderr_contains_str(&stderr_tap, DUP_SET_WARNING, TIMEOUT);
-    let count_at_start = count_occurrences(&stderr_after_start, DUP_SET_WARNING);
-    assert_eq!(
-        count_at_start, 1,
-        "I8: expected exactly 1 warning at startup, got {}; stderr:\n{}",
-        count_at_start, stderr_after_start
-    );
+    // Positive control: the startup warning is printed.
+    wait_for_tap(&stderr_tap, DUP_SET_WARNING, TIMEOUT);
 
     // Edit 1: trigger a rebuild.
     write_atomic(&src, "version 2");
@@ -4795,42 +5073,47 @@ fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
         "I8: rebuild after edit 2 must complete"
     );
 
-    // After two rebuilds, the warning count must still be 1 (negative control:
-    // emitting at the rebuild sites would raise it).
-    let final_stderr = stderr_tap.text();
-    let final_count = count_occurrences(&final_stderr, DUP_SET_WARNING);
+    // Ordered anchor: the marker's diagnostic reaches stderr after every line of the
+    // startup and of both rebuilds, so the count read back below is final.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
+    let final_stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
-        final_count, 1,
-        "I8: after two edits the warning must still appear exactly once; \
-         got {}; stderr:\n{}",
-        final_count, final_stderr
+        count_occurrences(&final_stderr, "Recompiled "),
+        2,
+        "I8: control: both edits rebuilt; stderr:\n{final_stderr}"
     );
-
-    drop(child);
+    assert_eq!(
+        count_occurrences(&final_stderr, DUP_SET_WARNING),
+        1,
+        "I8: after two edits the warning must still appear exactly once; \
+         stderr:\n{final_stderr}"
+    );
 }
 
-// ── I9: dir-watch mode warns exactly ONCE — guards the :2185 double-print ────
+// ── I9: dir-watch mode warns exactly ONCE — at startup, never on a rebuild ────
 
 #[test]
 fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
     // I9: mds watch (dir mode) with --set x=1 --set x=2 must print the
     // duplicate-key warning exactly once — at startup — and NOT again on rebuilds.
     //
-    // dir_watch_startup calls build_runtime_vars twice (once at :2064 to emit,
-    // once at :2185 for the dedup baseline to discard).  This test is the SOLE
-    // mechanical guard that:
-    //   - the second call at :2185 does NOT also emit (double-print on startup), AND
-    //   - rebuild calls at :1914 do NOT emit (per-event growth).
+    // The directory startup compile (`dir_startup::startup_compile`) calls
+    // build_runtime_vars once, and emits; every rebuild calls it again.  This test
+    // is the SOLE mechanical guard that:
+    //   - startup emits once (no double-print on startup), AND
+    //   - rebuild calls do NOT emit (per-event growth).
     //
-    // Negative controls (manually verified during development — see commit body):
-    //   - Adding emit at watch.rs:2185 → count becomes 2 with no edits at all.
-    //   - Adding emit at watch.rs:1914 → count grows to ≥ 2 after the rebuild below.
+    // Dir mode prints a rebuild's warnings AFTER its `Recompiled` line, so the only
+    // anchor that orders them is a later event: the order marker below. Mutation
+    // control: an extra emit in `rebuild_dir_batch` raises the count and fails this
+    // test (recorded when the anchor was added, #381).
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("t.mds");
     std::fs::write(&src, "version 1").unwrap();
     let out = dir.path().join("t.md");
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -4845,15 +5128,8 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
             .stdout(Stdio::null()),
     );
 
-    // Wait for the startup warning.
-    let stderr_startup = wait_for_stderr_contains_str(&stderr_tap, DUP_SET_WARNING, TIMEOUT);
-    let count_at_startup = count_occurrences(&stderr_startup, DUP_SET_WARNING);
-    assert_eq!(
-        count_at_startup, 1,
-        "I9: dir-watch startup must emit the warning exactly once (guards :2185); \
-         got {}; stderr:\n{}",
-        count_at_startup, stderr_startup
-    );
+    // Positive control: the startup warning is printed.
+    wait_for_tap(&stderr_tap, DUP_SET_WARNING, TIMEOUT);
 
     // Trigger a rebuild to exercise the :1914 path (handle_dir_event).
     write_atomic(&src, "version 2");
@@ -4862,17 +5138,22 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
         "I9: rebuild after edit must complete"
     );
 
-    // After the rebuild, the count must still be 1 (guards :1914 per-event growth).
-    let stderr_after_edit = stderr_tap.text();
-    let count_after_edit = count_occurrences(&stderr_after_edit, DUP_SET_WARNING);
+    // Ordered anchor: every line of the startup and of the rebuild precedes the
+    // marker's diagnostic, so the count is final.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
+    let final_stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
-        count_after_edit, 1,
-        "I9: after one rebuild, warning must still appear exactly once (guards :1914); \
-         got {}; stderr:\n{}",
-        count_after_edit, stderr_after_edit
+        count_occurrences(&final_stderr, "Recompiled "),
+        1,
+        "I9: control: the edit rebuilt; stderr:\n{final_stderr}"
     );
-
-    drop(child);
+    assert_eq!(
+        count_occurrences(&final_stderr, DUP_SET_WARNING),
+        1,
+        "I9: the warning must appear exactly once — at startup, and not again on \
+         the rebuild; stderr:\n{final_stderr}"
+    );
 }
 
 // ── I16-I18: duplicate --vars file key warnings under `mds watch` (#326) ─────
@@ -4885,9 +5166,12 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
 /// I16: mds watch (file mode) with a duplicated top-level key in the vars file
 /// warns at STARTUP and on EVERY rebuild. Guards the emit in `rebuild_file`.
 ///
-/// Each count assertion is preceded by a bounded wait for that count, so it reads
-/// "never more than N", not "happened to be N when sampled". The warning is written
-/// to stderr with no ordering relationship to the output file the test waits on.
+/// The warning is written to stderr with no ordering relationship to the output file
+/// the test waits on, so every count is read behind a line printed after it: startup
+/// prints its warnings before it compiles and `Compiled to` after it writes, a rebuild
+/// prints them before it writes and `Recompiled` after, and the order marker's
+/// diagnostic follows everything — a line a rebuild printed after its `Recompiled`
+/// included.
 #[test]
 fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
     let base = tempfile::tempdir().unwrap();
@@ -4917,7 +5201,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
             .stdout(Stdio::null()),
     );
 
-    let stderr_after_start = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
+    let stderr_after_start = wait_for_tap(&stderr_tap, "Compiled to", TIMEOUT);
     assert_eq!(
         count_occurrences(&stderr_after_start, &expected),
         1,
@@ -4931,7 +5215,7 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I16: rebuild after edit 1 must complete"
     );
-    let after_edit_1 = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
+    let after_edit_1 = wait_for_tap_count(&stderr_tap, "Recompiled ", 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&after_edit_1, &expected),
         2,
@@ -4944,8 +5228,16 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I16: rebuild after edit 2 must complete"
     );
-    let _ = wait_for_stderr_count(&stderr_tap, &expected, 3, TIMEOUT);
+    // Ordered anchor: the marker's compile fails before the warning's gate, so it adds
+    // no warning of its own.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let after_edit_2 = stderr_tap.finish_text(&mut child);
+    assert_eq!(
+        count_occurrences(&after_edit_2, "Recompiled "),
+        2,
+        "I16: control: both edits rebuilt; stderr:\n{after_edit_2}"
+    );
     assert_eq!(
         count_occurrences(&after_edit_2, &expected),
         3,
@@ -4954,18 +5246,20 @@ fn i16_file_watch_vars_file_duplicate_warns_at_startup_and_on_every_rebuild() {
 }
 
 /// I17: mds watch (dir mode) reports the vars-file duplicate exactly once per
-/// rebuild: once at startup (proving the dedup-baseline second read in
-/// `dir_watch_startup` does NOT double-print), and once more per subsequent rebuild
-/// (proving exactly one of `liveness_probe_dir` / `handle_fs_event_dir` emits, not
-/// both).
+/// rebuild: once at startup (proving the directory startup compile,
+/// `dir_startup::startup_compile`, does NOT double-print), and
+/// once more per subsequent rebuild (proving exactly one of `liveness_probe_dir` /
+/// `handle_fs_event_dir` emits, not both).
 ///
 /// Sampling hazard this test has to defend against: dir mode emits the warning AFTER
 /// the output write, so `wait_for_file_contains` returning tells you nothing about
 /// whether the warning has been written yet. Sampling `stderr_tap.text()` right there
 /// is a race in both directions, and CI has shown both — run 34404318888 attempt 1
-/// saw left 1 / right 2 here, while run 34366009518 saw left 3 / right 2. The wait
-/// for the expected count has to come first; the exact-count assertion then means
-/// "not more than expected" rather than "happened to be sampled at the right moment".
+/// saw left 1 / right 2 here, while run 34366009518 saw left 3 / right 2. Waiting for
+/// the expected count is not enough either: stopping the watcher the moment the count
+/// is reached would cut off a surplus warning printed just after it. The final count
+/// is read behind the order marker, whose diagnostic follows every line the startup
+/// and the rebuild printed.
 #[test]
 fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
     let base = tempfile::tempdir().unwrap();
@@ -4995,14 +5289,14 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
             .stdout(Stdio::null()),
     );
 
-    // No edits yet: the startup count must be exactly 1, proving the dedup-baseline
-    // second read in `dir_watch_startup` does not also emit.
-    let stderr_startup = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
+    // No edits yet: the startup count must be exactly 1. This is a sample — a second
+    // print still in the pipe would be missed here — and the final count below is the
+    // exact check.
+    let stderr_startup = wait_for_tap_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&stderr_startup, &expected),
         1,
-        "I17: dir-watch startup must emit the vars-file warning exactly once \
-         (guards the dedup-baseline second read in dir_watch_startup); \
+        "I17: dir-watch startup must emit the vars-file warning exactly once; \
          stderr:\n{stderr_startup}"
     );
 
@@ -5013,14 +5307,22 @@ fn i17_dir_watch_vars_file_duplicate_warns_once_per_rebuild() {
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I17: rebuild after edit must complete"
     );
-    let _ = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
+    // Ordered anchor: the marker's compile fails, so its batch changes nothing and
+    // adds no warning of its own.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr_after_edit = stderr_tap.finish_text(&mut child);
+    assert_eq!(
+        count_occurrences(&stderr_after_edit, "Recompiled "),
+        1,
+        "I17: control: the edit rebuilt; stderr:\n{stderr_after_edit}"
+    );
     assert_eq!(
         count_occurrences(&stderr_after_edit, &expected),
         2,
-        "I17: one rebuild must add exactly one more warning (guards a double-emit \
-         between liveness_probe_dir and handle_fs_event_dir); \
-         stderr:\n{stderr_after_edit}"
+        "I17: startup and the one rebuild warn exactly once each (guards a \
+         double-emit at startup, and between liveness_probe_dir and \
+         handle_fs_event_dir); stderr:\n{stderr_after_edit}"
     );
 }
 
@@ -5062,8 +5364,11 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
         "I18: startup compile must complete"
     );
 
-    // Positive control (PF-013): no duplicate at startup.
-    let startup_stderr = stderr_tap.text();
+    // No duplicate at startup. Each zero below is read behind an ordered anchor, so it
+    // cannot be a sample taken before the warning reached the tap: startup prints its
+    // duplicate warnings before it compiles and `Compiled to` after it writes, and a
+    // rebuild prints them before it writes and `Recompiled` after.
+    let startup_stderr = wait_for_tap(&stderr_tap, "Compiled to", TIMEOUT);
     assert_eq!(
         count_occurrences(&startup_stderr, &expected),
         0,
@@ -5076,7 +5381,7 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I18: first rebuild must complete"
     );
-    let clean_rebuild_stderr = stderr_tap.text();
+    let clean_rebuild_stderr = wait_for_tap_count(&stderr_tap, "Recompiled ", 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&clean_rebuild_stderr, &expected),
         0,
@@ -5100,8 +5405,19 @@ fn i18_duplicate_introduced_mid_session_is_reported_on_the_next_rebuild() {
         wait_for_file_contains(&out, "version 3", TIMEOUT),
         "I18: rebuild after introducing the duplicate must complete"
     );
-    let _ = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
+    // Ordered anchor: whichever of the two events reaches the rebuild that publishes
+    // `version 3`, the other one's rebuild follows it — after that `Recompiled` line —
+    // and both precede the marker's diagnostic. The marker's compile fails, so it adds
+    // no warning of its own.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let final_stderr = stderr_tap.finish_text(&mut child);
+    assert_eq!(
+        count_occurrences(&final_stderr, "Recompiled "),
+        2,
+        "I18: control: the clean edit and the `version 3` edit rebuilt; \
+         stderr:\n{final_stderr}"
+    );
     assert_eq!(
         count_occurrences(&final_stderr, &expected),
         1,
@@ -5154,8 +5470,9 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
             .stdout(Stdio::null()),
     );
 
-    // Startup: exactly 1 warning (dir-mode startup, unaffected by this fix).
-    let startup_stderr = wait_for_stderr_count(&stderr_tap, &expected, 1, TIMEOUT);
+    // Startup: exactly 1 warning (dir-mode startup, unaffected by this fix). A sample,
+    // as in I17; the final count below is the exact check.
+    let startup_stderr = wait_for_tap_count(&stderr_tap, &expected, 1, TIMEOUT);
     assert_eq!(
         count_occurrences(&startup_stderr, &expected),
         1,
@@ -5193,7 +5510,14 @@ fn i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate() {
     // The self-heal recompile must ALSO re-warn about the vars-file duplicate —
     // proves liveness_probe_dir no longer discards the resolved vars, matching
     // handle_fs_event_dir's gate (emit iff the rebuild was observable).
-    let _ = wait_for_stderr_count(&stderr_tap, &expected, 2, TIMEOUT);
+    //
+    // Ordered anchor: dir mode warns after the rebuild's write, and the marker's
+    // diagnostic follows every line of the self-heal. Its compile fails, so it adds no
+    // warning of its own. TICK_TIMEOUT: the recreated root was re-armed by the idle
+    // tick, and should the marker's event still be missed, the tick's content check is
+    // what compiles it.
+    write_atomic(&root.join("new.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TICK_TIMEOUT);
     let final_stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&final_stderr, &expected),
@@ -5240,35 +5564,30 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
             .stdout(Stdio::null()),
     );
 
-    // Positive control (PF-013): the rebuild really happens even though nothing
-    // warns — otherwise "0 occurrences" below would be vacuous.
+    // Positive control: the startup compile and the rebuild really happen even though
+    // nothing warns — otherwise "0 occurrences" below would be vacuous.
     assert!(
         wait_for_file_contains(&out, "version 1", TIMEOUT),
         "I20: startup compile must complete even under --quiet"
     );
-    let startup_stderr = stderr_tap.text();
-    assert_eq!(
-        count_occurrences(&startup_stderr, &expected),
-        0,
-        "I20: --quiet must suppress the startup vars-file duplicate warning; \
-         stderr:\n{startup_stderr}"
-    );
-
     write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "I20: rebuild after edit must complete even under --quiet"
     );
 
-    // No count to wait for — the expectation is zero — so this one takes the
-    // strongest snapshot available instead: `finish_text` joins the drain, so a
-    // warning the child wrote and the drain had not yet copied would still be here.
-    let after_edit = stderr_tap.finish_text(&mut child);
+    // Ordered anchor: --quiet silences every status line, but not a diagnostic. The
+    // order marker's diagnostic reaches stderr after anything the startup or the
+    // rebuild printed, so the zero below covers both instead of sampling a pipe that
+    // might not have delivered a warning yet.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
-        count_occurrences(&after_edit, &expected),
+        count_occurrences(&stderr, &expected),
         0,
-        "I20: --quiet must suppress the vars-file duplicate warning on rebuild \
-         too; stderr:\n{after_edit}"
+        "I20: --quiet must suppress the vars-file duplicate warning at startup and on \
+         rebuild; stderr:\n{stderr}"
     );
 }
 
@@ -5306,11 +5625,8 @@ fn watch_file_mode_rename_into_place_triggers_rebuild() {
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "R1: a rename-into-place edit must trigger a rebuild"
     );
-    let stderr = wait_for_stderr_contains_str(&stderr_tap, "Recompiled", TIMEOUT);
-    assert!(
-        stderr.contains("Recompiled"),
-        "R1: the rebuild must announce itself; stderr:\n{stderr}"
-    );
+    // R1: the rebuild must announce itself.
+    wait_for_tap(&stderr_tap, "Recompiled", TIMEOUT);
 
     drop(child);
 }
@@ -5352,11 +5668,8 @@ fn watch_dir_mode_rename_into_place_triggers_rebuild() {
         wait_for_file_contains(&out, "version 2", TIMEOUT),
         "R2: a rename-into-place edit must trigger a rebuild"
     );
-    let stderr = wait_for_stderr_contains_str(&stderr_tap, "Recompiled", TIMEOUT);
-    assert!(
-        stderr.contains("Recompiled"),
-        "R2: the rebuild must announce itself; stderr:\n{stderr}"
-    );
+    // R2: the rebuild must announce itself.
+    wait_for_tap(&stderr_tap, "Recompiled", TIMEOUT);
 
     drop(child);
 }
@@ -5379,7 +5692,7 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
     let src = src_dir.join("t.mds");
     std::fs::write(&src, "version 1").unwrap();
 
-    let (child, stderr_tap) = spawn_ready(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -5412,6 +5725,14 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
         "R3 (positive control): a real source created by a rename must be compiled"
     );
 
+    // Ordered anchor: an event for a temp name — even one delivered after its rename —
+    // is handled before the marker's, so both absences below are read from a final
+    // state rather than a sample. The marker's compile fails; its own write goes
+    // through a temp file too.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = stderr_tap.finish_text(&mut child);
+
     // No output derives from any temp name, in either directory.
     for dir in [&out_dir, &src_dir] {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -5426,13 +5747,10 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
     }
 
     // And nothing announced compiling one.
-    let stderr = stderr_tap.text();
     assert!(
         !stderr.contains(".tmp-"),
         "R3: no status line may mention a write_atomic temp file; stderr:\n{stderr}"
     );
-
-    drop(child);
 }
 
 // ── Stderr capture completeness (#320) ──────────────────────────────────────
@@ -5544,15 +5862,54 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
     );
 }
 
+/// A symlink planted at the readiness file's temporary path does not redirect the marker
+/// (#390): `mds watch` creates that file new, never through an entry already there, so the
+/// file the link points to keeps its bytes and the marker is a file of its own. Control:
+/// the watcher still signals readiness — the harness returns only once the marker holds
+/// its text.
+///
+/// Unix-only: it plants a symlink, which Windows creates only with a privilege.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_readiness_file_s_temporary_path_does_not_redirect_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Page\n").unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, "VICTIM\n").unwrap();
+    let marker = dir.path().join("ready");
+    std::os::unix::fs::symlink(&victim, dir.path().join("ready.tmp")).unwrap();
+
+    let (child, _tap, _) = spawn_watch_ready_at(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
+            .stdout(Stdio::null()),
+        &marker,
+    );
+    let _child = ChildGuard(child);
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "VICTIM\n",
+        "the file the planted link points to keeps its bytes"
+    );
+    assert!(
+        std::fs::symlink_metadata(&marker)
+            .unwrap()
+            .file_type()
+            .is_file(),
+        "the marker is a file of its own, not the planted link"
+    );
+}
+
 // ── #413: directory arguments, and every `--help` example has a test ────────
 
 /// `mds watch .`, `./`, `..` and `sub/..` watch the directory they resolve to (#413).
 /// Directory mode takes its argument through the resolver every directory-mode
 /// subcommand shares, where it used to run `NativeFs::check_symlink`, which cannot take
 /// a path with no final name and failed with `file not found: .`. Each form compiles
-/// every file at startup, announces the canonical directory and rebuilds on an edit.
-/// The banner prints the canonical path in its on-disk spelling, so it is compared
-/// canonical to canonical, never with a typed spelling (#408).
+/// every file at startup, announces the directory as typed — never by the canonical
+/// path it watches (#390) — and rebuilds on an edit.
 #[test]
 fn watch_dot_forms_watch_the_canonical_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -5591,15 +5948,18 @@ fn watch_dot_forms_watch_the_canonical_directory() {
             tap.text()
         );
 
-        let stderr = wait_for_stderr_contains_str(&tap, "Watching directory ", TIMEOUT);
+        let stderr = wait_for_tap(&tap, "Watching directory ", TIMEOUT);
         let banner = stderr
             .lines()
             .find_map(|l| l.strip_prefix("Watching directory "))
             .unwrap_or_else(|| panic!("{label}: no banner; stderr: {stderr}"));
         assert_eq!(
-            Path::new(banner.trim()).canonicalize().unwrap(),
-            canonical,
-            "{label}: the banner names the directory `{typed}` resolves to"
+            banner, typed,
+            "{label}: the banner names the directory as typed"
+        );
+        assert!(
+            !stderr.contains(&format!("Watching directory {}", canonical.display())),
+            "{label}: never by the canonical directory; stderr: {stderr}"
         );
 
         let edited = format!("P{i}");
@@ -5661,8 +6021,7 @@ fn watch_dir_through_a_retargeted_link_is_refused() {
     std::fs::remove_file(&link).unwrap();
     symlink("b/y", &link).unwrap();
     write_atomic(&watched, "Hello A2\n");
-    let stderr =
-        wait_for_stderr_contains_str(&stderr_tap, "watched directory now resolves", TIMEOUT);
+    let stderr = wait_for_tap(&stderr_tap, "watched directory now resolves", TIMEOUT);
     assert!(
         squash(&stderr).contains(
             "mds::io×watcheddirectorynowresolvestoadifferentdirectory:\"link/..\";\
@@ -5735,7 +6094,7 @@ fn watch_dir_source_under_a_subdirectory_swapped_for_a_link_is_refused() {
         "control: the vars edit rebuilds every known source; stderr: {}",
         tap.text()
     );
-    let stderr = wait_for_stderr_contains_str(&tap, "watched file now resolves", TIMEOUT);
+    let stderr = wait_for_tap(&tap, "watched file now resolves", TIMEOUT);
     assert!(
         squash(&stderr).contains(
             "mds::io×watchedfilenowresolvestoadifferentfile:\"root/sub/x.mds\";\
@@ -6099,9 +6458,9 @@ fn watch_refuses_at_startup_to_write_over_the_entry() {
 }
 
 /// A rebuild never writes over the entry either. When the startup compile fails, the
-/// output path is resolved without knowing the kind and falls back to the Markdown
-/// default — the entry itself here, or the `-o` path as given, which leads back to the
-/// entry out of a directory that does not exist yet; once the source is fixed, the
+/// kind is unknown, and a fix that compiles to Markdown takes the Markdown default —
+/// the entry itself here — or the `-o` path as given, which leads back to the entry out
+/// of a directory that does not exist yet; once the source is fixed, the
 /// rebuild refuses (`mds::io`, the entry named as typed), keeps watching, and the fixed
 /// source stays byte-identical, with no directory created. It used to overwrite it
 /// with the compiled output.
@@ -6120,15 +6479,11 @@ fn watch_rebuild_never_writes_over_the_entry() {
                 .args(extra)
                 .stdout(Stdio::null()),
         );
-        let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
-        assert!(
-            stderr.contains("mds::syntax"),
-            "{label}: control: the startup compile fails; stderr: {stderr}"
-        );
+        // Control: the startup compile fails.
+        wait_for_tap(&tap, "mds::syntax", TIMEOUT);
 
         write_atomic(&src, TYPE_MDS_PAGE);
-        let needle = "output would overwrite the entry file";
-        let stderr = wait_for_stderr_contains_str(&tap, needle, TIMEOUT);
+        let stderr = wait_for_tap(&tap, "output would overwrite the entry file", TIMEOUT);
         assert!(
             squash(&stderr).contains(&entry_overwrite_refusal("page.md")),
             "{label}: the rebuild is refused; stderr: {stderr}"
@@ -6162,11 +6517,8 @@ fn watch_rebuild_never_writes_over_the_entry() {
             .args(["watch", "page.md", "--out-dir", "fresh", "--debounce", "0"])
             .stdout(Stdio::null()),
     );
-    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
-    assert!(
-        stderr.contains("mds::syntax"),
-        "control: the startup compile fails; stderr: {stderr}"
-    );
+    // Control: the startup compile fails.
+    wait_for_tap(&tap, "mds::syntax", TIMEOUT);
     assert!(
         !dir.path().join("fresh").exists(),
         "control: a failed startup compile creates no directory"
@@ -6229,14 +6581,10 @@ fn watch_refusal_is_not_preceded_by_the_extension_warning() {
             .args(["watch", "e.mds", "-o", "e.mds", "--debounce", "0"])
             .stdout(Stdio::null()),
     );
-    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
-    assert!(
-        stderr.contains("mds::syntax"),
-        "{label}: control: the startup compile fails; stderr: {stderr}"
-    );
+    // Control: the startup compile fails.
+    wait_for_tap(&tap, "mds::syntax", TIMEOUT);
     write_atomic(&src, "E\n");
-    let stderr =
-        wait_for_stderr_contains_str(&tap, "output would overwrite the entry file", TIMEOUT);
+    let stderr = wait_for_tap(&tap, "output would overwrite the entry file", TIMEOUT);
     assert!(
         squash(&stderr).contains(&entry_overwrite_refusal("e.mds")),
         "{label}: the rebuild is refused; stderr: {stderr}"
@@ -6260,11 +6608,8 @@ fn watch_refusal_is_not_preceded_by_the_extension_warning() {
     );
     let warning = "warning: output path 'other.mds' has extension '.mds' but compiled output \
                    is markdown (.md); writing to 'other.mds' anyway";
-    let stderr = wait_for_stderr_contains_str(&tap, warning, TIMEOUT);
-    assert!(
-        stderr.contains(warning),
-        "control: the warning still announces a write that happens; stderr: {stderr}"
-    );
+    // Control: the warning still announces a write that happens.
+    wait_for_tap(&tap, warning, TIMEOUT);
     drop(child);
 }
 
@@ -6395,11 +6740,8 @@ fn watch_startup_route_refusal_controls() {
             .args(["watch", "page.mds", "--debounce", "0"])
             .stdout(Stdio::null()),
     );
-    let stderr = wait_for_stderr_contains_str(&tap, "mds::syntax", TIMEOUT);
-    assert!(
-        stderr.contains("mds::syntax"),
-        "failed startup compile: the compile error is reported; stderr: {stderr}"
-    );
+    // Failed startup compile: the compile error is reported.
+    wait_for_tap(&tap, "mds::syntax", TIMEOUT);
     write_atomic(&src, "Hello fixed\n");
     assert!(
         wait_for_file_contains(&dir.path().join("page.md"), "Hello fixed", TIMEOUT),
@@ -6462,20 +6804,11 @@ fn watch_startup_route_refusal_controls() {
             .args(["watch", "page.mds", "-o", "-", "--debounce", "0"])
             .stdout(Stdio::piped()),
     );
-    // `wait_for_stderr_contains_str` polls any pipe tap; this one is stdout.
-    let stdout = wait_for_stderr_contains_str(&stdout_tap, "Hello one", TIMEOUT);
-    assert!(
-        stdout.contains("Hello one"),
-        "{label}: startup streams to stdout; stderr: {}",
-        tap.text()
-    );
+    // `wait_for_tap` polls any pipe tap; this one is stdout. Startup streams to stdout,
+    // and so does the rebuild.
+    wait_for_tap(&stdout_tap, "Hello one", TIMEOUT);
     write_atomic(&src, "Hello two\n");
-    let stdout = wait_for_stderr_contains_str(&stdout_tap, "Hello two", TIMEOUT);
-    assert!(
-        stdout.contains("Hello two"),
-        "{label}: the rebuild streams to stdout; stderr: {}",
-        tap.text()
-    );
+    wait_for_tap(&stdout_tap, "Hello two", TIMEOUT);
     assert!(
         !tap.text().contains("must not contain"),
         "{label}: nothing is refused; stderr: {}",
@@ -6490,4 +6823,4040 @@ fn watch_startup_route_refusal_controls() {
         "{label}: nothing is written next to the source"
     );
     drop(child);
+}
+
+// ── A failed startup compile or write: the route of the compiled kind (#257) ────
+//
+// A startup compile that fails leaves the output's kind unknown, so the first rebuild
+// that compiles decides the route by its kind. A startup write that fails follows a
+// compile that succeeded: the route its kind decided and the dependencies it reported
+// stay the session's. The write fails on a directory standing at the output path, which
+// no write replaces on any OS or under any privilege; removing the directory removes
+// the cause. `--poll-interval 0` turns the idle tick off, so every rebuild is the test's
+// own edit's and nothing rediscovers what startup dropped.
+
+/// A messages template whose `.json` output cannot be written at startup keeps the
+/// `.json` route (#257): the startup error names `./chat.json` as typed, and once the
+/// obstacle is gone an edit writes `chat.json`; no `chat.md` is ever created. It used to
+/// take the Markdown route of a failed compile, and write the JSON into `chat.md`.
+/// Control: after a startup compile that fails, a rebuild that compiles to Markdown
+/// writes `chat.md`.
+#[test]
+fn watch_failed_startup_write_keeps_the_compiled_kinds_route() {
+    let watch = |dir: &Path| {
+        spawn_ready(
+            mds_bin()
+                .current_dir(dir)
+                .args(["watch", "chat.mds"])
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("chat.mds");
+    let json = dir.path().join("chat.json");
+    let md = dir.path().join("chat.md");
+    std::fs::write(&src, "@message user:\nWhat is 2+2?\n@end\n").unwrap();
+    std::fs::create_dir(&json).unwrap();
+    // As `mds build chat.mds` names its output.
+    let shown = Path::new(".").join("chat.json");
+
+    let (child, tap) = watch(dir.path());
+    let startup = wait_for_tap(&tap, "cannot write", TIMEOUT);
+    assert!(
+        squash(&startup).contains(&squash(&format!("cannot write {}:", shown.display()))),
+        "the startup error names the .json output as typed; stderr: {startup}"
+    );
+
+    std::fs::remove_dir(&json).unwrap();
+    write_atomic(&src, "@message user:\nWhat is 3+3?\n@end\n");
+    // Anchored on the edit's own output: a late event for `chat.mds`, written before the
+    // spawn, can rebuild the startup text first — the failed write left the content
+    // dedup empty — so the first `Recompiled` need not be the edit's.
+    let rebuilt = wait_for_file_contains(&json, "What is 3+3?", TIMEOUT);
+    // A rebuild writes its output before it prints `Recompiled`.
+    let stderr = wait_for_tap(&tap, "Recompiled", TIMEOUT);
+    assert!(
+        !md.exists(),
+        "no Markdown output is ever created; chat.md holds {:?}; stderr: {stderr}",
+        std::fs::read_to_string(&md).ok()
+    );
+    assert!(
+        squash(&stderr).contains(&squash(&format!("Recompiled {}", shown.display()))),
+        "the rebuild writes the .json output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(&json).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&written).expect("the .json output is JSON");
+    assert!(
+        rebuilt && parsed.is_array() && written.contains("What is 3+3?"),
+        "chat.json holds the rebuilt messages: {written}"
+    );
+    drop(child);
+
+    // Control: a startup compile that fails leaves the kind unknown, so the first
+    // rebuild that compiles routes by its kind: Markdown, `chat.md`.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("chat.mds");
+    let md = dir.path().join("chat.md");
+    std::fs::write(&src, "Hello {{name\n").unwrap();
+    let (child, tap) = watch(dir.path());
+    wait_for_tap(&tap, "mds::syntax", TIMEOUT);
+    write_atomic(&src, "Hello fixed\n");
+    assert!(
+        wait_for_file_contains(&md, "Hello fixed", TIMEOUT),
+        "control: after a failed startup compile the rebuild writes chat.md; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// A failed startup write keeps the dependencies the compile reported (#257): once the
+/// obstacle is gone, an edit to the imported partial rebuilds the entry and writes it.
+/// They used to be dropped with the write, so with no idle tick to find them again only
+/// an edit to the entry itself rebuilt it.
+#[test]
+fn watch_failed_startup_write_keeps_the_compiled_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("part.mds");
+    let src = dir.path().join("page.mds");
+    let out = dir.path().join("page.md");
+    std::fs::write(&part, "@define who():\nWorld\n@end\n\n@export who\n").unwrap();
+    std::fs::write(&src, "@import \"./part.mds\" as p\nHello {{p.who()}}!\n").unwrap();
+    std::fs::create_dir(&out).unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.mds"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    // Control: the startup write fails.
+    wait_for_tap(&tap, "cannot write", TIMEOUT);
+
+    std::fs::remove_dir(&out).unwrap();
+    write_atomic(&part, "@define who():\nPlanet\n@end\n\n@export who\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello Planet!", TIMEOUT),
+        "an edit to the imported partial rebuilds the entry; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// A failed startup write warns about an explicit `-o` by the kind the compile produced,
+/// once (#257): the startup compile warns when the path's extension contradicts that kind,
+/// and the failed write adds nothing. It used to warn a second time measured against
+/// Markdown — twice for a Markdown output written to `-o out.json`, and once for a
+/// messages output, which `.json` names. The first session is the positive control for
+/// the second's absence.
+#[test]
+fn watch_failed_startup_write_warns_about_the_output_extension_once() {
+    // One session whose startup write to `-o out.json` fails: the warnings on stderr.
+    let warnings = |source: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat.mds"), source).unwrap();
+        std::fs::create_dir(dir.path().join("out.json")).unwrap();
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "chat.mds", "-o", "out.json"])
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        // Startup prints all it prints before it reports readiness, and a rebuild never
+        // prints the `-o` warning.
+        let stderr = tap.finish_text(&mut child);
+        assert!(
+            squash(&stderr).contains(&squash("cannot write out.json:")),
+            "the startup write fails; stderr: {stderr}"
+        );
+        (
+            count_occurrences(&squash(&stderr), &squash("has extension '.json'")),
+            stderr,
+        )
+    };
+
+    let (count, stderr) = warnings("Hello\n");
+    assert_eq!(
+        count, 1,
+        "a Markdown output named .json is warned about once; stderr: {stderr}"
+    );
+    let (count, stderr) = warnings("@message user:\nHi\n@end\n");
+    assert_eq!(
+        count, 0,
+        "a messages output named .json is not warned about; stderr: {stderr}"
+    );
+}
+
+/// A startup compile that fails leaves the output's kind unknown, and the first rebuild
+/// that compiles routes the output by the kind it compiles to (#257): a template fixed
+/// into messages writes `chat.json` and never `chat.md`, below `--out-dir` too, and one
+/// fixed into Markdown writes `chat.md` and never `chat.json`. It used to keep the
+/// Markdown route all session, and wrote the JSON into `chat.md`. Control: an explicit
+/// `-o` names the output whatever its kind, so the JSON goes to the file it names.
+#[test]
+fn watch_failed_startup_compile_routes_by_the_kind_it_compiles_to() {
+    const MESSAGES: &str = "@message user:\nWhat is 3+3?\n@end\n";
+    const MARKDOWN: &str = "Hello fixed\n";
+    // One session whose startup compile fails, then `fixed` saved over the entry: the
+    // directory, and stderr up to the first `Recompiled` — a rebuild writes its output
+    // before it prints that line.
+    let session = |args: &[&str], fixed: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("chat.mds");
+        std::fs::write(&src, "Hello {{name\n").unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "chat.mds"])
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        wait_for_tap(&tap, "mds::syntax", TIMEOUT);
+        write_atomic(&src, fixed);
+        let stderr = wait_for_tap(&tap, "Recompiled", TIMEOUT);
+        drop(child);
+        (dir, stderr)
+    };
+    let recompiled = |stderr: &str, shown: &Path| {
+        squash(stderr).contains(&squash(&format!("Recompiled {}", shown.display())))
+    };
+
+    // Messages, beside the entry.
+    let (dir, stderr) = session(&[], MESSAGES);
+    let md = dir.path().join("chat.md");
+    assert!(
+        !md.exists(),
+        "a template fixed into messages never writes chat.md; it holds {:?}; stderr: {stderr}",
+        std::fs::read_to_string(&md).ok()
+    );
+    assert!(
+        recompiled(&stderr, &Path::new(".").join("chat.json")),
+        "the rebuild names the .json output as typed; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("chat.json")).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&written).expect("the .json output is JSON");
+    assert!(
+        parsed.is_array() && written.contains("What is 3+3?"),
+        "chat.json holds the messages: {written}"
+    );
+
+    // Messages, below `--out-dir`.
+    let (dir, stderr) = session(&["--out-dir", "out"], MESSAGES);
+    assert!(
+        recompiled(&stderr, &Path::new("out").join("chat.json")),
+        "under --out-dir the rebuild writes the .json output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("out").join("chat.json")).unwrap();
+    assert!(
+        written.contains("What is 3+3?"),
+        "out/chat.json holds the messages: {written}"
+    );
+
+    // Control: Markdown, beside the entry — `chat.md` is written where it applies.
+    let (dir, stderr) = session(&[], MARKDOWN);
+    assert!(
+        recompiled(&stderr, &Path::new(".").join("chat.md")),
+        "control: the rebuild names the .md output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("chat.md")).unwrap();
+    assert!(
+        written.contains("Hello fixed"),
+        "control: chat.md holds the Markdown: {written}"
+    );
+    assert!(
+        !dir.path().join("chat.json").exists(),
+        "a template fixed into Markdown never writes chat.json; stderr: {stderr}"
+    );
+
+    // Control: an explicit `-o` is the route whatever the kind.
+    let (dir, stderr) = session(&["-o", "out.md"], MESSAGES);
+    assert!(
+        recompiled(&stderr, Path::new("out.md")),
+        "control: the rebuild writes the -o output; stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("out.md")).unwrap();
+    assert!(
+        written.contains("What is 3+3?"),
+        "control: out.md holds the messages: {written}"
+    );
+    assert!(
+        !dir.path().join("chat.json").exists() && !dir.path().join("out.json").exists(),
+        "control: -o is never routed by the kind; stderr: {stderr}"
+    );
+}
+
+/// After a failed startup compile, a route that is refused as the entry itself is not
+/// kept (#257, #425): a fix of a `type: mds` `.md` entry that compiles to Markdown would
+/// write over the entry and is refused, and a later edit that compiles to messages
+/// writes `page.json`. The refused route used to stay the session's, so that edit was
+/// refused too, and so was every later one.
+#[test]
+fn watch_route_refused_as_the_entry_is_not_kept() {
+    const MESSAGES: &str = "---\ntype: mds\n---\n@message user:\nWhat is 3+3?\n@end\n";
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.md");
+    let json = dir.path().join("page.json");
+    std::fs::write(&src, "---\ntype: mds\n---\nHello {{name\n").unwrap();
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "page.md"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    // Control: the startup compile fails.
+    wait_for_tap(&tap, "mds::syntax", TIMEOUT);
+
+    // Control: a fix that compiles to Markdown is refused — its route is the entry.
+    write_atomic(&src, TYPE_MDS_PAGE);
+    let refused = wait_for_tap(&tap, "output would overwrite the entry file", TIMEOUT);
+    assert!(
+        squash(&refused).contains(&entry_overwrite_refusal("page.md")),
+        "control: the Markdown route is refused; stderr: {refused}"
+    );
+
+    write_atomic(&src, MESSAGES);
+    // Refused rebuilds write nothing and print no `Recompiled`, so the first one is the
+    // write of page.json, which comes before it.
+    let written = wait_for_file_contains(&json, "What is 3+3?", TIMEOUT);
+    assert!(
+        written,
+        "a later compile to messages writes page.json; stderr: {}",
+        tap.text()
+    );
+    let stderr = wait_for_tap(&tap, "Recompiled", TIMEOUT);
+    assert!(
+        squash(&stderr).contains(&squash(&format!(
+            "Recompiled {}",
+            Path::new(".").join("page.json").display()
+        ))),
+        "the rebuild names page.json as typed; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&src).unwrap(),
+        MESSAGES,
+        "the entry is untouched"
+    );
+    drop(child);
+}
+
+// ── A failed directory-watch startup write is retried (#257) ───────────────────────
+//
+// A directory watch compiles each source once at startup, and the content dedup holds
+// only the outputs that startup wrote. A source whose output could not be written is
+// marked failed, so the next rebuild with a real change compiles it and writes it, even
+// when its content never changed. The write fails on a directory standing at the output
+// path, as in the section above.
+
+/// A directory watch whose startup write of one source fails writes that output on the
+/// next rebuild once the obstacle is gone (#257), even when the save leaves the source's
+/// content unchanged. Startup used to record the unwritten content as written, so the
+/// content dedup skipped that output until the source's content itself changed.
+/// Control: a save of the same bytes to a source whose startup write succeeded rewrites
+/// nothing.
+#[test]
+fn watch_dir_failed_startup_write_is_retried_on_the_next_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("d");
+    std::fs::create_dir(&d).unwrap();
+    let (a, b) = (d.join("a.mds"), d.join("b.mds"));
+    let (a_out, b_out) = (d.join("a.md"), d.join("b.md"));
+    std::fs::write(&a, "Steady a\n").unwrap();
+    std::fs::write(&b, "Steady b\n").unwrap();
+    std::fs::create_dir(&a_out).unwrap();
+    // As `mds build d` names each output.
+    let shown = |name: &str| Path::new("d").join(name);
+    let recompiled = |stderr: &str, name: &str| {
+        count_occurrences(
+            &squash(stderr),
+            &squash(&format!("Recompiled {}", shown(name).display())),
+        )
+    };
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "d"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    let startup = wait_for_tap(&tap, "cannot write", TIMEOUT);
+    assert!(
+        squash(&startup).contains(&squash(&format!(
+            "cannot write {}:",
+            shown("a.md").display()
+        ))),
+        "the startup write of a.md fails; stderr: {startup}"
+    );
+    assert!(
+        wait_for_file_contains(&b_out, "Steady b", TIMEOUT),
+        "control: the startup writes b.md; stderr: {startup}"
+    );
+
+    std::fs::remove_dir(&a_out).unwrap();
+    write_atomic(&a, "Steady a\n");
+    assert!(
+        wait_for_file_contains(&a_out, "Steady a", TIMEOUT),
+        "a save of the unchanged source writes a.md once the obstacle is gone; stderr: {}",
+        tap.text()
+    );
+
+    // Control: the same bytes, saved to the source whose startup write succeeded.
+    write_atomic(&b, "Steady b\n");
+    // Ordered anchor: every rebuild before it has printed what it prints.
+    write_atomic(&d.join("m.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        recompiled(&stderr, "a.md"),
+        1,
+        "a.md is written once; stderr: {stderr}"
+    );
+    assert_eq!(
+        recompiled(&stderr, "b.md"),
+        0,
+        "control: a save of the same bytes rewrites nothing; stderr: {stderr}"
+    );
+}
+
+/// A directory rebuild whose write fails keeps the dependencies its compile reported
+/// (#257), as startup does: once the obstacle is gone, an edit to a file outside the
+/// watched directory, which the edit whose write failed began to import, rebuilds the
+/// source. The rebuild used to keep the dependencies of the compile before it, so that
+/// file's directory was never watched and its edits were never seen. `--poll-interval
+/// 100`: should the edit below land before the failed rebuild has armed the new
+/// dependency's directory, the idle tick compares what the file holds.
+#[test]
+fn watch_dir_failed_rebuild_write_keeps_the_compiled_dependencies() {
+    let base = tempfile::tempdir().unwrap();
+    let (root, shared) = (base.path().join("root"), base.path().join("shared"));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // A project root above both, so `../shared/` can be imported.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    let partial = shared.join("_x.mds");
+    std::fs::write(
+        &partial,
+        "@define greet():\nShared one\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    let (a, a_out) = (root.join("a.mds"), root.join("a.md"));
+    std::fs::write(&a, "Plain a\n").unwrap();
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "root"])
+            .args(["--debounce", "0", "--poll-interval", "100"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&a_out, "Plain a", TIMEOUT),
+        "control: the startup writes a.md; stderr: {}",
+        tap.text()
+    );
+
+    // A directory at a.md, then an edit that imports the shared file: the rebuild
+    // compiles, and its write fails.
+    std::fs::remove_file(&a_out).unwrap();
+    std::fs::create_dir(&a_out).unwrap();
+    write_atomic(&a, "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n");
+    let failed = wait_for_tap(&tap, "cannot write", TIMEOUT);
+    assert!(
+        squash(&failed).contains(&squash(&format!(
+            "cannot write {}:",
+            Path::new("root").join("a.md").display()
+        ))),
+        "the rebuild's write of a.md fails; stderr: {failed}"
+    );
+
+    std::fs::remove_dir(&a_out).unwrap();
+    write_atomic(
+        &partial,
+        "@define greet():\nShared, edited\n@end\n\n@export greet\n",
+    );
+    assert!(
+        wait_for_file_contains(&a_out, "Shared, edited", TICK_TIMEOUT),
+        "an edit to the file the failed rebuild imported rebuilds a.md; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// A directory watch's startup compiles each source once (#257). A compile that panics
+/// prints the internal-compiler-error text once (`MDS_TEST_PANIC=compile:a`, a debug
+/// build's trigger), so the texts on stderr count the startup's compiles of `a.mds`.
+/// Startup used to compile every source a second time to seed the content dedup, and
+/// printed the text twice. `--debounce 30000` holds a rebuild until thirty seconds after
+/// its last event — a late event for a source written before the spawn included — so the
+/// session is stopped before any rebuild compiles, and every text is the startup's.
+/// Control: the other source is compiled and written.
+#[cfg(debug_assertions)]
+#[test]
+fn watch_dir_startup_compiles_each_source_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("d");
+    std::fs::create_dir(&d).unwrap();
+    for name in ["a", "b"] {
+        std::fs::write(d.join(format!("{name}.mds")), format!("Hello {name}\n")).unwrap();
+    }
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .env("MDS_TEST_PANIC", "compile:a")
+            .args(["watch", "d", "--quiet"])
+            .args(["--debounce", "30000", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    // The startup writes its outputs before it reports readiness.
+    let b_md = std::fs::read_to_string(d.join("b.md")).ok();
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        b_md.as_deref(),
+        Some("Hello b\n"),
+        "control: the startup compiles and writes the other source; stderr: {stderr}"
+    );
+    assert!(
+        !d.join("a.md").exists(),
+        "a compile that panicked writes no output; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, "mds: internal compiler error"),
+        1,
+        "the startup compiles a.mds once; stderr: {stderr}"
+    );
+}
+
+// ── Streams: a gone stdout reader, a closed stderr, a failing write (#157) ──────
+//
+// A closed pipe — its reader gone — never changes how `mds watch` exits. With `-o -`,
+// stdout IS the session's product, so a gone reader ends the session: one
+// `Stopped watching (stdout closed).` line, exit 0. A closed stderr only loses the
+// status lines, so the session keeps watching. Any other output failure during a live
+// session is reported (where stderr still works) and never changes the Ctrl+C exit; a
+// session that stops before it is live exits as a run that ends on its own does.
+
+/// The line a session ends with when `-o -` finds stdout's reader gone.
+const STOPPED_STDOUT_CLOSED: &str = "Stopped watching (stdout closed).\n";
+
+/// Upper bound for a watcher expected to exit — at startup, after a rebuild, or after a
+/// signal. A **failure bound**: it exits in milliseconds, and one still running at the
+/// deadline is the defect the caller asserts against.
+const SESSION_END_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Send SIGINT (Ctrl+C) to the watcher.
+///
+/// `#[cfg(unix)]`: SIGINT via `libc::kill` has no Windows analogue (#147).
+#[cfg(unix)]
+fn interrupt(guard: &ChildGuard) {
+    // SAFETY: `kill` takes no pointer; the pid is our own live child's.
+    unsafe {
+        libc::kill(guard.id() as libc::pid_t, libc::SIGINT);
+    }
+}
+
+/// `mds watch -o -` whose stdout reader is gone before it starts: the startup write finds
+/// the pipe closed, so the session prints `Stopped watching (stdout closed).` as its
+/// last line and exits 0; `--quiet` silences the line (#157).
+///
+/// The reader is dropped before the spawn ([`closed_pipe`]), so the first stdout write
+/// fails whatever the timing. Control: with an open pipe the same command writes the
+/// compiled output to stdout and keeps watching, so the closed arm really loses a write.
+#[test]
+fn watch_to_stdout_whose_reader_is_gone_stops_and_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let src = src.to_str().unwrap();
+    let loud = ["watch", src, "-o", "-", "--debounce", "0"];
+    let quiet = ["watch", src, "-o", "-", "--debounce", "0", "-q"];
+
+    // Control: an open pipe gets the output, and the session goes on.
+    let (mut open, _open_tap, open_stdout) =
+        spawn_ready_piped_stdout(mds_bin().args(loud).stdout(Stdio::piped()));
+    wait_for_tap(&open_stdout, "Hello one", TIMEOUT);
+    assert!(
+        open.0.try_wait().unwrap().is_none(),
+        "control: with an open pipe the session keeps watching"
+    );
+    drop(open);
+
+    let (mut closed, tap) =
+        spawn_unsynchronized(mds_bin().args(loud).stdout(Stdio::from(closed_pipe())));
+    let status = wait_bounded(
+        &mut closed,
+        SESSION_END_TIMEOUT,
+        "watch -o - with no reader",
+    );
+    let stderr = tap.finish_text(&mut closed);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a gone stdout reader ends the session with exit 0; stderr: {stderr:?}"
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines.len() == 2 && lines[0].starts_with("Watching "),
+        "the session prints `Watching …` and then exactly the stop line; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        format!("{}\n", lines[1]),
+        STOPPED_STDOUT_CLOSED,
+        "the last line names the closed stdout; stderr: {stderr:?}"
+    );
+
+    // `--quiet` silences the line; the loud arm above is its positive control.
+    let (mut quiet_run, quiet_tap) =
+        spawn_unsynchronized(mds_bin().args(quiet).stdout(Stdio::from(closed_pipe())));
+    let status = wait_bounded(
+        &mut quiet_run,
+        SESSION_END_TIMEOUT,
+        "watch -o - -q with no reader",
+    );
+    let stderr = quiet_tap.finish_text(&mut quiet_run);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "--quiet: a gone stdout reader ends the session with exit 0; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "--quiet prints nothing when stdout's reader is gone"
+    );
+}
+
+/// `mds watch -o -` whose reader goes away after the first output: the next rebuild's
+/// write finds the pipe closed, and the session ends with the same line and exit 0 —
+/// never `Recompiled`, since nothing was written; `--quiet` silences the line (#157).
+///
+/// The test owns the pipe's only reader: it reads the startup output, which the watcher
+/// writes before it signals readiness, and then drops the reader before the edit. The
+/// loud arm is the quiet arm's positive control: the same session prints the stop line.
+#[test]
+fn watch_to_stdout_stops_when_its_reader_goes_away_and_exits_0() {
+    use std::io::Read as _;
+
+    for quiet in [false, true] {
+        let what = if quiet { "--quiet" } else { "loud" };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("page.mds");
+        std::fs::write(&src, "Hello one\n").unwrap();
+        let mut args = vec!["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"];
+        if quiet {
+            args.push("-q");
+        }
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        let (mut guard, tap) = spawn_ready(mds_bin().args(&args).stdout(Stdio::from(writer)));
+
+        // Read the startup output on a helper thread, so the wait is bounded; the thread
+        // hands the reader back so the test decides when it goes.
+        let first_output = b"Hello one\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut first = vec![0u8; first_output.len()];
+            let read = reader.read_exact(&mut first).map(|()| first);
+            let _ = tx.send((read, reader));
+        });
+        let (read, reader) = rx
+            .recv_timeout(TIMEOUT)
+            .expect("the startup output must reach the pipe");
+        assert_eq!(
+            read.expect("read the startup output"),
+            first_output,
+            "control ({what}): the session writes its output to stdout"
+        );
+        drop(reader);
+
+        write_atomic(&src, "Hello two\n");
+        let status = wait_bounded(
+            &mut guard,
+            SESSION_END_TIMEOUT,
+            &format!("watch -o - ({what}) after its reader went away"),
+        );
+        let stderr = tap.finish_text(&mut guard);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{what}: a reader that goes away ends the session with exit 0; stderr: {stderr:?}"
+        );
+        if quiet {
+            assert_eq!(
+                stderr, "",
+                "--quiet prints nothing when stdout's reader goes away mid-session"
+            );
+            continue;
+        }
+        assert!(
+            stderr.ends_with(STOPPED_STDOUT_CLOSED)
+                && count_occurrences(&stderr, STOPPED_STDOUT_CLOSED) == 1,
+            "the session ends with exactly one stop line; stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.starts_with("Watching ") && !stderr.contains("Recompiled"),
+            "a write the closed pipe lost is not a rebuild; stderr: {stderr:?}"
+        );
+    }
+}
+
+/// `mds watch` with stderr closed from the start reaches readiness, rebuilds its output
+/// on an edit and keeps running; on unix it exits 0 at Ctrl+C (#157). File mode and
+/// directory mode.
+///
+/// A closed stderr cannot be read back, so each mode first runs the same session with
+/// stderr open, as the control: it writes there at every step — `Watching`,
+/// `Recompiled`, and on unix `Stopped watching.` — so every one of those writes is lost
+/// in the closed arm.
+#[test]
+fn watch_with_stderr_closed_keeps_watching() {
+    for mode in ["file", "directory"] {
+        for closed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("page.mds");
+            std::fs::write(&src, "Hello one\n").unwrap();
+            let out = dir.path().join("page.md");
+            let mut cmd = mds_bin();
+            if mode == "file" {
+                cmd.args(["watch", src.to_str().unwrap()]);
+            } else {
+                cmd.args(["watch", dir.path().to_str().unwrap()]);
+            }
+            cmd.args(["--debounce", "0"]).stdout(Stdio::null());
+            let what = format!(
+                "{mode} mode, stderr {}",
+                if closed { "closed" } else { "open" }
+            );
+
+            let (mut guard, tap) = if closed {
+                cmd.stderr(Stdio::from(closed_pipe()));
+                let (child, _no_stdout) = spawn_watch_ready_stderr_untapped(&mut cmd);
+                (ChildGuard(child), None)
+            } else {
+                let (guard, tap) = spawn_ready(&mut cmd);
+                (guard, Some(tap))
+            };
+
+            assert!(
+                wait_for_file_contains(&out, "Hello one", TIMEOUT),
+                "{what}: the startup compile writes the output"
+            );
+            write_atomic(&src, "Hello two\n");
+            assert!(
+                wait_for_file_contains(&out, "Hello two", TIMEOUT),
+                "{what}: an edit rebuilds the output"
+            );
+            if let Some(tap) = &tap {
+                wait_for_tap(tap, "Recompiled ", TIMEOUT);
+                assert!(
+                    tap.text().starts_with("Watching "),
+                    "control ({what}): the session writes its status lines to stderr"
+                );
+            }
+            assert!(
+                guard.0.try_wait().unwrap().is_none(),
+                "{what}: the session keeps watching"
+            );
+
+            #[cfg(unix)]
+            {
+                interrupt(&guard);
+                let status = wait_bounded(&mut guard, SESSION_END_TIMEOUT, &what);
+                assert_eq!(status.code(), Some(0), "{what}: Ctrl+C exits 0");
+                if let Some(tap) = tap {
+                    let stderr = tap.finish_text(&mut guard);
+                    assert!(
+                        stderr.ends_with("Stopped watching.\n"),
+                        "control ({what}): Ctrl+C prints the stop line; stderr: {stderr:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `mds watch -o -` into a stdout that fails other than by a closed pipe: the failure is
+/// reported once, as `mds::io` naming stdout, the session keeps watching, and a save of
+/// the same text writes it again — the lost write never became the content baseline
+/// that makes a rebuild of unchanged output skip its write. At Ctrl+C it exits 0 (#157).
+///
+/// Vector: stdout is a regular file already as long as the child's file-size limit and
+/// open at its end, so every write fails with "file too large" until the test empties
+/// the file and moves the shared offset back ([`full_file`], [`limit_file_growth`]).
+///
+/// 1. The startup write fails: reported once, and the session goes on.
+/// 2. An edit fails again: no second report, and no `Recompiled`. The edited entry
+///    `@include`s an empty module, whose warning shows on stderr that it was compiled.
+/// 3. The test makes room and saves the SAME text again: the write lands.
+#[cfg(unix)]
+#[test]
+fn watch_to_a_failing_stdout_reports_once_and_retries_the_same_content() {
+    const LIMIT: usize = 64;
+    const FINAL_MARKER_SOURCE: &str = "Final marker {{__final_marker__}}\n";
+    const FINAL_MARKER_LINE: &str = "undefined variable '__final_marker__'";
+    let include_warning = "@include of 'e' produced empty output";
+    let edited = "@import \"./empty.mds\" as e\n@include e\nHello two\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("empty.mds"), "").unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    // Outside the watched directory, so the output's own writes raise no events there.
+    let stdout_dir = tempfile::tempdir().unwrap();
+    let stdout_path = stdout_dir.path().join("stdout");
+
+    let mut cmd = mds_bin();
+    cmd.args([
+        "watch",
+        src.to_str().unwrap(),
+        "-o",
+        "-",
+        "--debounce",
+        "0",
+        // No idle tick: its first-tick recompile would write on its own schedule.
+        "--poll-interval",
+        "0",
+    ]);
+    let stdout_file = full_file(&stdout_path, LIMIT);
+    // Shares the child's stdout offset: step 3 moves it back.
+    let mut stdout_offset = stdout_file.try_clone().unwrap();
+    cmd.stdout(Stdio::from(stdout_file));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let (mut guard, tap) = spawn_ready(&mut cmd);
+
+    // 1. The startup write failed, and was reported, before readiness.
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: the vector fails every write, so the startup output never landed"
+    );
+    wait_for_tap(&tap, "cannot write to stdout", TIMEOUT);
+
+    // 2. A new text fails to write again. The marker orders the tap: every rebuild of
+    //    the edit finished before the marker's compile.
+    write_atomic(&src, edited);
+    wait_for_tap(&tap, include_warning, TIMEOUT);
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    let seen = wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&seen, "Recompiled"),
+        0,
+        "a write stdout lost is not a rebuild; stderr:\n{seen}"
+    );
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: no write reached the file"
+    );
+
+    // 3. Room in the file again; save the same text.
+    {
+        use std::io::Seek as _;
+        stdout_offset.set_len(0).unwrap();
+        stdout_offset.seek(std::io::SeekFrom::Start(0)).unwrap();
+    }
+    write_atomic(&src, edited);
+    let retried = poll_tap_until(&tap, TIMEOUT, |text| text.contains("Recompiled <stdout>"));
+    assert!(
+        retried.is_ok(),
+        "a save of the text whose write stdout lost must write it again; stderr:\n{}",
+        tap.text()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&stdout_path).unwrap(),
+        "Hello two\n",
+        "the retried write reached stdout"
+    );
+
+    write_atomic(&src, FINAL_MARKER_SOURCE);
+    let seen = wait_for_tap(&tap, FINAL_MARKER_LINE, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&seen, "cannot write to stdout"),
+        1,
+        "a stdout failure is reported once however many writes it fails; stderr:\n{seen}"
+    );
+    assert!(
+        seen.contains("mds::io") && seen.contains("File too large"),
+        "the report is `mds::io` with the cause; stderr:\n{seen}"
+    );
+    assert_eq!(
+        count_occurrences(&seen, "Recompiled"),
+        1,
+        "exactly the retried write is a rebuild; stderr:\n{seen}"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C after a stdout failure",
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a stdout failure during the session does not change the Ctrl+C exit"
+    );
+}
+
+/// `mds watch -o -` into a stdout that fails, recovers and fails again reports both
+/// failures: a write that lands ends the first one, so the second is new, not a repeat
+/// to stay silent about (#157).
+///
+/// Vector: as in [`watch_to_a_failing_stdout_reports_once_and_retries_the_same_content`]
+/// — the test empties the file to let writes land, and fills it again to fail them.
+///
+/// 1. The startup write fails: report one. An order marker then settles every late
+///    rebuild of the startup text, which would otherwise land once there is room.
+/// 2. The test makes room; an edit is written and is a rebuild.
+/// 3. The test fills the file; a new edit fails: report two.
+/// 4. A further edit fails again: no third report, and no `Recompiled`. It `@include`s
+///    an empty module, whose warning shows on stderr that it was compiled.
+#[cfg(unix)]
+#[test]
+fn watch_to_stdout_reports_a_new_failure_after_stdout_recovers() {
+    const LIMIT: usize = 64;
+    const FINAL_MARKER_SOURCE: &str = "Final marker {{__final_marker__}}\n";
+    const FINAL_MARKER_LINE: &str = "undefined variable '__final_marker__'";
+    let include_warning = "@include of 'e' produced empty output";
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("empty.mds"), "").unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    // Outside the watched directory, so the output's own writes raise no events there.
+    let stdout_dir = tempfile::tempdir().unwrap();
+    let stdout_path = stdout_dir.path().join("stdout");
+
+    let mut cmd = mds_bin();
+    cmd.args([
+        "watch",
+        src.to_str().unwrap(),
+        "-o",
+        "-",
+        "--debounce",
+        "0",
+        // No idle tick: its first-tick recompile would write on its own schedule.
+        "--poll-interval",
+        "0",
+    ]);
+    let stdout_file = full_file(&stdout_path, LIMIT);
+    // Shares the child's stdout offset: the test empties and refills the file with it.
+    let mut stdout_offset = stdout_file.try_clone().unwrap();
+    cmd.stdout(Stdio::from(stdout_file));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let (mut guard, tap) = spawn_ready(&mut cmd);
+
+    // 1. The startup write failed, and was reported, before readiness.
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: the vector fails every write, so the startup output never landed"
+    );
+    wait_for_tap(&tap, "cannot write to stdout", TIMEOUT);
+    // The startup text was never written, so the content dedup does not hold it back: a
+    // late event for the source would write it once there is room. The marker's compile
+    // writes nothing, and once its line is on the tap every earlier rebuild is done.
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+
+    // 2. Room in the file: stdout recovers.
+    {
+        use std::io::Seek as _;
+        stdout_offset.set_len(0).unwrap();
+        stdout_offset.seek(std::io::SeekFrom::Start(0)).unwrap();
+    }
+    write_atomic(&src, "Hello two\n");
+    let recovered = poll_tap_until(&tap, TIMEOUT, |text| text.contains("Recompiled <stdout>"));
+    assert!(
+        recovered.is_ok(),
+        "precondition: once there is room, a rebuild writes stdout; stderr:\n{}",
+        tap.text()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&stdout_path).unwrap(),
+        "Hello two\n",
+        "precondition: the recovered write reached stdout"
+    );
+
+    // 3. The file is full again: stdout fails again, and that is a new failure.
+    {
+        use std::io::{Seek as _, Write as _};
+        stdout_offset.set_len(0).unwrap();
+        stdout_offset.seek(std::io::SeekFrom::Start(0)).unwrap();
+        stdout_offset.write_all(&[b'#'; LIMIT]).unwrap();
+    }
+    write_atomic(&src, "Hello three\n");
+    wait_for_tap_count(&tap, "cannot write to stdout", 2, TIMEOUT);
+
+    // 4. Its repeat stays silent. The marker orders the tap: every rebuild before it
+    //    finished before the marker's compile.
+    write_atomic(
+        &src,
+        "@import \"./empty.mds\" as e\n@include e\nHello four\n",
+    );
+    wait_for_tap(&tap, include_warning, TIMEOUT);
+    write_atomic(&src, FINAL_MARKER_SOURCE);
+    let seen = wait_for_tap(&tap, FINAL_MARKER_LINE, TIMEOUT);
+    assert_eq!(
+        count_occurrences(&seen, "cannot write to stdout"),
+        2,
+        "one report per failure, however many writes each fails; stderr:\n{seen}"
+    );
+    assert_eq!(
+        count_occurrences(&seen, "Recompiled"),
+        1,
+        "only the write that landed is a rebuild; stderr:\n{seen}"
+    );
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: no write after the refill reached the file"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C after a second stdout failure",
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stdout failures during the session do not change the Ctrl+C exit"
+    );
+}
+
+/// A rebuild whose output file cannot be written, in a live session, is reported and
+/// does not change the Ctrl+C exit: 0 (#157).
+///
+/// Vector: the output path is replaced by a non-empty directory, which no write can
+/// rename a file over — no permissions involved, so it holds under root too.
+#[cfg(unix)]
+#[test]
+fn watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("page.md");
+
+    let (mut guard, tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--debounce",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello one", TIMEOUT),
+        "the startup compile writes the output"
+    );
+
+    std::fs::remove_file(&out).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("keep"), "a directory where the output was\n").unwrap();
+    write_atomic(&src, "Hello two\n");
+    let seen = wait_for_tap(&tap, "mds::io", TIMEOUT);
+    assert!(
+        !seen.contains("Recompiled"),
+        "the failed write is reported, not announced; stderr:\n{seen}"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C after a failed write",
+    );
+    let stderr = tap.finish_text(&mut guard);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a failed rebuild write does not change the Ctrl+C exit; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.ends_with("Stopped watching.\n"),
+        "the session ends as any Ctrl+C does; stderr: {stderr:?}"
+    );
+}
+
+/// stderr on a file the child may not grow: every stderr write fails other than by a
+/// closed pipe. That makes a batch run exit at least 2; a live watch session keeps
+/// watching and, at Ctrl+C, exits 0 — output failures during a session never change how
+/// it ends (#157).
+///
+/// Controls: the same stderr lifts `mds check` to exit 2, so the vector really records
+/// an output failure; and the same session with stderr open prints its status lines,
+/// so the failing arm really loses writes.
+#[cfg(unix)]
+#[test]
+fn watch_with_a_failing_stderr_keeps_watching_and_exits_0_at_ctrl_c() {
+    const LIMIT: usize = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let stderr_dir = tempfile::tempdir().unwrap();
+    let args = ["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"];
+
+    // Control 1: a batch run with this stderr exits 2.
+    let check_stderr = stderr_dir.path().join("check-stderr");
+    let mut check = mds_bin();
+    check
+        .args(["check", src.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(full_file(&check_stderr, LIMIT)));
+    limit_file_growth(&mut check, LIMIT as libc::rlim_t);
+    let mut check = ChildGuard(check.spawn().unwrap());
+    let status = wait_bounded(&mut check, SESSION_END_TIMEOUT, "mds check");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "control: a stderr that fails other than by a closed pipe lifts `mds check` to 2"
+    );
+
+    // Control 2: with stderr open the session writes its status lines.
+    let (open, open_tap, open_stdout) =
+        spawn_ready_piped_stdout(mds_bin().args(args).stdout(Stdio::piped()));
+    wait_for_tap(&open_stdout, "Hello one", TIMEOUT);
+    write_atomic(&src, "Hello two\n");
+    wait_for_tap(&open_stdout, "Hello two", TIMEOUT);
+    let seen = wait_for_tap(&open_tap, "Recompiled <stdout>", TIMEOUT);
+    assert!(
+        seen.starts_with("Watching "),
+        "control: the session writes its status lines to stderr; stderr: {seen:?}"
+    );
+    drop(open);
+    std::fs::write(&src, "Hello one\n").unwrap();
+
+    // The failing arm.
+    let stderr_path = stderr_dir.path().join("watch-stderr");
+    let mut cmd = mds_bin();
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(full_file(&stderr_path, LIMIT)));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let (child, stdout_tap) = spawn_watch_ready_stderr_untapped(&mut cmd);
+    let mut guard = ChildGuard(child);
+    let stdout_tap = stdout_tap.expect("stdout is piped");
+    wait_for_tap(&stdout_tap, "Hello one", TIMEOUT);
+    write_atomic(&src, "Hello two\n");
+    wait_for_tap(&stdout_tap, "Hello two", TIMEOUT);
+    assert!(
+        guard.0.try_wait().unwrap().is_none(),
+        "the session keeps watching with a failing stderr"
+    );
+
+    interrupt(&guard);
+    let status = wait_bounded(
+        &mut guard,
+        SESSION_END_TIMEOUT,
+        "Ctrl+C with a failing stderr",
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a failing stderr during the session does not change the Ctrl+C exit"
+    );
+    assert_eq!(
+        std::fs::read(&stderr_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: every stderr write failed"
+    );
+}
+
+/// A session that ends before it goes live keeps the rule of a run that ends on its own
+/// (#157): the startup write finds stdout's reader gone, the session stops, and a stderr
+/// that failed other than by a closed pipe lifts the exit code to 2. Only a live session
+/// leaves its exit code alone
+/// (`watch_with_a_failing_stderr_keeps_watching_and_exits_0_at_ctrl_c`).
+///
+/// Control: with stderr open the same session stops at the same point with exit 0 and
+/// prints its status lines, the stop line last, so the failing arm loses writes.
+#[cfg(unix)]
+#[test]
+fn watch_that_stops_before_it_is_live_exits_by_the_batch_rule() {
+    const LIMIT: usize = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    let args = ["watch", src.to_str().unwrap(), "-o", "-", "--debounce", "0"];
+
+    let (mut open, open_tap) =
+        spawn_unsynchronized(mds_bin().args(args).stdout(Stdio::from(closed_pipe())));
+    let status = wait_bounded(&mut open, SESSION_END_TIMEOUT, "stderr open");
+    let stderr = open_tap.finish_text(&mut open);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "control: with stderr open, a startup write into a gone reader ends the session \
+         with exit 0; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("Watching ") && stderr.ends_with(STOPPED_STDOUT_CLOSED),
+        "control: the session writes its status lines, the stop line last; stderr: {stderr:?}"
+    );
+
+    let stderr_dir = tempfile::tempdir().unwrap();
+    let stderr_path = stderr_dir.path().join("watch-stderr");
+    let mut cmd = mds_bin();
+    cmd.args(args)
+        .stdout(Stdio::from(closed_pipe()))
+        .stderr(Stdio::from(full_file(&stderr_path, LIMIT)));
+    limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+    let mut failing = ChildGuard(cmd.spawn().unwrap());
+    let status = wait_bounded(&mut failing, SESSION_END_TIMEOUT, "stderr failing");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "a session that stops before it is live exits as a batch run does: a stderr that \
+         failed other than by a closed pipe lifts its exit code to 2"
+    );
+    assert_eq!(
+        std::fs::read(&stderr_path).unwrap(),
+        vec![b'#'; LIMIT],
+        "precondition: every stderr write failed"
+    );
+}
+
+// ── One edit, one rebuild: event paths meet the session's keys (#390) ──────────
+//
+// A session keys what it watches by path: the dependencies a compile reports, the
+// `--vars` file, and the paths notify reports events under must name each file in one
+// form, or an edit to it starts no rebuild. Every session below runs with
+// `--poll-interval 0`, so no self-heal tick can stand in for an event the session
+// failed to match, and runs twice: with `src/a.mds` as the entry, and below the
+// directory argument `src`.
+
+/// The two ways a session below reaches `src/a.mds`: as the entry, and below the
+/// directory argument.
+const ENTRY_AND_DIRECTORY: [&[&str]; 2] = [&["watch", "src/a.mds"], &["watch", "src"]];
+
+/// Run `mds watch <args>` in `base` with native events only, where `src/a.mds` reads
+/// `edited`, and check that its output `src/a.md` holds `before` at startup and `after`
+/// once `edited` has been changed to `text`, once. Return the session's stderr whole —
+/// complete up to the order marker then written to `src/a.mds`, so a count over it is
+/// exact.
+#[track_caller]
+fn one_edit(
+    base: &Path,
+    args: &[&str],
+    edited: &Path,
+    text: &str,
+    (before, after): (&str, &str),
+) -> String {
+    let output = base.join("src").join("a.md");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base)
+            .args(args)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    let startup = std::fs::read_to_string(&output).unwrap_or_default();
+    assert!(
+        startup.contains(before),
+        "{args:?}: control: the startup output holds {before:?}; it held {startup:?}"
+    );
+
+    write_atomic(edited, text);
+    wait_for_tap(&tap, "Recompiled ", TIMEOUT);
+    let rebuilt = std::fs::read_to_string(&output).unwrap_or_default();
+    assert!(
+        rebuilt.contains(after) && !rebuilt.contains(before),
+        "{args:?}: the rebuild wrote what the edit made; the output held {rebuilt:?}"
+    );
+
+    write_atomic(&base.join("src").join("a.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    tap.finish_text(&mut child)
+}
+
+/// Assert that `stderr`, a session [`one_edit`] ran, holds exactly one rebuild.
+#[track_caller]
+fn assert_one_rebuild(args: &[&str], stderr: &str) {
+    assert_eq!(
+        count_occurrences(stderr, "Recompiled "),
+        1,
+        "{args:?}: one edit, one rebuild; stderr: {stderr}"
+    );
+}
+
+/// A dependency reached through a symlinked directory is keyed by the path the compile
+/// reports for it — the link's target — and notify reports the edit under the same path:
+/// one edit, one rebuild. The target lies outside the directory argument, so directory
+/// mode watches it as an out-of-root dependency directory; a `.mdsroot` marker above both
+/// keeps the import inside the project.
+///
+/// Unix-only: it creates a directory symlink.
+#[cfg(unix)]
+#[test]
+fn watch_rebuilds_once_when_a_dependency_behind_a_symlinked_directory_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("real-lib")).unwrap();
+        std::fs::write(base.join("real-lib/x.mds"), "X one\n").unwrap();
+        std::os::unix::fs::symlink(base.join("real-lib"), base.join("src/lib-link")).unwrap();
+        std::fs::write(
+            base.join("src/a.mds"),
+            "@import \"./lib-link/x.mds\" as x\n@include x\n",
+        )
+        .unwrap();
+
+        let edited = base.join("real-lib/x.mds");
+        let stderr = one_edit(base, args, &edited, "X two\n", ("X one", "X two"));
+        assert_one_rebuild(args, &stderr);
+    }
+}
+
+/// An imported partial is a dependency like any other: one edit, one rebuild of its
+/// importer — and, below the directory argument, no output of its own.
+#[test]
+fn watch_rebuilds_once_when_an_imported_partial_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/_part.mds"), "P one\n").unwrap();
+        std::fs::write(
+            base.join("src/a.mds"),
+            "@import \"./_part.mds\" as p\n@include p\n",
+        )
+        .unwrap();
+
+        let edited = base.join("src").join("_part.mds");
+        let stderr = one_edit(base, args, &edited, "P two\n", ("P one", "P two"));
+        assert_one_rebuild(args, &stderr);
+        assert!(
+            !base.join("src").join("_part.md").exists(),
+            "{args:?}: a partial has no output of its own"
+        );
+    }
+}
+
+/// The `--vars` file, typed relative to the working directory, is matched by the path
+/// notify reports its edit under: one edit, one rebuild.
+#[test]
+fn watch_rebuilds_once_when_the_vars_file_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/a.mds"), "Hello {{name}}\n").unwrap();
+        std::fs::write(base.join("vars.json"), r#"{"name": "one"}"#).unwrap();
+
+        let args = [args, &["--vars", "vars.json"][..]].concat();
+        let edited = base.join("vars.json");
+        let stderr = one_edit(
+            base,
+            &args,
+            &edited,
+            r#"{"name": "two"}"#,
+            ("Hello one", "Hello two"),
+        );
+        assert_one_rebuild(&args, &stderr);
+    }
+}
+
+/// A dependency outside the directory argument — `../shared/y.mds`, inside the project
+/// a `.mdsroot` marker bounds — is keyed by the path the compile reports for it, and
+/// directory mode watches its directory as an out-of-root dependency directory: one
+/// edit, one rebuild of the importer, and no output for the dependency.
+#[test]
+fn watch_rebuilds_once_when_a_dependency_outside_the_directory_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("shared")).unwrap();
+        std::fs::write(base.join("shared/y.mds"), "Y one\n").unwrap();
+        std::fs::write(
+            base.join("src/a.mds"),
+            "@import \"../shared/y.mds\" as y\n@include y\n",
+        )
+        .unwrap();
+
+        let edited = base.join("shared").join("y.mds");
+        let stderr = one_edit(base, args, &edited, "Y two\n", ("Y one", "Y two"));
+        assert_one_rebuild(args, &stderr);
+        assert!(
+            !base.join("shared").join("y.md").exists(),
+            "{args:?}: a dependency outside the directory has no output"
+        );
+    }
+}
+
+/// A dependency outside the directory argument that no startup compile reported — an
+/// edit adds the `@import` — has its directory watched from the rebuild that first
+/// reports it: an edit to the dependency then rebuilds its importer, with native events
+/// only, so no idle tick can arm the directory later (#257). A second edit to the entry,
+/// after the one that adds the import, is the barrier: the session rebuilds one change
+/// at a time, so once its output is written the rebuild before it has finished.
+#[test]
+fn watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("shared")).unwrap();
+        std::fs::write(base.join("shared/y.mds"), "Y one\n").unwrap();
+        std::fs::write(base.join("src/a.mds"), "A alone\n").unwrap();
+        let (entry, output) = (
+            base.join("src").join("a.mds"),
+            base.join("src").join("a.md"),
+        );
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&output, "A alone", TIMEOUT),
+            "{args:?}: control: the startup writes src/a.md; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&entry, "@import \"../shared/y.mds\" as y\n@include y\n");
+        assert!(
+            wait_for_file_contains(&output, "Y one", TIMEOUT),
+            "{args:?}: control: the edit that adds the import rebuilds; stderr: {}",
+            tap.text()
+        );
+        write_atomic(
+            &entry,
+            "@import \"../shared/y.mds\" as y\n@include y\nBarrier\n",
+        );
+        assert!(
+            wait_for_file_contains(&output, "Barrier", TIMEOUT),
+            "{args:?}: control: the barrier edit rebuilds; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&base.join("shared").join("y.mds"), "Y two\n");
+        assert!(
+            wait_for_file_contains(&output, "Y two", TIMEOUT),
+            "{args:?}: an edit to a dependency a rebuild first imported rebuilds its \
+             importer with native events only; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&entry, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        assert_eq!(
+            count_occurrences(&stderr, "Recompiled "),
+            3,
+            "{args:?}: three edits that change the output, three rebuilds; stderr: {stderr}"
+        );
+    }
+}
+
+/// A dependency outside the watched directory that a rebuild first imports has its
+/// directory watched even when that rebuild's output is refused (#257): the compile
+/// succeeded, so what it read is watched at once, and an edit to the dependency rebuilds
+/// its importer — refused and reported again — with native events only. Directory mode:
+/// an MDS module at the source's output (#425). File mode: `-o` names the entry, whose
+/// startup compile fails, so every rebuild that compiles is refused (#425); its refusal
+/// used to come before the rebuild watched what the compile read. A second refused edit
+/// to the entry is the barrier, as in
+/// [`watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports`]: directory mode
+/// watches the new directory once the rebuild has reported, and on macOS watching a
+/// directory restarts the event stream, which misses an edit made in that instant — so
+/// the barrier is saved again, at most three times, until a save of it is refused. A
+/// refused rebuild is reported for every event it runs on, and one save can make several,
+/// so `--debounce 100` gathers each save's events into one rebuild: once a save's refusal
+/// is on stderr, nothing of it is left to rebuild after the next edit.
+#[test]
+fn watch_arms_the_directory_of_a_dependency_a_refused_rebuild_imports() {
+    let import = "@import \"../shared/y.mds\" as y\n@include y\n";
+    let module_refusal = squash(&format!(
+        "cannot write {}: refusing to replace an MDS module",
+        Path::new("src").join("a.md").display()
+    ));
+    // (mode, working directory, arguments, the entry at startup, what startup reports,
+    // the refusal)
+    let sessions = [
+        (
+            "directory mode",
+            ".",
+            &["watch", "src"][..],
+            "A alone\n",
+            "refusing to replace an MDS module",
+            module_refusal,
+        ),
+        (
+            "file mode",
+            "src",
+            &["watch", "a.mds", "-o", "a.mds"][..],
+            "Hello {{name\n",
+            "mds::syntax",
+            entry_overwrite_refusal("a.mds"),
+        ),
+    ];
+    for (mode, cwd, args, startup, reported, refusal) in sessions {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        let (src, shared) = (base.join("src"), base.join("shared"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("y.mds"), "Y one\n").unwrap();
+        let entry = src.join("a.mds");
+        std::fs::write(&entry, startup).unwrap();
+        // Directory mode's output; file mode writes to `-o a.mds`, never here.
+        std::fs::write(src.join("a.md"), MODULE).unwrap();
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.join(cwd))
+                .args(args)
+                .args(["--debounce", "100", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        let refused = |stderr: &str| count_occurrences(&squash(stderr), &refusal);
+        let refused_after = |n: usize, what: &str| {
+            let seen = poll_tap_until(&tap, TIMEOUT, |seen| refused(seen) > n);
+            assert!(
+                seen.is_ok(),
+                "{mode}: {what} is refused; stderr: {}",
+                tap.text()
+            );
+            refused(&tap.text())
+        };
+        // Control: the startup writes nothing — directory mode's write is refused, file
+        // mode's compile fails.
+        let seen = refused(&wait_for_tap(&tap, reported, TIMEOUT));
+
+        write_atomic(&entry, import);
+        let seen = refused_after(seen, "the edit that adds the import");
+        let mut barrier = None;
+        for attempt in 1..=3 {
+            let text = format!("{import}Barrier {attempt}\n");
+            write_atomic(&entry, &text);
+            if poll_tap_until(&tap, TIMEOUT, |now| refused(now) > seen).is_ok() {
+                barrier = Some(text);
+                break;
+            }
+        }
+        let barrier = barrier.unwrap_or_else(|| {
+            panic!(
+                "{mode}: no save of the barrier edit is refused; stderr: {}",
+                tap.text()
+            )
+        });
+        let seen = refused(&tap.text());
+
+        write_atomic(&shared.join("y.mds"), "Y two\n");
+        refused_after(
+            seen,
+            "with native events only, an edit to the dependency a refused rebuild imported",
+        );
+        assert_eq!(
+            text_of(&src.join("a.md")).as_deref(),
+            Some(MODULE),
+            "{mode}: the module is kept; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&entry),
+            Some(barrier),
+            "{mode}: the entry is kept; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{mode}: watch keeps running after refused rebuilds; stderr: {}",
+            tap.text()
+        );
+        drop(child);
+    }
+}
+
+/// A dependency directory outside the directory argument whose watch failed at startup is
+/// not taken for armed: once it can be watched, the next rebuild arms it, and an edit to
+/// the dependency then rebuilds its importer, with native events only (#257). The
+/// directory is left searchable but not readable while the session starts: the compile
+/// still reaches the file in it, and inotify refuses to watch it. Barrier as in
+/// [`watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports`].
+///
+/// Linux only: FSEvents and Windows watch a directory the user cannot read, so no watch
+/// fails there. Skipped as root, whom no permission refuses.
+#[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "only inotify refuses to watch a directory the user cannot read"
+)]
+#[test]
+fn watch_retries_a_dependency_directory_whose_startup_watch_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root, whom no directory permission refuses");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path();
+    std::fs::write(base.join(".mdsroot"), "").unwrap();
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    let shared = base.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("y.mds"), "Y one\n").unwrap();
+    let import = "@import \"../shared/y.mds\" as y\n@include y\n";
+    let (entry, output) = (
+        base.join("src").join("a.mds"),
+        base.join("src").join("a.md"),
+    );
+    std::fs::write(&entry, import).unwrap();
+    // Outside the directory argument, the directory is named by the path the compile
+    // reports for it: its canonical one.
+    let refused = format!(
+        "warning: failed to watch external dep dir {}: ",
+        shared.canonicalize().unwrap().display()
+    );
+
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o100)).unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base)
+            .args(["watch", "src", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Control: the startup could not watch the directory.
+    wait_for_tap(&tap, &refused, TIMEOUT);
+    assert!(
+        wait_for_file_contains(&output, "Y one", TIMEOUT),
+        "control: the startup compile read the dependency; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&entry, format!("{import}Barrier\n"));
+    assert!(
+        wait_for_file_contains(&output, "Barrier", TIMEOUT),
+        "control: the barrier edit rebuilds; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&shared.join("y.mds"), "Y two\n");
+    assert!(
+        wait_for_file_contains(&output, "Y two", TIMEOUT),
+        "an edit to a dependency whose directory could not be watched at startup, and now \
+         can, rebuilds its importer with native events only; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&entry, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        count_occurrences(&stderr, &refused),
+        1,
+        "the startup's refusal only — the retry arms the directory; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, "Recompiled "),
+        2,
+        "two edits that change the output, two rebuilds; stderr: {stderr}"
+    );
+}
+
+// ── The out-dir during a session: deleted, replaced, retargeted (#160) ─────────
+
+/// Every way a session writes below an out-dir — file and directory mode, each with
+/// `--out-dir out` and with `mds.json`'s `build.output_dir` naming `out` (the flag says
+/// to write that `mds.json`) — so that its outputs land in `out/` below the working
+/// directory.
+const OUT_DIR_SESSIONS: [(&[&str], bool); 4] = [
+    (&["watch", "src/a.mds", "--out-dir", "out"], false),
+    (&["watch", "src", "--out-dir", "out"], false),
+    (&["watch", "src/a.mds"], true),
+    (&["watch", "src"], true),
+];
+
+/// A working directory for an out-dir session: `src/a.mds` and `src/b.mds`, and an
+/// `mds.json` naming `out` as `build.output_dir` when `config` says so.
+fn out_dir_session_base(config: bool) -> tempfile::TempDir {
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "A one\n").unwrap();
+    std::fs::write(src.join("b.mds"), "B one\n").unwrap();
+    if config {
+        std::fs::write(
+            base.path().join("mds.json"),
+            r#"{"build":{"output_dir":"out"}}"#,
+        )
+        .unwrap();
+    }
+    base
+}
+
+/// The names in `dir`, sorted. Unix-only, as the symlink tests that call it are.
+#[cfg(unix)]
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The refusal of a write below an out-dir that now leads elsewhere, naming the output
+/// `shown` as its status line does, squashed for comparison. Unix-only, as the symlink
+/// tests that call it are.
+#[cfg(unix)]
+fn out_dir_moved_refusal(shown: &Path) -> String {
+    squash(&format!(
+        "mds::io × cannot write {}: the output directory now resolves to a different \
+         directory; restart mds watch to follow it",
+        shown.display()
+    ))
+}
+
+/// How many times `stderr`, a session of [`OUT_DIR_SESSIONS`], says it rebuilt the
+/// output `name` below `out/` — named below the directory `mds.json` was reached by
+/// (`src/..`) when `config` says the session takes its out-dir from there.
+fn recompiled_below_out(stderr: &str, config: bool, name: &str) -> usize {
+    let out = if config {
+        Path::new("src").join("..").join("out")
+    } else {
+        Path::new("out").to_path_buf()
+    };
+    count_occurrences(
+        &squash(stderr),
+        &squash(&format!("Recompiled {} (", out.join(name).display())),
+    )
+}
+
+/// Wait until the session has rebuilt every event queued so far: `source` is given a
+/// compile that fails naming `__<name>__`, and the wait ends once that diagnostic is on
+/// `tap`. A late or repeated event for an earlier save — which, rebuilt after the out-dir
+/// is deleted, would write into the recreated one and add a rebuild to the count — is
+/// handled by then. The failed compile writes nothing. Each barrier takes a name of its
+/// own, since one save can be reported more than once.
+fn settle_queued_events(tap: &StderrTap, source: &Path, name: &str) {
+    write_atomic(source, format!("Barrier {{{{__{name}__}}}}\n"));
+    wait_for_tap(tap, &format!("undefined variable '__{name}__'"), TIMEOUT);
+}
+
+/// An out-dir deleted while `mds watch` runs is recreated by the next write below it,
+/// and the outputs the session wrote there are written again: a save that leaves an
+/// output unchanged rewrites it into the recreated directory rather than skipping it as
+/// written already — in directory mode another source's output, in file mode the
+/// entry's after a second deletion.
+#[test]
+fn watch_recreates_a_deleted_out_dir_and_writes_its_outputs_again() {
+    for (args, config) in OUT_DIR_SESSIONS {
+        let base = out_dir_session_base(config);
+        let base = base.path();
+        let (src, out) = (base.join("src"), base.join("out"));
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+            "{args:?}: control: the startup writes out/a.md; stderr: {}",
+            tap.text()
+        );
+
+        settle_queued_events(&tap, &src.join("a.mds"), "first_barrier");
+        std::fs::remove_dir_all(&out).unwrap();
+        write_atomic(&src.join("a.mds"), "A two\n");
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A two", TIMEOUT),
+            "{args:?}: an edit after the out-dir was deleted recreates it and writes \
+             there; stderr: {}",
+            tap.text()
+        );
+
+        // What the session wrote into the deleted directory is gone with it: a save that
+        // compiles to the bytes last written writes them again (a barrier's failed
+        // compile writes nothing, so they are still the ones last written).
+        let (saved, text, output) = if args[1] == "src" {
+            (src.join("b.mds"), "B one\n", out.join("b.md"))
+        } else {
+            settle_queued_events(&tap, &src.join("a.mds"), "second_barrier");
+            std::fs::remove_dir_all(&out).unwrap();
+            (src.join("a.mds"), "A two\n", out.join("a.md"))
+        };
+        write_atomic(&saved, text);
+        assert!(
+            wait_for_file_contains(&output, text.trim_end(), TIMEOUT),
+            "{args:?}: a save of unchanged bytes writes {} into the recreated out-dir; \
+             stderr: {}",
+            output.display(),
+            tap.text()
+        );
+
+        write_atomic(&src.join("a.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        let written = |name| recompiled_below_out(&stderr, config, name);
+        let expected = if args[1] == "src" { [1, 1] } else { [2, 0] };
+        assert_eq!(
+            [written("a.md"), written("b.md")],
+            expected,
+            "{args:?}: each output was written once into each directory it was missing \
+             from; stderr: {stderr}"
+        );
+    }
+}
+
+/// A new directory made where the out-dir was — the old one moved aside — while `mds
+/// watch` runs is the out-dir from then on: the next rebuild writes into it, and the
+/// directory moved aside keeps the output it held. On unix a save that leaves the output
+/// unchanged writes it into the new directory too; Windows tells one directory from
+/// another at the same path by its creation time alone, which file-system tunnelling
+/// may carry over to a directory made under the same name moments later.
+#[test]
+fn watch_writes_into_a_new_directory_made_in_place_of_the_out_dir() {
+    for (args, config) in OUT_DIR_SESSIONS {
+        let base = out_dir_session_base(config);
+        let base = base.path();
+        let (src, out, moved) = (base.join("src"), base.join("out"), base.join("out.old"));
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+            "{args:?}: control: the startup writes out/a.md; stderr: {}",
+            tap.text()
+        );
+
+        settle_queued_events(&tap, &src.join("a.mds"), "first_barrier");
+        std::fs::rename(&out, &moved).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        let mut rebuilds = 0;
+        if cfg!(unix) {
+            write_atomic(&src.join("a.mds"), "A one\n");
+            assert!(
+                wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+                "{args:?}: a save of unchanged bytes writes out/a.md into the new \
+                 directory; stderr: {}",
+                tap.text()
+            );
+            rebuilds += 1;
+        }
+        write_atomic(&src.join("a.mds"), "A two\n");
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A two", TIMEOUT),
+            "{args:?}: an edit writes out/a.md into the new directory; stderr: {}",
+            tap.text()
+        );
+        rebuilds += 1;
+        assert_eq!(
+            std::fs::read_to_string(moved.join("a.md")).unwrap(),
+            "A one\n",
+            "{args:?}: the directory moved aside keeps its output"
+        );
+
+        write_atomic(&src.join("a.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        assert_eq!(
+            recompiled_below_out(&stderr, config, "a.md"),
+            rebuilds,
+            "{args:?}: each rebuild of a.mds wrote out/a.md once; stderr: {stderr}"
+        );
+    }
+}
+
+/// An out-dir the user named through a symlink that is retargeted while `mds watch`
+/// runs is not followed: the next write below it is refused (`mds::io`), naming the
+/// output as its status line does and saying to restart, nothing is written to the
+/// link's new target or to the directory the session started with, and watching goes
+/// on. Control: once the link leads back to that directory, an edit is written there.
+///
+/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
+    use std::os::unix::fs::symlink;
+
+    for args in [
+        &["watch", "src/x.mds", "--out-dir", "lnk"][..],
+        &["watch", "src", "--out-dir", "lnk"],
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        for name in ["src", "a", "b"] {
+            std::fs::create_dir(base.join(name)).unwrap();
+        }
+        let source = base.join("src").join("x.mds");
+        std::fs::write(&source, "X one\n").unwrap();
+        let (lnk, a_out, b) = (
+            base.join("lnk"),
+            base.join("a").join("x.md"),
+            base.join("b"),
+        );
+        symlink("a", &lnk).unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&a_out, "X one", TIMEOUT),
+            "{args:?}: control: the startup writes through the link; stderr: {}",
+            tap.text()
+        );
+
+        std::fs::remove_file(&lnk).unwrap();
+        symlink("b", &lnk).unwrap();
+        write_atomic(&source, "X two\n");
+        let refusal = out_dir_moved_refusal(&Path::new("lnk").join("x.md"));
+        let refused = poll_tap_until(&tap, TIMEOUT, |text| squash(text).contains(&refusal));
+        assert!(
+            refused.is_ok(),
+            "{args:?}: the write is refused, naming the output as typed; stderr: {refused:?}"
+        );
+        assert_eq!(
+            names_in(&b),
+            Vec::<String>::new(),
+            "{args:?}: nothing is written to the link's new target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a_out).unwrap(),
+            "X one\n",
+            "{args:?}: nor to the directory the session started with"
+        );
+
+        std::fs::remove_file(&lnk).unwrap();
+        symlink("a", &lnk).unwrap();
+        write_atomic(&source, "X three\n");
+        assert!(
+            wait_for_file_contains(&a_out, "X three", TIMEOUT),
+            "{args:?}: control: through the link led back, the session writes again; \
+             stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            names_in(&b),
+            Vec::<String>::new(),
+            "{args:?}: b stays empty"
+        );
+        drop(child);
+    }
+}
+
+/// An out-dir replaced by a symlink while `mds watch` runs is refused, and nothing lands
+/// in the directory the link leads to: `--out-dir`, the path the user typed, now leads
+/// there and is refused as a retargeted one is; `build.output_dir`'s own directories lie
+/// below the directory `mds.json` is in, the anchor, so the link is refused as any
+/// symlink below an anchor is, named below the directory `mds.json` was reached by.
+/// Control: a real directory made back in its place is written into.
+///
+/// Unix-only: it makes a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    for (args, config) in OUT_DIR_SESSIONS {
+        let base = out_dir_session_base(config);
+        let base = base.path();
+        let (source, out, victim) = (
+            base.join("src").join("a.mds"),
+            base.join("out"),
+            base.join("victim"),
+        );
+        std::fs::create_dir(&victim).unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+            "{args:?}: control: the startup writes out/a.md; stderr: {}",
+            tap.text()
+        );
+
+        std::fs::remove_dir_all(&out).unwrap();
+        symlink("victim", &out).unwrap();
+        write_atomic(&source, "A two\n");
+        let refusal = if config {
+            squash(&format!(
+                "mds::io × cannot write {}: refusing to follow a symlink",
+                Path::new("src").join("..").join("out").display()
+            ))
+        } else {
+            out_dir_moved_refusal(&Path::new("out").join("a.md"))
+        };
+        let refused = poll_tap_until(&tap, TIMEOUT, |text| squash(text).contains(&refusal));
+        assert!(
+            refused.is_ok(),
+            "{args:?}: the write is refused, naming the path as the user knows it; \
+             stderr: {refused:?}"
+        );
+        assert_eq!(
+            names_in(&victim),
+            Vec::<String>::new(),
+            "{args:?}: nothing is written into the directory the link leads to"
+        );
+
+        std::fs::remove_file(&out).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        write_atomic(&source, "A three\n");
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A three", TIMEOUT),
+            "{args:?}: control: a real directory back in place is written into; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            names_in(&victim),
+            Vec::<String>::new(),
+            "{args:?}: victim stays empty"
+        );
+        drop(child);
+    }
+}
+
+// ── A session removes only an output it wrote and that is unchanged (#160) ──────
+
+/// A template that compiles to messages, so its output is `.json`.
+const MESSAGES_KIND: &str = "@message user:\nWhat is 3+3?\n@end\n";
+
+/// What a hand-written file beside a source holds — never anything mds writes.
+const HAND_WRITTEN: &str = "hand-written, not mds output\n";
+
+/// What the user writes over an output the session wrote.
+const USER_EDIT: &str = "the user's own edit\n";
+
+/// The two batches a deleted source's outputs are removed in — one whose only changes
+/// are deletions, and one that also edits the `--vars` file and so recompiles every
+/// source — each with the arguments that make it and whether `vars.json` is edited.
+const DELETION_BATCHES: [(&str, &[&str], bool); 2] = [
+    ("a deletion alone", &["--debounce", "0"], false),
+    (
+        "a deletion with a --vars edit",
+        &["--vars", "vars.json", "--debounce", "500"],
+        true,
+    ),
+];
+
+/// The lines of `stderr` that start with `prefix`, sorted.
+fn lines_starting(stderr: &str, prefix: &str) -> Vec<String> {
+    let mut lines: Vec<String> = stderr
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `name` below the directory `dir` as a status line names it, with the platform's
+/// separator.
+fn below(dir: &str, name: &str) -> String {
+    Path::new(dir).join(name).display().to_string()
+}
+
+/// The text of `path`, or `None` when it cannot be read.
+fn text_of(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// A watched directory `notes/` below a fresh base directory holding `files`, beside a
+/// `vars.json` for the batches that edit it.
+fn notes_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    for (name, text) in files {
+        std::fs::write(notes.join(name), text).unwrap();
+    }
+    std::fs::write(base.path().join("vars.json"), r#"{"name": "one"}"#).unwrap();
+    base
+}
+
+/// Deleting sources in a watched directory removes only the outputs the session wrote
+/// (#160). A hand-written `todo.json` beside the Markdown source `todo.mds`, a
+/// hand-written `msg.md` beside the messages source `msg.mds`, and a hand-written
+/// `_p.md` beside the partial `_p.mds`, which has no output, all survive — each sibling
+/// with one notice, the partial's with none — while `todo.md` and `msg.json`, which the
+/// session wrote, are removed with `Removed … (source deleted)`: in a batch of deletions
+/// alone and in one that also edits the `--vars` file. Every one of them was deleted.
+#[test]
+fn watch_keeps_the_hand_written_siblings_of_a_deleted_source() {
+    for (label, extra, edit_vars) in DELETION_BATCHES {
+        let base = notes_with(&[
+            ("todo.mds", "Buy milk\n"),
+            ("todo.json", HAND_WRITTEN),
+            ("msg.mds", MESSAGES_KIND),
+            ("msg.md", HAND_WRITTEN),
+            ("_p.mds", "Partial\n"),
+            ("_p.md", HAND_WRITTEN),
+        ]);
+        let notes = base.path().join("notes");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path())
+                .args(["watch", "notes", "--poll-interval", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&notes.join("todo.md"), "Buy milk", TIMEOUT)
+                && wait_for_file_contains(&notes.join("msg.json"), "What is 3+3?", TIMEOUT),
+            "{label}: control: the startup writes todo.md and msg.json; stderr: {}",
+            tap.text()
+        );
+
+        // `todo.mds` last: a batch handles its deletions in name order, so once
+        // `todo.md` is gone every deletion before it has been handled too.
+        for name in ["_p.mds", "msg.mds", "todo.mds"] {
+            std::fs::remove_file(notes.join(name)).unwrap();
+        }
+        if edit_vars {
+            write_atomic(&base.path().join("vars.json"), r#"{"name": "two"}"#);
+        }
+        assert!(
+            wait_for_file_gone(&notes.join("msg.json"), TIMEOUT)
+                && wait_for_file_gone(&notes.join("todo.md"), TIMEOUT),
+            "{label}: control: the outputs the session wrote are removed; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        for name in ["todo.json", "msg.md", "_p.md"] {
+            assert_eq!(
+                text_of(&notes.join(name)).as_deref(),
+                Some(HAND_WRITTEN),
+                "{label}: the hand-written {name} survives; stderr: {stderr}"
+            );
+        }
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [
+                format!(
+                    "Kept {}: not written by this session",
+                    below("notes", "msg.md")
+                ),
+                format!(
+                    "Kept {}: not written by this session",
+                    below("notes", "todo.json")
+                ),
+            ],
+            "{label}: one notice for each hand-written sibling, none for the partial's; \
+             stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            [
+                format!("Removed {} (source deleted)", below("notes", "msg.json")),
+                format!("Removed {} (source deleted)", below("notes", "todo.md")),
+            ],
+            "{label}: stderr: {stderr}"
+        );
+    }
+}
+
+/// An output the session wrote is removed with its deleted source only while it holds
+/// exactly what the session wrote there (#160): `edited.md`, which the user edited
+/// since, is kept with a notice that says so, while `same.md`, left as it was written,
+/// is removed — in both kinds of batch. The edited one was deleted.
+#[test]
+fn watch_keeps_an_output_edited_since_the_session_wrote_it() {
+    for (label, extra, edit_vars) in DELETION_BATCHES {
+        let base = notes_with(&[("edited.mds", "Edited\n"), ("same.mds", "Same\n")]);
+        let notes = base.path().join("notes");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path())
+                .args(["watch", "notes", "--poll-interval", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&notes.join("edited.md"), "Edited", TIMEOUT)
+                && wait_for_file_contains(&notes.join("same.md"), "Same", TIMEOUT),
+            "{label}: control: the startup writes both outputs; stderr: {}",
+            tap.text()
+        );
+        std::fs::write(notes.join("edited.md"), USER_EDIT).unwrap();
+
+        // `same.mds` last, as above: once `same.md` is gone both are handled.
+        for name in ["edited.mds", "same.mds"] {
+            std::fs::remove_file(notes.join(name)).unwrap();
+        }
+        if edit_vars {
+            write_atomic(&base.path().join("vars.json"), r#"{"name": "two"}"#);
+        }
+        assert!(
+            wait_for_file_gone(&notes.join("same.md"), TIMEOUT),
+            "{label}: control: the output left as written is removed; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            text_of(&notes.join("edited.md")).as_deref(),
+            Some(USER_EDIT),
+            "{label}: the output the user edited survives; stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [format!(
+                "Kept {}: changed since it was written",
+                below("notes", "edited.md")
+            )],
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            [format!(
+                "Removed {} (source deleted)",
+                below("notes", "same.md")
+            )],
+            "{label}: stderr: {stderr}"
+        );
+    }
+}
+
+/// A deleted source's outputs are found by the path the session wrote them to, never by
+/// a stem (#160). Deleting `a.b.mds`, written to `out/a.b.md`, removes that file and
+/// leaves `out/a.md`, written for `a.mds`: the stem probe took `.b` for an extension and
+/// removed `out/a.md` in its place. A deleted dependency outside the watched directory,
+/// which has no output of its own, removes nothing: the probe flattened it to `out/x.md`,
+/// the output of the source `x.mds` inside the directory, and removed that.
+#[test]
+fn watch_removes_the_output_a_deleted_source_was_written_to() {
+    let base = tempfile::tempdir().unwrap();
+    let (src, shared, out) = (
+        base.path().join("src"),
+        base.path().join("shared"),
+        base.path().join("out"),
+    );
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // A `.git` marker puts the project root at the base, so `src` may import `shared`.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+    std::fs::write(src.join("a.b.mds"), "A dot B\n").unwrap();
+    std::fs::write(src.join("x.mds"), "X\n").unwrap();
+    std::fs::write(
+        shared.join("x.mds"),
+        "@define greet():\nShared\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("importer.mds"),
+        "@import \"../shared/x.mds\" as x\n{{x.greet()}}\n",
+    )
+    .unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "src", "--out-dir", "out"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    for (name, text) in [
+        ("a.md", "A"),
+        ("a.b.md", "A dot B"),
+        ("x.md", "X"),
+        ("importer.md", "Shared"),
+    ] {
+        assert!(
+            wait_for_file_contains(&out.join(name), text, TIMEOUT),
+            "control: the startup writes out/{name}; stderr: {}",
+            tap.text()
+        );
+    }
+
+    std::fs::remove_file(src.join("a.b.mds")).unwrap();
+    std::fs::remove_file(shared.join("x.mds")).unwrap();
+    // The importer's compile reports the missing import before the batch handles its
+    // deletions; the marker's save comes after it, in a batch of its own.
+    let broken = poll_tap_until(&tap, TIMEOUT, |text| {
+        text.contains("file not found") || text.contains("No such file")
+    });
+    assert!(
+        broken.is_ok(),
+        "control: the importer recompiles; stderr: {broken:?}"
+    );
+    write_atomic(&src.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&out.join("a.md")).as_deref(),
+        Some("A\n"),
+        "out/a.md, written for a.mds, survives the deletion of a.b.mds; stderr: {stderr}"
+    );
+    assert_eq!(
+        text_of(&out.join("x.md")).as_deref(),
+        Some("X\n"),
+        "out/x.md, written for src/x.mds, survives the deletion of shared/x.mds; \
+         stderr: {stderr}"
+    );
+    assert!(
+        !out.join("a.b.md").exists(),
+        "out/a.b.md, written for a.b.mds, is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Removed "),
+        [format!(
+            "Removed {} (source deleted)",
+            below("out", "a.b.md")
+        )],
+        "stderr: {stderr}"
+    );
+}
+
+/// A source in a watched directory that now compiles to the other kind has the output
+/// of the old kind removed only when the session wrote it and it is unchanged (#160):
+/// `a.b.mds`, edited into messages, writes `out/a.b.json` and removes `out/a.b.md` —
+/// never `out/a.md`, written for `a.mds`, which a stem probe found in its place — and
+/// `c.mds` writes `out/c.json` and keeps `out/c.md`, which the user edited, with a
+/// notice. Both were deleted.
+#[test]
+fn watch_removes_the_old_output_of_a_changed_kind_only_when_it_wrote_it() {
+    let base = tempfile::tempdir().unwrap();
+    let (src, out) = (base.path().join("src"), base.path().join("out"));
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+    std::fs::write(src.join("a.b.mds"), "A dot B\n").unwrap();
+    std::fs::write(src.join("c.mds"), "C\n").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "src", "--out-dir", "out"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    for (name, text) in [("a.md", "A"), ("a.b.md", "A dot B"), ("c.md", "C")] {
+        assert!(
+            wait_for_file_contains(&out.join(name), text, TIMEOUT),
+            "control: the startup writes out/{name}; stderr: {}",
+            tap.text()
+        );
+    }
+    std::fs::write(out.join("c.md"), USER_EDIT).unwrap();
+
+    for name in ["a.b", "c"] {
+        write_atomic(&src.join(format!("{name}.mds")), MESSAGES_KIND);
+        assert!(
+            wait_for_file_contains(&out.join(format!("{name}.json")), "What is 3+3?", TIMEOUT),
+            "control: {name}.mds edited into messages writes out/{name}.json; stderr: {}",
+            tap.text()
+        );
+    }
+    write_atomic(&src.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&out.join("a.md")).as_deref(),
+        Some("A\n"),
+        "out/a.md, written for a.mds, survives a.b.mds's change of kind; stderr: {stderr}"
+    );
+    assert!(
+        !out.join("a.b.md").exists(),
+        "out/a.b.md, written and left as it was, is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        text_of(&out.join("c.md")).as_deref(),
+        Some(USER_EDIT),
+        "out/c.md, which the user edited, survives; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [format!(
+            "Kept {}: changed since it was written",
+            below("out", "c.md")
+        )],
+        "stderr: {stderr}"
+    );
+}
+
+/// A watched file that now compiles to the other kind is written to that kind's output,
+/// as its startup compile would be (#160) — `chat.md`, then `chat.json`, then `chat.md`
+/// again — and the output of the old kind is removed when the session wrote it and it is
+/// unchanged, or kept with a notice once the user edited it. The kind's output used to be
+/// fixed for the session, so the JSON went into `chat.md`. Control: an explicit `-o` is
+/// the output whatever the kind, so it never changes and nothing is removed.
+#[test]
+fn watch_writes_a_file_whose_kind_changed_to_that_kinds_output() {
+    let session = |args: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat.mds"), "Hello\n").unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "chat.mds"])
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        (dir, child, tap)
+    };
+
+    // Markdown, then messages, then Markdown again, each output left as written.
+    let (dir, mut child, tap) = session(&[]);
+    let (src, md, json) = (
+        dir.path().join("chat.mds"),
+        dir.path().join("chat.md"),
+        dir.path().join("chat.json"),
+    );
+    assert!(
+        wait_for_file_contains(&md, "Hello", TIMEOUT),
+        "control: the startup writes chat.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+        "a template edited into messages writes chat.json; chat.md holds {:?}; stderr: {}",
+        text_of(&md),
+        tap.text()
+    );
+    assert!(
+        wait_for_file_gone(&md, TIMEOUT),
+        "chat.md, written and left as it was, is removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, "Hello again\n");
+    assert!(
+        wait_for_file_contains(&md, "Hello again", TIMEOUT) && wait_for_file_gone(&json, TIMEOUT),
+        "edited back into Markdown, it writes chat.md and removes chat.json; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    let shown = |name: &str| Path::new(".").join(name).display().to_string();
+    let recompiled =
+        |name: &str| lines_starting(&stderr, &format!("Recompiled {} (", shown(name))).len();
+    assert_eq!(
+        (recompiled("chat.json"), recompiled("chat.md")),
+        (1, 1),
+        "each rebuild names the output of its own kind; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        Vec::<String>::new(),
+        "stderr: {stderr}"
+    );
+
+    // An edited `chat.md` is kept.
+    let (dir, mut child, tap) = session(&[]);
+    let (src, md) = (dir.path().join("chat.mds"), dir.path().join("chat.md"));
+    assert!(
+        wait_for_file_contains(&md, "Hello", TIMEOUT),
+        "control: the startup writes chat.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::write(&md, USER_EDIT).unwrap();
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&dir.path().join("chat.json"), "What is 3+3?", TIMEOUT),
+        "a template edited into messages writes chat.json; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some(USER_EDIT),
+        "chat.md, which the user edited, survives; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [format!(
+            "Kept {}: changed since it was written",
+            shown("chat.md")
+        )],
+        "stderr: {stderr}"
+    );
+
+    // Control: `-o out.md` takes the messages too, and nothing else is written or removed.
+    let (dir, mut child, tap) = session(&["-o", "out.md"]);
+    let named = dir.path().join("out.md");
+    assert!(
+        wait_for_file_contains(&named, "Hello", TIMEOUT),
+        "control: the startup writes out.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&dir.path().join("chat.mds"), MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&named, "What is 3+3?", TIMEOUT),
+        "control: -o out.md takes the messages; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&dir.path().join("chat.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    for name in ["chat.json", "chat.md", "out.json"] {
+        assert!(
+            !dir.path().join(name).exists(),
+            "control: -o is never routed by the kind, so {name} is not written; \
+             stderr: {stderr}"
+        );
+    }
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        Vec::<String>::new(),
+        "control: stderr: {stderr}"
+    );
+}
+
+/// `--quiet` suppresses the notice that a file is kept (#160), as it does the `Removed`
+/// line, and the file is kept all the same: a hand-written `todo.json` beside a deleted
+/// `todo.mds`, whose `todo.md` the session wrote and removes, and a `chat.md` the user
+/// edited before the watched file was edited into messages.
+#[test]
+fn watch_quiet_keeps_files_without_a_notice() {
+    let base = notes_with(&[("todo.mds", "Buy milk\n"), ("todo.json", HAND_WRITTEN)]);
+    let notes = base.path().join("notes");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args([
+                "watch",
+                "notes",
+                "-q",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("todo.md"), "Buy milk", TIMEOUT),
+        "control: the startup writes todo.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::remove_file(notes.join("todo.mds")).unwrap();
+    assert!(
+        wait_for_file_gone(&notes.join("todo.md"), TIMEOUT),
+        "control: the output the session wrote is removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        text_of(&notes.join("todo.json")).as_deref(),
+        Some(HAND_WRITTEN),
+        "the hand-written todo.json survives; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Kept ") && !stderr.contains("Removed "),
+        "--quiet prints neither; stderr: {stderr}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (src, md) = (dir.path().join("chat.mds"), dir.path().join("chat.md"));
+    std::fs::write(&src, "Hello\n").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "chat.mds",
+                "-q",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&md, "Hello", TIMEOUT),
+        "control: the startup writes chat.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::write(&md, USER_EDIT).unwrap();
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&dir.path().join("chat.json"), "What is 3+3?", TIMEOUT),
+        "control: a template edited into messages writes chat.json; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some(USER_EDIT),
+        "chat.md, which the user edited, survives; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Kept "),
+        "--quiet prints no notice; stderr: {stderr}"
+    );
+}
+
+/// A source that is unlinked and created again within one batch — an editor that saves
+/// so, a branch checkout or `git stash` replacing it — is an edit, not a deletion
+/// (#160): its output is rewritten, nothing is removed and no notice printed, and the
+/// hand-written sibling beside it is untouched.
+#[test]
+fn watch_treats_a_source_unlinked_and_created_again_as_an_edit() {
+    let base = notes_with(&[("todo.mds", "Buy milk\n"), ("todo.json", HAND_WRITTEN)]);
+    let notes = base.path().join("notes");
+    // A debounce window long enough to take the unlink and the create into one batch.
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args([
+                "watch",
+                "notes",
+                "--debounce",
+                "300",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("todo.md"), "Buy milk", TIMEOUT),
+        "control: the startup writes todo.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::remove_file(notes.join("todo.mds")).unwrap();
+    write_atomic(&notes.join("todo.mds"), "Buy bread\n");
+    assert!(
+        wait_for_file_contains(&notes.join("todo.md"), "Buy bread", TIMEOUT),
+        "control: the source created again is rebuilt; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&notes.join("todo.json")).as_deref(),
+        Some(HAND_WRITTEN),
+        "the hand-written todo.json survives; stderr: {stderr}"
+    );
+    assert_eq!(
+        (
+            lines_starting(&stderr, "Removed "),
+            lines_starting(&stderr, "Kept ")
+        ),
+        (Vec::new(), Vec::new()),
+        "nothing is removed and no notice printed; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(
+            &stderr,
+            &format!("Recompiled {} (", below("notes", "todo.md"))
+        )
+        .len(),
+        1,
+        "control: the edit is one rebuild; stderr: {stderr}"
+    );
+}
+
+// ── A change of kind writes only where nothing is, or over the session's own file (#160) ─
+
+/// A template that compiles to messages other than [`MESSAGES_KIND`]'s.
+const OTHER_MESSAGES: &str = "@message user:\nWhat is 4+4?\n@end\n";
+
+/// `notes/chat.mds` watched as a file and as part of its directory: the mode, the
+/// directory below the base the session runs in, the arguments that watch it, and the
+/// directory a status line names its outputs below.
+const CHAT_SESSIONS: [(&str, &str, &[&str], &str); 2] = [
+    ("file mode", "notes", &["watch", "chat.mds"], "."),
+    ("directory mode", "", &["watch", "notes"], "notes"),
+];
+
+/// A source edited into the other kind mid-session never overwrites a file the session
+/// did not write at that kind's output path (#160): a hand-written `chat.md` beside the
+/// messages source `chat.mds` is kept, with one notice, when the source is edited into
+/// Markdown, and the old output `chat.json` is kept as it was; edited back into messages,
+/// `chat.json` is written again and `chat.md` is still untouched. Both modes. Control:
+/// once `chat.md` is gone, the next save writes it, and `chat.json`, which the session
+/// wrote and left as it was, is removed.
+#[test]
+fn watch_never_writes_over_a_file_it_did_not_write_when_the_kind_changes() {
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", MESSAGES_KIND), ("chat.md", HAND_WRITTEN)]);
+        let notes = base.path().join("notes");
+        let (src, md, json) = (
+            notes.join("chat.mds"),
+            notes.join("chat.md"),
+            notes.join("chat.json"),
+        );
+        let shown_md = below(shown_dir, "chat.md");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+            "{mode}: control: the startup writes chat.json; stderr: {}",
+            tap.text()
+        );
+        let startup_json = text_of(&json);
+
+        write_atomic(&src, "Hello\n");
+        let seen = poll_tap_until(&tap, TIMEOUT, |seen| {
+            seen.contains(&format!("Recompiled {shown_md} ("))
+                || seen.contains(&format!("Kept {shown_md}:"))
+        });
+        assert!(
+            seen.is_ok(),
+            "{mode}: the edit into Markdown reported nothing; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(HAND_WRITTEN),
+            "{mode}: chat.md, which the session did not write, is not overwritten; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&json),
+            startup_json,
+            "{mode}: chat.json, the old kind's output, is kept as it was; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&src, OTHER_MESSAGES);
+        assert!(
+            wait_for_file_contains(&json, "What is 4+4?", TIMEOUT),
+            "{mode}: edited back into messages, it writes chat.json; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(HAND_WRITTEN),
+            "{mode}: chat.md is still untouched; stderr: {}",
+            tap.text()
+        );
+
+        // Control: nothing at chat.md, and the next save writes it.
+        std::fs::remove_file(&md).unwrap();
+        write_atomic(&src, "Hello\n");
+        assert!(
+            wait_for_file_contains(&md, "Hello", TIMEOUT) && wait_for_file_gone(&json, TIMEOUT),
+            "{mode}: control: with chat.md gone, the next save writes it and removes \
+             chat.json; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [format!(
+                "Kept {shown_md}: not written by this session; not overwritten"
+            )],
+            "{mode}: one notice; stderr: {stderr}"
+        );
+        let recompiled = |name: &str| {
+            lines_starting(&stderr, &format!("Recompiled {} (", below(shown_dir, name))).len()
+        };
+        assert_eq!(
+            (recompiled("chat.json"), recompiled("chat.md")),
+            (1, 1),
+            "{mode}: one rebuild of each kind is written; stderr: {stderr}"
+        );
+    }
+}
+
+/// `--quiet` prints no notice for a file a change of kind keeps (#160), and keeps it all
+/// the same: a hand-written `chat.md` beside `chat.mds`, edited into Markdown. Control:
+/// `talk.mds`, edited into Markdown with it, has nothing at `talk.md`, so `talk.md` is
+/// written and the session's `talk.json` removed.
+#[test]
+fn watch_quiet_keeps_a_file_a_change_of_kind_would_overwrite_without_a_notice() {
+    let base = notes_with(&[
+        ("chat.mds", MESSAGES_KIND),
+        ("chat.md", HAND_WRITTEN),
+        ("talk.mds", MESSAGES_KIND),
+    ]);
+    let notes = base.path().join("notes");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args([
+                "watch",
+                "notes",
+                "-q",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    for name in ["chat.json", "talk.json"] {
+        assert!(
+            wait_for_file_contains(&notes.join(name), "What is 3+3?", TIMEOUT),
+            "control: the startup writes {name}; stderr: {}",
+            tap.text()
+        );
+    }
+    let startup_json = text_of(&notes.join("chat.json"));
+    write_atomic(&notes.join("chat.mds"), "Hello\n");
+    write_atomic(&notes.join("talk.mds"), "Hello\n");
+    assert!(
+        wait_for_file_contains(&notes.join("talk.md"), "Hello", TIMEOUT)
+            && wait_for_file_gone(&notes.join("talk.json"), TIMEOUT),
+        "control: talk.md is written and talk.json removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&notes.join("chat.md")).as_deref(),
+        Some(HAND_WRITTEN),
+        "the hand-written chat.md is not overwritten; stderr: {stderr}"
+    );
+    assert_eq!(
+        text_of(&notes.join("chat.json")),
+        startup_json,
+        "chat.json, the old kind's output, is kept as it was; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Kept "),
+        "--quiet prints no notice; stderr: {stderr}"
+    );
+}
+
+/// An empty output the startup wrote is the session's like any other (#160): `chat.mds`
+/// compiles to empty Markdown, so the startup writes an empty `chat.md`; edited into
+/// messages, it writes `chat.json`, and `chat.md`, written and left as it was, is
+/// removed without a notice.
+#[test]
+fn watch_removes_an_empty_startup_output_when_the_kind_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, md, json) = (
+        dir.path().join("chat.mds"),
+        dir.path().join("chat.md"),
+        dir.path().join("chat.json"),
+    );
+    std::fs::write(&src, "").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "chat.mds",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some(""),
+        "control: the startup writes an empty chat.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+        "control: edited into messages, it writes chat.json; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        wait_for_file_gone(&md, TIMEOUT),
+        "the empty chat.md the startup wrote is removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        Vec::<String>::new(),
+        "stderr: {stderr}"
+    );
+}
+
+/// A file a change of kind keeps is told about again once the source has been rebuilt to
+/// anything else in between (#160): `chat.mds`, a messages source beside a hand-written
+/// `chat.md`, is edited into Markdown — one notice — then back to the messages the
+/// session wrote, which writes nothing, and saved broken; edited into the same Markdown
+/// again, the session tells it again. Both modes. Control: each save that keeps it gets
+/// one notice, however many events it reaches the watcher as.
+#[test]
+fn watch_tells_a_kept_file_again_once_its_source_has_changed_in_between() {
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", MESSAGES_KIND), ("chat.md", HAND_WRITTEN)]);
+        let notes = base.path().join("notes");
+        let (src, md, json) = (
+            notes.join("chat.mds"),
+            notes.join("chat.md"),
+            notes.join("chat.json"),
+        );
+        let notice = format!(
+            "Kept {}: not written by this session; not overwritten",
+            below(shown_dir, "chat.md")
+        );
+        let notices = |seen: &str| seen.lines().filter(|line| *line == notice).count();
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+            "{mode}: control: the startup writes chat.json; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&src, "Hello\n");
+        assert!(
+            poll_tap_until(&tap, TIMEOUT, |seen| notices(seen) == 1).is_ok(),
+            "{mode}: control: the first edit into Markdown is told; stderr: {}",
+            tap.text()
+        );
+        // Back to what the session wrote: nothing to write. Then broken: nothing either.
+        write_atomic(&src, MESSAGES_KIND);
+        write_atomic(&src, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+
+        write_atomic(&src, "Hello\n");
+        assert!(
+            poll_tap_until(&tap, TIMEOUT, |seen| notices(seen) == 2).is_ok(),
+            "{mode}: the same edit into Markdown, made again, is told again; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, OTHER_MESSAGES);
+        wait_for_tap(
+            &tap,
+            &format!("Recompiled {} (", below(shown_dir, "chat.json")),
+            TIMEOUT,
+        );
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            notices(&stderr),
+            2,
+            "{mode}: one notice for each save that kept chat.md; stderr: {stderr}"
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(HAND_WRITTEN),
+            "{mode}: chat.md is kept throughout; stderr: {stderr}"
+        );
+    }
+}
+
+// ── The record of an output names the source it was written for, until it goes (#160) ─
+
+/// Beside its sources `a.b.mds` and `a.mds` both name their Markdown output `a.md`, and
+/// the session's record of `a.md` names the source it last wrote it for (#160): deleting
+/// `a.mds` never removes `a.md` once the session wrote it for `a.b.mds`, which is still
+/// there — it is kept, with one notice, as `a.b.mds` wrote it. Control: deleting
+/// `a.b.mds`, the source the session last wrote `a.md` for, removes it.
+#[test]
+fn watch_never_removes_the_output_of_a_source_that_is_still_there() {
+    let base = notes_with(&[("a.mds", "Plain A\n"), ("a.b.mds", "Plain B\n")]);
+    let notes = base.path().join("notes");
+    let (md, shown_md) = (notes.join("a.md"), below("notes", "a.md"));
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "notes", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&md, "Plain", TIMEOUT),
+        "control: the startup writes notes/a.md; stderr: {}",
+        tap.text()
+    );
+    // Whichever source the startup wrote `a.md` for last, the session writes it for
+    // `a.b.mds` now.
+    write_atomic(&notes.join("a.b.mds"), "Second B\n");
+    assert!(
+        wait_for_file_contains(&md, "Second B", TIMEOUT),
+        "control: a.b.mds's edit writes notes/a.md; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_file(notes.join("a.mds")).unwrap();
+    let told = |seen: &str| {
+        seen.lines().any(|line| {
+            line.starts_with(&format!("Kept {shown_md}:"))
+                || line.starts_with(&format!("Removed {shown_md} "))
+        })
+    };
+    assert!(
+        poll_tap_until(&tap, TIMEOUT, told).is_ok(),
+        "the deletion of a.mds reported nothing on notes/a.md; stderr: {}",
+        tap.text()
+    );
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some("Second B\n"),
+        "notes/a.md, written for a.b.mds, survives the deletion of a.mds; stderr: {}",
+        tap.text()
+    );
+
+    // Control: the source the session last wrote it for.
+    std::fs::remove_file(notes.join("a.b.mds")).unwrap();
+    assert!(
+        wait_for_file_gone(&md, TIMEOUT),
+        "control: deleting a.b.mds removes notes/a.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [format!("Kept {shown_md}: not written by this source")],
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Removed "),
+        [format!("Removed {shown_md} (source deleted)")],
+        "one removal, for a.b.mds; stderr: {stderr}"
+    );
+}
+
+/// A change of kind writes over a file the session wrote only when it wrote it for the
+/// same source (#160): beside its sources `a.mds` writes messages to `a.json` and
+/// `a.b.mds` Markdown to `a.md`, so `a.b.mds`, edited into messages, finds at its new
+/// output path the `a.json` the session wrote for `a.mds` — kept, with one notice, as
+/// `a.mds` has it, and `a.md` kept too. Control: once `a.json` is gone, the next save of
+/// `a.b.mds` writes it and removes `a.md`, which the session wrote for `a.b.mds`.
+#[test]
+fn watch_never_replaces_the_output_of_another_source_when_the_kind_changes() {
+    let base = notes_with(&[("a.mds", MESSAGES_KIND), ("a.b.mds", "Plain B\n")]);
+    let notes = base.path().join("notes");
+    let (json, md) = (notes.join("a.json"), notes.join("a.md"));
+    let shown_json = below("notes", "a.json");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "notes", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&json, "What is 3+3?", TIMEOUT)
+            && wait_for_file_contains(&md, "Plain B", TIMEOUT),
+        "control: the startup writes notes/a.json and notes/a.md; stderr: {}",
+        tap.text()
+    );
+    let startup_json = text_of(&json);
+
+    write_atomic(&notes.join("a.b.mds"), OTHER_MESSAGES);
+    let seen = poll_tap_until(&tap, TIMEOUT, |seen| {
+        seen.contains(&format!("Recompiled {shown_json} ("))
+            || seen.contains(&format!("Kept {shown_json}:"))
+    });
+    assert!(
+        seen.is_ok(),
+        "the edit of a.b.mds into messages reported nothing; stderr: {}",
+        tap.text()
+    );
+    assert_eq!(
+        text_of(&json),
+        startup_json,
+        "notes/a.json, written for a.mds, is not overwritten; stderr: {}",
+        tap.text()
+    );
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some("Plain B\n"),
+        "notes/a.md, a.b.mds's old output, is kept as it was; stderr: {}",
+        tap.text()
+    );
+
+    // Control: nothing at a.json, and the next save writes it.
+    std::fs::remove_file(&json).unwrap();
+    write_atomic(&notes.join("a.b.mds"), OTHER_MESSAGES);
+    assert!(
+        wait_for_file_contains(&json, "What is 4+4?", TIMEOUT) && wait_for_file_gone(&md, TIMEOUT),
+        "control: with a.json gone, a.b.mds writes it and removes a.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [format!(
+            "Kept {shown_json}: not written by this source; not overwritten"
+        )],
+        "one notice; stderr: {stderr}"
+    );
+}
+
+/// A file the session wrote and the user then changed is told as changed, never as not
+/// written by the session (#160): `chat.mds` writes `chat.md`, the user edits it, and the
+/// template is edited into messages — `chat.json` written, `chat.md` kept as changed —
+/// then back into the Markdown it was: `chat.md` is kept again, `changed since it was
+/// written; not overwritten`, however equal the new Markdown is to what the session wrote
+/// there. In directory mode, deleting `chat.mds` then keeps it once more as changed, and
+/// removes `chat.json`. Both modes.
+#[test]
+fn watch_names_a_file_it_wrote_then_the_user_changed_as_changed() {
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", "Hello\n")]);
+        let notes = base.path().join("notes");
+        let (src, md, json) = (
+            notes.join("chat.mds"),
+            notes.join("chat.md"),
+            notes.join("chat.json"),
+        );
+        let shown_md = below(shown_dir, "chat.md");
+        let kept = |seen: &str| {
+            seen.lines()
+                .filter(|line| line.starts_with(&format!("Kept {shown_md}:")))
+                .count()
+        };
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&md, "Hello", TIMEOUT),
+            "{mode}: control: the startup writes chat.md; stderr: {}",
+            tap.text()
+        );
+        std::fs::write(&md, USER_EDIT).unwrap();
+        write_atomic(&src, MESSAGES_KIND);
+        assert!(
+            wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+            "{mode}: control: edited into messages, it writes chat.json; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&src, "Hello\n");
+        assert!(
+            poll_tap_until(&tap, TIMEOUT, |seen| {
+                kept(seen) >= 2 || seen.contains(&format!("Recompiled {shown_md} ("))
+            })
+            .is_ok(),
+            "{mode}: the edit back into Markdown reported nothing on chat.md; stderr: {}",
+            tap.text()
+        );
+        let directory_mode = shown_dir == "notes";
+        if directory_mode {
+            std::fs::remove_file(&src).unwrap();
+            assert!(
+                wait_for_file_gone(&json, TIMEOUT),
+                "{mode}: control: deleting chat.mds removes chat.json; stderr: {}",
+                tap.text()
+            );
+        }
+        write_atomic(&src, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(USER_EDIT),
+            "{mode}: chat.md keeps the user's edit; stderr: {stderr}"
+        );
+        let changed = format!("Kept {shown_md}: changed since it was written");
+        let mut expected = vec![changed.clone(), format!("{changed}; not overwritten")];
+        if directory_mode {
+            expected.push(changed);
+        }
+        expected.sort();
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            expected,
+            "{mode}: stderr: {stderr}"
+        );
+    }
+}
+
+/// A file the session wrote, changed by the user and then restored to exactly the bytes
+/// the session wrote, is the session's own again (#160): `chat.md`, kept as changed when
+/// the template is edited into messages, is restored by hand, and the template edited
+/// back into Markdown replaces it and removes `chat.json`. Both modes. Control: the
+/// notice the first change of kind gave while it was changed.
+#[test]
+fn watch_replaces_its_own_file_once_the_user_restores_it_when_the_kind_changes() {
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", "Hello\n")]);
+        let notes = base.path().join("notes");
+        let (src, md, json) = (
+            notes.join("chat.mds"),
+            notes.join("chat.md"),
+            notes.join("chat.json"),
+        );
+        let shown_md = below(shown_dir, "chat.md");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&md, "Hello", TIMEOUT),
+            "{mode}: control: the startup writes chat.md; stderr: {}",
+            tap.text()
+        );
+        let written = std::fs::read(&md).unwrap();
+        std::fs::write(&md, USER_EDIT).unwrap();
+        write_atomic(&src, MESSAGES_KIND);
+        assert!(
+            wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+            "{mode}: control: edited into messages, it writes chat.json; stderr: {}",
+            tap.text()
+        );
+        wait_for_tap(
+            &tap,
+            &format!("Kept {shown_md}: changed since it was written"),
+            TIMEOUT,
+        );
+
+        std::fs::write(&md, &written).unwrap();
+        write_atomic(&src, "Hello again\n");
+        assert!(
+            wait_for_file_contains(&md, "Hello again", TIMEOUT)
+                && wait_for_file_gone(&json, TIMEOUT),
+            "{mode}: chat.md, restored to what the session wrote, is replaced and chat.json \
+             removed; chat.md holds {:?}; stderr: {}",
+            text_of(&md),
+            tap.text()
+        );
+        write_atomic(&src, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [format!("Kept {shown_md}: changed since it was written")],
+            "{mode}: stderr: {stderr}"
+        );
+    }
+}
+
+/// `src/page.mds` watched below `--out-dir out` as a file and as part of its directory:
+/// the mode, and the arguments that watch it.
+#[cfg(unix)]
+const OUT_DIR_PAGE_SESSIONS: [(&str, &[&str]); 2] = [
+    ("file mode", &["watch", "src/page.mds", "--out-dir", "out"]),
+    ("directory mode", &["watch", "src", "--out-dir", "out"]),
+];
+
+/// After a change of kind, the old kind's output in an out-dir made since the session
+/// last wrote there is not the session's, and is told as such (#160): with `out` moved
+/// aside and a new `out` made holding a hand-written `page.md`, `page.mds` edited into
+/// messages writes `out/page.json` and keeps `out/page.md`, with `Kept out/page.md: not
+/// written by this session`. Both modes. Control: in the out-dir the session wrote to,
+/// `out/page.md`, written and left as it was, is removed without a notice.
+///
+/// Unix-only: Windows tells one directory from another at the same path by its creation
+/// time alone, which file-system tunnelling may carry over to a directory made under the
+/// same name moments later.
+#[cfg(unix)]
+#[test]
+fn watch_tells_an_old_kind_output_in_a_remade_out_dir_is_kept() {
+    for (mode, args) in OUT_DIR_PAGE_SESSIONS {
+        for remade in [true, false] {
+            let base = tempfile::tempdir().unwrap();
+            let (src, out) = (base.path().join("src"), base.path().join("out"));
+            std::fs::create_dir(&src).unwrap();
+            std::fs::write(src.join("page.mds"), "Hello\n").unwrap();
+            let (mut child, tap) = spawn_ready(
+                mds_bin()
+                    .current_dir(base.path())
+                    .args(args)
+                    .args(["--debounce", "0", "--poll-interval", "0"])
+                    .stdout(Stdio::null()),
+            );
+            assert!(
+                wait_for_file_contains(&out.join("page.md"), "Hello", TIMEOUT),
+                "{mode}: control: the startup writes out/page.md; stderr: {}",
+                tap.text()
+            );
+            settle_queued_events(&tap, &src.join("page.mds"), "barrier");
+            if remade {
+                std::fs::rename(&out, base.path().join("out.old")).unwrap();
+                std::fs::create_dir(&out).unwrap();
+                std::fs::write(out.join("page.md"), HAND_WRITTEN).unwrap();
+            }
+            write_atomic(&src.join("page.mds"), MESSAGES_KIND);
+            assert!(
+                wait_for_file_contains(&out.join("page.json"), "What is 3+3?", TIMEOUT),
+                "{mode}, remade {remade}: edited into messages, it writes out/page.json; \
+                 stderr: {}",
+                tap.text()
+            );
+            if !remade {
+                assert!(
+                    wait_for_file_gone(&out.join("page.md"), TIMEOUT),
+                    "{mode}: control: out/page.md, written and left as it was, is removed; \
+                     stderr: {}",
+                    tap.text()
+                );
+            }
+            write_atomic(&src.join("page.mds"), ORDER_MARKER_SOURCE);
+            wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+            let stderr = tap.finish_text(&mut child);
+
+            let expected = if remade {
+                assert_eq!(
+                    text_of(&out.join("page.md")).as_deref(),
+                    Some(HAND_WRITTEN),
+                    "{mode}: the hand-written out/page.md is kept; stderr: {stderr}"
+                );
+                vec![format!(
+                    "Kept {}: not written by this session",
+                    below("out", "page.md")
+                )]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                lines_starting(&stderr, "Kept "),
+                expected,
+                "{mode}, remade {remade}: stderr: {stderr}"
+            );
+        }
+    }
+}
+
+/// `--quiet` prints no notice for a file kept as another source's or as changed since the
+/// session wrote it (#160), and keeps it all the same — in directory mode beside the
+/// sources: `a.b.mds` edited into messages keeps `a.json`, written for `a.mds`; deleting
+/// `c.mds` keeps `c.md`, written for `c.b.mds`; and `chat.md`, which the user changed after
+/// the session wrote it, is kept when `chat.mds` is edited into messages and back.
+/// Control: `chat.json` is written, and the deleted `y.mds`'s `y.md` removed.
+#[test]
+fn watch_quiet_keeps_the_outputs_of_other_sources_and_changed_files_without_a_notice() {
+    let base = notes_with(&[
+        ("a.mds", MESSAGES_KIND),
+        ("a.b.mds", "Plain B\n"),
+        ("c.mds", "Plain C\n"),
+        ("c.b.mds", "Plain CB\n"),
+        ("chat.mds", "Hello\n"),
+        ("y.mds", "Plain Y\n"),
+    ]);
+    let notes = base.path().join("notes");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args([
+                "watch",
+                "notes",
+                "-q",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    for (name, text) in [
+        ("a.json", "What is 3+3?"),
+        ("a.md", "Plain B"),
+        ("c.md", "Plain C"),
+        ("chat.md", "Hello"),
+        ("y.md", "Plain Y"),
+    ] {
+        assert!(
+            wait_for_file_contains(&notes.join(name), text, TIMEOUT),
+            "control: the startup writes {name}; stderr: {}",
+            tap.text()
+        );
+    }
+    let startup_json = text_of(&notes.join("a.json"));
+    write_atomic(&notes.join("c.b.mds"), "Second CB\n");
+    assert!(
+        wait_for_file_contains(&notes.join("c.md"), "Second CB", TIMEOUT),
+        "control: c.b.mds's edit writes c.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::write(notes.join("chat.md"), USER_EDIT).unwrap();
+    write_atomic(&notes.join("chat.mds"), MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&notes.join("chat.json"), "What is 3+3?", TIMEOUT),
+        "control: chat.mds edited into messages writes chat.json; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&notes.join("chat.mds"), "Hello\n");
+    write_atomic(&notes.join("a.b.mds"), OTHER_MESSAGES);
+    std::fs::remove_file(notes.join("c.mds")).unwrap();
+    std::fs::remove_file(notes.join("y.mds")).unwrap();
+    assert!(
+        wait_for_file_gone(&notes.join("y.md"), TIMEOUT),
+        "control: deleting y.mds removes y.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&notes.join("a.json")),
+        startup_json,
+        "a.json, written for a.mds, is not overwritten; stderr: {stderr}"
+    );
+    for (name, text) in [
+        ("a.md", "Plain B\n"),
+        ("c.md", "Second CB\n"),
+        ("chat.md", USER_EDIT),
+    ] {
+        assert_eq!(
+            text_of(&notes.join(name)).as_deref(),
+            Some(text),
+            "{name} is kept; stderr: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("Kept "),
+        "--quiet prints no notice; stderr: {stderr}"
+    );
+}
+
+/// A symlink at a deleted source's output is never removed, and a dangling one is told
+/// as a live one is (#160): the user replaces `x.md`, which the session wrote, with a link
+/// to nothing, and `y.md` with a link to a file; deleting `x.mds` and `y.mds` keeps both
+/// links, each with `warning: could not remove <output>: refusing to remove a symlink`,
+/// and the link's target is left as it was. Control: the live link's warning.
+///
+/// Unix-only: it makes symlinks, which Windows allows only with a privilege.
+#[cfg(unix)]
+#[test]
+fn watch_reports_a_dangling_symlink_at_a_deleted_source_s_output() {
+    let base = notes_with(&[("x.mds", "Plain X\n"), ("y.mds", "Plain Y\n")]);
+    let notes = base.path().join("notes");
+    let target = base.path().join("target.txt");
+    std::fs::write(&target, HAND_WRITTEN).unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "notes", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    for (name, text) in [("x.md", "Plain X"), ("y.md", "Plain Y")] {
+        assert!(
+            wait_for_file_contains(&notes.join(name), text, TIMEOUT),
+            "control: the startup writes notes/{name}; stderr: {}",
+            tap.text()
+        );
+    }
+    for (name, to) in [
+        ("x.md", base.path().join("nowhere")),
+        ("y.md", target.clone()),
+    ] {
+        std::fs::remove_file(notes.join(name)).unwrap();
+        std::os::unix::fs::symlink(&to, notes.join(name)).unwrap();
+    }
+
+    // `y.mds` last: a batch handles its deletions in name order, so once its warning is
+    // printed the deletion of `x.mds` has been handled too.
+    for name in ["x.mds", "y.mds"] {
+        std::fs::remove_file(notes.join(name)).unwrap();
+    }
+    let warning = |name: &str| {
+        format!(
+            "warning: could not remove {}: refusing to remove a symlink",
+            below("notes", name)
+        )
+    };
+    wait_for_tap(&tap, &warning("y.md"), TIMEOUT);
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert!(
+        stderr.contains(&warning("x.md")),
+        "the dangling link at notes/x.md is told as a live one is; stderr: {stderr}"
+    );
+    for name in ["x.md", "y.md"] {
+        assert!(
+            std::fs::symlink_metadata(notes.join(name)).is_ok_and(|meta| meta.is_symlink()),
+            "the link at notes/{name} is left; stderr: {stderr}"
+        );
+    }
+    assert_eq!(
+        text_of(&target).as_deref(),
+        Some(HAND_WRITTEN),
+        "the live link's target is left as it was; stderr: {stderr}"
+    );
+}
+
+/// The debug build's pause between a directory batch's split and its compile (#160): the
+/// file it names ends the pause, and the same name with `.paused` appended says the batch
+/// has stopped.
+#[cfg(debug_assertions)]
+const BATCH_PAUSE: &str = "MDS_TEST_PAUSE_AFTER_BATCH_SPLIT";
+
+/// Wait until the session's rebuild batch has stopped at its pause ([`BATCH_PAUSE`]) and
+/// said so at `paused`. Bounded by [`TIMEOUT`].
+#[cfg(debug_assertions)]
+#[track_caller]
+fn wait_paused(paused: &Path, child: &mut ChildGuard, tap: &StderrTap, label: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !paused.exists() {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!(
+                "{label}: setup: the session ended ({status}) before a batch paused; \
+                 stderr: {}",
+                tap.text()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: setup: no batch paused; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A source deleted while a batch is rebuilding it is a deleted source (#160): its
+/// output is retired as any deleted source's is — `same.md`, left as the session wrote
+/// it, is removed with `Removed … (source deleted)`, and `edited.md`, which the user
+/// edited, is kept with a notice — with no `file not found` error for it, and the session
+/// keeps watching. Both sources are deleted while the batch is paused once it has told
+/// the sources still there from those gone ([`BATCH_PAUSE`]): a batch of edits, paused
+/// after its partition, used to forget a source it found gone without retiring its
+/// output, and a batch that recompiles every source for a `--vars` edit, paused at the
+/// first compile, reported the source it could no longer read as `file not found`.
+#[cfg(debug_assertions)]
+#[test]
+fn watch_handles_a_source_deleted_during_its_rebuild_as_deleted() {
+    for (label, extra, edit_vars) in DELETION_BATCHES {
+        let base = notes_with(&[("edited.mds", "Edited\n"), ("same.mds", "Same\n")]);
+        let notes = base.path().join("notes");
+        let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path())
+                .args(["watch", "notes", "--poll-interval", "0"])
+                .args(extra)
+                .env(BATCH_PAUSE, &go)
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&notes.join("edited.md"), "Edited", TIMEOUT)
+                && wait_for_file_contains(&notes.join("same.md"), "Same", TIMEOUT),
+            "{label}: control: the startup writes both outputs; stderr: {}",
+            tap.text()
+        );
+        std::fs::write(notes.join("edited.md"), USER_EDIT).unwrap();
+
+        // The batch: both sources saved as they are, or the vars file edited.
+        if edit_vars {
+            write_atomic(&base.path().join("vars.json"), r#"{"name": "two"}"#);
+        } else {
+            write_atomic(&notes.join("edited.mds"), "Edited\n");
+            write_atomic(&notes.join("same.mds"), "Same\n");
+        }
+        wait_paused(&paused, &mut child, &tap, label);
+        for name in ["edited.mds", "same.mds"] {
+            std::fs::remove_file(notes.join(name)).unwrap();
+        }
+        std::fs::write(&go, "").unwrap();
+
+        let kept = format!(
+            "Kept {}: changed since it was written",
+            below("notes", "edited.md")
+        );
+        let removed = format!("Removed {} (source deleted)", below("notes", "same.md"));
+        wait_for_tap(&tap, &kept, TIMEOUT);
+        wait_for_tap(&tap, &removed, TIMEOUT);
+        write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{label}: the session keeps watching; stderr: {}",
+            tap.text()
+        );
+        #[cfg(unix)]
+        {
+            interrupt(&child);
+            let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{label}: Ctrl+C ends the session with exit 0; stderr: {}",
+                tap.text()
+            );
+        }
+        let stderr = tap.finish_text(&mut child);
+
+        assert!(
+            !stderr.contains("file not found"),
+            "{label}: a source deleted during its rebuild is no compile error; \
+             stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [kept],
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            [removed],
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            text_of(&notes.join("edited.md")).as_deref(),
+            Some(USER_EDIT),
+            "{label}: the output the user edited survives; stderr: {stderr}"
+        );
+        assert!(
+            !notes.join("same.md").exists(),
+            "{label}: the output left as written is gone; stderr: {stderr}"
+        );
+    }
+}
+
+// ── #425: an output never replaces an MDS module ─────────────────────────────
+
+/// An MDS module: a `.md` file whose frontmatter declares `type: mds`.
+const MODULE: &str = "---\ntype: mds\nname: X\n---\nHi {{name}}\n";
+
+/// How many times `stderr` refuses, as `mds::io`, a write of `shown` with `cause`.
+fn refusals(stderr: &str, shown: &str, cause: &str) -> usize {
+    count_occurrences(
+        &squash(stderr),
+        &squash(&format!("cannot write {shown}: {cause}")),
+    )
+}
+
+/// `mds watch` never writes an output over an MDS module (#425), in file mode and in
+/// directory mode: `chat.md`, which declares `type: mds`, at the output of the Markdown
+/// source `chat.mds`, is refused at startup and by every rebuild of the same kind,
+/// `mds::io`, naming it as its `Recompiled` line would, and kept; the session keeps
+/// watching. A module put where the session's own output was is kept too, and once it is
+/// gone the refused text saved again is written: a refused write leaves nothing recorded
+/// as written. Control: with `chat.md` gone, the next save writes it. At Ctrl+C the
+/// session exits 0, as after any write that failed once it was live.
+#[test]
+fn watch_never_writes_over_an_mds_module() {
+    const CAUSE: &str = "refusing to replace an MDS module";
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", "Hello one\n"), ("chat.md", MODULE)]);
+        let notes = base.path().join("notes");
+        let (src, md) = (notes.join("chat.mds"), notes.join("chat.md"));
+        let shown_md = below(shown_dir, "chat.md");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        let refused_after = |n: usize, what: &str| {
+            let seen = poll_tap_until(&tap, TIMEOUT, |seen| refusals(seen, &shown_md, CAUSE) > n);
+            assert!(
+                seen.is_ok(),
+                "{mode}: {what} is refused; stderr: {}",
+                tap.text()
+            );
+            assert_eq!(
+                text_of(&md).as_deref(),
+                Some(MODULE),
+                "{mode}: {what} keeps the module; stderr: {}",
+                tap.text()
+            );
+            refusals(&tap.text(), &shown_md, CAUSE)
+        };
+
+        let seen = refused_after(0, "the startup write");
+        write_atomic(&src, "Hello two\n");
+        refused_after(seen, "a rebuild of the same kind");
+        settle_queued_events(&tap, &src, "module_kept");
+
+        // Control: nothing at chat.md, and the next save writes it.
+        std::fs::remove_file(&md).unwrap();
+        write_atomic(&src, "Hello three\n");
+        assert!(
+            wait_for_file_contains(&md, "Hello three", TIMEOUT),
+            "{mode}: control: with chat.md gone, the next save writes it; stderr: {}",
+            tap.text()
+        );
+        settle_queued_events(&tap, &src, "module_written");
+
+        // A module put where the session's own output was.
+        std::fs::write(&md, MODULE).unwrap();
+        let seen = refusals(&tap.text(), &shown_md, CAUSE);
+        write_atomic(&src, "Hello four\n");
+        refused_after(seen, "a rebuild over a module put in place of the output");
+
+        // The refused write is retried: nothing was written, so with the module gone the
+        // same text saved again is written, not skipped as written already.
+        std::fs::remove_file(&md).unwrap();
+        write_atomic(&src, "Hello four\n");
+        assert!(
+            wait_for_file_contains(&md, "Hello four", TIMEOUT),
+            "{mode}: the refused text, saved again, is written; stderr: {}",
+            tap.text()
+        );
+
+        #[cfg(unix)]
+        {
+            interrupt(&child);
+            let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{mode}: refused writes do not change the Ctrl+C exit; stderr: {}",
+                tap.text()
+            );
+        }
+        let stderr = tap.finish_text(&mut child);
+        assert!(
+            stderr.contains("mds::io"),
+            "{mode}: each refusal is mds::io; stderr: {stderr}"
+        );
+    }
+}
+
+/// A template whose output is itself an MDS module rewrites it in `mds watch` (#425), in
+/// file mode and in directory mode: `gen.mds`, whose `{{fm}}` the `--vars` file fills with
+/// frontmatter declaring `type: mds`, writes the module `gen.md` at startup, and the
+/// rebuild an edit makes writes it again, with no refusal — an output that is a module may
+/// replace one. The rebuild used to be refused, so the session could never update its own
+/// output. Control: an edit that makes the output no module is refused over the module,
+/// which is kept; the next edit that makes it a module again writes it. At Ctrl+C the
+/// session exits 0.
+#[test]
+fn watch_rewrites_its_own_output_that_declares_type_mds() {
+    const CAUSE: &str = "refusing to replace an MDS module";
+    const GENERATED: &str = "---\ntype: mds\n---\nBody two\n";
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[
+            ("gen.mds", "{{fm}}\nBody one\n"),
+            ("v.json", r#"{"fm":"---\ntype: mds\n---"}"#),
+        ]);
+        let notes = base.path().join("notes");
+        let (src, md) = (notes.join("gen.mds"), notes.join("gen.md"));
+        let shown_md = below(shown_dir, "gen.md");
+        let vars = below(shown_dir, "v.json");
+        let mut session: Vec<&str> = args
+            .iter()
+            .map(|&arg| if arg == "chat.mds" { "gen.mds" } else { arg })
+            .collect();
+        session.extend(["--vars", vars.as_str()]);
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(&session)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&md, "Body one", TIMEOUT),
+            "{mode}: the startup writes the module gen.md; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&src, "{{fm}}\nBody two\n");
+        assert!(
+            wait_for_file_contains(&md, "Body two", TIMEOUT),
+            "{mode}: the rebuild writes its own module output again; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(text_of(&md).as_deref(), Some(GENERATED), "{mode}");
+        assert_eq!(
+            refusals(&tap.text(), &shown_md, CAUSE),
+            0,
+            "{mode}: nothing is refused; stderr: {}",
+            tap.text()
+        );
+
+        // Control: an output that is no module is refused over the module.
+        write_atomic(&src, "Plain\n");
+        let seen = poll_tap_until(&tap, TIMEOUT, |seen| refusals(seen, &shown_md, CAUSE) > 0);
+        assert!(
+            seen.is_ok(),
+            "{mode}: control: an output that is no module is refused; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(GENERATED),
+            "{mode}: control: the module is kept; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, "{{fm}}\nBody three\n");
+        assert!(
+            wait_for_file_contains(&md, "Body three", TIMEOUT),
+            "{mode}: a module output again is written; stderr: {}",
+            tap.text()
+        );
+
+        #[cfg(unix)]
+        {
+            interrupt(&child);
+            let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{mode}: a refused write does not change the Ctrl+C exit; stderr: {}",
+                tap.text()
+            );
+        }
+        drop(tap.finish_text(&mut child));
+    }
+}
+
+// ── #425: an output never replaces a file the run reads ──────────────────────
+
+/// An output a session must never write, over a file it reads: the source that compiles
+/// to it, a new text of the same kind for that source, the output as its `Recompiled`
+/// line would name it, the file, and what the file holds.
+struct Guarded<'a> {
+    source: &'a Path,
+    edit: &'a str,
+    shown: String,
+    file: &'a Path,
+    was: &'a str,
+}
+
+/// `mds watch` with `args`, run in `cwd`, refuses each of `guarded` at startup and again
+/// on the rebuild of the same kind its source's edit makes — `mds::io`, `cannot write
+/// <output>: refusing to replace a file this run reads` — and the file keeps what it
+/// held; the session keeps watching, and at Ctrl+C exits 0.
+fn assert_never_writes_over(label: &str, cwd: &Path, args: &[&str], guarded: &[Guarded<'_>]) {
+    const CAUSE: &str = "refusing to replace a file this run reads";
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(cwd)
+            .args(args)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    let refused_after = |one: &Guarded<'_>, n: usize, what: &str| {
+        let seen = poll_tap_until(&tap, TIMEOUT, |seen| refusals(seen, &one.shown, CAUSE) > n);
+        assert!(
+            seen.is_ok(),
+            "{label}: {what}: {} is refused; stderr: {}",
+            one.shown,
+            tap.text()
+        );
+        assert_eq!(
+            text_of(one.file).as_deref(),
+            Some(one.was),
+            "{label}: {what}: {} is left as it was; stderr: {}",
+            one.shown,
+            tap.text()
+        );
+    };
+    for one in guarded {
+        refused_after(one, 0, "the startup write");
+    }
+    for one in guarded {
+        let seen = refusals(&tap.text(), &one.shown, CAUSE);
+        write_atomic(one.source, one.edit);
+        refused_after(one, seen, "a rebuild of the same kind");
+    }
+    #[cfg(unix)]
+    {
+        interrupt(&child);
+        let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{label}: refused writes do not change the Ctrl+C exit; stderr: {}",
+            tap.text()
+        );
+    }
+    drop(tap.finish_text(&mut child));
+}
+
+/// `mds watch` never writes an output over its `--vars` file or the `mds.json` in force
+/// (#425), in file mode and in directory mode: the messages template `chat.mds`, given
+/// `--vars chat.json`, and `mds.mds` beside `mds.json` are refused at startup and by every
+/// rebuild of the same kind, and both files keep what they held; the session keeps
+/// watching. Both used to be replaced at startup — and every rebuild then read an array
+/// as its vars. Control: with another `--vars` file, `chat.json` is written.
+#[test]
+fn watch_never_writes_over_its_vars_file_or_the_mds_json_in_force() {
+    const VARS: &str = "{\"name\": \"Dean\"}\n";
+    const CONFIG: &str = "{\"build\":{\"source_map\":false}}\n";
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[
+            ("chat.mds", "@message user:\nHi {{name}}\n@end\n"),
+            ("chat.json", VARS),
+            ("mds.mds", "@message user:\nHello\n@end\n"),
+            ("mds.json", CONFIG),
+        ]);
+        let notes = base.path().join("notes");
+        let cwd = base.path().join(cwd);
+        let vars = below(shown_dir, "chat.json");
+        let (chat_src, chat_json) = (notes.join("chat.mds"), notes.join("chat.json"));
+        let (config_src, config) = (notes.join("mds.mds"), notes.join("mds.json"));
+        let chat = Guarded {
+            source: &chat_src,
+            edit: "@message user:\nHi again {{name}}\n@end\n",
+            shown: below(shown_dir, "chat.json"),
+            file: &chat_json,
+            was: VARS,
+        };
+        let in_force = Guarded {
+            source: &config_src,
+            edit: "@message user:\nHello again\n@end\n",
+            shown: below(shown_dir, "mds.json"),
+            file: &config,
+            was: CONFIG,
+        };
+        let mut with_vars = args.to_vec();
+        with_vars.extend(["--vars", vars.as_str()]);
+        if args.contains(&"notes") {
+            assert_never_writes_over(mode, &cwd, &with_vars, &[chat, in_force]);
+        } else {
+            assert_never_writes_over(mode, &cwd, &with_vars, &[chat]);
+            assert_never_writes_over(mode, &cwd, &["watch", "mds.mds"], &[in_force]);
+        }
+    }
+
+    // Control: another `--vars` file, and `chat.json` is the output it always was.
+    let base = notes_with(&[("chat.mds", "@message user:\nHi {{name}}\n@end\n")]);
+    let notes = base.path().join("notes");
+    std::fs::write(notes.join("chat.json"), VARS).unwrap();
+    let vars = Path::new("..").join("vars.json");
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&notes)
+            .args(["watch", "chat.mds", "--vars"])
+            .arg(&vars)
+            .args(["--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("chat.json"), "Hi one", TIMEOUT),
+        "control: chat.json is written; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch` in directory mode never writes an output over the `mds.json` nearest a
+/// source (#425) — the one `mds watch <source>` holds in force: `notes/sub/mds.mds`'s
+/// messages output `notes/sub/mds.json` is refused at startup and by every rebuild of the
+/// same kind, and keeps what it held; the session keeps watching, and at Ctrl+C exits 0.
+/// It used to be replaced at startup.
+#[test]
+fn watch_never_writes_over_the_mds_json_nearest_a_source() {
+    const CONFIG: &str = "{\"build\":{}}\n";
+    let base = notes_with(&[("doc.mds", "Doc\n")]);
+    let sub = base.path().join("notes").join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("mds.mds"), "@message user:\nSub\n@end\n").unwrap();
+    std::fs::write(sub.join("mds.json"), CONFIG).unwrap();
+    let (src, config) = (sub.join("mds.mds"), sub.join("mds.json"));
+    assert_never_writes_over(
+        "directory mode",
+        base.path(),
+        &["watch", "notes"],
+        &[Guarded {
+            source: &src,
+            edit: "@message user:\nSub again\n@end\n",
+            shown: below(&below("notes", "sub"), "mds.json"),
+            file: &config,
+            was: CONFIG,
+        }],
+    );
+}
+
+/// `mds watch` never writes its output over a source its entry imports (#425), even an
+/// output that declares `type: mds` itself, which may replace any other module — each
+/// source's `{{fm}}` the `--vars` file fills with that frontmatter. In file mode `-o
+/// lib.mds` names the module `page.mds` imports; in directory mode `lib.mds`'s own output
+/// `lib.md` is the module it imports. Each is refused at startup and by the rebuild an edit
+/// makes, as a file the run reads, and keeps what it held. In file mode it used to be
+/// replaced by the compiled page.
+#[test]
+fn watch_never_writes_over_a_source_its_entry_imports() {
+    const VARS: &str = r#"{"fm":"---\ntype: mds\n---"}"#;
+    const LIB: &str = "---\ntype: mds\n---\nShared\n";
+    let base = notes_with(&[
+        ("lib.mds", "Shared\n"),
+        (
+            "page.mds",
+            "@import \"./lib.mds\" as l\n{{fm}}\n@include l\nPage\n",
+        ),
+        ("v.json", VARS),
+    ]);
+    let notes = base.path().join("notes");
+    let (page, lib) = (notes.join("page.mds"), notes.join("lib.mds"));
+    assert_never_writes_over(
+        "file mode",
+        &notes,
+        &["watch", "page.mds", "-o", "lib.mds", "--vars", "v.json"],
+        &[Guarded {
+            source: &page,
+            edit: "@import \"./lib.mds\" as l\n{{fm}}\n@include l\nMore\n",
+            shown: "lib.mds".to_owned(),
+            file: &lib,
+            was: "Shared\n",
+        }],
+    );
+
+    let base = notes_with(&[
+        ("lib.mds", "@import \"./lib.md\" as l\n{{fm}}\nLib\n"),
+        ("lib.md", LIB),
+        ("v.json", VARS),
+    ]);
+    let notes = base.path().join("notes");
+    let (src, md) = (notes.join("lib.mds"), notes.join("lib.md"));
+    let vars = below("notes", "v.json");
+    assert_never_writes_over(
+        "directory mode",
+        base.path(),
+        &["watch", "notes", "--vars", vars.as_str()],
+        &[Guarded {
+            source: &src,
+            edit: "@import \"./lib.md\" as l\n{{fm}}\nLib again\n",
+            shown: below("notes", "lib.md"),
+            file: &md,
+            was: LIB,
+        }],
+    );
 }

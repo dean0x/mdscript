@@ -58,6 +58,12 @@ ctrlc = "3.5"
 # 14-day flush rule for this batch. rust-version = "1.85" in its published Cargo.toml,
 # within the workspace MSRV (1.88). Only the default features ("std", "text") are used.
 similar = "3.1"
+# rustix: the directory-relative syscalls (`openat`, `mkdirat`, `renameat`, `fstatat`,
+# `fchmod`) mds-cli's unix write primitive walks below an output's anchor with, never
+# following a symlink there (#160). Already in Cargo.lock through tempfile, at the version
+# pinned here, so it adds a dependency edge and no package. Apache-2.0 WITH
+# LLVM-exception OR Apache-2.0 OR MIT; rust-version 1.63, within the workspace MSRV.
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
 
 # panic = "unwind" is required workspace-wide because mds-wasm and mds-napi use
 # catch_unwind at the JS boundary to convert panics into structured JS errors.

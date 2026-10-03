@@ -22,6 +22,11 @@ path = "src/main.rs"
 # because the delay no longer sits inside a window where a file is covered by neither
 # the OS watcher nor the mtime baseline. MUST NOT be enabled in a shipped build.
 startup-race-probe = []
+# DEVELOPMENT-ONLY. Prints a panic's message and location after the CLI's fixed
+# internal-compiler-error text (#389), to diagnose an unexpected panic locally. A
+# panic message can carry a user's text and absolute filesystem paths, which is why
+# the CLI never shows it. MUST NOT be enabled in a shipped build.
+debug-panics = []
 
 [dependencies]
 mds = { package = "mds-core", path = "../mds-core", version = "0.4.4" }
@@ -33,6 +38,9 @@ notify = { workspace = true }
 ctrlc = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 thiserror = { workspace = true }

@@ -1,9 +1,10 @@
 use std::io::Read;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
 pub fn fixture(name: &str) -> PathBuf {
@@ -22,6 +23,19 @@ pub fn mds_bin() -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mds"));
     cmd.env("NO_COLOR", "1");
     cmd
+}
+
+/// The write end of a pipe whose read end has already been dropped.
+///
+/// Handing this to a child as one of its standard streams makes every write the child
+/// makes to that stream fail with a broken pipe from the first byte on. The reader is
+/// dropped BEFORE the child is spawned: dropping `child.stdout` / `child.stderr` after
+/// the spawn instead races the child, since a short run can finish writing first.
+#[allow(dead_code)]
+pub fn closed_pipe() -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().expect("create a pipe");
+    drop(reader);
+    writer
 }
 
 /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
@@ -154,9 +168,9 @@ pub fn dup_vars_file_omitted(n: usize, path: &Path) -> String {
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
 ///
-/// Same body as the private `count_occurrences` in `warnings.rs` / `cli_watch.rs` —
-/// those files import only the two render helpers above (E0255 otherwise) and keep
-/// their own private copy of this one.
+/// Same body as the private `count_occurrences` in `warnings.rs` — that file imports
+/// only the two render helpers above (E0255 otherwise) and keeps its own private copy
+/// of this one.
 #[allow(dead_code)]
 pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     let mut count = 0;
@@ -282,6 +296,7 @@ impl ChildGuard {
 
     /// Reap an already-exiting child. `Child::wait` caches its status, so calling this
     /// and then letting `Drop` run is safe.
+    #[track_caller]
     pub fn wait_status(&mut self) -> std::process::ExitStatus {
         self.0.wait().expect("wait failed")
     }
@@ -367,7 +382,12 @@ impl PipeTap {
 }
 
 /// Spawn a background thread that drains `reader` into a fresh [`PipeTap`].
-fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
+///
+/// The spawn helpers below call it with a child's pipe; the wait self-tests in
+/// `cli_watch.rs` call it with an in-memory reader, so they exercise the waits without
+/// a process.
+#[allow(dead_code)]
+pub fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = buf.clone();
     let handle = std::thread::spawn(move || {
@@ -389,6 +409,110 @@ fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
         drain: Arc::new(Mutex::new(Some(handle))),
     }
 }
+
+// ── Pipe-tap waits ───────────────────────────────────────────────────────────
+
+/// How often the pipe-tap waits sample their tap.
+const TAP_POLL: Duration = Duration::from_millis(20);
+
+/// Poll `tap` until `done` holds for its text, or `timeout` elapses. Never panics.
+///
+/// `Ok` carries the text that satisfied `done`; `Err` carries the last text seen when
+/// the time ran out. This is for the one caller that treats an unmet condition as
+/// data rather than as a failure — the watch cap test, which must tell "no rebuild
+/// yet" apart from a broken harness. Every other wait goes through [`wait_for_tap`] or
+/// [`wait_for_tap_count`], which fail at the caller.
+#[allow(dead_code)]
+pub fn poll_tap_until(
+    tap: &PipeTap,
+    timeout: Duration,
+    done: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    // Bounded by `timeout`: at most timeout / TAP_POLL iterations, and the text is
+    // tested once more after the deadline passes, so a condition met on the last
+    // sample still counts.
+    loop {
+        let text = tap.text();
+        if done(&text) {
+            return Ok(text);
+        }
+        if Instant::now() >= deadline {
+            return Err(text);
+        }
+        std::thread::sleep(TAP_POLL);
+    }
+}
+
+/// Wait until `tap` holds `needle`, and return everything it holds at that moment.
+///
+/// PANICS on timeout. The message opens with the CALLER's `file:line:column` and ends
+/// with what the tap actually held, so a missing line is reported where the test waited
+/// for it, as the precondition that never happened — never as a later assertion about
+/// text that was simply incomplete. A wait that returned the text on timeout let the
+/// caller's own assertion report the shortfall as if it were a final answer.
+///
+/// A tap samples a live pipe: text returned here is complete only up to `needle`.
+/// A count over it needs an ordered anchor — a line the child writes AFTER everything
+/// being counted — or [`PipeTap::finish_text`] once such an anchor has been seen.
+#[track_caller]
+#[allow(dead_code)]
+pub fn wait_for_tap(tap: &PipeTap, needle: &str, timeout: Duration) -> String {
+    match poll_tap_until(tap, timeout, |text| text.contains(needle)) {
+        Ok(text) => text,
+        Err(seen) => panic!(
+            "wait_for_tap at {}: {needle:?} did not appear within {timeout:?}; \
+             the tap held:\n{seen}",
+            Location::caller()
+        ),
+    }
+}
+
+/// Wait until `tap` holds at least `n` occurrences of `needle`, and return everything
+/// it holds at that moment.
+///
+/// PANICS on timeout, naming the caller's `file:line:column` and the count it saw.
+///
+/// Why a count and not "contains": a stderr line the watcher emits AFTER the output
+/// write has no ordering relationship with the output file the test waited on.
+/// Dir-mode emits the duplicate-vars-key warning after the write (watch.rs
+/// `handle_fs_event_dir`), so a snapshot taken the instant `wait_for_file_contains`
+/// returns can legitimately be one warning short — or, if the previous rebuild's
+/// warning has not been sampled yet, one long. Waiting for the expected count first
+/// turns the assertion that follows into a genuine over-count check instead of a race.
+#[track_caller]
+#[allow(dead_code)]
+pub fn wait_for_tap_count(tap: &PipeTap, needle: &str, n: usize, timeout: Duration) -> String {
+    match poll_tap_until(tap, timeout, |text| count_occurrences(text, needle) >= n) {
+        Ok(text) => text,
+        Err(seen) => panic!(
+            "wait_for_tap_count at {}: expected at least {n} occurrences of {needle:?} \
+             within {timeout:?}; saw {}; the tap held:\n{seen}",
+            Location::caller(),
+            count_occurrences(&seen, needle)
+        ),
+    }
+}
+
+/// A source whose compile always fails with one `mds::undefined_var` diagnostic
+/// carrying [`ORDER_MARKER_LINE`]. Diagnostics survive `--quiet`.
+///
+/// Writing it to a watched source makes an ORDERED ANCHOR on stderr. The watch loop
+/// handles one event at a time and finishes a rebuild — its `Recompiled` line, its
+/// post-write warnings — before it takes the next event, so once the marker's
+/// diagnostic is on the tap, everything earlier rebuilds wrote is on it too. A count
+/// or an absence taken at that point is exact rather than a sample of a live pipe.
+/// The failed compile writes no output, so the output file keeps what it held.
+#[allow(dead_code)]
+pub const ORDER_MARKER_SOURCE: &str = "Order marker {{__order_marker__}}\n";
+
+/// The line of the diagnostic [`ORDER_MARKER_SOURCE`] produces, once per compile.
+///
+/// One edit can reach the watcher as several events, and each failed compile reports
+/// again, so this line can print several times for a single edit: wait for it, never
+/// count it.
+#[allow(dead_code)]
+pub const ORDER_MARKER_LINE: &str = "undefined variable '__order_marker__'";
 
 /// Spawn a `mds watch` command and drain its stderr, WITHOUT waiting for readiness.
 ///
@@ -450,36 +574,103 @@ pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap, Optio
 /// slow machine.
 #[allow(dead_code)]
 pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutTap>) {
-    // A private directory per spawn: the suite runs at full parallelism, so a shared
-    // path would let one watcher's marker satisfy another's wait. Dropped — and so
-    // deleted — when this function returns, by which point the marker has been read.
-    let ready_dir = tempfile::tempdir().expect("failed to create readiness tempdir");
-    let ready_path = ready_dir.path().join("watch-ready");
+    let ready = ReadyFile::new();
+    let (mut child, tap, stdout_tap) =
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", ready.path()));
+    ready.wait(&mut child, || tap.text());
+    (child, tap, stdout_tap)
+}
+
+/// [`spawn_watch_ready`] for a command whose stderr the caller has set to something
+/// that needs no draining — a closed pipe, a file — which is left alone here.
+///
+/// A piped stdout is still drained, and its tap returned, as [`spawn_watch_ready`]
+/// does. With nothing tapping stderr, a watcher that ends at startup is reported by its
+/// exit status alone.
+#[allow(dead_code)]
+pub fn spawn_watch_ready_stderr_untapped(cmd: &mut Command) -> (Child, Option<StdoutTap>) {
+    let ready = ReadyFile::new();
+    let mut child = cmd
+        .env("MDS_TEST_READY", ready.path())
+        .spawn()
+        .expect("failed to spawn mds watch");
+    let stdout_tap = child.stdout.take().map(tap_reader);
+    ready.wait(&mut child, || "(stderr is not tapped)".to_string());
+    (child, stdout_tap)
+}
+
+/// [`spawn_watch_ready`] with the readiness file at `marker`, a path the caller chose —
+/// so it can plant something at it, or at the temporary path beside it, first. `marker`
+/// must be absolute and in a directory that test owns.
+#[allow(dead_code)]
+pub fn spawn_watch_ready_at(
+    cmd: &mut Command,
+    marker: &Path,
+) -> (Child, StderrTap, Option<StdoutTap>) {
     assert!(
-        ready_path.is_absolute(),
+        marker.is_absolute(),
         "MDS_TEST_READY must be absolute; mds watch ignores relative values"
     );
-
     let (mut child, tap, stdout_tap) =
-        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", &ready_path));
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", marker));
+    wait_for_ready(marker, &mut child, || tap.text());
+    (child, tap, stdout_tap)
+}
 
+/// The file one spawned watcher creates when it is live (`MDS_TEST_READY`).
+struct ReadyFile {
+    /// A private directory per spawn: the suite runs at full parallelism, so a shared
+    /// path would let one watcher's marker satisfy another's wait. Dropped — and so
+    /// deleted — with this value, by which point the marker has been read.
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl ReadyFile {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("failed to create readiness tempdir");
+        let path = dir.path().join("watch-ready");
+        assert!(
+            path.is_absolute(),
+            "MDS_TEST_READY must be absolute; mds watch ignores relative values"
+        );
+        Self { _dir: dir, path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Block until `child` has created the marker; see [`wait_for_ready`].
+    fn wait(&self, child: &mut Child, stderr: impl Fn() -> String) {
+        wait_for_ready(&self.path, child, stderr);
+    }
+}
+
+/// Block until `child` has created the readiness file at `marker`. `stderr` reports what
+/// the child has printed so far, for the panic messages.
+///
+/// # Panics
+/// Panics if the child exits first, or if [`READY_TIMEOUT`] passes (the child is killed
+/// and reaped first).
+fn wait_for_ready(marker: &Path, child: &mut Child, stderr: impl Fn() -> String) {
     // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
-        if std::fs::read(&ready_path).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
-            return (child, tap, stdout_tap);
+        if std::fs::read(marker).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
+            return;
         }
         // Check liveness before the deadline so a watcher that failed at startup is
         // reported as "exited", not as "timed out".
         if let Ok(Some(status)) = child.try_wait() {
-            let seen = tap.text();
+            let seen = stderr();
             panic!(
                 "mds watch exited with {status:?} before signalling readiness; \
                  stderr was:\n{seen}"
             );
         }
         if std::time::Instant::now() >= deadline {
-            let seen = tap.text();
+            let seen = stderr();
             let _ = child.kill();
             let _ = child.wait();
             panic!(
@@ -489,6 +680,66 @@ pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutT
         }
         std::thread::sleep(READY_POLL);
     }
+}
+
+// ── A stream that fails other than by a closed pipe (#157) ───────────────────
+
+/// Make the child `cmd` spawns unable to grow a file past `limit` bytes: its file-size
+/// limit is `limit` and it ignores SIGXFSZ, so a write past the limit fails with "file
+/// too large" (EFBIG) instead of killing the child.
+///
+/// A stream on a regular file the child may not grow then fails every write for a
+/// reason other than a closed pipe — on every unix, where `/dev/full` is Linux only.
+/// Pipes are not files, so the limit leaves a piped stream alone; every file the child
+/// writes itself (outputs, the readiness marker) is limited too.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn limit_file_growth(cmd: &mut Command, limit: libc::rlim_t) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `signal` is on POSIX's async-signal-safe list, and
+    // `setrlimit` is a thin wrapper around its system call that takes no lock and
+    // allocates nothing. The closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            let growth = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &growth) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// A regular file of exactly `len` bytes, open for writing at its end, to hand to a
+/// child as a stream: under [`limit_file_growth`] with `len` as the limit, every write
+/// the child makes to it fails with "file too large".
+///
+/// Not opened for appending: macOS checks the limit against the descriptor's offset,
+/// and an appending descriptor sits at 0 until its first write, so a write shorter than
+/// the limit would get through. The offset is shared with every copy of the descriptor
+/// — the child's stream and a `try_clone` the test keeps — so the test makes room again
+/// by shortening the file and moving that clone's offset back (#157).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn full_file(path: &Path, len: usize) -> std::fs::File {
+    use std::io::{Seek as _, SeekFrom};
+
+    std::fs::write(path, vec![b'#'; len]).expect("fill the stream file");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open the stream file");
+    file.seek(SeekFrom::End(0))
+        .expect("move to the end of the stream file");
+    file
 }
 
 /// Assert that `s` contains no raw C0 (excluding `\t` and `\n`), DEL, C1, bidi

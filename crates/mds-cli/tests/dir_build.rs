@@ -563,45 +563,505 @@ fn dir_check_mixed_content_file_nonzero() {
     );
 }
 
-// ── T-CLI-21 variant: stale-output cleanup on format-flip (dir build) ─────────
+// ── #160: what a directory build removes after a change of kind ───────────────
 
+/// A messages template, compiled by the stale-output tests below.
+const MESSAGES: &str = "@message user:\nHi\n@end\n";
+
+/// What `mds build` writes for [`MESSAGES`]: the first build of
+/// `dir_build_out_dir_removes_a_stale_json_only_when_it_is_exactly_what_mds_wrote` pins it.
+const MESSAGES_OUTPUT: &str = "[\n  {\n    \"role\": \"user\",\n    \"content\": \"Hi\"\n  }\n]\n";
+
+/// A Markdown template, compiled by the stale-output tests below.
+const MARKDOWN: &str = "Plain\n";
+
+/// A JSON file its author wrote by hand.
+const HAND_WRITTEN_JSON: &str = "{\"hand\":\"written\",\"not\":\"mds output\"}";
+
+/// `mds build src --out-dir out` and `extra` in `root`, so every output is named below
+/// `out` as typed.
+fn build_src_into_out(root: &Path, extra: &[&str]) -> std::process::Output {
+    mds_bin()
+        .current_dir(root)
+        .args(["build", "src", "--out-dir", "out"])
+        .args(extra)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// Write `contents` to `rel` below `root`, making its directory first.
+fn put(root: &Path, rel: &str, contents: &str) {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, contents).unwrap();
+}
+
+/// What `rel` below `root` holds, or `None` when no readable file is there.
+fn read(root: &Path, rel: &str) -> Option<String> {
+    fs::read_to_string(root.join(rel)).ok()
+}
+
+/// The `warning: kept …` lines of `output`'s stderr, sorted: a directory build visits its
+/// sources in the order the filesystem lists them.
+fn kept_lines(output: &std::process::Output) -> Vec<String> {
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.starts_with("warning: kept "))
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `lines`, sorted, as [`kept_lines`] gives them.
+fn sorted(mut lines: Vec<String>) -> Vec<String> {
+    lines.sort();
+    lines
+}
+
+/// The warning that keeps the stale JSON `name` below `out`, named as typed.
+fn kept_json(name: &str) -> String {
+    format!(
+        "warning: kept stale output {}: not proven to be written by mds",
+        Path::new("out").join(name).display()
+    )
+}
+
+/// The warning that keeps the stale Markdown output `name` below `out`, named as typed.
+fn kept_markdown(name: &str) -> String {
+    format!(
+        "warning: kept stale output {}: mds never removes a Markdown file",
+        Path::new("out").join(name).display()
+    )
+}
+
+/// #160: a directory build with `--out-dir` removes the stale JSON of a source that now
+/// compiles to Markdown only when it holds exactly the messages output mds writes — here
+/// the one the first build wrote — and keeps any other JSON at such a name with one
+/// warning naming it as typed: a hand-written file, and the same messages formatted
+/// another way. The removal is the control for both files kept.
 #[test]
-fn dir_build_stale_output_cleaned_on_format_flip() {
-    let src = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-
-    // Step 1: Build a plain template → produces page.md
-    let mds_path = src.path().join("page.mds");
-    fs::write(&mds_path, "Hello, world!\n").unwrap();
-
-    let output1 = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
-    assert!(
-        output1.status.success(),
-        "first build should succeed; stderr: {}",
-        String::from_utf8_lossy(&output1.stderr)
+fn dir_build_out_dir_removes_a_stale_json_only_when_it_is_exactly_what_mds_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/x.mds", MARKDOWN);
+    put(root, "src/y.mds", MESSAGES);
+    put(root, "src/z.mds", MARKDOWN);
+    let first = build_src_into_out(root, &[]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
     );
-    let md_out = out.path().join("page.md");
-    assert!(md_out.exists(), "page.md should be created on first build");
-
-    // Step 2: Rewrite the template to use @message → would produce page.json
-    fs::write(&mds_path, "@message user:\nHello!\n@end\n").unwrap();
-
-    let output2 = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
-    assert!(
-        output2.status.success(),
-        "second build should succeed; stderr: {}",
-        String::from_utf8_lossy(&output2.stderr)
-    );
-    let json_out = out.path().join("page.json");
-    assert!(
-        json_out.exists(),
-        "page.json should be created on second build"
+    assert_eq!(
+        read(root, "out/y.json").as_deref(),
+        Some(MESSAGES_OUTPUT),
+        "what mds writes for a messages template"
     );
 
-    // Stale page.md from step 1 must be removed.
-    assert!(
-        !md_out.exists(),
-        "stale page.md should be removed after format flip to messages"
+    // y.mds now compiles to Markdown, so out/y.json is a stale output mds wrote; x.json
+    // and z.json are stale names too, holding what mds did not write.
+    put(root, "src/y.mds", MARKDOWN);
+    put(root, "out/x.json", HAND_WRITTEN_JSON);
+    let reformatted = "[{\"role\":\"user\",\"content\":\"Hi\"}]\n";
+    put(root, "out/z.json", reformatted);
+    let second = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(second.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        read(root, "out/x.json").as_deref(),
+        Some(HAND_WRITTEN_JSON),
+        "the hand-written x.json survives; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/z.json").as_deref(),
+        Some(reformatted),
+        "the same messages formatted another way survive; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/y.json"),
+        None,
+        "control: the stale y.json mds wrote is removed; stderr: {stderr}"
+    );
+    assert_eq!(read(root, "out/y.md").as_deref(), Some(MARKDOWN));
+    assert_eq!(
+        kept_lines(&second),
+        sorted(vec![kept_json("x.json"), kept_json("z.json")]),
+        "stderr: {stderr}"
+    );
+}
+
+/// #160: a directory build with `--out-dir` never removes a stale Markdown output — the
+/// `.md` of a source that now compiles to messages — even one holding exactly what an
+/// earlier build wrote, nor anything else at such a name, a directory here: each is kept
+/// with one warning naming it as typed, none under `--quiet`. Control: the stale JSON of
+/// a source changed the other way is removed by the same build.
+#[test]
+fn dir_build_out_dir_keeps_a_stale_markdown_output_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/page.mds", MARKDOWN);
+    put(root, "src/j.mds", MESSAGES);
+    let first = build_src_into_out(root, &[]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(read(root, "out/page.md").as_deref(), Some(MARKDOWN));
+
+    put(root, "src/page.mds", MESSAGES);
+    put(root, "src/j.mds", MARKDOWN);
+    // A stale `d.md` that is a directory, beside the `d.json` a messages template writes.
+    put(root, "src/d.mds", MESSAGES);
+    put(root, "out/d.md/keep", "keep\n");
+    let second = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(second.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        read(root, "out/page.md").as_deref(),
+        Some(MARKDOWN),
+        "the stale page.md is kept; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/page.json").as_deref(),
+        Some(MESSAGES_OUTPUT)
+    );
+    assert_eq!(
+        read(root, "out/d.md/keep").as_deref(),
+        Some("keep\n"),
+        "nothing under the stale d.md is touched"
+    );
+    assert_eq!(read(root, "out/d.json").as_deref(), Some(MESSAGES_OUTPUT));
+    assert_eq!(
+        read(root, "out/j.json"),
+        None,
+        "control: the stale j.json mds wrote is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        kept_lines(&second),
+        sorted(vec![kept_markdown("d.md"), kept_markdown("page.md")]),
+        "stderr: {stderr}"
+    );
+
+    let quiet = build_src_into_out(root, &["--quiet"]);
+    assert_eq!(
+        (quiet.status.code(), String::from_utf8_lossy(&quiet.stderr)),
+        (Some(0), "".into()),
+        "--quiet keeps them without a word"
+    );
+    assert_eq!(read(root, "out/page.md").as_deref(), Some(MARKDOWN));
+}
+
+/// #160: the stale output a directory build looks for is the other kind of the output it
+/// just wrote — `out/a.z.md`'s is `out/a.z.json` — never one derived from the source's
+/// name, which for `a.z.mds` names `a.mds`'s outputs, `out/a.json` and `out/a.md`. Here
+/// `a.mds` and `b.mds` fail to compile, so their outputs from the build before stay as
+/// they were whatever order the build visits the sources in.
+#[test]
+fn dir_build_out_dir_looks_for_the_stale_output_beside_the_output_it_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/a.mds", MESSAGES);
+    put(root, "src/a.z.mds", MESSAGES);
+    put(root, "src/b.mds", MARKDOWN);
+    put(root, "src/b.z.mds", MARKDOWN);
+    let first = build_src_into_out(root, &[]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    create_bad_mds(&root.join("src"), "a.mds");
+    create_bad_mds(&root.join("src"), "b.mds");
+    put(root, "src/a.z.mds", MARKDOWN);
+    put(root, "src/b.z.mds", MESSAGES);
+    let second = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(second.status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(
+        read(root, "out/a.json").as_deref(),
+        Some(MESSAGES_OUTPUT),
+        "a.mds's output survives a.z.mds's change of kind; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/b.md").as_deref(),
+        Some(MARKDOWN),
+        "b.mds's output survives b.z.mds's change of kind; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/a.z.json"),
+        None,
+        "control: a.z.mds's own stale JSON is removed; stderr: {stderr}"
+    );
+    assert_eq!(read(root, "out/a.z.md").as_deref(), Some(MARKDOWN));
+    assert_eq!(read(root, "out/b.z.json").as_deref(), Some(MESSAGES_OUTPUT));
+    assert_eq!(read(root, "out/b.z.md").as_deref(), Some(MARKDOWN));
+    assert_eq!(
+        kept_lines(&second),
+        vec![kept_markdown("b.z.md")],
+        "stderr: {stderr}"
+    );
+}
+
+/// #160: what is not a regular file at a stale JSON's name — a symlink, live or dangling,
+/// a directory and, on Unix, a FIFO — is kept, never followed or opened, with the warning
+/// a hand-written file gets, and the build exits 0. The live link leads to a file holding
+/// exactly the messages output mds writes, so only its being a link keeps it. Control: a
+/// stale JSON mds wrote is removed by the same build.
+#[test]
+fn dir_build_out_dir_keeps_what_is_not_a_regular_file_at_a_stale_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/k.mds", MESSAGES);
+    let first = build_src_into_out(root, &[]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    put(root, "src/k.mds", MARKDOWN);
+    for name in ["d", "l", "m"] {
+        put(root, &format!("src/{name}.mds"), MARKDOWN);
+    }
+    put(root, "elsewhere.json", MESSAGES_OUTPUT);
+    if !make_symlink(&root.join("elsewhere.json"), &root.join("out/l.json")) {
+        return;
+    }
+    assert!(make_symlink(
+        &root.join("missing.json"),
+        &root.join("out/m.json")
+    ));
+    put(root, "out/d.json/keep", "keep\n");
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut want = vec![
+        kept_json("d.json"),
+        kept_json("l.json"),
+        kept_json("m.json"),
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        put(root, "src/f.mds", MARKDOWN);
+        let fifo = root.join("out/f.json");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL in it");
+        // SAFETY: `name` is a NUL-terminated path in this test's own scratch directory.
+        assert_eq!(
+            unsafe { libc::mkfifo(name.as_ptr(), 0o644) },
+            0,
+            "make a FIFO"
+        );
+        want.push(kept_json("f.json"));
+    }
+    let second = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(second.status.code(), Some(0), "stderr: {stderr}");
+    for link in ["out/l.json", "out/m.json"] {
+        assert!(
+            fs::symlink_metadata(root.join(link)).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "the symlink {link} is kept; stderr: {stderr}"
+        );
+    }
+    assert_eq!(
+        read(root, "elsewhere.json").as_deref(),
+        Some(MESSAGES_OUTPUT)
+    );
+    assert_eq!(read(root, "out/d.json/keep").as_deref(), Some("keep\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            fs::symlink_metadata(root.join("out/f.json"))
+                .is_ok_and(|meta| meta.file_type().is_fifo()),
+            "the FIFO is kept; stderr: {stderr}"
+        );
+    }
+    assert_eq!(
+        read(root, "out/k.json"),
+        None,
+        "control: the stale k.json mds wrote is removed; stderr: {stderr}"
+    );
+    assert_eq!(kept_lines(&second), sorted(want), "stderr: {stderr}");
+}
+
+/// #160: a partial has no output, so it removes nothing: a JSON holding exactly the
+/// messages output mds writes and a Markdown file at its output's names are left, without
+/// a warning. Control: a source's stale JSON is removed by the same build.
+#[test]
+fn dir_build_out_dir_partial_removes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/q.mds", MESSAGES);
+    let first = build_src_into_out(root, &[]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    put(root, "src/q.mds", MARKDOWN);
+    put(root, "src/_p.mds", MESSAGES);
+    put(root, "out/_p.json", MESSAGES_OUTPUT);
+    put(root, "out/_p.md", "P\n");
+    let second = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(second.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(read(root, "out/_p.json").as_deref(), Some(MESSAGES_OUTPUT));
+    assert_eq!(read(root, "out/_p.md").as_deref(), Some("P\n"));
+    assert_eq!(
+        read(root, "out/q.json"),
+        None,
+        "control: the stale q.json mds wrote is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        kept_lines(&second),
+        Vec::<String>::new(),
+        "stderr: {stderr}"
+    );
+}
+
+/// #160: a stale output whose name is too long for the file system is no file: a Markdown
+/// source with a 251-byte stem writes `out/<stem>.md` (254 bytes), and its other kind's
+/// `out/<stem>.json` (256 bytes) cannot exist, so the build has nothing to look at there
+/// and exits 0. Control: with a 250-byte stem, `<stem>.json` fits, and the stale `.json`
+/// the first build wrote is removed once the source compiles to Markdown.
+#[cfg(unix)]
+#[test]
+fn dir_build_out_dir_a_stale_name_too_long_for_the_file_system_is_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (long, fits) = ("y".repeat(251), "z".repeat(250));
+    put(root, &format!("src/{long}.mds"), MARKDOWN);
+    put(root, &format!("src/{fits}.mds"), MESSAGES);
+
+    let first = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert_eq!(first.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        read(root, &format!("out/{long}.md")).as_deref(),
+        Some(MARKDOWN),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, &format!("out/{fits}.json")).as_deref(),
+        Some(MESSAGES_OUTPUT),
+        "control: the first build writes the messages output; stderr: {stderr}"
+    );
+
+    put(root, &format!("src/{fits}.mds"), MARKDOWN);
+    let second = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(second.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        read(root, &format!("out/{fits}.json")),
+        None,
+        "control: the stale .json mds wrote is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        kept_lines(&second),
+        Vec::<String>::new(),
+        "stderr: {stderr}"
+    );
+}
+
+/// The paths the `Compiled to` lines of `output`'s stderr name, as printed.
+fn compiled_to(output: &std::process::Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("Compiled to "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// #160: beside its sources a directory build looks at no other-kind output, so it never
+/// removes, or warns about, an output it wrote this run. There `a.b.mds` and `a.mds` both
+/// name theirs `a.md` or `a.json`, so the other kind's name of one is the output of the
+/// other: in `p` `a.mds` writes `a.json` and `a.b.mds` writes `a.md`, in `q` the other way
+/// round, so whichever source a build visits first, one of them names the other's output.
+/// Every output a `Compiled to` line names is there afterwards, and no `kept` warning
+/// names one. Control: below `--out-dir` the two outputs have names of their own, and the
+/// stale `.json` an earlier build wrote for `x.mds`, which now compiles to Markdown, is
+/// removed by the same build.
+#[test]
+fn a_build_beside_its_sources_never_removes_an_output_it_wrote_this_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/p/a.mds", MESSAGES);
+    put(root, "src/p/a.b.mds", MARKDOWN);
+    put(root, "src/q/a.mds", MARKDOWN);
+    put(root, "src/q/a.b.mds", MESSAGES);
+
+    let beside = mds_bin()
+        .current_dir(root)
+        .args(["build", "src"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&beside.stderr);
+    assert_eq!(beside.status.code(), Some(0), "stderr: {stderr}");
+    let compiled = compiled_to(&beside);
+    assert_eq!(compiled.len(), 4, "one output per source; stderr: {stderr}");
+    for shown in &compiled {
+        assert!(
+            root.join(shown).is_file(),
+            "{shown}, which this run wrote, is still there; stderr: {stderr}"
+        );
+    }
+    for shown in &compiled {
+        assert!(
+            !kept_lines(&beside)
+                .iter()
+                .any(|line| line.contains(&format!(" {shown}: "))),
+            "no warning names {shown}, which this run wrote; stderr: {stderr}"
+        );
+    }
+    for json in ["src/p/a.json", "src/q/a.json"] {
+        assert_eq!(
+            read(root, json).as_deref(),
+            Some(MESSAGES_OUTPUT),
+            "{json}; stderr: {stderr}"
+        );
+    }
+    for md in ["src/p/a.md", "src/q/a.md"] {
+        assert_eq!(
+            read(root, md).as_deref(),
+            Some(MARKDOWN),
+            "{md}; stderr: {stderr}"
+        );
+    }
+
+    // Control: below an out-dir the outputs do not collide, and a stale output is
+    // looked at.
+    put(root, "src/x.mds", MARKDOWN);
+    put(root, "out/x.json", MESSAGES_OUTPUT);
+    let into_out = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&into_out.stderr);
+    assert_eq!(into_out.status.code(), Some(0), "stderr: {stderr}");
+    for rel in [
+        "out/p/a.json",
+        "out/p/a.b.md",
+        "out/q/a.md",
+        "out/q/a.b.json",
+    ] {
+        assert!(root.join(rel).is_file(), "control: {rel}; stderr: {stderr}");
+    }
+    assert_eq!(
+        read(root, "out/x.json"),
+        None,
+        "control: the stale x.json mds wrote is removed; stderr: {stderr}"
     );
 }
 
@@ -1508,22 +1968,19 @@ fn dir_build_write_failure_preserves_existing_outputs() {
     let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o755));
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
-        Some(0),
-        "a dir build into a read-only output dir must fail; stderr: {stderr}"
+        Some(2),
+        "a dir build into a read-only output dir is an I/O failure, exit 2 (#157); \
+         stderr: {stderr}"
     );
     assert!(
-        stderr.contains("0 built"),
-        "the summary must report nothing built; got: {stderr}"
+        stderr.contains("0 built, 2 failed"),
+        "the summary must report both failures; got: {stderr}"
     );
     assert!(
-        stderr.contains("failed"),
-        "the summary must report the failures; got: {stderr}"
-    );
-    assert!(
-        stderr.contains("error:"),
-        "each failure must be reported on stderr; got: {stderr}"
+        stderr.matches("mds::io").count() == 2,
+        "each failure must be reported as mds::io on stderr; got: {stderr}"
     );
     assert!(
         stderr.contains("a.md"),
@@ -1569,10 +2026,10 @@ fn dir_build_source_map_sidecar_symlink_target_rejected() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
-        Some(0),
-        "a symlinked sidecar must fail the dir build; stderr: {stderr}"
+        Some(2),
+        "a symlinked sidecar is a failed write, exit 2 (#157); stderr: {stderr}"
     );
     assert!(
         out.join("page.md").is_file(),
@@ -1590,6 +2047,221 @@ fn dir_build_source_map_sidecar_symlink_target_rejected() {
         fs::read_to_string(&real).unwrap(),
         "OLD",
         "the symlink target must not be written through"
+    );
+}
+
+// ── #157: an I/O failure lifts a directory build's exit to 2 ─────────────────
+
+/// A directory build with one template error exits 1; add one output directory that
+/// cannot be created and it exits 2 — an I/O failure, `mds::io` — while the files that
+/// can be built are still built (#157).
+///
+/// `#[cfg(unix)]`: the mkdir failure comes from a `0o555`-mode out-dir, which Windows'
+/// read-only attribute does not reproduce.
+#[cfg(unix)]
+#[test]
+fn dir_build_with_a_template_error_and_a_failed_mkdir_exits_2() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let src = tempfile::tempdir().unwrap();
+    create_bad_mds(src.path(), "a.mds");
+    create_plain_mds(src.path(), "c.mds");
+    fs::create_dir_all(src.path().join("sub/deep")).unwrap();
+    create_plain_mds(&src.path().join("sub/deep"), "b.mds");
+
+    // Control: the template error alone exits 1, and the other two are built.
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    let control = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: a template error alone must exit 1; stderr: {control_stderr}"
+    );
+    assert!(
+        out.join("sub/deep/b.md").is_file() && out.join("c.md").is_file(),
+        "control: the files that compile must be built; stderr: {control_stderr}"
+    );
+
+    // `out/sub` exists but nothing can be created in it, so `out/sub/deep` cannot be
+    // made; `out` itself stays writable, so `c.md` is still built.
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("out");
+    let blocked = out.join("sub");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::create_dir(blocked.join("probe")).is_ok() {
+        let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+        eprintln!("skipped: a directory can be created at mode 0o555 (running as root?)");
+        return;
+    }
+    let output = build_dir(src.path(), &["--out-dir", out.to_str().unwrap()]);
+    let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a template error plus a failed mkdir must exit 2; stderr: {stderr}"
+    );
+    // In the one wording of a failed write, naming the output (#160).
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("cannot write"),
+        "the mkdir failure must be reported as mds::io; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 built, 2 failed"),
+        "the summary must count the template error and the mkdir failure; stderr: {stderr}"
+    );
+    assert!(
+        out.join("c.md").is_file(),
+        "the file whose directory exists must still be built"
+    );
+}
+
+/// A stale JSON that cannot be read — so nothing shows whether mds wrote it — is an
+/// error, not a warning: the run exits 2 (`mds::io`, `cannot read stale output …`) though
+/// every output was written, and the file is left (#157, #160). A proven one whose
+/// removal fails is the same `mds::io` error, `could not remove stale output …`, pinned
+/// where the removal is made (`output.rs`): no build writes an output into a directory it
+/// cannot remove a file from.
+///
+/// Unix-only: a mode makes the file unreadable; skipped where it does not (as root).
+#[cfg(unix)]
+#[test]
+fn dir_build_stale_json_that_cannot_be_read_exits_2() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/x.mds", MARKDOWN);
+    // Control: the same stale JSON, readable, is removed, exit 0.
+    put(root, "out/x.json", MESSAGES_OUTPUT);
+    let control = build_src_into_out(root, &[]);
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "control: stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert_eq!(
+        read(root, "out/x.json"),
+        None,
+        "control: the stale x.json is removed"
+    );
+
+    put(root, "out/x.json", MESSAGES_OUTPUT);
+    let stale = root.join("out/x.json");
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&stale).is_ok() {
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!("skipped: x.json is readable at mode 0o000 (running as root?)");
+        return;
+    }
+    let output = build_src_into_out(root, &[]);
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    let squash = |text: &str| text.split_whitespace().collect::<String>();
+    let error = format!(
+        "cannot read stale output {}: {}",
+        Path::new("out").join("x.json").display(),
+        std::io::Error::from_raw_os_error(libc::EACCES)
+    );
+    assert!(
+        stderr.contains("mds::io") && squash(&stderr).contains(&squash(&error)),
+        "{error:?} as mds::io; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/x.md").as_deref(),
+        Some(MARKDOWN),
+        "the output itself is still written"
+    );
+    assert_eq!(
+        read(root, "out/x.json").as_deref(),
+        Some(MESSAGES_OUTPUT),
+        "the stale x.json is left"
+    );
+}
+
+/// A stale JSON proven to be mds's whose removal fails is an error on Windows too: the
+/// run exits 2 (`mds::io`, `could not remove stale output …`) though every output was
+/// written, and the file is left (#157, #160). Control: once nothing holds it, the next
+/// build removes it, exit 0.
+///
+/// Windows-only — it runs in the Windows CI leg, never on a unix machine. There, a file
+/// held open by a handle that does not share deletion cannot be removed while it is
+/// held; a read-only file is no such case, since std removes one on Windows.
+#[cfg(windows)]
+#[test]
+fn dir_build_stale_json_that_cannot_be_removed_exits_2_on_windows() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_SHARE_READ`: another handle may read the file, never delete it.
+    const FILE_SHARE_READ: u32 = 0x1;
+    /// `ERROR_SHARING_VIOLATION`: what removing a file another handle denies that gives.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/x.mds", MESSAGES);
+    let first = build_src_into_out(root, &[]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(read(root, "out/x.json").as_deref(), Some(MESSAGES_OUTPUT));
+
+    put(root, "src/x.mds", MARKDOWN);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(root.join("out").join("x.json"))
+        .unwrap();
+    let output = build_src_into_out(root, &[]);
+    drop(held);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    let squash = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect()
+    };
+    let error = format!(
+        "could not remove stale output {}: {}",
+        Path::new("out").join("x.json").display(),
+        std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION)
+    );
+    assert!(
+        stderr.contains("mds::io") && squash(&stderr).contains(&squash(&error)),
+        "{error:?} as mds::io; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/x.md").as_deref(),
+        Some(MARKDOWN),
+        "the output itself is still written"
+    );
+    assert_eq!(
+        read(root, "out/x.json").as_deref(),
+        Some(MESSAGES_OUTPUT),
+        "the stale x.json is left"
+    );
+
+    let control = build_src_into_out(root, &[]);
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "control: stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert_eq!(
+        read(root, "out/x.json"),
+        None,
+        "control: the stale x.json is removed"
     );
 }
 
@@ -1791,8 +2463,8 @@ fn dir_build_dotdot_root_mirrors_without_warning() {
 /// `watch` — single-file `-o`/`--out-dir` never canonicalizes). On Windows,
 /// `Path::canonicalize` always returns the verbatim form (`\\?\C:\…`) once the
 /// directory exists, so `--out-dir` must already exist for this test to exercise
-/// the bug. The `Compiled to …` status line — and every other path `--out-dir`
-/// feeds — must show the conventional form instead.
+/// the bug. The `Compiled to …` status line names the output below the out-dir as
+/// typed (#390), so no verbatim prefix reaches it.
 #[cfg(windows)]
 #[test]
 fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
@@ -1819,9 +2491,10 @@ fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
         output.status.success(),
         "dir build should succeed; stderr: {stderr}"
     );
+    let expected_line = format!("Compiled to {}\n", out.path().join("plain.md").display());
     assert!(
-        stderr.contains("Compiled to"),
-        "expected a Compiled to status line; got: {stderr}"
+        stderr.contains(&expected_line),
+        "expected the out-dir as typed, {expected_line:?}; got: {stderr}"
     );
     assert!(
         !stdout.contains(r"\\?\"),
@@ -1833,16 +2506,13 @@ fn dir_build_out_dir_status_line_has_no_verbatim_prefix_on_windows() {
     );
 }
 
-/// Unix control for the Windows test above: off Windows, canonicalizing
-/// `--out-dir` never produces a verbatim path, so `display_native_path` is a
-/// no-op and the `Compiled to …` line names the canonical output path unchanged.
-///
-/// `#[cfg(unix)]`: this is the off-Windows control arm for the preceding
-/// Windows-only test; the property it asserts (no verbatim prefix, because
-/// there is none to strip) does not apply on Windows (#147/#409).
-#[cfg(unix)]
+/// The `Compiled to …` line of a directory build names the output below `--out-dir`
+/// exactly as typed, never below the out-dir's canonical path (#390). On macOS the
+/// temporary directory is `/var/…` and its canonical path `/private/var/…`, so the two
+/// differ; where they coincide the canonical check has nothing to tell apart, and the
+/// typed line is still pinned exactly.
 #[test]
-fn dir_build_out_dir_status_line_unchanged_off_windows() {
+fn dir_build_out_dir_status_line_names_the_out_dir_as_typed() {
     let src = tempfile::tempdir().unwrap();
     create_plain_mds(src.path(), "plain.mds");
 
@@ -1854,16 +2524,282 @@ fn dir_build_out_dir_status_line_unchanged_off_windows() {
         output.status.success(),
         "dir build should succeed; stderr: {stderr}"
     );
-    let expected_line = format!(
-        "Compiled to {}",
-        out.path()
-            .canonicalize()
-            .unwrap()
-            .join("plain.md")
-            .display()
-    );
+    let typed = out.path().join("plain.md");
+    let expected_line = format!("Compiled to {}\n", typed.display());
     assert!(
         stderr.contains(&expected_line),
-        "expected the unchanged canonical status line {expected_line:?}; got: {stderr}"
+        "expected the out-dir as typed, {expected_line:?}; got: {stderr}"
     );
+    let canonical = out.path().canonicalize().unwrap().join("plain.md");
+    if canonical != typed {
+        assert!(
+            !stderr.contains(&format!("Compiled to {}", canonical.display())),
+            "never the canonical out-dir {canonical:?}; got: {stderr}"
+        );
+    }
+}
+
+// ── #425: an output never replaces an MDS module ─────────────────────────────
+
+/// An MDS module: a `.md` file whose frontmatter declares `type: mds`.
+const MODULE: &str = "---\ntype: mds\nname: X\n---\nHi {{name}}\n";
+
+/// `mds build` in `dir` with `args`: `(exit code, stderr)`.
+fn build_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = mds_bin()
+        .current_dir(dir)
+        .arg("build")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Whether `stderr` refuses, as `mds::io`, a write of `shown` with `cause` — whitespace
+/// and miette's frame, which wraps a long message, set aside.
+fn refuses(stderr: &str, shown: &Path, cause: &str) -> bool {
+    let squash = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect()
+    };
+    stderr.contains("mds::io")
+        && squash(stderr).contains(&squash(&format!(
+            "cannot write {}: {cause}",
+            shown.display()
+        )))
+}
+
+/// A directory build never writes an output over an MDS module (#425), beside its
+/// sources or below `--out-dir`: `a.md`, which declares `type: mds`, is refused,
+/// `mds::io`, naming it as its `Compiled to` line would, and kept; the build goes on with
+/// the other sources — `b.md`, a plain file, is written over — and exits 2. It used to
+/// replace the module, exit 0.
+#[test]
+fn dir_build_never_writes_over_an_mds_module() {
+    for out_dir in [None, Some("out")] {
+        let label = format!("out-dir {out_dir:?}");
+        let base = tempfile::tempdir().unwrap();
+        let src = base.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mds"), "Hello A\n").unwrap();
+        fs::write(src.join("b.mds"), "Hello B\n").unwrap();
+        let outputs = match out_dir {
+            Some(out) => base.path().join(out),
+            None => src.clone(),
+        };
+        fs::create_dir_all(&outputs).unwrap();
+        fs::write(outputs.join("a.md"), MODULE).unwrap();
+        fs::write(outputs.join("b.md"), "old b\n").unwrap();
+        let shown = Path::new(out_dir.unwrap_or("src"));
+
+        let mut args = vec!["src"];
+        args.extend(out_dir.iter().flat_map(|out| ["--out-dir", out]));
+        let (code, stderr) = build_in(base.path(), &args);
+        assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+        assert!(
+            refuses(
+                &stderr,
+                &shown.join("a.md"),
+                "refusing to replace an MDS module"
+            ),
+            "{label}: the module is refused by name; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(outputs.join("a.md")).unwrap(),
+            MODULE,
+            "{label}: the module is kept; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(outputs.join("b.md")).unwrap(),
+            "Hello B\n",
+            "{label}: control: the plain b.md is written over; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 built, 1 failed"),
+            "{label}: the build goes on with the other source; stderr: {stderr}"
+        );
+    }
+}
+
+/// A directory build writes an output that is itself an MDS module over a module (#425),
+/// but never over the module its source imports, a file the run reads: `gen.mds`, whose
+/// `{{fm}}` the `--vars` file fills with frontmatter declaring `type: mds`, replaces the
+/// module `src/gen.md`; `lib.mds`, which imports `./lib.md` and makes a module too, is
+/// refused over it, `mds::io`, and `lib.md` is left as it was; the build exits 2. It used
+/// to refuse both as modules.
+#[test]
+fn dir_build_writes_a_module_output_over_a_module_but_never_over_its_import() {
+    const LIB: &str = "---\ntype: mds\n---\nShared\n";
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(
+        base.path().join("v.json"),
+        r#"{"fm":"---\ntype: mds\n---"}"#,
+    )
+    .unwrap();
+    fs::write(src.join("gen.mds"), "{{fm}}\nBody\n").unwrap();
+    fs::write(src.join("gen.md"), MODULE).unwrap();
+    fs::write(
+        src.join("lib.mds"),
+        "@import \"./lib.md\" as l\n{{fm}}\nLib\n",
+    )
+    .unwrap();
+    fs::write(src.join("lib.md"), LIB).unwrap();
+
+    let (code, stderr) = build_in(base.path(), &["src", "--vars", "v.json"]);
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert_eq!(
+        fs::read_to_string(src.join("gen.md")).unwrap(),
+        "---\ntype: mds\n---\nBody\n",
+        "a module output replaces the module; stderr: {stderr}"
+    );
+    assert!(
+        refuses(
+            &stderr,
+            &Path::new("src").join("lib.md"),
+            "refusing to replace a file this run reads"
+        ),
+        "the imported module is refused by name; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(src.join("lib.md")).unwrap(),
+        LIB,
+        "the imported module is left as it was; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 built, 1 failed"),
+        "the build goes on with the other source; stderr: {stderr}"
+    );
+}
+
+/// A directory build never writes an output over the `mds.json` nearest a source (#425) —
+/// the one `mds build <source>` holds in force — as file mode never does: `mds build .`
+/// refuses `sub/mds.mds`'s messages output `./sub/mds.json`, `mds::io`, leaves it as it
+/// was, goes on with `doc.mds` and exits 2, and `mds build sub/mds.mds` refuses it the
+/// same way. It used to be replaced by the directory build, exit 0 for that file. The
+/// nested `mds.json` is not otherwise read: one that is no JSON at all is refused just the
+/// same, unreported. Control: with no `sub/mds.json`, the directory build writes it, exit 0.
+#[test]
+fn dir_build_never_writes_over_a_nested_mds_json() {
+    let fixture = |nested: Option<&str>| {
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(base.path().join("mds.json"), "{}\n").unwrap();
+        fs::write(sub.join("mds.mds"), "@message user:\nSub\n@end\n").unwrap();
+        fs::write(base.path().join("doc.mds"), "Doc\n").unwrap();
+        if let Some(nested) = nested {
+            fs::write(sub.join("mds.json"), nested).unwrap();
+        }
+        base
+    };
+    let shown = Path::new(".").join("sub").join("mds.json");
+    for nested in ["{\"build\":{}}\n", "{ not json\n"] {
+        let base = fixture(Some(nested));
+        let (code, stderr) = build_in(base.path(), &["."]);
+        assert_eq!(code, Some(2), "{nested:?}: stderr: {stderr}");
+        assert!(
+            refuses(&stderr, &shown, "refusing to replace a file this run reads"),
+            "{nested:?}: the nested mds.json is refused by name; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(base.path().join("sub").join("mds.json")).unwrap(),
+            nested,
+            "{nested:?}: the nested mds.json is left as it was; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(base.path().join("doc.md")).unwrap(),
+            "Doc\n",
+            "{nested:?}: the build goes on with doc.mds; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 built, 1 failed") && !stderr.contains("invalid mds.json"),
+            "{nested:?}: one failure, and the nested mds.json is not read; stderr: {stderr}"
+        );
+    }
+
+    let base = fixture(Some("{\"build\":{}}\n"));
+    let (code, stderr) = build_in(base.path(), &["sub/mds.mds"]);
+    assert_eq!(code, Some(2), "file mode: stderr: {stderr}");
+    assert!(
+        refuses(
+            &stderr,
+            &Path::new("sub").join("mds.json"),
+            "refusing to replace a file this run reads"
+        ),
+        "file mode refuses it the same way; stderr: {stderr}"
+    );
+
+    let base = fixture(None);
+    let (code, stderr) = build_in(base.path(), &["."]);
+    assert_eq!(code, Some(0), "control: stderr: {stderr}");
+    assert!(
+        fs::read_to_string(base.path().join("sub").join("mds.json"))
+            .unwrap()
+            .contains("Sub"),
+        "control: with no nested mds.json, the output is written; stderr: {stderr}"
+    );
+}
+
+/// A directory build never writes an output over a file the run reads (#425), beside its
+/// sources or below `--out-dir`: the `--vars` file at the output of the messages template
+/// `chat.mds`, and the `mds.json` in force at the output of `mds.mds`, are each refused,
+/// `mds::io`, naming the output as its `Compiled to` line would, and left as they were;
+/// the build goes on with `b.mds` and exits 2. They used to be replaced, exit 0.
+#[test]
+fn dir_build_never_writes_over_a_file_it_reads() {
+    const VARS: &str = "{\"name\": \"Dean\"}\n";
+    const CONFIG: &str = "{\"build\":{\"source_map\":false}}\n";
+    // Where the outputs and the two files go, and the arguments after `build src`.
+    let legs: [(&str, &[&str]); 2] = [
+        ("src", &["--vars", "src/chat.json"]),
+        (".", &["--out-dir", ".", "--vars", "chat.json"]),
+    ];
+    for (outputs, extra) in legs {
+        let base = tempfile::tempdir().unwrap();
+        let src = base.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("chat.mds"), "@message user:\nHi {{name}}\n@end\n").unwrap();
+        fs::write(src.join("mds.mds"), "@message user:\nHello\n@end\n").unwrap();
+        fs::write(src.join("b.mds"), "Hello B\n").unwrap();
+        let at = base.path().join(outputs);
+        fs::write(at.join("chat.json"), VARS).unwrap();
+        fs::write(at.join("mds.json"), CONFIG).unwrap();
+        let shown = Path::new(outputs);
+
+        let mut args = vec!["src"];
+        args.extend(extra);
+        let (code, stderr) = build_in(base.path(), &args);
+        assert_eq!(code, Some(2), "{args:?}: stderr: {stderr}");
+        for (name, was) in [("chat.json", VARS), ("mds.json", CONFIG)] {
+            assert!(
+                refuses(
+                    &stderr,
+                    &shown.join(name),
+                    "refusing to replace a file this run reads"
+                ),
+                "{args:?}: {name} is refused by name; stderr: {stderr}"
+            );
+            assert_eq!(
+                fs::read_to_string(at.join(name)).unwrap(),
+                was,
+                "{args:?}: {name} is left as it was; stderr: {stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(at.join("b.md")).unwrap(),
+            "Hello B\n",
+            "{args:?}: control: b.md is written; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 built, 2 failed"),
+            "{args:?}: the build goes on with the other source; stderr: {stderr}"
+        );
+    }
 }
