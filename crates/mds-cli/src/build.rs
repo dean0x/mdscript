@@ -684,9 +684,34 @@ pub(crate) struct RuntimeVarArgs {
 }
 
 /// Load vars from an optional file path, returning None if no file was given.
+///
+/// A file that is a symlink is refused through [`vars_file_error`], as `mds watch`
+/// refuses it at startup (#157).
 pub(crate) fn load_optional_vars_file(path: Option<PathBuf>) -> Result<Option<mds::VarsLoad>> {
-    path.map(|p| mds::load_vars_file_reporting_duplicates(&p).map_err(miette::Error::from))
-        .transpose()
+    path.map(|p| {
+        mds::load_vars_file_reporting_duplicates(&p)
+            .map_err(|e| miette::Error::from(vars_file_error(&p, e)))
+    })
+    .transpose()
+}
+
+/// The error a `--vars` file at `typed`, the path as typed, is refused with (#157).
+///
+/// The symlink check's refusal (`ImportError`, the only one a vars file's load or its
+/// symlink check gives) is an I/O failure on the command line, the same on every
+/// command: `mds::io`, exit 2, `--vars file must not be a symlink: <path>`, the path
+/// escaped. Every other error — a forbidden character in the resolved path, a file
+/// missing, unreadable, too large or not a JSON object — keeps its own message and code.
+pub(crate) fn vars_file_error(typed: &Path, e: MdsError) -> MdsError {
+    match e {
+        MdsError::ImportError { .. } => MdsError::Io {
+            message: format!(
+                "--vars file must not be a symlink: {}",
+                mds::escape_path_for_message(&typed.to_string_lossy())
+            ),
+        },
+        other => other,
+    }
 }
 
 /// Result of [`build_runtime_vars`]: the resolved map plus intra-flag duplicate-key

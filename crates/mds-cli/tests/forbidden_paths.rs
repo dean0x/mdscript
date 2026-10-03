@@ -343,6 +343,48 @@ mod walker {
     }
 }
 
+// ── A symlinked --vars file is an I/O failure on every command (#157) ───────
+
+/// A `--vars` file that is a symlink is refused by every command that takes the flag as
+/// `mds watch` refuses it: `mds::io`, exit 2, `--vars file must not be a symlink: <path
+/// as typed>` (#157). `mds build` and `mds check` passed the library's own refusal through
+/// (`mds::import`, `symlinks are not allowed in vars file path: …`, exit 1), and
+/// `mds lint` showed it under that code. Control: the file the link leads to, named by its
+/// own path, is read.
+#[test]
+fn a_symlinked_vars_file_is_an_io_error_on_every_command() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.mds"), "Hello {{name}}!\n").unwrap();
+    std::fs::write(dir.path().join("real.json"), r#"{"name": "vars"}"#).unwrap();
+    if !common::make_symlink(&dir.path().join("real.json"), &dir.path().join("link.json")) {
+        // No symlink privilege (Windows without Developer Mode): nothing to refuse.
+        return;
+    }
+    for command in ["build", "check", "lint", "watch"] {
+        let (code, text) = run(dir.path(), &[command, "in.mds", "--vars", "link.json"]);
+        assert_eq!(code, Some(2), "{command}: exit 2; got: {text}");
+        assert!(text.contains("mds::io"), "{command}: mds::io; got: {text}");
+        assert!(
+            squash(&text).contains(&squash("--vars file must not be a symlink: link.json")),
+            "{command}: names the file as typed, in the words mds watch uses; got: {text}"
+        );
+        assert!(
+            !text.contains("mds::import") && !text.contains("symlinks are not allowed"),
+            "{command}: not the library's own refusal; got: {text}"
+        );
+    }
+
+    let (code, text) = run(
+        dir.path(),
+        &["build", "in.mds", "--vars", "real.json", "-o", "-"],
+    );
+    assert_eq!(code, Some(0), "control: the real file is read; got: {text}");
+    assert!(
+        text.contains("Hello vars!"),
+        "control: its variables are used; got: {text}"
+    );
+}
+
 // ── Stdin: the working directory is shown as "." ────────────────────────────
 //
 // Unix-only: a Windows directory name cannot hold a C0 control such as TAB or ESC,

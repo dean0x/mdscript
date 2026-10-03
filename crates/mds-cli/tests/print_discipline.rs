@@ -795,6 +795,13 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          on disk before it is replaced; no message shows it.",
     ),
     (
+        "build.rs",
+        "vars_file_error",
+        1,
+        "Names the typed `--vars` path through `mds::escape_path_for_message` of its \
+         lossy text when it is a symlink, for every command that takes the flag.",
+    ),
+    (
         "input.rs",
         "refusal",
         1,
@@ -823,13 +830,6 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
         "`to_str` takes the canonical path to read it, and `display` hands its directory, \
          lossless once that passed, to `anchor_base_dir`: arguments, not message text. \
          The message names the path through `safe_path`.",
-    ),
-    (
-        "watch.rs",
-        "canonicalize_vars_path",
-        1,
-        "Names the typed `--vars` path through `mds::escape_path_for_message` of its \
-         lossy text when it is a symlink.",
     ),
     (
         "watch.rs",

@@ -428,9 +428,10 @@ pub(crate) fn external_recovery_decision(
 /// `exists` probe — so before its directory is ever watched — with the message
 /// `check_symlink` gives an existing one (`mds::io`).
 ///
-/// Only the symlink refusal (`ImportError`) is reworded for the `--vars` flag; every
-/// other `check_symlink` error — a forbidden character in the resolved path, or a
-/// file removed since the `exists` probe — keeps its own message and code.
+/// Only the symlink refusal (`ImportError`) is reworded for the `--vars` flag, as every
+/// command words it ([`crate::build::vars_file_error`], #157); every other `check_symlink`
+/// error — a forbidden character in the resolved path, or a file removed since the
+/// `exists` probe — keeps its own message and code.
 pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<PathBuf>, MdsError> {
     if let Some(p) = &vars {
         crate::output::reject_forbidden_output_path("path", p.as_os_str())?;
@@ -438,15 +439,7 @@ pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<Pat
     match vars {
         Some(p) if p.exists() => mds::NativeFs::check_symlink(&p)
             .map(Some)
-            .map_err(|e| match e {
-                MdsError::ImportError { .. } => MdsError::Io {
-                    message: format!(
-                        "--vars file must not be a symlink: {}",
-                        mds::escape_path_for_message(&p.to_string_lossy())
-                    ),
-                },
-                other => other,
-            }),
+            .map_err(|e| crate::build::vars_file_error(&p, e)),
         other => Ok(other),
     }
 }
