@@ -1,5 +1,6 @@
 //! The one write primitive: every file `mds` writes goes through it —
 //! [`write_compiled`] for `mds build` and `mds watch` outputs and `.map` sidecars (#425),
+//! [`write_compiled_and_look`] for a directory build's outputs below an out-dir (#160),
 //! [`atomic_write_file`] for `mds init --force`'s starter, [`create_new`] for `mds init`'s
 //! starter without `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix`
 //! rewrites, [`write_over_own`] for an `mds watch` output after its source's change of kind
@@ -129,9 +130,12 @@
 //! then removed by its name, so one put there in between is removed instead.
 //!
 //! A directory build learns whether anything has a stale output's name from the write of
-//! the output beside it, which looks there, in the directory it went in, before it closes
-//! it ([`write_compiled_and_look`]): a name nothing has needs no removal, and no walk is
-//! made for one; anything there goes through [`remove_proven`].
+//! the output beside it, which looks there just after its rename, without following a
+//! symlink ([`write_compiled_and_look`]) — on unix with `fstatat(AT_SYMLINK_NOFOLLOW)` on
+//! the descriptor its walk opened, before it closes it; on Windows by path, as its write
+//! goes: a name nothing has needs no removal, and no walk is made for one; anything there,
+//! and a look that fails, is dealt with as before — removed, if at all, only through
+//! [`remove_proven`].
 //!
 //! # Contract (#226)
 //!
@@ -302,12 +306,14 @@ fn write_compiled_in(
 
 /// Write a compiled output as [`write_compiled`] does, then look at `beside`, a file in the
 /// same directory — a directory build's stale output, the other kind's of the same name —
-/// in that directory as the write's walk opened it, before it is closed: without following
-/// a symlink, and opening nothing (#160). Where nothing has its name there is nothing to
+/// without following a symlink, and never reading it (#160): on unix in that directory as
+/// the write's walk opened it, before it is closed; on Windows by path, as the write goes
+/// (the residual the module docs describe). Where nothing has its name there is nothing to
 /// prove or remove, and the second walk a removal makes is not needed; where something
-/// has it, or the look cannot tell, the caller removes it through [`remove_proven`], whose
-/// own walk and checks are made as for any removal. A `beside` that is not in the
-/// directory the output went in is not looked at, and is [`Beside::Something`].
+/// has it, or the look cannot tell, the caller deals with it as before — removing it, if
+/// at all, through [`remove_proven`], whose own walk and checks are made as for any
+/// removal. A `beside` that is not in the directory the output went in is not looked at,
+/// and is [`Beside::Something`].
 ///
 /// # Errors
 ///
