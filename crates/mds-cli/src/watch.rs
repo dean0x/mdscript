@@ -2157,11 +2157,11 @@ fn handle_fs_event_file(
     FileEventAction::Rebuild
 }
 
-/// Compile `entry`, compare with last-written content, resync watches, and write
+/// Compile `entry`, resync watches, compare with last-written content, and write
 /// if changed.  Called from both the idle-tick and the FS-event arm of file mode's live
 /// session (`file_startup::FileSession`'s `on_tick` and `on_message`) — the single
 /// canonical implementation of the
-/// compile→dedup→resync→write→settle sequence for single-file mode.
+/// compile→resync→route→dedup→write→settle sequence for single-file mode.
 ///
 /// `ctx` holds compile-time constants; `state` holds all mutable loop state;
 /// `watcher` is passed separately (non-Clone, distinct lifecycle role).
@@ -2170,7 +2170,8 @@ fn handle_fs_event_file(
 /// (#157). Every other outcome, failures included, keeps watching.
 ///
 /// # Invariants preserved
-/// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output.
+/// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output, by
+///   every compile that succeeds — its output refused or not written included (#257).
 /// - PF-004: all reads go through `compile_to_content`.
 /// - Error-settle: every failure — the vars file, the compile, the output route or its
 ///   #425 refusal, the write — goes through [`settle`], except a repeated stdout failure,
@@ -2221,32 +2222,9 @@ fn rebuild_file(
     let runtime_vars = resolved.vars.take();
 
     let t0 = Instant::now();
-    // Compile and admit as one step, so a failure of either is reported and settled the
-    // same way, and watching continues.
     let entry = &ctx.entry;
-    let routed = entry.compile(runtime_vars, ctx.quiet).and_then(|compiled| {
-        // The compiled kind's route, re-decided by every rebuild: one whose kind changed
-        // is written to that kind's output (#257) — only where nothing is, or over the
-        // file this session wrote there (#160).
-        let output_path = state.output.of(compiled.kind).clone();
-        // #425: a rebuild never writes over the entry — reachable after a failed startup
-        // compile, which refuses no route, and after a change of kind: the route of the
-        // compiled kind, or an explicit `-o`, can be the entry. A refused route writes
-        // nothing; the next rebuild routes again. No `-o` extension warning (`&None`):
-        // startup printed it for the path an explicit `-o` names, which every rebuild
-        // reuses.
-        admit_output(
-            written_path(&output_path),
-            entry.paths(),
-            &None,
-            compiled.kind,
-            ctx.quiet,
-        )
-        .map_err(miette::Error::from)?;
-        Ok((compiled, output_path))
-    });
-    let (compiled, output_path) = match routed {
-        Ok(routed) => routed,
+    let compiled = match entry.compile(runtime_vars, ctx.quiet) {
+        Ok(compiled) => compiled,
         Err(failure) => {
             settle(
                 SettleInto::File(state),
@@ -2256,6 +2234,50 @@ fn rebuild_file(
             return ControlFlow::Continue(());
         }
     };
+
+    // Freshness rule: always recompute dep set from fresh output — before the output's
+    // route is admitted, so the files a compile read are watched even when its output is
+    // refused, a dependency in a directory no earlier compile reported included (#257).
+    let deps = graph_keys(&compiled.dependencies);
+    let new_dirs = dirs_to_watch(&entry.canonical, &deps, ctx.vars_path.as_deref());
+    state.watched_dirs = resync_watches(
+        watcher,
+        &state.watched_dirs,
+        &new_dirs,
+        entry.dir_paths(),
+        vars_dir_paths(ctx.vars_path.as_deref(), ctx.vars_path_typed.as_deref()),
+    );
+    // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
+    // dirs removed by resync_watches are no longer in watched_dirs.
+    state.armed_dirs = state.watched_dirs.clone();
+    state.foi = files_of_interest(&entry.canonical, &deps, ctx.vars_path.as_deref());
+    // Update mtime snapshot after a compile (even if content unchanged).
+    state.last_mtimes = snapshot_state(&state.foi);
+
+    // The compiled kind's route, re-decided by every rebuild: one whose kind changed is
+    // written to that kind's output (#257) — only where nothing is, or over the file this
+    // session wrote there (#160).
+    let output_path = state.output.of(compiled.kind).clone();
+    // #425: a rebuild never writes over the entry — reachable after a failed startup
+    // compile, which refuses no route, and after a change of kind: the route of the
+    // compiled kind, or an explicit `-o`, can be the entry. A refused route writes
+    // nothing, and is reported and settled as a failed compile is; the next rebuild
+    // routes again. No `-o` extension warning (`&None`): startup printed it for the path
+    // an explicit `-o` names, which every rebuild reuses.
+    if let Err(refused) = admit_output(
+        written_path(&output_path),
+        entry.paths(),
+        &None,
+        compiled.kind,
+        ctx.quiet,
+    ) {
+        settle(
+            SettleInto::File(state),
+            Some(miette::Report::from(refused)),
+            Settle::MarkErrored(&entry.canonical),
+        );
+        return ControlFlow::Continue(());
+    }
 
     // The content-dedup key: where the output is written.
     let output_key = OutputKey::of(output_path.as_ref());
@@ -2282,23 +2304,6 @@ fn rebuild_file(
     if content_changed {
         crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
     }
-
-    // Freshness rule: always recompute dep set from fresh output.
-    let deps = graph_keys(&compiled.dependencies);
-    let new_dirs = dirs_to_watch(&ctx.entry.canonical, &deps, ctx.vars_path.as_deref());
-    state.watched_dirs = resync_watches(
-        watcher,
-        &state.watched_dirs,
-        &new_dirs,
-        ctx.entry.dir_paths(),
-        vars_dir_paths(ctx.vars_path.as_deref(), ctx.vars_path_typed.as_deref()),
-    );
-    // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
-    // dirs removed by resync_watches are no longer in watched_dirs.
-    state.armed_dirs = state.watched_dirs.clone();
-    state.foi = files_of_interest(&ctx.entry.canonical, &deps, ctx.vars_path.as_deref());
-    // Update mtime snapshot after a compile (even if content unchanged).
-    state.last_mtimes = snapshot_state(&state.foi);
 
     if !content_changed {
         return ControlFlow::Continue(());

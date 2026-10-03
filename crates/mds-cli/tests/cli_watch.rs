@@ -8268,6 +8268,110 @@ fn watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports() {
     }
 }
 
+/// A dependency outside the watched directory that a rebuild first imports has its
+/// directory watched even when that rebuild's output is refused (#257): the compile
+/// succeeded, so what it read is watched at once, and an edit to the dependency rebuilds
+/// its importer — refused and reported again — with native events only. Directory mode:
+/// an MDS module at the source's output (#425). File mode: `-o` names the entry, whose
+/// startup compile fails, so every rebuild that compiles is refused (#425); its refusal
+/// used to come before the rebuild watched what the compile read. A second refused edit
+/// to the entry is the barrier, as in
+/// [`watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports`]. A refused
+/// rebuild is reported for every event it runs on, and one save can make several, so
+/// `--debounce 100` gathers each save's events into one rebuild: once a save's refusal
+/// is on stderr, nothing of it is left to rebuild after the next edit.
+#[test]
+fn watch_arms_the_directory_of_a_dependency_a_refused_rebuild_imports() {
+    let import = "@import \"../shared/y.mds\" as y\n@include y\n";
+    let module_refusal = squash(&format!(
+        "cannot write {}: refusing to replace an MDS module",
+        Path::new("src").join("a.md").display()
+    ));
+    // (mode, working directory, arguments, the entry at startup, what startup reports,
+    // the refusal)
+    let sessions = [
+        (
+            "directory mode",
+            ".",
+            &["watch", "src"][..],
+            "A alone\n",
+            "refusing to replace an MDS module",
+            module_refusal,
+        ),
+        (
+            "file mode",
+            "src",
+            &["watch", "a.mds", "-o", "a.mds"][..],
+            "Hello {{name\n",
+            "mds::syntax",
+            entry_overwrite_refusal("a.mds"),
+        ),
+    ];
+    for (mode, cwd, args, startup, reported, refusal) in sessions {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        let (src, shared) = (base.join("src"), base.join("shared"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("y.mds"), "Y one\n").unwrap();
+        let entry = src.join("a.mds");
+        std::fs::write(&entry, startup).unwrap();
+        // Directory mode's output; file mode writes to `-o a.mds`, never here.
+        std::fs::write(src.join("a.md"), MODULE).unwrap();
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.join(cwd))
+                .args(args)
+                .args(["--debounce", "100", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        let refused = |stderr: &str| count_occurrences(&squash(stderr), &refusal);
+        let refused_after = |n: usize, what: &str| {
+            let seen = poll_tap_until(&tap, TIMEOUT, |seen| refused(seen) > n);
+            assert!(
+                seen.is_ok(),
+                "{mode}: {what} is refused; stderr: {}",
+                tap.text()
+            );
+            refused(&tap.text())
+        };
+        // Control: the startup writes nothing — directory mode's write is refused, file
+        // mode's compile fails.
+        let seen = refused(&wait_for_tap(&tap, reported, TIMEOUT));
+
+        write_atomic(&entry, import);
+        let seen = refused_after(seen, "the edit that adds the import");
+        let barrier = format!("{import}Barrier\n");
+        write_atomic(&entry, &barrier);
+        let seen = refused_after(seen, "the barrier edit");
+
+        write_atomic(&shared.join("y.mds"), "Y two\n");
+        refused_after(
+            seen,
+            "with native events only, an edit to the dependency a refused rebuild imported",
+        );
+        assert_eq!(
+            text_of(&src.join("a.md")).as_deref(),
+            Some(MODULE),
+            "{mode}: the module is kept; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&entry),
+            Some(barrier),
+            "{mode}: the entry is kept; stderr: {}",
+            tap.text()
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{mode}: watch keeps running after refused rebuilds; stderr: {}",
+            tap.text()
+        );
+        drop(child);
+    }
+}
+
 /// A dependency directory outside the directory argument whose watch failed at startup is
 /// not taken for armed: once it can be watched, the next rebuild arms it, and an edit to
 /// the dependency then rebuilds its importer, with native events only (#257). The
