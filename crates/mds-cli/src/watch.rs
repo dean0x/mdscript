@@ -48,7 +48,7 @@
 //! - Streams (#157): with `-o -`, stdout's reader going away ends the session with
 //!   `Stopped watching (stdout closed).` and verdict 0, since nothing can receive its
 //!   output any more; a closed stderr only loses the status lines. Once live
-//!   ([`go_live`]), a rebuild's output failure is reported where it can be and never
+//!   ([`live::run_session`]), a rebuild's output failure is reported where it can be and never
 //!   changes the exit code; a session that ends at startup exits as a batch run does.
 //!   Every status line goes through the CLI's stderr writer, which never panics.
 //! - Compile errors during watching never terminate the watcher.
@@ -78,9 +78,8 @@ use mds::MdsError;
 
 use crate::build::{
     admit_output, auto_detect_mds_file, build_runtime_vars, compile_inputs, compile_to_content,
-    emit_duplicate_var_warnings, load_config, resolve_dir_as_created, resolve_output_path_for_kind,
-    run_reads, source_inputs, write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig,
-    RuntimeVarArgs,
+    resolve_dir_as_created, resolve_output_path_for_kind, source_inputs, write_output,
+    CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
@@ -503,10 +502,10 @@ enum StopReason {
 /// Emit the session's last status line to stderr (unless quiet): `Stopped watching.`, or
 /// `Stopped watching (stdout closed).` when `-o -` lost its reader.
 ///
-/// Called at every point where a watch session ends without an error: Ctrl+C in both
-/// watch loops, and a gone stdout reader in file mode, at startup or on a rebuild. The
-/// verdict is 0 — the exit code of a live session ([`go_live`]); a session that stops at
-/// startup exits as a batch run with that verdict does (#157).
+/// Called at every point where a watch session ends without an error: Ctrl+C in the watch
+/// loop both modes share, and a gone stdout reader in file mode, at startup or on a
+/// rebuild. The verdict is 0 — the exit code of a live session ([`live::run_session`]); a
+/// session that stops at startup exits as a batch run with that verdict does (#157).
 fn stop_watching(quiet: bool, why: StopReason) {
     if quiet {
         return;
@@ -515,17 +514,6 @@ fn stop_watching(quiet: bool, why: StopReason) {
         StopReason::Interrupted => crate::output::ewriteln!("Stopped watching."),
         StopReason::StdoutClosed => crate::output::ewriteln!("Stopped watching (stdout closed)."),
     }
-}
-
-/// The session is live: every watched directory is armed and every baseline captured.
-///
-/// From here on a rebuild's output failure is reported as it happens and never changes
-/// how the session exits: the exit funnel applies its watch-session rule (#157). Only
-/// then is the readiness marker written, so a test that sees the marker sees a live
-/// session.
-fn go_live() {
-    crate::output::note_watch_session_live();
-    emit_ready_marker();
 }
 
 /// Test-only delay injected right after the startup output is published.
@@ -1569,6 +1557,17 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
     // Clamp poll_interval: 0 = disable; nonzero ≥ 50ms floor (reconcile rule).
     let tick_opt: Option<Duration> = clamp_poll_interval(poll_interval);
 
+    let session_args = SessionArgs {
+        out_dir,
+        vars,
+        set_vars,
+        set_string_vars,
+        clear,
+        debounce_ms: debounce,
+        quiet,
+        tick: tick_opt,
+    };
+
     if is_dir {
         // #413: the one directory-argument check every directory-mode subcommand makes
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`). It
@@ -1582,14 +1581,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
                 canonical,
                 what: Watched::Root,
             },
-            out_dir,
-            vars,
-            set_vars,
-            set_string_vars,
-            clear,
-            debounce,
-            quiet,
-            tick_opt,
+            session_args,
         )
     } else {
         // Reject a symlinked entry (build parity — PF-004); plain canonicalize would
@@ -1604,16 +1596,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
                 what: Watched::Entry,
             },
             output,
-            SessionArgs {
-                out_dir,
-                vars,
-                set_vars,
-                set_string_vars,
-                clear,
-                debounce_ms: debounce,
-                quiet,
-                tick: tick_opt,
-            },
+            session_args,
         )
     }
 }
@@ -3571,16 +3554,6 @@ fn compile_one_source(
     false
 }
 
-/// Return value from `dir_watch_startup` bundling the watcher, channel, state,
-/// liveness state, and context struct produced during startup.
-struct DirStartup {
-    watcher: RecommendedWatcher,
-    rx: mpsc::Receiver<Msg>,
-    state: DirWatchState,
-    liveness: LivenessState,
-    ctx: DirWatchCtx,
-}
-
 /// Compile-time context for directory-mode watch, parallel to `FileCompileCtx`.
 ///
 /// Groups the parameters resolved once at startup and threaded into every
@@ -3931,436 +3904,608 @@ fn handle_fs_event_dir(
     DirEventOutcome::Done
 }
 
-/// Perform all one-time startup work for directory-mode watch.
+/// Directory watch: `root.typed` is the directory as typed — `mds.json` is looked up from it
+/// (#413) and every status line names it, and the directories below it, by it (#390);
+/// `root.canonical` is its canonical form, which notify reports event paths under.
 ///
-/// Loads config, compiles each source once and writes its output (the content
-/// dedup records only what was written), sets up the watcher + Ctrl+C handler,
-/// seeds the mtime snapshot, and builds the context structs needed by the event
-/// loop.
+/// Startup runs in phases whose order the types enforce (#429, [`dir_startup`]):
+/// [`dir_startup::arm_pre_read`] arms the root, and the `--vars` file's directory outside
+/// it, before any source is read, [`dir_startup::startup_compile`] compiles each source once
+/// and writes its output, [`dir_startup::arm_deps_and_seed`] arms the directories of the
+/// dependencies outside the root and seeds what every rebuild reads, and
+/// [`dir_startup::Seeded::go_live`] goes live and watches until the session stops.
+fn run_watch_dir(root: WatchedPath, args: SessionArgs) -> Result<()> {
+    let armed = dir_startup::arm_pre_read(root, args)?;
+    let compiled = dir_startup::startup_compile(&armed)?;
+    dir_startup::arm_deps_and_seed(armed, compiled).go_live();
+    Ok(())
+}
+
+/// Directory mode's startup, in phases whose order the types enforce (#429).
 ///
-/// Extracted from `run_watch_dir` to separate the ~186-line setup from the
-/// event loop — each half is independently readable and the startup can be
-/// tested in isolation (review issue #3 / architecture.md).
-#[allow(clippy::too_many_arguments)]
-fn dir_watch_startup(
-    watch_root: WatchedPath,
-    out_dir: Option<PathBuf>,
-    vars: Option<PathBuf>,
-    set_vars: Vec<(String, String)>,
-    set_string_vars: Vec<(String, String)>,
-    clear: bool,
-    debounce_ms: u64,
-    quiet: bool,
-) -> Result<DirStartup> {
-    let working_dir = WorkingDir::record();
-    let root = watch_root.canonical.as_path();
-    // Load config once from the root directory, as typed, so a config error names
-    // `mds.json` as the input reaches it (`./mds.json`, `src/../mds.json`), never by its
-    // canonical absolute path (#413); the config directory it returns is canonical.
-    let config = load_config(&watch_root.typed)?;
-    // #326: keep the --vars argument as the user typed it (see FileCompileCtx's
-    // vars_path_typed doc for why) — `vars_path` below stays canonical for matching.
-    let vars_path_typed = vars.clone();
-    // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
-    // Also rejects a symlinked vars file at startup (build parity — PF-004).
-    let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
-    let static_set_vars = set_vars;
-    let static_set_string_vars = set_string_vars;
+/// Each phase takes the token only the phase before it makes, and every token's fields are
+/// private to this module, so nothing outside it can make one: an
+/// [`Armed`](dir_startup::Armed) comes only from [`dir_startup::arm_pre_read`], a
+/// [`Compiled`](dir_startup::Compiled) only from [`dir_startup::startup_compile`] given an
+/// `Armed`, a [`Seeded`](dir_startup::Seeded) only from [`dir_startup::arm_deps_and_seed`]
+/// given both, and the session goes live only from a `Seeded`
+/// ([`dir_startup::Seeded::go_live`]). That is the order the session's change detection
+/// rests on: the root armed recursively, and the `--vars` file's directory outside it,
+/// before the tree is walked or any source read; every source's `(mtime, size)` baseline
+/// taken before the first of them is read, and a dependency's as soon as the compile that
+/// reports it returns; the directories of the dependencies outside the root armed once
+/// every startup output is published; Ctrl+C wired last, with nothing but the loop after
+/// it.
+mod dir_startup {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::ops::ControlFlow;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    // Compute the OutputBase (Fix 2 — subtree mirroring). Reject `..` at startup. The
-    // out-dir's canonical form keeps the starts_with(&root) in-root exclusion check
-    // reliable even when cwd contains symlinks (root is already canonical — security #8).
-    let output_base = resolve_output_base(out_dir.as_ref(), &config)?;
+    use miette::Result;
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
-    // When the out-dir is inside root, exclude it from collection so the watcher
-    // doesn't self-pollute (AC-M7 / edge case 6).
-    let exclude_prefix: Option<PathBuf> = match &output_base {
-        OutputBase::Dir { canonical: d, .. } if d.starts_with(root) => Some(d.clone()),
-        _ => None,
+    use crate::build::{
+        build_runtime_vars, emit_duplicate_var_warnings, load_config, run_reads, source_inputs,
+        write_output, ProjectConfig, RuntimeVarArgs,
+    };
+    use crate::output::{
+        collect_mds_files, eprint_warning, is_partial, notify_cause, output_path_for, safe_inline,
+        safe_path, OutputBase, RootPaths,
     };
 
-    if !quiet {
-        crate::output::ewriteln!("Watching directory {}", safe_path(&watch_root.typed));
+    use super::{
+        baseline_path, canonicalize_vars_path, graph_key, graph_keys, handle_fs_event_dir, live,
+        liveness_probe_dir, resolve_output_base, settle_startup_error, shown_watched_dir,
+        snapshot_state, startup_race_probe, DirEventOutcome, DirWatchCtx, DirWatchState, FileStamp,
+        LivenessState, Msg, OutDirAnchor, SessionArgs, StampMap, StartupInto, StopReason,
+        WatchedPath, WorkingDir, MAX_COLLECT_DEPTH,
+    };
+
+    /// The root armed recursively, and the `--vars` file's directory outside it, before the
+    /// tree is walked or any source read: made only by [`arm_pre_read`].
+    pub(super) struct Armed {
+        /// The watched directory, as typed and canonical ([`super::Watched::Root`]).
+        root: WatchedPath,
+        /// `--out-dir`.
+        out_dir: Option<PathBuf>,
+        /// The working directory at startup, which every rebuild restores first.
+        working_dir: WorkingDir,
+        /// The `mds.json` in force, looked up from the root as typed.
+        config: Option<ProjectConfig>,
+        /// The `--vars` file, canonical: what notify names its events by (#326).
+        vars_path: Option<PathBuf>,
+        /// The `--vars` file as typed, which it is read and named by (#326).
+        vars_path_typed: Option<PathBuf>,
+        static_set_vars: Vec<(String, String)>,
+        static_set_string_vars: Vec<(String, String)>,
+        /// Where every output is written ([`OutputBase`]).
+        output_base: OutputBase,
+        /// The out-dir when it is inside the root, which the walk leaves out.
+        exclude_prefix: Option<PathBuf>,
+        /// The `--vars` file's directory when it is outside the root, armed on its own.
+        vars_dir_extra: Option<PathBuf>,
+        quiet: bool,
+        clear: bool,
+        debounce_ms: u64,
+        tick: Option<Duration>,
+        /// The channel the watcher sends on — and Ctrl+C, once the session is live.
+        tx: mpsc::Sender<Msg>,
+        rx: mpsc::Receiver<Msg>,
+        watcher: RecommendedWatcher,
     }
 
-    // Additionally watch the vars file's parent if it is outside root.
-    let vars_dir_extra: Option<PathBuf> = vars_path.as_deref().and_then(|vf| {
-        let parent = vf.parent()?;
-        // Only watch if outside root to avoid redundancy.
-        if !parent.starts_with(root) {
-            Some(parent.to_path_buf())
-        } else {
-            None
+    /// Every source compiled once, and its output written when it could be: made only by
+    /// [`startup_compile`].
+    pub(super) struct Compiled {
+        /// The dependency graph, what was written and where, and the sources errored.
+        state: DirWatchState,
+        /// Every source's `(mtime, size)`, taken before the first of them was read, and each
+        /// dependency's, taken as the compile that reported it returned.
+        pre_mtimes: StampMap,
+    }
+
+    /// Every directory armed and every baseline taken, with what every rebuild reads: made
+    /// only by [`arm_deps_and_seed`].
+    pub(super) struct Seeded {
+        /// The sender the watcher was armed with, which Ctrl+C is wired to.
+        tx: mpsc::Sender<Msg>,
+        rx: mpsc::Receiver<Msg>,
+        tick: Option<Duration>,
+        session: DirSession,
+    }
+
+    /// A directory-mode session once live ([`live::Session`]): what every rebuild reads, the
+    /// watcher, the loop state and the liveness probe's.
+    struct DirSession {
+        ctx: DirWatchCtx,
+        watcher: RecommendedWatcher,
+        state: DirWatchState,
+        liveness: LivenessState,
+    }
+
+    /// The `--vars` file's directory armed on its own, outside the root, in the two forms a
+    /// message names it by ([`shown_watched_dir`]): the canonical directory armed, and the
+    /// file's directory as typed.
+    fn extra_vars_dir<'a>(
+        vars_dir_extra: Option<&'a Path>,
+        vars_path_typed: Option<&'a Path>,
+    ) -> Option<RootPaths<'a>> {
+        vars_dir_extra
+            .zip(vars_path_typed)
+            .map(|(walked, typed)| RootPaths {
+                typed: mds::effective_parent(typed),
+                walked,
+            })
+    }
+
+    /// Record the working directory, load `mds.json`, check the `--vars` file and the
+    /// out-dir, and say what is watched; then arm the root, and the `--vars` file's
+    /// directory outside it, before the tree is walked or any source read.
+    pub(super) fn arm_pre_read(watch_root: WatchedPath, args: SessionArgs) -> Result<Armed> {
+        let SessionArgs {
+            out_dir,
+            vars,
+            set_vars,
+            set_string_vars,
+            clear,
+            debounce_ms,
+            quiet,
+            tick,
+        } = args;
+        let working_dir = WorkingDir::record();
+        let root = watch_root.canonical.as_path();
+        // Load config once from the root directory, as typed, so a config error names
+        // `mds.json` as the input reaches it (`./mds.json`, `src/../mds.json`), never by its
+        // canonical absolute path (#413); the config directory it returns is canonical.
+        let config = load_config(&watch_root.typed)?;
+        // #326: keep the --vars argument as the user typed it (see FileCompileCtx's
+        // vars_path_typed doc for why) — `vars_path` below stays canonical for matching.
+        let vars_path_typed = vars.clone();
+        // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
+        // Also rejects a symlinked vars file at startup (build parity).
+        let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
+        let static_set_vars = set_vars;
+        let static_set_string_vars = set_string_vars;
+
+        // Compute the OutputBase (Fix 2 — subtree mirroring). Reject `..` at startup. The
+        // out-dir's canonical form keeps the starts_with(&root) in-root exclusion check
+        // reliable even when cwd contains symlinks (root is already canonical — security #8).
+        let output_base = resolve_output_base(out_dir.as_ref(), &config)?;
+
+        // When the out-dir is inside root, exclude it from collection so the watcher
+        // doesn't self-pollute (AC-M7 / edge case 6).
+        let exclude_prefix: Option<PathBuf> = match &output_base {
+            OutputBase::Dir { canonical: d, .. } if d.starts_with(root) => Some(d.clone()),
+            _ => None,
+        };
+
+        if !quiet {
+            crate::output::ewriteln!("Watching directory {}", safe_path(&watch_root.typed));
         }
-    });
-    // That directory in the two forms a message names it by ([`shown_watched_dir`]).
-    let vars_dir = vars_dir_extra
-        .as_deref()
-        .zip(vars_path_typed.as_deref())
-        .map(|(walked, typed)| RootPaths {
-            typed: mds::effective_parent(typed),
-            walked,
+
+        // Additionally watch the vars file's parent if it is outside root.
+        let vars_dir_extra: Option<PathBuf> = vars_path.as_deref().and_then(|vf| {
+            let parent = vf.parent()?;
+            // Only watch if outside root to avoid redundancy.
+            if !parent.starts_with(root) {
+                Some(parent.to_path_buf())
+            } else {
+                None
+            }
         });
+        // That directory in the two forms a message names it by ([`shown_watched_dir`]).
+        let vars_dir = extra_vars_dir(vars_dir_extra.as_deref(), vars_path_typed.as_deref());
 
-    // ── Arm before publish (startup race) ─────────────────────────────────────
-    //
-    // The recursive root watch is armed BEFORE the tree is walked, before any
-    // source is read, and before any output is written, so that every in-root edit
-    // from this point on generates an event that is queued on `rx` and drained once
-    // the event loop starts. That is the primary detector and the cheapest one.
-    //
-    // The idle tick's content backstop (#321) is the second detector and covers what
-    // arming order cannot: a dependency whose directory is unknowable until the
-    // compile that reads it returns. Ordering is still what keeps that backstop cheap
-    // — arming first means the backstop almost never has to fire.
-    //
-    // Arming first also means the watcher observes the startup compile's own
-    // reads and writes. Three pre-existing guards absorb that, and all three are
-    // still in force:
-    //   1. `is_content_event` drops `Access(_)` — every read the compile performs.
-    //   2. `handle_fs_event_dir` keeps only paths with a `.mds` extension, so the
-    //      `.md`/`.json` outputs this startup writes can never seed a rebuild.
-    //      This is the guard that covers in-place output (`OutputBase::NextToSource`),
-    //      where outputs land beside their sources inside the watched root.
-    //   3. `last_written` content-dedup in `compile_one_source`.
-    //
-    // When `--out-dir` sits inside the root, arming early widens the window in
-    // which the watcher sees its own outputs, so that case is covered twice:
-    // `exclude_prefix` keeps the out-dir out of `collect_mds_files`, and
-    // `handle_fs_event_dir` drops every event whose path is under an
-    // `OutputBase::Dir` before the extension filter even runs. The out-dir is
-    // created by the first write *after* the recursive watch is armed, so notify
-    // adds it to the watch set — the exclusion is what keeps that harmless.
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_fs = tx.clone();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            crate::output::panic_in_handler("notify");
-            let _ = tx_fs.send(Msg::Fs(res));
-        },
-        notify::Config::default(),
-    )
-    .map_err(|e| {
-        miette::miette!(
-            "failed to initialize file watcher: {}",
-            safe_inline(notify_cause(&e))
+        // ── Arm before publish (startup race) ─────────────────────────────────
+        //
+        // The recursive root watch is armed BEFORE the tree is walked, before any
+        // source is read, and before any output is written, so that every in-root edit
+        // from this point on generates an event that is queued on `rx` and drained once
+        // the event loop starts. That is the primary detector and the cheapest one.
+        //
+        // The idle tick's content backstop (#321) is the second detector and covers what
+        // arming order cannot: a dependency whose directory is unknowable until the
+        // compile that reads it returns. Ordering is still what keeps that backstop cheap
+        // — arming first means the backstop almost never has to fire.
+        //
+        // Arming first also means the watcher observes the startup compile's own
+        // reads and writes. Three pre-existing guards absorb that, and all three are
+        // still in force:
+        //   1. `is_content_event` drops `Access(_)` — every read the compile performs.
+        //   2. `handle_fs_event_dir` keeps only paths with a `.mds` extension, so the
+        //      `.md`/`.json` outputs this startup writes can never seed a rebuild.
+        //      This is the guard that covers in-place output (`OutputBase::NextToSource`),
+        //      where outputs land beside their sources inside the watched root.
+        //   3. `last_written` content-dedup in `compile_one_source`.
+        //
+        // When `--out-dir` sits inside the root, arming early widens the window in
+        // which the watcher sees its own outputs, so that case is covered twice:
+        // `exclude_prefix` keeps the out-dir out of `collect_mds_files`, and
+        // `handle_fs_event_dir` drops every event whose path is under an
+        // `OutputBase::Dir` before the extension filter even runs. The out-dir is
+        // created by the first write *after* the recursive watch is armed, so notify
+        // adds it to the watch set — the exclusion is what keeps that harmless.
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let tx_fs = tx.clone();
+        let mut watcher = RecommendedWatcher::new(
+            move |res| {
+                crate::output::panic_in_handler("notify");
+                let _ = tx_fs.send(Msg::Fs(res));
+            },
+            notify::Config::default(),
         )
-    })?;
-
-    // Watch the root recursively.
-    watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
-        miette::miette!(
-            "failed to watch directory {}: {}\n\
-                 hint: on Linux you may need to increase fs.inotify.max_user_watches",
-            safe_path(&shown_watched_dir(root, watch_root.root_paths(), vars_dir)),
-            safe_inline(notify_cause(&e))
-        )
-    })?;
-
-    // Watch the vars dir if it is outside root — soft warning on failure (mirrors the
-    // external-dep-dir convention and the liveness probe's best-effort re-arm semantics;
-    // a transient failure must not abort the session, applies the reconcile rule / consistency fix).
-    if let Some(ref vd) = vars_dir_extra {
-        if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
-            eprint_warning(&format!(
-                "warning: failed to watch vars directory {}: {}",
-                safe_path(&shown_watched_dir(vd, watch_root.root_paths(), vars_dir)),
+        .map_err(|e| {
+            miette::miette!(
+                "failed to initialize file watcher: {}",
                 safe_inline(notify_cause(&e))
-            ));
+            )
+        })?;
+
+        // Watch the root recursively.
+        watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
+            miette::miette!(
+                "failed to watch directory {}: {}\n\
+                     hint: on Linux you may need to increase fs.inotify.max_user_watches",
+                safe_path(&shown_watched_dir(root, watch_root.root_paths(), vars_dir)),
+                safe_inline(notify_cause(&e))
+            )
+        })?;
+
+        // Watch the vars dir if it is outside root — soft warning on failure (mirrors the
+        // external-dep-dir convention and the liveness probe's best-effort re-arm
+        // semantics; a transient failure must not abort the session, applies the reconcile
+        // rule / consistency fix).
+        if let Some(ref vd) = vars_dir_extra {
+            if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
+                eprint_warning(&format!(
+                    "warning: failed to watch vars directory {}: {}",
+                    safe_path(&shown_watched_dir(vd, watch_root.root_paths(), vars_dir)),
+                    safe_inline(notify_cause(&e))
+                ));
+            }
         }
+
+        Ok(Armed {
+            root: watch_root,
+            out_dir,
+            working_dir,
+            config,
+            vars_path,
+            vars_path_typed,
+            static_set_vars,
+            static_set_string_vars,
+            output_base,
+            exclude_prefix,
+            vars_dir_extra,
+            quiet,
+            clear,
+            debounce_ms,
+            tick,
+            tx,
+            rx,
+            watcher,
+        })
     }
 
-    // Startup compile: compile all .mds files found under root.
-    let all_files = collect_mds_files(root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
-    let resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: vars_path_typed.clone(),
-        set_vars: static_set_vars.clone(),
-        set_string_vars: static_set_string_vars.clone(),
-    })?;
-    emit_duplicate_var_warnings(&resolved, quiet);
-    let runtime_vars = resolved.vars;
+    /// Once [`arm_pre_read`] has armed what the walk and the compiles read: walk the root,
+    /// take every source's baseline before the first is read, then compile each source once
+    /// and write its output. A source whose compile or write fails is reported and marked
+    /// errored, and watching continues.
+    pub(super) fn startup_compile(armed: &Armed) -> Result<Compiled> {
+        let Armed {
+            root: watch_root,
+            out_dir,
+            config,
+            vars_path,
+            vars_path_typed,
+            static_set_vars,
+            static_set_string_vars,
+            output_base,
+            exclude_prefix,
+            ..
+        } = armed;
+        let root = watch_root.canonical.as_path();
+        let quiet = armed.quiet;
 
-    // Build the dependency graph and compile all files at startup.
-    let mut state = DirWatchState {
-        forward_deps: HashMap::new(),
-        errored: HashSet::new(),
-        known_files: BTreeSet::new(),
-        last_written: HashMap::new(),
-        outputs: HashMap::new(),
-        kept: HashMap::new(),
-        // Recorded below, once the startup writes have made the out-dir.
-        out_dir: None,
-        reads: run_reads(vars_path.as_deref(), config.as_ref()),
-        external_dep_dirs: BTreeSet::new(),
-        last_mtimes: HashMap::new(),
-    };
+        // Startup compile: compile all .mds files found under root.
+        let all_files = collect_mds_files(root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: vars_path_typed.clone(),
+            set_vars: static_set_vars.clone(),
+            set_string_vars: static_set_string_vars.clone(),
+        })?;
+        emit_duplicate_var_warnings(&resolved, quiet);
+        let runtime_vars = resolved.vars;
 
-    // Capture the content baseline BEFORE the first read of any source, mirroring
-    // single-file mode (#321). What makes the backstop sound is that this snapshot is
-    // strictly older than the reads whose results were published: an edit that lands
-    // anywhere after this point therefore registers as a difference on the first idle
-    // tick, even when no filesystem event announced it.
-    //
-    // Taking it afterwards instead would be worse than useless — it would record the
-    // *post*-edit state as the baseline, so the watcher would believe an output
-    // compiled from the pre-edit content was up to date, and hold that belief forever.
-    //
-    // Keys go through `graph_key`, exactly as `known_files` below does. `tracked_set`
-    // is built from those canonical keys, so a raw key here would never match one of
-    // them — every source would read as "not in the baseline", i.e. changed, and the
-    // first idle tick would recompile the whole tree. `collect_mds_files` walks a root
-    // that is already canonical, but a symlinked subdirectory inside it still resolves
-    // to something else, and the rest of this function does not assume otherwise.
-    let mut pre_mtimes = snapshot_state(
-        &all_files
-            .iter()
-            .map(|p| graph_key(p))
-            .collect::<HashSet<_>>(),
-    );
+        // Build the dependency graph and compile all files at startup.
+        let mut state = DirWatchState {
+            forward_deps: HashMap::new(),
+            errored: HashSet::new(),
+            known_files: BTreeSet::new(),
+            last_written: HashMap::new(),
+            outputs: HashMap::new(),
+            kept: HashMap::new(),
+            // Recorded below, once the startup writes have made the out-dir.
+            out_dir: None,
+            reads: run_reads(vars_path.as_deref(), config.as_ref()),
+            external_dep_dirs: BTreeSet::new(),
+            last_mtimes: HashMap::new(),
+        };
 
-    for source in &all_files {
-        let key = graph_key(source);
-        match watch_root.compile_source(source, runtime_vars.clone(), quiet) {
-            Ok(compiled) => {
-                let dep_paths = graph_keys(&compiled.dependencies);
+        // Capture the content baseline BEFORE the first read of any source, mirroring
+        // single-file mode (#321). What makes the backstop sound is that this snapshot is
+        // strictly older than the reads whose results were published: an edit that lands
+        // anywhere after this point therefore registers as a difference on the first idle
+        // tick, even when no filesystem event announced it.
+        //
+        // Taking it afterwards instead would be worse than useless — it would record the
+        // *post*-edit state as the baseline, so the watcher would believe an output
+        // compiled from the pre-edit content was up to date, and hold that belief forever.
+        //
+        // Keys go through `graph_key`, exactly as `known_files` below does. `tracked_set`
+        // is built from those canonical keys, so a raw key here would never match one of
+        // them — every source would read as "not in the baseline", i.e. changed, and the
+        // first idle tick would recompile the whole tree. `collect_mds_files` walks a root
+        // that is already canonical, but a symlinked subdirectory inside it still resolves
+        // to something else, and the rest of this function does not assume otherwise.
+        let mut pre_mtimes = snapshot_state(
+            &all_files
+                .iter()
+                .map(|p| graph_key(p))
+                .collect::<HashSet<_>>(),
+        );
 
-                // Track external dep dirs (DD3 — cross-root).
-                for dep in &dep_paths {
-                    if let Some(parent) = dep.parent() {
-                        if !parent.starts_with(root) {
-                            state.external_dep_dirs.insert(parent.to_path_buf());
+        for source in &all_files {
+            let key = graph_key(source);
+            match watch_root.compile_source(source, runtime_vars.clone(), quiet) {
+                Ok(compiled) => {
+                    let dep_paths = graph_keys(&compiled.dependencies);
+
+                    // Track external dep dirs (DD3 — cross-root).
+                    for dep in &dep_paths {
+                        if let Some(parent) = dep.parent() {
+                            if !parent.starts_with(root) {
+                                state.external_dep_dirs.insert(parent.to_path_buf());
+                            }
+                        }
+                    }
+
+                    // Baseline each dependency the instant the compile that discovered it
+                    // returns, not in one pass after the whole tree is done. A dependency's
+                    // existence is unknown until it is read, so its baseline can never
+                    // precede its own read — but it can precede everything else, which
+                    // shrinks its blind window from "the rest of startup" to the gap
+                    // between one read and the next statement. `baseline_path` keeps the
+                    // pre-compile value for any dependency that is also an in-root source:
+                    // the older of the two is always the safe one.
+                    for dep in &dep_paths {
+                        baseline_path(dep, &mut pre_mtimes);
+                    }
+
+                    state.forward_deps.insert(key.clone(), dep_paths);
+                    state.known_files.insert(key.clone());
+
+                    // Partials (DD2): track in graph but don't emit their own output.
+                    if !is_partial(source) {
+                        // Derive the output path from the compiled kind (intrinsic extension).
+                        //
+                        // Invariant: `key` is `graph_key(source)` for a source the walker
+                        // collected under the already-canonical `root`, and the walker skips
+                        // symlinked files and directories — so the canonical key is still
+                        // prefixed by `root` and the out-of-root flatten arm cannot fire
+                        // here (#217).
+                        let ext = compiled.kind.extension();
+                        let out = output_path_for(&key, watch_root.root_paths(), output_base, ext);
+                        // The content dedup holds only what was written: a source whose
+                        // write failed is errored instead, so the next rebuild with a real
+                        // change writes it even when its content has not changed (#257) —
+                        // and nothing it did not write is ever its to remove (#160).
+                        let inputs = source_inputs(&key, &compiled.dependencies, &state.reads);
+                        if let Err(e) =
+                            write_output(Some(&out), &compiled.content, &inputs, quiet, true)
+                        {
+                            settle_startup_error(StartupInto::Dir(&mut state), Some(e), &key);
+                        } else {
+                            state.wrote(&key, &out, compiled.content);
                         }
                     }
                 }
-
-                // Baseline each dependency the instant the compile that discovered it
-                // returns, not in one pass after the whole tree is done. A dependency's
-                // existence is unknown until it is read, so its baseline can never
-                // precede its own read — but it can precede everything else, which
-                // shrinks its blind window from "the rest of startup" to the gap
-                // between one read and the next statement. `baseline_path` keeps the
-                // pre-compile value for any dependency that is also an in-root source:
-                // the older of the two is always the safe one.
-                for dep in &dep_paths {
-                    baseline_path(dep, &mut pre_mtimes);
-                }
-
-                state.forward_deps.insert(key.clone(), dep_paths);
-                state.known_files.insert(key.clone());
-
-                // Partials (DD2): track in graph but don't emit their own output.
-                if !is_partial(source) {
-                    // Derive the output path from the compiled kind (intrinsic extension).
-                    //
-                    // Invariant: `key` is `graph_key(source)` for a source the walker
-                    // collected under the already-canonical `root`, and the walker skips
-                    // symlinked files and directories — so the canonical key is still
-                    // prefixed by `root` and the out-of-root flatten arm cannot fire
-                    // here (#217).
-                    let ext = compiled.kind.extension();
-                    let out = output_path_for(&key, watch_root.root_paths(), &output_base, ext);
-                    // The content dedup holds only what was written: a source whose
-                    // write failed is errored instead, so the next rebuild with a real
-                    // change writes it even when its content has not changed (#257) —
-                    // and nothing it did not write is ever its to remove (#160).
-                    let inputs = source_inputs(&key, &compiled.dependencies, &state.reads);
-                    if let Err(e) =
-                        write_output(Some(&out), &compiled.content, &inputs, quiet, true)
-                    {
-                        settle_startup_error(StartupInto::Dir(&mut state), Some(e), &key);
-                    } else {
-                        state.wrote(&key, &out, compiled.content);
-                    }
+                Err(failure) => {
+                    // `key` is new to the graph — each source is compiled once here — so the
+                    // errored source's dependency set is the empty one.
+                    settle_startup_error(StartupInto::Dir(&mut state), failure.unreported(), &key);
+                    state.known_files.insert(key);
                 }
             }
-            Err(failure) => {
-                // `key` is new to the graph — each source is compiled once here — so the
-                // errored source's dependency set is the empty one.
-                settle_startup_error(StartupInto::Dir(&mut state), failure.unreported(), &key);
-                state.known_files.insert(key);
+        }
+        // The directory the startup writes made, or found, is the one the first rebuild's
+        // write compares (#160).
+        state.out_dir = OutDirAnchor::record(out_dir.as_deref(), config.as_ref());
+
+        Ok(Compiled { state, pre_mtimes })
+    }
+
+    /// Arm the directories of the dependencies outside the root that the startup compile
+    /// reported — one that cannot be armed is a warning — then seed what every rebuild
+    /// reads: the merged baseline, the liveness probe's state and the session's context.
+    pub(super) fn arm_deps_and_seed(armed: Armed, compiled: Compiled) -> Seeded {
+        let Armed {
+            root: watch_root,
+            out_dir: _,
+            working_dir,
+            config: _,
+            vars_path,
+            vars_path_typed,
+            static_set_vars,
+            static_set_string_vars,
+            output_base,
+            exclude_prefix,
+            vars_dir_extra,
+            quiet,
+            clear,
+            debounce_ms,
+            tick,
+            tx,
+            rx,
+            mut watcher,
+        } = armed;
+        let Compiled {
+            mut state,
+            pre_mtimes,
+        } = compiled;
+        let root = watch_root.canonical.as_path();
+
+        // All startup outputs are now published — the positive-control injection point.
+        startup_race_probe();
+
+        // Watch external dep dirs NonRecursive (DD3). Cross-root dependencies are only
+        // discovered by the startup compile, so unlike the root they cannot be armed
+        // before the first read; an edit landing in that window produces no event for
+        // anyone. What closes it is the baseline [`startup_compile`] captured, which
+        // predates the read — the idle tick's content backstop compares against it and
+        // recompiles (#321). `MDS_WATCH_READY` still marks the instant both detectors
+        // cover every path, so tests can synchronise on arming rather than on a tick.
+        let vars_dir = extra_vars_dir(vars_dir_extra.as_deref(), vars_path_typed.as_deref());
+        for ext_dir in &state.external_dep_dirs {
+            if let Err(e) = watcher.watch(ext_dir, RecursiveMode::NonRecursive) {
+                eprint_warning(&format!(
+                    "warning: failed to watch external dep dir {}: {}",
+                    safe_path(&shown_watched_dir(
+                        ext_dir,
+                        watch_root.root_paths(),
+                        vars_dir
+                    )),
+                    safe_inline(notify_cause(&e))
+                ));
             }
         }
-    }
-    // The directory the startup writes made, or found, is the one the first rebuild's
-    // write compares (#160).
-    state.out_dir = OutDirAnchor::record(out_dir.as_deref(), config.as_ref());
 
-    // All startup outputs are now published — the positive-control injection point.
-    startup_race_probe();
-
-    // Watch external dep dirs NonRecursive (DD3). Cross-root dependencies are only
-    // discovered by the startup compile, so unlike the root they cannot be armed
-    // before the first read; an edit landing in that window produces no event for
-    // anyone. What closes it is the baseline captured above, which predates the read
-    // — the idle tick's content backstop compares against it and recompiles (#321).
-    // `MDS_WATCH_READY` still marks the instant both detectors cover every path, so
-    // tests can synchronise on arming rather than on a tick.
-    for ext_dir in &state.external_dep_dirs {
-        if let Err(e) = watcher.watch(ext_dir, RecursiveMode::NonRecursive) {
-            eprint_warning(&format!(
-                "warning: failed to watch external dep dir {}: {}",
-                safe_path(&shown_watched_dir(
-                    ext_dir,
-                    watch_root.root_paths(),
-                    vars_dir
-                )),
-                safe_inline(notify_cause(&e))
-            ));
+        // Seed the content backstop's baseline (#321).
+        //
+        // The merge DIRECTION is load-bearing, exactly as in single-file mode: the
+        // pre-compile pairs in `pre_mtimes` overwrite the post-compile ones, because only
+        // they predate the reads whose results were published. Inverting the merge — or
+        // switching to one that keeps the value already present — would silently restore
+        // the lost-save bug while every test still passes.
+        let mut last_mtimes = snapshot_state(&state.tracked_set());
+        // Witness for the assertion below, taken before the merge consumes `pre_mtimes`.
+        // Chosen by `min()` rather than by iteration order: a `HashMap` yields an arbitrary
+        // first element, which would make a failure reproduce only sometimes.
+        //
+        // This can only fire when the two snapshots actually differ for the witness path —
+        // i.e. when the file changed during startup, which is the `startup-race-probe`
+        // suite's scenario and no other. It is a canary against a future refactor inverting
+        // the merge, not a runtime guarantee, and it is deliberately `debug_assert`: the
+        // property is a property of the code's shape, not of any input, so a release-time
+        // check would guard nothing a debug run does not already catch.
+        let witness: Option<(PathBuf, FileStamp)> =
+            pre_mtimes.keys().min().map(|p| (p.clone(), pre_mtimes[p]));
+        last_mtimes.extend(pre_mtimes);
+        if let Some((path, pre)) = witness {
+            debug_assert_eq!(
+                last_mtimes.get(&path).copied(),
+                Some(pre),
+                "baseline merge inverted: a pre-compile (mtime, size) must survive the merge \
+                 with the post-compile snapshot, or an edit made during startup can never \
+                 register as a difference on the idle tick"
+            );
         }
-    }
+        state.last_mtimes = last_mtimes;
 
-    // Seed the content backstop's baseline (#321).
-    //
-    // The merge DIRECTION is load-bearing, exactly as in single-file mode: the
-    // pre-compile pairs in `pre_mtimes` overwrite the post-compile ones, because only
-    // they predate the reads whose results were published. Inverting the merge — or
-    // switching to one that keeps the value already present — would silently restore
-    // the lost-save bug while every test still passes.
-    let mut last_mtimes = snapshot_state(&state.tracked_set());
-    // Witness for the assertion below, taken before the merge consumes `pre_mtimes`.
-    // Chosen by `min()` rather than by iteration order: a `HashMap` yields an arbitrary
-    // first element, which would make a failure reproduce only sometimes.
-    //
-    // This can only fire when the two snapshots actually differ for the witness path —
-    // i.e. when the file changed during startup, which is the `startup-race-probe`
-    // suite's scenario and no other. It is a canary against a future refactor inverting
-    // the merge, not a runtime guarantee, and it is deliberately `debug_assert`: the
-    // property is a property of the code's shape, not of any input, so a release-time
-    // check would guard nothing a debug run does not already catch.
-    let witness: Option<(PathBuf, FileStamp)> =
-        pre_mtimes.keys().min().map(|p| (p.clone(), pre_mtimes[p]));
-    last_mtimes.extend(pre_mtimes);
-    if let Some((path, pre)) = witness {
-        debug_assert_eq!(
-            last_mtimes.get(&path).copied(),
-            Some(pre),
-            "baseline merge inverted: a pre-compile (mtime, size) must survive the merge \
-             with the post-compile snapshot, or an edit made during startup can never \
-             register as a difference on the idle tick"
-        );
-    }
-    state.last_mtimes = last_mtimes;
-
-    // Track which external dep dirs were successfully armed during startup (lines above
-    // called watcher.watch() for each; treat all existing dirs as armed, missing ones
-    // as unarmed so the first tick arms them when they reappear).
-    let startup_armed_external: BTreeSet<PathBuf> = state
-        .external_dep_dirs
-        .iter()
-        .filter(|d| d.exists())
-        .cloned()
-        .collect();
-
-    let liveness = LivenessState {
-        first_tick: true,
-        root_was_missing: !root.exists(),
-        // root_armed = true when root existed at startup (watcher.watch was just called).
-        // false when root was missing at startup so the first tick re-arms it on appearance.
-        root_armed: root.exists(),
-        // Seed with any external dep dirs that don't exist yet so their first
-        // appearance is treated as a recovery edge (not a per-tick walk).
-        missing_external_dirs: state
+        // Track which external dep dirs were successfully armed during startup (lines above
+        // called watcher.watch() for each; treat all existing dirs as armed, missing ones
+        // as unarmed so the first tick arms them when they reappear).
+        let startup_armed_external: BTreeSet<PathBuf> = state
             .external_dep_dirs
             .iter()
-            .filter(|d| !d.exists())
+            .filter(|d| d.exists())
             .cloned()
-            .collect(),
-        armed_external_dirs: startup_armed_external,
-    };
+            .collect();
 
-    let ctx = DirWatchCtx {
-        root: watch_root,
-        working_dir,
-        vars_path,
-        vars_path_typed,
-        static_set_vars,
-        static_set_string_vars,
-        output_base,
-        exclude_prefix,
-        vars_dir_extra,
-        clear,
-        debounce_ms,
-        quiet,
-    };
+        let liveness = LivenessState {
+            first_tick: true,
+            root_was_missing: !root.exists(),
+            // root_armed = true when root existed at startup (watcher.watch was just called).
+            // false when root was missing at startup so the first tick re-arms it on appearance.
+            root_armed: root.exists(),
+            // Seed with any external dep dirs that don't exist yet so their first
+            // appearance is treated as a recovery edge (not a per-tick walk).
+            missing_external_dirs: state
+                .external_dep_dirs
+                .iter()
+                .filter(|d| !d.exists())
+                .cloned()
+                .collect(),
+            armed_external_dirs: startup_armed_external,
+        };
 
-    // ── Ctrl+C: install LAST, once the loop that can service it is about to run ──
-    //
-    // See the matching note in `run_watch_file`. Dir mode is the worse case: an
-    // installed handler only enqueues `Msg::Interrupt`, which nothing reads until
-    // `run_watch_dir`'s loop starts, and startup here compiles and writes every
-    // source in the tree. Installing before that pass means Ctrl+C during a
-    // large-tree startup is swallowed for its whole duration, and the tool writes
-    // the remaining outputs and exits 0. Nothing above needs the handler.
-    let tx_ctrlc = tx.clone();
-    let _ = ctrlc::set_handler(move || {
-        crate::output::panic_in_handler("ctrlc");
-        let _ = tx_ctrlc.send(Msg::Interrupt);
-    });
+        let ctx = DirWatchCtx {
+            root: watch_root,
+            working_dir,
+            vars_path,
+            vars_path_typed,
+            static_set_vars,
+            static_set_string_vars,
+            output_base,
+            exclude_prefix,
+            vars_dir_extra,
+            clear,
+            debounce_ms,
+            quiet,
+        };
 
-    // Root, external dep dirs and the vars dir are all armed — the watch is live.
-    go_live();
-
-    Ok(DirStartup {
-        watcher,
-        rx,
-        state,
-        liveness,
-        ctx,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_watch_dir(
-    root: WatchedPath,
-    out_dir: Option<PathBuf>,
-    vars: Option<PathBuf>,
-    set_vars: Vec<(String, String)>,
-    set_string_vars: Vec<(String, String)>,
-    clear: bool,
-    debounce_ms: u64,
-    quiet: bool,
-    tick: Option<Duration>,
-) -> Result<()> {
-    let DirStartup {
-        mut watcher,
-        rx,
-        mut state,
-        mut liveness,
-        ctx,
-    } = dir_watch_startup(
-        root,
-        out_dir,
-        vars,
-        set_vars,
-        set_string_vars,
-        clear,
-        debounce_ms,
-        quiet,
-    )?;
-
-    // ── Watch loop ────────────────────────────────────────────────────────────
-    let mut clock = TickClock::new(tick);
-    loop {
-        match clock.recv_next(&rx) {
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Ok(None) => {
-                // Idle tick — run liveness probe (reconcile rule, DD1).
-                liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
-                continue;
-            }
-            Ok(Some(msg)) => match handle_fs_event_dir(msg, &ctx, &rx, &mut state) {
-                DirEventOutcome::Skip | DirEventOutcome::Done => {}
-                DirEventOutcome::Stop => {
-                    stop_watching(ctx.quiet, StopReason::Interrupted);
-                    return Ok(());
-                }
+        Seeded {
+            tx,
+            rx,
+            tick,
+            session: DirSession {
+                ctx,
+                watcher,
+                state,
+                liveness,
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 
-    stop_watching(ctx.quiet, StopReason::Interrupted);
-    Ok(())
+    impl Seeded {
+        /// Every watch armed and every baseline taken: go live — Ctrl+C wired last — and
+        /// watch until the session stops ([`live::run_session`]).
+        pub(super) fn go_live(self) {
+            let Seeded {
+                tx,
+                rx,
+                tick,
+                session,
+            } = self;
+            live::run_session(tx, rx, tick, session);
+        }
+    }
+
+    impl live::Session for DirSession {
+        fn is_quiet(&self) -> bool {
+            self.ctx.quiet
+        }
+
+        fn on_tick(&mut self) -> ControlFlow<StopReason> {
+            // Idle tick — run liveness probe (reconcile rule, DD1).
+            liveness_probe_dir(
+                &self.ctx,
+                &mut self.watcher,
+                &mut self.liveness,
+                &mut self.state,
+            );
+            ControlFlow::Continue(())
+        }
+
+        fn on_message(&mut self, msg: Msg, rx: &mpsc::Receiver<Msg>) -> ControlFlow<StopReason> {
+            match handle_fs_event_dir(msg, &self.ctx, rx, &mut self.state) {
+                DirEventOutcome::Skip | DirEventOutcome::Done => ControlFlow::Continue(()),
+                DirEventOutcome::Stop => ControlFlow::Break(StopReason::Interrupted),
+            }
+        }
+    }
 }
 
 /// Process a batch of changed `.mds` paths in directory mode.
