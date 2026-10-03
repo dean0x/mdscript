@@ -912,13 +912,6 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
          there, each escaped through `safe_file_display` — naming no path.",
     ),
     (
-        "watch.rs",
-        "safe_inline(&e)",
-        1,
-        "An `MdsError` from `probe_and_remove_stale`, whose text names the stale output \
-         as shown through `safe_path` and its cause through `io_cause` (#390).",
-    ),
-    (
         "output.rs",
         "not_removed.cause()",
         1,
@@ -929,10 +922,12 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
     (
         "watch.rs",
         "safe_inline(not_removed.cause())",
-        1,
+        2,
         "A `write::NotRemoved`'s cause, escaped where it is made — an io error through \
          `io_cause`, a fixed refusal, or one naming the refused directory as shown \
-         through `safe_path` — and escaped again, which changes nothing (#160).",
+         through `safe_path` — and escaped again, which changes nothing: the warning that \
+         a deleted source's output, and the one that the other kind's output after a \
+         change of kind, could not be removed (#160).",
     ),
 ];
 

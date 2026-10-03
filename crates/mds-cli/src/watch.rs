@@ -83,9 +83,8 @@ use crate::build::{
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
-    notify_cause, output_base_no_ext, output_path_for, output_stem_for, probe_and_remove_stale,
-    resolve_output_base, safe_inline, safe_path, stdout_failure, write_stdout, OutputBase,
-    Panicked, RootPaths, StdoutOutcome, WriteTarget,
+    notify_cause, output_path_for, resolve_output_base, safe_inline, safe_path, stdout_failure,
+    write_stdout, OutputBase, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
 use crate::write::{remove_proven, DirIdentity, NotRemoved, Removal};
 
@@ -1121,40 +1120,89 @@ fn below_checked_out_dir(anchor: Option<&OutDirAnchor>, target: &WriteTarget) ->
     }
 }
 
-/// Remove `out`, the output a deleted source had, as every deletion below the out-dir is
-/// made (#160): the out-dir checked first, as before a write — one the typed path leads
-/// elsewhere from refuses the removal — and the file removed below the directory that
-/// check found ([`below_checked_out_dir`]), through no symlink and only as a regular file
-/// ([`remove_proven`]). Reported as `Removed <out> (source deleted)`, or a warning that it
-/// could not be.
-fn remove_output_of_deleted_source(
+/// Why a session retires one of its outputs (#160), which decides how a removal is told.
+#[derive(Clone, Copy)]
+enum Retirement {
+    /// Its source was deleted: a removal prints `Removed <output> (source deleted)`.
+    SourceDeleted,
+    /// Its source now compiles to the other kind, whose output was just written: a
+    /// removal is silent, as cleaning up after a change of kind always was.
+    KindChanged,
+}
+
+/// Retire `out`, an output its source no longer has (#160). `written` is what this
+/// session last wrote there, if it wrote there at all, and `now` what the out-dir check
+/// made before this found.
+///
+/// The file is removed only if this session wrote it and it still holds exactly those
+/// bytes, and only as every deletion below the out-dir is made: below the directory that
+/// check found ([`below_checked_out_dir`]) — one the typed path leads elsewhere from
+/// refuses the removal — through no symlink and only as a regular file
+/// ([`remove_proven`]). A file this session did not write, or one changed since it was
+/// written, is kept, with one notice saying which (none under `--quiet`). A file that is
+/// not there is not mentioned.
+fn retire_output(
     out: &WriteTarget,
-    mut out_dir: Option<&mut OutDirAnchor>,
-    last_written: &mut HashMap<PathBuf, String>,
+    anchor: Option<&OutDirAnchor>,
+    now: OutDirNow,
+    written: Option<String>,
+    why: Retirement,
     quiet: bool,
 ) {
-    let removal = match check_out_dir(out_dir.as_deref_mut(), last_written) {
+    if !out.path.exists() {
+        return;
+    }
+    let Some(written) = written else {
+        if !quiet {
+            crate::output::ewriteln!(
+                "Kept {}: not written by this session",
+                safe_path(&out.shown)
+            );
+        }
+        return;
+    };
+    let removal = match now {
         OutDirNow::Elsewhere => Err(NotRemoved::out_dir_moved()),
         OutDirNow::Unchanged | OutDirNow::New => {
-            remove_proven(&below_checked_out_dir(out_dir.as_deref(), out), |_| {
-                Ok(true)
+            remove_proven(&below_checked_out_dir(anchor, out), |file| {
+                holds_exactly(file, &written)
             })
         }
     };
     match removal {
         Ok(Removal::Removed) => {
-            if !quiet {
+            if let (Retirement::SourceDeleted, false) = (why, quiet) {
                 crate::output::ewriteln!("Removed {} (source deleted)", safe_path(&out.shown));
             }
         }
-        // Every regular file is the one to remove here, so none is kept.
-        Ok(Removal::Missing | Removal::Kept) => {}
-        Err(not_removed) => eprint_warning(&format!(
-            "warning: could not remove {}: {}",
-            safe_path(&out.shown),
-            safe_inline(not_removed.cause())
-        )),
+        Ok(Removal::Kept) => {
+            if !quiet {
+                crate::output::ewriteln!(
+                    "Kept {}: changed since it was written",
+                    safe_path(&out.shown)
+                );
+            }
+        }
+        Ok(Removal::Missing) => {}
+        Err(not_removed) => match why {
+            Retirement::SourceDeleted => eprint_warning(&format!(
+                "warning: could not remove {}: {}",
+                safe_path(&out.shown),
+                safe_inline(not_removed.cause())
+            )),
+            Retirement::KindChanged => eprint_warning(&format!(
+                "warning: could not remove stale output {}: {}",
+                safe_path(&out.shown),
+                safe_inline(not_removed.cause())
+            )),
+        },
     }
+}
+
+/// Whether `file` holds exactly `written`: read no further than one byte past it.
+fn holds_exactly(file: &mut std::fs::File, written: &str) -> std::io::Result<bool> {
+    let len = written.len() as u64;
+    Ok(mds::read_at_most(file, len.saturating_add(1), len)? == written.as_bytes())
 }
 
 // ── Watched paths ─────────────────────────────────────────────────────────────
@@ -1485,14 +1533,11 @@ enum CompileWriteOutcome {
     /// output of that kind takes. `mds watch` keeps watching. `Some` is the failure to
     /// report; `None` a compile that panicked, which the panic hook reported (#389).
     CompileFailed(Option<miette::Report>),
-    /// Compiled and routed, but not written. The route the compiled kind decided and the
-    /// dependencies the compile reported stay the session's (#257): every rebuild writes
-    /// there and is triggered by them. `mds watch` keeps watching. `failure`: `Some` to
-    /// report; `None` a repeat of a stdout failure reported already
-    /// ([`OutputWrite::Failed`]).
+    /// Compiled and routed, but not written. The dependencies the compile reported stay
+    /// the session's (#257): every rebuild is triggered by them. `mds watch` keeps
+    /// watching. `failure`: `Some` to report, naming the route of the compiled kind;
+    /// `None` a repeat of a stdout failure reported already ([`OutputWrite::Failed`]).
     WriteFailed {
-        /// Where the compiled kind is written; `None` is stdout (`-o -`).
-        output_path: Option<WriteTarget>,
         /// Transitive dependency paths, as graph keys ([`graph_keys`]).
         deps: Vec<PathBuf>,
         failure: Option<miette::Report>,
@@ -1571,7 +1616,7 @@ fn write_session_output(
 ///
 /// Returns a [`CompileWriteOutcome`]. `CompileFailed` and `WriteFailed` are failures
 /// `mds watch` reports and keeps watching through — a failed write still carries the
-/// route and the dependencies its compile decided (#257); `StdoutClosed` ends the
+/// dependencies its compile reported (#257); `StdoutClosed` ends the
 /// session before it goes live, with exit 0 (#157). The `Err` this function
 /// itself returns is an output route no rebuild can use, which ends `mds watch` at
 /// startup (exit 2), since every rebuild writes where startup resolved: a route that
@@ -1622,7 +1667,6 @@ fn compile_and_write(
                 compiled.content,
             )),
             OutputWrite::Failed(failure) => CompileWriteOutcome::WriteFailed {
-                output_path,
                 deps: graph_keys(&compiled.dependencies),
                 failure,
             },
@@ -1679,12 +1723,12 @@ impl OutputKey {
 /// resolve never gets here: it ends `mds watch` at startup.
 #[derive(Debug, PartialEq, Eq)]
 enum OutputRoute {
-    /// Every rebuild writes here: the route of the kind the startup compile produced,
-    /// written or not, or the path an explicit `-o` names whatever the kind. `None` is
-    /// stdout (`-o -`).
-    Decided(Option<WriteTarget>),
-    /// The startup compile failed, so the output's kind is unknown: the route of each
-    /// kind, of which the first compile whose route is admitted takes its kind's.
+    /// The path an explicit `-o` names: every output is written there, whatever its
+    /// kind. `None` is stdout (`-o -`).
+    Named(Option<WriteTarget>),
+    /// No `-o`: the route of each kind, resolved at startup, and every output takes its
+    /// own kind's — after a startup compile that failed, and when an edit changes the
+    /// kind (#257, #160).
     ByKind {
         markdown: Option<WriteTarget>,
         messages: Option<WriteTarget>,
@@ -1692,11 +1736,11 @@ enum OutputRoute {
 }
 
 impl OutputRoute {
-    /// The route an output of `kind` takes: the decided one whatever the kind, or else
+    /// The route an output of `kind` takes: the named one whatever the kind, or else
     /// that kind's.
     fn of(&self, kind: OutputKind) -> &Option<WriteTarget> {
         match self {
-            Self::Decided(route) => route,
+            Self::Named(route) => route,
             Self::ByKind { markdown, messages } => match kind {
                 OutputKind::Markdown => markdown,
                 OutputKind::Messages => messages,
@@ -1704,11 +1748,16 @@ impl OutputRoute {
         }
     }
 
-    /// Decide the route an output of `kind` takes ([`Self::of`]): every later output
-    /// takes it whatever its kind. A decided route stays as it is.
-    fn decide(&mut self, kind: OutputKind) {
-        if let Self::ByKind { .. } = self {
-            *self = Self::Decided(self.of(kind).clone());
+    /// The route an output of `kind` no longer takes once it is written: the other
+    /// kind's — whose output a change of kind leaves behind (#160) — and none for a
+    /// named route, which every kind takes.
+    fn other_than(&self, kind: OutputKind) -> Option<&WriteTarget> {
+        match self {
+            Self::Named(_) => None,
+            Self::ByKind { markdown, messages } => match kind {
+                OutputKind::Markdown => messages.as_ref(),
+                OutputKind::Messages => markdown.as_ref(),
+            },
         }
     }
 }
@@ -1732,7 +1781,8 @@ struct FileWatchState {
     last_mtimes: StampMap,
     /// Content-dedup map: what was last written, by where it was written.
     last_written: HashMap<OutputKey, String>,
-    /// Where every rebuild writes ([`OutputRoute::of`], [`OutputRoute::decide`]).
+    /// Where every rebuild writes ([`OutputRoute::of`]), and the output a change of kind
+    /// leaves behind ([`OutputRoute::other_than`]).
     output: OutputRoute,
     /// The out-dir the output is written below, checked before every write; `None` for
     /// `-o` and for an output beside the entry.
@@ -1943,11 +1993,15 @@ fn rebuild_file(
     // same way, and watching continues.
     let entry = &ctx.entry;
     let routed = entry.compile(runtime_vars, ctx.quiet).and_then(|compiled| {
+        // The compiled kind's route, re-decided by every rebuild: one whose kind changed
+        // is written to that kind's output, as at startup (#257, #160).
         let output_path = state.output.of(compiled.kind).clone();
         // #425: a rebuild never writes over the entry — reachable after a failed startup
-        // compile, which refuses no route: the route of the compiled kind, or an
-        // explicit `-o`, can be the entry. No `-o` extension warning (`&None`): startup
-        // printed it for the path an explicit `-o` names, which every rebuild reuses.
+        // compile, which refuses no route, and after a change of kind: the route of the
+        // compiled kind, or an explicit `-o`, can be the entry. A refused route writes
+        // nothing; the next rebuild routes again. No `-o` extension warning (`&None`):
+        // startup printed it for the path an explicit `-o` names, which every rebuild
+        // reuses.
         admit_output(
             written_path(&output_path),
             entry.paths(),
@@ -1956,10 +2010,6 @@ fn rebuild_file(
             ctx.quiet,
         )
         .map_err(miette::Error::from)?;
-        // After a failed startup compile, the first route admitted is decided by its
-        // kind, and this rebuild and every later one write there; a refused one is not
-        // kept (#257).
-        state.output.decide(compiled.kind);
         Ok((compiled, output_path))
     });
     let (compiled, output_path) = match routed {
@@ -2040,6 +2090,20 @@ fn rebuild_file(
             state.last_written.insert(output_key, compiled.content);
             if let Some(anchor) = &mut state.out_dir {
                 anchor.written();
+            }
+            // A change of kind (#160): the other kind's output is retired only if this
+            // session wrote it, and removed only while it holds what was written.
+            if let Some(stale) = state.output.other_than(compiled.kind).cloned() {
+                if let Some(written) = state.last_written.remove(&OutputKey::of(Some(&stale))) {
+                    retire_output(
+                        &stale,
+                        state.out_dir.as_ref(),
+                        out_dir,
+                        Some(written),
+                        Retirement::KindChanged,
+                        ctx.quiet,
+                    );
+                }
             }
         }
         // Not written: `last_written` keeps what was last written, so the next rebuild
@@ -2334,9 +2398,19 @@ fn run_watch_file(
     // the entry file itself (#425): refused at startup, exit 2, before anything is
     // written. A compile or write error is reported, and watching continues.
     let startup = compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet)?;
-    let (output_route, initial_deps, initial_content) = match startup {
+    // The route each output takes: an explicit `-o` names one whatever the kind; without
+    // it, the route of each kind is resolved now and every output takes its own kind's
+    // (#257, #160) — after a startup compile that failed, whose kind is unknown, and when
+    // an edit changes the kind — so a `.json` output is never written to `.md`. A route
+    // that fails to resolve is refused here, exit 2: no rebuild could write anywhere
+    // else. Every rebuild refuses and reports a route that is the entry (#425).
+    let route_of =
+        |kind| resolve_output_path_for_kind(Some(entry.paths()), &output, &out_dir, &config, kind);
+    // What the startup wrote and where, if it wrote, and the dependencies its compile
+    // reported.
+    let (initial_written, initial_deps) = match startup {
         CompileWriteOutcome::Written((output_path, deps, content)) => {
-            (OutputRoute::Decided(output_path), deps, content)
+            (Some((output_path, content)), deps)
         }
         // stdout's reader is gone before the session went live: it stops here, and its
         // verdict is 0 — a closed pipe never changes the exit code (#157).
@@ -2345,52 +2419,39 @@ fn run_watch_file(
             return Ok(());
         }
         // Compiled and routed, but not written: report it and keep watching, with the
-        // route the compiled kind decided and the dependencies the compile reported — a
-        // `.json` output stays `.json`, and an edit to a dependency rebuilds (#257).
-        // Nothing was written, so the dedup map below stays empty and the next rebuild
-        // writes even when its output has not changed.
-        CompileWriteOutcome::WriteFailed {
-            output_path,
-            deps,
-            failure,
-        } => {
+        // dependencies the compile reported — an edit to one rebuilds (#257). Nothing was
+        // written, so the dedup map below stays empty and the next rebuild writes even
+        // when its output has not changed.
+        CompileWriteOutcome::WriteFailed { deps, failure } => {
             settle_startup_error(StartupInto::File, failure, &entry.canonical);
-            (OutputRoute::Decided(output_path), deps, String::new())
+            (None, deps)
         }
         CompileWriteOutcome::CompileFailed(e) => {
             // Initial compile error: print and continue watching (entry dir still
-            // watched).
+            // watched). Nothing is written now.
             settle_startup_error(StartupInto::File, e, &entry.canonical);
-            // The kind is unknown, and with it the route an output of that kind takes: the
-            // route of each kind is resolved now, and the first compile whose route is
-            // admitted takes its kind's (#257) — a `.json` output is never written to
-            // `.md`. A route that fails to resolve is refused here as after a successful
-            // compile (exit 2): no rebuild could write anywhere else. Nothing is written
-            // now, and every rebuild refuses and reports a route that is the entry (#425).
-            let route_of = |kind| {
-                resolve_output_path_for_kind(Some(entry.paths()), &output, &out_dir, &config, kind)
-            };
-            let markdown = route_of(OutputKind::Markdown)?;
-            let route = if output.is_some() {
+            if output.is_some() {
                 // An explicit `-o` names the route whatever the kind. Its refusal is
                 // dropped here: admitting it only decides whether the `-o` extension
                 // warning, which announces a write, is printed — never for an output that
                 // is the entry.
                 let _ = admit_output(
-                    written_path(&markdown),
+                    written_path(&route_of(OutputKind::Markdown)?),
                     entry.paths(),
                     &output,
                     OutputKind::Markdown,
                     quiet,
                 );
-                OutputRoute::Decided(markdown)
-            } else {
-                OutputRoute::ByKind {
-                    markdown,
-                    messages: route_of(OutputKind::Messages)?,
-                }
-            };
-            (route, vec![], String::new())
+            }
+            (None, vec![])
+        }
+    };
+    let output_route = if output.is_some() {
+        OutputRoute::Named(route_of(OutputKind::Markdown)?)
+    } else {
+        OutputRoute::ByKind {
+            markdown: route_of(OutputKind::Markdown)?,
+            messages: route_of(OutputKind::Messages)?,
         }
     };
 
@@ -2442,13 +2503,13 @@ fn run_watch_file(
 
     // Record the dedup baseline. The event loop has not started, so nothing can
     // consult this map before it is populated (guard 3 above).
-    // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
-    // initial_content is empty when the initial compile or write failed (above), and a
-    // failed compile leaves the route to the first compile whose route is admitted. In
-    // either case leave last_written empty so the next successful rebuild always writes.
+    // Reuse the content the startup wrote (issue 3 — no second compile needed). When the
+    // initial compile or write failed (above) nothing was written, and an empty output is
+    // not recorded either: last_written stays empty so the next successful rebuild always
+    // writes.
     let mut last_written: HashMap<OutputKey, String> = HashMap::new();
-    if let (OutputRoute::Decided(written), false) = (&output_route, initial_content.is_empty()) {
-        last_written.insert(OutputKey::of(written.as_ref()), initial_content);
+    if let Some((written, content)) = initial_written.filter(|(_, content)| !content.is_empty()) {
+        last_written.insert(OutputKey::of(written.as_ref()), content);
     }
 
     let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
@@ -2588,8 +2649,13 @@ struct DirWatchState {
     errored: HashSet<PathBuf>,
     /// Last-seen collected `.mds` set for reconcile/rename detection.
     known_files: BTreeSet<PathBuf>,
-    /// Content-dedup map keyed by the path each output is written to (`WriteTarget.path`).
+    /// Content-dedup map keyed by the path each output is written to (`WriteTarget.path`):
+    /// what this session last wrote there, and so the proof a removal asks for (#160).
     last_written: HashMap<PathBuf, String>,
+    /// The output each source last had written this session, by source: where a deleted
+    /// source's outputs are looked for (#160). A source with no entry — a partial, a
+    /// dependency outside the root, one never written — has none to remove.
+    outputs: HashMap<PathBuf, WriteTarget>,
     /// The out-dir every output is written below, checked before each write; `None` when
     /// outputs go beside their sources.
     out_dir: Option<OutDirAnchor>,
@@ -2613,7 +2679,7 @@ impl DirWatchState {
         src: &Path,
         dep_paths: Vec<PathBuf>,
         root: &Path,
-        out: Option<&Path>,
+        out: Option<&WriteTarget>,
         content: Option<String>,
     ) {
         // Track external dep dirs (DD3 — cross-root).
@@ -2627,9 +2693,17 @@ impl DirWatchState {
         self.forward_deps.insert(src.to_path_buf(), dep_paths);
         self.errored.remove(src);
         self.known_files.insert(src.to_path_buf());
-        if let (Some(out_path), Some(c)) = (out, content) {
-            self.last_written.insert(out_path.to_path_buf(), c);
+        if let (Some(out), Some(content)) = (out, content) {
+            self.wrote(src, out, content);
         }
+    }
+
+    /// `content` was written to `out`, the output of `src`: what a later write may skip as
+    /// unchanged and a removal asks the file to still hold, and where the source's
+    /// outputs are once it is deleted (#160).
+    fn wrote(&mut self, src: &Path, out: &WriteTarget, content: String) {
+        self.last_written.insert(out.path.clone(), content);
+        self.outputs.insert(src.to_path_buf(), out.clone());
     }
 
     /// Record a compile error for `src`, **keeping** whatever dep set the last
@@ -2675,23 +2749,52 @@ impl DirWatchState {
     }
 
     /// Remove every GRAPH record of `src` — its forward edges, its error flag and its
-    /// known-files membership — without touching `last_written`.
-    ///
-    /// This is the whole of `forget` for a source that never had an output of its own:
-    /// an out-of-root dependency, which is a graph node only (DD3). `last_written` is
-    /// keyed by OUTPUT path, and guessing an output path for such a source means running
-    /// it through the out-of-root flatten arm, which yields a key that belongs to an
-    /// in-root source instead (#217).
+    /// known-files membership.
     fn forget_graph(&mut self, src: &Path) {
         self.forward_deps.remove(src);
         self.errored.remove(src);
         self.known_files.remove(src);
     }
 
-    /// Remove all state for a deleted source and its output.
-    fn forget(&mut self, src: &Path, out: &Path) {
-        self.last_written.remove(out);
+    /// Remove all state for `src`, a source that is gone: its graph records, and the
+    /// record of its output with what was written there, so nothing written for it is
+    /// this session's to remove any more (#160). The output is the one recorded when it
+    /// was written, never one guessed from the source's path: a dependency outside the
+    /// root has none, and a guess for one took the out-of-root flatten arm and named an
+    /// in-root source's output (#217).
+    fn forget(&mut self, src: &Path) {
+        if let Some(out) = self.outputs.remove(src) {
+            self.last_written.remove(&out.path);
+        }
         self.forget_graph(src);
+    }
+
+    /// Retire the outputs of `src`, a deleted source, and forget it (#160): the output it
+    /// was last written to and the other kind's beside it, each removed only if this
+    /// session wrote it and it is unchanged, or else kept ([`retire_output`]). A source
+    /// that is there again — unlinked and created anew within the batch, as an editor's
+    /// save, a branch checkout or `git stash` does — keeps its output and its state: the
+    /// event that created it rebuilds it.
+    fn retire_deleted(&mut self, src: &Path, quiet: bool) {
+        if src.exists() {
+            return;
+        }
+        if let Some(out) = self.outputs.get(src).cloned() {
+            let now = check_out_dir(self.out_dir.as_mut(), &mut self.last_written);
+            for ext in ["md", "json"] {
+                let candidate = out.sibling(|path| path.with_extension(ext));
+                let written = self.last_written.remove(&candidate.path);
+                retire_output(
+                    &candidate,
+                    self.out_dir.as_ref(),
+                    now,
+                    written,
+                    Retirement::SourceDeleted,
+                    quiet,
+                );
+            }
+        }
+        self.forget(src);
     }
 }
 
@@ -2815,46 +2918,33 @@ fn compile_one_source(
                                 elapsed
                             );
                         }
-                        // AC-FUNC-23 (stale-output cleanup on format-flip in watch mode):
-                        // probe for the wrong-extension sibling and unlink it — but ONLY
-                        // when the tool itself wrote that sibling this session (gate on
-                        // last_written membership). This prevents clobbering a hand-authored
-                        // file that happens to share the stem (e.g. notes.md kept next to
-                        // notes.mds which now compiles to notes.json). Issue 1.
-                        //
-                        // This unlink must NOT trigger the watcher: `out` is the NEW
-                        // output path we just wrote; the stale sibling has a DIFFERENT
-                        // extension, so it is outside the `last_written` map and the
-                        // `is_content_event` gate will drop any inotify events it causes.
-                        // The watcher self-trigger guard (content-dedup / last_written)
-                        // also covers the freshly written `out` — the next event for that
-                        // path will find identical content and skip the write.
-                        let base_no_ext =
-                            output_stem_for(src, watch_root.root_paths(), output_base);
-                        let stale_path = base_no_ext
-                            .path
-                            .with_extension(compiled.kind.stale_extension());
-                        // Remove the stale-extension sibling from last_written so the key
-                        // doesn't accumulate stale entries (memory hygiene). The remove()
-                        // return value tells us whether this tool wrote the stale path.
-                        let tool_wrote_stale = state.last_written.remove(&stale_path).is_some();
-                        if tool_wrote_stale {
-                            // Removed below the directory the write's check found, as the
-                            // output was written there (#160). A rebuild's failure never
-                            // changes how the session exits, so this one stays the warning
-                            // it was (#157).
-                            let stale_stem =
-                                below_checked_out_dir(state.out_dir.as_ref(), &base_no_ext);
-                            if let Err(e) = probe_and_remove_stale(&stale_stem, compiled.kind) {
-                                eprint_warning(&format!("warning: {}", safe_inline(&e)));
-                            }
+                        // A change of kind (#160): the other kind's output beside `out` —
+                        // named from `out` itself, so `a.b.mds`'s is `a.b.md`, never the
+                        // `a.md` written for `a.mds` — is retired only if this session
+                        // wrote it, and removed only while it holds what was written. A
+                        // hand-written `notes.md` beside `notes.mds`, which now compiles
+                        // to `notes.json`, is never touched. The removal, below the
+                        // directory the write's check found, triggers no rebuild: it is
+                        // no `.mds` file. A rebuild's failure never changes how the
+                        // session exits, so one to remove it stays a warning (#157).
+                        let stale = out
+                            .sibling(|path| path.with_extension(compiled.kind.stale_extension()));
+                        if let Some(written) = state.last_written.remove(&stale.path) {
+                            retire_output(
+                                &stale,
+                                state.out_dir.as_ref(),
+                                out_dir,
+                                Some(written),
+                                Retirement::KindChanged,
+                                quiet,
+                            );
                         }
 
                         state.record_success(
                             src,
                             dep_paths,
                             root,
-                            Some(&out.path),
+                            Some(&out),
                             Some(compiled.content),
                         );
                         return true;
@@ -3396,6 +3486,7 @@ fn dir_watch_startup(
         errored: HashSet::new(),
         known_files: BTreeSet::new(),
         last_written: HashMap::new(),
+        outputs: HashMap::new(),
         // Recorded below, once the startup writes have made the out-dir.
         out_dir: None,
         external_dep_dirs: BTreeSet::new(),
@@ -3468,11 +3559,12 @@ fn dir_watch_startup(
                     let out = output_path_for(&key, watch_root.root_paths(), &output_base, ext);
                     // The content dedup holds only what was written: a source whose
                     // write failed is errored instead, so the next rebuild with a real
-                    // change writes it even when its content has not changed (#257).
+                    // change writes it even when its content has not changed (#257) —
+                    // and nothing it did not write is ever its to remove (#160).
                     if let Err(e) = write_output(Some(&out), &compiled.content, quiet, true) {
                         settle_startup_error(StartupInto::Dir(&mut state), Some(e), &key);
                     } else {
-                        state.last_written.insert(out.path, compiled.content);
+                        state.wrote(&key, &out, compiled.content);
                     }
                 }
             }
@@ -3732,31 +3824,10 @@ fn process_dir_batch_vars_changed(
     let mut any_changed = false;
     let all_sources: Vec<PathBuf> = state.known_files.iter().cloned().collect();
 
-    // Determine which known sources no longer exist — their output files must be
-    // removed just as in the incremental deletion step (step 5).
-    let deleted: Vec<&PathBuf> = all_sources.iter().filter(|p| !p.exists()).collect();
-    for del_src in &deleted {
-        // Source is gone — we don't know the extension it used. Probe both; name each
-        // output as typed (#390).
-        let stem = output_stem_for(del_src, watch_root.root_paths(), output_base);
-        for ext in &["md", "json"] {
-            let out = stem.sibling(|p| p.with_extension(ext));
-            if out.path.exists() {
-                remove_output_of_deleted_source(
-                    &out,
-                    state.out_dir.as_mut(),
-                    &mut state.last_written,
-                    quiet,
-                );
-                // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
-                // (forward_deps, errored, known_files, last_written).
-                state.forget(del_src, &out.path);
-            }
-        }
-        // Ensure the source is cleaned from state even if neither sibling existed.
-        state.forward_deps.remove(*del_src);
-        state.errored.remove(*del_src);
-        state.known_files.remove(*del_src);
+    // Determine which known sources no longer exist — their outputs are retired just as
+    // in the incremental deletion step (step 5), by the same rule (#160).
+    for del_src in all_sources.iter().filter(|p| !p.exists()) {
+        state.retire_deleted(del_src, quiet);
     }
 
     // Snapshot the old maps, clear them so compile_one_source's record_success
@@ -3847,21 +3918,9 @@ fn process_dir_batch_incremental(
             // `forward_deps`, and `known_files` now so it doesn't accumulate as a ghost
             // entry and waste per-batch allocation on every subsequent real-change event.
             if !deleted.contains(src) {
-                if is_in_root {
-                    // Source is gone — probe both .md and .json to clean up either sibling.
-                    let base_no_ext = output_base_no_ext(src, root, output_base);
-                    for ext in &["md", "json"] {
-                        let out = base_no_ext.with_extension(ext);
-                        state.forget(src, &out);
-                    }
-                } else {
-                    // An external dep never had an output, so there is no sibling to
-                    // forget. Probing through `output_base_no_ext` would take the
-                    // out-of-root flatten arm and forget `<out-dir>/<file name>.md` —
-                    // an entry belonging to the IN-ROOT source with that file name,
-                    // whose next rebuild would then rewrite identical bytes (#217).
-                    state.forget_graph(src);
-                }
+                // Its output, if it had one, is the one recorded for it: an external dep
+                // has none, so nothing an in-root source wrote is forgotten for it (#217).
+                state.forget(src);
             }
             continue;
         }
@@ -3894,27 +3953,10 @@ fn process_dir_batch_incremental(
         }
     }
 
-    // 5. Deletions: after importers recompiled, clean up graph + outputs.
+    // 5. Deletions: after importers recompiled, retire the outputs and forget the graph
+    //    records of each deleted source (#160).
     for del_src in &deleted {
-        // Source is gone — we don't know the extension it used. Probe both; name each
-        // output as typed (#390).
-        let stem = output_stem_for(del_src, watch_root.root_paths(), output_base);
-        for ext in &["md", "json"] {
-            let out = stem.sibling(|p| p.with_extension(ext));
-            if out.path.exists() {
-                remove_output_of_deleted_source(
-                    &out,
-                    state.out_dir.as_mut(),
-                    &mut state.last_written,
-                    quiet,
-                );
-            }
-            state.forget(del_src, &out.path);
-        }
-        // Ensure source is cleaned even if no outputs were found.
-        state.forward_deps.remove(del_src);
-        state.errored.remove(del_src);
-        state.known_files.remove(del_src);
+        state.retire_deleted(del_src, quiet);
     }
 
     // 6. Prune external_dep_dirs to only dirs still referenced by live forward_deps.
@@ -5198,6 +5240,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            outputs: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5235,6 +5278,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            outputs: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5261,10 +5305,10 @@ mod tests {
     /// #217: pruning a ghost EXTERNAL dep must not forget an in-root source's output.
     ///
     /// A dependency outside the watched root never had an output of its own, so there is
-    /// no sibling to forget. Probing for one through `output_base_no_ext` takes the
-    /// out-of-root flatten arm and yields `<out-dir>/<file name>`, which is exactly the
-    /// path an IN-ROOT source with the same file name owns. The prune then dropped that
-    /// source's `last_written` entry and its next rebuild rewrote identical bytes.
+    /// none to forget. A probe for one from its path took the out-of-root flatten arm and
+    /// yielded `<out-dir>/<file name>`, which is exactly the path an IN-ROOT source with
+    /// the same file name owns. The prune then dropped that source's `last_written` entry
+    /// and its next rebuild rewrote identical bytes.
     ///
     /// Reachable: an importer whose cross-root `@import` target is deleted leaves the
     /// vanished dep in `errored`, and every later real-change batch re-seeds `errored`.
@@ -5295,6 +5339,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            outputs: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5363,6 +5408,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            outputs: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5492,10 +5538,9 @@ mod tests {
         );
     }
 
-    /// #257: a write that fails after the compile succeeded keeps what the compile
-    /// decided — the route of its kind, `.json` for a messages template, and the
-    /// dependencies it reported — and reports the failure naming that output. Only a
-    /// compile that fails leaves the kind unknown.
+    /// #257: a write that fails after the compile succeeded keeps the dependencies the
+    /// compile reported, and reports the failure naming the output of the compiled kind —
+    /// `.json` for a messages template. Only a compile that fails leaves the kind unknown.
     #[test]
     fn compile_and_write_tells_a_failed_write_from_a_failed_compile() {
         let dir = tempfile::tempdir().unwrap();
@@ -5520,16 +5565,7 @@ mod tests {
         let name = |path: &Path| path.file_name().and_then(|n| n.to_str()).map(str::to_owned);
 
         match compile_and_write(&watched, &None, &None, &None, None, true).unwrap() {
-            CompileWriteOutcome::WriteFailed {
-                output_path,
-                deps,
-                failure,
-            } => {
-                assert_eq!(
-                    written_path(&output_path).and_then(name).as_deref(),
-                    Some("chat.json"),
-                    "the route of the compiled kind"
-                );
+            CompileWriteOutcome::WriteFailed { deps, failure } => {
                 let dep_names: Vec<_> = deps.iter().filter_map(|d| name(d)).collect();
                 assert!(
                     dep_names.iter().any(|n| n == "part.mds"),
@@ -5561,42 +5597,27 @@ mod tests {
         );
     }
 
-    /// #257: after a failed startup compile the route of each kind is the one an output of
-    /// that kind takes, and nothing is decided until a route is; then every later output
-    /// takes it whatever its kind. A route decided at startup — by the startup compile's
-    /// kind, or an explicit `-o` — is never decided again.
+    /// #257, #160: without `-o` every output takes the route of its own kind — after a
+    /// failed startup compile, and after a change of kind — and leaves the other kind's
+    /// behind; the route an explicit `-o` names is every kind's, and leaves none.
     #[test]
-    fn output_route_is_decided_by_the_first_compiled_kind() {
+    fn output_route_is_each_kinds_own_unless_one_is_named() {
         let target = |name: &str| Some(WriteTarget::as_typed(PathBuf::from(name)));
-        let by_kind = || OutputRoute::ByKind {
-            markdown: target("chat.md"),
-            messages: target("chat.json"),
+        let (md, json, named) = (target("chat.md"), target("chat.json"), target("out.md"));
+        let by_kind = OutputRoute::ByKind {
+            markdown: md.clone(),
+            messages: json.clone(),
         };
+        assert_eq!(by_kind.of(OutputKind::Messages), &json);
+        assert_eq!(by_kind.of(OutputKind::Markdown), &md);
+        assert_eq!(by_kind.other_than(OutputKind::Messages), md.as_ref());
+        assert_eq!(by_kind.other_than(OutputKind::Markdown), json.as_ref());
 
-        let mut route = by_kind();
-        assert_eq!(route.of(OutputKind::Messages), &target("chat.json"));
-        assert_eq!(route.of(OutputKind::Markdown), &target("chat.md"));
-        assert_eq!(route, by_kind(), "the route of a kind decides nothing");
-        route.decide(OutputKind::Messages);
-        assert_eq!(route, OutputRoute::Decided(target("chat.json")));
-        assert_eq!(
-            route.of(OutputKind::Markdown),
-            &target("chat.json"),
-            "kept whatever kind follows"
-        );
-
-        // Control: a first compile to Markdown decides the Markdown route.
-        let mut route = by_kind();
-        route.decide(OutputKind::Markdown);
-        assert_eq!(route, OutputRoute::Decided(target("chat.md")));
-
-        let mut route = OutputRoute::Decided(target("out.md"));
-        route.decide(OutputKind::Messages);
-        assert_eq!(
-            route.of(OutputKind::Messages),
-            &target("out.md"),
-            "a decided route is never decided again"
-        );
+        let route = OutputRoute::Named(named.clone());
+        for kind in [OutputKind::Markdown, OutputKind::Messages] {
+            assert_eq!(route.of(kind), &named, "-o is the route of every kind");
+            assert_eq!(route.other_than(kind), None, "-o leaves nothing behind");
+        }
     }
 
     /// #417: the watched entry is compiled by the typed path while that path leads to the
@@ -5779,6 +5800,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            outputs: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5793,7 +5815,7 @@ mod tests {
             foi,
             last_mtimes: HashMap::new(),
             last_written: HashMap::new(),
-            output: OutputRoute::Decided(None),
+            output: OutputRoute::Named(None),
             out_dir: None,
             entry_was_missing: false,
             first_tick: false,

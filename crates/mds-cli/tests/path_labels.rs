@@ -2103,6 +2103,12 @@ const LABEL_TABLE: &[&[&str]] = &[
         "removed_names_the_output_as_typed_when_the_vars_file_changes_in_the_same_batch",
     ],
     &["an_output_that_cannot_be_removed_is_named_as_typed"],
+    &[
+        "watch_keeps_the_hand_written_siblings_of_a_deleted_source",
+        "watch_keeps_an_output_edited_since_the_session_wrote_it",
+        "watch_removes_the_old_output_of_a_changed_kind_only_when_it_wrote_it",
+        "watch_writes_a_file_whose_kind_changed_to_that_kinds_output",
+    ],
     &["an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk"],
     &["a_watched_directory_is_named_as_the_user_typed_it"],
     &[

@@ -145,7 +145,12 @@ input. The compiler enforces several defense-in-depth controls:
   through a symlink nor one at the file, and, in `mds watch`, only below the out-dir it
   checked: on Unix the file is opened in the directory the walk reached without
   following a symlink, proven, and unlinked (`unlinkat`) from that directory only while
-  its name is still the device and inode opened.
+  its name is still the device and inode opened. `mds watch` removes an output — of a
+  deleted source, or of the old kind after a change of kind — only when the session
+  wrote that file and it still holds exactly the bytes written (#160): a file it did not
+  write, hand-written or left by another run, and one changed since are kept with a
+  notice. The proof is the content, so a file holding exactly those bytes is removed as
+  the session's own.
   **Windows residual**: the standard library has no descriptor-relative walk on
   Windows. Each directory below the anchor is checked and refused when it is a
   symlink or a junction, and the write — or the removal — then goes by path, so a

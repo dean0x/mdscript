@@ -460,18 +460,20 @@ fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
 
 /// `mds watch` never removes a deleted source's output through a symlink that replaced a
 /// directory below `--out-dir`: the removal is refused by the path the user knows the
-/// output by, naming the link, and the hand-written file of that name in the directory
-/// the link points at is left as it was. Controls: earlier in the same session, a deleted
-/// source's output below a real directory is removed; and the link is left in place.
+/// output by, naming the link, and the file of that name in the directory the link points
+/// at is left as it was — one holding exactly the bytes the session wrote, which is all a
+/// removal otherwise asks of a file (#160). Controls: earlier in the same session, a
+/// deleted source's output below a real directory is removed; and the link is left in
+/// place.
 #[cfg(unix)]
 #[test]
 fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
-    const HAND: &str = "{\"hand\": \"written\", \"not\": \"mds output\"}\n";
+    const HAND: &str = "X\n";
     let dir = scratch();
     let root = dir.path();
     put(root, "src/top.mds", "Top\n");
     put(root, "src/sub/x.mds", "X\n");
-    let victim = put(root, "victim/x.json", HAND);
+    let victim = put(root, "victim/x.md", HAND);
 
     let (child, tap, _) = common::spawn_watch_ready(
         mds_bin()
@@ -493,7 +495,7 @@ fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
     std::fs::remove_dir_all(root.join("out/sub")).unwrap();
     std::os::unix::fs::symlink("../victim", root.join("out/sub")).unwrap();
     std::fs::remove_file(root.join("src/sub/x.mds")).unwrap();
-    common::wait_for_tap(&tap, "x.json", TIMEOUT);
+    common::wait_for_tap(&tap, "could not remove", TIMEOUT);
     let stderr = tap.finish_text(&mut child);
 
     assert_eq!(
@@ -504,7 +506,7 @@ fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
     assert!(
         stderr.contains(&format!(
             "warning: could not remove {}: refusing to follow a symlink at {}",
-            native("out/sub/x.json"),
+            native("out/sub/x.md"),
             native("out/sub")
         )),
         "the refusal names the output and the link as typed; stderr: {stderr}"

@@ -8559,3 +8559,649 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
         drop(child);
     }
 }
+
+// ── A session removes only an output it wrote and that is unchanged (#160) ──────
+
+/// A template that compiles to messages, so its output is `.json`.
+const MESSAGES_KIND: &str = "@message user:\nWhat is 3+3?\n@end\n";
+
+/// What a hand-written file beside a source holds — never anything mds writes.
+const HAND_WRITTEN: &str = "hand-written, not mds output\n";
+
+/// What the user writes over an output the session wrote.
+const USER_EDIT: &str = "the user's own edit\n";
+
+/// The two batches a deleted source's outputs are removed in — one whose only changes
+/// are deletions, and one that also edits the `--vars` file and so recompiles every
+/// source — each with the arguments that make it and whether `vars.json` is edited.
+const DELETION_BATCHES: [(&str, &[&str], bool); 2] = [
+    ("a deletion alone", &["--debounce", "0"], false),
+    (
+        "a deletion with a --vars edit",
+        &["--vars", "vars.json", "--debounce", "500"],
+        true,
+    ),
+];
+
+/// The lines of `stderr` that start with `prefix`, sorted.
+fn lines_starting(stderr: &str, prefix: &str) -> Vec<String> {
+    let mut lines: Vec<String> = stderr
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `name` below the directory `dir` as a status line names it, with the platform's
+/// separator.
+fn below(dir: &str, name: &str) -> String {
+    Path::new(dir).join(name).display().to_string()
+}
+
+/// The text of `path`, or `None` when it cannot be read.
+fn text_of(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// A watched directory `notes/` below a fresh base directory holding `files`, beside a
+/// `vars.json` for the batches that edit it.
+fn notes_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    for (name, text) in files {
+        std::fs::write(notes.join(name), text).unwrap();
+    }
+    std::fs::write(base.path().join("vars.json"), r#"{"name": "one"}"#).unwrap();
+    base
+}
+
+/// Deleting sources in a watched directory removes only the outputs the session wrote
+/// (#160). A hand-written `todo.json` beside the Markdown source `todo.mds`, a
+/// hand-written `msg.md` beside the messages source `msg.mds`, and a hand-written
+/// `_p.md` beside the partial `_p.mds`, which has no output, all survive — each sibling
+/// with one notice, the partial's with none — while `todo.md` and `msg.json`, which the
+/// session wrote, are removed with `Removed … (source deleted)`: in a batch of deletions
+/// alone and in one that also edits the `--vars` file. Every one of them was deleted.
+#[test]
+fn watch_keeps_the_hand_written_siblings_of_a_deleted_source() {
+    for (label, extra, edit_vars) in DELETION_BATCHES {
+        let base = notes_with(&[
+            ("todo.mds", "Buy milk\n"),
+            ("todo.json", HAND_WRITTEN),
+            ("msg.mds", MESSAGES_KIND),
+            ("msg.md", HAND_WRITTEN),
+            ("_p.mds", "Partial\n"),
+            ("_p.md", HAND_WRITTEN),
+        ]);
+        let notes = base.path().join("notes");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path())
+                .args(["watch", "notes", "--poll-interval", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&notes.join("todo.md"), "Buy milk", TIMEOUT)
+                && wait_for_file_contains(&notes.join("msg.json"), "What is 3+3?", TIMEOUT),
+            "{label}: control: the startup writes todo.md and msg.json; stderr: {}",
+            tap.text()
+        );
+
+        // `todo.mds` last: a batch handles its deletions in name order, so once
+        // `todo.md` is gone every deletion before it has been handled too.
+        for name in ["_p.mds", "msg.mds", "todo.mds"] {
+            std::fs::remove_file(notes.join(name)).unwrap();
+        }
+        if edit_vars {
+            write_atomic(&base.path().join("vars.json"), r#"{"name": "two"}"#);
+        }
+        assert!(
+            wait_for_file_gone(&notes.join("msg.json"), TIMEOUT)
+                && wait_for_file_gone(&notes.join("todo.md"), TIMEOUT),
+            "{label}: control: the outputs the session wrote are removed; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        for name in ["todo.json", "msg.md", "_p.md"] {
+            assert_eq!(
+                text_of(&notes.join(name)).as_deref(),
+                Some(HAND_WRITTEN),
+                "{label}: the hand-written {name} survives; stderr: {stderr}"
+            );
+        }
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [
+                format!(
+                    "Kept {}: not written by this session",
+                    below("notes", "msg.md")
+                ),
+                format!(
+                    "Kept {}: not written by this session",
+                    below("notes", "todo.json")
+                ),
+            ],
+            "{label}: one notice for each hand-written sibling, none for the partial's; \
+             stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            [
+                format!("Removed {} (source deleted)", below("notes", "msg.json")),
+                format!("Removed {} (source deleted)", below("notes", "todo.md")),
+            ],
+            "{label}: stderr: {stderr}"
+        );
+    }
+}
+
+/// An output the session wrote is removed with its deleted source only while it holds
+/// exactly what the session wrote there (#160): `edited.md`, which the user edited
+/// since, is kept with a notice that says so, while `same.md`, left as it was written,
+/// is removed — in both kinds of batch. The edited one was deleted.
+#[test]
+fn watch_keeps_an_output_edited_since_the_session_wrote_it() {
+    for (label, extra, edit_vars) in DELETION_BATCHES {
+        let base = notes_with(&[("edited.mds", "Edited\n"), ("same.mds", "Same\n")]);
+        let notes = base.path().join("notes");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path())
+                .args(["watch", "notes", "--poll-interval", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&notes.join("edited.md"), "Edited", TIMEOUT)
+                && wait_for_file_contains(&notes.join("same.md"), "Same", TIMEOUT),
+            "{label}: control: the startup writes both outputs; stderr: {}",
+            tap.text()
+        );
+        std::fs::write(notes.join("edited.md"), USER_EDIT).unwrap();
+
+        // `same.mds` last, as above: once `same.md` is gone both are handled.
+        for name in ["edited.mds", "same.mds"] {
+            std::fs::remove_file(notes.join(name)).unwrap();
+        }
+        if edit_vars {
+            write_atomic(&base.path().join("vars.json"), r#"{"name": "two"}"#);
+        }
+        assert!(
+            wait_for_file_gone(&notes.join("same.md"), TIMEOUT),
+            "{label}: control: the output left as written is removed; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            text_of(&notes.join("edited.md")).as_deref(),
+            Some(USER_EDIT),
+            "{label}: the output the user edited survives; stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [format!(
+                "Kept {}: changed since it was written",
+                below("notes", "edited.md")
+            )],
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            [format!(
+                "Removed {} (source deleted)",
+                below("notes", "same.md")
+            )],
+            "{label}: stderr: {stderr}"
+        );
+    }
+}
+
+/// A deleted source's outputs are found by the path the session wrote them to, never by
+/// a stem (#160). Deleting `a.b.mds`, written to `out/a.b.md`, removes that file and
+/// leaves `out/a.md`, written for `a.mds`: the stem probe took `.b` for an extension and
+/// removed `out/a.md` in its place. A deleted dependency outside the watched directory,
+/// which has no output of its own, removes nothing: the probe flattened it to `out/x.md`,
+/// the output of the source `x.mds` inside the directory, and removed that.
+#[test]
+fn watch_removes_the_output_a_deleted_source_was_written_to() {
+    let base = tempfile::tempdir().unwrap();
+    let (src, shared, out) = (
+        base.path().join("src"),
+        base.path().join("shared"),
+        base.path().join("out"),
+    );
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // A `.git` marker puts the project root at the base, so `src` may import `shared`.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+    std::fs::write(src.join("a.b.mds"), "A dot B\n").unwrap();
+    std::fs::write(src.join("x.mds"), "X\n").unwrap();
+    std::fs::write(
+        shared.join("x.mds"),
+        "@define greet():\nShared\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("importer.mds"),
+        "@import \"../shared/x.mds\" as x\n{{x.greet()}}\n",
+    )
+    .unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "src", "--out-dir", "out"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    for (name, text) in [
+        ("a.md", "A"),
+        ("a.b.md", "A dot B"),
+        ("x.md", "X"),
+        ("importer.md", "Shared"),
+    ] {
+        assert!(
+            wait_for_file_contains(&out.join(name), text, TIMEOUT),
+            "control: the startup writes out/{name}; stderr: {}",
+            tap.text()
+        );
+    }
+
+    std::fs::remove_file(src.join("a.b.mds")).unwrap();
+    std::fs::remove_file(shared.join("x.mds")).unwrap();
+    // The importer's compile reports the missing import before the batch handles its
+    // deletions; the marker's save comes after it, in a batch of its own.
+    let broken = poll_tap_until(&tap, TIMEOUT, |text| {
+        text.contains("file not found") || text.contains("No such file")
+    });
+    assert!(
+        broken.is_ok(),
+        "control: the importer recompiles; stderr: {broken:?}"
+    );
+    write_atomic(&src.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&out.join("a.md")).as_deref(),
+        Some("A\n"),
+        "out/a.md, written for a.mds, survives the deletion of a.b.mds; stderr: {stderr}"
+    );
+    assert_eq!(
+        text_of(&out.join("x.md")).as_deref(),
+        Some("X\n"),
+        "out/x.md, written for src/x.mds, survives the deletion of shared/x.mds; \
+         stderr: {stderr}"
+    );
+    assert!(
+        !out.join("a.b.md").exists(),
+        "out/a.b.md, written for a.b.mds, is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Removed "),
+        [format!(
+            "Removed {} (source deleted)",
+            below("out", "a.b.md")
+        )],
+        "stderr: {stderr}"
+    );
+}
+
+/// A source in a watched directory that now compiles to the other kind has the output
+/// of the old kind removed only when the session wrote it and it is unchanged (#160):
+/// `a.b.mds`, edited into messages, writes `out/a.b.json` and removes `out/a.b.md` —
+/// never `out/a.md`, written for `a.mds`, which a stem probe found in its place — and
+/// `c.mds` writes `out/c.json` and keeps `out/c.md`, which the user edited, with a
+/// notice. Both were deleted.
+#[test]
+fn watch_removes_the_old_output_of_a_changed_kind_only_when_it_wrote_it() {
+    let base = tempfile::tempdir().unwrap();
+    let (src, out) = (base.path().join("src"), base.path().join("out"));
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "A\n").unwrap();
+    std::fs::write(src.join("a.b.mds"), "A dot B\n").unwrap();
+    std::fs::write(src.join("c.mds"), "C\n").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "src", "--out-dir", "out"])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    for (name, text) in [("a.md", "A"), ("a.b.md", "A dot B"), ("c.md", "C")] {
+        assert!(
+            wait_for_file_contains(&out.join(name), text, TIMEOUT),
+            "control: the startup writes out/{name}; stderr: {}",
+            tap.text()
+        );
+    }
+    std::fs::write(out.join("c.md"), USER_EDIT).unwrap();
+
+    for name in ["a.b", "c"] {
+        write_atomic(&src.join(format!("{name}.mds")), MESSAGES_KIND);
+        assert!(
+            wait_for_file_contains(&out.join(format!("{name}.json")), "What is 3+3?", TIMEOUT),
+            "control: {name}.mds edited into messages writes out/{name}.json; stderr: {}",
+            tap.text()
+        );
+    }
+    write_atomic(&src.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&out.join("a.md")).as_deref(),
+        Some("A\n"),
+        "out/a.md, written for a.mds, survives a.b.mds's change of kind; stderr: {stderr}"
+    );
+    assert!(
+        !out.join("a.b.md").exists(),
+        "out/a.b.md, written and left as it was, is removed; stderr: {stderr}"
+    );
+    assert_eq!(
+        text_of(&out.join("c.md")).as_deref(),
+        Some(USER_EDIT),
+        "out/c.md, which the user edited, survives; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [format!(
+            "Kept {}: changed since it was written",
+            below("out", "c.md")
+        )],
+        "stderr: {stderr}"
+    );
+}
+
+/// A watched file that now compiles to the other kind is written to that kind's output,
+/// as its startup compile would be (#160) — `chat.md`, then `chat.json`, then `chat.md`
+/// again — and the output of the old kind is removed when the session wrote it and it is
+/// unchanged, or kept with a notice once the user edited it. The kind's output used to be
+/// fixed for the session, so the JSON went into `chat.md`. Control: an explicit `-o` is
+/// the output whatever the kind, so it never changes and nothing is removed.
+#[test]
+fn watch_writes_a_file_whose_kind_changed_to_that_kinds_output() {
+    let session = |args: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat.mds"), "Hello\n").unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .args(["watch", "chat.mds"])
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        (dir, child, tap)
+    };
+
+    // Markdown, then messages, then Markdown again, each output left as written.
+    let (dir, mut child, tap) = session(&[]);
+    let (src, md, json) = (
+        dir.path().join("chat.mds"),
+        dir.path().join("chat.md"),
+        dir.path().join("chat.json"),
+    );
+    assert!(
+        wait_for_file_contains(&md, "Hello", TIMEOUT),
+        "control: the startup writes chat.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+        "a template edited into messages writes chat.json; chat.md holds {:?}; stderr: {}",
+        text_of(&md),
+        tap.text()
+    );
+    assert!(
+        wait_for_file_gone(&md, TIMEOUT),
+        "chat.md, written and left as it was, is removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, "Hello again\n");
+    assert!(
+        wait_for_file_contains(&md, "Hello again", TIMEOUT) && wait_for_file_gone(&json, TIMEOUT),
+        "edited back into Markdown, it writes chat.md and removes chat.json; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    let shown = |name: &str| Path::new(".").join(name).display().to_string();
+    let recompiled =
+        |name: &str| lines_starting(&stderr, &format!("Recompiled {} (", shown(name))).len();
+    assert_eq!(
+        (recompiled("chat.json"), recompiled("chat.md")),
+        (1, 1),
+        "each rebuild names the output of its own kind; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        Vec::<String>::new(),
+        "stderr: {stderr}"
+    );
+
+    // An edited `chat.md` is kept.
+    let (dir, mut child, tap) = session(&[]);
+    let (src, md) = (dir.path().join("chat.mds"), dir.path().join("chat.md"));
+    assert!(
+        wait_for_file_contains(&md, "Hello", TIMEOUT),
+        "control: the startup writes chat.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::write(&md, USER_EDIT).unwrap();
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&dir.path().join("chat.json"), "What is 3+3?", TIMEOUT),
+        "a template edited into messages writes chat.json; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some(USER_EDIT),
+        "chat.md, which the user edited, survives; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [format!(
+            "Kept {}: changed since it was written",
+            shown("chat.md")
+        )],
+        "stderr: {stderr}"
+    );
+
+    // Control: `-o out.md` takes the messages too, and nothing else is written or removed.
+    let (dir, mut child, tap) = session(&["-o", "out.md"]);
+    let named = dir.path().join("out.md");
+    assert!(
+        wait_for_file_contains(&named, "Hello", TIMEOUT),
+        "control: the startup writes out.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&dir.path().join("chat.mds"), MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&named, "What is 3+3?", TIMEOUT),
+        "control: -o out.md takes the messages; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&dir.path().join("chat.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    for name in ["chat.json", "chat.md", "out.json"] {
+        assert!(
+            !dir.path().join(name).exists(),
+            "control: -o is never routed by the kind, so {name} is not written; \
+             stderr: {stderr}"
+        );
+    }
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        Vec::<String>::new(),
+        "control: stderr: {stderr}"
+    );
+}
+
+/// `--quiet` suppresses the notice that a file is kept (#160), as it does the `Removed`
+/// line, and the file is kept all the same: a hand-written `todo.json` beside a deleted
+/// `todo.mds`, whose `todo.md` the session wrote and removes, and a `chat.md` the user
+/// edited before the watched file was edited into messages.
+#[test]
+fn watch_quiet_keeps_files_without_a_notice() {
+    let base = notes_with(&[("todo.mds", "Buy milk\n"), ("todo.json", HAND_WRITTEN)]);
+    let notes = base.path().join("notes");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args([
+                "watch",
+                "notes",
+                "-q",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("todo.md"), "Buy milk", TIMEOUT),
+        "control: the startup writes todo.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::remove_file(notes.join("todo.mds")).unwrap();
+    assert!(
+        wait_for_file_gone(&notes.join("todo.md"), TIMEOUT),
+        "control: the output the session wrote is removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        text_of(&notes.join("todo.json")).as_deref(),
+        Some(HAND_WRITTEN),
+        "the hand-written todo.json survives; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Kept ") && !stderr.contains("Removed "),
+        "--quiet prints neither; stderr: {stderr}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (src, md) = (dir.path().join("chat.mds"), dir.path().join("chat.md"));
+    std::fs::write(&src, "Hello\n").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "chat.mds",
+                "-q",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&md, "Hello", TIMEOUT),
+        "control: the startup writes chat.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::write(&md, USER_EDIT).unwrap();
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&dir.path().join("chat.json"), "What is 3+3?", TIMEOUT),
+        "control: a template edited into messages writes chat.json; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some(USER_EDIT),
+        "chat.md, which the user edited, survives; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Kept "),
+        "--quiet prints no notice; stderr: {stderr}"
+    );
+}
+
+/// A source that is unlinked and created again within one batch — an editor that saves
+/// so, a branch checkout or `git stash` replacing it — is an edit, not a deletion
+/// (#160): its output is rewritten, nothing is removed and no notice printed, and the
+/// hand-written sibling beside it is untouched.
+#[test]
+fn watch_treats_a_source_unlinked_and_created_again_as_an_edit() {
+    let base = notes_with(&[("todo.mds", "Buy milk\n"), ("todo.json", HAND_WRITTEN)]);
+    let notes = base.path().join("notes");
+    // A debounce window long enough to take the unlink and the create into one batch.
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args([
+                "watch",
+                "notes",
+                "--debounce",
+                "300",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("todo.md"), "Buy milk", TIMEOUT),
+        "control: the startup writes todo.md; stderr: {}",
+        tap.text()
+    );
+    std::fs::remove_file(notes.join("todo.mds")).unwrap();
+    write_atomic(&notes.join("todo.mds"), "Buy bread\n");
+    assert!(
+        wait_for_file_contains(&notes.join("todo.md"), "Buy bread", TIMEOUT),
+        "control: the source created again is rebuilt; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&notes.join("todo.json")).as_deref(),
+        Some(HAND_WRITTEN),
+        "the hand-written todo.json survives; stderr: {stderr}"
+    );
+    assert_eq!(
+        (
+            lines_starting(&stderr, "Removed "),
+            lines_starting(&stderr, "Kept ")
+        ),
+        (Vec::new(), Vec::new()),
+        "nothing is removed and no notice printed; stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(
+            &stderr,
+            &format!("Recompiled {} (", below("notes", "todo.md"))
+        )
+        .len(),
+        1,
+        "control: the edit is one rebuild; stderr: {stderr}"
+    );
+}
