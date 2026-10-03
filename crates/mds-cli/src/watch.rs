@@ -650,16 +650,52 @@ fn went_empty(before: Option<&FileStamp>, now: &FileStamp) -> bool {
     matches!((before.and_then(|stamp| stamp.1), now.1), (Some(had), Some(0)) if had > 0)
 }
 
+/// `path`'s `(mtime, size)` now; `(None, None)` when it cannot be read.
+fn stamp_now(path: &Path) -> FileStamp {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.modified().ok(), Some(m.len())),
+        Err(_) => (None, None),
+    }
+}
+
 /// Whether any of `paths` went from non-empty to empty since `baseline` was taken
 /// ([`went_empty`]): one `stat` per path, stopping at the first that did.
 fn any_went_empty<'a>(paths: impl IntoIterator<Item = &'a PathBuf>, baseline: &StampMap) -> bool {
-    paths.into_iter().any(|path| {
-        let now = match std::fs::metadata(path) {
-            Ok(m) => (m.modified().ok(), Some(m.len())),
-            Err(_) => (None, None),
-        };
-        went_empty(baseline.get(path), &now)
-    })
+    paths
+        .into_iter()
+        .any(|path| went_empty(baseline.get(path), &stamp_now(path)))
+}
+
+/// Which of `paths` went from non-empty to empty since `baseline` was taken
+/// ([`went_empty`]): one `stat` per path.
+fn emptied_paths<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+    baseline: &StampMap,
+) -> BTreeSet<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|path| went_empty(baseline.get(*path), &stamp_now(path)))
+        .cloned()
+        .collect()
+}
+
+/// The baseline a batch leaves while a rebuild is held (#380): `fresh`, except that a file
+/// gone empty since `before` keeps the stamp that saw its bytes, so the next look finds it
+/// emptied still. A file `before` never saw takes its fresh stamp.
+fn baseline_keeping_emptied(before: &StampMap, mut fresh: StampMap) -> StampMap {
+    for (path, now) in &mut fresh {
+        if let Some(old) = before.get(path).filter(|old| went_empty(Some(*old), now)) {
+            *now = *old;
+        }
+    }
+    fresh
+}
+
+/// The instant a rebuild decides its hold at: `now`, or `due` — the deadline of the hold
+/// that runs it — if `now` is earlier, so that deadline ends the hold whatever the clock
+/// does between the wake and the rebuild (#380).
+fn not_before(now: Instant, due: Option<Instant>) -> Instant {
+    due.map_or(now, |due| now.max(due))
 }
 
 /// A rebuild held while a watched file is empty, and the **absolute** deadline at which it
@@ -674,10 +710,17 @@ fn any_went_empty<'a>(paths: impl IntoIterator<Item = &'a PathBuf>, baseline: &S
 /// are. Either rebuild takes the baseline again, so a file that stays empty is not
 /// emptied any more, and a later truncation starts a hold of its own.
 ///
+/// A file the rebuild's compile read can also be found emptied after the rebuild looked —
+/// a truncation that began between the look and the read ([`Self::on_late_empty`]). That
+/// rebuild is held as one the look found is, unless the deadline ended the hold in it: a
+/// rebuild the deadline runs compiles the files as they are, and nothing found after its
+/// look holds it again.
+///
 /// The hold never reads the clock: every instant is an argument. The rebuild that looks
-/// at the files passes the instant it looked; the watch loop's driver, [`TickClock`],
-/// waits for [`Self::deadline`] and wakes the session there — under `--poll-interval 0`
-/// too, where no tick would.
+/// at the files passes the instant it looked — never earlier than the deadline it is run
+/// for ([`not_before`]); the watch loop's driver, [`TickClock`], waits for
+/// [`Self::deadline`] and wakes the session there — under `--poll-interval 0` too, where
+/// no tick would.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum EmptyHold {
     /// No rebuild is held.
@@ -685,6 +728,9 @@ enum EmptyHold {
     Off,
     /// Rebuilds are held until this instant.
     Until(Instant),
+    /// The deadline ended the hold in the rebuild now running, which compiles the files as
+    /// they are; no rebuild is held. The next rebuild's look decides afresh.
+    Expired,
 }
 
 /// What a rebuild does, as [`EmptyHold::on_rebuild`] decides it.
@@ -704,22 +750,33 @@ impl EmptyHold {
                 *self = Self::Off;
                 HoldVerdict::Compile
             }
-            (Self::Off, true) => {
+            (Self::Off | Self::Expired, true) => {
                 *self = Self::Until(now + EMPTY_HOLD_DEADLINE);
                 HoldVerdict::Hold
             }
             (Self::Until(until), true) if now < until => HoldVerdict::Hold,
             (Self::Until(_), true) => {
-                *self = Self::Off;
+                *self = Self::Expired;
                 HoldVerdict::Compile
             }
+        }
+    }
+
+    /// A rebuild that compiled found, at `now`, a file its compile read emptied since the
+    /// rebuild looked. It is held as [`Self::on_rebuild`] holds one the look found — the
+    /// deadline set by the first such finding and never moved — unless the deadline ended
+    /// the hold in this rebuild, which compiles the files as they are.
+    fn on_late_empty(&mut self, now: Instant) -> HoldVerdict {
+        match *self {
+            Self::Expired => HoldVerdict::Compile,
+            Self::Off | Self::Until(_) => self.on_rebuild(true, now),
         }
     }
 
     /// When the held rebuild runs anyway, if a rebuild is held.
     fn deadline(&self) -> Option<Instant> {
         match *self {
-            Self::Off => None,
+            Self::Off | Self::Expired => None,
             Self::Until(until) => Some(until),
         }
     }
@@ -2477,7 +2534,11 @@ fn handle_fs_event_file(
 /// so the next event or tick finds the file again. The hold ends at the first rebuild that
 /// finds none emptied, or at its deadline ([`EmptyHold`]), when the files are compiled as
 /// they are; an output published empty over the non-empty one before it is announced
-/// ([`announce_emptied_output`]).
+/// ([`announce_emptied_output`]). A file the compile read found emptied after that look —
+/// a truncation that began between the two — holds the rebuild the same way, unless the
+/// deadline ended the hold in it ([`EmptyHold::on_late_empty`]). `due` is the hold's
+/// deadline when that deadline runs this rebuild, which then ends the hold
+/// ([`not_before`]); `None` for an event or a tick.
 ///
 /// # Invariants preserved
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output, by
@@ -2495,12 +2556,20 @@ fn rebuild_file(
     ctx: &FileCompileCtx,
     watcher: &mut RecommendedWatcher,
     state: &mut FileWatchState,
+    due: Option<Instant>,
 ) -> ControlFlow<StopReason> {
     ctx.working_dir.restore_if_recreated();
     // #380: a file of interest emptied holds the rebuild back — before `kept` is taken,
     // since a rebuild held is no rebuild.
     let emptied = any_went_empty(&state.foi, &state.last_mtimes);
-    if state.hold.on_rebuild(emptied, Instant::now()) == HoldVerdict::Hold {
+    let verdict = state
+        .hold
+        .on_rebuild(emptied, not_before(Instant::now(), due));
+    debug_assert!(
+        due.is_none() || verdict == HoldVerdict::Compile,
+        "a held rebuild's deadline ends its hold"
+    );
+    if verdict == HoldVerdict::Hold {
         settle(SettleInto::File(state), None, Settle::Defer);
         return ControlFlow::Continue(());
     }
@@ -2552,10 +2621,22 @@ fn rebuild_file(
         }
     };
 
+    let deps = graph_keys(&compiled.dependencies);
+    let foi = files_of_interest(&entry.canonical, &deps, ctx.vars_path.as_deref());
+    // #380: a file the compile read, emptied since the look above — a truncation that began
+    // between the two — holds the rebuild back as the look would have, with nothing
+    // recorded, unless the deadline ended the hold in this rebuild.
+    if any_went_empty(&foi, &state.last_mtimes)
+        && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
+    {
+        state.kept = kept_before;
+        settle(SettleInto::File(state), None, Settle::Defer);
+        return ControlFlow::Continue(());
+    }
+
     // Freshness rule: always recompute dep set from fresh output — before the output's
     // route is admitted, so the files a compile read are watched even when its output is
     // refused, a dependency in a directory no earlier compile reported included (#257).
-    let deps = graph_keys(&compiled.dependencies);
     let new_dirs = dirs_to_watch(&entry.canonical, &deps, ctx.vars_path.as_deref());
     state.watched_dirs = resync_watches(
         watcher,
@@ -2567,7 +2648,7 @@ fn rebuild_file(
     // Keep armed_dirs in sync: all dirs in watched_dirs are successfully armed;
     // dirs removed by resync_watches are no longer in watched_dirs.
     state.armed_dirs = state.watched_dirs.clone();
-    state.foi = files_of_interest(&entry.canonical, &deps, ctx.vars_path.as_deref());
+    state.foi = foi;
     // Update mtime snapshot after a compile (even if content unchanged).
     state.last_mtimes = snapshot_state(&state.foi);
 
@@ -3485,22 +3566,18 @@ mod file_startup {
         fn on_tick(&mut self) -> ControlFlow<StopReason> {
             // Idle tick — run liveness probe (reconcile rule).
             if liveness_probe_file(&self.ctx, &mut self.watcher, &mut self.state) {
-                rebuild_file(&self.ctx, &mut self.watcher, &mut self.state)
+                rebuild_file(&self.ctx, &mut self.watcher, &mut self.state, None)
             } else {
                 ControlFlow::Continue(())
             }
         }
 
         fn on_hold_due(&mut self) -> ControlFlow<StopReason> {
-            // The rebuild decides the hold first, at an instant past its deadline, so it
-            // ends the hold whatever the files hold (#380).
-            let next = rebuild_file(&self.ctx, &mut self.watcher, &mut self.state);
-            assert_eq!(
-                self.state.hold,
-                EmptyHold::Off,
-                "a held rebuild's deadline must end the hold"
-            );
-            next
+            // The rebuild decides the hold first, at an instant no earlier than its
+            // deadline, so it ends the hold whatever the files hold or the clock does
+            // (#380).
+            let due = self.state.hold.deadline();
+            rebuild_file(&self.ctx, &mut self.watcher, &mut self.state, due)
         }
 
         fn on_message(&mut self, msg: Msg, rx: &mpsc::Receiver<Msg>) -> ControlFlow<StopReason> {
@@ -3508,7 +3585,7 @@ mod file_startup {
                 FileEventAction::Skip => ControlFlow::Continue(()),
                 FileEventAction::Stop => ControlFlow::Break(StopReason::Interrupted),
                 FileEventAction::Rebuild => {
-                    rebuild_file(&self.ctx, &mut self.watcher, &mut self.state)
+                    rebuild_file(&self.ctx, &mut self.watcher, &mut self.state, None)
                 }
             }
         }
@@ -3587,9 +3664,9 @@ struct HeldBatch {
 }
 
 impl HeldBatch {
-    /// Hold `batch` back, with `vars_changed`, beside the batches held before it.
-    fn hold(&mut self, batch: &BTreeSet<PathBuf>, vars_changed: bool) {
-        self.paths.extend(batch.iter().cloned());
+    /// Hold `paths` back, with `vars_changed`, beside the batches held before them.
+    fn hold<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>, vars_changed: bool) {
+        self.paths.extend(paths.into_iter().cloned());
         self.vars_changed |= vars_changed;
     }
 
@@ -3605,6 +3682,23 @@ impl HeldBatch {
         paths.extend(batch.iter().cloned());
         (paths, vars_changed || held.vars_changed)
     }
+}
+
+/// `batch` and `vars_changed` with the watched files a look found `emptied` joined to them
+/// (#380): the `--vars` file as a change to it, every other file as a path of the batch —
+/// whether or not its own event came — so the batch that ends a hold rebuilds it.
+fn join_emptied(
+    batch: &BTreeSet<PathBuf>,
+    vars_changed: bool,
+    emptied: &BTreeSet<PathBuf>,
+    vars_file: Option<&Path>,
+) -> (BTreeSet<PathBuf>, bool) {
+    let (vars, paths): (Vec<&PathBuf>, Vec<&PathBuf>) = emptied
+        .iter()
+        .partition(|path| Some(path.as_path()) == vars_file);
+    let mut joined = batch.clone();
+    joined.extend(paths.into_iter().cloned());
+    (joined, vars_changed || !vars.is_empty())
 }
 
 impl DirWatchState {
@@ -3896,6 +3990,24 @@ fn compile_one_source(
             };
 
             if content_changed {
+                // #380: a file the compile read, emptied since the batch looked — a
+                // truncation that began between the two — holds `src` back as the look
+                // would have, unless the deadline ended the hold in this rebuild: nothing
+                // written or recorded, `src` kept to be rebuilt with the batch that ends
+                // the hold.
+                let source = src.to_path_buf();
+                let reads = std::iter::once(&source)
+                    .chain(&dep_paths)
+                    .chain(state.vars_file.as_ref());
+                if any_went_empty(reads, &state.last_mtimes)
+                    && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
+                {
+                    if let Some(kept) = kept_before {
+                        state.kept.insert(source.clone(), kept);
+                    }
+                    state.held.hold([&source], false);
+                    return false;
+                }
                 let written = match out_dir {
                     OutDirNow::Elsewhere => {
                         Err(miette::Report::new(crate::write::out_dir_moved(&out)))
@@ -4234,7 +4346,7 @@ fn liveness_probe_dir(
         // root delete+recreate) re-reports the vars-file duplicate keys under the same
         // content-changed gate, and one logical edit observed by both paths still warns
         // once — tests I17 and I19.
-        rebuild_dir_batch(ctx, &batch, false /* vars_changed */, state);
+        rebuild_dir_batch(ctx, &batch, false /* vars_changed */, state, None);
         arm_external_dirs_after_rebuild(ctx, watcher, liveness, state);
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
@@ -4252,6 +4364,11 @@ fn liveness_probe_dir(
 /// left as it was ([`Settle::Defer`]), and the batch is kept ([`HeldBatch`]) to be rebuilt
 /// with the one that ends the hold — the first to find no watched file emptied, or the
 /// first at or past its deadline ([`EmptyHold`]), which compiles the files as they are.
+/// Every file the look finds emptied joins the batch, its own event lost or not
+/// ([`join_emptied`]), so that batch rebuilds it. A source whose compile read a file
+/// emptied after the look is held the same way, alone ([`compile_one_source`]). `due` is
+/// the hold's deadline when that deadline runs this rebuild, which then ends the hold
+/// ([`not_before`]); `None` for an event or a tick.
 /// The vars file is then reloaded (freshness rule), and a
 /// failure to read it is reported and settled: it may be temporarily absent (AC-W7 /
 /// AC-C5). `--set`/`--set-string` are fixed for the session and warned once at startup —
@@ -4266,17 +4383,27 @@ fn rebuild_dir_batch(
     batch: &BTreeSet<PathBuf>,
     vars_changed: bool,
     state: &mut DirWatchState,
+    due: Option<Instant>,
 ) {
     ctx.working_dir.restore_if_recreated();
 
-    // #380: a watched file emptied holds the whole batch back.
-    let emptied = any_went_empty(&state.watched_set(), &state.last_mtimes);
-    if state.hold.on_rebuild(emptied, Instant::now()) == HoldVerdict::Hold {
-        state.held.hold(batch, vars_changed);
+    // #380: a watched file emptied holds the whole batch back, and joins it.
+    let emptied = emptied_paths(&state.watched_set(), &state.last_mtimes);
+    let verdict = state
+        .hold
+        .on_rebuild(!emptied.is_empty(), not_before(Instant::now(), due));
+    debug_assert!(
+        due.is_none() || verdict == HoldVerdict::Compile,
+        "a held rebuild's deadline ends its hold"
+    );
+    let (batch, vars_changed) =
+        join_emptied(batch, vars_changed, &emptied, state.vars_file.as_deref());
+    if verdict == HoldVerdict::Hold {
+        state.held.hold(&batch, vars_changed);
         settle(SettleInto::Dir(state), None, Settle::Defer);
         return;
     }
-    let (batch, vars_changed) = state.held.release(batch, vars_changed);
+    let (batch, vars_changed) = state.held.release(&batch, vars_changed);
 
     let resolved = match build_runtime_vars(RuntimeVarArgs {
         vars: ctx.vars_path_typed.clone(),
@@ -4410,7 +4537,7 @@ fn handle_fs_event_dir(
         clear_terminal();
     }
 
-    rebuild_dir_batch(ctx, &mds_changed, vars_changed, state);
+    rebuild_dir_batch(ctx, &mds_changed, vars_changed, state, None);
     DirEventOutcome::Done
 }
 
@@ -5002,14 +5129,10 @@ mod dir_startup {
 
         fn on_hold_due(&mut self) -> ControlFlow<StopReason> {
             // The batches held back, with nothing new: the rebuild decides the hold first,
-            // at an instant past its deadline, so it ends the hold whatever the files hold
-            // (#380).
-            rebuild_dir_batch(&self.ctx, &BTreeSet::new(), false, &mut self.state);
-            assert_eq!(
-                self.state.hold,
-                EmptyHold::Off,
-                "a held rebuild's deadline must end the hold"
-            );
+            // at an instant no earlier than its deadline, so it ends the hold whatever the
+            // files hold or the clock does (#380).
+            let due = self.state.hold.deadline();
+            rebuild_dir_batch(&self.ctx, &BTreeSet::new(), false, &mut self.state, due);
             arm_external_dirs_after_rebuild(
                 &self.ctx,
                 &mut self.watcher,
@@ -5077,7 +5200,16 @@ fn process_dir_batch(
     // the whole set, also settles the sources a *failed* compile touched (so an
     // unchanged broken file does not re-fire every tick) and drops keys for sources the
     // batch deleted, which `snapshot_state` achieves by replacing the map outright.
-    state.last_mtimes = snapshot_state(&state.watched_set());
+    //
+    // A source held back because its compile read a file emptied since the batch looked
+    // leaves the hold running (#380): an emptied file then keeps the stamp that saw its
+    // bytes, so the next look finds it emptied still and the hold is kept.
+    let fresh = snapshot_state(&state.watched_set());
+    state.last_mtimes = if state.hold.deadline().is_some() {
+        baseline_keeping_emptied(&state.last_mtimes, fresh)
+    } else {
+        fresh
+    };
     any_changed
 }
 
@@ -7986,6 +8118,330 @@ mod tests {
             !any_went_empty(&rebuild.watched_set(), &rebuild.last_mtimes),
             "positive control: a rebaseline takes the empty file in"
         );
+    }
+
+    /// A canonical temporary directory: every path a rebuild carries is canonical, and
+    /// macOS tempdirs are below a symlink.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, path)
+    }
+
+    /// Directory mode's rebuild context: `root` watched, outputs below `out`, no `--vars`,
+    /// quiet.
+    fn dir_ctx(root: &Path, out: &Path) -> DirWatchCtx {
+        DirWatchCtx {
+            root: WatchedPath {
+                typed: root.to_path_buf(),
+                canonical: root.to_path_buf(),
+                what: Watched::Root,
+            },
+            working_dir: WorkingDir { canonical: None },
+            vars_path: None,
+            vars_path_typed: None,
+            static_set_vars: Vec::new(),
+            static_set_string_vars: Vec::new(),
+            output_base: dir_base(out.to_path_buf()),
+            exclude_prefix: None,
+            vars_dir_extra: None,
+            clear: false,
+            debounce_ms: 0,
+            quiet: true,
+        }
+    }
+
+    /// #380: a watched file found emptied while its own event was lost joins the held
+    /// batch, so the batch that ends the hold rebuilds it — its write's event lost too —
+    /// rather than taking its new content into the baseline unseen.
+    #[test]
+    fn a_file_found_emptied_without_its_event_is_rebuilt_when_the_hold_ends() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (a, x) = (root.join("a.mds"), root.join("x.mds"));
+        std::fs::write(&a, "A one\n").unwrap();
+        std::fs::write(&x, "X one\n").unwrap();
+        let ctx = dir_ctx(&root, &out);
+        let mut state = empty_dir_state();
+        state.known_files.extend([a.clone(), x.clone()]);
+        state.last_mtimes = snapshot_state(&state.watched_set());
+
+        // x emptied, its event lost: a batch for a finds it so.
+        std::fs::write(&x, "").unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+        assert!(
+            state.hold.deadline().is_some(),
+            "control: the batch is held while x is empty"
+        );
+        // x written, that event lost as well: the next batch finds nothing emptied.
+        std::fs::write(&x, "X two\n").unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), false, &mut state, None);
+
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).ok();
+        assert!(
+            read("a.md").is_some_and(|text| text.contains("A one")),
+            "positive control: the held batch is rebuilt; out/a.md: {:?}",
+            read("a.md")
+        );
+        assert!(
+            read("x.md").is_some_and(|text| text.contains("X two")),
+            "the file found emptied is rebuilt with it; out/x.md: {:?}",
+            read("x.md")
+        );
+    }
+
+    /// #380: a file rebuild whose compile read a file of interest emptied after the
+    /// rebuild first looked — a truncation that began between the two — is held, not
+    /// published, and leaves the baseline as it was. Nothing pauses a file rebuild
+    /// between its look and its compile, so the included module is left out of the files
+    /// the look stats while the baseline still holds a stamp that saw its bytes.
+    /// Positive control: a baseline that saw it empty publishes the same compile.
+    #[test]
+    fn a_file_rebuild_whose_compile_read_a_file_emptied_since_its_look_is_held() {
+        let (_dir, root) = canonical_tempdir();
+        let entry = root.join("page.mds");
+        let module = root.join("_inc.mds");
+        let out = root.join("page.md");
+        std::fs::write(
+            &entry,
+            "@import \"./_inc.mds\" as inc\nPage.\n@include inc\n",
+        )
+        .unwrap();
+        std::fs::write(&module, "").unwrap();
+        let ctx = FileCompileCtx {
+            entry: WatchedPath {
+                typed: entry.clone(),
+                canonical: entry.clone(),
+                what: Watched::Entry,
+            },
+            working_dir: WorkingDir { canonical: None },
+            vars_path: None,
+            vars_path_typed: None,
+            reads: Vec::new(),
+            static_set_vars: Vec::new(),
+            static_set_string_vars: Vec::new(),
+            quiet: true,
+        };
+        let mut watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default())
+                .unwrap();
+
+        for (seen, held) in [(Some(9), true), (Some(0), false)] {
+            let _ = std::fs::remove_file(&out);
+            let mut state = file_state(std::iter::once(entry.clone()).collect());
+            state.output = OutputRoute::Named(Some(WriteTarget::as_typed(out.clone())));
+            state.last_mtimes = snapshot_state(&state.foi);
+            state.last_mtimes.insert(module.clone(), (None, seen));
+            let before = state.last_mtimes.clone();
+
+            let _ = rebuild_file(&ctx, &mut watcher, &mut state, None);
+
+            let written = std::fs::read_to_string(&out).ok();
+            if held {
+                assert_eq!(
+                    written, None,
+                    "a compile that read a file emptied since the look is held, not published"
+                );
+                assert!(state.hold.deadline().is_some(), "a hold of its own is set");
+                assert_eq!(state.last_mtimes, before, "the baseline is left as it was");
+            } else {
+                assert!(
+                    written
+                        .as_deref()
+                        .is_some_and(|text| text.contains("Page.")),
+                    "positive control: a file the baseline saw empty is no file emptied; \
+                     page.md: {written:?}"
+                );
+                assert_eq!(state.hold.deadline(), None, "nothing is held");
+            }
+        }
+    }
+
+    /// #380: a directory source whose compile read itself emptied since the batch looked is
+    /// held alone — nothing written, the source kept to be rebuilt — and the batch that
+    /// ends the hold rebuilds it. Nothing pauses a release build between a batch's look
+    /// and its compile (`tests/cli_watch_truncate.rs` uses the debug build's pause), so the
+    /// source is one the look does not stat — not yet known — whose baseline stamp saw
+    /// bytes.
+    #[test]
+    fn a_directory_source_whose_compile_read_it_emptied_since_the_look_is_held() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let page = root.join("page.mds");
+        std::fs::write(&page, "").unwrap();
+        let ctx = dir_ctx(&root, &out);
+        let mut state = empty_dir_state();
+        state.last_mtimes.insert(page.clone(), (None, Some(9)));
+
+        rebuild_dir_batch(
+            &ctx,
+            &BTreeSet::from([page.clone()]),
+            false,
+            &mut state,
+            None,
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("page.md")).ok(),
+            None,
+            "a compile that read its source emptied since the look is held, not published"
+        );
+        assert!(state.hold.deadline().is_some(), "a hold of its own is set");
+        assert!(state.held.paths.contains(&page), "{:?}", state.held);
+
+        std::fs::write(&page, "Page two\n").unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), false, &mut state, None);
+        assert!(
+            std::fs::read_to_string(out.join("page.md"))
+                .is_ok_and(|text| text.contains("Page two")),
+            "the batch that ends the hold rebuilds the source held"
+        );
+        assert_eq!(state.hold.deadline(), None, "the hold has ended");
+    }
+
+    /// #380: a file found emptied after a rebuild looked holds it as the look would have —
+    /// at a deadline set by the first such finding and never moved — unless the deadline
+    /// ended the hold in this rebuild, which compiles the files as they are. The rebuild
+    /// after that decides afresh.
+    #[test]
+    fn empty_hold_holds_a_late_finding_unless_the_deadline_ended_it() {
+        let t0 = Instant::now();
+        let mut hold = EmptyHold::default();
+        assert_eq!(hold.on_rebuild(false, t0), HoldVerdict::Compile);
+        assert_eq!(
+            hold.on_late_empty(t0 + ms(1)),
+            HoldVerdict::Hold,
+            "found after a look that found nothing"
+        );
+        let deadline = t0 + ms(1) + EMPTY_HOLD_DEADLINE;
+        assert_eq!(hold.deadline(), Some(deadline));
+        assert_eq!(hold.on_late_empty(t0 + ms(100)), HoldVerdict::Hold);
+        assert_eq!(
+            hold.deadline(),
+            Some(deadline),
+            "a later finding must not move the deadline"
+        );
+
+        // The deadline's rebuild: compiled as the files are, and never held again.
+        assert_eq!(hold.on_rebuild(true, deadline), HoldVerdict::Compile);
+        assert_eq!(
+            hold.on_late_empty(deadline + ms(1)),
+            HoldVerdict::Compile,
+            "a rebuild the deadline runs compiles the files as they are"
+        );
+        assert_eq!(hold.deadline(), None, "and leaves nothing held");
+
+        // The next rebuild decides afresh: a later truncation holds on a deadline of its
+        // own, and a rebuild that finds nothing ends it.
+        assert_eq!(hold.on_rebuild(true, deadline + ms(10)), HoldVerdict::Hold);
+        assert_eq!(
+            hold.deadline(),
+            Some(deadline + ms(10) + EMPTY_HOLD_DEADLINE)
+        );
+        assert_eq!(
+            hold.on_rebuild(false, deadline + ms(20)),
+            HoldVerdict::Compile
+        );
+        assert_eq!(hold.deadline(), None);
+    }
+
+    /// #380: the rebuild a hold's deadline runs decides at an instant no earlier than that
+    /// deadline, so it ends the hold even when the clock reads earlier — a clock that steps
+    /// back between the wake and the rebuild. An event's or a tick's rebuild takes the
+    /// clock as it reads.
+    #[test]
+    fn a_deadline_rebuild_ends_its_hold_whatever_the_clock_reads() {
+        let deadline = Instant::now() + EMPTY_HOLD_DEADLINE;
+        let behind = deadline - ms(5);
+        assert_eq!(not_before(behind, None), behind);
+        assert_eq!(not_before(behind, Some(deadline)), deadline);
+        assert_eq!(
+            not_before(deadline + ms(5), Some(deadline)),
+            deadline + ms(5)
+        );
+
+        let mut held = EmptyHold::Until(deadline);
+        assert_eq!(
+            held.on_rebuild(true, behind),
+            HoldVerdict::Hold,
+            "control: a rebuild at the clock's earlier reading is held again"
+        );
+        assert_eq!(
+            held.on_rebuild(true, not_before(behind, Some(deadline))),
+            HoldVerdict::Compile,
+            "the deadline's rebuild ends the hold"
+        );
+        assert_eq!(held.deadline(), None);
+    }
+
+    /// #380: the files a look finds emptied join the batch — the `--vars` file as a change
+    /// to it, every other as a path — whether or not their events came.
+    #[test]
+    fn files_found_emptied_join_the_batch() {
+        let path = |name: &str| PathBuf::from("/w").join(name);
+        let batch: BTreeSet<PathBuf> = BTreeSet::from([path("a.mds")]);
+        let vars = path("vars.json");
+        let emptied: BTreeSet<PathBuf> = BTreeSet::from([path("x.mds"), vars.clone()]);
+
+        assert_eq!(
+            join_emptied(&batch, false, &emptied, Some(&vars)),
+            (BTreeSet::from([path("a.mds"), path("x.mds")]), true),
+            "the vars file is a change to it, not a path of the batch"
+        );
+        assert_eq!(
+            join_emptied(&batch, false, &BTreeSet::from([path("x.mds")]), Some(&vars)),
+            (BTreeSet::from([path("a.mds"), path("x.mds")]), false)
+        );
+        assert_eq!(
+            join_emptied(&batch, true, &BTreeSet::new(), Some(&vars)),
+            (batch.clone(), true),
+            "nothing emptied: the batch as it came"
+        );
+    }
+
+    /// #380: while a rebuild is held, a batch's baseline keeps the stamp that saw an
+    /// emptied file's bytes; every other file — one with bytes, one the old baseline never
+    /// saw, one it saw empty — takes its fresh stamp.
+    #[test]
+    fn a_held_baseline_keeps_the_stamp_that_saw_an_emptied_file_s_bytes() {
+        let path = |name: &str| PathBuf::from("/w").join(name);
+        let before: StampMap = [
+            (path("emptied"), (None, Some(5))),
+            (path("edited"), (None, Some(3))),
+            (path("was_empty"), (None, Some(0))),
+        ]
+        .into_iter()
+        .collect();
+        let fresh: StampMap = [
+            (path("emptied"), (None, Some(0))),
+            (path("edited"), (None, Some(4))),
+            (path("was_empty"), (None, Some(0))),
+            (path("new"), (None, Some(0))),
+        ]
+        .into_iter()
+        .collect();
+        let kept = baseline_keeping_emptied(&before, fresh.clone());
+        assert_eq!(kept.get(&path("emptied")), Some(&(None, Some(5))));
+        for name in ["edited", "was_empty", "new"] {
+            assert_eq!(kept.get(&path(name)), fresh.get(&path(name)), "{name}");
+        }
+        assert_eq!(kept.len(), fresh.len());
+    }
+
+    /// #380: the paths found emptied since a baseline: those it saw with bytes that have
+    /// none now — not one still with bytes, nor one it never saw.
+    #[test]
+    fn emptied_paths_are_those_found_with_none_after_bytes() {
+        let (_dir, root) = canonical_tempdir();
+        let [emptied, kept, unseen] = ["emptied", "kept", "unseen"].map(|name| root.join(name));
+        std::fs::write(&emptied, "bytes").unwrap();
+        std::fs::write(&kept, "bytes").unwrap();
+        let paths: HashSet<PathBuf> = [emptied.clone(), kept.clone()].into_iter().collect();
+        let baseline = snapshot_state(&paths);
+        std::fs::write(&emptied, "").unwrap();
+        std::fs::write(&unseen, "").unwrap();
+
+        let all = [emptied.clone(), kept, unseen];
+        assert_eq!(emptied_paths(&all, &baseline), BTreeSet::from([emptied]));
     }
 
     /// `Settle::MarkErrored` records a directory-mode source as errored in a rebuild,

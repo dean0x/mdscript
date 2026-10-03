@@ -596,6 +596,67 @@ fn dir_mode_a_source_created_during_a_hold_is_compiled_with_a_vars_edit() {
     OutputLog::default().wait_for(&new_out, "New two", EMPTY_HOLD_DEADLINE + TIMEOUT);
 }
 
+/// A source truncated while its rebuild is under way — after the rebuild looked and found
+/// it full, before its compile read it — is held as one the look found empty is: the
+/// empty read is never published, and the write that follows is. The debug build's pause
+/// between a directory batch's look and its compile (`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`)
+/// makes the window certain.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_source_truncated_after_its_rebuild_looked_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let a = root.join("a.mds");
+    std::fs::write(&a, "A one\n").unwrap();
+    let out = dir.path().join("out");
+    let a_out = out.join("a.md");
+    let (go, paused) = (dir.path().join("go"), dir.path().join("go.paused"));
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_BATCH_SPLIT", &go)
+            .stdout(Stdio::null()),
+    );
+    let mut log = OutputLog::default();
+    log.wait_for(&a_out, "A one", TIMEOUT);
+
+    // A save: its rebuild looks, finds a.mds full, and pauses before compiling it.
+    write_atomic(&a, "A two\n");
+    let paused_by = Instant::now() + TIMEOUT;
+    // Bounded by TIMEOUT: at most TIMEOUT / OUTPUT_POLL iterations.
+    while !paused.exists() {
+        assert!(
+            Instant::now() < paused_by,
+            "setup: the rebuild never paused; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(OUTPUT_POLL);
+    }
+    let hold = Hold::start(&a);
+    std::fs::write(&go, "").unwrap();
+    log.poll_for(&a_out, TRUNCATE_HOLD);
+    let timing = hold.write_and_close("A three\n");
+    log.wait_for(&a_out, "A three", TIMEOUT);
+
+    let stderr = stderr_through_the_marker(&a, tap, &mut child);
+    let what = "directory mode, truncated after the look";
+    assert_no_empty_before_the_deadline(&log, timing.started, what);
+    if strict_claims_apply(&timing, what) {
+        assert!(
+            log.first_empty.is_none(),
+            "{what}: a.md must never be empty while a.mds is held truncated; states: {:?}",
+            log.contents()
+        );
+        assert_holding_printed_nothing(&stderr, 1, what);
+    }
+}
+
 // ── The deadline ────────────────────────────────────────────────────────────
 
 /// Truncate the entry and close it without writing: the empty output IS published —
