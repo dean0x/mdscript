@@ -140,10 +140,17 @@ input. The compiler enforces several defense-in-depth controls:
   and refused as one already there is; on a filesystem without hard links the starter
   is written in place into a file created exclusively, which keeps that guarantee but
   not atomicity.
+  A stale output, a stale `.map` sidecar and, in `mds watch`, a deleted source's output
+  are removed below their anchor in the same way (#160), only as a regular file, never
+  through a symlink nor one at the file, and, in `mds watch`, only below the out-dir it
+  checked: on Unix the file is opened in the directory the walk reached without
+  following a symlink, proven, and unlinked (`unlinkat`) from that directory only while
+  its name is still the device and inode opened.
   **Windows residual**: the standard library has no descriptor-relative walk on
   Windows. Each directory below the anchor is checked and refused when it is a
-  symlink or a junction, and the write then goes by path, so a directory that another
-  process replaces with a link between that check and the write is followed; a link
+  symlink or a junction, and the write — or the removal — then goes by path, so a
+  directory that another process replaces with a link between that check and the
+  write is followed; a link
   in place before the write is refused. The anchor `mds watch` checked is compared by
   path there, just before that walk, so a link swapped onto the out-dir's path after
   the comparison is followed too. Other reparse points, such as a cloud-sync

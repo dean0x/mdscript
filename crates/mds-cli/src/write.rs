@@ -2,7 +2,8 @@
 //! [`atomic_write_file`] for `mds build` and `mds watch` outputs and `.map` sidecars and
 //! `mds init --force`'s starter, [`create_new`] for `mds init`'s starter without
 //! `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix` rewrites (#227,
-//! #160). `tests/write_funnel.rs` keeps it the only one.
+//! #160) — and every file it removes, through [`remove_proven`]. `tests/write_funnel.rs`
+//! keeps it the only one.
 //!
 //! # Replace by rename
 //!
@@ -68,6 +69,20 @@
 //! O_EXCL | O_NOFOLLOW`) — still never over another file, but no longer all or nothing: a
 //! failure while it is written leaves the file partly written. Windows moves the
 //! temporary file into place without `MOVEFILE_REPLACE_EXISTING`.
+//!
+//! # A removal proves its file first (#160)
+//!
+//! [`remove_proven`] removes a stale output, a stale `.map` sidecar or a deleted source's
+//! output only once the file is shown to be the one to remove. The directory it is in is
+//! walked to as a write's is — never created, a symlink below the anchor refused — and
+//! the file is looked at without following a symlink: a symlink there is refused, never
+//! removed, and anything else that is not a regular file is left unopened. On unix the
+//! file is then opened in that directory (`openat(O_NOFOLLOW | O_NONBLOCK)`), `fstat` must
+//! find a regular file, the caller's proof reads it, and `fstatat(AT_SYMLINK_NOFOLLOW)`
+//! must find the same device and inode at the name before `unlinkat` removes it from the
+//! directory the walk opened: a file put in its place after it was opened is left. Only
+//! one put there in the instant between that look and the removal is removed instead.
+//! Windows checks each directory below the anchor as a write does, and removes by path.
 //!
 //! # Contract (#226)
 //!
@@ -309,6 +324,88 @@ pub(crate) fn replace_if_unchanged(
     imp::replace_held(held, content.as_bytes(), durability).map_err(|f| worded(&target, f))
 }
 
+/// Remove `target` once it is shown to be a regular file `proof` accepts, below its anchor
+/// and through no symlink there or at the file (#160; see the module docs): `proof` reads
+/// the file as opened in the directory the walk reached, and the name is removed from that
+/// directory only while it is still that file. A target that names the directory its
+/// caller checked ([`WriteTarget::below_checked_anchor`]) is removed only below that one,
+/// as a write is made only there. Nothing is created, and a file that is not there —
+/// nor, below the anchor, a directory on its way — is nothing to remove.
+///
+/// # Errors
+///
+/// [`NotRemoved`], the file left as it is, with a cause that names no path but the
+/// shown form of a refused directory, for the caller to word after the file's name.
+pub(crate) fn remove_proven(
+    target: &WriteTarget,
+    proof: impl FnOnce(&mut std::fs::File) -> std::io::Result<bool>,
+) -> std::result::Result<Removal, NotRemoved> {
+    let below = Below::of(target).map_err(|e| NotRemoved::Failed(safe_inline(io_cause(&e))))?;
+    imp::remove(&below, target.checked_anchor(), proof).map_err(|f| not_removed(target, f))
+}
+
+/// What [`remove_proven`] found at its file, and did.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// The file was proven, and is removed.
+    Removed,
+    /// Nothing has its name, nor — below the anchor — a directory on its way.
+    Missing,
+    /// A regular file its proof does not accept: left as it is.
+    Kept,
+}
+
+/// Why [`remove_proven`] did not remove a file that is, or may be, there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotRemoved {
+    /// Not a regular file — a directory, a FIFO, a socket or a device: never opened.
+    NotAFile,
+    /// It could not be looked at or read, so nothing is known of it: the cause, escaped.
+    Unreadable(String),
+    /// Refused — a symlink at it or below the anchor, an anchor that is not the directory
+    /// checked, another file at its name by the time it was to go — or the removal
+    /// failed: the cause, escaped.
+    Failed(String),
+}
+
+impl NotRemoved {
+    /// The refusal of a removal below an out-dir that now leads to a different directory
+    /// than the one the `mds watch` session started with, as [`out_dir_moved`] refuses a
+    /// write there (#160).
+    pub(crate) fn out_dir_moved() -> Self {
+        Self::Failed(OUT_DIR_MOVED.to_owned())
+    }
+
+    /// Why the file was not removed, as its caller's message gives it after the file's
+    /// name.
+    pub(crate) fn cause(&self) -> &str {
+        match self {
+            Self::NotAFile => NOT_A_REGULAR_FILE,
+            Self::Unreadable(cause) | Self::Failed(cause) => cause,
+        }
+    }
+}
+
+/// `failure`, a removal of `target` that did not happen, as [`NotRemoved`] gives it.
+fn not_removed(target: &WriteTarget, failure: Failure) -> NotRemoved {
+    let cause = |e: &std::io::Error| safe_inline(io_cause(e));
+    match failure {
+        Failure::NotARegularFile => NotRemoved::NotAFile,
+        Failure::Unreadable(e) => NotRemoved::Unreadable(cause(&e)),
+        Failure::AnchorMoved => NotRemoved::out_dir_moved(),
+        Failure::Changed => NotRemoved::Failed(CHANGED_WHILE_CHECKED.to_owned()),
+        Failure::LinkBelowAnchor { depth } => NotRemoved::Failed(format!(
+            "{FOLLOW_REFUSAL} at {}",
+            safe_path(&shown_directory(target, depth))
+        )),
+        Failure::LinkAtTarget => NotRemoved::Failed(SYMLINK_REMOVAL_REFUSAL.to_owned()),
+        // Only a new file's commit meets a file at its name; a removal never does.
+        Failure::Exists => NotRemoved::Failed(cause(&std::io::ErrorKind::AlreadyExists.into())),
+        Failure::Io(e) => NotRemoved::Failed(cause(&e)),
+    }
+}
+
 /// `failure`, a write of `target` that did not land, as the `mds::io` error it reports.
 fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
     match failure {
@@ -329,9 +426,9 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
             io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
         }
         Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
-        #[cfg(unix)]
         Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
-        Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
+        // Only a removal's look at its file, or its proof's read, fails as unreadable.
+        Failure::Unreadable(e) | Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
     }
 }
 
@@ -342,8 +439,15 @@ pub(crate) const ALREADY_EXISTS: &str = "already exists (use --force to overwrit
 /// Why [`atomic_write_file`] refuses to replace a symlink at its target.
 const SYMLINK_REFUSAL: &str = "refusing to replace a symlink";
 
-/// Why [`atomic_write_file`] refuses to replace a FIFO, a socket or a device at its target.
-#[cfg(unix)]
+/// Why [`remove_proven`] refuses to remove a symlink at its file: mds writes none.
+const SYMLINK_REMOVAL_REFUSAL: &str = "refusing to remove a symlink";
+
+/// Why [`remove_proven`] leaves a file whose name, by the time it was to be removed, was
+/// another file's than the one its proof read.
+const CHANGED_WHILE_CHECKED: &str = "changed while it was checked";
+
+/// Why [`atomic_write_file`] refuses to replace, and [`remove_proven`] to remove, a FIFO, a
+/// socket, a device or a directory.
 const NOT_A_REGULAR_FILE: &str = "not a regular file";
 
 /// Why [`atomic_write_file`] refuses a symlink at a directory below the anchor.
@@ -388,7 +492,7 @@ enum Failure {
     /// The anchor opened is not the directory the caller checked.
     AnchorMoved,
     /// The file a rewrite read is not as it was read: its bytes, or its stamp, differ, or
-    /// it is gone.
+    /// it is gone; or another file has the name of the one a removal proved.
     Changed,
     /// A new file's target is there, or appeared before the commit ([`create_new`]).
     Exists,
@@ -396,9 +500,11 @@ enum Failure {
     LinkBelowAnchor { depth: usize },
     /// The target itself is a symlink.
     LinkAtTarget,
-    /// The target itself is a FIFO, a socket or a device.
-    #[cfg(unix)]
+    /// The target itself is a FIFO, a socket or a device — or, for a removal, a
+    /// directory.
     NotARegularFile,
+    /// A file to be removed could not be looked at, or its proof could not read it.
+    Unreadable(std::io::Error),
     /// Anything else.
     Io(std::io::Error),
 }
@@ -506,7 +612,7 @@ mod unix {
     use rustix::io::Errno;
 
     use super::{
-        Below, Commit, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX,
+        Below, Commit, DirIdentity, Durability, Failure, Parents, Removal, TEMP_PREFIX, TEMP_SUFFIX,
     };
 
     /// The anchor: a directory, resolved by path — through a symlink the user named.
@@ -535,8 +641,9 @@ mod unix {
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
 
-    /// A file a rewrite reads again: never through a symlink, and never waiting on a FIFO
-    /// put in its place, which the read then refuses as no longer the file read.
+    /// A file a rewrite reads again, or a removal's proof reads: never through a symlink,
+    /// and never waiting on a FIFO put in its place, which the read then refuses as no
+    /// longer the file read, and the removal as not a regular file.
     const READ: OFlags = OFlags::RDONLY
         .union(OFlags::NOFOLLOW)
         .union(OFlags::NONBLOCK)
@@ -640,8 +747,8 @@ mod unix {
     /// before its bytes are read, so a change made while they are read changes it too.
     pub(super) fn read_stamped(below: &Below<'_>, read: &[u8]) -> Result<Held, Failure> {
         let dir = walk(below, None, Parents::Existing)?;
-        let mut file = match fs::openat(&dir, below.name, READ, Mode::empty()) {
-            Ok(fd) => File::from(fd),
+        let mut file = match open_to_read(dir.as_fd(), below.name) {
+            Ok(file) => file,
             Err(Errno::LOOP) => return Err(Failure::LinkAtTarget),
             Err(Errno::NOENT) => return Err(Failure::Changed),
             Err(e) => return Err(e.into()),
@@ -671,6 +778,72 @@ mod unix {
     ) -> Result<(), Failure> {
         let commit = Commit::Replace(Some(&held.stamp));
         replace(held.dir, &held.name, content, durability, commit)
+    }
+
+    /// Remove `below.name` from the directory [`walk`] opens — creating none — once it is
+    /// a regular file `proof` accepts, and only while the name is still that file (#160).
+    /// It is looked at without following a symlink first, so anything but a regular file
+    /// is never opened; then opened without following one, and never waiting on a FIFO
+    /// put in its place; its device and inode, from the file opened, must be the name's
+    /// again, looked at once `proof` has read it, before it is unlinked.
+    pub(super) fn remove(
+        below: &Below<'_>,
+        anchor: Option<DirIdentity>,
+        proof: impl FnOnce(&mut File) -> std::io::Result<bool>,
+    ) -> Result<Removal, Failure> {
+        let dir = match walk(below, anchor, Parents::Existing) {
+            Ok(dir) => dir,
+            Err(Failure::Io(e)) if nothing_below(&e) => return Ok(Removal::Missing),
+            Err(failure) => return Err(failure),
+        };
+        let name = below.name;
+        match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => {}
+                FileType::Symlink => return Err(Failure::LinkAtTarget),
+                _ => return Err(Failure::NotARegularFile),
+            },
+            Err(Errno::NOENT) => return Ok(Removal::Missing),
+            Err(e) => return Err(Failure::Unreadable(e.into())),
+        }
+        let mut file = match open_to_read(dir.as_fd(), name) {
+            Ok(file) => file,
+            Err(Errno::LOOP) => return Err(Failure::LinkAtTarget),
+            Err(Errno::NOENT) => return Ok(Removal::Missing),
+            Err(e) => return Err(Failure::Unreadable(e.into())),
+        };
+        let opened = fs::fstat(&file).map_err(|e| Failure::Unreadable(e.into()))?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
+            return Err(Failure::NotARegularFile);
+        }
+        if !proof(&mut file).map_err(Failure::Unreadable)? {
+            return Ok(Removal::Kept);
+        }
+        drop(file);
+        // The file proven must still be the one at the name: another put there since is
+        // left as it is.
+        match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(now) if (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino) => {}
+            Ok(_) => return Err(Failure::Changed),
+            Err(Errno::NOENT) => return Ok(Removal::Missing),
+            Err(e) => return Err(e.into()),
+        }
+        match fs::unlinkat(&dir, name, AtFlags::empty()) {
+            Ok(()) => Ok(Removal::Removed),
+            Err(Errno::NOENT) => Ok(Removal::Missing),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether `e`, from the walk to a file to be removed, says a directory on its way is
+    /// not there, or is no directory: then no file is there to remove.
+    fn nothing_below(e: &std::io::Error) -> bool {
+        matches!(Errno::from_io_error(e), Some(Errno::NOENT | Errno::NOTDIR))
+    }
+
+    /// Open `name` in `dir` to read it: a rewrite's second read, or a removal's proof.
+    fn open_to_read(dir: BorrowedFd<'_>, name: &OsStr) -> Result<File, Errno> {
+        fs::openat(dir, name, READ, Mode::empty()).map(File::from)
     }
 
     /// Open the anchor by path, creating it first when it is missing and `parents` says so.
@@ -1052,7 +1225,7 @@ mod windows {
     use std::time::SystemTime;
 
     use super::{
-        Below, Commit, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX,
+        Below, Commit, DirIdentity, Durability, Failure, Parents, Removal, TEMP_PREFIX, TEMP_SUFFIX,
     };
 
     /// `ERROR_PATH_NOT_FOUND`: a directory that is not there, in the operating system's
@@ -1154,6 +1327,51 @@ mod windows {
     ) -> Result<(), Failure> {
         let commit = Commit::Replace(Some(&held.stamp));
         replace(&held.dir, &held.file, content, durability, commit)
+    }
+
+    /// Remove `below.name`, in the directory [`walk`] checks — creating none — once it is
+    /// a regular file `proof` accepts, refusing a symlink or a junction there; the file is
+    /// closed again before it is removed by path (the residual the module docs describe).
+    pub(super) fn remove(
+        below: &Below<'_>,
+        anchor: Option<DirIdentity>,
+        proof: impl FnOnce(&mut std::fs::File) -> std::io::Result<bool>,
+    ) -> Result<Removal, Failure> {
+        let dir = match walk(below, anchor, Parents::Existing) {
+            Ok(dir) => dir,
+            Err(Failure::Io(e)) if nothing_below(&e) => return Ok(Removal::Missing),
+            Err(failure) => return Err(failure),
+        };
+        let target = dir.join(below.name);
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
+            Ok(meta) if !meta.is_file() => return Err(Failure::NotARegularFile),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Missing),
+            Err(e) => return Err(Failure::Unreadable(e)),
+        }
+        let proven = match std::fs::File::open(&target) {
+            Ok(mut file) => proof(&mut file).map_err(Failure::Unreadable)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Missing),
+            Err(e) => return Err(Failure::Unreadable(e)),
+        };
+        if !proven {
+            return Ok(Removal::Kept);
+        }
+        match std::fs::remove_file(&target) {
+            Ok(()) => Ok(Removal::Removed),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Removal::Missing),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether `e`, from the walk to a file to be removed, says a directory on its way is
+    /// not there, or is no directory: then no file is there to remove.
+    fn nothing_below(e: &std::io::Error) -> bool {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) || e.raw_os_error() == Some(PATH_NOT_FOUND)
     }
 
     /// Put `content` at `target` in `dir`, by way of a temporary file beside it, as
@@ -2161,6 +2379,218 @@ mod tests {
             failed(&["rename", "link"]),
             "a failed link is no reason to write in place"
         );
+    }
+
+    // ── A removal ────────────────────────────────────────────────────────────────
+
+    /// The file `rel` below the anchor `anchor`, named below `o`.
+    fn to_remove(anchor: &Path, rel: &str) -> WriteTarget {
+        WriteTarget::below(anchor, Path::new("o"), Path::new(rel))
+    }
+
+    /// A file its proof does not accept is kept, and the proof is given the file to be
+    /// removed to read; a file its proof cannot read is kept too, as unreadable (#160).
+    /// Control: the same file, its proof accepting it, is removed.
+    #[test]
+    fn a_file_its_proof_does_not_accept_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.json");
+        std::fs::write(&file, "stale").unwrap();
+        let target = to_remove(dir.path(), "x.json");
+
+        let mut read = String::new();
+        let kept = remove_proven(&target, |opened| {
+            std::io::Read::read_to_string(opened, &mut read)?;
+            Ok(false)
+        });
+        assert_eq!(kept, Ok(Removal::Kept));
+        assert_eq!(read, "stale", "the proof reads the file to be removed");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "stale",
+            "it is kept"
+        );
+
+        let unreadable = remove_proven(&target, |_| Err(std::io::ErrorKind::InvalidData.into()));
+        assert!(
+            matches!(unreadable, Err(NotRemoved::Unreadable(_))),
+            "{unreadable:?}"
+        );
+        assert!(file.exists(), "a file its proof cannot read is kept");
+
+        assert_eq!(remove_proven(&target, |_| Ok(true)), Ok(Removal::Removed));
+        assert!(!file.exists(), "control: the file proven is removed");
+    }
+
+    /// A file that is not there — nor a directory on its way, nor one that is a file — is
+    /// nothing to remove, and its proof is never asked (#160). Control: a file that is
+    /// there is given to its proof.
+    #[test]
+    fn a_file_that_is_not_there_is_nothing_to_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        for rel in ["gone.json", "gone/x.json", "file/x.json"] {
+            let removal = remove_proven(&to_remove(dir.path(), rel), |_| {
+                panic!("{rel}: there is no file to prove")
+            });
+            assert_eq!(removal, Ok(Removal::Missing), "{rel}");
+        }
+
+        std::fs::write(dir.path().join("here.json"), "x").unwrap();
+        let mut asked = false;
+        let removal = remove_proven(&to_remove(dir.path(), "here.json"), |_| {
+            asked = true;
+            Ok(false)
+        });
+        assert_eq!(removal, Ok(Removal::Kept));
+        assert!(asked, "control: the proof is asked of a file that is there");
+    }
+
+    /// A symlink below the anchor is never removed through, and one at the file — live or
+    /// dangling — is never removed: each is refused, the directory by the path the user
+    /// knows it by, and the file a link leads to is left (#160). Control: the same name
+    /// below a real directory is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_through_a_symlink_or_of_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        let victim = dir.path().join("victim");
+        std::fs::create_dir_all(anchor.join("real")).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("x.json"), "victim").unwrap();
+        std::os::unix::fs::symlink(&victim, anchor.join("sub")).unwrap();
+        std::os::unix::fs::symlink(victim.join("x.json"), anchor.join("real/live.json")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), anchor.join("real/gone.json"))
+            .unwrap();
+
+        assert_eq!(
+            remove_proven(&to_remove(&anchor, "sub/x.json"), |_| Ok(true)),
+            Err(NotRemoved::Failed(format!("{FOLLOW_REFUSAL} at o/sub")))
+        );
+        for link in ["real/live.json", "real/gone.json"] {
+            assert_eq!(
+                remove_proven(&to_remove(&anchor, link), |_| Ok(true)),
+                Err(NotRemoved::Failed(SYMLINK_REMOVAL_REFUSAL.to_owned())),
+                "{link}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(victim.join("x.json")).unwrap(),
+            "victim",
+            "nothing is removed through a symlink"
+        );
+        assert_eq!(
+            entries(&anchor.join("real")),
+            ["gone.json", "live.json"],
+            "no symlink is removed"
+        );
+
+        std::fs::write(anchor.join("real/x.json"), "stale").unwrap();
+        assert_eq!(
+            remove_proven(&to_remove(&anchor, "real/x.json"), |_| Ok(true)),
+            Ok(Removal::Removed)
+        );
+        assert_eq!(
+            entries(&anchor.join("real")),
+            ["gone.json", "live.json"],
+            "control: the file is removed"
+        );
+    }
+
+    /// A FIFO or a directory at the name is no file to remove: refused as not a regular
+    /// file, left as it is, and never given to a proof (#160). Control: a regular file
+    /// beside them is removed.
+    #[cfg(unix)]
+    #[test]
+    fn anything_but_a_regular_file_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.path().join("x.json"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo x.json");
+        std::fs::create_dir(dir.path().join("x.md")).unwrap();
+        for name in ["x.json", "x.md"] {
+            let removal = remove_proven(&to_remove(dir.path(), name), |_| {
+                panic!("{name}: not a file to prove")
+            });
+            assert_eq!(removal, Err(NotRemoved::NotAFile), "{name}");
+        }
+        assert_eq!(entries(dir.path()), ["x.json", "x.md"], "both are left");
+
+        std::fs::write(dir.path().join("x.txt"), "stale").unwrap();
+        assert_eq!(
+            remove_proven(&to_remove(dir.path(), "x.txt"), |_| Ok(true)),
+            Ok(Removal::Removed)
+        );
+        assert_eq!(
+            entries(dir.path()),
+            ["x.json", "x.md"],
+            "control: the file is removed"
+        );
+    }
+
+    /// A file put at the name after the one there was opened — between its proof and its
+    /// removal — is not removed: the removal is refused, and the file put there is left
+    /// (#160). Control: with nothing put there, the file proven is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_in_the_place_of_the_one_proven_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.json");
+        let other = dir.path().join("other.json");
+        std::fs::write(&file, "proven").unwrap();
+        std::fs::write(&other, "put there").unwrap();
+        let target = to_remove(dir.path(), "x.json");
+
+        let swapped = remove_proven(&target, |_| {
+            std::fs::rename(&other, &file)?;
+            Ok(true)
+        });
+        assert_eq!(
+            swapped,
+            Err(NotRemoved::Failed(CHANGED_WHILE_CHECKED.to_owned()))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "put there",
+            "the file put there is left"
+        );
+
+        assert_eq!(remove_proven(&target, |_| Ok(true)), Ok(Removal::Removed));
+        assert!(!file.exists(), "control: the file proven is removed");
+    }
+
+    /// A removal whose anchor is not the directory its caller checked is refused before
+    /// anything below it is looked at, as a write there is (#160). Control: the directory
+    /// checked, opened, has the file removed.
+    ///
+    /// `#[cfg(unix)]`: two directories made a moment apart are told apart by their inode
+    /// there; Windows has their creation times alone, which can be equal.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_whose_anchor_is_not_the_directory_checked_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(out.join("sub")).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let file = out.join("sub/x.json");
+        std::fs::write(&file, "stale").unwrap();
+        let identity = |of: &Path| DirIdentity::of(of).expect("a directory");
+        let target = to_remove(&out, "sub/x.json");
+
+        let swapped = target.below_checked_anchor(&out, 0, identity(&other));
+        assert_eq!(
+            remove_proven(&swapped, |_| Ok(true)),
+            Err(NotRemoved::out_dir_moved())
+        );
+        assert!(file.exists(), "nothing is removed below it");
+
+        let checked = target.below_checked_anchor(&out, 0, identity(&out));
+        assert_eq!(remove_proven(&checked, |_| Ok(true)), Ok(Removal::Removed));
+        assert!(!file.exists(), "control: the file is removed");
     }
 
     // ── The temporary file ───────────────────────────────────────────────────────

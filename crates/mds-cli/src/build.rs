@@ -9,7 +9,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use crate::output::WriteTarget;
-use crate::write::{atomic_write_file, Durability, Parents};
+use crate::write::{atomic_write_file, Durability, NotRemoved, Parents, Removal};
 use mds::{
     effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
     STRING_SOURCE_MAP_LABEL,
@@ -1429,61 +1429,50 @@ pub(crate) fn apply_source_map_file_label(
 /// A missing file is skipped silently. Anything else that is not such a sidecar is left
 /// in place with a warning (unless `quiet`): one that is not a regular file is never
 /// opened — opening a FIFO with no writer blocks — and a regular file is recognised by
-/// its first bytes alone ([`has_sidecar_head`]), so none is read whole (#428). Every
-/// message names the map by `map.shown` (#390).
+/// its first bytes alone ([`has_sidecar_head`]), so none is read whole (#428). The
+/// removal goes through [`crate::write::remove_proven`] (#160): the map is looked at,
+/// read and removed below its anchor, through no symlink there or at the map, and only
+/// while it is the file read. Every message names the map by `map.shown` (#390).
 ///
 /// # Errors
 ///
 /// A map that cannot be read — so nothing is known of its content — and a sidecar that
-/// cannot be removed are `mds::io` (exit 2, #157).
+/// is not removed — refused, or the removal failed — are `mds::io` (exit 2, #157).
 pub(crate) fn verify_then_delete_map(
     map: &WriteTarget,
     expected_basename: &str,
     quiet: bool,
 ) -> Result<(), MdsError> {
-    let unreadable = |e: &std::io::Error| MdsError::Io {
+    let error = |what: &str, cause: &str| MdsError::Io {
         message: format!(
-            "cannot read stale map {}: {}",
-            crate::output::safe_path(&map.shown),
-            crate::output::safe_inline(crate::output::io_cause(e))
+            "{what} stale map {}: {cause}",
+            crate::output::safe_path(&map.shown)
         ),
     };
-    let metadata = match std::fs::metadata(&map.path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(unreadable(&e)),
-    };
-    let sidecar = if metadata.is_file() {
-        match std::fs::File::open(&map.path)
-            .and_then(|mut file| has_sidecar_head(&mut file, expected_basename))
-        {
-            Ok(sidecar) => sidecar,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(unreadable(&e)),
+    let proof = |file: &mut std::fs::File| has_sidecar_head(file, expected_basename);
+    match crate::write::remove_proven(map, proof) {
+        Ok(Removal::Removed) => {
+            if !quiet {
+                crate::output::ewriteln!(
+                    "Removed stale map {}",
+                    crate::output::safe_path(&map.shown)
+                );
+            }
+            Ok(())
         }
-    } else {
-        false
-    };
-    if !sidecar {
-        if !quiet {
-            crate::output::ewriteln!(
-                "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
-                crate::output::safe_path(&map.shown)
-            );
+        Ok(Removal::Missing) => Ok(()),
+        Ok(Removal::Kept) | Err(NotRemoved::NotAFile) => {
+            if !quiet {
+                crate::output::ewriteln!(
+                    "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
+                    crate::output::safe_path(&map.shown)
+                );
+            }
+            Ok(())
         }
-        return Ok(());
+        Err(NotRemoved::Unreadable(cause)) => Err(error("cannot read", &cause)),
+        Err(NotRemoved::Failed(cause)) => Err(error("could not remove", &cause)),
     }
-    std::fs::remove_file(&map.path).map_err(|e| MdsError::Io {
-        message: format!(
-            "could not remove stale map {}: {}",
-            crate::output::safe_path(&map.shown),
-            crate::output::safe_inline(crate::output::io_cause(&e))
-        ),
-    })?;
-    if !quiet {
-        crate::output::ewriteln!("Removed stale map {}", crate::output::safe_path(&map.shown));
-    }
-    Ok(())
 }
 
 /// Whether `reader` starts with the bytes every sidecar mds writes for the output named
@@ -1877,10 +1866,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         // No-source-map build: if a stale sidecar exists from a prior source-map build,
         // remove it (AC-FUNC-10).
         if let Some(ref out) = output_path {
-            let map = out.sibling(map_path_for);
-            if map.path.exists() {
-                verify_then_delete_map(&map, &file_name_of(out), quiet)?;
-            }
+            verify_then_delete_map(&out.sibling(map_path_for), &file_name_of(out), quiet)?;
         }
     }
 
@@ -3271,5 +3257,46 @@ mod tests {
             other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
         }
         assert!(map.exists(), "a map that cannot be read is left in place");
+    }
+
+    /// #160: a stale map whose directory below the anchor is a symlink — `mds.json`'s
+    /// `build.output_dir` puts directories there — is not removed through it: the removal
+    /// is refused (`mds::io`), naming the map and the link as shown, and the sidecar of
+    /// that name where the link leads is left. Control: the same sidecar below a real
+    /// directory is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_map_is_never_removed_through_a_symlink_below_its_anchor() {
+        let sidecar = "{\"version\":3,\"file\":\"x.md\",\"sources\":[],\"mappings\":\"\"}";
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir_all(anchor.join("real")).unwrap();
+        std::fs::create_dir(dir.path().join("victim")).unwrap();
+        std::os::unix::fs::symlink("../victim", anchor.join("sub")).unwrap();
+        let victim = dir.path().join("victim/x.md.map");
+        std::fs::write(&victim, sidecar).unwrap();
+
+        let map = WriteTarget::below(&anchor, Path::new("out"), Path::new("sub/x.md.map"));
+        let result = verify_then_delete_map(&map, "x.md", true);
+        assert_eq!(
+            std::fs::read_to_string(&victim).ok().as_deref(),
+            Some(sidecar),
+            "nothing is removed through the symlink"
+        );
+        match result {
+            Err(MdsError::Io { message }) => assert_eq!(
+                message,
+                "could not remove stale map out/sub/x.md.map: \
+                 refusing to follow a symlink at out/sub"
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+
+        // Control: below a real directory, the sidecar is removed.
+        let real = anchor.join("real/x.md.map");
+        std::fs::write(&real, sidecar).unwrap();
+        let map = WriteTarget::below(&anchor, Path::new("out"), Path::new("real/x.md.map"));
+        assert!(verify_then_delete_map(&map, "x.md", true).is_ok());
+        assert!(!real.exists(), "control: the stale sidecar is removed");
     }
 }

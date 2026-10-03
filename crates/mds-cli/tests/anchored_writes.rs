@@ -456,6 +456,128 @@ fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
     );
 }
 
+// ── A removal below the anchor ──────────────────────────────────────────────
+
+/// `mds watch` never removes a deleted source's output through a symlink that replaced a
+/// directory below `--out-dir`: the removal is refused by the path the user knows the
+/// output by, naming the link, and the hand-written file of that name in the directory
+/// the link points at is left as it was. Controls: earlier in the same session, a deleted
+/// source's output below a real directory is removed; and the link is left in place.
+#[cfg(unix)]
+#[test]
+fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
+    const HAND: &str = "{\"hand\": \"written\", \"not\": \"mds output\"}\n";
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "src/top.mds", "Top\n");
+    put(root, "src/sub/x.mds", "X\n");
+    let victim = put(root, "victim/x.json", HAND);
+
+    let (child, tap, _) = common::spawn_watch_ready(
+        mds_bin()
+            .current_dir(root)
+            .args(["watch", "src", "--out-dir", "out", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let mut child = common::ChildGuard(child);
+    assert_eq!(read(&root.join("out/sub/x.md")), "X\n");
+
+    // Control: the output of a source deleted below a real directory is removed.
+    std::fs::remove_file(root.join("src/top.mds")).unwrap();
+    common::wait_for_tap(&tap, "top.md (source deleted)", TIMEOUT);
+    assert!(
+        !root.join("out/top.md").exists(),
+        "control: the deleted source's output is removed"
+    );
+
+    std::fs::remove_dir_all(root.join("out/sub")).unwrap();
+    std::os::unix::fs::symlink("../victim", root.join("out/sub")).unwrap();
+    std::fs::remove_file(root.join("src/sub/x.mds")).unwrap();
+    common::wait_for_tap(&tap, "x.json", TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        read(&victim),
+        HAND,
+        "nothing is removed through the symlink; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "warning: could not remove {}: refusing to follow a symlink at {}",
+            native("out/sub/x.json"),
+            native("out/sub")
+        )),
+        "the refusal names the output and the link as typed; stderr: {stderr}"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("out/sub"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is left in place"
+    );
+}
+
+/// `mds watch` never removes a deleted source's output through an out-dir replaced by a
+/// symlink mid-session: the out-dir is checked first, as before a write, the removal is
+/// refused as such a write is, naming the output as typed, and the file of that name
+/// where the link leads is left as it was. Control: earlier in the same session, a
+/// deleted source's output in the out-dir as it started is removed.
+#[cfg(unix)]
+#[test]
+fn watch_never_removes_an_output_through_an_out_dir_replaced_by_a_symlink() {
+    const HAND: &str = "Hand-written, not an mds output\n";
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "src/top.mds", "Top\n");
+    put(root, "src/x.mds", "X\n");
+    let victim = put(root, "victim/x.md", HAND);
+
+    let (child, tap, _) = common::spawn_watch_ready(
+        mds_bin()
+            .current_dir(root)
+            .args(["watch", "src", "--out-dir", "out", "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let mut child = common::ChildGuard(child);
+    assert_eq!(read(&root.join("out/x.md")), "X\n");
+
+    // Control: the output of a source deleted while the out-dir is as it started is removed.
+    std::fs::remove_file(root.join("src/top.mds")).unwrap();
+    common::wait_for_tap(&tap, "top.md (source deleted)", TIMEOUT);
+    assert!(
+        !root.join("out/top.md").exists(),
+        "control: the deleted source's output is removed"
+    );
+
+    std::fs::remove_dir_all(root.join("out")).unwrap();
+    std::os::unix::fs::symlink("victim", root.join("out")).unwrap();
+    std::fs::remove_file(root.join("src/x.mds")).unwrap();
+    let reported = common::poll_tap_until(&tap, TIMEOUT, |seen| {
+        seen.contains("x.md (source deleted)") || seen.contains("could not remove")
+    });
+    let stderr = tap.finish_text(&mut child);
+
+    assert!(
+        reported.is_ok(),
+        "the deletion reported nothing; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(&victim),
+        HAND,
+        "nothing is removed through the symlink; stderr: {stderr}"
+    );
+    let refusal = format!(
+        "warning: could not remove {}: the output directory now resolves to a different \
+         directory; restart mds watch to follow it",
+        native("out/x.md")
+    );
+    assert!(
+        squash(&stderr).contains(&squash(&refusal)),
+        "the refusal names the output as typed; stderr: {stderr}"
+    );
+}
+
 // ── A directory swapped for a link while a rewrite runs ─────────────────────
 
 /// A pipe filled to the brim, and its ends: a child given the write end as a stream

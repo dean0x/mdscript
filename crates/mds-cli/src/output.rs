@@ -1683,9 +1683,11 @@ pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
 /// format flip (e.g. a file that used to emit `x.md` but now emits `x.json`).
 ///
 /// If neither sibling exists the function is a no-op, and a removal that succeeds is
-/// silent: stale cleanup is a housekeeping detail. A wrong-extension file that exists but
-/// cannot be removed is an `mds::io` error the caller reports (#157); nothing is printed
-/// here.
+/// silent: stale cleanup is a housekeeping detail. The removal goes through
+/// [`crate::write::remove_proven`] (#160): below the stem's anchor, through no symlink
+/// there, and only of a regular file. A wrong-extension file that exists but is not
+/// removed — refused, not a regular file, or the removal failed — is an `mds::io` error
+/// the caller reports (#157); nothing is printed here.
 ///
 /// `base_no_ext` is the output's path WITHOUT extension (e.g. `/out/foo` for a source
 /// `foo.mds`) in both of [`output_stem_for`]'s forms. The function constructs
@@ -1700,16 +1702,16 @@ pub(crate) fn probe_and_remove_stale(
 ) -> std::result::Result<(), mds::MdsError> {
     let stale_ext = kind.stale_extension();
     let stale = base_no_ext.sibling(|base| base.with_extension(stale_ext));
-    if !stale.path.exists() {
-        return Ok(());
+    match crate::write::remove_proven(&stale, |_| Ok(true)) {
+        Ok(_) => Ok(()),
+        Err(not_removed) => Err(mds::MdsError::Io {
+            message: format!(
+                "could not remove stale output {}: {}",
+                safe_path(&stale.shown),
+                not_removed.cause()
+            ),
+        }),
     }
-    std::fs::remove_file(&stale.path).map_err(|e| mds::MdsError::Io {
-        message: format!(
-            "could not remove stale output {}: {}",
-            safe_path(&stale.shown),
-            safe_inline(io_cause(&e))
-        ),
-    })
 }
 
 /// Where a `Dir`-mode source lands below the out-dir, without its extension.
@@ -2633,6 +2635,46 @@ mod tests {
             ),
             target("src", "src", "sub/page.md")
         );
+    }
+
+    /// #160: a stale output whose directory below the anchor is a symlink is not removed
+    /// through it: the removal is refused (`mds::io`), naming the stale output and the
+    /// link as shown, and the file of that name where the link leads is left. Control: the
+    /// same stale output below a real directory is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_output_is_never_removed_through_a_symlink_below_its_anchor() {
+        const HAND: &str = "{\"hand\": \"written\"}";
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir_all(anchor.join("real")).unwrap();
+        std::fs::create_dir(dir.path().join("victim")).unwrap();
+        std::os::unix::fs::symlink("../victim", anchor.join("sub")).unwrap();
+        let victim = dir.path().join("victim/x.json");
+        std::fs::write(&victim, HAND).unwrap();
+
+        let stem = WriteTarget::below(&anchor, Path::new("out"), Path::new("sub/x"));
+        let result = probe_and_remove_stale(&stem, OutputKind::Markdown);
+        assert_eq!(
+            std::fs::read_to_string(&victim).ok().as_deref(),
+            Some(HAND),
+            "nothing is removed through the symlink"
+        );
+        match result {
+            Err(mds::MdsError::Io { message }) => assert_eq!(
+                message,
+                "could not remove stale output out/sub/x.json: \
+                 refusing to follow a symlink at out/sub"
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+
+        // Control: below a real directory, the stale output is removed.
+        let real = anchor.join("real/x.json");
+        std::fs::write(&real, HAND).unwrap();
+        let stem = WriteTarget::below(&anchor, Path::new("out"), Path::new("real/x"));
+        assert!(probe_and_remove_stale(&stem, OutputKind::Markdown).is_ok());
+        assert!(!real.exists(), "control: the stale output is removed");
     }
 
     /// #390: a root walked in another form than it was typed in — `mds watch` walks the

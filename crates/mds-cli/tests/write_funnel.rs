@@ -1,16 +1,18 @@
 //! Write-funnel guard (#227, #160): every artifact `mds` writes from production code must
 //! go through the single atomic choke point in `crate::write` — `atomic_write_file`, or,
 //! for a rewrite of a file just read, `replace_if_unchanged`, or, for a new file that
-//! must never replace one, `create_new`, which share its tail.
+//! must never replace one, `create_new`, which share its tail — and every file it
+//! removes through `remove_proven`, below the same anchor.
 //!
 //! # Why this exists
 //!
 //! `atomic_write_file` is temp-file + sync + rename below the write's anchor: a crash or a
 //! mid-write error never leaves a truncated artifact, nothing is written through a
-//! symlink below the anchor or at the target, and a replaced file keeps its mode. A raw
-//! `std::fs::write` — or a raw `create_dir_all`, `create_dir`, `mkdirat`, `openat`,
-//! `rename`, `renameat`, `renameat_with`, `linkat`, `unlinkat` or path-based
-//! `fs::set_permissions` — at any *one* remaining site
+//! symlink below the anchor or at the target, and a replaced file keeps its mode;
+//! `remove_proven` removes a file only below its anchor, through no symlink, once it is
+//! proven. A raw `std::fs::write` — or a raw `create_dir_all`, `create_dir`, `mkdirat`,
+//! `openat`, `rename`, `renameat`, `renameat_with`, `linkat`, `unlinkat`, path-based
+//! `fs::set_permissions` or `remove_file` — at any *one* remaining site
 //! silently forfeits all of that for the artifact it touches, and "did we remember every
 //! write site?" is an unbounded search that three reviewers can each answer differently.
 //! This test converts it into a machine-checked invariant: a raw write in
@@ -50,7 +52,9 @@ use std::path::{Path, PathBuf};
 /// swapped component redirects (the primitive uses `fchmod` on its own descriptor);
 /// `fs::rename(` — `std::fs::rename(` and rustix's alike — moves a file by path, and
 /// `renameat(` relative to a descriptor, `renameat_with(` with flags; `fs::linkat(` gives
-/// a file a second name relative to a descriptor, and `unlinkat(` removes one. `create_dir(`
+/// a file a second name relative to a descriptor, and `unlinkat(` removes one;
+/// `remove_file(` — `std::fs::remove_file(` and an imported `fs::remove_file(` alike —
+/// removes a file by path, through any symlink on the way. `create_dir(`
 /// is not part of `create_dir_all(`, nor `fs::rename(` of `fs::renameat(`, nor `renameat(`
 /// of `renameat_with(`, nor `fs::linkat(` of `fs::unlinkat(` — which is why the link's
 /// needle is the qualified spelling — so each call is counted once.
@@ -68,6 +72,7 @@ const NEEDLES: &[&str] = &[
     "renameat_with(",
     "fs::linkat(",
     "unlinkat(",
+    "remove_file(",
 ];
 
 /// Production sites that may keep a raw write: `(file basename, needle, max hits, why)`.
@@ -90,6 +95,14 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "test-only readiness marker: <path>.tmp, created new, renamed onto the marker path \
          an absolute environment variable names — the rename is its atomic step",
+    ),
+    (
+        "watch.rs",
+        "remove_file(",
+        1,
+        "test-only readiness marker: an entry already at <path>.tmp — a leftover, or a \
+         planted link, the entry itself and never what a link points to — removed before \
+         the marker is created new once more; no file mds writes",
     ),
     (
         "write.rs",
@@ -120,9 +133,10 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
         "the primitive's unix walk: the anchor (opened, then again once created), each \
          directory below it without following a symlink (opened, then again once \
          created), the temporary file, created new without following one, the file a \
-         rewrite reads again before it replaces it, opened read-only without following \
-         one, and the file a new file's commit writes in place on a filesystem without \
-         hard links, created new without following one (#160)",
+         rewrite reads again before it replaces it, or a removal's proof reads before it \
+         is removed, opened read-only without following one, and the file a new file's \
+         commit writes in place on a filesystem without hard links, created new without \
+         following one (#160)",
     ),
     (
         "write.rs",
@@ -150,9 +164,18 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "write.rs",
         "unlinkat(",
-        1,
+        2,
         "the temporary file's guard: a temporary file not renamed over its target — a \
-         failed write's, or a linked one's — removed from the directory the walk opened \
+         failed write's, or a linked one's — removed from the directory the walk opened; \
+         and `remove_proven`'s unix arm: a file proven, removed from the directory the \
+         walk opened while its name is still that file (#160)",
+    ),
+    (
+        "write.rs",
+        "remove_file(",
+        1,
+        "`remove_proven`'s Windows arm: a file proven, removed by path once each directory \
+         below the anchor is checked not to be a link — the residual SECURITY.md documents \
          (#160)",
     ),
 ];
@@ -302,8 +325,9 @@ fn the_guard_flags_a_planted_raw_write() {
     );
 
     // And the anchored write's own entry points (#160): a directory created by path or
-    // relative to a descriptor, a descriptor-relative open, a mode changed by path, and a
-    // rename by path or relative to a descriptor — each counted once.
+    // relative to a descriptor, a descriptor-relative open, a mode changed by path, a
+    // rename by path or relative to a descriptor, and a removal relative to a descriptor
+    // or by path — each counted once.
     for planted in [
         "fn f(p: &Path) { let _ = std::fs::create_dir_all(p); }",
         "fn f(p: &Path) { let _ = std::fs::create_dir(p); }",
@@ -316,6 +340,8 @@ fn the_guard_flags_a_planted_raw_write() {
         "fn f(d: BorrowedFd, a: &OsStr, b: &OsStr) { let _ = fs::renameat_with(d, a, d, b, RenameFlags::NOREPLACE); }",
         "fn f(d: BorrowedFd, a: &OsStr, b: &OsStr) { let _ = rustix::fs::linkat(d, a, d, b, AtFlags::empty()); }",
         "fn f(d: BorrowedFd, a: &OsStr) { let _ = rustix::fs::unlinkat(d, a, AtFlags::empty()); }",
+        "fn f(p: &Path) { let _ = std::fs::remove_file(p); }",
+        "fn f(p: &Path) { let _ = fs::remove_file(p); }",
     ] {
         assert_eq!(scan_violation_count(planted), 1, "must be flagged: {planted}");
     }

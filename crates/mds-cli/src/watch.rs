@@ -82,12 +82,12 @@ use crate::build::{
     write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
 };
 use crate::output::{
-    collect_mds_files, eprint_error, eprint_warning, io_cause, is_partial,
-    is_within_default_excluded_dir, notify_cause, output_base_no_ext, output_path_for,
-    output_stem_for, probe_and_remove_stale, resolve_output_base, safe_inline, safe_path,
-    stdout_failure, write_stdout, OutputBase, Panicked, RootPaths, StdoutOutcome, WriteTarget,
+    collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
+    notify_cause, output_base_no_ext, output_path_for, output_stem_for, probe_and_remove_stale,
+    resolve_output_base, safe_inline, safe_path, stdout_failure, write_stdout, OutputBase,
+    Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
-use crate::write::DirIdentity;
+use crate::write::{remove_proven, DirIdentity, NotRemoved, Removal};
 
 // ── Public args struct ────────────────────────────────────────────────────────
 
@@ -1118,6 +1118,42 @@ fn below_checked_out_dir(anchor: Option<&OutDirAnchor>, target: &WriteTarget) ->
             target.below_checked_anchor(&anchor.resolved, missing, identity)
         }
         None => target.clone(),
+    }
+}
+
+/// Remove `out`, the output a deleted source had, as every deletion below the out-dir is
+/// made (#160): the out-dir checked first, as before a write — one the typed path leads
+/// elsewhere from refuses the removal — and the file removed below the directory that
+/// check found ([`below_checked_out_dir`]), through no symlink and only as a regular file
+/// ([`remove_proven`]). Reported as `Removed <out> (source deleted)`, or a warning that it
+/// could not be.
+fn remove_output_of_deleted_source(
+    out: &WriteTarget,
+    mut out_dir: Option<&mut OutDirAnchor>,
+    last_written: &mut HashMap<PathBuf, String>,
+    quiet: bool,
+) {
+    let removal = match check_out_dir(out_dir.as_deref_mut(), last_written) {
+        OutDirNow::Elsewhere => Err(NotRemoved::out_dir_moved()),
+        OutDirNow::Unchanged | OutDirNow::New => {
+            remove_proven(&below_checked_out_dir(out_dir.as_deref(), out), |_| {
+                Ok(true)
+            })
+        }
+    };
+    match removal {
+        Ok(Removal::Removed) => {
+            if !quiet {
+                crate::output::ewriteln!("Removed {} (source deleted)", safe_path(&out.shown));
+            }
+        }
+        // Every regular file is the one to remove here, so none is kept.
+        Ok(Removal::Missing | Removal::Kept) => {}
+        Err(not_removed) => eprint_warning(&format!(
+            "warning: could not remove {}: {}",
+            safe_path(&out.shown),
+            safe_inline(not_removed.cause())
+        )),
     }
 }
 
@@ -2803,9 +2839,13 @@ fn compile_one_source(
                         // return value tells us whether this tool wrote the stale path.
                         let tool_wrote_stale = state.last_written.remove(&stale_path).is_some();
                         if tool_wrote_stale {
-                            // A rebuild's failure never changes how the session exits, so
-                            // this one stays the warning it was (#157).
-                            if let Err(e) = probe_and_remove_stale(&base_no_ext, compiled.kind) {
+                            // Removed below the directory the write's check found, as the
+                            // output was written there (#160). A rebuild's failure never
+                            // changes how the session exits, so this one stays the warning
+                            // it was (#157).
+                            let stale_stem =
+                                below_checked_out_dir(state.out_dir.as_ref(), &base_no_ext);
+                            if let Err(e) = probe_and_remove_stale(&stale_stem, compiled.kind) {
                                 eprint_warning(&format!("warning: {}", safe_inline(&e)));
                             }
                         }
@@ -3702,23 +3742,12 @@ fn process_dir_batch_vars_changed(
         for ext in &["md", "json"] {
             let out = stem.sibling(|p| p.with_extension(ext));
             if out.path.exists() {
-                match std::fs::remove_file(&out.path) {
-                    Ok(()) => {
-                        if !quiet {
-                            crate::output::ewriteln!(
-                                "Removed {} (source deleted)",
-                                safe_path(&out.shown)
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprint_warning(&format!(
-                            "warning: could not remove {}: {}",
-                            safe_path(&out.shown),
-                            safe_inline(io_cause(&e))
-                        ));
-                    }
-                }
+                remove_output_of_deleted_source(
+                    &out,
+                    state.out_dir.as_mut(),
+                    &mut state.last_written,
+                    quiet,
+                );
                 // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
                 // (forward_deps, errored, known_files, last_written).
                 state.forget(del_src, &out.path);
@@ -3873,23 +3902,12 @@ fn process_dir_batch_incremental(
         for ext in &["md", "json"] {
             let out = stem.sibling(|p| p.with_extension(ext));
             if out.path.exists() {
-                match std::fs::remove_file(&out.path) {
-                    Ok(()) => {
-                        if !quiet {
-                            crate::output::ewriteln!(
-                                "Removed {} (source deleted)",
-                                safe_path(&out.shown)
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprint_warning(&format!(
-                            "warning: could not remove {}: {}",
-                            safe_path(&out.shown),
-                            safe_inline(io_cause(&e))
-                        ));
-                    }
-                }
+                remove_output_of_deleted_source(
+                    &out,
+                    state.out_dir.as_mut(),
+                    &mut state.last_written,
+                    quiet,
+                );
             }
             state.forget(del_src, &out.path);
         }

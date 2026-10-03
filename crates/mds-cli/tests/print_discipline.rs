@@ -326,7 +326,9 @@ const SITE_FLOORS: &[(&str, usize)] = &[
     ("main.rs", 11),
     // 4 since the write primitive and its tests moved to `write.rs` (#160).
     ("output.rs", 4),
-    ("watch.rs", 18),
+    // 16 since one function removes a deleted source's output, and reports it, for both
+    // kinds of directory batch (#160).
+    ("watch.rs", 16),
     // The skip notices of the write primitive's tests, moved from `output.rs` (#160).
     ("write.rs", 3),
 ];
@@ -915,6 +917,22 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
         1,
         "An `MdsError` from `probe_and_remove_stale`, whose text names the stale output \
          as shown through `safe_path` and its cause through `io_cause` (#390).",
+    ),
+    (
+        "output.rs",
+        "not_removed.cause()",
+        1,
+        "A `write::NotRemoved`'s cause, escaped where it is made: an io error through \
+         `io_cause`, a fixed refusal, or one naming the refused directory as shown \
+         through `safe_path` (#160).",
+    ),
+    (
+        "watch.rs",
+        "safe_inline(not_removed.cause())",
+        1,
+        "A `write::NotRemoved`'s cause, escaped where it is made — an io error through \
+         `io_cause`, a fixed refusal, or one naming the refused directory as shown \
+         through `safe_path` — and escaped again, which changes nothing (#160).",
     ),
 ];
 
@@ -2250,10 +2268,11 @@ fn messages_interpolate_an_error_only_as_its_cause() {
         sinks >= 150,
         "non-vacuity: expected at least 150 message sinks across mds-cli/src, found {sinks}"
     );
-    // 23 since every write failure is worded once, in one place (#160).
+    // 19 since every write failure, and every removal's, is worded once, in one place
+    // (#160).
     assert!(
-        causes >= 23,
-        "non-vacuity: expected at least 23 causes shown through {CAUSE_PRODUCERS:?}, found \
+        causes >= 19,
+        "non-vacuity: expected at least 19 causes shown through {CAUSE_PRODUCERS:?}, found \
          {causes}"
     );
     assert!(
