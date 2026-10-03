@@ -978,6 +978,93 @@ fn dir_build_out_dir_a_stale_name_too_long_for_the_file_system_is_no_file() {
     );
 }
 
+/// The paths the `Compiled to` lines of `output`'s stderr name, as printed.
+fn compiled_to(output: &std::process::Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("Compiled to "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// #160: beside its sources a directory build looks at no other-kind output, so it never
+/// removes, or warns about, an output it wrote this run. There `a.b.mds` and `a.mds` both
+/// name theirs `a.md` or `a.json`, so the other kind's name of one is the output of the
+/// other: in `p` `a.mds` writes `a.json` and `a.b.mds` writes `a.md`, in `q` the other way
+/// round, so whichever source a build visits first, one of them names the other's output.
+/// Every output a `Compiled to` line names is there afterwards, and no `kept` warning
+/// names one. Control: below `--out-dir` the two outputs have names of their own, and the
+/// stale `.json` an earlier build wrote for `x.mds`, which now compiles to Markdown, is
+/// removed by the same build.
+#[test]
+fn a_build_beside_its_sources_never_removes_an_output_it_wrote_this_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/p/a.mds", MESSAGES);
+    put(root, "src/p/a.b.mds", MARKDOWN);
+    put(root, "src/q/a.mds", MARKDOWN);
+    put(root, "src/q/a.b.mds", MESSAGES);
+
+    let beside = mds_bin()
+        .current_dir(root)
+        .args(["build", "src"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&beside.stderr);
+    assert_eq!(beside.status.code(), Some(0), "stderr: {stderr}");
+    let compiled = compiled_to(&beside);
+    assert_eq!(compiled.len(), 4, "one output per source; stderr: {stderr}");
+    for shown in &compiled {
+        assert!(
+            root.join(shown).is_file(),
+            "{shown}, which this run wrote, is still there; stderr: {stderr}"
+        );
+    }
+    for shown in &compiled {
+        assert!(
+            !kept_lines(&beside)
+                .iter()
+                .any(|line| line.contains(&format!(" {shown}: "))),
+            "no warning names {shown}, which this run wrote; stderr: {stderr}"
+        );
+    }
+    for json in ["src/p/a.json", "src/q/a.json"] {
+        assert_eq!(
+            read(root, json).as_deref(),
+            Some(MESSAGES_OUTPUT),
+            "{json}; stderr: {stderr}"
+        );
+    }
+    for md in ["src/p/a.md", "src/q/a.md"] {
+        assert_eq!(
+            read(root, md).as_deref(),
+            Some(MARKDOWN),
+            "{md}; stderr: {stderr}"
+        );
+    }
+
+    // Control: below an out-dir the outputs do not collide, and a stale output is
+    // looked at.
+    put(root, "src/x.mds", MARKDOWN);
+    put(root, "out/x.json", MESSAGES_OUTPUT);
+    let into_out = build_src_into_out(root, &[]);
+    let stderr = String::from_utf8_lossy(&into_out.stderr);
+    assert_eq!(into_out.status.code(), Some(0), "stderr: {stderr}");
+    for rel in [
+        "out/p/a.json",
+        "out/p/a.b.md",
+        "out/q/a.md",
+        "out/q/a.b.json",
+    ] {
+        assert!(root.join(rel).is_file(), "control: {rel}; stderr: {stderr}");
+    }
+    assert_eq!(
+        read(root, "out/x.json"),
+        None,
+        "control: the stale x.json mds wrote is removed; stderr: {stderr}"
+    );
+}
+
 // ── T-CLI: empty dir build exits one (#204) ──────────────────────────────────
 
 /// #204 reversal: until v0.4.3 this test was `dir_build_empty_dir_exits_zero` and

@@ -2017,14 +2017,6 @@ fn run_build_directory(
     // definitions-only module compiles to zero bytes silently; "N built" alone
     // implies N useful artifacts (PF-034-adjacent).
     let mut empty_count: usize = 0;
-    // Track paths successfully written in this build run so the stale-cleanup
-    // step can verify it was tool-produced before deleting (issue 1 guard):
-    // prevents clobbering a hand-authored file that shares a stem with a .mds
-    // (e.g. notes.md kept next to notes.mds that now compiles to notes.json).
-    // Same-stem .md/.json files adjacent to a .mds in NextToSource mode are
-    // considered tool-owned; if a collision is a concern use --out-dir to
-    // separate source and output trees.
-    let mut written_this_run: HashSet<PathBuf> = HashSet::new();
 
     for file in &files {
         // Skip partials: they contribute to imports but produce no standalone output.
@@ -2096,7 +2088,6 @@ fn run_build_directory(
                                 crate::output::safe_path(&target.shown)
                             );
                         }
-                        written_this_run.insert(target.path.clone());
 
                         // Write sidecar map (non-inline mode).
                         if source_map && !inline {
@@ -2127,15 +2118,12 @@ fn run_build_directory(
                         // Stale-output cleanup (#160): the other kind's output of the
                         // name just written — left by a build when the source compiled
                         // to that kind — is removed only when mds provably wrote it, and
-                        // a stale `.md` never (see `probe_and_remove_stale`). Below an
-                        // out-dir every output is looked at; next to the source only one
-                        // this run wrote, so a hand-authored file of that name is never
-                        // touched.
-                        let stale_path =
-                            target.path.with_extension(compiled.kind.stale_extension());
-                        let looked_at = matches!(output_base, OutputBase::Dir { .. })
-                            || written_this_run.contains(&stale_path);
-                        if looked_at {
+                        // a stale `.md` never (see `probe_and_remove_stale`). It is
+                        // looked at below an out-dir only: next to the source that name
+                        // can be a hand-authored file's, or another source's output, one
+                        // this run wrote included — `a.b.mds` and `a.mds` both name
+                        // theirs `a.md` or `a.json` there.
+                        if matches!(output_base, OutputBase::Dir { .. }) {
                             // The output itself was built, so the file is not counted as
                             // failed; a failed removal still lifts the exit code (#157).
                             if let Err(e) = probe_and_remove_stale(&target, compiled.kind, quiet) {

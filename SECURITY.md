@@ -156,7 +156,9 @@ input. The compiler enforces several defense-in-depth controls:
   those bytes, by the same stamped replace as `mds fmt` (#160): anything else there,
   hand-written, left by another run or changed since, is kept with a notice.
   `mds build <dir>` removes the stale `.json` of a source whose kind
-  changed only when it holds exactly what mds writes for a messages output — read
+  changed below an out-dir only — beside its sources, where another source's output
+  can have that name, it looks at none — and only when it holds exactly what mds
+  writes for a messages output — read
   no further than 10 MiB, parsed and written back to the same bytes — and never a stale
   `.md`: anything else at that name, a symlink, a FIFO or a directory included, is kept
   with a warning (#160). The proof is the content here too: a file holding exactly a
