@@ -6,12 +6,13 @@
 //! `atomic_write_file` is temp-file + sync + rename below the write's anchor: a crash or a
 //! mid-write error never leaves a truncated artifact, nothing is written through a
 //! symlink below the anchor or at the target, and a replaced file keeps its mode. A raw
-//! `std::fs::write` — or a raw `create_dir_all`, `openat` or path-based
-//! `fs::set_permissions` — at any *one* remaining site silently forfeits all of that for
-//! the artifact it touches, and "did we remember every write site?" is an unbounded search
-//! that three reviewers can each answer differently. This test converts it into a
-//! machine-checked invariant: a raw write in `crates/mds-cli/src/**` is a failure unless
-//! it appears in [`ALLOWED_RAW_WRITES`] with a written justification.
+//! `std::fs::write` — or a raw `create_dir_all`, `create_dir`, `mkdirat`, `openat`,
+//! `rename`, `renameat` or path-based `fs::set_permissions` — at any *one* remaining site
+//! silently forfeits all of that for the artifact it touches, and "did we remember every
+//! write site?" is an unbounded search that three reviewers can each answer differently.
+//! This test converts it into a machine-checked invariant: a raw write in
+//! `crates/mds-cli/src/**` is a failure unless it appears in [`ALLOWED_RAW_WRITES`] with a
+//! written justification.
 //!
 //! It also pins the tail of the primitive itself ([`primitive_pin_violations`]): the unix
 //! arm syncs the temporary file and then its directory, renames with `renameat` and
@@ -39,18 +40,25 @@ use std::path::{Path, PathBuf};
 
 /// Raw write entry points that must be funnelled. `std::fs::write(` contains
 /// `fs::write(`, so the short form matches both the qualified and imported spellings;
-/// `.create_new(` is a file a hand-built `OpenOptions` creates; `create_dir_all(` creates
-/// directories by path, following any symlink in it; `openat(` is a descriptor-relative
-/// open the write primitive alone should make; `fs::set_permissions(` changes a mode by
-/// path, which a swapped component redirects (the primitive uses `fchmod` on its own
-/// descriptor).
+/// `.create_new(` is a file a hand-built `OpenOptions` creates; `create_dir_all(` and
+/// `create_dir(` create directories by path, following any symlink in it, and `mkdirat(`
+/// one relative to a descriptor; `openat(` is a descriptor-relative open the write
+/// primitive alone should make; `fs::set_permissions(` changes a mode by path, which a
+/// swapped component redirects (the primitive uses `fchmod` on its own descriptor);
+/// `fs::rename(` — `std::fs::rename(` and rustix's alike — moves a file by path, and
+/// `renameat(` relative to a descriptor. `create_dir(` is not part of `create_dir_all(`,
+/// nor `fs::rename(` of `fs::renameat(`, so each call is counted once.
 const NEEDLES: &[&str] = &[
     "fs::write(",
     "File::create(",
     ".create_new(",
     "create_dir_all(",
+    "create_dir(",
+    "mkdirat(",
     "openat(",
     "fs::set_permissions(",
+    "fs::rename(",
+    "renameat(",
 ];
 
 /// Production sites that may keep a raw write: `(file basename, needle, max hits, why)`.
@@ -68,6 +76,13 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
          already there, then renamed — already atomic",
     ),
     (
+        "watch.rs",
+        "fs::rename(",
+        1,
+        "test-only readiness marker: <path>.tmp, created new, renamed onto the marker path \
+         an absolute environment variable names — the rename is its atomic step",
+    ),
+    (
         "write.rs",
         "create_dir_all(",
         2,
@@ -76,11 +91,33 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "write.rs",
+        "create_dir(",
+        1,
+        "the primitive's Windows arm creates a missing directory below the anchor by path, \
+         once its parent is checked not to be a link — the residual SECURITY.md documents \
+         (#160)",
+    ),
+    (
+        "write.rs",
+        "mkdirat(",
+        1,
+        "the primitive's unix walk creates a missing directory below the anchor in the one \
+         above it (#160)",
+    ),
+    (
+        "write.rs",
         "openat(",
         5,
         "the primitive's unix walk: the anchor (opened, then again once created), each \
          directory below it without following a symlink (opened, then again once \
          created), and the temporary file, created new without following one (#160)",
+    ),
+    (
+        "write.rs",
+        "renameat(",
+        1,
+        "the primitive's unix tail: the temporary file renamed over the target in the \
+         directory the walk opened (#160)",
     ),
 ];
 
@@ -228,12 +265,18 @@ fn the_guard_flags_a_planted_raw_write() {
         "a planted create_new open in a plain fn must be flagged"
     );
 
-    // And the anchored write's own entry points (#160): a directory created by path, a
-    // descriptor-relative open, and a mode changed by path.
+    // And the anchored write's own entry points (#160): a directory created by path or
+    // relative to a descriptor, a descriptor-relative open, a mode changed by path, and a
+    // rename by path or relative to a descriptor — each counted once.
     for planted in [
         "fn f(p: &Path) { let _ = std::fs::create_dir_all(p); }",
+        "fn f(p: &Path) { let _ = std::fs::create_dir(p); }",
+        "fn f(d: BorrowedFd, n: &OsStr) { let _ = rustix::fs::mkdirat(d, n, Mode::from_raw_mode(0o777)); }",
         "fn f(d: BorrowedFd, n: &OsStr) { let _ = rustix::fs::openat(d, n, OFlags::RDONLY, Mode::empty()); }",
         "fn f(p: &Path) { let _ = std::fs::set_permissions(p, Permissions::from_mode(0o600)); }",
+        "fn f(a: &Path, b: &Path) { let _ = std::fs::rename(a, b); }",
+        "fn f(a: &Path, b: &Path) { let _ = rustix::fs::rename(a, b); }",
+        "fn f(d: BorrowedFd, a: &OsStr, b: &OsStr) { let _ = rustix::fs::renameat(d, a, d, b); }",
     ] {
         assert_eq!(scan_violation_count(planted), 1, "must be flagged: {planted}");
     }

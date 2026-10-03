@@ -71,9 +71,10 @@ use crate::output::{io_cause, safe_inline, safe_path, WriteTarget};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Durability {
     /// `sync_all()` on the temporary file before the rename and, on unix, on its directory
-    /// after it. For files whose content exists nowhere else: `mds fmt` and `mds lint
-    /// --fix` rewrite the user's hand-authored `.mds` source in place, so bytes lost to a
-    /// power failure are lost for good.
+    /// after it — where the filesystem can sync a directory at all: one that refuses it
+    /// does not fail a write that has landed. For files whose content exists nowhere else:
+    /// `mds fmt` and `mds lint --fix` rewrite the user's hand-authored `.mds` source in
+    /// place, so bytes lost to a power failure are lost for good.
     Fsync,
     /// Rename only. For **derived** artifacts — compiled outputs and `.map` sidecars —
     /// which are reproducible by re-running `mds build`, and `mds init`'s fixed starter. A
@@ -503,15 +504,35 @@ mod unix {
     ///
     /// `File::sync_all` is `F_FULLFSYNC` on Apple platforms, which a filesystem may refuse
     /// for a directory (`ENOTSUP`, `EOPNOTSUPP`, `EINVAL`); a plain `fsync` is the fallback
-    /// for those, and any other failure is the write's.
+    /// for those. A filesystem that refuses that too cannot sync a directory: the rename
+    /// has landed, so the write stands. Any other failure is the write's.
     fn sync_directory(dir: OwnedFd) -> std::io::Result<()> {
         let dir = File::from(dir);
-        match dir.sync_all() {
-            Err(e) if Errno::from_io_error(&e).is_some_and(refused_for_a_directory) => {
-                Ok(fs::fsync(&dir)?)
-            }
+        settle_directory_sync(
+            || dir.sync_all(),
+            || fs::fsync(&dir).map_err(std::io::Error::from),
+        )
+    }
+
+    /// The directory sync's outcome, from `full`, the sync asked for first, and `plain`,
+    /// the fallback made only when `full` was refused for a directory: a refusal of both
+    /// is no error, as there is no directory sync to be had.
+    pub(super) fn settle_directory_sync(
+        full: impl FnOnce() -> std::io::Result<()>,
+        plain: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        match full() {
+            Err(e) if refused(&e) => match plain() {
+                Err(e) if refused(&e) => Ok(()),
+                synced => synced,
+            },
             synced => synced,
         }
+    }
+
+    /// Whether `e` is a refusal to sync a directory the way it was asked.
+    fn refused(e: &std::io::Error) -> bool {
+        Errno::from_io_error(e).is_some_and(refused_for_a_directory)
     }
 
     /// Whether `errno` is a refusal to sync a directory the way it was asked, rather than a
@@ -869,6 +890,54 @@ mod tests {
                 "{errno:?} of a directory is the write's own failure"
             );
         }
+    }
+
+    /// The Fsync tier's directory sync, after the rename has landed: a sync refused for a
+    /// directory (`ENOTSUP`, `EOPNOTSUPP`, `EINVAL`) falls back to a plain one, and a
+    /// filesystem that refuses that too cannot sync a directory at all — the write stands,
+    /// with no error. Any other failure, of either sync, is the write's; the fallback is
+    /// made only after a refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_sync_the_filesystem_refuses_twice_does_not_fail_the_write() {
+        use rustix::io::Errno;
+
+        let fail = |errno: Errno| -> std::io::Result<()> { Err(errno.into()) };
+        let settle = |full: std::io::Result<()>, plain: Option<std::io::Result<()>>| {
+            let mut fell_back = false;
+            let settled = super::unix::settle_directory_sync(
+                || full,
+                || {
+                    fell_back = true;
+                    plain.expect("no fallback after this sync")
+                },
+            );
+            (settled.map_err(|e| Errno::from_io_error(&e)), fell_back)
+        };
+
+        assert_eq!(settle(Ok(()), None), (Ok(()), false), "synced");
+        for refusal in [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::INVAL] {
+            assert_eq!(
+                settle(fail(refusal), Some(Ok(()))),
+                (Ok(()), true),
+                "{refusal:?}, then a plain sync"
+            );
+            assert_eq!(
+                settle(fail(refusal), Some(fail(Errno::INVAL))),
+                (Ok(()), true),
+                "{refusal:?}, then a plain sync refused too: no directory sync to be had"
+            );
+            assert_eq!(
+                settle(fail(refusal), Some(fail(Errno::IO))),
+                (Err(Some(Errno::IO)), true),
+                "{refusal:?}, then a plain sync that fails: the write's error"
+            );
+        }
+        assert_eq!(
+            settle(fail(Errno::IO), None),
+            (Err(Some(Errno::IO)), false),
+            "a failed sync is the write's error, with no fallback"
+        );
     }
 
     /// A symlinked anchor is followed: the anchor is resolved by path, as the user typed it
