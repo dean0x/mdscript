@@ -466,10 +466,13 @@ fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
             "init filename must not contain '..' components"
         ));
     }
+    // A friendly early answer only: a file that appears after this look is refused by the
+    // commit itself (`write::create_new`, #160).
     if filename.exists() && !force {
         return Err(miette::miette!(
-            "{} already exists (use --force to overwrite)",
-            output::safe_path(&filename)
+            "{} {}",
+            output::safe_path(&filename),
+            write::ALREADY_EXISTS
         ));
     }
     let starter = "\
@@ -486,14 +489,21 @@ Your items:
 - {{item}}
 @end
 ";
-    // #386: the same replace-by-rename primitive as every other CLI write — a symlink
-    // at `filename` (live under `--force`, dangling without it) is refused instead of
-    // written through; `--force` replaces a regular file by rename with its mode
-    // preserved. `RenameOnly` because the starter is a fixed public template a re-run
-    // reproduces. Anchored at the typed parent, which must exist: init creates no
-    // directory (#160).
-    write::atomic_write_file(
-        &output::WriteTarget::as_typed(filename.clone()),
+    // #386: the same primitive as every other CLI write — a symlink at `filename` (live
+    // under `--force`, dangling without it) is refused instead of written through;
+    // `--force` replaces a regular file by rename with its mode preserved, and without it
+    // the starter is committed only where nothing is, so a file that appeared after the
+    // check above is refused, not replaced (#160). `RenameOnly` because the starter is a
+    // fixed public template a re-run reproduces. Anchored at the typed parent, which must
+    // exist: init creates no directory (#160).
+    let target = output::WriteTarget::as_typed(filename.clone());
+    let commit = if force {
+        write::atomic_write_file
+    } else {
+        write::create_new
+    };
+    commit(
+        &target,
         starter,
         write::Durability::RenameOnly,
         write::Parents::Existing,

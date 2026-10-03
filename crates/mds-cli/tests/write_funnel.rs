@@ -1,6 +1,7 @@
 //! Write-funnel guard (#227, #160): every artifact `mds` writes from production code must
 //! go through the single atomic choke point in `crate::write` — `atomic_write_file`, or,
-//! for a rewrite of a file just read, `replace_if_unchanged`, which shares its tail.
+//! for a rewrite of a file just read, `replace_if_unchanged`, or, for a new file that
+//! must never replace one, `create_new`, which share its tail.
 //!
 //! # Why this exists
 //!
@@ -8,7 +9,8 @@
 //! mid-write error never leaves a truncated artifact, nothing is written through a
 //! symlink below the anchor or at the target, and a replaced file keeps its mode. A raw
 //! `std::fs::write` — or a raw `create_dir_all`, `create_dir`, `mkdirat`, `openat`,
-//! `rename`, `renameat` or path-based `fs::set_permissions` — at any *one* remaining site
+//! `rename`, `renameat`, `renameat_with`, `linkat`, `unlinkat` or path-based
+//! `fs::set_permissions` — at any *one* remaining site
 //! silently forfeits all of that for the artifact it touches, and "did we remember every
 //! write site?" is an unbounded search that three reviewers can each answer differently.
 //! This test converts it into a machine-checked invariant: a raw write in
@@ -47,8 +49,11 @@ use std::path::{Path, PathBuf};
 /// primitive alone should make; `fs::set_permissions(` changes a mode by path, which a
 /// swapped component redirects (the primitive uses `fchmod` on its own descriptor);
 /// `fs::rename(` — `std::fs::rename(` and rustix's alike — moves a file by path, and
-/// `renameat(` relative to a descriptor. `create_dir(` is not part of `create_dir_all(`,
-/// nor `fs::rename(` of `fs::renameat(`, so each call is counted once.
+/// `renameat(` relative to a descriptor, `renameat_with(` with flags; `fs::linkat(` gives
+/// a file a second name relative to a descriptor, and `unlinkat(` removes one. `create_dir(`
+/// is not part of `create_dir_all(`, nor `fs::rename(` of `fs::renameat(`, nor `renameat(`
+/// of `renameat_with(`, nor `fs::linkat(` of `fs::unlinkat(` — which is why the link's
+/// needle is the qualified spelling — so each call is counted once.
 const NEEDLES: &[&str] = &[
     "fs::write(",
     "File::create(",
@@ -60,6 +65,9 @@ const NEEDLES: &[&str] = &[
     "fs::set_permissions(",
     "fs::rename(",
     "renameat(",
+    "renameat_with(",
+    "fs::linkat(",
+    "unlinkat(",
 ];
 
 /// Production sites that may keep a raw write: `(file basename, needle, max hits, why)`.
@@ -108,12 +116,13 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "write.rs",
         "openat(",
-        6,
+        7,
         "the primitive's unix walk: the anchor (opened, then again once created), each \
          directory below it without following a symlink (opened, then again once \
-         created), the temporary file, created new without following one, and the file \
-         a rewrite reads again before it replaces it, opened read-only without following \
-         one (#160)",
+         created), the temporary file, created new without following one, the file a \
+         rewrite reads again before it replaces it, opened read-only without following \
+         one, and the file a new file's commit writes in place on a filesystem without \
+         hard links, created new without following one (#160)",
     ),
     (
         "write.rs",
@@ -121,6 +130,30 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "the primitive's unix tail: the temporary file renamed over the target in the \
          directory the walk opened (#160)",
+    ),
+    (
+        "write.rs",
+        "renameat_with(",
+        1,
+        "a new file's commit (`mds init` without `--force`): the temporary file renamed \
+         onto the target in the directory the walk opened, never over a file there \
+         (#160)",
+    ),
+    (
+        "write.rs",
+        "fs::linkat(",
+        1,
+        "a new file's commit where no rename that never replaces is to be had: the \
+         temporary file linked to the target in the directory the walk opened, which \
+         fails on a file there (#160)",
+    ),
+    (
+        "write.rs",
+        "unlinkat(",
+        1,
+        "the temporary file's guard: a temporary file not renamed over its target — a \
+         failed write's, or a linked one's — removed from the directory the walk opened \
+         (#160)",
     ),
 ];
 
@@ -280,6 +313,9 @@ fn the_guard_flags_a_planted_raw_write() {
         "fn f(a: &Path, b: &Path) { let _ = std::fs::rename(a, b); }",
         "fn f(a: &Path, b: &Path) { let _ = rustix::fs::rename(a, b); }",
         "fn f(d: BorrowedFd, a: &OsStr, b: &OsStr) { let _ = rustix::fs::renameat(d, a, d, b); }",
+        "fn f(d: BorrowedFd, a: &OsStr, b: &OsStr) { let _ = fs::renameat_with(d, a, d, b, RenameFlags::NOREPLACE); }",
+        "fn f(d: BorrowedFd, a: &OsStr, b: &OsStr) { let _ = rustix::fs::linkat(d, a, d, b, AtFlags::empty()); }",
+        "fn f(d: BorrowedFd, a: &OsStr) { let _ = rustix::fs::unlinkat(d, a, AtFlags::empty()); }",
     ] {
         assert_eq!(scan_violation_count(planted), 1, "must be flagged: {planted}");
     }

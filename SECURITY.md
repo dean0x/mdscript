@@ -131,6 +131,13 @@ input. The compiler enforces several defense-in-depth controls:
   clock is coarser than the time between two writes (one-second timestamps, say), an
   edit that keeps the file's size within the same tick is not seen; and on Windows the
   second read, the comparison and the rename all go by path.
+  `mds init` without `--force` never replaces a file (#160): the starter is given its
+  name only where nothing has it at that moment — by a rename that never replaces on
+  Linux, Android and Apple platforms, else by a hard link, and on Windows by a move
+  without replace — so a file that appears after its existence check is left as it is
+  and the run refused (`mds::io`); on a filesystem without hard links the starter is
+  written in place into a file created exclusively, which keeps that guarantee but
+  not atomicity.
   **Windows residual**: the standard library has no descriptor-relative walk on
   Windows. Each directory below the anchor is checked and refused when it is a
   symlink or a junction, and the write then goes by path, so a directory that another

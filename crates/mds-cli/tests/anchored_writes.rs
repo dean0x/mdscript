@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 use common::mds_bin;
 
 /// How long a run, or one step of a watch session, may take before the test fails.
-#[cfg(unix)]
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A scratch directory whose name no output could carry by chance.
@@ -629,9 +628,9 @@ fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
 
 // ── A rewrite writes only over the bytes it read ────────────────────────────
 
-/// The debug build's pause between a rewrite's read and its replace: the file it names
-/// ends the pause, and the same name with `.paused` appended says the run has stopped.
-#[cfg(unix)]
+/// The debug build's pause between a rewrite's read and its replace, and between `mds
+/// init`'s look at its target and its commit: the file it names ends the pause, and the
+/// same name with `.paused` appended says the run has stopped.
 const PAUSE: &str = "MDS_TEST_PAUSE_BEFORE_REPLACE";
 
 /// A source a rewrite changes, as written and as rewritten.
@@ -665,10 +664,8 @@ const REWRITES: [(&[&str], &Source); 4] = [
     (&["lint", "--fix", "src"], &UNFIXED),
 ];
 
-/// Run `mds <args>` in `root`, paused between its rewrite's read and its replace: once it
-/// has read the file and stopped, `meanwhile` runs, then the run goes on. Returns the
-/// exit code and stderr.
-#[cfg(unix)]
+/// Run `mds <args>` in `root`, paused at the debug build's pause ([`PAUSE`]): once it has
+/// stopped, `meanwhile` runs, then the run goes on. Returns the exit code and stderr.
 fn rewrite_paused(root: &Path, args: &[&str], meanwhile: impl FnOnce()) -> (Option<i32>, String) {
     let go = root.join("go");
     let paused = root.join("go.paused");
@@ -805,6 +802,68 @@ fn a_rewrite_never_writes_over_a_file_it_did_not_read() {
             assert_eq!(code, Some(0), "{args:?}, link {link}: stderr: {stderr}");
         }
     }
+}
+
+// ── `mds init` never replaces a file that appears after its check ───────────
+
+/// A file that appears between `mds init`'s look at its target and the commit of the
+/// starter file is not replaced (#160): the run refuses (`mds::io`, exit 2), naming the
+/// file as typed, the file keeps its bytes, and no temporary file is left. Controls: with
+/// nothing put there in that window, the same run creates the starter file; and `--force`
+/// replaces a file that is there.
+#[test]
+fn init_never_replaces_a_file_that_appears_after_its_check() {
+    const APPEARED: &str = "Written by another program while init ran\n";
+    let dir = scratch();
+    let root = dir.path();
+    std::fs::create_dir(root.join("sub")).expect("create the target's directory");
+    let file = root.join("sub").join("new.mds");
+    let typed = native("sub/new.mds");
+    let args = ["init", typed.as_str()];
+
+    let (code, stderr) = rewrite_paused(root, &args, || {
+        std::fs::write(&file, APPEARED).expect("put a file where init writes");
+    });
+    assert_eq!(
+        read(&file),
+        APPEARED,
+        "the file that appeared keeps its bytes; stderr: {stderr}"
+    );
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    let refusal = format!("{typed} already exists (use --force to overwrite)");
+    assert!(
+        stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refusal)),
+        "the refusal names the file as typed; stderr: {stderr}"
+    );
+    assert_eq!(
+        entries(&root.join("sub")),
+        ["new.mds"],
+        "no temporary file is left"
+    );
+
+    // Control: nothing appears in the window, and the starter file is created.
+    std::fs::remove_file(&file).expect("remove the file that appeared");
+    let (code, stderr) = rewrite_paused(root, &args, || {});
+    assert_eq!(code, Some(0), "control; stderr: {stderr}");
+    assert!(
+        read(&file).contains("Hello {{name}}!"),
+        "control: the starter file is created"
+    );
+    assert_eq!(entries(&root.join("sub")), ["new.mds"]);
+
+    // Control: `--force` replaces a file that is there.
+    std::fs::write(&file, APPEARED).expect("put a file where init writes");
+    let out = run(root, &["init", typed.as_str(), "--force"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--force; stderr: {}",
+        text(&out.stderr)
+    );
+    assert!(
+        read(&file).contains("Hello {{name}}!"),
+        "--force replaces the file"
+    );
 }
 
 // ── Windows ──────────────────────────────────────────────────────────────────

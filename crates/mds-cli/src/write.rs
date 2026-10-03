@@ -1,7 +1,8 @@
 //! The one write primitive: every file `mds` writes goes through it —
 //! [`atomic_write_file`] for `mds build` and `mds watch` outputs and `.map` sidecars and
-//! `mds init`'s starter, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix`
-//! rewrites (#227, #160). `tests/write_funnel.rs` keeps it the only one.
+//! `mds init --force`'s starter, [`create_new`] for `mds init`'s starter without
+//! `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix` rewrites (#227,
+//! #160). `tests/write_funnel.rs` keeps it the only one.
 //!
 //! # Replace by rename
 //!
@@ -53,6 +54,20 @@
 //! a stamp of the file; [`replace_if_unchanged`] renames the rewrite into that directory
 //! only while the file there is still the one read, so an edit made after the read is not
 //! overwritten and a directory swapped after it never receives the rewrite.
+//!
+//! # A new file, never over another (#160)
+//!
+//! [`create_new`] gives the temporary file the target's name only where nothing has that
+//! name, at the moment it is given — not at an earlier look — so a file that appears in
+//! between is left as it is and the write refused. On unix the commit is a rename that
+//! never replaces (`renameat2(RENAME_NOREPLACE)` on Linux and Android,
+//! `renameatx_np(RENAME_EXCL)` on Apple platforms); where the platform, the kernel or the
+//! filesystem has none, a hard link of the temporary file to the target, which never
+//! replaces either, and the temporary name removed; and on a filesystem without hard
+//! links, the content written in place into a target created exclusively (`O_CREAT |
+//! O_EXCL | O_NOFOLLOW`) — still never over another file, but no longer all or nothing: a
+//! failure while it is written leaves the file partly written. Windows moves the
+//! temporary file into place without `MOVEFILE_REPLACE_EXISTING`.
 //!
 //! # Contract (#226)
 //!
@@ -170,8 +185,57 @@ pub(crate) fn atomic_write_file(
 ) -> std::result::Result<(), mds::MdsError> {
     let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
     let anchor = target.checked_anchor();
-    imp::write(&below, anchor, content.as_bytes(), durability, parents)
-        .map_err(|failure| worded(target, failure))
+    let commit = Commit::Replace(None);
+    imp::write(
+        &below,
+        anchor,
+        content.as_bytes(),
+        durability,
+        parents,
+        commit,
+    )
+    .map_err(|failure| worded(target, failure))
+}
+
+/// Write `content` to `target` as [`atomic_write_file`] does, but only as a new file
+/// (#160): the temporary file is given the target's name only where nothing has it at
+/// that moment (see the module docs), so a file that appears after any earlier look at
+/// the target — `mds init`'s own check included — is never replaced.
+///
+/// # Errors
+///
+/// As [`atomic_write_file`]'s, and, for a target that is there — before the write or
+/// appearing while it runs — `mds::io` `<file> already exists (use --force to
+/// overwrite)`, the file named by `target.shown`; the file is left as it is and no
+/// temporary file is left behind. A symlink at the target is refused as
+/// [`atomic_write_file`] refuses one.
+pub(crate) fn create_new(
+    target: &WriteTarget,
+    content: &str,
+    durability: Durability,
+    parents: Parents,
+) -> std::result::Result<(), mds::MdsError> {
+    let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
+    let anchor = target.checked_anchor();
+    imp::write(
+        &below,
+        anchor,
+        content.as_bytes(),
+        durability,
+        parents,
+        Commit::New,
+    )
+    .map_err(|failure| worded(target, failure))
+}
+
+/// How the temporary file a write has filled takes the target's name.
+#[derive(Debug, Clone, Copy)]
+enum Commit<S> {
+    /// Renamed over whatever file is there — for a rewrite, only while that file still
+    /// holds the stamp `S` it was read with.
+    Replace(Option<S>),
+    /// Given the name only where nothing has it ([`create_new`]).
+    New,
 }
 
 /// A file `mds fmt` or `mds lint --fix` is about to rewrite, read again by
@@ -240,6 +304,9 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
                 safe_path(&target.shown)
             ),
         },
+        Failure::Exists => mds::MdsError::Io {
+            message: format!("{} {ALREADY_EXISTS}", safe_path(&target.shown)),
+        },
         Failure::LinkBelowAnchor { depth } => {
             io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
         }
@@ -249,6 +316,10 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
         Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
     }
 }
+
+/// Why [`create_new`] — and `mds init`'s own check before it — refuses a target that is
+/// there, after the file's name.
+pub(crate) const ALREADY_EXISTS: &str = "already exists (use --force to overwrite)";
 
 /// Why [`atomic_write_file`] refuses to replace a symlink at its target.
 const SYMLINK_REFUSAL: &str = "refusing to replace a symlink";
@@ -301,6 +372,8 @@ enum Failure {
     /// The file a rewrite read is not as it was read: its bytes, or its stamp, differ, or
     /// it is gone.
     Changed,
+    /// A new file's target is there, or appeared before the commit ([`create_new`]).
+    Exists,
     /// The directory `depth` levels below the anchor is a symlink.
     LinkBelowAnchor { depth: usize },
     /// The target itself is a symlink.
@@ -414,7 +487,9 @@ mod unix {
     use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, CWD};
     use rustix::io::Errno;
 
-    use super::{Below, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
+    use super::{
+        Below, Commit, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX,
+    };
 
     /// The anchor: a directory, resolved by path — through a symlink the user named.
     const ANCHOR: OFlags = OFlags::RDONLY
@@ -429,6 +504,14 @@ mod unix {
 
     /// The temporary file: a new file, never through a symlink.
     const TEMP: OFlags = OFlags::WRONLY
+        .union(OFlags::CREATE)
+        .union(OFlags::EXCL)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+
+    /// The file a new file's commit writes in place, on a filesystem without hard links: a
+    /// new file, never one already there, and never through a symlink.
+    const IN_PLACE: OFlags = OFlags::WRONLY
         .union(OFlags::CREATE)
         .union(OFlags::EXCL)
         .union(OFlags::NOFOLLOW)
@@ -452,17 +535,17 @@ mod unix {
     /// clash is another writer's file or a leftover, and sixteen in a row is not chance.
     pub(super) const MAX_TEMP_ATTEMPTS: usize = 16;
 
-    /// Write `content` to `below.name`, replacing the file in the directory [`walk`]
-    /// opens.
+    /// Write `content` to `below.name` in the directory [`walk`] opens, as `commit` says.
     pub(super) fn write(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
         content: &[u8],
         durability: Durability,
         parents: Parents,
+        commit: Commit<&Stamp>,
     ) -> Result<(), Failure> {
         let dir = walk(below, anchor, parents)?;
-        replace(dir, below.name, content, durability, None)
+        replace(dir, below.name, content, durability, commit)
     }
 
     /// Open the directory `below.name` is in: the anchor by path — and, when `anchor`
@@ -561,7 +644,8 @@ mod unix {
         content: &[u8],
         durability: Durability,
     ) -> Result<(), Failure> {
-        replace(held.dir, &held.name, content, durability, Some(&held.stamp))
+        let commit = Commit::Replace(Some(&held.stamp));
+        replace(held.dir, &held.name, content, durability, commit)
     }
 
     /// Open the anchor by path, creating it first when it is missing and `parents` says so.
@@ -639,24 +723,27 @@ mod unix {
             .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink)
     }
 
-    /// Replace `name` in `dir` with `content`, by way of a temporary file beside it — when
-    /// `unchanged` stamps the file a rewrite read, only if the file there still holds it,
-    /// looked at just before the rename.
+    /// Put `content` at `name` in `dir`, by way of a temporary file beside it, as `commit`
+    /// says: renamed over the file there — when it stamps the file a rewrite read, only if
+    /// the file there still holds it, looked at just before the rename — or given the name
+    /// only where nothing has it ([`commit_new`]).
     fn replace(
         dir: OwnedFd,
         name: &OsStr,
         content: &[u8],
         durability: Durability,
-        unchanged: Option<&Stamp>,
+        commit: Commit<&Stamp>,
     ) -> Result<(), Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
         let existing = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
-                FileType::RegularFile => Some(Mode::from_raw_mode(stat.st_mode)),
-                FileType::Symlink => return Err(Failure::LinkAtTarget),
+            Ok(stat) => match (FileType::from_raw_mode(stat.st_mode), commit) {
+                (FileType::Symlink, _) => return Err(Failure::LinkAtTarget),
+                // A new file is never put where anything is.
+                (_, Commit::New) => return Err(Failure::Exists),
+                (FileType::RegularFile, _) => Some(Mode::from_raw_mode(stat.st_mode)),
                 // A directory has no mode a file should take: the rename below refuses to
                 // replace it, and the temporary file is unlinked again.
-                FileType::Directory => None,
+                (FileType::Directory, _) => None,
                 _ => return Err(Failure::NotARegularFile),
             },
             Err(Errno::NOENT) => None,
@@ -668,26 +755,170 @@ mod unix {
             Some(_) => Mode::RUSR.union(Mode::WUSR),
             None => NEW_FILE,
         };
-        let (mut temp, mut file) = create_temp(dir.as_fd(), create, temp_names())?;
+        let (mut temp, file) = create_temp(dir.as_fd(), create, temp_names())?;
         if let Some(mode) = existing {
             fs::fchmod(&file, mode)?;
         }
-        file.write_all(content)?;
-        if durability == Durability::Fsync {
-            file.sync_all()?;
+        fill(file, content, durability)?;
+        match commit {
+            Commit::Replace(unchanged) => {
+                if unchanged.is_some_and(|stamp| !stamp.holds(dir.as_fd(), name)) {
+                    // The temporary file is unlinked again as `temp` drops.
+                    return Err(Failure::Changed);
+                }
+                fs::renameat(dir.as_fd(), &temp.name, dir.as_fd(), name)?;
+                temp.renamed = true;
+                drop(temp);
+            }
+            Commit::New => {
+                // A file that appears while the run pauses here is met by the commit
+                // itself, not by the look above.
+                super::pause_before_replace();
+                commit_new(temp, name, content, durability, &NO_CLOBBER)?;
+            }
         }
-        drop(file);
-        if unchanged.is_some_and(|stamp| !stamp.holds(dir.as_fd(), name)) {
-            // The temporary file is unlinked again as `temp` drops.
-            return Err(Failure::Changed);
-        }
-        fs::renameat(dir.as_fd(), &temp.name, dir.as_fd(), name)?;
-        temp.renamed = true;
-        drop(temp);
         if durability == Durability::Fsync {
             sync_directory(dir)?;
         }
         Ok(())
+    }
+
+    /// Write `content` to `file` and, in the [`Durability::Fsync`] tier, sync it; then
+    /// close it.
+    fn fill(mut file: File, content: &[u8], durability: Durability) -> std::io::Result<()> {
+        file.write_all(content)?;
+        if durability == Durability::Fsync {
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// One step of a new file's commit: give the file `from` in `dir` the name `to` there,
+    /// never over a file that has it.
+    pub(super) type Step<'s> = &'s dyn Fn(BorrowedFd<'_>, &OsStr, &OsStr) -> Result<(), Errno>;
+
+    /// The steps a new file's commit takes, in order (#160): a rename that never replaces,
+    /// then a hard link, which never replaces either; each is passed over when it is not
+    /// to be had (see [`commit_new`]).
+    pub(super) struct NewSteps<'s> {
+        pub(super) rename: Step<'s>,
+        pub(super) link: Step<'s>,
+    }
+
+    /// The steps a new file's commit takes.
+    pub(super) const NO_CLOBBER: NewSteps<'static> = NewSteps {
+        rename: &rename_noreplace,
+        link: &link_new,
+    };
+
+    /// Give `temp`'s file the name `name` in the directory it is in, only where nothing has
+    /// that name: by `steps.rename`; where that is not to be had — `EINVAL`, `ENOSYS`,
+    /// `ENOTSUP` or `EOPNOTSUPP`: no such rename on this platform, kernel or filesystem — by
+    /// `steps.link`, the temporary name then removed as `temp` drops; and where that is
+    /// not to be had either — `EPERM`, `ENOSYS`, `ENOTSUP`, `EOPNOTSUPP` or `EMLINK`: a
+    /// filesystem without hard links — by writing `content` in place, into a file created
+    /// exclusively ([`write_in_place`]). `EEXIST` from any step, a file that appeared since
+    /// the target was looked at, refuses the write and leaves that file as it is.
+    pub(super) fn commit_new(
+        mut temp: Temp<'_>,
+        name: &OsStr,
+        content: &[u8],
+        durability: Durability,
+        steps: &NewSteps<'_>,
+    ) -> Result<(), Failure> {
+        let dir = temp.dir;
+        match (steps.rename)(dir, &temp.name, name) {
+            Ok(()) => {
+                temp.renamed = true;
+                Ok(())
+            }
+            Err(errno) if no_such_rename(errno) => match (steps.link)(dir, &temp.name, name) {
+                Ok(()) => Ok(()),
+                Err(errno) if no_hard_links(errno) => {
+                    write_in_place(dir, name, content, durability)
+                }
+                Err(errno) => Err(refused_if_there(errno)),
+            },
+            Err(errno) => Err(refused_if_there(errno)),
+        }
+    }
+
+    /// Rename `from` to `to` in `dir`, never over a file at `to`:
+    /// `renameat2(RENAME_NOREPLACE)` on Linux and Android, `renameatx_np(RENAME_EXCL)` on
+    /// Apple platforms.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    ))]
+    fn rename_noreplace(dir: BorrowedFd<'_>, from: &OsStr, to: &OsStr) -> Result<(), Errno> {
+        fs::renameat_with(dir, from, dir, to, fs::RenameFlags::NOREPLACE)
+    }
+
+    /// No rename that never replaces on this platform: not to be had, so the commit goes on
+    /// to a hard link.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )))]
+    fn rename_noreplace(_: BorrowedFd<'_>, _: &OsStr, _: &OsStr) -> Result<(), Errno> {
+        Err(Errno::NOSYS)
+    }
+
+    /// Link `to` in `dir` to the file `from` is, which fails on a name already taken.
+    fn link_new(dir: BorrowedFd<'_>, from: &OsStr, to: &OsStr) -> Result<(), Errno> {
+        fs::linkat(dir, from, dir, to, AtFlags::empty())
+    }
+
+    /// Write `content` to `name` in `dir`, created exclusively and without following a
+    /// symlink: a new file's commit on a filesystem without hard links. No file there is
+    /// replaced, but the write is not all or nothing — one that fails part-way leaves the
+    /// file partly written.
+    fn write_in_place(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        content: &[u8],
+        durability: Durability,
+    ) -> Result<(), Failure> {
+        let file = fs::openat(dir, name, IN_PLACE, NEW_FILE).map_err(refused_if_there)?;
+        fill(File::from(file), content, durability)?;
+        Ok(())
+    }
+
+    /// Whether `errno`, from a rename that never replaces, says there is no such rename.
+    fn no_such_rename(errno: Errno) -> bool {
+        [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&errno)
+    }
+
+    /// Whether `errno`, from a hard link, says the filesystem makes none.
+    fn no_hard_links(errno: Errno) -> bool {
+        [
+            Errno::PERM,
+            Errno::NOSYS,
+            Errno::NOTSUP,
+            Errno::OPNOTSUPP,
+            Errno::MLINK,
+        ]
+        .contains(&errno)
+    }
+
+    /// `errno` from a step of a new file's commit, as the write's failure: `EEXIST`, a
+    /// file at the name, is the refusal.
+    fn refused_if_there(errno: Errno) -> Failure {
+        if errno == Errno::EXIST {
+            Failure::Exists
+        } else {
+            Failure::from(errno)
+        }
     }
 
     /// A temporary file a write created in `dir`, unlinked when dropped unless it was
@@ -795,29 +1026,35 @@ mod windows {
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
-    use super::{Below, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
+    use super::{
+        Below, Commit, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX,
+    };
 
     /// `ERROR_PATH_NOT_FOUND`: a directory that is not there, in the operating system's
     /// words.
     const PATH_NOT_FOUND: i32 = 3;
 
     /// Write `content` to `below.name`, in the directory [`walk`] checks, by path (the
-    /// residual the module docs describe), refusing a symlink at the target.
+    /// residual the module docs describe), as `commit` says, refusing a symlink at the
+    /// target.
     pub(super) fn write(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
         content: &[u8],
         durability: Durability,
         parents: Parents,
+        commit: Commit<&Stamp>,
     ) -> Result<(), Failure> {
         let dir = walk(below, anchor, parents)?;
         let target = dir.join(below.name);
-        match std::fs::symlink_metadata(&target) {
-            Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        match (std::fs::symlink_metadata(&target), commit) {
+            (Ok(meta), _) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
+            // A new file is never put where anything is.
+            (Ok(_), Commit::New) => return Err(Failure::Exists),
+            (Err(e), _) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
-        replace(&dir, &target, content, durability, None)
+        replace(&dir, &target, content, durability, commit)
     }
 
     /// A file as a rewrite read it, by path (#160): its size and the times it was last
@@ -890,24 +1127,20 @@ mod windows {
         content: &[u8],
         durability: Durability,
     ) -> Result<(), Failure> {
-        replace(
-            &held.dir,
-            &held.file,
-            content,
-            durability,
-            Some(&held.stamp),
-        )
+        let commit = Commit::Replace(Some(&held.stamp));
+        replace(&held.dir, &held.file, content, durability, commit)
     }
 
-    /// Replace `target` in `dir` with `content`, by way of a temporary file beside it —
-    /// when `unchanged` stamps the file a rewrite read, only if `target` still holds it,
-    /// looked at just before the file is persisted over it.
+    /// Put `content` at `target` in `dir`, by way of a temporary file beside it, as
+    /// `commit` says: persisted over the file there — when it stamps the file a rewrite
+    /// read, only if `target` still holds it, looked at just before — or moved into place
+    /// without `MOVEFILE_REPLACE_EXISTING`, which fails on a file that is there.
     fn replace(
         dir: &Path,
         target: &Path,
         content: &[u8],
         durability: Durability,
-        unchanged: Option<&Stamp>,
+        commit: Commit<&Stamp>,
     ) -> Result<(), Failure> {
         let mut temp = tempfile::Builder::new()
             .prefix(TEMP_PREFIX)
@@ -917,11 +1150,27 @@ mod windows {
         if durability == Durability::Fsync {
             temp.as_file().sync_all()?;
         }
-        if unchanged.is_some_and(|stamp| !stamp.holds(target)) {
-            // The temporary file is deleted again as `temp` drops.
-            return Err(Failure::Changed);
+        match commit {
+            Commit::Replace(unchanged) => {
+                if unchanged.is_some_and(|stamp| !stamp.holds(target)) {
+                    // The temporary file is deleted again as `temp` drops.
+                    return Err(Failure::Changed);
+                }
+                temp.persist(target).map_err(|e| e.error)?;
+            }
+            Commit::New => {
+                // A file that appears while the run pauses here is met by the move itself.
+                super::pause_before_replace();
+                // The temporary file is deleted again as the error drops.
+                temp.persist_noclobber(target).map_err(|e| {
+                    if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                        Failure::Exists
+                    } else {
+                        Failure::from(e.error)
+                    }
+                })?;
+            }
         }
-        temp.persist(target).map_err(|e| e.error)?;
         Ok(())
     }
 
@@ -985,11 +1234,12 @@ mod windows {
     }
 }
 
-// ── Test-only pause before a rewrite's replace (#160) ────────────────────────
+// ── Test-only pause before a rewrite's replace or a new file's commit (#160) ─
 
 /// `MDS_TEST_PAUSE_BEFORE_REPLACE`: how a debug build is made to stop between a rewrite's
 /// read and its replace, so that a test can change the file, or swap its directory, in
-/// that window (`tests/anchored_writes.rs`). A release build has none of it.
+/// that window, and between [`create_new`]'s look at its target and its commit, so that a
+/// test can put a file there (`tests/anchored_writes.rs`). A release build has none of it.
 #[cfg(debug_assertions)]
 mod pause_trigger {
     use std::path::PathBuf;
@@ -1037,7 +1287,7 @@ mod pause_trigger {
 #[cfg(debug_assertions)]
 pub(crate) use pause_trigger::pause_before_replace;
 
-/// A release build's pause before a rewrite's replace: none.
+/// A release build's pause before a rewrite's replace or a new file's commit: none.
 #[cfg(not(debug_assertions))]
 pub(crate) fn pause_before_replace() {}
 
@@ -1657,6 +1907,204 @@ mod tests {
                 safe_path(&target.shown)
             ),
             "a symlink in its place"
+        );
+    }
+
+    // ── A new file, never over another ───────────────────────────────────────────
+
+    /// [`create_new`] puts a file where nothing is, and refuses a target that is there:
+    /// `<file> already exists (use --force to overwrite)`, the file left as it is and no
+    /// temporary file (#160). A symlink there is refused as a symlink, and nothing is
+    /// written through it. Control: [`atomic_write_file`] replaces the same file.
+    #[test]
+    fn a_new_file_is_never_put_where_a_file_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        let target = WriteTarget::new(file.clone(), PathBuf::from("a.mds"));
+        let new = |content: &str| {
+            create_new(&target, content, Durability::RenameOnly, Parents::Existing)
+                .map_err(|e| e.to_string())
+        };
+
+        new("first").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+        assert_eq!(
+            new("second"),
+            Err(format!("{} {ALREADY_EXISTS}", safe_path(&target.shown)))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+        assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
+
+        atomic_write_file(
+            &target,
+            "replaced",
+            Durability::RenameOnly,
+            Parents::Existing,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "replaced");
+
+        std::fs::remove_file(&file).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        if make_symlink(&elsewhere, &file) {
+            assert_eq!(
+                new("third"),
+                Err(format!(
+                    "cannot write {}: {SYMLINK_REFUSAL}",
+                    safe_path(&target.shown)
+                ))
+            );
+            assert!(!elsewhere.exists(), "nothing is written through the link");
+        }
+    }
+
+    /// Each step of a new file's commit puts the file where nothing is, and never over a
+    /// file that is there (#160): the rename that never replaces; a hard link, once each
+    /// answer saying that rename is not to be had is given; and the content written in
+    /// place into a file created exclusively, once each answer saying hard links are not
+    /// to be had either is given too. With the name taken, each step refuses, the file
+    /// there keeps its bytes, and no temporary file is left. A step that fails otherwise
+    /// fails the write, and no later step is taken.
+    #[cfg(unix)]
+    #[test]
+    fn each_step_of_a_new_file_s_commit_never_replaces_a_file() {
+        use std::cell::RefCell;
+        use std::ffi::OsString;
+        use std::io::Write as _;
+        use std::os::fd::{AsFd as _, BorrowedFd};
+
+        use rustix::fs::{Mode, OFlags};
+        use rustix::io::Errno;
+
+        use super::unix::{commit_new, create_temp, NewSteps, NO_CLOBBER};
+
+        /// What a commit of `new` to `a.mds` came to: its outcome, the steps it took, the
+        /// bytes of `a.mds` — `there` when it was taken first — and the names left.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Outcome {
+            result: Result<(), String>,
+            steps: Vec<&'static str>,
+            file: Option<String>,
+            names: Vec<String>,
+        }
+
+        // `rename` and `link`: the answer each step gives in place of its own, if any.
+        let commit = |rename: Option<Errno>, link: Option<Errno>, taken: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.mds");
+            if taken {
+                std::fs::write(&file, "there").unwrap();
+            }
+            let fd = rustix::fs::open(
+                dir.path(),
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+            let taken_steps = RefCell::new(Vec::new());
+            let forced_rename = |d: BorrowedFd<'_>, from: &OsStr, to: &OsStr| {
+                taken_steps.borrow_mut().push("rename");
+                rename.map_or_else(|| (NO_CLOBBER.rename)(d, from, to), Err)
+            };
+            let forced_link = |d: BorrowedFd<'_>, from: &OsStr, to: &OsStr| {
+                taken_steps.borrow_mut().push("link");
+                link.map_or_else(|| (NO_CLOBBER.link)(d, from, to), Err)
+            };
+            let steps = NewSteps {
+                rename: &forced_rename,
+                link: &forced_link,
+            };
+            let temp_name = OsString::from(format!("{TEMP_PREFIX}step{TEMP_SUFFIX}"));
+            let (temp, mut written) =
+                create_temp(fd.as_fd(), Mode::from_raw_mode(0o644), [temp_name]).unwrap();
+            written.write_all(b"new").unwrap();
+            drop(written);
+            let result = commit_new(
+                temp,
+                OsStr::new("a.mds"),
+                b"new",
+                Durability::RenameOnly,
+                &steps,
+            )
+            .map_err(|failure| match failure {
+                Failure::Exists => "exists".to_owned(),
+                Failure::Io(e) => format!("{:?}", Errno::from_io_error(&e)),
+                other => format!("{other:?}"),
+            });
+            Outcome {
+                result,
+                steps: taken_steps.into_inner(),
+                file: std::fs::read_to_string(&file).ok(),
+                names: entries(dir.path()),
+            }
+        };
+        let landed = |steps: &[&'static str]| Outcome {
+            result: Ok(()),
+            steps: steps.to_vec(),
+            file: Some("new".to_owned()),
+            names: vec!["a.mds".to_owned()],
+        };
+        let refused = |steps: &[&'static str]| Outcome {
+            result: Err("exists".to_owned()),
+            steps: steps.to_vec(),
+            file: Some("there".to_owned()),
+            names: vec!["a.mds".to_owned()],
+        };
+
+        assert_eq!(commit(None, None, false), landed(&["rename"]), "renamed");
+        assert_eq!(
+            commit(None, None, true),
+            refused(&["rename"]),
+            "rename refused"
+        );
+        for no_rename in [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP] {
+            let both = ["rename", "link"];
+            assert_eq!(
+                commit(Some(no_rename), None, false),
+                landed(&both),
+                "{no_rename:?}: linked"
+            );
+            assert_eq!(
+                commit(Some(no_rename), None, true),
+                refused(&both),
+                "{no_rename:?}: link refused"
+            );
+        }
+        for no_link in [
+            Errno::PERM,
+            Errno::NOSYS,
+            Errno::NOTSUP,
+            Errno::OPNOTSUPP,
+            Errno::MLINK,
+        ] {
+            let both = ["rename", "link"];
+            assert_eq!(
+                commit(Some(Errno::INVAL), Some(no_link), false),
+                landed(&both),
+                "{no_link:?}: written in place"
+            );
+            assert_eq!(
+                commit(Some(Errno::INVAL), Some(no_link), true),
+                refused(&both),
+                "{no_link:?}: written in place refused"
+            );
+        }
+
+        let failed = |steps: &[&'static str]| Outcome {
+            result: Err(format!("{:?}", Some(Errno::IO))),
+            steps: steps.to_vec(),
+            file: None,
+            names: Vec::new(),
+        };
+        assert_eq!(
+            commit(Some(Errno::IO), None, false),
+            failed(&["rename"]),
+            "a failed rename is no reason to link"
+        );
+        assert_eq!(
+            commit(Some(Errno::INVAL), Some(Errno::IO), false),
+            failed(&["rename", "link"]),
+            "a failed link is no reason to write in place"
         );
     }
 
