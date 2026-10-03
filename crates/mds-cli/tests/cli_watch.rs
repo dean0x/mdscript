@@ -10062,9 +10062,10 @@ fn refusals(stderr: &str, shown: &str, cause: &str) -> usize {
 /// directory mode: `chat.md`, which declares `type: mds`, at the output of the Markdown
 /// source `chat.mds`, is refused at startup and by every rebuild of the same kind,
 /// `mds::io`, naming it as its `Recompiled` line would, and kept; the session keeps
-/// watching. A module put where the session's own output was is kept too. Control: with
-/// `chat.md` gone, the next save writes it. At Ctrl+C the session exits 0, as after any
-/// write that failed once it was live.
+/// watching. A module put where the session's own output was is kept too, and once it is
+/// gone the refused text saved again is written: a refused write leaves nothing recorded
+/// as written. Control: with `chat.md` gone, the next save writes it. At Ctrl+C the
+/// session exits 0, as after any write that failed once it was live.
 #[test]
 fn watch_never_writes_over_an_mds_module() {
     const CAUSE: &str = "refusing to replace an MDS module";
@@ -10116,6 +10117,16 @@ fn watch_never_writes_over_an_mds_module() {
         let seen = refusals(&tap.text(), &shown_md, CAUSE);
         write_atomic(&src, "Hello four\n");
         refused_after(seen, "a rebuild over a module put in place of the output");
+
+        // The refused write is retried: nothing was written, so with the module gone the
+        // same text saved again is written, not skipped as written already.
+        std::fs::remove_file(&md).unwrap();
+        write_atomic(&src, "Hello four\n");
+        assert!(
+            wait_for_file_contains(&md, "Hello four", TIMEOUT),
+            "{mode}: the refused text, saved again, is written; stderr: {}",
+            tap.text()
+        );
 
         #[cfg(unix)]
         {
