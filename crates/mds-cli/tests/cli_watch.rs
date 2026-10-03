@@ -9432,3 +9432,75 @@ fn watch_removes_an_empty_startup_output_when_the_kind_changes() {
         "stderr: {stderr}"
     );
 }
+
+/// A file a change of kind keeps is told about again once the source has been rebuilt to
+/// anything else in between (#160): `chat.mds`, a messages source beside a hand-written
+/// `chat.md`, is edited into Markdown — one notice — then back to the messages the
+/// session wrote, which writes nothing, and saved broken; edited into the same Markdown
+/// again, the session tells it again. Both modes. Control: each save that keeps it gets
+/// one notice, however many events it reaches the watcher as.
+#[test]
+fn watch_tells_a_kept_file_again_once_its_source_has_changed_in_between() {
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", MESSAGES_KIND), ("chat.md", HAND_WRITTEN)]);
+        let notes = base.path().join("notes");
+        let (src, md, json) = (
+            notes.join("chat.mds"),
+            notes.join("chat.md"),
+            notes.join("chat.json"),
+        );
+        let notice = format!(
+            "Kept {}: not written by this session; not overwritten",
+            below(shown_dir, "chat.md")
+        );
+        let notices = |seen: &str| seen.lines().filter(|line| *line == notice).count();
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+            "{mode}: control: the startup writes chat.json; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&src, "Hello\n");
+        assert!(
+            poll_tap_until(&tap, TIMEOUT, |seen| notices(seen) == 1).is_ok(),
+            "{mode}: control: the first edit into Markdown is told; stderr: {}",
+            tap.text()
+        );
+        // Back to what the session wrote: nothing to write. Then broken: nothing either.
+        write_atomic(&src, MESSAGES_KIND);
+        write_atomic(&src, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+
+        write_atomic(&src, "Hello\n");
+        assert!(
+            poll_tap_until(&tap, TIMEOUT, |seen| notices(seen) == 2).is_ok(),
+            "{mode}: the same edit into Markdown, made again, is told again; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, OTHER_MESSAGES);
+        wait_for_tap(
+            &tap,
+            &format!("Recompiled {} (", below(shown_dir, "chat.json")),
+            TIMEOUT,
+        );
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            notices(&stderr),
+            2,
+            "{mode}: one notice for each save that kept chat.md; stderr: {stderr}"
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(HAND_WRITTEN),
+            "{mode}: chat.md is kept throughout; stderr: {stderr}"
+        );
+    }
+}

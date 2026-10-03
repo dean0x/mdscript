@@ -1209,7 +1209,7 @@ fn retire_output(
 /// caller's out-dir check found, with the directories it goes in created. Anything else
 /// there — a file this session did not write, one changed since, a symlink, a directory —
 /// is kept, with one notice saying which (none under `--quiet`, and none when `told`: the
-/// same content was kept from the same source's output before), and nothing is written:
+/// rebuild of the same source just before kept the same content), and nothing is written:
 /// `Ok(false)`, so a later save tries again. The output of the old kind is the caller's
 /// to retire, and only once the new one is written.
 fn write_after_change_of_kind(
@@ -1832,9 +1832,9 @@ struct FileWatchState {
     /// another — a change of kind — writes only where nothing is, or over its own file
     /// ([`write_after_change_of_kind`], #160).
     written_to: Option<OutputKey>,
-    /// What a change of kind last kept from being written, the file there not being the
-    /// session's (#160): a rebuild of the same again — another event of the same save —
-    /// tries again but tells it no more. Cleared by every write.
+    /// What the last rebuild kept from being written after a change of kind, the file
+    /// there not being the session's (#160): the next rebuild of the same — another event
+    /// of the same save — tries again but tells it no more. Any other rebuild clears it.
     kept: Option<String>,
     /// Where every rebuild writes ([`OutputRoute::of`]), and the output a change of kind
     /// leaves behind ([`OutputRoute::other_than`]).
@@ -2012,6 +2012,9 @@ fn rebuild_file(
     state: &mut FileWatchState,
 ) -> ControlFlow<StopReason> {
     ctx.working_dir.restore_if_recreated();
+    // What the rebuild before this one kept from being written (#160): told again unless
+    // this rebuild keeps the same once more, as another event of the same save does.
+    let kept_before = state.kept.take();
 
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
     // Print the error, settle mtime to avoid re-fire, and keep watching.
@@ -2132,7 +2135,7 @@ fn rebuild_file(
             &below_checked_out_dir(state.out_dir.as_ref(), target),
             state.last_written.get(&output_key).map(String::as_str),
             &compiled.content,
-            state.kept.as_ref() == Some(&compiled.content),
+            kept_before.as_ref() == Some(&compiled.content),
             ctx.quiet,
         ) {
             Ok(true) => OutputWrite::Written,
@@ -2169,7 +2172,6 @@ fn rebuild_file(
                 .last_written
                 .insert(output_key.clone(), compiled.content);
             state.written_to = Some(output_key);
-            state.kept = None;
             if let Some(anchor) = &mut state.out_dir {
                 anchor.written();
             }
@@ -2742,9 +2744,10 @@ struct DirWatchState {
     /// source's outputs are looked for (#160). A source with no entry — a partial, a
     /// dependency outside the root, one never written — has none to remove.
     outputs: HashMap<PathBuf, WriteTarget>,
-    /// By source: what a change of kind last kept from being written, the file there not
-    /// being the session's (#160) — a rebuild of the same again tries again but tells it no
-    /// more. Cleared by the source's next write, and when it is forgotten.
+    /// By source: what its last rebuild kept from being written after a change of kind,
+    /// the file there not being the session's (#160) — the next rebuild of the same tries
+    /// again but tells it no more. Any other rebuild of the source clears it, as does
+    /// forgetting the source.
     kept: HashMap<PathBuf, String>,
     /// The out-dir every output is written below, checked before each write; `None` when
     /// outputs go beside their sources.
@@ -2794,7 +2797,6 @@ impl DirWatchState {
     fn wrote(&mut self, src: &Path, out: &WriteTarget, content: String) {
         self.last_written.insert(out.path.clone(), content);
         self.outputs.insert(src.to_path_buf(), out.clone());
-        self.kept.remove(src);
     }
 
     /// Record a compile error for `src`, **keeping** whatever dep set the last
@@ -2851,8 +2853,7 @@ impl DirWatchState {
     /// record of its output with what was written there, so nothing written for it is
     /// this session's to remove any more (#160). The output is the one recorded when it
     /// was written, never one guessed from the source's path: a dependency outside the
-    /// root has none, and a guess for one took the out-of-root flatten arm and named an
-    /// in-root source's output (#217).
+    /// root has none (#217).
     fn forget(&mut self, src: &Path) {
         if let Some(out) = self.outputs.remove(src) {
             self.last_written.remove(&out.path);
@@ -2954,6 +2955,9 @@ fn compile_one_source(
 ) -> bool {
     let root = watch_root.canonical.as_path();
     let t0 = Instant::now();
+    // What the rebuild of `src` before this one kept from being written (#160): told again
+    // unless this rebuild keeps the same once more, as another event of the same save does.
+    let kept_before = state.kept.remove(src);
     let failure = match watch_root.compile_source(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths = graph_keys(&compiled.dependencies);
@@ -3000,7 +3004,7 @@ fn compile_one_source(
                             &below_checked_out_dir(state.out_dir.as_ref(), &out),
                             state.last_written.get(&out.path).map(String::as_str),
                             &compiled.content,
-                            state.kept.get(src) == Some(&compiled.content),
+                            kept_before.as_ref() == Some(&compiled.content),
                             quiet,
                         )
                         .map_err(miette::Report::new)
