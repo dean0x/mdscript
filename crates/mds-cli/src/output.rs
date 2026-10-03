@@ -2973,6 +2973,55 @@ mod tests {
         assert!(!stale.exists(), "control: the stale output is removed");
     }
 
+    /// #160: a stale `.json` whose bytes are not UTF-8, or that is larger than the read
+    /// cap (10 MiB), is not proven mds's and is kept by a directory build's cleanup, though
+    /// it holds what mds writes for a messages output but for one byte, or would hold
+    /// exactly that but for its size. Control: the same messages output of exactly the
+    /// cap, and the output with its byte restored, are each removed. Built at run time.
+    #[test]
+    fn a_stale_json_that_is_not_utf8_or_over_the_read_cap_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir(&anchor).unwrap();
+        let stale = anchor.join("x.json");
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("x.md"));
+        let kept_or_removed = |bytes: &[u8]| {
+            std::fs::write(&stale, bytes).unwrap();
+            assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
+            if stale.exists() {
+                "kept"
+            } else {
+                "removed"
+            }
+        };
+
+        let mut not_utf8 = HI.as_bytes().to_vec();
+        not_utf8[HI.find("Hi").unwrap() + 1] = 0xFF;
+        assert_eq!(kept_or_removed(&not_utf8), "kept", "not UTF-8");
+        assert_eq!(kept_or_removed(HI.as_bytes()), "removed", "control: {HI:?}");
+
+        // What mds writes for one message whose content is `len` bytes of `a`.
+        let output = |len: usize| {
+            let message = WrittenMessage {
+                role: "user".to_owned(),
+                content: "a".repeat(len),
+            };
+            crate::build::messages_json(&[message]).unwrap()
+        };
+        let cap = usize::try_from(mds::MAX_FILE_SIZE).unwrap();
+        let frame = output(0).len();
+        let over = output(cap + 1 - frame);
+        assert_eq!(over.len(), cap + 1, "one byte over the cap");
+        assert_eq!(kept_or_removed(over.as_bytes()), "kept", "over the cap");
+        let at_cap = output(cap - frame);
+        assert_eq!(at_cap.len(), cap, "exactly the cap");
+        assert_eq!(
+            kept_or_removed(at_cap.as_bytes()),
+            "removed",
+            "control: exactly the cap"
+        );
+    }
+
     /// #390: a root walked in another form than it was typed in — `mds watch` walks the
     /// canonical directory — names an output next to its source, and the stem it is named
     /// from, below the directory as typed, while both are written and probed below the
