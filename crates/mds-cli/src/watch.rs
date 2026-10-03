@@ -26,8 +26,9 @@
 //!    directory is unknowable until the compile that reads it returns, and a watch
 //!    descriptor destroyed by `rmdir` never announces its own replacement (#321).
 //!
-//! The tick is scheduled against an absolute deadline (`TickClock`), so a stream of
-//! filesystem events cannot postpone the backstop indefinitely (#319).
+//! The tick is scheduled against an absolute deadline (`TickSchedule`, driven by
+//! `TickClock`), so a stream of filesystem events cannot postpone the backstop
+//! indefinitely (#319).
 //!
 //! # Coalescing
 //!
@@ -616,7 +617,7 @@ fn create_ready_marker(tmp: &Path) -> std::io::Result<()> {
     file.write_all(READY_MARKER.as_bytes())
 }
 
-/// Idle-tick scheduler holding an **absolute** deadline (#319).
+/// The idle tick's schedule, holding an **absolute** deadline (#319).
 ///
 /// The liveness probe is the watcher's only backstop for a change that no filesystem
 /// event ever announced, so how the tick is scheduled decides whether that backstop
@@ -633,25 +634,84 @@ fn create_ready_marker(tmp: &Path) -> std::io::Result<()> {
 ///
 /// Keeping the deadline as an `Instant` pins the tick to wall-clock time instead:
 /// an incoming message shortens the remaining wait rather than restarting it, so the
-/// tick comes due on schedule no matter how loaded the channel is.
+/// tick comes due on schedule no matter how loaded the channel is. A tick that is
+/// already due is reported before any message is taken ([`TickPoll::Due`]), so a
+/// channel that is never empty cannot postpone it either.
 ///
 /// Re-arming to `now + interval` at the moment a tick is *observed* bounds it from
 /// the other side. The probe — and any recompile it triggers — runs between two
-/// `recv_next` calls, so a probe that overruns its own interval simply arms the next
-/// deadline from when it finished. It can never accumulate overdue ticks and fire
-/// them back-to-back: at most one tick per interval, under every load.
+/// polls, so a probe that overruns its own interval simply arms the next deadline
+/// from when it finished. It can never accumulate overdue ticks and fire them
+/// back-to-back: at most one tick per interval, under every load.
+///
+/// The schedule never reads the clock: every instant is an argument. [`TickClock`]
+/// is the driver that reads it and waits on the channel.
+#[derive(Debug, Clone, Copy)]
+enum TickSchedule {
+    /// `--poll-interval 0`: the probe is off, and no tick ever comes due.
+    Off,
+    /// One tick per `interval`; the next comes due at `next`.
+    Every { interval: Duration, next: Instant },
+}
+
+/// What a [`TickSchedule`] says at a given instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickPoll {
+    /// No tick will ever come due: wait for a message for as long as it takes.
+    Never,
+    /// The tick is due: run it before taking another message. The schedule has
+    /// already re-armed one interval from the instant it was asked at.
+    Due,
+    /// Not due yet: wait at most this long for a message.
+    Wait(Duration),
+}
+
+impl TickSchedule {
+    /// The schedule of a session that starts at `now`: its first tick comes due one
+    /// interval later.
+    fn start(interval: Option<Duration>, now: Instant) -> Self {
+        match interval {
+            None => Self::Off,
+            Some(interval) => Self::Every {
+                interval,
+                next: now + interval,
+            },
+        }
+    }
+
+    /// Whether the tick is due at `now`. A due tick re-arms the schedule
+    /// ([`Self::rearm`]).
+    fn poll(&mut self, now: Instant) -> TickPoll {
+        let Self::Every { next, .. } = *self else {
+            return TickPoll::Never;
+        };
+        if now >= next {
+            self.rearm(now);
+            TickPoll::Due
+        } else {
+            TickPoll::Wait(next - now)
+        }
+    }
+
+    /// A tick was observed at `now`: the next comes due one interval after it — never
+    /// one interval after the deadline it may have missed.
+    fn rearm(&mut self, now: Instant) {
+        if let Self::Every { interval, next } = self {
+            *next = now + *interval;
+        }
+    }
+}
+
+/// Drives a [`TickSchedule`] on the real clock and the watch channel: the only place
+/// the idle tick reads `Instant::now()` or waits.
 struct TickClock {
-    /// `None` when `--poll-interval 0` disabled the probe; `recv_next` then blocks.
-    interval: Option<Duration>,
-    /// Instant at which the next idle tick comes due. Unused while `interval` is `None`.
-    next: Instant,
+    schedule: TickSchedule,
 }
 
 impl TickClock {
     fn new(interval: Option<Duration>) -> Self {
         Self {
-            interval,
-            next: Instant::now() + interval.unwrap_or(Duration::ZERO),
+            schedule: TickSchedule::start(interval, Instant::now()),
         }
     }
 
@@ -665,26 +725,20 @@ impl TickClock {
         &mut self,
         rx: &mpsc::Receiver<Msg>,
     ) -> std::result::Result<Option<Msg>, mpsc::RecvTimeoutError> {
-        let Some(interval) = self.interval else {
-            return rx
+        match self.schedule.poll(Instant::now()) {
+            TickPoll::Never => rx
                 .recv()
                 .map(Some)
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
-        };
-        let now = Instant::now();
-        // Already due: fire before taking another message, so a saturated channel
-        // cannot postpone the probe indefinitely.
-        if now >= self.next {
-            self.next = now + interval;
-            return Ok(None);
-        }
-        match rx.recv_timeout(self.next - now) {
-            Ok(msg) => Ok(Some(msg)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.next = Instant::now() + interval;
-                Ok(None)
-            }
-            Err(e @ mpsc::RecvTimeoutError::Disconnected) => Err(e),
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            TickPoll::Due => Ok(None),
+            TickPoll::Wait(wait) => match rx.recv_timeout(wait) {
+                Ok(msg) => Ok(Some(msg)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.schedule.rearm(Instant::now());
+                    Ok(None)
+                }
+                Err(e @ mpsc::RecvTimeoutError::Disconnected) => Err(e),
+            },
         }
     }
 }
@@ -723,16 +777,23 @@ const MAX_DEBOUNCE_MESSAGES: usize = 10_000;
 enum DebounceEnd {
     /// `--debounce 0`: coalescing is off; no window was ever opened.
     Disabled,
+    /// The window closed on its own ([`DebounceWindow::classify`]).
+    Closed(WindowEnd),
+    /// Ctrl+C. The caller must stop, not rebuild.
+    Interrupted,
+    /// The watcher's sender was dropped.
+    Disconnected,
+}
+
+/// Why an open [`DebounceWindow`] closed on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowEnd {
     /// A full window passed with no further content event: the intended exit.
     Quiet,
     /// The absolute cap elapsed while events were still arriving.
     Cap,
     /// `MAX_DEBOUNCE_MESSAGES` messages were drained in this window.
     MessageLimit,
-    /// Ctrl+C. The caller must stop, not rebuild.
-    Interrupted,
-    /// The watcher's sender was dropped.
-    Disconnected,
 }
 
 /// Result of one debounce window.
@@ -772,6 +833,93 @@ fn debounce_cap(window: Duration) -> Duration {
     (window * DEBOUNCE_CAP_FACTOR).max(DEBOUNCE_CAP_FLOOR)
 }
 
+/// One open debounce window: a quiet period with an absolute cap and a message limit
+/// (see [`drain_debounce`] for why each rule exists).
+///
+/// It never reads the clock: every instant is an argument. [`drain_debounce`] is the
+/// driver that reads it and waits on the channel.
+struct DebounceWindow {
+    /// The quiet period every content event restarts.
+    window: Duration,
+    /// `start + debounce_cap(window)`: no event extends the window past it.
+    cap_end: Instant,
+    /// When the window closes unless a content event extends it; never past `cap_end`.
+    deadline: Instant,
+    /// Messages drained so far, of every kind.
+    messages: usize,
+    /// Every path seen in a content event.
+    paths: BTreeSet<PathBuf>,
+}
+
+impl DebounceWindow {
+    /// A window opened at `start`: it closes one window later unless a content event
+    /// extends it, and never after `start + debounce_cap(window)`.
+    fn open(window: Duration, start: Instant) -> Self {
+        Self {
+            window,
+            cap_end: start + debounce_cap(window),
+            deadline: start + window,
+            messages: 0,
+            paths: BTreeSet::new(),
+        }
+    }
+
+    /// A filesystem event drained at `now`. It counts toward the message limit; a
+    /// content event also contributes its paths and extends the window
+    /// ([`Self::on_content`]). An `Access` event does neither (inotify
+    /// IN_ACCESS/IN_OPEN/IN_CLOSE_NOWRITE — reads must not trigger recompiles; see
+    /// [`is_content_event`]).
+    fn on_event(&mut self, event: notify::Event, now: Instant) {
+        self.messages += 1;
+        if !is_content_event(&event.kind) {
+            return;
+        }
+        self.paths.extend(event.paths);
+        self.on_content(now);
+    }
+
+    /// A watch error was drained: it counts toward the message limit and extends
+    /// nothing.
+    fn on_watch_error(&mut self) {
+        self.messages += 1;
+    }
+
+    /// A content event at `now`: the window now closes one window after it, but never
+    /// after the cap end.
+    fn on_content(&mut self, now: Instant) {
+        self.deadline = (now + self.window).min(self.cap_end);
+    }
+
+    /// When the window closes unless a content event extends it.
+    fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Whether the window has closed by `now`, and why. `None`: it is still open, so
+    /// wait for a message until [`Self::deadline`].
+    fn classify(&self, now: Instant) -> Option<WindowEnd> {
+        // The bound, enforced in release too: a window may be extended by further
+        // events, never past `start + cap`. Pure arithmetic: a descheduled runner
+        // cannot trip it, only a defect can. Asserting on MEASURED elapsed time
+        // instead would panic a shipped watcher whenever `recv_timeout` overshoots.
+        assert!(
+            self.deadline <= self.cap_end,
+            "debounce deadline escaped its cap: a file written to continuously would \
+             postpone its own rebuild (and the idle-tick backstop behind it) for as \
+             long as the writing lasts"
+        );
+        if self.messages >= MAX_DEBOUNCE_MESSAGES {
+            Some(WindowEnd::MessageLimit)
+        } else if now < self.deadline {
+            None
+        } else if self.deadline == self.cap_end {
+            Some(WindowEnd::Cap)
+        } else {
+            Some(WindowEnd::Quiet)
+        }
+    }
+}
+
 /// Coalesce a burst of filesystem events into one rebuild.
 ///
 /// # Quiet period, not a fixed window
@@ -805,79 +953,44 @@ fn debounce_cap(window: Duration) -> Duration {
 /// rebuild ([`event_is_relevant`] in file mode, the `.mds`/root filter in dir mode);
 /// this decides when.
 fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome {
-    let mut paths = BTreeSet::new();
-
     let Some(window) = clamp_debounce(debounce_ms) else {
         // `--debounce 0`: no coalescing. The channel is left untouched, so the next
         // event is delivered to the loop as its own batch.
         return DebounceOutcome {
-            paths,
+            paths: BTreeSet::new(),
             end: DebounceEnd::Disabled,
         };
     };
 
-    let start = Instant::now();
-    let hard_cap = start + debounce_cap(window);
-    let mut deadline = start + window;
-    let mut messages: usize = 0;
-
+    // The window decides; this loop only reads the clock and waits on the channel.
+    // Bounded by the window: it closes at its cap end or its message limit.
+    let mut open = DebounceWindow::open(window, Instant::now());
     let end = loop {
-        // The bound, enforced in release too: a window may be extended by further
-        // events, never past `start + cap`. Pure arithmetic: a descheduled runner
-        // cannot trip it, only a defect can. Asserting on MEASURED elapsed time
-        // instead would panic a shipped watcher whenever `recv_timeout` overshoots.
-        assert!(
-            deadline <= hard_cap,
-            "debounce deadline escaped its cap: a file written to continuously would \
-             postpone its own rebuild (and the idle-tick backstop behind it) for as \
-             long as the writing lasts"
-        );
-
-        if messages >= MAX_DEBOUNCE_MESSAGES {
-            break DebounceEnd::MessageLimit;
-        }
-
         let now = Instant::now();
-        if now >= deadline {
-            break if deadline == hard_cap {
-                DebounceEnd::Cap
-            } else {
-                DebounceEnd::Quiet
-            };
+        if let Some(closed) = open.classify(now) {
+            break DebounceEnd::Closed(closed);
         }
-
-        match rx.recv_timeout(deadline - now) {
-            Ok(msg) => {
-                messages += 1;
-                match msg {
-                    Msg::Fs(Ok(event)) => {
-                        // Drop Access events (inotify IN_ACCESS/IN_OPEN/IN_CLOSE_NOWRITE)
-                        // — reads must not trigger recompiles; see is_content_event.
-                        if !is_content_event(&event.kind) {
-                            continue;
-                        }
-                        for p in event.paths {
-                            paths.insert(p);
-                        }
-                        deadline = (Instant::now() + window).min(hard_cap);
-                    }
-                    Msg::Fs(Err(e)) => {
-                        eprint_warning(&format!(
-                            "warning: watch error during debounce: {}",
-                            safe_inline(notify_cause(&e))
-                        ));
-                    }
-                    Msg::Interrupt => break DebounceEnd::Interrupted,
-                }
+        match rx.recv_timeout(open.deadline() - now) {
+            Ok(Msg::Fs(Ok(event))) => open.on_event(event, Instant::now()),
+            Ok(Msg::Fs(Err(e))) => {
+                open.on_watch_error();
+                eprint_warning(&format!(
+                    "warning: watch error during debounce: {}",
+                    safe_inline(notify_cause(&e))
+                ));
             }
-            // The deadline is the single decision point: re-loop and let the checks
-            // above classify the exit.
+            Ok(Msg::Interrupt) => break DebounceEnd::Interrupted,
+            // The deadline is the single decision point: re-loop and let the window
+            // classify the exit.
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break DebounceEnd::Disconnected,
         }
     };
 
-    DebounceOutcome { paths, end }
+    DebounceOutcome {
+        paths: open.paths,
+        end,
+    }
 }
 
 // ── Poll-interval clamp (reconcile rule) ─────────────────────────────────────────────
@@ -5714,61 +5827,88 @@ mod tests {
         );
     }
 
-    // ── TickClock (#319) ─────────────────────────────────────────────────────
+    // ── Idle-tick schedule (#319, #397) ──────────────────────────────────────
     //
     // The probe-starvation defect. These assert the two properties that make the idle
     // tick a usable backstop rather than a best-effort one: it fires under load, and
-    // it does not fire more often than its interval.
+    // it does not fire more often than its interval. They run on synthetic instants:
+    // `Instant::now()` is read once per test as an arbitrary origin, and every other
+    // instant is an exact offset from it, so no assertion depends on how fast the
+    // runner is.
 
-    /// A tick fires when the channel stays silent.
-    #[test]
-    fn tick_clock_fires_when_idle() {
-        let (_tx, rx) = mpsc::channel::<Msg>();
-        let mut clock = TickClock::new(Some(Duration::from_millis(50)));
-        assert!(
-            matches!(clock.recv_next(&rx), Ok(None)),
-            "an idle channel must produce a tick"
-        );
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
     }
 
-    /// A tick fires even when messages arrive faster than the interval (#319).
-    ///
-    /// This is the regression test for the starvation bug: the previous
-    /// implementation handed `recv_timeout` a fresh interval per message, so a sender
-    /// running at 20× the tick rate postponed the probe forever. Fifty messages at 5ms
-    /// spans 250ms — five full 50ms intervals — so a correct clock must yield at least
-    /// one tick before they are exhausted.
-    #[test]
-    fn tick_clock_fires_under_message_flood() {
-        let (tx, rx) = mpsc::channel::<Msg>();
-        let sender = std::thread::spawn(move || {
-            // Bounded: exactly 50 sends, then the thread ends.
-            for _ in 0..50 {
-                if tx.send(Msg::Interrupt).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
+    /// Replays [`TickClock::recv_next`] on a channel that is never empty: every poll
+    /// that is not `Due` takes a message, and handling one moves the clock on by
+    /// `per_message`. Returns when each tick came due before `until`, as offsets.
+    fn ticks_under_saturation(
+        interval: Duration,
+        per_message: Duration,
+        until: Duration,
+    ) -> Vec<Duration> {
+        let t0 = Instant::now();
+        let mut schedule = TickSchedule::start(Some(interval), t0);
+        let mut now = t0;
+        let mut ticks = Vec::new();
+        // Bounded: one step per message or tick.
+        for _ in 0..10_000 {
+            if now >= t0 + until {
+                return ticks;
             }
-        });
-
-        let mut clock = TickClock::new(Some(Duration::from_millis(50)));
-        let mut ticks = 0usize;
-        // Bounded: at most 200 receives regardless of what the sender does.
-        for _ in 0..200 {
-            match clock.recv_next(&rx) {
-                Ok(None) => {
-                    ticks += 1;
-                    break;
-                }
-                Ok(Some(_)) => {}
-                Err(_) => break,
+            match schedule.poll(now) {
+                TickPoll::Due => ticks.push(now - t0),
+                TickPoll::Wait(_) | TickPoll::Never => now += per_message,
             }
         }
-        sender.join().expect("sender thread panicked");
-        assert!(
-            ticks > 0,
-            "the idle tick must fire while messages are arriving 10x faster than the \
-             poll interval; a starvable tick makes the content backstop unreachable"
+        panic!("the replay did not reach {until:?} within 10 000 steps; ticks so far: {ticks:?}");
+    }
+
+    /// The tick comes due one interval after the session starts, and re-arms from the
+    /// instant it fired — whether a poll found it due or the driver's wait ran out.
+    #[test]
+    fn tick_schedule_comes_due_one_interval_after_it_starts() {
+        let t0 = Instant::now();
+        let mut schedule = TickSchedule::start(Some(ms(50)), t0);
+        assert_eq!(schedule.poll(t0), TickPoll::Wait(ms(50)));
+        assert_eq!(schedule.poll(t0 + ms(49)), TickPoll::Wait(ms(1)));
+        assert_eq!(
+            schedule.poll(t0 + ms(50)),
+            TickPoll::Due,
+            "an idle channel must produce a tick one interval in"
+        );
+        assert_eq!(
+            schedule.poll(t0 + ms(50)),
+            TickPoll::Wait(ms(50)),
+            "a due tick re-arms one interval after it fired"
+        );
+
+        // The driver's wait for a message ran out at the deadline: it re-arms from there.
+        schedule.rearm(t0 + ms(100));
+        assert_eq!(schedule.poll(t0 + ms(100)), TickPoll::Wait(ms(50)));
+        assert_eq!(schedule.poll(t0 + ms(150)), TickPoll::Due);
+    }
+
+    /// A due tick is reported before the next message is taken, so a channel that is
+    /// never empty cannot postpone it (#319).
+    ///
+    /// The starvation bug handed `recv_timeout` a fresh interval per message, so a
+    /// sender faster than the tick rate postponed the probe forever. Here a message is
+    /// always waiting: each tick still comes due on the first poll at or after its
+    /// deadline — on time when the message cadence divides the interval, otherwise at
+    /// most one message late — and each next one a full interval after it.
+    #[test]
+    fn tick_schedule_is_due_first_under_saturation() {
+        assert_eq!(
+            ticks_under_saturation(ms(50), ms(5), ms(210)),
+            [ms(50), ms(100), ms(150), ms(200)],
+            "a saturated channel must not postpone a tick past its deadline"
+        );
+        assert_eq!(
+            ticks_under_saturation(ms(50), ms(7), ms(230)),
+            [ms(56), ms(112), ms(168), ms(224)],
+            "a tick is due at the first poll at or after its deadline, under saturation too"
         );
     }
 
@@ -5779,30 +5919,41 @@ mod tests {
     /// than from the moment the tick was observed would fire a catch-up burst after
     /// any slow probe.
     #[test]
-    fn tick_clock_rate_limits_consecutive_ticks() {
-        let (_tx, rx) = mpsc::channel::<Msg>();
-        let interval = Duration::from_millis(50);
-        let mut clock = TickClock::new(Some(interval));
-        assert!(matches!(clock.recv_next(&rx), Ok(None)), "first tick");
-
-        // Simulate a probe that overran its own interval.
-        std::thread::sleep(Duration::from_millis(120));
+    fn tick_schedule_rearms_from_the_tick_it_observed() {
         let t0 = Instant::now();
-        assert!(matches!(clock.recv_next(&rx), Ok(None)), "overdue tick");
-        let t1 = Instant::now();
-        assert!(
-            matches!(clock.recv_next(&rx), Ok(None)),
-            "tick after the overdue one"
-        );
-        assert!(
-            t1.duration_since(t0) < Duration::from_millis(20),
+        let interval = ms(50);
+        let mut schedule = TickSchedule::start(Some(interval), t0);
+        assert_eq!(schedule.poll(t0 + ms(50)), TickPoll::Due, "first tick");
+
+        // A probe that overran its own interval: the next poll comes 120ms later.
+        assert_eq!(
+            schedule.poll(t0 + ms(170)),
+            TickPoll::Due,
             "an overdue tick must fire immediately, not wait another interval"
         );
-        assert!(
-            t1.elapsed() >= Duration::from_millis(40),
+        assert_eq!(
+            schedule.poll(t0 + ms(170)),
+            TickPoll::Wait(interval),
             "the tick following an overdue one must wait a full interval, not fire a \
-             catch-up burst; got {:?}",
-            t1.elapsed()
+             catch-up burst"
+        );
+        assert_eq!(schedule.poll(t0 + ms(219)), TickPoll::Wait(ms(1)));
+        assert_eq!(schedule.poll(t0 + ms(220)), TickPoll::Due);
+    }
+
+    /// `--poll-interval 0`: no tick ever comes due, however long the session runs.
+    #[test]
+    fn tick_schedule_without_interval_never_comes_due() {
+        let t0 = Instant::now();
+        let mut off = TickSchedule::start(None, t0);
+        let mut on = TickSchedule::start(Some(ms(50)), t0);
+        for later in [Duration::ZERO, ms(50), Duration::from_secs(3_600)] {
+            assert_eq!(off.poll(t0 + later), TickPoll::Never, "at {later:?}");
+        }
+        assert_eq!(
+            on.poll(t0 + ms(50)),
+            TickPoll::Due,
+            "positive control: with an interval the same instant is due"
         );
     }
 
@@ -5829,141 +5980,137 @@ mod tests {
     // ── Debounce window domain (#379) ────────────────────────────────────────
 
     /// A minimal content event on `path`, shaped like the ones notify delivers.
-    fn modify_event(path: &str) -> Msg {
-        Msg::Fs(Ok(notify::Event {
+    fn content_event(path: &str) -> notify::Event {
+        notify::Event {
             kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
             paths: vec![PathBuf::from(path)],
             attrs: Default::default(),
-        }))
+        }
     }
 
     /// A read event — the kind `is_content_event` drops.
-    fn access_event(path: &str) -> Msg {
-        Msg::Fs(Ok(notify::Event {
+    fn read_event(path: &str) -> notify::Event {
+        notify::Event {
             kind: notify::EventKind::Access(notify::event::AccessKind::Read),
             paths: vec![PathBuf::from(path)],
             attrs: Default::default(),
-        }))
+        }
     }
 
-    /// Run `drain_debounce` on a worker thread and refuse to wait past `bound`.
+    /// A content event on `path` as the watch channel carries it.
+    fn modify_event(path: &str) -> Msg {
+        Msg::Fs(Ok(content_event(path)))
+    }
+
+    /// Upper bound on the steps of one [`replay`]: the message limit, twice over.
+    const REPLAY_STEPS: usize = 2 * MAX_DEBOUNCE_MESSAGES;
+
+    /// How [`drain_debounce`] drives a window, replayed on synthetic instants.
     ///
-    /// The function under test is meant to be bounded. A mutation that removes the
-    /// bound would otherwise hang the test binary until the harness's own timeout,
-    /// which reports as an infrastructure problem rather than as a failed contract.
-    /// Collecting the result through a `recv_timeout` turns that mutation into a
-    /// clean, named failure at `bound`.
-    ///
-    /// The worker thread is deliberately not joined on the timeout path: it is
-    /// blocked precisely because the bound it should have honoured is gone, so
-    /// joining it would reintroduce the hang this exists to prevent.
-    fn drain_bounded(
-        rx: mpsc::Receiver<Msg>,
-        debounce_ms: u64,
-        bound: Duration,
-        why: &str,
-    ) -> DebounceOutcome {
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let outcome = drain_debounce(&rx, debounce_ms);
-            // The receiver may already have given up; the send failing is fine.
-            let _ = done_tx.send(outcome);
-        });
-        done_rx.recv_timeout(bound).unwrap_or_else(|e| {
-            panic!("drain_debounce did not return within {bound:?} ({e:?}): {why}")
-        })
+    /// `events` arrive at their instants, in order. One that arrives before the
+    /// window's deadline is drained at its own instant (at once if it was already
+    /// queued); otherwise the wait for it runs out at the deadline. Returns the instant
+    /// the window closed at, why, and the window as it closed. `events` may be endless:
+    /// only as many are taken as the window drains.
+    fn replay(
+        window: Duration,
+        start: Instant,
+        events: impl IntoIterator<Item = (Instant, notify::Event)>,
+    ) -> (Instant, WindowEnd, DebounceWindow) {
+        let mut open = DebounceWindow::open(window, start);
+        let mut events = events.into_iter().peekable();
+        let mut now = start;
+        // Bounded: one step per drained event or ran-out wait.
+        for _ in 0..REPLAY_STEPS {
+            if let Some(end) = open.classify(now) {
+                return (now, end, open);
+            }
+            let deadline = open.deadline();
+            match events.next_if(|(at, _)| *at < deadline) {
+                Some((at, event)) => {
+                    now = now.max(at);
+                    open.on_event(event, now);
+                }
+                None => now = deadline,
+            }
+        }
+        panic!("the window was still open after {REPLAY_STEPS} steps");
     }
 
     /// Every content event restarts the window: a burst longer than the window
-    /// coalesces into ONE result, not one per window's worth of burst.
+    /// coalesces into ONE result, which closes one window after the burst's last event.
     ///
     /// A window that expired at a fixed offset from the FIRST event splits any burst
     /// longer than `debounce_ms`; each piece rebuilds separately, against a different
     /// intermediate state of the file.
     #[test]
-    fn debounce_quiet_period_extends_on_content_events() {
-        let (tx, rx) = mpsc::channel::<Msg>();
-        // The window now outlives the burst, so the test must too: in production the
-        // notify sender lives as long as the watcher, and a dropped sender means
-        // "the watcher is gone", not "the burst ended".
-        let keepalive = tx.clone();
-        // 40 events, 5ms apart: a ~200ms burst under a 100ms window.
-        let sender = std::thread::spawn(move || {
-            for i in 0..40u32 {
-                if tx.send(modify_event(&format!("/w/f{i}.mds"))).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-
+    fn debounce_window_quiet_end_is_one_window_after_the_last_content_event() {
         let t0 = Instant::now();
-        let outcome = drain_bounded(
-            rx,
-            100,
-            Duration::from_secs(3),
-            "a burst of content events must not postpone the window forever",
+        let (closed_at, end, _) = replay(ms(100), t0, std::iter::empty());
+        assert_eq!(
+            (closed_at, end),
+            (t0 + ms(100), WindowEnd::Quiet),
+            "with no further event the window closes one window after it opened"
         );
-        let elapsed = t0.elapsed();
-        drop(keepalive);
-        sender.join().expect("sender thread panicked");
 
+        // 40 events, 5ms apart: a 195ms burst under a 100ms window.
+        let burst = (0..40u32).map(|i| (t0 + ms(5) * i, content_event(&format!("/w/f{i}.mds"))));
+        let (closed_at, end, closed) = replay(ms(100), t0, burst);
         assert_eq!(
-            outcome.end,
-            DebounceEnd::Quiet,
-            "a 200ms burst under a 100ms window must end quiet, not capped"
+            end,
+            WindowEnd::Quiet,
+            "a 195ms burst under a 100ms window must end quiet, not capped"
         );
         assert_eq!(
-            outcome.paths.len(),
+            closed_at,
+            t0 + ms(295),
+            "the window closes one window after the burst's last event (195ms)"
+        );
+        assert_eq!(
+            closed.classify(t0 + ms(294)),
+            None,
+            "one millisecond earlier the window is still open"
+        );
+        assert_eq!(
+            closed.paths.len(),
             40,
             "every path in the burst must be collected into the one window; got {:?}",
-            outcome.paths
-        );
-        assert!(
-            elapsed >= Duration::from_millis(240) && elapsed <= Duration::from_millis(900),
-            "the window must outlast the burst (>=200ms) and then close one window \
-             later (~100ms), so ~300ms; got {elapsed:?}"
+            closed.paths
         );
     }
 
-    /// The cap ends a stream that never goes quiet.
+    /// The cap ends a stream that never goes quiet, exactly `debounce_cap(window)`
+    /// after the window opened.
     ///
     /// Without it an extendable window is unbounded: a file written to continuously
     /// postpones its own rebuild — and the idle-tick backstop behind it — for as long
     /// as the writing lasts.
     #[test]
-    fn debounce_cap_ends_a_continuous_stream() {
-        let (tx, rx) = mpsc::channel::<Msg>();
-        // Events every 2ms for ~2s: never a 50ms gap, so the window never goes quiet.
-        let sender = std::thread::spawn(move || {
-            // Bounded: at most 1000 iterations regardless of timing.
-            for _ in 0..1000u32 {
-                if tx.send(modify_event("/w/hot.mds")).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        });
-
-        let t0 = Instant::now();
-        let outcome = drain_bounded(
-            rx,
-            50,
-            Duration::from_secs(3),
-            "an unbounded window never returns while writes continue",
-        );
-        let elapsed = t0.elapsed();
-        sender.join().expect("sender thread panicked");
-
-        assert_eq!(
-            outcome.end,
-            DebounceEnd::Cap,
-            "a continuous stream must end the window at the cap, not quiet"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(1600),
-            "cap for a 50ms window is max(500ms, 1s) = 1s; got {elapsed:?}"
-        );
+    fn debounce_window_cap_ends_an_endless_stream_exactly_at_start_plus_cap() {
+        // (window, one content event every .., cap): every gap is shorter than the
+        // window, so the window never goes quiet; the stream never ends.
+        let streams = [
+            (ms(50), ms(2), ms(1_000)),
+            (ms(10), ms(9), ms(1_000)),
+            (ms(250), ms(100), ms(2_500)),
+            (ms(1_000), ms(999), ms(10_000)),
+        ];
+        for (window, every, cap) in streams {
+            let t0 = Instant::now();
+            let endless = (1u32..).map(|i| (t0 + every * i, content_event("/w/hot.mds")));
+            let (closed_at, end, closed) = replay(window, t0, endless);
+            assert_eq!(
+                end,
+                WindowEnd::Cap,
+                "a {window:?} window under an event every {every:?} must end at the cap"
+            );
+            assert_eq!(
+                closed_at,
+                t0 + cap,
+                "a {window:?} window must close exactly at its cap, max(10 x window, 1s)"
+            );
+            assert_eq!(closed.paths.len(), 1, "every event names the same path");
+        }
     }
 
     /// `--debounce 0` opens no window and consumes nothing.
@@ -5972,18 +6119,12 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Msg>();
         tx.send(modify_event("/w/a.mds")).expect("send failed");
 
-        let t0 = Instant::now();
         let outcome = drain_debounce(&rx, 0);
-        let elapsed = t0.elapsed();
 
         assert_eq!(outcome.end, DebounceEnd::Disabled);
         assert!(
             outcome.paths.is_empty(),
             "a disabled window must collect nothing"
-        );
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "a disabled window must return immediately; got {elapsed:?}"
         );
         assert!(
             matches!(rx.try_recv(), Ok(Msg::Fs(Ok(_)))),
@@ -5992,33 +6133,26 @@ mod tests {
         );
     }
 
-    /// Ctrl+C ends the window at once, however long the window had left.
+    /// Ctrl+C ends the window when it is drained, however long the window had left:
+    /// a 5s window that waited itself out would end `Quiet`, not `Interrupted`.
     #[test]
     fn debounce_interrupt_returns_immediately() {
         let (tx, rx) = mpsc::channel::<Msg>();
-        let sender = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            let _ = tx.send(Msg::Interrupt);
-        });
+        tx.send(modify_event("/w/a.mds")).expect("send failed");
+        tx.send(Msg::Interrupt).expect("send failed");
 
-        let t0 = Instant::now();
-        let outcome = drain_bounded(
-            rx,
-            5_000,
-            Duration::from_secs(2),
-            "Ctrl+C must not wait out the window",
-        );
-        let elapsed = t0.elapsed();
-        sender.join().expect("sender thread panicked");
+        let outcome = drain_debounce(&rx, 5_000);
+        drop(tx);
 
         assert_eq!(outcome.end, DebounceEnd::Interrupted);
         assert!(
             outcome.interrupted(),
             "interrupted() must agree with the end reason"
         );
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "an interrupt must end a 5s window immediately; got {elapsed:?}"
+        assert_eq!(
+            outcome.paths.len(),
+            1,
+            "positive control: the window was open and draining when Ctrl+C arrived"
         );
     }
 
@@ -6027,86 +6161,74 @@ mod tests {
     /// The compile reads its own sources, so an extending `Access` event would let the
     /// watcher hold its own window open.
     #[test]
-    fn debounce_access_events_do_not_extend() {
-        let (tx, rx) = mpsc::channel::<Msg>();
-        // Outlive the read stream, so a window that DID extend ends on its own
-        // elapsed time rather than on the sender being dropped — the failure then
-        // names the property under test instead of the channel's lifetime.
-        let keepalive = tx.clone();
-        let sender = std::thread::spawn(move || {
-            if tx.send(modify_event("/w/a.mds")).is_err() {
-                return;
-            }
-            // Bounded: at most 60 iterations (~300ms) regardless of timing.
-            for _ in 0..60u32 {
-                if tx.send(access_event("/w/a.mds")).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-
+    fn debounce_window_reads_count_but_neither_extend_nor_collect() {
         let t0 = Instant::now();
-        let outcome = drain_bounded(
-            rx,
-            100,
-            Duration::from_secs(3),
-            "a stream of reads must not hold the window open",
-        );
-        let elapsed = t0.elapsed();
-        drop(keepalive);
-        sender.join().expect("sender thread panicked");
-
-        assert_eq!(outcome.end, DebounceEnd::Quiet);
+        // One content event, then 300ms of reads, one every 5ms.
+        let reads = std::iter::once((t0, content_event("/w/a.mds")))
+            .chain((1..=60u32).map(|i| (t0 + ms(5) * i, read_event("/w/a.mds"))));
+        let (closed_at, end, closed) = replay(ms(100), t0, reads);
         assert_eq!(
-            outcome.paths.len(),
+            (closed_at, end),
+            (t0 + ms(100), WindowEnd::Quiet),
+            "300ms of reads must not extend a 100ms window"
+        );
+        assert_eq!(
+            closed.paths.len(),
             1,
             "only the one content event contributes a path; got {:?}",
-            outcome.paths
+            closed.paths
         );
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "300ms of reads must not extend a 100ms window past ~100ms; got {elapsed:?}"
+        assert_eq!(
+            closed.messages, 20,
+            "the content event and the 19 reads drained before the deadline all count"
         );
+
+        // Positive control: content events at the same instants do extend.
+        let writes = (0..=60u32).map(|i| (t0 + ms(5) * i, content_event(&format!("/w/f{i}.mds"))));
+        let (closed_at, end, closed) = replay(ms(100), t0, writes);
+        assert_eq!((closed_at, end), (t0 + ms(400), WindowEnd::Quiet));
+        assert_eq!(closed.paths.len(), 61);
     }
 
-    /// One window drains a bounded number of messages.
+    /// One window drains a bounded number of messages, of every kind.
     ///
     /// The cap bounds the window's duration; this bounds its work and its memory. A
     /// sender faster than the drain would otherwise grow `paths` without limit inside
     /// a single window.
     #[test]
-    fn debounce_message_limit_bounds_one_window() {
-        let (tx, rx) = mpsc::channel::<Msg>();
-        // Pre-queued so the drain is never waiting on the sender.
-        for _ in 0..12_000u32 {
-            tx.send(modify_event("/w/same.mds")).expect("send failed");
-        }
-
+    fn debounce_window_closes_at_the_message_limit() {
         let t0 = Instant::now();
-        let outcome = drain_bounded(
-            rx,
-            100,
-            Duration::from_secs(5),
-            "an unbounded message count lets a fast sender own the window",
-        );
-        let elapsed = t0.elapsed();
-        drop(tx);
-
+        let mut open = DebounceWindow::open(ms(100), t0);
+        for _ in 2..MAX_DEBOUNCE_MESSAGES {
+            open.on_event(content_event("/w/same.mds"), t0);
+        }
+        open.on_event(read_event("/w/same.mds"), t0);
         assert_eq!(
-            outcome.end,
-            DebounceEnd::MessageLimit,
+            open.classify(t0),
+            None,
+            "one message short of the limit, the window is still open"
+        );
+        open.on_watch_error();
+        assert_eq!(
+            open.classify(t0),
+            Some(WindowEnd::MessageLimit),
+            "contents, reads and watch errors all count toward the limit"
+        );
+
+        // 12 000 events already queued when the window opens.
+        let queued = (0..12_000u32).map(|_| (t0, content_event("/w/same.mds")));
+        let (closed_at, end, closed) = replay(ms(100), t0, queued);
+        assert_eq!(
+            (closed_at, end),
+            (t0, WindowEnd::MessageLimit),
             "12 000 queued events must hit the message bound, not the quiet period"
         );
+        assert_eq!(closed.messages, MAX_DEBOUNCE_MESSAGES);
         assert_eq!(
-            outcome.paths.len(),
+            closed.paths.len(),
             1,
             "all 12 000 events name the same path; got {:?}",
-            outcome.paths
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "the bound must be reached promptly; got {elapsed:?}"
+            closed.paths
         );
     }
 
@@ -6123,21 +6245,60 @@ mod tests {
         tx.send(modify_event("/w/a.mds")).expect("send failed");
         drop(tx);
 
-        let t0 = Instant::now();
         let outcome = drain_debounce(&rx, 5_000);
-        let elapsed = t0.elapsed();
 
-        assert_eq!(outcome.end, DebounceEnd::Disconnected);
+        assert_eq!(
+            outcome.end,
+            DebounceEnd::Disconnected,
+            "a 5s window that waited itself out would end Quiet, not Disconnected"
+        );
         assert_eq!(
             outcome.paths.len(),
             1,
             "messages queued before the disconnect must still be collected; got {:?}",
             outcome.paths
         );
+    }
+
+    /// The one real-clock test: both drivers read `Instant::now()` and wait on a real
+    /// channel. Lower bounds only — a slow runner can make a wait longer, never shorter
+    /// — and the synthetic tests above pin every exact instant.
+    #[test]
+    fn debounce_and_tick_drivers_run_on_the_real_clock() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        tx.send(modify_event("/w/a.mds")).expect("send failed");
+
+        let t0 = Instant::now();
+        let outcome = drain_debounce(&rx, 20);
         assert!(
-            elapsed < Duration::from_millis(500),
-            "a disconnect must end a 5s window immediately; got {elapsed:?}"
+            t0.elapsed() >= ms(20),
+            "a 20ms window must wait at least 20ms; got {:?}",
+            t0.elapsed()
         );
+        // Quiet unless the runner stalled for the better part of the 1s cap between
+        // opening the window and draining the event.
+        assert!(
+            matches!(
+                outcome.end,
+                DebounceEnd::Closed(WindowEnd::Quiet | WindowEnd::Cap)
+            ),
+            "the window must close on its own; got {:?}",
+            outcome.end
+        );
+        assert_eq!(outcome.paths.len(), 1, "the queued event is drained");
+
+        let t1 = Instant::now();
+        let mut clock = TickClock::new(Some(ms(50)));
+        assert!(
+            matches!(clock.recv_next(&rx), Ok(None)),
+            "an idle channel must produce a tick"
+        );
+        assert!(
+            t1.elapsed() >= ms(50),
+            "the tick must not come due before its interval; got {:?}",
+            t1.elapsed()
+        );
+        drop(tx);
     }
 
     /// The clamp contract, verifiable without the watch loop.
