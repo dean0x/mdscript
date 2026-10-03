@@ -2099,6 +2099,85 @@ fn dir_build_stale_json_that_cannot_be_read_exits_2() {
     );
 }
 
+/// A stale JSON proven to be mds's whose removal fails is an error on Windows too: the
+/// run exits 2 (`mds::io`, `could not remove stale output …`) though every output was
+/// written, and the file is left (#157, #160). Control: once nothing holds it, the next
+/// build removes it, exit 0.
+///
+/// Windows-only — it runs in the Windows CI leg, never on a unix machine. There, a file
+/// held open by a handle that does not share deletion cannot be removed while it is
+/// held; a read-only file is no such case, since std removes one on Windows.
+#[cfg(windows)]
+#[test]
+fn dir_build_stale_json_that_cannot_be_removed_exits_2_on_windows() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_SHARE_READ`: another handle may read the file, never delete it.
+    const FILE_SHARE_READ: u32 = 0x1;
+    /// `ERROR_SHARING_VIOLATION`: what removing a file another handle denies that gives.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    put(root, "src/x.mds", MESSAGES);
+    let first = build_src_into_out(root, &[]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(read(root, "out/x.json").as_deref(), Some(MESSAGES_OUTPUT));
+
+    put(root, "src/x.mds", MARKDOWN);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(root.join("out").join("x.json"))
+        .unwrap();
+    let output = build_src_into_out(root, &[]);
+    drop(held);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    let squash = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect()
+    };
+    let error = format!(
+        "could not remove stale output {}: {}",
+        Path::new("out").join("x.json").display(),
+        std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION)
+    );
+    assert!(
+        stderr.contains("mds::io") && squash(&stderr).contains(&squash(&error)),
+        "{error:?} as mds::io; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(root, "out/x.md").as_deref(),
+        Some(MARKDOWN),
+        "the output itself is still written"
+    );
+    assert_eq!(
+        read(root, "out/x.json").as_deref(),
+        Some(MESSAGES_OUTPUT),
+        "the stale x.json is left"
+    );
+
+    let control = build_src_into_out(root, &[]);
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "control: stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert_eq!(
+        read(root, "out/x.json"),
+        None,
+        "control: the stale x.json is removed"
+    );
+}
+
 // ── #217: output-path invariants (flatten visibility, non-UTF-8 paths) ────────
 
 /// #217: `mds build` on a path that cannot be named in UTF-8 exits 2 and writes

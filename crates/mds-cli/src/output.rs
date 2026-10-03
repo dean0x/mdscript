@@ -2919,6 +2919,52 @@ mod tests {
         assert!(!stale.exists(), "control: the stale output is removed");
     }
 
+    /// #160, #157: the same on Windows — a stale output proven mds's whose removal fails is
+    /// an `mds::io` error naming it as shown, and the file is left. Control: once nothing
+    /// holds it, it is removed.
+    ///
+    /// Windows-only — it runs in the Windows CI leg, never on a unix machine. There, a file
+    /// held open by a handle that does not share deletion cannot be removed while it is
+    /// held; a read-only file is no such case, since std removes one on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn a_proven_stale_output_held_open_on_windows_is_an_io_error() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        /// `FILE_SHARE_READ`: another handle may read the file, never delete it.
+        const FILE_SHARE_READ: u32 = 0x1;
+        /// `ERROR_SHARING_VIOLATION`: what removing a file another handle denies that gives.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir(&anchor).unwrap();
+        let stale = anchor.join("x.json");
+        std::fs::write(&stale, HI).unwrap();
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("x.md"));
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&stale)
+            .unwrap();
+        let result = probe_and_remove_stale(&written, OutputKind::Markdown, true);
+        drop(held);
+
+        match result {
+            Err(mds::MdsError::Io { message }) => assert_eq!(
+                message,
+                format!(
+                    "could not remove stale output {}: {}",
+                    Path::new("out").join("x.json").display(),
+                    std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION)
+                )
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&stale).ok().as_deref(), Some(HI));
+        assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
+        assert!(!stale.exists(), "control: the stale output is removed");
+    }
+
     /// #390: a root walked in another form than it was typed in — `mds watch` walks the
     /// canonical directory — names an output next to its source, and the stem of a
     /// deleted source's output, below the directory as typed, while both are written and
