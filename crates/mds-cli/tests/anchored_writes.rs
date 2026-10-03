@@ -627,6 +627,186 @@ fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
     assert_refused_after_the_swap(dir.path(), code, &stderr, &files);
 }
 
+// ── A rewrite writes only over the bytes it read ────────────────────────────
+
+/// The debug build's pause between a rewrite's read and its replace: the file it names
+/// ends the pause, and the same name with `.paused` appended says the run has stopped.
+#[cfg(unix)]
+const PAUSE: &str = "MDS_TEST_PAUSE_BEFORE_REPLACE";
+
+/// A source a rewrite changes, as written and as rewritten.
+#[cfg(unix)]
+struct Source {
+    written: &'static str,
+    rewritten: &'static str,
+}
+
+/// What `mds fmt` rewrites, and how.
+#[cfg(unix)]
+const UNFORMATTED: Source = Source {
+    written: "Alpha\r\n",
+    rewritten: "Alpha\n",
+};
+
+/// What `mds lint --fix` rewrites, and how.
+#[cfg(unix)]
+const UNFIXED: Source = Source {
+    written: "@if \"x\" == \"y\":\nhidden\n@end\nAlpha\n",
+    rewritten: "Alpha\n",
+};
+
+/// Each rewrite of `src/a.mds`: `mds fmt` and `mds lint --fix`, given the file and given
+/// its directory.
+#[cfg(unix)]
+const REWRITES: [(&[&str], &Source); 4] = [
+    (&["fmt", "src/a.mds"], &UNFORMATTED),
+    (&["fmt", "src"], &UNFORMATTED),
+    (&["lint", "--fix", "src/a.mds"], &UNFIXED),
+    (&["lint", "--fix", "src"], &UNFIXED),
+];
+
+/// Run `mds <args>` in `root`, paused between its rewrite's read and its replace: once it
+/// has read the file and stopped, `meanwhile` runs, then the run goes on. Returns the
+/// exit code and stderr.
+#[cfg(unix)]
+fn rewrite_paused(root: &Path, args: &[&str], meanwhile: impl FnOnce()) -> (Option<i32>, String) {
+    let go = root.join("go");
+    let paused = root.join("go.paused");
+    for signal in [&go, &paused] {
+        if signal.exists() {
+            std::fs::remove_file(signal).expect("clear the last run's pause");
+        }
+    }
+    let child = mds_bin()
+        .current_dir(root)
+        .args(args)
+        .env(PAUSE, &go)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mds");
+    let mut child = common::ChildGuard(child);
+    let tap = common::tap_reader(child.0.stderr.take().expect("the run's stderr"));
+
+    // Bounded by TIMEOUT.
+    let deadline = Instant::now() + TIMEOUT;
+    while !paused.exists() {
+        if let Some(status) = child.0.try_wait().expect("poll the run") {
+            panic!(
+                "setup: {args:?} ended ({status}) before its rewrite paused; stderr: {}",
+                tap.text()
+            );
+        }
+        assert!(Instant::now() < deadline, "setup: {args:?} did not pause");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    meanwhile();
+    std::fs::write(&go, "").expect("let the run go on");
+
+    // Bounded by TIMEOUT.
+    let deadline = Instant::now() + TIMEOUT;
+    let code = loop {
+        if let Some(status) = child.0.try_wait().expect("poll the run") {
+            break status.code();
+        }
+        assert!(Instant::now() < deadline, "{args:?} did not end");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    (code, tap.finish_text(&mut child))
+}
+
+/// The refusal of a rewrite whose file changed after it was read, the file as typed.
+#[cfg(unix)]
+fn changed(file: &str) -> String {
+    format!(
+        "\"{}\" changed since it was read; not written",
+        native(file)
+    )
+}
+
+/// A file edited between a rewrite's read and its replace is not overwritten: `mds fmt`
+/// and `mds lint --fix`, given the file or its directory, refuse (`mds::io`, exit 2),
+/// the edit survives, and no temporary file is left (#160). Control: with no edit in
+/// that window, the same run rewrites the file.
+#[cfg(unix)]
+#[test]
+fn a_rewrite_refuses_a_file_edited_after_it_was_read() {
+    const EDIT: &str = "Edited by hand while the rewrite ran\n";
+    for (args, source) in REWRITES {
+        let dir = scratch();
+        let root = dir.path();
+        let file = put(root, "src/a.mds", source.written);
+
+        let (code, stderr) = rewrite_paused(root, args, || {
+            std::fs::write(&file, EDIT).expect("edit the file");
+        });
+        assert_eq!(
+            read(&file),
+            EDIT,
+            "{args:?}: the edit survives; stderr: {stderr}"
+        );
+        assert_eq!(code, Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("mds::io") && squash(&stderr).contains(&squash(&changed("src/a.mds"))),
+            "{args:?}: the refusal names the file as typed; stderr: {stderr}"
+        );
+        assert_eq!(
+            entries(&root.join("src")),
+            ["a.mds"],
+            "{args:?}: no temporary file is left"
+        );
+
+        std::fs::write(&file, source.written).unwrap();
+        let (code, stderr) = rewrite_paused(root, args, || {});
+        assert_eq!(code, Some(0), "{args:?}: control; stderr: {stderr}");
+        assert_eq!(
+            read(&file),
+            source.rewritten,
+            "{args:?}: control rewrites it"
+        );
+    }
+}
+
+/// A directory swapped between a rewrite's read and its replace never makes the rewrite
+/// write the file it read over another (#160): with `src` moved away and `other` put in
+/// its place — as a directory, or as a symlink to it — `other/a.mds` is left as it was,
+/// and the file read, in the directory it was read in, is the one rewritten (control).
+#[cfg(unix)]
+#[test]
+fn a_rewrite_never_writes_over_a_file_it_did_not_read() {
+    const OTHER: &str = "Bravo, another file of the same name\n";
+    for link in [false, true] {
+        for (args, source) in REWRITES {
+            let dir = scratch();
+            let root = dir.path();
+            put(root, "src/a.mds", source.written);
+            put(root, "other/a.mds", OTHER);
+
+            let (code, stderr) = rewrite_paused(root, args, || {
+                std::fs::rename(root.join("src"), root.join("src.moved")).unwrap();
+                if link {
+                    std::os::unix::fs::symlink("other", root.join("src")).unwrap();
+                } else {
+                    std::fs::rename(root.join("other"), root.join("src")).unwrap();
+                }
+            });
+            let other = if link { "other/a.mds" } else { "src/a.mds" };
+            assert_eq!(
+                read(&root.join(other)),
+                OTHER,
+                "{args:?}, link {link}: the other file is not written; stderr: {stderr}"
+            );
+            assert_eq!(
+                read(&root.join("src.moved/a.mds")),
+                source.rewritten,
+                "{args:?}, link {link}: the file read is rewritten; stderr: {stderr}"
+            );
+            assert_eq!(code, Some(0), "{args:?}, link {link}: stderr: {stderr}");
+        }
+    }
+}
+
 // ── Windows ──────────────────────────────────────────────────────────────────
 
 /// Windows: a directory symlink, and a junction, below `--out-dir` are refused as the

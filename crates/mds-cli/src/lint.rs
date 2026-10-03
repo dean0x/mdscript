@@ -83,7 +83,7 @@ use crate::output::{
     catch_compile, collect_mds_files_detailed, eprint_warning, render_unified_diff, safe_inline,
     safe_path, Panicked, RootPaths, WriteTarget, STDIN_DISPLAY_LABEL,
 };
-use crate::write::{atomic_write_file, Durability, Parents};
+use crate::write::{read_stamped, replace_if_unchanged, Durability};
 
 // AC-224-15: No local rule-name list. The single source of truth is
 // mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
@@ -1265,12 +1265,10 @@ fn apply_fix(
         findings: residual,
         fixed: new_source,
     };
-    let fix = match atomic_write_file(
-        target,
-        &residual.fixed,
-        Durability::Fsync,
-        Parents::Existing,
-    ) {
+    // Only over the bytes the fix was made from, in the directory they were read in (#160).
+    let fix = match read_stamped(target, &text)
+        .and_then(|read| replace_if_unchanged(read, &residual.fixed, Durability::Fsync))
+    {
         Ok(()) => Rewrite::Written { residual, partial },
         Err(error) => {
             // A JSON output records each input once — a directory's entry, a file

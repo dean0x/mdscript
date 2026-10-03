@@ -1,5 +1,6 @@
 //! Write-funnel guard (#227, #160): every artifact `mds` writes from production code must
-//! go through the single atomic choke point `crate::write::atomic_write_file`.
+//! go through the single atomic choke point in `crate::write` — `atomic_write_file`, or,
+//! for a rewrite of a file just read, `replace_if_unchanged`, which shares its tail.
 //!
 //! # Why this exists
 //!
@@ -107,10 +108,12 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "write.rs",
         "openat(",
-        5,
+        6,
         "the primitive's unix walk: the anchor (opened, then again once created), each \
          directory below it without following a symlink (opened, then again once \
-         created), and the temporary file, created new without following one (#160)",
+         created), the temporary file, created new without following one, and the file \
+         a rewrite reads again before it replaces it, opened read-only without following \
+         one (#160)",
     ),
     (
         "write.rs",

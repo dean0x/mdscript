@@ -35,7 +35,7 @@ use crate::output::{
     catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path, stdout_failure,
     write_stdout, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
-use crate::write::{atomic_write_file, Durability, Parents};
+use crate::write::{read_stamped, replace_if_unchanged, Durability};
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -169,16 +169,13 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let read_only = check || diff;
     if !read_only {
         if result.changed {
-            // Atomic write preserves file permissions and avoids truncate-then-write
-            // data loss on crash or full disk (avoids the issue fixed for lint by
-            // commit c5aa086 — both write paths now share the same helper). A file
-            // argument is anchored at its typed parent (#160).
-            atomic_write_file(
-                &WriteTarget::as_typed(path.to_path_buf()),
-                &result.formatted,
-                Durability::Fsync,
-                Parents::Existing,
-            )?;
+            // Replace-by-rename preserves file permissions and avoids truncate-then-write
+            // data loss on crash or full disk — the same helpers as lint --fix. A file
+            // argument is anchored at its typed parent, read again there and replaced only
+            // if it still holds the bytes formatted, in the directory it was read in
+            // (#160).
+            let read = read_stamped(&WriteTarget::as_typed(path.to_path_buf()), &source)?;
+            replace_if_unchanged(read, &result.formatted, Durability::Fsync)?;
             if !quiet {
                 crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
             }
@@ -290,15 +287,13 @@ fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
     } else if !result.changed {
         FileOutcome::Unchanged
     } else {
-        // Atomic write preserves file permissions and avoids truncate-then-write
-        // data loss on crash or full disk — same guarantee as lint --fix (avoids
-        // the divergence introduced after commit c5aa086 hardened the lint path).
-        match atomic_write_file(
-            &WriteTarget::walked_below(RootPaths::as_typed(root), file),
-            &result.formatted,
-            Durability::Fsync,
-            Parents::Existing,
-        ) {
+        // Replace-by-rename preserves file permissions and avoids truncate-then-write
+        // data loss on crash or full disk — the same helpers as lint --fix — and writes
+        // only over the bytes formatted, in the directory they were read in (#160).
+        let target = WriteTarget::walked_below(RootPaths::as_typed(root), file);
+        match read_stamped(&target, &source)
+            .and_then(|read| replace_if_unchanged(read, &result.formatted, Durability::Fsync))
+        {
             Ok(()) => {
                 if !quiet {
                     crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(file));

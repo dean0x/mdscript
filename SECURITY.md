@@ -118,6 +118,19 @@ input. The compiler enforces several defense-in-depth controls:
   a relative path (an absolute one is refused before anything is written), and its own
   directories lie below the anchor, so a symlink committed there, such as
   `dist -> ~/elsewhere`, is refused rather than followed.
+  `mds fmt` and `mds lint --fix` write only over the bytes they read (#160): before a
+  rewrite the file is read again below its anchor, without following a symlink, and
+  must hold the bytes formatted or fixed; on Unix the directory it is in stays open and
+  the rewrite is renamed into that directory, whatever its path leads to by then, so a
+  directory swapped after the read never receives another file's content. Just before
+  the rename the file is looked at again in that directory and compared with a stamp
+  taken when it was read — device and inode, size, and modification and status-change
+  times — and a file edited in between is left as edited and the rewrite refused
+  (`mds::io`, `"<path>" changed since it was read; not written`). Residuals: an edit
+  that lands between that comparison and the rename is replaced; on a filesystem whose
+  clock is coarser than the time between two writes (one-second timestamps, say), an
+  edit that keeps the file's size within the same tick is not seen; and on Windows the
+  second read, the comparison and the rename all go by path.
   **Windows residual**: the standard library has no descriptor-relative walk on
   Windows. Each directory below the anchor is checked and refused when it is a
   symlink or a junction, and the write then goes by path, so a directory that another

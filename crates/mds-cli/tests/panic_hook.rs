@@ -1669,6 +1669,68 @@ fn the_trigger_is_compiled_only_into_debug_builds() {
     );
 }
 
+/// The pause between a rewrite's read and its replace (#160) compiles only into a debug
+/// build, as the panic trigger does: every mention of `MDS_TEST_PAUSE_BEFORE_REPLACE` sits
+/// inside `mod pause_trigger`, whose attributes hold `#[cfg(debug_assertions)]`, and
+/// `pause_before_replace` has a release build's stub that does nothing.
+///
+/// Controls: the module without its `cfg`, a mention outside it, a release stub that does
+/// something, and no release stub are each reported.
+#[test]
+fn the_pause_before_a_replace_is_compiled_only_into_debug_builds() {
+    let write = read_source("src/write.rs");
+    let sources = crate_sources();
+    let found = gate_findings(&sources, &PAUSE_TRIGGER);
+    assert!(
+        found.is_empty(),
+        "the pause before a replace must be compiled only into debug builds:\n{}",
+        found.join("\n")
+    );
+
+    let with = |from: &str, to: &str| -> Vec<(String, String)> {
+        let planted = write.replacen(from, to, 1);
+        assert_ne!(planted, write, "precondition: write.rs holds {from:?}");
+        sources
+            .iter()
+            .map(|(name, src)| {
+                let src = if name == "write.rs" { &planted } else { src };
+                (name.clone(), src.clone())
+            })
+            .collect()
+    };
+    let stub = "pub(crate) fn pause_before_replace() {}";
+    for (planted, what) in [
+        (
+            with(
+                "#[cfg(debug_assertions)]\nmod pause_trigger",
+                "mod pause_trigger",
+            ),
+            "a pause module without `#[cfg(debug_assertions)]`",
+        ),
+        (
+            with(
+                stub,
+                "pub(crate) fn pause_before_replace() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_PAUSE_BEFORE_REPLACE\");\n}",
+            ),
+            "the pause's variable outside its module",
+        ),
+        (
+            with(
+                stub,
+                "pub(crate) fn pause_before_replace() {\n    let _ = 1;\n}",
+            ),
+            "a release stub that does something",
+        ),
+        (with(stub, ""), "a pause without a release stub"),
+    ] {
+        assert!(
+            !gate_findings(&planted, &PAUSE_TRIGGER).is_empty(),
+            "{what} must be reported"
+        );
+    }
+}
+
 /// A panic in one file's compile fails that file alone (#389), so each per-file catch — a
 /// `catch_compile` call — wraps that compile and nothing else: its closure is
 /// `AssertUnwindSafe(|| <one call>)`, the call is one of [`COMPILE_CALLS`] as written
@@ -2564,40 +2626,75 @@ fn hook_findings(output: &str) -> Vec<String> {
 /// What is wrong with the trigger's gating across `sources`; empty when nothing is (see
 /// [`the_trigger_is_compiled_only_into_debug_builds`]).
 fn trigger_findings(sources: &[(String, String)]) -> Vec<String> {
+    gate_findings(sources, &PANIC_TRIGGER)
+}
+
+/// A hook that only a debug build may hold: the module it lives in, the words that may
+/// appear only inside that module — each looked for with string literals kept (`true`) or
+/// blanked (`false`) — and its functions, each with a release build's stub that does
+/// nothing.
+struct DebugGate {
+    module: &'static str,
+    needles: &'static [(&'static str, bool)],
+    fns: &'static [&'static str],
+}
+
+/// The panic trigger (#389): `MDS_TEST_PANIC` and `panic_any`, in `mod panic_trigger`.
+const PANIC_TRIGGER: DebugGate = DebugGate {
+    module: "panic_trigger",
+    needles: &[("MDS_TEST_PANIC", true), ("panic_any", false)],
+    fns: TRIGGER_FNS,
+};
+
+/// The pause between a rewrite's read and its replace (#160):
+/// `MDS_TEST_PAUSE_BEFORE_REPLACE`, in `mod pause_trigger`.
+const PAUSE_TRIGGER: DebugGate = DebugGate {
+    module: "pause_trigger",
+    needles: &[("MDS_TEST_PAUSE_BEFORE_REPLACE", true)],
+    fns: &["pause_before_replace"],
+};
+
+/// What is wrong with `gate`'s gating across `sources`; empty when nothing is: its module
+/// is one, under `#[cfg(debug_assertions)]`; its words appear in it alone; and each of its
+/// functions is defined there once and once outside it as an empty stub under
+/// `#[cfg(not(debug_assertions))]`.
+fn gate_findings(sources: &[(String, String)], gate: &DebugGate) -> Vec<String> {
+    let module_item = format!("mod {}", gate.module);
     let mut found = Vec::new();
     let mut modules = 0usize;
-    let mut defined = vec![0usize; TRIGGER_FNS.len()];
-    let mut stubs = vec![0usize; TRIGGER_FNS.len()];
+    let mut defined = vec![0usize; gate.fns.len()];
+    let mut stubs = vec![0usize; gate.fns.len()];
     for (name, src) in sources {
         let code = blank(src, true);
         let with_literals = blank(src, false);
-        let module = mod_body(&code, "panic_trigger");
+        let module = mod_body(&code, gate.module);
         if let Some(module) = &module {
             modules += 1;
             let item = with_literals[..*module.start()]
-                .rfind("mod panic_trigger")
+                .rfind(&module_item)
                 .unwrap_or(0);
             if !attributes_above(&with_literals, item).contains(&"#[cfg(debug_assertions)]") {
                 found.push(format!(
-                    "{name}: `mod panic_trigger` is not under `#[cfg(debug_assertions)]`"
+                    "{name}: `{module_item}` is not under `#[cfg(debug_assertions)]`"
                 ));
             }
         }
         let inside = |at: usize| module.as_ref().is_some_and(|m| m.contains(&at));
-        for (needle, view) in [("MDS_TEST_PANIC", &with_literals), ("panic_any", &code)] {
+        for &(needle, literals) in gate.needles {
+            let view = if literals { &with_literals } else { &code };
             for (at, _) in view.match_indices(needle) {
                 if !inside(at) {
                     found.push(format!(
-                        "{name}:{}: `{needle}` outside `mod panic_trigger`",
+                        "{name}:{}: `{needle}` outside `{module_item}`",
                         line_of(&code, at)
                     ));
                 }
             }
         }
-        // Each trigger function: defined in the module, and a release build's stub outside
-        // it, under `#[cfg(not(debug_assertions))]`, with an empty body.
+        // Each function: defined in the module, and a release build's stub outside it,
+        // under `#[cfg(not(debug_assertions))]`, with an empty body.
         for (fn_name, body) in fn_bodies(&code) {
-            let Some(index) = TRIGGER_FNS.iter().position(|f| *f == fn_name) else {
+            let Some(index) = gate.fns.iter().position(|f| *f == fn_name) else {
                 continue;
             };
             if inside(*body.start()) {
@@ -2627,13 +2724,13 @@ fn trigger_findings(sources: &[(String, String)]) -> Vec<String> {
     }
     if modules != 1 {
         found.push(format!(
-            "the crate must hold exactly one `mod panic_trigger`; it holds {modules}"
+            "the crate must hold exactly one `{module_item}`; it holds {modules}"
         ));
     }
-    for ((fn_name, defined), stubs) in TRIGGER_FNS.iter().zip(defined).zip(stubs) {
+    for ((fn_name, defined), stubs) in gate.fns.iter().zip(defined).zip(stubs) {
         if defined != 1 || stubs != 1 {
             found.push(format!(
-                "`{fn_name}` must be defined once in `mod panic_trigger` and once as a \
+                "`{fn_name}` must be defined once in `{module_item}` and once as a \
                  release build's stub; it is defined {defined} and {stubs} times"
             ));
         }

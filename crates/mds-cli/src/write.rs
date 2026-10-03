@@ -1,7 +1,7 @@
-//! The one write primitive: every file `mds` writes goes through [`atomic_write_file`] —
-//! `mds build` and `mds watch` outputs and `.map` sidecars, `mds fmt` and `mds lint
-//! --fix` rewrites, and `mds init`'s starter (#227, #160). `tests/write_funnel.rs` keeps
-//! it the only one.
+//! The one write primitive: every file `mds` writes goes through it —
+//! [`atomic_write_file`] for `mds build` and `mds watch` outputs and `.map` sidecars and
+//! `mds init`'s starter, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix`
+//! rewrites (#227, #160). `tests/write_funnel.rs` keeps it the only one.
 //!
 //! # Replace by rename
 //!
@@ -45,6 +45,14 @@
 //! anchor `mds watch` checked is compared by path too, just before the walk. A
 //! directory swapped for a link between those checks and the write is followed: the
 //! residual SECURITY.md and spec §7.2 document.
+//!
+//! # Rewrites over the bytes read (#160)
+//!
+//! `mds fmt` and `mds lint --fix` rewrite a file they have read. [`read_stamped`] reads it
+//! again below its anchor and holds the directory it is in — on unix its descriptor — with
+//! a stamp of the file; [`replace_if_unchanged`] renames the rewrite into that directory
+//! only while the file there is still the one read, so an edit made after the read is not
+//! overwritten and a directory swapped after it never receives the rewrite.
 //!
 //! # Contract (#226)
 //!
@@ -162,18 +170,84 @@ pub(crate) fn atomic_write_file(
 ) -> std::result::Result<(), mds::MdsError> {
     let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
     let anchor = target.checked_anchor();
-    imp::write(&below, anchor, content.as_bytes(), durability, parents).map_err(|failure| {
-        match failure {
-            Failure::AnchorMoved => out_dir_moved(target),
-            Failure::LinkBelowAnchor { depth } => {
-                io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
-            }
-            Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
-            #[cfg(unix)]
-            Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
-            Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
-        }
+    imp::write(&below, anchor, content.as_bytes(), durability, parents)
+        .map_err(|failure| worded(target, failure))
+}
+
+/// A file `mds fmt` or `mds lint --fix` is about to rewrite, read again by
+/// [`read_stamped`] and held for [`replace_if_unchanged`] (#160): the directory it was
+/// read in, still open on unix, its name there, and a stamp of the file as it was read.
+pub(crate) struct ReadForRewrite {
+    target: WriteTarget,
+    held: imp::Held,
+}
+
+/// Read `target` again for its rewrite, below its anchor and through no symlink there or
+/// at the file, and hold it if its bytes are `read` — the text the rewrite was made from,
+/// which the caller read by path, with every check a source read makes (#160).
+///
+/// What is held is the directory the file was read in — its descriptor, on unix — and a
+/// stamp of the file: on unix its device, inode, size and modification and status-change
+/// times; on Windows, which has no descriptor-relative walk in std, its size and its
+/// modification and creation times, by path. [`replace_if_unchanged`] writes into that
+/// directory, whatever its path leads to by then, and only over that file.
+///
+/// # Errors
+///
+/// `mds::io`, worded as [`atomic_write_file`] words a failure — a symlink below the
+/// anchor or at the file is refused as it refuses one — and, for a file whose bytes are
+/// not `read` any more, or that is gone, `"<file>" changed since it was read; not
+/// written`, the file named by `target.shown`.
+pub(crate) fn read_stamped(
+    target: &WriteTarget,
+    read: &str,
+) -> std::result::Result<ReadForRewrite, mds::MdsError> {
+    let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
+    let held = imp::read_stamped(&below, read.as_bytes()).map_err(|f| worded(target, f))?;
+    Ok(ReadForRewrite {
+        target: target.clone(),
+        held,
     })
+}
+
+/// Replace the file `read` holds with `content`, by way of a temporary file in the
+/// directory it was read in, unless it has changed since it was read (#160): just before
+/// the rename the file is looked at again in that directory, and a stamp that differs
+/// refuses the rewrite, leaving the file — the edit made to it — as it is, and no
+/// temporary file.
+///
+/// # Errors
+///
+/// `mds::io`: `"<file>" changed since it was read; not written` for a file that changed,
+/// else as [`atomic_write_file`] words a failure.
+pub(crate) fn replace_if_unchanged(
+    read: ReadForRewrite,
+    content: &str,
+    durability: Durability,
+) -> std::result::Result<(), mds::MdsError> {
+    pause_before_replace();
+    let ReadForRewrite { target, held } = read;
+    imp::replace_held(held, content.as_bytes(), durability).map_err(|f| worded(&target, f))
+}
+
+/// `failure`, a write of `target` that did not land, as the `mds::io` error it reports.
+fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
+    match failure {
+        Failure::AnchorMoved => out_dir_moved(target),
+        Failure::Changed => mds::MdsError::Io {
+            message: format!(
+                "\"{}\" changed since it was read; not written",
+                safe_path(&target.shown)
+            ),
+        },
+        Failure::LinkBelowAnchor { depth } => {
+            io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
+        }
+        Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
+        #[cfg(unix)]
+        Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
+        Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
+    }
 }
 
 /// Why [`atomic_write_file`] refuses to replace a symlink at its target.
@@ -224,6 +298,9 @@ fn shown_directory(target: &WriteTarget, depth: usize) -> PathBuf {
 enum Failure {
     /// The anchor opened is not the directory the caller checked.
     AnchorMoved,
+    /// The file a rewrite read is not as it was read: its bytes, or its stamp, differ, or
+    /// it is gone.
+    Changed,
     /// The directory `depth` levels below the anchor is a symlink.
     LinkBelowAnchor { depth: usize },
     /// The target itself is a symlink.
@@ -357,6 +434,13 @@ mod unix {
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
 
+    /// A file a rewrite reads again: never through a symlink, and never waiting on a FIFO
+    /// put in its place, which the read then refuses as no longer the file read.
+    const READ: OFlags = OFlags::RDONLY
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::NONBLOCK)
+        .union(OFlags::CLOEXEC);
+
     /// The mode a new file asks for: `0666`, which the umask then narrows, as for
     /// `std::fs::write`.
     const NEW_FILE: Mode = Mode::from_raw_mode(0o666);
@@ -368,9 +452,8 @@ mod unix {
     /// clash is another writer's file or a leftover, and sixteen in a row is not chance.
     pub(super) const MAX_TEMP_ATTEMPTS: usize = 16;
 
-    /// Write `content` to `below.name`: open the anchor by path — and, when `anchor` names
-    /// the directory it must be, refuse another — then each directory below it from the
-    /// one above without following a symlink, and replace the file in the last.
+    /// Write `content` to `below.name`, replacing the file in the directory [`walk`]
+    /// opens.
     pub(super) fn write(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
@@ -378,6 +461,18 @@ mod unix {
         durability: Durability,
         parents: Parents,
     ) -> Result<(), Failure> {
+        let dir = walk(below, anchor, parents)?;
+        replace(dir, below.name, content, durability, None)
+    }
+
+    /// Open the directory `below.name` is in: the anchor by path — and, when `anchor`
+    /// names the directory it must be, refuse another — then each directory below it from
+    /// the one above without following a symlink.
+    fn walk(
+        below: &Below<'_>,
+        anchor: Option<DirIdentity>,
+        parents: Parents,
+    ) -> Result<OwnedFd, Failure> {
         let mut dir = open_anchor(&below.anchor, parents)?;
         if let Some(checked) = anchor {
             dir = opened_as_checked(dir, checked)?;
@@ -387,7 +482,86 @@ mod unix {
                 .map_err(|errno| below_failure(dir.as_fd(), name, depth, errno))?;
             dir = next;
         }
-        replace(dir, below.name, content, durability)
+        Ok(dir)
+    }
+
+    /// A file as a rewrite read it (#160): its device and inode, its size, and the times
+    /// it was last modified and last changed, each to the nanosecond where the filesystem
+    /// keeps one. Writing to the file, renaming another over it, or changing its mode
+    /// changes at least one of them — within the resolution of the filesystem's clock.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        device: i128,
+        inode: i128,
+        size: i128,
+        modified: (i128, i128),
+        changed: (i128, i128),
+    }
+
+    impl Stamp {
+        /// The stamp `stat` gives. Every field widens without loss, whatever integer type
+        /// the platform gives it.
+        fn of(stat: &fs::Stat) -> Self {
+            Self {
+                device: i128::from(stat.st_dev),
+                inode: i128::from(stat.st_ino),
+                size: i128::from(stat.st_size),
+                modified: (i128::from(stat.st_mtime), i128::from(stat.st_mtime_nsec)),
+                changed: (i128::from(stat.st_ctime), i128::from(stat.st_ctime_nsec)),
+            }
+        }
+
+        /// Whether `name` in `dir`, looked at without following a symlink, is still the
+        /// file this stamp was taken of, unchanged.
+        fn holds(&self, dir: BorrowedFd<'_>, name: &OsStr) -> bool {
+            fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|stat| Self::of(&stat) == *self)
+        }
+    }
+
+    /// A file a rewrite read, held for its replace: the directory it was read in, still
+    /// open, its name there, and its stamp.
+    pub(super) struct Held {
+        dir: OwnedFd,
+        name: OsString,
+        stamp: Stamp,
+    }
+
+    /// Read `below.name` again in the directory [`walk`] opens, without following a
+    /// symlink, and hold it if its bytes are `read`: the stamp is taken of the file opened,
+    /// before its bytes are read, so a change made while they are read changes it too.
+    pub(super) fn read_stamped(below: &Below<'_>, read: &[u8]) -> Result<Held, Failure> {
+        let dir = walk(below, None, Parents::Existing)?;
+        let mut file = match fs::openat(&dir, below.name, READ, Mode::empty()) {
+            Ok(fd) => File::from(fd),
+            Err(Errno::LOOP) => return Err(Failure::LinkAtTarget),
+            Err(Errno::NOENT) => return Err(Failure::Changed),
+            Err(e) => return Err(e.into()),
+        };
+        let stat = fs::fstat(&file)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(Failure::Changed);
+        }
+        // One byte more than was read tells a file that grew from one that did not.
+        let expected = u64::try_from(read.len()).unwrap_or(u64::MAX);
+        if mds::read_at_most(&mut file, expected.saturating_add(1), expected)? != read {
+            return Err(Failure::Changed);
+        }
+        Ok(Held {
+            dir,
+            name: below.name.to_owned(),
+            stamp: Stamp::of(&stat),
+        })
+    }
+
+    /// Replace the file `held` was read from with `content`, in the directory it was read
+    /// in, unless its stamp has changed by the time of the rename.
+    pub(super) fn replace_held(
+        held: Held,
+        content: &[u8],
+        durability: Durability,
+    ) -> Result<(), Failure> {
+        replace(held.dir, &held.name, content, durability, Some(&held.stamp))
     }
 
     /// Open the anchor by path, creating it first when it is missing and `parents` says so.
@@ -465,12 +639,15 @@ mod unix {
             .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink)
     }
 
-    /// Replace `name` in `dir` with `content`, by way of a temporary file beside it.
+    /// Replace `name` in `dir` with `content`, by way of a temporary file beside it — when
+    /// `unchanged` stamps the file a rewrite read, only if the file there still holds it,
+    /// looked at just before the rename.
     fn replace(
         dir: OwnedFd,
         name: &OsStr,
         content: &[u8],
         durability: Durability,
+        unchanged: Option<&Stamp>,
     ) -> Result<(), Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
         let existing = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -500,6 +677,10 @@ mod unix {
             file.sync_all()?;
         }
         drop(file);
+        if unchanged.is_some_and(|stamp| !stamp.holds(dir.as_fd(), name)) {
+            // The temporary file is unlinked again as `temp` drops.
+            return Err(Failure::Changed);
+        }
         fs::renameat(dir.as_fd(), &temp.name, dir.as_fd(), name)?;
         temp.renamed = true;
         drop(temp);
@@ -611,7 +792,8 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use std::io::Write as _;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
 
     use super::{Below, DirIdentity, Durability, Failure, Parents, TEMP_PREFIX, TEMP_SUFFIX};
 
@@ -619,10 +801,8 @@ mod windows {
     /// words.
     const PATH_NOT_FOUND: i32 = 3;
 
-    /// Write `content` to `below.name`: refuse an anchor that is not the directory
-    /// `anchor` names, when it names one, and a symlink or a junction at any directory
-    /// below the anchor, then replace the file by path (the residual the module docs
-    /// describe: each is looked at by path, before the write).
+    /// Write `content` to `below.name`, in the directory [`walk`] checks, by path (the
+    /// residual the module docs describe), refusing a symlink at the target.
     pub(super) fn write(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
@@ -630,6 +810,129 @@ mod windows {
         durability: Durability,
         parents: Parents,
     ) -> Result<(), Failure> {
+        let dir = walk(below, anchor, parents)?;
+        let target = dir.join(below.name);
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        replace(&dir, &target, content, durability, None)
+    }
+
+    /// A file as a rewrite read it, by path (#160): its size and the times it was last
+    /// modified and created.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        size: u64,
+        modified: Option<SystemTime>,
+        created: Option<SystemTime>,
+    }
+
+    impl Stamp {
+        /// The stamp `meta` gives.
+        fn of(meta: &std::fs::Metadata) -> Self {
+            Self {
+                size: meta.len(),
+                modified: meta.modified().ok(),
+                created: meta.created().ok(),
+            }
+        }
+
+        /// Whether `file`, looked at by path without following a symlink, is still the
+        /// regular file this stamp was taken of, unchanged.
+        fn holds(&self, file: &Path) -> bool {
+            std::fs::symlink_metadata(file)
+                .is_ok_and(|meta| meta.is_file() && Self::of(&meta) == *self)
+        }
+    }
+
+    /// A file a rewrite read, held for its replace, by path: the directory it was read in,
+    /// the file, and its stamp.
+    pub(super) struct Held {
+        dir: PathBuf,
+        file: PathBuf,
+        stamp: Stamp,
+    }
+
+    /// Read `below.name` again in the directory [`walk`] checks, by path, refusing a
+    /// symlink there, and hold it if its bytes are `read`.
+    pub(super) fn read_stamped(below: &Below<'_>, read: &[u8]) -> Result<Held, Failure> {
+        let dir = walk(below, None, Parents::Existing)?;
+        let target = dir.join(below.name);
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Failure::Changed),
+            Err(e) => return Err(e.into()),
+        }
+        let mut opened = std::fs::File::open(&target)?;
+        let meta = opened.metadata()?;
+        if !meta.is_file() {
+            return Err(Failure::Changed);
+        }
+        // One byte more than was read tells a file that grew from one that did not.
+        let expected = u64::try_from(read.len()).unwrap_or(u64::MAX);
+        if mds::read_at_most(&mut opened, expected.saturating_add(1), expected)? != read {
+            return Err(Failure::Changed);
+        }
+        Ok(Held {
+            dir,
+            file: target,
+            stamp: Stamp::of(&meta),
+        })
+    }
+
+    /// Replace the file `held` was read from with `content`, unless its stamp has changed
+    /// by the time it is replaced.
+    pub(super) fn replace_held(
+        held: Held,
+        content: &[u8],
+        durability: Durability,
+    ) -> Result<(), Failure> {
+        replace(
+            &held.dir,
+            &held.file,
+            content,
+            durability,
+            Some(&held.stamp),
+        )
+    }
+
+    /// Replace `target` in `dir` with `content`, by way of a temporary file beside it —
+    /// when `unchanged` stamps the file a rewrite read, only if `target` still holds it,
+    /// looked at just before the file is persisted over it.
+    fn replace(
+        dir: &Path,
+        target: &Path,
+        content: &[u8],
+        durability: Durability,
+        unchanged: Option<&Stamp>,
+    ) -> Result<(), Failure> {
+        let mut temp = tempfile::Builder::new()
+            .prefix(TEMP_PREFIX)
+            .suffix(TEMP_SUFFIX)
+            .tempfile_in(dir)?;
+        temp.as_file_mut().write_all(content)?;
+        if durability == Durability::Fsync {
+            temp.as_file().sync_all()?;
+        }
+        if unchanged.is_some_and(|stamp| !stamp.holds(target)) {
+            // The temporary file is deleted again as `temp` drops.
+            return Err(Failure::Changed);
+        }
+        temp.persist(target).map_err(|e| e.error)?;
+        Ok(())
+    }
+
+    /// The directory `below.name` is in: the anchor, created first when `parents` says
+    /// so — refused when `anchor` names another directory than the one there — then each
+    /// directory below it, refused when it is a symlink or a junction; all by path.
+    fn walk(
+        below: &Below<'_>,
+        anchor: Option<DirIdentity>,
+        parents: Parents,
+    ) -> Result<PathBuf, Failure> {
         if parents == Parents::Create {
             // A name on the anchor's path taken by a link that leads nowhere — the anchor
             // then resolves to nothing — is a directory that is not there, as on unix; a
@@ -656,22 +959,7 @@ mod windows {
                 return Err(Failure::LinkBelowAnchor { depth });
             }
         }
-        let target = dir.join(below.name);
-        match std::fs::symlink_metadata(&target) {
-            Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
-        let mut temp = tempfile::Builder::new()
-            .prefix(TEMP_PREFIX)
-            .suffix(TEMP_SUFFIX)
-            .tempfile_in(&dir)?;
-        temp.as_file_mut().write_all(content)?;
-        if durability == Durability::Fsync {
-            temp.as_file().sync_all()?;
-        }
-        temp.persist(&target).map_err(|e| e.error)?;
-        Ok(())
+        Ok(dir)
     }
 
     /// Whether `dir`, a directory below the anchor, is one that is not a symlink or a
@@ -696,6 +984,62 @@ mod windows {
         Ok(true)
     }
 }
+
+// ── Test-only pause before a rewrite's replace (#160) ────────────────────────
+
+/// `MDS_TEST_PAUSE_BEFORE_REPLACE`: how a debug build is made to stop between a rewrite's
+/// read and its replace, so that a test can change the file, or swap its directory, in
+/// that window (`tests/anchored_writes.rs`). A release build has none of it.
+#[cfg(debug_assertions)]
+mod pause_trigger {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::{atomic_write_file, Durability, Parents};
+    use crate::output::WriteTarget;
+
+    /// The variable naming the file that ends the pause. The run writes the same name with
+    /// `.paused` appended once it has stopped, for the test to wait for.
+    const VARIABLE: &str = "MDS_TEST_PAUSE_BEFORE_REPLACE";
+
+    /// How long the pause waits between two looks for the file that ends it.
+    const POLL: Duration = Duration::from_millis(5);
+
+    /// How many looks the pause makes before the replace goes on regardless: ten seconds.
+    const MAX_POLLS: u32 = 2_000;
+
+    /// Stop here when `MDS_TEST_PAUSE_BEFORE_REPLACE` names a file: say so by writing
+    /// `<file>.paused`, then wait until `<file>` exists, or until [`MAX_POLLS`] looks have
+    /// found none.
+    pub(crate) fn pause_before_replace() {
+        let Some(go) = std::env::var_os(VARIABLE).map(PathBuf::from) else {
+            return;
+        };
+        let mut paused = go.clone().into_os_string();
+        paused.push(".paused");
+        // A marker that cannot be written leaves the test waiting for it, which the test
+        // reports as a run that never paused.
+        let _ = atomic_write_file(
+            &WriteTarget::as_typed(PathBuf::from(paused)),
+            "",
+            Durability::RenameOnly,
+            Parents::Existing,
+        );
+        for _ in 0..MAX_POLLS {
+            if go.exists() {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) use pause_trigger::pause_before_replace;
+
+/// A release build's pause before a rewrite's replace: none.
+#[cfg(not(debug_assertions))]
+pub(crate) fn pause_before_replace() {}
 
 #[cfg(test)]
 mod tests {
@@ -1259,6 +1603,61 @@ mod tests {
         std::fs::create_dir(&nowhere).unwrap();
         atomic_write_file(&target, "X", Durability::RenameOnly, Parents::Create).unwrap();
         assert_eq!(std::fs::read_to_string(nowhere.join("x.md")).unwrap(), "X");
+    }
+
+    // ── A rewrite over the bytes it read ─────────────────────────────────────────
+
+    /// A rewrite's second read holds the file only as it was read (#160): other bytes,
+    /// more bytes, a file gone and a symlink in its place are each refused; a file edited
+    /// after the read is not replaced — the edit is left and no temporary file — and one
+    /// as it was read is (control).
+    ///
+    /// Each edit changes the file's size: a filesystem whose clock is coarser than the
+    /// time between two writes can give an edit of the same size the same times.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_replaces_only_the_file_as_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        let target = WriteTarget::new(file.clone(), PathBuf::from("a.mds"));
+        let changed = format!(
+            "\"{}\" changed since it was read; not written",
+            safe_path(&target.shown)
+        );
+        let refused = |read: &str| {
+            read_stamped(&target, read)
+                .map(|_| ())
+                .expect_err("not the file as read")
+                .to_string()
+        };
+        std::fs::write(&file, "one").unwrap();
+        assert_eq!(refused("two"), changed, "other bytes");
+        assert_eq!(refused("on"), changed, "more bytes than were read");
+
+        let read = read_stamped(&target, "one").unwrap();
+        std::fs::write(&file, "edited").unwrap();
+        let err = replace_if_unchanged(read, "ONE", Durability::Fsync)
+            .expect_err("edited after the read")
+            .to_string();
+        assert_eq!(err, changed);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "edited");
+        assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
+
+        let read = read_stamped(&target, "edited").unwrap();
+        replace_if_unchanged(read, "EDITED", Durability::Fsync).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "EDITED");
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(refused("EDITED"), changed, "gone");
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &file).unwrap();
+        assert_eq!(
+            refused("EDITED"),
+            format!(
+                "cannot write {}: {SYMLINK_REFUSAL}",
+                safe_path(&target.shown)
+            ),
+            "a symlink in its place"
+        );
     }
 
     // ── The temporary file ───────────────────────────────────────────────────────
