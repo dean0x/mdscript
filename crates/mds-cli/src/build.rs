@@ -9,7 +9,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use crate::output::WriteTarget;
-use crate::write::{atomic_write_file, Durability, NotRemoved, Parents, Removal};
+use crate::write::{write_compiled, NotRemoved, Removal};
 use mds::{
     effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
     STRING_SOURCE_MAP_LABEL,
@@ -854,13 +854,14 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
 /// summary line is emitted (not a redundant `"Compiled to …"` line).
 /// Set `announce = true` for the initial/startup compile and for `mds build`.
 ///
-/// The file write goes through [`atomic_write_file`] (#227, #160): a crash or write error
-/// mid-way never leaves a truncated artifact — the previous output, if any, survives until
-/// the rename — the anchor and the directories below it are created as needed, and a
-/// symlink below the anchor or at the output path is refused. The stdout arm writes and
-/// flushes the whole output at once ([`crate::output::write_stdout`]).
+/// The file write goes through [`write_compiled`] (#227, #160, #425): a crash or write
+/// error mid-way never leaves a truncated artifact — the previous output, if any, survives
+/// until the rename — the anchor and the directories below it are created as needed, a
+/// symlink below the anchor or at the output path is refused, and so is an MDS module at
+/// the output path, which is left as it is. The stdout arm writes and flushes the whole
+/// output at once ([`crate::output::write_stdout`]).
 ///
-/// Compiled artifacts are written with [`Durability::RenameOnly`]: they are derived files
+/// Compiled artifacts are written with `Durability::RenameOnly`: they are derived files
 /// a rebuild reproduces, and `F_FULLFSYNC` per artifact tripled a 500-template watch
 /// startup. Source rewrites (`fmt`, `lint --fix`) keep the fsync.
 pub(crate) fn write_output(
@@ -871,7 +872,7 @@ pub(crate) fn write_output(
 ) -> Result<()> {
     match target {
         Some(target) => {
-            atomic_write_file(target, compiled, Durability::RenameOnly, Parents::Create)?;
+            write_compiled(target, compiled)?;
             if !quiet && announce {
                 crate::output::ewriteln!("Compiled to {}", crate::output::safe_path(&target.shown));
             }
@@ -1710,12 +1711,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             // untrusted; see the `mds::SourceMap` rustdoc. The status
                             // line below is a diagnostic surface and IS escaped.
                             let map_json = sm.to_json();
-                            atomic_write_file(
-                                &map,
-                                &map_json,
-                                Durability::RenameOnly,
-                                Parents::Create,
-                            )?;
+                            write_compiled(&map, &map_json)?;
                             if !quiet {
                                 crate::output::ewriteln!(
                                     "Source map written to {}",
@@ -1846,12 +1842,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     if let Some(ref sm) = source_map {
                         let map = out.sibling(map_path_for);
                         let map_json = sm.to_json();
-                        atomic_write_file(
-                            &map,
-                            &map_json,
-                            Durability::RenameOnly,
-                            Parents::Create,
-                        )?;
+                        write_compiled(&map, &map_json)?;
                         if !quiet {
                             crate::output::ewriteln!(
                                 "Source map written to {}",
@@ -2071,13 +2062,9 @@ fn run_build_directory(
                 // it accumulates per-file counters instead of returning early, so it is
                 // its own call site. Both are enforced by `tests/write_funnel.rs`. The
                 // write creates the out-dir and the mirrored directories below it, and
-                // refuses a symlink among them (#160).
-                match atomic_write_file(
-                    &target,
-                    &final_content,
-                    Durability::RenameOnly,
-                    Parents::Create,
-                ) {
+                // refuses a symlink among them (#160) and an MDS module at the output
+                // (#425): that file fails, and the build goes on with the next.
+                match write_compiled(&target, &final_content) {
                     Ok(()) => {
                         if wrote_empty {
                             empty_count += 1;
@@ -2094,12 +2081,7 @@ fn run_build_directory(
                             if let Some(ref sm) = compiled.source_map {
                                 let map = target.sibling(map_path_for);
                                 let map_json = sm.to_json();
-                                if let Err(e) = atomic_write_file(
-                                    &map,
-                                    &map_json,
-                                    Durability::RenameOnly,
-                                    Parents::Create,
-                                ) {
+                                if let Err(e) = write_compiled(&map, &map_json) {
                                     // The primitive's message already names the path —
                                     // re-prefixing it would print the path twice (#227).
                                     crate::output::eprint_io_failure(e);

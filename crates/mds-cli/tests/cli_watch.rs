@@ -10044,3 +10044,94 @@ fn watch_reports_a_dangling_symlink_at_a_deleted_source_s_output() {
         "the live link's target is left as it was; stderr: {stderr}"
     );
 }
+
+// ── #425: an output never replaces an MDS module ─────────────────────────────
+
+/// An MDS module: a `.md` file whose frontmatter declares `type: mds`.
+const MODULE: &str = "---\ntype: mds\nname: X\n---\nHi {{name}}\n";
+
+/// How many times `stderr` refuses, as `mds::io`, a write of `shown` with `cause`.
+fn refusals(stderr: &str, shown: &str, cause: &str) -> usize {
+    count_occurrences(
+        &squash(stderr),
+        &squash(&format!("cannot write {shown}: {cause}")),
+    )
+}
+
+/// `mds watch` never writes an output over an MDS module (#425), in file mode and in
+/// directory mode: `chat.md`, which declares `type: mds`, at the output of the Markdown
+/// source `chat.mds`, is refused at startup and by every rebuild of the same kind,
+/// `mds::io`, naming it as its `Recompiled` line would, and kept; the session keeps
+/// watching. A module put where the session's own output was is kept too. Control: with
+/// `chat.md` gone, the next save writes it. At Ctrl+C the session exits 0, as after any
+/// write that failed once it was live.
+#[test]
+fn watch_never_writes_over_an_mds_module() {
+    const CAUSE: &str = "refusing to replace an MDS module";
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", "Hello one\n"), ("chat.md", MODULE)]);
+        let notes = base.path().join("notes");
+        let (src, md) = (notes.join("chat.mds"), notes.join("chat.md"));
+        let shown_md = below(shown_dir, "chat.md");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        let refused_after = |n: usize, what: &str| {
+            let seen = poll_tap_until(&tap, TIMEOUT, |seen| refusals(seen, &shown_md, CAUSE) > n);
+            assert!(
+                seen.is_ok(),
+                "{mode}: {what} is refused; stderr: {}",
+                tap.text()
+            );
+            assert_eq!(
+                text_of(&md).as_deref(),
+                Some(MODULE),
+                "{mode}: {what} keeps the module; stderr: {}",
+                tap.text()
+            );
+            refusals(&tap.text(), &shown_md, CAUSE)
+        };
+
+        let seen = refused_after(0, "the startup write");
+        write_atomic(&src, "Hello two\n");
+        refused_after(seen, "a rebuild of the same kind");
+        settle_queued_events(&tap, &src, "module_kept");
+
+        // Control: nothing at chat.md, and the next save writes it.
+        std::fs::remove_file(&md).unwrap();
+        write_atomic(&src, "Hello three\n");
+        assert!(
+            wait_for_file_contains(&md, "Hello three", TIMEOUT),
+            "{mode}: control: with chat.md gone, the next save writes it; stderr: {}",
+            tap.text()
+        );
+        settle_queued_events(&tap, &src, "module_written");
+
+        // A module put where the session's own output was.
+        std::fs::write(&md, MODULE).unwrap();
+        let seen = refusals(&tap.text(), &shown_md, CAUSE);
+        write_atomic(&src, "Hello four\n");
+        refused_after(seen, "a rebuild over a module put in place of the output");
+
+        #[cfg(unix)]
+        {
+            interrupt(&child);
+            let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{mode}: refused writes do not change the Ctrl+C exit; stderr: {}",
+                tap.text()
+            );
+        }
+        let stderr = tap.finish_text(&mut child);
+        assert!(
+            stderr.contains("mds::io"),
+            "{mode}: each refusal is mds::io; stderr: {stderr}"
+        );
+    }
+}

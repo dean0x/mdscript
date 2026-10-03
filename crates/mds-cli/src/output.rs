@@ -5,7 +5,7 @@
 //! - [`OutputBase`] / [`resolve_output_base`] / [`output_path_for`]: directory-mode
 //!   path resolution used by watch and build-directory. Each output is a
 //!   [`WriteTarget`]: the path written, the path a message shows (#390), and the anchor
-//!   [`crate::write::atomic_write_file`] writes it below (#160).
+//!   [`crate::write::write_compiled`] writes it below (#160).
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: a directory build's stale-output cleanup after a change of
 //!   kind, which removes only a `.json` mds provably wrote (#160).
@@ -1074,7 +1074,7 @@ pub(crate) enum OutputBase {
 /// as typed, or the part below a directory they named — the directory argument,
 /// `--out-dir`, or the directory `mds.json` was reached by — joined to that directory as
 /// typed. A status line, a message the caller writes itself, and the error
-/// [`crate::write::atomic_write_file`] raises writing it name the file by `shown` alone,
+/// [`crate::write::write_compiled`] raises writing it name the file by `shown` alone,
 /// so display never resolves a path again.
 ///
 /// The last `below_anchor` components of `path` — and of `shown`, which ends in the same

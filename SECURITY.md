@@ -186,6 +186,12 @@ input. The compiler enforces several defense-in-depth controls:
   `mds build` and `mds watch` refuse an output that is the entry file itself —
   however `-o`, `--out-dir`, `build.output_dir` or the default output name it —
   before anything is written or any directory created (`mds::io`, exit 2, #425).
+  Nor do they write an output over an MDS module — a `.md` file whose frontmatter
+  declares `type: mds`, which a template can import: just before the rename the file
+  at the output path is read as opened in the directory the write walked to (on
+  Windows, by path), and a module, or a `.md` file that cannot be read to tell, is
+  refused and left as it is (`mds::io`, #425). A module put there in the instant
+  between that read and the rename is replaced.
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 

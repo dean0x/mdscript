@@ -1,9 +1,10 @@
 //! Write-funnel guard (#227, #160): every artifact `mds` writes from production code must
 //! go through the single atomic choke point in `crate::write` — `atomic_write_file`, or,
-//! for a rewrite of a file just read, `replace_if_unchanged`, or, for a new file that
-//! must never replace one, `create_new`, or, for `mds watch`'s output after a change of
-//! kind, `write_over_own`, which share its tail — and every file it removes through
-//! `remove_proven`, below the same anchor.
+//! for a compiled output or a sidecar, which never replaces an MDS module (#425),
+//! `write_compiled`, or, for a rewrite of a file just read, `replace_if_unchanged`, or,
+//! for a new file that must never replace one, `create_new`, or, for `mds watch`'s output
+//! after a change of kind, `write_over_own`, which share its tail — and every file it
+//! removes through `remove_proven`, below the same anchor.
 //!
 //! # Why this exists
 //!

@@ -165,6 +165,13 @@ such as a `--vars` file that cannot load or a directory with nothing to lint —
 `--fix --diff` prints its diffs before it (changed in v0.5.0; these failures printed only on
 stderr).
 
+**Never over an MDS module** (#425): `mds build` and `mds watch` never write an output over a
+`.md` file whose frontmatter declares `type: mds` — a module a template can import — at the
+output path. It is refused (`mds::io`, `cannot write <file>: refusing to replace an MDS module`)
+and left as it is: `mds build <file>` exits 2, `mds build <dir>` goes on with the other files
+and exits 2, and `mds watch` reports it and keeps watching. Any other `.md` file there is
+written over as before.
+
 **Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary (`N built, N failed`; `N passed, N failed` for `check`) is printed on a successful run or when any file fails; the exit code is non-zero if any file fails. Under `--quiet`, the summary is suppressed on a fully-successful run but is always emitted when any file fails, so the non-zero exit is never unexplained. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) also exits non-zero (`1`) with `no .mds files found in <dir>; nothing was built` (`…checked` for `check`), likewise even under `--quiet` — an empty tree is treated as a misconfiguration, not a success. (Changed in v0.4.3; previously exited 0.) A directory whose `.mds` files are all `_`-prefixed partials is treated the same way — `build`/`check` exit `1` with `<n> .mds file(s) found in <dir> but all are _-prefixed partials; nothing was built` (`…checked`), even under `--quiet`, while `mds fmt` and `mds lint` are unaffected since they format and lint partials. (Changed in v0.4.3; previously `0 built, 0 failed`, exit 0.) `mds watch <dir>` is the exception: it starts on an empty tree and compiles files created later. When a file's kind changes, `mds build <dir>` with `--out-dir` (or `build.output_dir`) removes the old `.json` only while it holds exactly the messages output mds writes, and never removes the old `.md`; anything else at that name is kept, with a warning. `mds watch <dir>` removes the output of a deleted source, and the old output of a file whose kind changed, only when that session wrote the file and it is unchanged; any other file is kept, with a notice. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
 
 `mds fmt <dir>` follows the same directory-mode conventions (recursive, symlinks rejected, continue-on-error, non-zero exit summary) with one deliberate difference: it formats `_`-prefixed **partials too** — formatting rewrites source, not compiled output, and a partial's source is just as much a candidate for reformatting as any other file.
@@ -223,7 +230,8 @@ shared partial rebuilds **all transitive importers** automatically.
   that template while it is unchanged (both modes). A hand-written `chat.md` beside
   `chat.mds` is never overwritten: it is kept with `Kept <file>: not written by this
   session; not overwritten`, the old output stays as it was, and the next save tries
-  again. The startup write, and `-o`, write over whatever is there, as `mds build` does.
+  again. The startup write, and `-o`, write over whatever is there but an MDS module, as
+  `mds build` does.
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.

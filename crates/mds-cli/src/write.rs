@@ -1,10 +1,10 @@
 //! The one write primitive: every file `mds` writes goes through it —
-//! [`atomic_write_file`] for `mds build` and `mds watch` outputs and `.map` sidecars and
-//! `mds init --force`'s starter, [`create_new`] for `mds init`'s starter without
-//! `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix` rewrites,
-//! [`write_over_own`] for an `mds watch` output after its source's change of kind (#227,
-//! #160) — and every file it removes, through [`remove_proven`]. `tests/write_funnel.rs`
-//! keeps it the only one.
+//! [`write_compiled`] for `mds build` and `mds watch` outputs and `.map` sidecars (#425),
+//! [`atomic_write_file`] for `mds init --force`'s starter, [`create_new`] for `mds init`'s
+//! starter without `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix`
+//! rewrites, [`write_over_own`] for an `mds watch` output after its source's change of kind
+//! (#227, #160) — and every file it removes, through [`remove_proven`].
+//! `tests/write_funnel.rs` keeps it the only one.
 //!
 //! # Replace by rename
 //!
@@ -70,6 +70,21 @@
 //! O_EXCL | O_NOFOLLOW`) — still never over another file, but no longer all or nothing: a
 //! failure while it is written leaves the file partly written. Windows moves the
 //! temporary file into place without `MOVEFILE_REPLACE_EXISTING`.
+//!
+//! # Never over an MDS module (#425)
+//!
+//! [`write_compiled`] renames an output over whatever file is at its target, except an MDS
+//! module: a `.md` file whose frontmatter declares `type: mds`, as mds-core judges one
+//! ([`mds::check_module_type`]), which a template may import. Just before the rename the
+//! file at the target is looked at in the directory the write is in, without following a
+//! symlink, and a regular file there is read as opened in that directory — on unix
+//! `openat(O_NOFOLLOW | O_NONBLOCK)` from the walk's descriptor, never by path — up to
+//! [`mds::MAX_FILE_SIZE`] bytes, and only when it starts with a frontmatter fence: a module
+//! is refused, the write leaves no temporary file, and the module is left as it is. One
+//! that cannot be read is refused too, since nothing tells it is no module. A symlink put
+//! there by then is replaced, never written through, as for every write; a module put
+//! there in the instant between that look and the rename is replaced too. Windows looks
+//! and reads by path, as its write goes.
 //!
 //! # Over the caller's own file, or as a new one (#160)
 //!
@@ -216,6 +231,32 @@ pub(crate) fn atomic_write_file(
         .map_err(|failure| worded(target, failure))
 }
 
+/// Write a compiled output, or its `.map` sidecar, to `target` as [`atomic_write_file`]
+/// writes one — [`Durability::RenameOnly`], since a rebuild reproduces it, creating the
+/// directories it goes in — but never over an MDS module (#425; see the module docs): a
+/// `.md` file whose frontmatter declares `type: mds` is a source a template imports, not
+/// an output to replace.
+///
+/// # Errors
+///
+/// As [`atomic_write_file`]; and a module at the target, or a regular `.md` file there that
+/// cannot be read to tell, is refused before the rename — `cannot write <file>: refusing
+/// to replace an MDS module`, or the read's cause — and left as it is, with no temporary
+/// file left behind.
+pub(crate) fn write_compiled(
+    target: &WriteTarget,
+    content: &str,
+) -> std::result::Result<(), mds::MdsError> {
+    write_below_anchor(
+        target,
+        content,
+        Durability::RenameOnly,
+        Parents::Create,
+        Commit::Output,
+    )
+    .map_err(|failure| worded(target, failure))
+}
+
 /// Write `content` to `target` as [`atomic_write_file`] does, but only as a new file
 /// (#160): the temporary file is given the target's name only where nothing has it at
 /// that moment (see the module docs), so a file that appears after any earlier look at
@@ -294,8 +335,8 @@ pub(crate) fn write_over_own(
     })
 }
 
-/// [`atomic_write_file`] and [`create_new`] share this: resolve `target` below its anchor,
-/// then write through it as `commit` says.
+/// [`atomic_write_file`], [`write_compiled`] and [`create_new`] share this: resolve
+/// `target` below its anchor, then write through it as `commit` says.
 fn write_below_anchor(
     target: &WriteTarget,
     content: &str,
@@ -321,6 +362,9 @@ enum Commit<S> {
     /// Renamed over whatever file is there — for a rewrite, only while that file still
     /// holds the stamp `S` it was read with.
     Replace(Option<S>),
+    /// Renamed over whatever file is there, unless it is an MDS module ([`write_compiled`],
+    /// #425).
+    Output,
     /// Given the name only where nothing has it ([`create_new`]).
     New,
 }
@@ -461,8 +505,10 @@ fn not_removed(target: &WriteTarget, failure: Failure) -> NotRemoved {
             safe_path(&shown_directory(target, depth))
         )),
         Failure::LinkAtTarget => NotRemoved::Link,
-        // Only a new file's commit meets a file at its name; a removal never does.
+        // Only a new file's commit meets a file at its name, and only an output's refuses a
+        // module; a removal never does either.
         Failure::Exists => NotRemoved::Failed(cause(&std::io::ErrorKind::AlreadyExists.into())),
+        Failure::Module => NotRemoved::Failed(MODULE_REFUSAL.to_owned()),
         Failure::Io(e) => NotRemoved::Failed(cause(&e)),
     }
 }
@@ -487,6 +533,7 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
             io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
         }
         Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
+        Failure::Module => io_error(&target.shown, MODULE_REFUSAL.to_owned()),
         Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
         // Only a removal's look at its file, or its proof's read, fails as unreadable.
         Failure::Unreadable(e) | Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
@@ -502,6 +549,9 @@ const SYMLINK_REFUSAL: &str = "refusing to replace a symlink";
 
 /// Why [`remove_proven`] refuses to remove a symlink at its file: mds writes none.
 const SYMLINK_REMOVAL_REFUSAL: &str = "refusing to remove a symlink";
+
+/// Why [`write_compiled`] refuses to replace an MDS module (#425).
+const MODULE_REFUSAL: &str = "refusing to replace an MDS module";
 
 /// Why [`remove_proven`] leaves a file whose name, by the time it was to be removed, was
 /// another file's than the one its proof read.
@@ -561,6 +611,8 @@ enum Failure {
     LinkBelowAnchor { depth: usize },
     /// The target itself is a symlink.
     LinkAtTarget,
+    /// An output's target is an MDS module ([`write_compiled`], #425).
+    Module,
     /// The target itself is a FIFO, a socket or a device — or, for a removal, a
     /// directory.
     NotARegularFile,
@@ -649,6 +701,41 @@ fn ends_as_a_directory(path: &Path) -> bool {
     }
 }
 
+/// Whether `name` is a `.md` file's: the only name an MDS module an output could take has
+/// (#425).
+fn names_markdown(name: &OsStr) -> bool {
+    Path::new(name).extension().is_some_and(|ext| ext == "md")
+}
+
+/// Whether `file`, opened at a `.md` file's name ([`names_markdown`]) of `size` bytes, is
+/// an MDS module an output must never replace (#425): its frontmatter declares
+/// `type: mds`, as mds-core's own check takes a module ([`mds::check_module_type`]). It is
+/// read on only past a frontmatter fence, so an output's own bytes cost one short read,
+/// and no further than [`mds::MAX_FILE_SIZE`] bytes in all — more than mds reads of any
+/// module; bytes that are not UTF-8 are judged with each replaced.
+fn is_mds_module(file: &mut std::fs::File, size: u64) -> std::io::Result<bool> {
+    /// The longest frontmatter fence: `---` and a CRLF.
+    const FENCE: &[u8] = b"---\r\n";
+    /// The key mds-core's check is given: it judges a `.md` key by the source alone, so
+    /// this one stands for the file's own name, which the caller has checked is a `.md`
+    /// file's — and no path becomes text.
+    const MARKDOWN_KEY: &str = "module.md";
+    let fence = u64::try_from(FENCE.len()).unwrap_or(u64::MAX);
+    let mut head = mds::read_at_most(file, fence, 0)?;
+    if !(head.starts_with(b"---\n") || head.starts_with(FENCE)) {
+        return Ok(false);
+    }
+    let read = u64::try_from(head.len()).unwrap_or(u64::MAX);
+    head.extend(mds::read_at_most(
+        file,
+        mds::MAX_FILE_SIZE.saturating_sub(read),
+        size,
+    )?);
+    let text = String::from_utf8_lossy(&head);
+    let key = mds::ModuleRef::keyed(MARKDOWN_KEY).typed(MARKDOWN_KEY);
+    Ok(mds::check_module_type(key, &text).is_ok())
+}
+
 /// The name every temporary file starts with, so a crash's leftover is recognisable.
 const TEMP_PREFIX: &str = ".mds-tmp-";
 
@@ -702,9 +789,10 @@ mod unix {
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
 
-    /// A file a rewrite reads again, or a removal's proof reads: never through a symlink,
-    /// and never waiting on a FIFO put in its place, which the read then refuses as no
-    /// longer the file read, and the removal as not a regular file.
+    /// A file a rewrite reads again, a removal's proof reads, or an output's target read to
+    /// tell an MDS module (#425): never through a symlink, and never waiting on a FIFO put
+    /// in its place, which the read then refuses as no longer the file read, the removal as
+    /// not a regular file, and the output's look as no module.
     const READ: OFlags = OFlags::RDONLY
         .union(OFlags::NOFOLLOW)
         .union(OFlags::NONBLOCK)
@@ -994,8 +1082,9 @@ mod unix {
 
     /// Put `content` at `name` in `dir`, by way of a temporary file beside it, as `commit`
     /// says: renamed over the file there — when it stamps the file a rewrite read, only if
-    /// the file there still holds it, looked at just before the rename — or given the name
-    /// only where nothing has it ([`commit_new`]).
+    /// the file there still holds it, and for an output only if it is no MDS module, each
+    /// looked at just before the rename ([`ready_to_replace`]) — or given the name only
+    /// where nothing has it ([`commit_new`]).
     fn replace(
         dir: OwnedFd,
         name: &OsStr,
@@ -1030,11 +1119,9 @@ mod unix {
         }
         fill(file, content, durability)?;
         match commit {
-            Commit::Replace(unchanged) => {
-                if unchanged.is_some_and(|stamp| !stamp.holds(dir.as_fd(), name)) {
-                    // The temporary file is unlinked again as `temp` drops.
-                    return Err(Failure::Changed);
-                }
+            Commit::Replace(_) | Commit::Output => {
+                // The temporary file is unlinked again as `temp` drops.
+                ready_to_replace(dir.as_fd(), name, commit)?;
                 fs::renameat(dir.as_fd(), &temp.name, dir.as_fd(), name)?;
                 temp.renamed = true;
                 drop(temp);
@@ -1050,6 +1137,49 @@ mod unix {
             sync_directory(dir)?;
         }
         Ok(())
+    }
+
+    /// Whether the rename over `name` in `dir` may go on, as `commit` says, looked at just
+    /// before it: a rewrite's file must still hold the stamp it was read with, and an
+    /// output's target must be no MDS module (#425).
+    fn ready_to_replace(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        commit: Commit<&Stamp>,
+    ) -> Result<(), Failure> {
+        match commit {
+            Commit::Replace(Some(stamp)) if !stamp.holds(dir, name) => Err(Failure::Changed),
+            Commit::Output if is_a_module(dir, name)? => Err(Failure::Module),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether `name` in `dir` is an MDS module (#425): a `.md` regular file, looked at
+    /// without following a symlink, then opened in `dir` — never by path — and read there,
+    /// that [`super::is_mds_module`] takes for one. Nothing there, a symlink — which the
+    /// rename replaces, never writing through it — and anything else that is no regular
+    /// file are none; a file that cannot be opened or read is an error.
+    fn is_a_module(dir: BorrowedFd<'_>, name: &OsStr) -> Result<bool, Failure> {
+        if !super::names_markdown(name) {
+            return Ok(false);
+        }
+        match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
+            Ok(_) | Err(Errno::NOENT) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let mut file = match open_to_read(dir, name) {
+            Ok(file) => file,
+            // Gone since the look, or a symlink put there since: no module to replace.
+            Err(Errno::NOENT | Errno::LOOP) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let opened = fs::fstat(&file)?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
+            return Ok(false);
+        }
+        let size = u64::try_from(opened.st_size).unwrap_or(0);
+        Ok(super::is_mds_module(&mut file, size)?)
     }
 
     /// Write `content` to `file` and, in the [`Durability::Fsync`] tier, sync it; then
@@ -1477,7 +1607,8 @@ mod windows {
 
     /// Put `content` at `target` in `dir`, by way of a temporary file beside it, as
     /// `commit` says: persisted over the file there — when it stamps the file a rewrite
-    /// read, only if `target` still holds it, looked at just before — or moved into place
+    /// read, only if `target` still holds it, and for an output only if it is no MDS
+    /// module, each looked at just before ([`ready_to_replace`]) — or moved into place
     /// without `MOVEFILE_REPLACE_EXISTING`, which fails on a file that is there.
     fn replace(
         dir: &Path,
@@ -1495,11 +1626,9 @@ mod windows {
             temp.as_file().sync_all()?;
         }
         match commit {
-            Commit::Replace(unchanged) => {
-                if unchanged.is_some_and(|stamp| !stamp.holds(target)) {
-                    // The temporary file is deleted again as `temp` drops.
-                    return Err(Failure::Changed);
-                }
+            Commit::Replace(_) | Commit::Output => {
+                // The temporary file is deleted again as `temp` drops.
+                ready_to_replace(target, commit)?;
                 temp.persist(target).map_err(|e| e.error)?;
             }
             Commit::New => {
@@ -1516,6 +1645,41 @@ mod windows {
             }
         }
         Ok(())
+    }
+
+    /// Whether the move over `target` may go on, as `commit` says, looked at by path just
+    /// before it: a rewrite's file must still hold the stamp it was read with, and an
+    /// output's target must be no MDS module (#425).
+    fn ready_to_replace(target: &Path, commit: Commit<&Stamp>) -> Result<(), Failure> {
+        match commit {
+            Commit::Replace(Some(stamp)) if !stamp.holds(target) => Err(Failure::Changed),
+            Commit::Output if is_a_module(target)? => Err(Failure::Module),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether `target` is an MDS module (#425): a `.md` regular file, looked at without
+    /// following a symlink, then opened and read by path, that [`super::is_mds_module`]
+    /// takes for one. Nothing there, a symlink — which the move replaces, never writing
+    /// through it — and anything else that is no regular file are none; a file that cannot
+    /// be opened or read is an error.
+    fn is_a_module(target: &Path) -> Result<bool, Failure> {
+        if !target.file_name().is_some_and(super::names_markdown) {
+            return Ok(false);
+        }
+        match std::fs::symlink_metadata(target) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let mut file = match std::fs::File::open(target) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let size = file.metadata()?.len();
+        Ok(super::is_mds_module(&mut file, size)?)
     }
 
     /// The directory `below.name` is in: the anchor, created first when `parents` says
@@ -2444,6 +2608,132 @@ mod tests {
             entries(dir.path()),
             ["a.md"],
             "the FIFO is left, and no temporary file"
+        );
+    }
+
+    // ── Never over an MDS module (#425) ─────────────────────────────────────────
+
+    /// An output is never written over an MDS module (#425): a `.md` file that declares
+    /// `type: mds` — bare, quoted, or with CRLF lines — is refused, named as shown, and
+    /// left as it is, with no temporary file. Controls: a `.md` file with no frontmatter,
+    /// one that declares another `type`, one with `type: mds` below another key only, a
+    /// `.mds` file that declares `type: mds`, and a name nothing has are each written.
+    #[test]
+    fn an_output_is_never_written_over_an_mds_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let shown = |name: &str| PathBuf::from("out").join(name);
+        let write = |name: &str| {
+            write_compiled(&WriteTarget::new(dir.path().join(name), shown(name)), "X")
+                .map_err(|e| e.to_string())
+        };
+        let text = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        for (name, module) in [
+            ("m.md", "---\ntype: mds\n---\nM\n"),
+            ("q.md", "---\ntype: \"mds\"\n---\nQ\n"),
+            ("crlf.md", "---\r\ntype: 'mds'\r\n---\r\nC\r\n"),
+        ] {
+            std::fs::write(dir.path().join(name), module).unwrap();
+            assert_eq!(
+                write(name),
+                Err(format!(
+                    "cannot write {}: {MODULE_REFUSAL}",
+                    shown(name).display()
+                )),
+                "{name}"
+            );
+            assert_eq!(text(name), module, "{name} is left as it is");
+        }
+        assert_eq!(
+            temp_residue(dir.path()),
+            Vec::<String>::new(),
+            "no temporary file"
+        );
+        for (name, other) in [
+            ("plain.md", Some("plain\n")),
+            ("other.md", Some("---\ntype: other\n---\nO\n")),
+            ("nested.md", Some("---\nconfig:\n  type: mds\n---\nN\n")),
+            ("source.mds", Some("---\ntype: mds\n---\nS\n")),
+            ("new.md", None),
+        ] {
+            if let Some(other) = other {
+                std::fs::write(dir.path().join(name), other).unwrap();
+            }
+            assert_eq!(write(name), Ok(()), "control: {name} is written");
+            assert_eq!(text(name), "X", "control: {name}");
+        }
+    }
+
+    /// The module check reads the file in the directory the write opened, never by path
+    /// (#425): while a thread points the symlinked anchor `cur` at a directory holding a
+    /// module, then at one holding a plain file, and back, at most 2,000 writes in at most
+    /// 10 s never replace the module — each lands in the plain file's directory or is
+    /// refused. Controls: the loop met both — some writes landed, some were refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_module_is_judged_in_the_directory_the_write_opened() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        /// How long each state is held: about as long as a write takes.
+        const HOLD: Duration = Duration::from_micros(200);
+        const MODULE: &str = "---\ntype: mds\n---\nM\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let (with_module, plain) = (dir.path().join("with-module"), dir.path().join("plain"));
+        std::fs::create_dir(&with_module).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(with_module.join("a.md"), MODULE).unwrap();
+        std::fs::write(plain.join("a.md"), "plain\n").unwrap();
+        let cur = dir.path().join("cur");
+        std::os::unix::fs::symlink(&with_module, &cur).unwrap();
+        let target = WriteTarget::below(&cur, Path::new("cur"), Path::new("a.md"));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = Arc::clone(&stop);
+            let (base, with_module, plain) =
+                (dir.path().to_path_buf(), with_module.clone(), plain.clone());
+            std::thread::spawn(move || {
+                // Bounded: at most 100,000 swaps, and the loop ends with the writes. Each
+                // swap renames a new link over `cur`, so `cur` always leads somewhere.
+                for i in 0..100_000u32 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let next = if i % 2 == 0 { &plain } else { &with_module };
+                    let link = base.join(format!("link-{i}"));
+                    let _ = std::os::unix::fs::symlink(next, &link);
+                    let _ = std::fs::rename(&link, base.join("cur"));
+                    std::thread::sleep(HOLD);
+                }
+            })
+        };
+
+        let started = Instant::now();
+        let (mut written, mut refused) = (0u32, 0u32);
+        // Bounded: 2,000 writes or 10 s, whichever comes first.
+        for _ in 0..2_000 {
+            if started.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            match write_compiled(&target, "X") {
+                Ok(()) => written += 1,
+                Err(e) if e.to_string().contains(MODULE_REFUSAL) => refused += 1,
+                Err(_) => {}
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(with_module.join("a.md")).unwrap(),
+            MODULE,
+            "the module is never replaced ({written} written, {refused} refused)"
+        );
+        assert!(
+            written > 0 && refused > 0,
+            "the loop met both directories: {written} written, {refused} refused"
         );
     }
 

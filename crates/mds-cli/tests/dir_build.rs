@@ -2538,3 +2538,90 @@ fn dir_build_out_dir_status_line_names_the_out_dir_as_typed() {
         );
     }
 }
+
+// ── #425: an output never replaces an MDS module ─────────────────────────────
+
+/// An MDS module: a `.md` file whose frontmatter declares `type: mds`.
+const MODULE: &str = "---\ntype: mds\nname: X\n---\nHi {{name}}\n";
+
+/// `mds build` in `dir` with `args`: `(exit code, stderr)`.
+fn build_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = mds_bin()
+        .current_dir(dir)
+        .arg("build")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Whether `stderr` refuses, as `mds::io`, a write of `shown` with `cause` — whitespace
+/// and miette's frame, which wraps a long message, set aside.
+fn refuses(stderr: &str, shown: &Path, cause: &str) -> bool {
+    let squash = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect()
+    };
+    stderr.contains("mds::io")
+        && squash(stderr).contains(&squash(&format!(
+            "cannot write {}: {cause}",
+            shown.display()
+        )))
+}
+
+/// A directory build never writes an output over an MDS module (#425), beside its
+/// sources or below `--out-dir`: `a.md`, which declares `type: mds`, is refused,
+/// `mds::io`, naming it as its `Compiled to` line would, and kept; the build goes on with
+/// the other sources — `b.md`, a plain file, is written over — and exits 2. It used to
+/// replace the module, exit 0.
+#[test]
+fn dir_build_never_writes_over_an_mds_module() {
+    for out_dir in [None, Some("out")] {
+        let label = format!("out-dir {out_dir:?}");
+        let base = tempfile::tempdir().unwrap();
+        let src = base.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mds"), "Hello A\n").unwrap();
+        fs::write(src.join("b.mds"), "Hello B\n").unwrap();
+        let outputs = match out_dir {
+            Some(out) => base.path().join(out),
+            None => src.clone(),
+        };
+        fs::create_dir_all(&outputs).unwrap();
+        fs::write(outputs.join("a.md"), MODULE).unwrap();
+        fs::write(outputs.join("b.md"), "old b\n").unwrap();
+        let shown = Path::new(out_dir.unwrap_or("src"));
+
+        let mut args = vec!["src"];
+        args.extend(out_dir.iter().flat_map(|out| ["--out-dir", out]));
+        let (code, stderr) = build_in(base.path(), &args);
+        assert_eq!(code, Some(2), "{label}: stderr: {stderr}");
+        assert!(
+            refuses(
+                &stderr,
+                &shown.join("a.md"),
+                "refusing to replace an MDS module"
+            ),
+            "{label}: the module is refused by name; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(outputs.join("a.md")).unwrap(),
+            MODULE,
+            "{label}: the module is kept; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(outputs.join("b.md")).unwrap(),
+            "Hello B\n",
+            "{label}: control: the plain b.md is written over; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 built, 1 failed"),
+            "{label}: the build goes on with the other source; stderr: {stderr}"
+        );
+    }
+}

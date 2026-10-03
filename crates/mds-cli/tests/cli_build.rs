@@ -2463,14 +2463,20 @@ mod entry_overwrite {
         }
 
         // A hard link to the entry is another name for the same file, not the entry's
-        // path: the write replaces that name by rename (§7.2 "Output writing"), so it is
-        // not refused and the entry keeps its content.
+        // path, so the entry refusal does not answer it; but the file it names declares
+        // `type: mds`, so the write refuses it as an MDS module (#425), and both names
+        // keep their content.
         if std::fs::hard_link(root.join("page.md"), root.join("page_hl.md")).is_ok() {
             let (code, _, stderr) = run_in(root, &["build", "page.md", "-o", "page_hl.md"]);
-            assert_eq!(code, Some(0), "-o page_hl.md: stderr: {stderr}");
+            assert_eq!(code, Some(2), "-o page_hl.md: stderr: {stderr}");
+            assert!(
+                stderr.contains("cannot write page_hl.md: refusing to replace an MDS module")
+                    && !stderr.contains("overwrite the entry"),
+                "-o page_hl.md: stderr: {stderr}"
+            );
             assert_eq!(
                 std::fs::read_to_string(root.join("page_hl.md")).unwrap(),
-                COMPILED
+                PAGE
             );
             assert_eq!(
                 std::fs::read_to_string(root.join("page.md")).unwrap(),
@@ -3084,4 +3090,134 @@ fn a_stale_map_name_too_long_for_the_file_system_is_no_file() {
         !map.exists(),
         "control: the stale sidecar is removed; stderr: {stderr}"
     );
+}
+
+// ── #425: an output never replaces an MDS module ─────────────────────────────
+
+mod module_overwrite {
+    use super::*;
+    use std::path::Path;
+
+    /// An MDS module: a `.md` file whose frontmatter declares `type: mds`, as a template
+    /// imports one.
+    pub(super) const MODULE: &str = "---\ntype: mds\nname: X\n---\nHi {{name}}\n";
+
+    /// Run `mds build` in `dir` with `args`: `(exit code, stderr)`.
+    pub(super) fn build_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+        let out = mds_bin()
+            .current_dir(dir)
+            .arg("build")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// `text` without whitespace or miette's frame, which wraps a long message.
+    pub(super) fn squash(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect()
+    }
+
+    /// Whether `stderr` refuses, as `mds::io`, a write of `shown` with `cause`.
+    pub(super) fn refuses(stderr: &str, shown: &Path, cause: &str) -> bool {
+        stderr.contains("mds::io")
+            && squash(stderr).contains(&squash(&format!(
+                "cannot write {}: {cause}",
+                shown.display()
+            )))
+    }
+
+    /// Why an output is not written over an MDS module.
+    pub(super) const MODULE_CAUSE: &str = "refusing to replace an MDS module";
+
+    /// `mds build` never writes its output over an MDS module (#425): `a.md`, which
+    /// declares `type: mds`, at the default output of `a.mds`, and `lib.md` named by
+    /// `-o` — and a module whose `type` is quoted, or whose lines end in CRLF — is
+    /// refused, `mds::io`, exit 2, naming the output as its `Compiled to` line would;
+    /// nothing is written and no temporary file is left. It used to replace the module
+    /// with the compiled output, exit 0.
+    #[test]
+    fn build_never_writes_over_an_mds_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.mds"), "Hello A\n").unwrap();
+        std::fs::write(root.join("a.md"), MODULE).unwrap();
+        std::fs::write(root.join("lib.md"), MODULE).unwrap();
+        std::fs::write(root.join("single.md"), "---\ntype: 'mds'\n---\nS\n").unwrap();
+        std::fs::write(root.join("crlf.md"), "---\r\ntype: \"mds\"\r\n---\r\nC\r\n").unwrap();
+        let before = entry_overwrite::snapshot(root);
+
+        let rows: [(&[&str], std::path::PathBuf); 4] = [
+            (&["a.mds"], Path::new(".").join("a.md")),
+            (
+                &["a.mds", "-o", "lib.md"],
+                Path::new("lib.md").to_path_buf(),
+            ),
+            (
+                &["a.mds", "-o", "single.md"],
+                Path::new("single.md").to_path_buf(),
+            ),
+            (
+                &["a.mds", "-o", "crlf.md"],
+                Path::new("crlf.md").to_path_buf(),
+            ),
+        ];
+        for (args, shown) in rows {
+            let (code, stderr) = build_in(root, args);
+            assert_eq!(code, Some(2), "build {args:?}: stderr: {stderr}");
+            assert!(
+                refuses(&stderr, &shown, MODULE_CAUSE),
+                "build {args:?}: the module is refused by name; stderr: {stderr}"
+            );
+            assert!(
+                !stderr.contains("Compiled to"),
+                "build {args:?}: nothing is announced; stderr: {stderr}"
+            );
+        }
+        assert_eq!(
+            entry_overwrite::snapshot(root),
+            before,
+            "nothing is written, and no temporary file is left"
+        );
+    }
+
+    /// A `.md` file that is no MDS module is written over as before (#425): one without
+    /// frontmatter, one whose frontmatter declares another `type`, one that declares
+    /// `type: mds` only below another key, and one with `type: mds` in its body alone.
+    /// Control for the refusal above: the same build writes each, exit 0.
+    #[test]
+    fn build_writes_over_a_markdown_file_that_is_no_mds_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.mds"), "Hello A\n").unwrap();
+        let others = [
+            ("plain.md", "notes\n"),
+            ("other.md", "---\ntype: other\n---\nO\n"),
+            ("nested.md", "---\nconfig:\n  type: mds\n---\nN\n"),
+            ("body.md", "type: mds\n"),
+        ];
+        for (name, text) in others {
+            std::fs::write(root.join(name), text).unwrap();
+            let (code, stderr) = build_in(root, &["a.mds", "-o", name]);
+            assert_eq!(code, Some(0), "build a.mds -o {name}: stderr: {stderr}");
+            assert_eq!(
+                std::fs::read_to_string(root.join(name)).unwrap(),
+                "Hello A\n",
+                "{name} is written over; stderr: {stderr}"
+            );
+        }
+        std::fs::write(root.join("a.md"), "notes\n").unwrap();
+        let (code, stderr) = build_in(root, &["a.mds"]);
+        assert_eq!(code, Some(0), "build a.mds: stderr: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.md")).unwrap(),
+            "Hello A\n"
+        );
+    }
 }
