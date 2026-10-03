@@ -1097,7 +1097,10 @@ fn file_identity(path: &Path) -> Option<PathBuf> {
 /// A relative `dir` is anchored at the working directory with [`std::path::absolute`].
 /// On Windows that also collapses `..` lexically, which is how every Win32 file call
 /// reads a path, so the walk and the write agree there too.
-fn resolve_dir_as_created(dir: &Path) -> Option<PathBuf> {
+///
+/// `mds watch` resolves its out-dir this way before each write, to tell the directory
+/// the session started with from one the path now leads to (#160).
+pub(crate) fn resolve_dir_as_created(dir: &Path) -> Option<PathBuf> {
     use std::path::Component;
 
     if let Ok(canonical) = dir.canonicalize() {

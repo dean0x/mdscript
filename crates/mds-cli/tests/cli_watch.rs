@@ -8194,3 +8194,345 @@ fn watch_rebuilds_once_when_a_dependency_outside_the_directory_changes() {
         );
     }
 }
+
+// ── The out-dir during a session: deleted, replaced, retargeted (#160) ─────────
+
+/// Every way a session writes below an out-dir — file and directory mode, each with
+/// `--out-dir out` and with `mds.json`'s `build.output_dir` naming `out` (the flag says
+/// to write that `mds.json`) — so that its outputs land in `out/` below the working
+/// directory.
+const OUT_DIR_SESSIONS: [(&[&str], bool); 4] = [
+    (&["watch", "src/a.mds", "--out-dir", "out"], false),
+    (&["watch", "src", "--out-dir", "out"], false),
+    (&["watch", "src/a.mds"], true),
+    (&["watch", "src"], true),
+];
+
+/// A working directory for an out-dir session: `src/a.mds` and `src/b.mds`, and an
+/// `mds.json` naming `out` as `build.output_dir` when `config` says so.
+fn out_dir_session_base(config: bool) -> tempfile::TempDir {
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.mds"), "A one\n").unwrap();
+    std::fs::write(src.join("b.mds"), "B one\n").unwrap();
+    if config {
+        std::fs::write(
+            base.path().join("mds.json"),
+            r#"{"build":{"output_dir":"out"}}"#,
+        )
+        .unwrap();
+    }
+    base
+}
+
+/// The names in `dir`, sorted. Unix-only, as the symlink tests that call it are.
+#[cfg(unix)]
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The refusal of a write below an out-dir that now leads elsewhere, naming the output
+/// `shown` as its status line does, squashed for comparison. Unix-only, as the symlink
+/// tests that call it are.
+#[cfg(unix)]
+fn out_dir_moved_refusal(shown: &Path) -> String {
+    squash(&format!(
+        "mds::io × cannot write {}: the output directory now resolves to a different \
+         directory; restart mds watch to follow it",
+        shown.display()
+    ))
+}
+
+/// How many times `stderr`, a session of [`OUT_DIR_SESSIONS`], says it rebuilt the
+/// output `name` below `out/` — named below the directory `mds.json` was reached by
+/// (`src/..`) when `config` says the session takes its out-dir from there.
+fn recompiled_below_out(stderr: &str, config: bool, name: &str) -> usize {
+    let out = if config {
+        Path::new("src").join("..").join("out")
+    } else {
+        Path::new("out").to_path_buf()
+    };
+    count_occurrences(
+        &squash(stderr),
+        &squash(&format!("Recompiled {} (", out.join(name).display())),
+    )
+}
+
+/// An out-dir deleted while `mds watch` runs is recreated by the next write below it,
+/// and the outputs the session wrote there are written again: a save that leaves an
+/// output unchanged rewrites it into the recreated directory rather than skipping it as
+/// written already — in directory mode another source's output, in file mode the
+/// entry's after a second deletion.
+#[test]
+fn watch_recreates_a_deleted_out_dir_and_writes_its_outputs_again() {
+    for (args, config) in OUT_DIR_SESSIONS {
+        let base = out_dir_session_base(config);
+        let base = base.path();
+        let (src, out) = (base.join("src"), base.join("out"));
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+            "{args:?}: control: the startup writes out/a.md; stderr: {}",
+            tap.text()
+        );
+
+        std::fs::remove_dir_all(&out).unwrap();
+        write_atomic(&src.join("a.mds"), "A two\n");
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A two", TIMEOUT),
+            "{args:?}: an edit after the out-dir was deleted recreates it and writes \
+             there; stderr: {}",
+            tap.text()
+        );
+
+        // What the session wrote into the deleted directory is gone with it: a save of
+        // the same bytes writes it again.
+        let (saved, text, output) = if args[1] == "src" {
+            (src.join("b.mds"), "B one\n", out.join("b.md"))
+        } else {
+            std::fs::remove_dir_all(&out).unwrap();
+            (src.join("a.mds"), "A two\n", out.join("a.md"))
+        };
+        write_atomic(&saved, text);
+        assert!(
+            wait_for_file_contains(&output, text.trim_end(), TIMEOUT),
+            "{args:?}: a save of unchanged bytes writes {} into the recreated out-dir; \
+             stderr: {}",
+            output.display(),
+            tap.text()
+        );
+
+        write_atomic(&src.join("a.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        let written = |name| recompiled_below_out(&stderr, config, name);
+        let expected = if args[1] == "src" { [1, 1] } else { [2, 0] };
+        assert_eq!(
+            [written("a.md"), written("b.md")],
+            expected,
+            "{args:?}: each output was written once into each directory it was missing \
+             from; stderr: {stderr}"
+        );
+    }
+}
+
+/// A new directory made where the out-dir was — the old one moved aside — while `mds
+/// watch` runs is the out-dir from then on: the next rebuild writes into it, and the
+/// directory moved aside keeps the output it held. On unix a save that leaves the output
+/// unchanged writes it into the new directory too; Windows tells one directory from
+/// another at the same path by its creation time alone, which file-system tunnelling
+/// may carry over to a directory made under the same name moments later.
+#[test]
+fn watch_writes_into_a_new_directory_made_in_place_of_the_out_dir() {
+    for (args, config) in OUT_DIR_SESSIONS {
+        let base = out_dir_session_base(config);
+        let base = base.path();
+        let (src, out, moved) = (base.join("src"), base.join("out"), base.join("out.old"));
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+            "{args:?}: control: the startup writes out/a.md; stderr: {}",
+            tap.text()
+        );
+
+        std::fs::rename(&out, &moved).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        let mut rebuilds = 0;
+        if cfg!(unix) {
+            write_atomic(&src.join("a.mds"), "A one\n");
+            assert!(
+                wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+                "{args:?}: a save of unchanged bytes writes out/a.md into the new \
+                 directory; stderr: {}",
+                tap.text()
+            );
+            rebuilds += 1;
+        }
+        write_atomic(&src.join("a.mds"), "A two\n");
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A two", TIMEOUT),
+            "{args:?}: an edit writes out/a.md into the new directory; stderr: {}",
+            tap.text()
+        );
+        rebuilds += 1;
+        assert_eq!(
+            std::fs::read_to_string(moved.join("a.md")).unwrap(),
+            "A one\n",
+            "{args:?}: the directory moved aside keeps its output"
+        );
+
+        write_atomic(&src.join("a.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        assert_eq!(
+            recompiled_below_out(&stderr, config, "a.md"),
+            rebuilds,
+            "{args:?}: each rebuild of a.mds wrote out/a.md once; stderr: {stderr}"
+        );
+    }
+}
+
+/// An out-dir the user named through a symlink that is retargeted while `mds watch`
+/// runs is not followed: the next write below it is refused (`mds::io`), naming the
+/// output as its status line does and saying to restart, nothing is written to the
+/// link's new target or to the directory the session started with, and watching goes
+/// on. Control: once the link leads back to that directory, an edit is written there.
+///
+/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
+    use std::os::unix::fs::symlink;
+
+    for args in [
+        &["watch", "src/x.mds", "--out-dir", "lnk"][..],
+        &["watch", "src", "--out-dir", "lnk"],
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        for name in ["src", "a", "b"] {
+            std::fs::create_dir(base.join(name)).unwrap();
+        }
+        let source = base.join("src").join("x.mds");
+        std::fs::write(&source, "X one\n").unwrap();
+        let (lnk, a_out, b) = (
+            base.join("lnk"),
+            base.join("a").join("x.md"),
+            base.join("b"),
+        );
+        symlink("a", &lnk).unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&a_out, "X one", TIMEOUT),
+            "{args:?}: control: the startup writes through the link; stderr: {}",
+            tap.text()
+        );
+
+        std::fs::remove_file(&lnk).unwrap();
+        symlink("b", &lnk).unwrap();
+        write_atomic(&source, "X two\n");
+        let refusal = out_dir_moved_refusal(&Path::new("lnk").join("x.md"));
+        let refused = poll_tap_until(&tap, TIMEOUT, |text| squash(text).contains(&refusal));
+        assert!(
+            refused.is_ok(),
+            "{args:?}: the write is refused, naming the output as typed; stderr: {refused:?}"
+        );
+        assert_eq!(
+            names_in(&b),
+            Vec::<String>::new(),
+            "{args:?}: nothing is written to the link's new target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a_out).unwrap(),
+            "X one\n",
+            "{args:?}: nor to the directory the session started with"
+        );
+
+        std::fs::remove_file(&lnk).unwrap();
+        symlink("a", &lnk).unwrap();
+        write_atomic(&source, "X three\n");
+        assert!(
+            wait_for_file_contains(&a_out, "X three", TIMEOUT),
+            "{args:?}: control: through the link led back, the session writes again; \
+             stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            names_in(&b),
+            Vec::<String>::new(),
+            "{args:?}: b stays empty"
+        );
+        drop(child);
+    }
+}
+
+/// An out-dir replaced by a symlink while `mds watch` runs — the path the user typed now
+/// leads into another directory — is refused as a retargeted one is, and nothing lands
+/// in that directory. Control: a real directory made back in its place is written into.
+///
+/// Unix-only: it makes a directory symlink; the rule itself is platform-independent.
+#[cfg(unix)]
+#[test]
+fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    for args in [
+        &["watch", "src/a.mds", "--out-dir", "out"][..],
+        &["watch", "src", "--out-dir", "out"],
+    ] {
+        let base = out_dir_session_base(false);
+        let base = base.path();
+        let (source, out, victim) = (
+            base.join("src").join("a.mds"),
+            base.join("out"),
+            base.join("victim"),
+        );
+        std::fs::create_dir(&victim).unwrap();
+        let (child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+            "{args:?}: control: the startup writes out/a.md; stderr: {}",
+            tap.text()
+        );
+
+        std::fs::remove_dir_all(&out).unwrap();
+        symlink("victim", &out).unwrap();
+        write_atomic(&source, "A two\n");
+        let refusal = out_dir_moved_refusal(&Path::new("out").join("a.md"));
+        let refused = poll_tap_until(&tap, TIMEOUT, |text| squash(text).contains(&refusal));
+        assert!(
+            refused.is_ok(),
+            "{args:?}: the write is refused, naming the output as typed; stderr: {refused:?}"
+        );
+        assert_eq!(
+            names_in(&victim),
+            Vec::<String>::new(),
+            "{args:?}: nothing is written into the directory the link leads to"
+        );
+
+        std::fs::remove_file(&out).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        write_atomic(&source, "A three\n");
+        assert!(
+            wait_for_file_contains(&out.join("a.md"), "A three", TIMEOUT),
+            "{args:?}: control: a real directory back in place is written into; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            names_in(&victim),
+            Vec::<String>::new(),
+            "{args:?}: victim stays empty"
+        );
+        drop(child);
+    }
+}

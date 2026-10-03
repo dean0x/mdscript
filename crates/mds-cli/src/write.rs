@@ -19,7 +19,9 @@
 //! resolved by path, in the form the run holds it — as typed, or, for a directory-mode
 //! `--out-dir` and the anchors `mds watch` derives from its entry or directory argument,
 //! as resolved once when the run started — so a symlinked anchor is followed (a
-//! symlinked directory argument is refused before anything is written, #413). Nothing
+//! symlinked directory argument is refused before anything is written, #413); `mds
+//! watch` refuses a write whose out-dir, as the user named it, now leads to another
+//! directory before the write is made ([`out_dir_moved`]). Nothing
 //! below it is: each directory is opened from the one above it without following a
 //! symlink, and the file is created, checked and renamed in the last one. A symlink
 //! planted below the anchor, or swapped in while the write runs, is refused (`mds::io`,
@@ -136,6 +138,18 @@ const NOT_A_REGULAR_FILE: &str = "not a regular file";
 
 /// Why [`atomic_write_file`] refuses a symlink at a directory below the anchor.
 const FOLLOW_REFUSAL: &str = "refusing to follow a symlink";
+
+/// Why a `mds watch` session refuses a write below an out-dir that now leads elsewhere.
+const OUT_DIR_MOVED: &str = "the output directory now resolves to a different directory; \
+                             restart mds watch to follow it";
+
+/// The `mds::io` refusal of a write below an out-dir whose path, as the user named it,
+/// now leads to a different directory than the one the `mds watch` session started with
+/// (#160): `cannot write <file>: …`, the file named by `target.shown`, as every failure
+/// to write it is.
+pub(crate) fn out_dir_moved(target: &WriteTarget) -> mds::MdsError {
+    io_error(&target.shown, OUT_DIR_MOVED.to_owned())
+}
 
 /// The `mds::io` error for a write that failed: `shown` — the file, or the directory below
 /// the anchor that was a symlink — escaped (#390), then the cause, escaped too.

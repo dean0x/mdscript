@@ -93,7 +93,11 @@ input. The compiler enforces several defense-in-depth controls:
   or, for `build.output_dir`, the directory that contains `mds.json` — which is
   resolved by path, so a symlinked anchor the user named is followed: as typed, or,
   for a directory-mode `--out-dir` and the anchors `mds watch` derives from its
-  entry or directory argument, as resolved once when the run starts. Nothing below it
+  entry or directory argument, as resolved once when the run starts. `mds watch`
+  writes only below the out-dir it resolved at startup: a write whose out-dir, as the
+  user named it, now leads to a different directory — a symlink retargeted, the
+  out-dir replaced by a link — is refused (`mds::io`, restart to follow it) rather
+  than followed, while a deleted out-dir is created again at the same path. Nothing below it
   is (#160): on Unix each directory below the anchor is opened from the one above
   without following a symlink (`openat` with `O_NOFOLLOW`), and the temp file is
   created (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own

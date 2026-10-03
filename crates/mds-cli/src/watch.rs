@@ -78,8 +78,8 @@ use mds::MdsError;
 
 use crate::build::{
     admit_output, auto_detect_mds_file, build_runtime_vars, compile_to_content,
-    emit_duplicate_var_warnings, load_config, resolve_output_path_for_kind, write_output,
-    CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
+    emit_duplicate_var_warnings, load_config, resolve_dir_as_created, resolve_output_path_for_kind,
+    write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, io_cause, is_partial,
@@ -963,6 +963,128 @@ impl WorkingDir {
     }
 }
 
+// ── The out-dir during a session (#160) ───────────────────────────────────────
+
+/// One directory as the filesystem tells it from another at the same path: its device
+/// and inode on unix, with its birth time where the filesystem keeps one, since a
+/// directory made where a deleted one was can be given the freed inode; its creation time
+/// alone on Windows, where std gives no file index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    created: Option<std::time::SystemTime>,
+}
+
+impl DirIdentity {
+    /// The directory at `path`, through a symlink; `None` when there is none.
+    fn of(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        let meta = std::fs::metadata(path).ok().filter(|meta| meta.is_dir())?;
+        Some(Self {
+            #[cfg(unix)]
+            dev: meta.dev(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+            created: meta.created().ok(),
+        })
+    }
+}
+
+/// What a write finds where the out-dir was ([`OutDirAnchor::check`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutDirNow {
+    /// The directory the session last saw there.
+    Unchanged,
+    /// No directory, or a different one at the same path — deleted, or another put in its
+    /// place: the write creates or uses it, and no output the session wrote is in it.
+    New,
+    /// The path the user named now leads to a different directory: the write is refused.
+    Elsewhere,
+}
+
+/// The out-dir a `mds watch` session writes below, as it was when the session started
+/// (#160): `--out-dir`, or `mds.json`'s `build.output_dir` below the directory `mds.json`
+/// is in.
+///
+/// Every write below it first resolves the path the user named again — `--out-dir` as
+/// typed, or the directory `mds.json` was reached by — as the write would create it, and
+/// compares the result with the one resolved when the session started, canonical with
+/// canonical (#408). A different directory — a symlink on the path retargeted, the out-dir
+/// replaced by a link, or the working directory a relative one is typed against moved —
+/// refuses the write: the session writes only where it started, and following the path
+/// elsewhere is for a restart to decide. The same
+/// path is written below whatever directory is there: a deleted out-dir is created again
+/// by the write, a directory put in its place is used, and either becomes the one the
+/// next write compares; none of the outputs the session wrote is in it, so the content
+/// dedup is cleared and none is skipped as written already. Nothing is held open between
+/// writes.
+struct OutDirAnchor {
+    /// The path the user named: `--out-dir` as typed, or the directory `mds.json` was
+    /// reached by.
+    typed: PathBuf,
+    /// Where `typed` led when the session started, as a write would create it.
+    resolved: PathBuf,
+    /// The directory outputs are written below: `resolved`, or `build.output_dir` below it.
+    out_dir: PathBuf,
+    /// The directory the session last saw at `out_dir`; `None` while there was none.
+    identity: Option<DirIdentity>,
+}
+
+impl OutDirAnchor {
+    /// The out-dir a session writes below, recorded once its startup writes are made:
+    /// `--out-dir`, else `build.output_dir`. `None` for neither — an output beside its
+    /// source is below the watched entry's or root's directory, which every compile
+    /// checks ([`WatchedPath::ensure_unmoved`]) — and for a working directory that does
+    /// not resolve.
+    fn record(out_dir: Option<&Path>, config: Option<&ProjectConfig>) -> Option<Self> {
+        let (typed, below) = match (out_dir, config) {
+            (Some(typed), _) => (typed.to_path_buf(), None),
+            (None, Some(project)) => (
+                project.shown_dir.clone(),
+                Some(project.config.build.output_dir.as_deref()?),
+            ),
+            (None, None) => return None,
+        };
+        let resolved = resolve_dir_as_created(&typed)?;
+        let out_dir = below.map_or_else(|| resolved.clone(), |below| resolved.join(below));
+        let identity = DirIdentity::of(&out_dir);
+        Some(Self {
+            typed,
+            resolved,
+            out_dir,
+            identity,
+        })
+    }
+
+    /// What the out-dir is now ([`OutDirNow`]). A directory that is not the one last seen
+    /// becomes the one the next check compares.
+    fn check(&mut self) -> OutDirNow {
+        if resolve_dir_as_created(&self.typed).as_ref() != Some(&self.resolved) {
+            return OutDirNow::Elsewhere;
+        }
+        let now = DirIdentity::of(&self.out_dir);
+        if now.is_some() && now == self.identity {
+            OutDirNow::Unchanged
+        } else {
+            self.identity = now;
+            OutDirNow::New
+        }
+    }
+
+    /// A write below the out-dir succeeded: the directory it created, if it found none,
+    /// is the one the next check compares.
+    fn written(&mut self) {
+        if self.identity.is_none() {
+            self.identity = DirIdentity::of(&self.out_dir);
+        }
+    }
+}
+
 // ── Watched paths ─────────────────────────────────────────────────────────────
 
 /// What a [`WatchedPath`] is: it decides how the typed form is resolved and how a
@@ -1540,6 +1662,9 @@ struct FileWatchState {
     last_written: HashMap<OutputKey, String>,
     /// Where every rebuild writes ([`OutputRoute::of`], [`OutputRoute::decide`]).
     output: OutputRoute,
+    /// The out-dir the output is written below, checked before every write; `None` for
+    /// `-o` and for an output beside the entry.
+    out_dir: Option<OutDirAnchor>,
     /// Whether the entry file was missing on the previous liveness tick.
     entry_was_missing: bool,
     /// True on the very first tick; forces a reconcile to close the startup race window.
@@ -1780,6 +1905,16 @@ fn rebuild_file(
     // The content-dedup key: where the output is written.
     let output_key = OutputKey::of(output_path.as_ref());
 
+    // The out-dir as it is now (#160): one the typed path leads elsewhere from refuses
+    // the write below; a new one holds nothing the dedup could skip.
+    let out_dir = state
+        .out_dir
+        .as_mut()
+        .map_or(OutDirNow::Unchanged, OutDirAnchor::check);
+    if out_dir == OutDirNow::New {
+        state.last_written.clear();
+    }
+
     // Content-based dedup: skip write + summary line when unchanged.
     let content_changed = state
         .last_written
@@ -1813,7 +1948,13 @@ fn rebuild_file(
     if !content_changed {
         return ControlFlow::Continue(());
     }
-    match write_session_output(output_path.as_ref(), &compiled.content, ctx.quiet, false) {
+    let written = match (out_dir, output_path.as_ref()) {
+        (OutDirNow::Elsewhere, Some(target)) => OutputWrite::Failed(Some(miette::Report::new(
+            crate::write::out_dir_moved(target),
+        ))),
+        _ => write_session_output(output_path.as_ref(), &compiled.content, ctx.quiet, false),
+    };
+    match written {
         OutputWrite::Written => {
             let elapsed = t0.elapsed().as_millis();
             let dep_count = deps.len();
@@ -1826,6 +1967,9 @@ fn rebuild_file(
                 );
             }
             state.last_written.insert(output_key, compiled.content);
+            if let Some(anchor) = &mut state.out_dir {
+                anchor.written();
+            }
         }
         // Not written: `last_written` keeps what was last written, so the next rebuild
         // writes again even when its output has not changed.
@@ -2281,6 +2425,13 @@ fn run_watch_file(
         last_mtimes,
         last_written,
         output: output_route,
+        // After the startup write, so the directory it made is the one the first rebuild
+        // compares; `-o` names its own path, which no out-dir is below.
+        out_dir: if output.is_some() {
+            None
+        } else {
+            OutDirAnchor::record(out_dir.as_deref(), config.as_ref())
+        },
         entry_was_missing,
         first_tick: true,
         missing_watched_dirs,
@@ -2368,6 +2519,9 @@ struct DirWatchState {
     known_files: BTreeSet<PathBuf>,
     /// Content-dedup map keyed by the path each output is written to (`WriteTarget.path`).
     last_written: HashMap<PathBuf, String>,
+    /// The out-dir every output is written below, checked before each write; `None` when
+    /// outputs go beside their sources.
+    out_dir: Option<OutDirAnchor>,
     /// Parent dirs of dependencies located outside the watched root.
     /// Watched NonRecursive; re-armed by liveness probe.
     external_dep_dirs: BTreeSet<PathBuf>,
@@ -2555,6 +2709,16 @@ fn compile_one_source(
             let ext = compiled.kind.extension();
             let out = output_path_for(src, watch_root.root_paths(), output_base, ext);
 
+            // The out-dir as it is now (#160): one the typed path leads elsewhere from
+            // refuses the write below; a new one holds nothing the dedup could skip.
+            let out_dir = state
+                .out_dir
+                .as_mut()
+                .map_or(OutDirNow::Unchanged, OutDirAnchor::check);
+            if out_dir == OutDirNow::New {
+                state.last_written.clear();
+            }
+
             // Content-based dedup: skip write when content unchanged.
             let content_changed = state
                 .last_written
@@ -2562,8 +2726,19 @@ fn compile_one_source(
                 .is_none_or(|prev| *prev != compiled.content);
 
             if content_changed {
-                match write_output(Some(&out), &compiled.content, quiet, false) {
+                let written = match out_dir {
+                    OutDirNow::Elsewhere => {
+                        Err(miette::Report::new(crate::write::out_dir_moved(&out)))
+                    }
+                    OutDirNow::Unchanged | OutDirNow::New => {
+                        write_output(Some(&out), &compiled.content, quiet, false)
+                    }
+                };
+                match written {
                     Ok(()) => {
+                        if let Some(anchor) = &mut state.out_dir {
+                            anchor.written();
+                        }
                         let elapsed = t0.elapsed().as_millis();
                         let dep_count = compiled.dependencies.len();
                         if !quiet {
@@ -3151,6 +3326,8 @@ fn dir_watch_startup(
         errored: HashSet::new(),
         known_files: BTreeSet::new(),
         last_written: HashMap::new(),
+        // Recorded below, once the startup writes have made the out-dir.
+        out_dir: None,
         external_dep_dirs: BTreeSet::new(),
         last_mtimes: HashMap::new(),
     };
@@ -3237,6 +3414,9 @@ fn dir_watch_startup(
             }
         }
     }
+    // The directory the startup writes made, or found, is the one the first rebuild's
+    // write compares (#160).
+    state.out_dir = OutDirAnchor::record(out_dir.as_deref(), config.as_ref());
 
     // All startup outputs are now published — the positive-control injection point.
     startup_race_probe();
@@ -4970,6 +5150,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5006,6 +5187,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5065,6 +5247,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5132,6 +5315,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5547,6 +5731,7 @@ mod tests {
             errored: HashSet::new(),
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
+            out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         }
@@ -5561,6 +5746,7 @@ mod tests {
             last_mtimes: HashMap::new(),
             last_written: HashMap::new(),
             output: OutputRoute::Decided(None),
+            out_dir: None,
             entry_was_missing: false,
             first_tick: false,
             missing_watched_dirs: BTreeSet::new(),
@@ -5724,5 +5910,137 @@ mod tests {
             |e| reported.push(e.to_string()),
         );
         assert_eq!(reported, ["broken"]);
+    }
+
+    /// An out-dir is unchanged until it goes. Deleted, it is new — no output the session
+    /// wrote is there to skip — and so is the directory a write makes in its place, which
+    /// the next check compares once [`OutDirAnchor::written`] has taken it. A directory
+    /// put in its place is new once, then the one compared (unix: Windows tells the two
+    /// apart by their creation time alone, which tunnelling can carry over).
+    #[test]
+    fn an_out_dir_deleted_or_replaced_at_its_path_is_new_once() {
+        let base = tempfile::tempdir().unwrap();
+        let out = base.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let mut anchor = OutDirAnchor::record(Some(&out), None).expect("an out-dir");
+        assert_eq!(
+            anchor.check(),
+            OutDirNow::Unchanged,
+            "the directory recorded"
+        );
+
+        std::fs::remove_dir(&out).unwrap();
+        assert_eq!(anchor.check(), OutDirNow::New, "deleted");
+        assert_eq!(anchor.check(), OutDirNow::New, "still none");
+        // The write creates the directory again.
+        std::fs::create_dir(&out).unwrap();
+        anchor.written();
+        assert_eq!(
+            anchor.check(),
+            OutDirNow::Unchanged,
+            "the directory the write made"
+        );
+
+        if cfg!(unix) {
+            std::fs::rename(&out, base.path().join("out.old")).unwrap();
+            std::fs::create_dir(&out).unwrap();
+            assert_eq!(
+                anchor.check(),
+                OutDirNow::New,
+                "another directory in its place"
+            );
+            assert_eq!(
+                anchor.check(),
+                OutDirNow::Unchanged,
+                "then the one compared"
+            );
+        }
+    }
+
+    /// An out-dir named through a symlink is elsewhere once the link leads to another
+    /// directory — one that is there, or one a write would create there — or nowhere, and
+    /// is itself again once the link leads back: a check never takes the other directory
+    /// as the one it compares.
+    #[cfg(unix)]
+    #[test]
+    fn an_out_dir_the_typed_path_leads_away_from_is_elsewhere() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            std::fs::create_dir(base.path().join(name)).unwrap();
+        }
+        let link = base.path().join("link");
+        symlink("a", &link).unwrap();
+        let mut anchor = OutDirAnchor::record(Some(&link), None).expect("an out-dir");
+        // `link/out` is not there yet: the write would create it in `a`.
+        let mut below = OutDirAnchor::record(Some(&link.join("out")), None).expect("an out-dir");
+        assert_eq!(anchor.check(), OutDirNow::Unchanged);
+        assert_eq!(below.check(), OutDirNow::New, "none yet");
+
+        let retarget = |to: &str| {
+            std::fs::remove_file(&link).unwrap();
+            symlink(to, &link).unwrap();
+        };
+        retarget("b");
+        assert_eq!(
+            anchor.check(),
+            OutDirNow::Elsewhere,
+            "a directory that is there"
+        );
+        assert_eq!(
+            below.check(),
+            OutDirNow::Elsewhere,
+            "one a write would create"
+        );
+        retarget("nowhere");
+        assert_eq!(
+            anchor.check(),
+            OutDirNow::Elsewhere,
+            "a link that leads nowhere"
+        );
+
+        retarget("a");
+        assert_eq!(anchor.check(), OutDirNow::Unchanged, "led back");
+        assert_eq!(below.check(), OutDirNow::New, "led back, still none");
+    }
+
+    /// `build.output_dir` is checked below the directory `mds.json` was reached by, the
+    /// path compared; `--out-dir` takes precedence over it, as it does for the output
+    /// base, and with neither, or a configuration without `build.output_dir`, there is no
+    /// out-dir to check.
+    #[test]
+    fn a_build_output_dir_is_checked_below_the_directory_of_mds_json() {
+        use crate::build::{BuildConfig, MdsConfig};
+
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().canonicalize().unwrap();
+        let config = |output_dir: Option<&str>| ProjectConfig {
+            config: MdsConfig {
+                build: BuildConfig {
+                    output_dir: output_dir.map(str::to_owned),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            dir: dir.clone(),
+            shown_dir: base.path().to_path_buf(),
+        };
+        let dist = config(Some("dist"));
+        std::fs::create_dir(dir.join("dist")).unwrap();
+        let mut anchor = OutDirAnchor::record(None, Some(&dist)).expect("an out-dir");
+        assert_eq!(
+            (&anchor.typed, &anchor.out_dir),
+            (&base.path().to_path_buf(), &dir.join("dist"))
+        );
+        assert_eq!(anchor.check(), OutDirNow::Unchanged);
+        std::fs::remove_dir(dir.join("dist")).unwrap();
+        assert_eq!(anchor.check(), OutDirNow::New, "deleted below it");
+
+        let flag = base.path().join("flag");
+        let chosen = OutDirAnchor::record(Some(&flag), Some(&dist)).expect("an out-dir");
+        assert_eq!(chosen.out_dir, dir.join("flag"), "--out-dir first");
+        assert!(OutDirAnchor::record(None, Some(&config(None))).is_none());
+        assert!(OutDirAnchor::record(None, None).is_none());
     }
 }
