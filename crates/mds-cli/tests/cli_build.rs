@@ -1716,8 +1716,9 @@ fn check_unknown_lint_rule_in_mds_json_emits_no_warning() {
 /// when `mds.json` names a lint rule that does not exist.
 ///
 /// `mds fmt <DIR>` calls `load_config` (fmt.rs:308) and thus follows the same
-/// code path as `mds build` and `watch.rs:822`.  A passing test proves
-/// `load_config` returns `Ok` for configs with unknown rule names.
+/// code path as `mds build` and the startup of `mds watch` (watch.rs
+/// `file_startup::startup_compile` and `dir_startup::arm_pre_read`).  A passing test
+/// proves `load_config` returns `Ok` for configs with unknown rule names.
 /// Note: `mds fmt <FILE>` does NOT call `load_config`; only the directory target
 /// exercises this code path.
 /// Non-vacuity (ADR-009 / PF-013): a positive-control arm confirms that an
