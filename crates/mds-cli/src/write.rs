@@ -93,9 +93,12 @@
 //! module or an input is refused, the write leaves no temporary file, and the file is left
 //! as it is. A symlink put there by then is replaced, never written through, as for every
 //! write; a module or an input put there in the instant between that look and the rename
-//! is replaced too. Windows looks and reads by path, as its write goes, and compares the
-//! canonical paths of the target and of each input, since std gives no file index there: a
-//! hard link to an input is another path, and is written over by the rename.
+//! is replaced too. Windows looks and reads by path, as its write goes, judges the target
+//! by the name of the file it opens — less the dots and spaces it ends in, which Windows
+//! drops, so `lib.md.` and `lib.md ` are `lib.md` — and compares the canonical paths of
+//! the target and of each input, since std gives no file index there: a hard link to an
+//! input is another path, and is written over by the rename; a target whose canonical
+//! path cannot be had, but that is not gone, is refused, as a look that fails is on unix.
 //!
 //! # Over the caller's own file, or as a new one (#160)
 //!
@@ -780,6 +783,21 @@ fn names_source(name: &OsStr) -> bool {
     Path::new(name)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("mds"))
+}
+
+/// `name`, the last component of a path, as code units — UTF-16 on Windows — less the
+/// dots and spaces it ends in, which Windows drops from the last component of a path it
+/// opens: there `lib.md.` and `lib.md ` are the file `lib.md`, so the name a write is
+/// judged by is this one (#425). A name of nothing but dots and spaces is kept whole.
+#[cfg(any(windows, test))]
+fn as_windows_opens<T: Copy + Into<u32>>(name: &[T]) -> &[T] {
+    match name
+        .iter()
+        .rposition(|&unit| !matches!(unit.into(), 0x2E | 0x20))
+    {
+        Some(last) => &name[..=last],
+        None => name,
+    }
 }
 
 /// Whether `file`, opened at a `.md` file's name ([`names_markdown`]) of `size` bytes, is
@@ -1541,7 +1559,9 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
+    use std::ffi::OsString;
     use std::io::Write as _;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
@@ -1797,7 +1817,7 @@ mod windows {
         if !module && is_a_module(target)? {
             return Err(Failure::Module);
         }
-        if is_an_input(inputs, target) {
+        if is_an_input(inputs, target)? {
             return Err(Failure::Input);
         }
         Ok(())
@@ -1805,30 +1825,43 @@ mod windows {
 
     /// Whether `target` is one of `inputs`, by canonical path: std gives no file index on
     /// Windows, so a hard link to an input — another path — is not one (the residual the
-    /// module docs describe).
-    fn is_an_input(inputs: &Inputs, target: &Path) -> bool {
-        let Ok(target) = std::fs::canonicalize(target) else {
-            return false;
+    /// module docs describe). A target gone since the look is none — nothing to replace —
+    /// and one whose canonical path cannot be had otherwise is an error, which refuses the
+    /// write, as a look that fails does on unix.
+    fn is_an_input(inputs: &Inputs, target: &Path) -> Result<bool, Failure> {
+        let target = match std::fs::canonicalize(target) {
+            Ok(target) => target,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
         };
-        inputs
+        Ok(inputs
             .files
             .iter()
-            .any(|file| std::fs::canonicalize(file).is_ok_and(|file| file == target))
+            .any(|file| std::fs::canonicalize(file).is_ok_and(|file| file == target)))
     }
 
-    /// Whether `target`, a regular file a moment ago, is an MDS module (#425): a `.mds` file
-    /// by its name alone ([`super::names_source`]), never read; a `.md` file
-    /// ([`super::names_markdown`]) opened and read by path, that [`super::is_mds_module`]
-    /// takes for one. Any other name is none, and so is a `.md` file gone since; a `.md`
-    /// file that cannot be opened or read is [`Failure::UnreadMarkdown`].
+    /// The name of the file `target` opens: its last component less the dots and spaces
+    /// it ends in, which Windows drops ([`super::as_windows_opens`]) — so `-o "lib.md."`
+    /// and `-o "lib.md "`, which write `lib.md`, are judged as `lib.md` (#425).
+    fn opened_name(target: &Path) -> Option<OsString> {
+        let name: Vec<u16> = target.file_name()?.encode_wide().collect();
+        Some(OsString::from_wide(super::as_windows_opens(&name)))
+    }
+
+    /// Whether `target`, a regular file a moment ago, is an MDS module (#425), by the name
+    /// of the file it opens ([`opened_name`]): a `.mds` file by its name alone
+    /// ([`super::names_source`]), never read; a `.md` file ([`super::names_markdown`])
+    /// opened and read by path, that [`super::is_mds_module`] takes for one. Any other name
+    /// is none, and so is a `.md` file gone since; a `.md` file that cannot be opened or
+    /// read is [`Failure::UnreadMarkdown`].
     fn is_a_module(target: &Path) -> Result<bool, Failure> {
-        let Some(name) = target.file_name() else {
+        let Some(name) = opened_name(target) else {
             return Ok(false);
         };
-        if super::names_source(name) {
+        if super::names_source(&name) {
             return Ok(true);
         }
-        if !super::names_markdown(name) {
+        if !super::names_markdown(&name) {
             return Ok(false);
         }
         let judge = || -> std::io::Result<bool> {
@@ -3151,6 +3184,66 @@ mod tests {
             std::fs::read_to_string(path("locked.mds")).unwrap(),
             "Hello\n"
         );
+    }
+
+    /// A name is judged as Windows opens it (#425): less the dots and spaces it ends in,
+    /// which Windows drops from a path's last component, so `lib.md.` and `lib.md ` are
+    /// `lib.md` — in bytes and in UTF-16 units alike. Controls: a name that ends in neither
+    /// is kept as it is, a dot or space inside it is kept, and a name of nothing but dots
+    /// and spaces is kept whole.
+    #[test]
+    fn a_name_is_judged_without_the_dots_and_spaces_windows_drops() {
+        let trimmed = |name: &str| as_windows_opens(name.as_bytes()).to_vec();
+        for (name, opens) in [
+            ("lib.md.", "lib.md"),
+            ("lib.md ", "lib.md"),
+            ("lib.md. .", "lib.md"),
+            ("lib.mds...", "lib.mds"),
+            ("lib.md", "lib.md"),
+            ("a. b.md", "a. b.md"),
+            ("...", "..."),
+            (". ", ". "),
+            ("", ""),
+        ] {
+            assert_eq!(trimmed(name), opens.as_bytes(), "{name:?}");
+        }
+        let wide: Vec<u16> = "lib.md .".encode_utf16().collect();
+        let expected: Vec<u16> = "lib.md".encode_utf16().collect();
+        assert_eq!(as_windows_opens(&wide), expected.as_slice(), "UTF-16");
+    }
+
+    /// On Windows an output's target is judged as the file it opens (#425): `m.md.` and
+    /// `m.md ` write `m.md`, a module, and are refused, named as typed, and `lib.mds.` is
+    /// the source `lib.mds`, refused too; each is left as it is. Control: `plain.md.` writes
+    /// `plain.md`, which is no module.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_name_ending_in_dots_or_spaces_is_judged_as_the_file_it_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let write = |name: &str| {
+            write_compiled(
+                &WriteTarget::new(path(name), PathBuf::from(name)),
+                "X",
+                &Inputs::default(),
+            )
+            .map_err(|e| e.to_string())
+        };
+        let module = "---\ntype: mds\n---\nM\n";
+        std::fs::write(path("m.md"), module).unwrap();
+        std::fs::write(path("lib.mds"), "Hello\n").unwrap();
+        std::fs::write(path("plain.md"), "notes\n").unwrap();
+        for name in ["m.md.", "m.md ", "lib.mds."] {
+            assert_eq!(
+                write(name),
+                Err(format!("cannot write {name}: {MODULE_REFUSAL}")),
+                "{name:?}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(path("m.md")).unwrap(), module);
+        assert_eq!(std::fs::read_to_string(path("lib.mds")).unwrap(), "Hello\n");
+        assert_eq!(write("plain.md."), Ok(()), "control");
+        assert_eq!(std::fs::read_to_string(path("plain.md")).unwrap(), "X");
     }
 
     /// Each step of a new file's commit puts the file where nothing is, and never over a
