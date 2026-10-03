@@ -5039,9 +5039,9 @@ mod dir_startup {
 
 /// Process a batch of changed `.mds` paths in directory mode.
 ///
-/// Thin dispatcher: delegates to `process_dir_batch_vars_changed` when all
-/// known files must be recompiled (vars file changed), or to
-/// `process_dir_batch_incremental` for a normal seed-and-propagate pass.
+/// Thin dispatcher: delegates to `process_dir_batch_vars_changed` when every source
+/// must be recompiled (vars file changed) — the known ones and those the batch names —
+/// or to `process_dir_batch_incremental` for a normal seed-and-propagate pass.
 ///
 /// Called by both the event path and the reconcile path so the same state
 /// transitions apply uniformly.
@@ -5062,7 +5062,7 @@ fn process_dir_batch(
     state: &mut DirWatchState,
 ) -> bool {
     let any_changed = if vars_changed {
-        process_dir_batch_vars_changed(watch_root, output_base, runtime_vars, quiet, state)
+        process_dir_batch_vars_changed(changed, watch_root, output_base, runtime_vars, quiet, state)
     } else {
         process_dir_batch_incremental(changed, watch_root, output_base, runtime_vars, quiet, state)
     };
@@ -5081,7 +5081,20 @@ fn process_dir_batch(
     any_changed
 }
 
-/// Full recompile of all known files triggered by a vars-file change.
+/// Whether `path`, which a directory batch names, is a source of the watch below `root`: a
+/// `.mds` file there, outside the directories the walk skips — what a full walk would
+/// find (#380). A dependency the batch names, an in-root module that is no `.mds` file
+/// included, is none.
+fn names_a_source(root: &Path, path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "mds")
+        && path.starts_with(root)
+        && !is_within_default_excluded_dir(root, path)
+}
+
+/// Full recompile of every source triggered by a vars-file change: the known ones, and
+/// those `changed` names that no walk has found ([`names_a_source`]) — one created in the
+/// same batch, or in a batch held with it, which is then known as the walk's are (#380).
+/// A dependency `changed` names is recompiled through its importers, which all are.
 ///
 /// Recomputes the entire forward-deps graph, external-dep-dirs, and errored set
 /// from scratch (prunes stale entries left over from deleted sources).
@@ -5097,17 +5110,24 @@ fn process_dir_batch(
 /// Returns `true` when at least one source in the batch produced an observable,
 /// content-changed rebuild (see `compile_one_source`).
 fn process_dir_batch_vars_changed(
+    changed: &BTreeSet<PathBuf>,
     watch_root: &WatchedPath,
     output_base: &OutputBase,
     runtime_vars: &Option<HashMap<String, mds::Value>>,
     quiet: bool,
     state: &mut DirWatchState,
 ) -> bool {
+    let root = watch_root.canonical.as_path();
     let mut any_changed = false;
-    let all_sources: Vec<PathBuf> = state.known_files.iter().cloned().collect();
+    let all_sources: BTreeSet<PathBuf> = state
+        .known_files
+        .iter()
+        .chain(changed.iter().filter(|path| names_a_source(root, path)))
+        .cloned()
+        .collect();
 
-    // Determine which known sources no longer exist — their outputs are retired just as
-    // in the incremental deletion step (step 5), by the same rule (#160).
+    // Determine which of them no longer exist — their outputs are retired just as in the
+    // incremental deletion step (step 5), by the same rule (#160).
     for del_src in all_sources.iter().filter(|p| !p.exists()) {
         state.retire_deleted(del_src, quiet);
     }
@@ -7316,6 +7336,96 @@ mod tests {
              last_written entry; keys: {:?}",
             state.last_written.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// #380: a batch whose `--vars` file changed recompiles every known source, and also
+    /// compiles the sources it names that no walk has found — one created in the same
+    /// batch, or held with it — which are then known, and in the baseline. A path the
+    /// batch names that is no source below the root is not compiled as one.
+    #[test]
+    fn a_vars_changed_batch_compiles_the_sources_created_in_it() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // Canonical, as every path a batch carries is (macOS tempdirs are below a symlink).
+        let canonical = |dir: &tempfile::TempDir| std::fs::canonicalize(dir.path()).unwrap();
+        let (root, out) = (canonical(&root_dir), canonical(&out_dir));
+        let known = root.join("known.mds");
+        let created = root.join("created.mds");
+        // An in-root MDS module a source could import: it compiles, but is no source.
+        let not_a_source = root.join("notes.md");
+        let excluded = root.join("node_modules").join("dep.mds");
+        let outside = canonical(&elsewhere).join("outside.mds");
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        for (path, text) in [
+            (&known, "Known.\n"),
+            (&created, "Created.\n"),
+            (&not_a_source, "---\ntype: mds\nname: notes\n---\nNotes.\n"),
+            (&excluded, "Excluded.\n"),
+            (&outside, "Outside.\n"),
+        ] {
+            std::fs::write(path, text).unwrap();
+        }
+        let mut state = empty_dir_state();
+        state.known_files.insert(known.clone());
+
+        let changed: BTreeSet<PathBuf> = [&created, &not_a_source, &excluded, &outside]
+            .into_iter()
+            .cloned()
+            .collect();
+        process_dir_batch(
+            &changed,
+            true,
+            &WatchedPath {
+                typed: root.clone(),
+                canonical: root.clone(),
+                what: Watched::Root,
+            },
+            &dir_base(out.clone()),
+            &None,
+            true,
+            &mut state,
+        );
+
+        let read = |rel: &Path| std::fs::read_to_string(out.join(rel)).ok();
+        assert!(
+            read(Path::new("known.md")).is_some_and(|text| text.contains("Known.")),
+            "positive control: a known source is recompiled; out/known.md: {:?}",
+            read(Path::new("known.md"))
+        );
+        assert!(
+            read(Path::new("created.md")).is_some_and(|text| text.contains("Created.")),
+            "a source created in the batch is compiled with it; out/created.md: {:?}",
+            read(Path::new("created.md"))
+        );
+        assert!(
+            state.known_files.contains(&created) && state.last_mtimes.contains_key(&created),
+            "and is known and in the baseline, so a later edit or the idle tick finds it; \
+             known: {:?}",
+            state.known_files
+        );
+        // Where each would be written had it been compiled as a source.
+        for rel in [
+            PathBuf::from("notes.md"),
+            Path::new("node_modules").join("dep.md"),
+            PathBuf::from("outside.md"),
+        ] {
+            assert_eq!(
+                read(&rel),
+                None,
+                "{}: a path that is no source below the root is not compiled as one",
+                rel.display()
+            );
+        }
+        for path in [&not_a_source, &excluded, &outside] {
+            assert!(
+                !state.known_files.contains(path) && !state.errored.contains(path),
+                "{}: neither known nor errored; known: {:?}, errored: {:?}",
+                path.display(),
+                state.known_files,
+                state.errored
+            );
+        }
     }
 
     /// #265: a source under the root is compiled by the root as typed plus its path

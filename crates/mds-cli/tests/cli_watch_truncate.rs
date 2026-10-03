@@ -557,6 +557,45 @@ fn dir_mode_held_truncate_defers_the_whole_batch() {
     }
 }
 
+/// A source created while another is held empty is compiled when the hold ends, though a
+/// batch held with it changed the `--vars` file: the batch that ends the hold recompiles
+/// every source, the ones created during the hold included.
+#[test]
+fn dir_mode_a_source_created_during_a_hold_is_compiled_with_a_vars_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let a = root.join("a.mds");
+    std::fs::write(&a, "A {{v}}\n").unwrap();
+    let out = dir.path().join("out");
+    let (a_out, new_out) = (out.join("a.md"), out.join("new.md"));
+
+    let (_child, _tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .arg("--vars")
+            .arg(&vars)
+            // No idle tick: its first full walk would find the new source whatever the
+            // batch did.
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    OutputLog::default().wait_for(&a_out, "A one", TIMEOUT);
+
+    // a.mds emptied and left so: every batch is held until the deadline, which compiles
+    // the files as they are.
+    std::fs::write(&a, "").unwrap();
+    std::fs::write(root.join("new.mds"), "New {{v}}\n").unwrap();
+    write_atomic(&vars, r#"{"v": "two"}"#);
+
+    OutputLog::default().wait_for(&new_out, "New two", EMPTY_HOLD_DEADLINE + TIMEOUT);
+}
+
 // ── The deadline ────────────────────────────────────────────────────────────
 
 /// Truncate the entry and close it without writing: the empty output IS published —

@@ -1380,6 +1380,53 @@ fn watch_dir_mode_vars_change_recompiles_all() {
     drop(child);
 }
 
+/// #380: a source created in the same debounce window as a `--vars` edit is compiled by
+/// that batch — which recompiles every known source — and not left unbuilt because no
+/// walk had found it yet.
+#[test]
+fn watch_dir_mode_compiles_a_source_created_with_a_vars_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.mds"), "A {{v}}\n").unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let out = dir.path().join("out");
+
+    let (child, _stderr_tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .arg("--vars")
+            .arg(&vars)
+            // One window for both edits below, made a moment apart; no idle tick, whose
+            // first full walk would find the new source whatever the batch did.
+            .args(["--debounce", "300", "--poll-interval", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+        "a.md is written at startup"
+    );
+
+    std::fs::write(root.join("new.mds"), "New {{v}}\n").unwrap();
+    write_atomic(&vars, r#"{"v": "two"}"#);
+
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "A two", TIMEOUT),
+        "positive control: the vars edit recompiles the known source"
+    );
+    assert!(
+        wait_for_file_contains(&out.join("new.md"), "New two", TIMEOUT),
+        "the source created with the vars edit is compiled; new.md: {:?}",
+        std::fs::read_to_string(out.join("new.md")).ok()
+    );
+
+    drop(child);
+}
+
 // ── AC-A5: Quiet mode keeps compile errors visible ────────────────────────
 
 /// Under `-q`, compile errors must still appear on stderr; the watcher stays alive.
