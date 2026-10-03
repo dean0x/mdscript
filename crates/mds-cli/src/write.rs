@@ -183,18 +183,7 @@ pub(crate) fn atomic_write_file(
     durability: Durability,
     parents: Parents,
 ) -> std::result::Result<(), mds::MdsError> {
-    let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
-    let anchor = target.checked_anchor();
-    let commit = Commit::Replace(None);
-    imp::write(
-        &below,
-        anchor,
-        content.as_bytes(),
-        durability,
-        parents,
-        commit,
-    )
-    .map_err(|failure| worded(target, failure))
+    write_below_anchor(target, content, durability, parents, Commit::Replace(None))
 }
 
 /// Write `content` to `target` as [`atomic_write_file`] does, but only as a new file
@@ -215,6 +204,18 @@ pub(crate) fn create_new(
     durability: Durability,
     parents: Parents,
 ) -> std::result::Result<(), mds::MdsError> {
+    write_below_anchor(target, content, durability, parents, Commit::New)
+}
+
+/// [`atomic_write_file`] and [`create_new`] share this: resolve `target` below its anchor,
+/// then write through it as `commit` says, wording any failure as the write's own.
+fn write_below_anchor(
+    target: &WriteTarget,
+    content: &str,
+    durability: Durability,
+    parents: Parents,
+    commit: Commit<&imp::Stamp>,
+) -> std::result::Result<(), mds::MdsError> {
     let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
     let anchor = target.checked_anchor();
     imp::write(
@@ -223,7 +224,7 @@ pub(crate) fn create_new(
         content.as_bytes(),
         durability,
         parents,
-        Commit::New,
+        commit,
     )
     .map_err(|failure| worded(target, failure))
 }
