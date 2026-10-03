@@ -7229,7 +7229,8 @@ fn watch_dir_failed_startup_write_is_retried_on_the_next_rebuild() {
 /// watched directory, which the edit whose write failed began to import, rebuilds the
 /// source. The rebuild used to keep the dependencies of the compile before it, so that
 /// file's directory was never watched and its edits were never seen. `--poll-interval
-/// 100`: the idle tick arms a new dependency's directory and compares what it holds.
+/// 100`: should the edit below land before the failed rebuild has armed the new
+/// dependency's directory, the idle tick compares what the file holds.
 #[test]
 fn watch_dir_failed_rebuild_write_keeps_the_compiled_dependencies() {
     let base = tempfile::tempdir().unwrap();
@@ -8197,6 +8198,163 @@ fn watch_rebuilds_once_when_a_dependency_outside_the_directory_changes() {
             "{args:?}: a dependency outside the directory has no output"
         );
     }
+}
+
+/// A dependency outside the directory argument that no startup compile reported — an
+/// edit adds the `@import` — has its directory watched from the rebuild that first
+/// reports it: an edit to the dependency then rebuilds its importer, with native events
+/// only, so no idle tick can arm the directory later (#257). A second edit to the entry,
+/// after the one that adds the import, is the barrier: the session rebuilds one change
+/// at a time, so once its output is written the rebuild before it has finished.
+#[test]
+fn watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("shared")).unwrap();
+        std::fs::write(base.join("shared/y.mds"), "Y one\n").unwrap();
+        std::fs::write(base.join("src/a.mds"), "A alone\n").unwrap();
+        let (entry, output) = (
+            base.join("src").join("a.mds"),
+            base.join("src").join("a.md"),
+        );
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base)
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&output, "A alone", TIMEOUT),
+            "{args:?}: control: the startup writes src/a.md; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&entry, "@import \"../shared/y.mds\" as y\n@include y\n");
+        assert!(
+            wait_for_file_contains(&output, "Y one", TIMEOUT),
+            "{args:?}: control: the edit that adds the import rebuilds; stderr: {}",
+            tap.text()
+        );
+        write_atomic(
+            &entry,
+            "@import \"../shared/y.mds\" as y\n@include y\nBarrier\n",
+        );
+        assert!(
+            wait_for_file_contains(&output, "Barrier", TIMEOUT),
+            "{args:?}: control: the barrier edit rebuilds; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&base.join("shared").join("y.mds"), "Y two\n");
+        assert!(
+            wait_for_file_contains(&output, "Y two", TIMEOUT),
+            "{args:?}: an edit to a dependency a rebuild first imported rebuilds its \
+             importer with native events only; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&entry, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        assert_eq!(
+            count_occurrences(&stderr, "Recompiled "),
+            3,
+            "{args:?}: three edits that change the output, three rebuilds; stderr: {stderr}"
+        );
+    }
+}
+
+/// A dependency directory outside the directory argument whose watch failed at startup is
+/// not taken for armed: once it can be watched, the next rebuild arms it, and an edit to
+/// the dependency then rebuilds its importer, with native events only (#257). The
+/// directory is left searchable but not readable while the session starts: the compile
+/// still reaches the file in it, and inotify refuses to watch it. Barrier as in
+/// [`watch_arms_the_directory_of_a_dependency_a_rebuild_first_imports`].
+///
+/// Linux only: FSEvents and Windows watch a directory the user cannot read, so no watch
+/// fails there. Skipped as root, whom no permission refuses.
+#[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "only inotify refuses to watch a directory the user cannot read"
+)]
+#[test]
+fn watch_retries_a_dependency_directory_whose_startup_watch_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root, whom no directory permission refuses");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path();
+    std::fs::write(base.join(".mdsroot"), "").unwrap();
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    let shared = base.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("y.mds"), "Y one\n").unwrap();
+    let import = "@import \"../shared/y.mds\" as y\n@include y\n";
+    let (entry, output) = (
+        base.join("src").join("a.mds"),
+        base.join("src").join("a.md"),
+    );
+    std::fs::write(&entry, import).unwrap();
+    // Outside the directory argument, the directory is named by the path the compile
+    // reports for it: its canonical one.
+    let refused = format!(
+        "warning: failed to watch external dep dir {}: ",
+        shared.canonicalize().unwrap().display()
+    );
+
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o100)).unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base)
+            .args(["watch", "src", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Control: the startup could not watch the directory.
+    wait_for_tap(&tap, &refused, TIMEOUT);
+    assert!(
+        wait_for_file_contains(&output, "Y one", TIMEOUT),
+        "control: the startup compile read the dependency; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&entry, format!("{import}Barrier\n"));
+    assert!(
+        wait_for_file_contains(&output, "Barrier", TIMEOUT),
+        "control: the barrier edit rebuilds; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&shared.join("y.mds"), "Y two\n");
+    assert!(
+        wait_for_file_contains(&output, "Y two", TIMEOUT),
+        "an edit to a dependency whose directory could not be watched at startup, and now \
+         can, rebuilds its importer with native events only; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&entry, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        count_occurrences(&stderr, &refused),
+        1,
+        "the startup's refusal only — the retry arms the directory; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, "Recompiled "),
+        2,
+        "two edits that change the output, two rebuilds; stderr: {stderr}"
+    );
 }
 
 // ── The out-dir during a session: deleted, replaced, retargeted (#160) ─────────

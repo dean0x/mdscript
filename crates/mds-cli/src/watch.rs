@@ -2521,6 +2521,21 @@ fn vars_dir_paths<'a>(
     })
 }
 
+/// In directory mode, the `--vars` file's directory armed on its own, outside the root, in
+/// the two forms a message names it by ([`shown_watched_dir`]): the canonical directory
+/// armed, and the file's directory as typed.
+fn extra_vars_dir<'a>(
+    vars_dir_extra: Option<&'a Path>,
+    vars_path_typed: Option<&'a Path>,
+) -> Option<RootPaths<'a>> {
+    vars_dir_extra
+        .zip(vars_path_typed)
+        .map(|(walked, typed)| RootPaths {
+            typed: mds::effective_parent(typed),
+            walked,
+        })
+}
+
 /// Single-file watch: `entry.typed` is the path as typed — the entry is compiled by it
 /// (#417), `mds.json` is looked up from it at startup (#413), and every status line
 /// names the entry and its output by it (#390), so they name the files as the user
@@ -3593,6 +3608,58 @@ struct DirWatchCtx {
     quiet: bool,
 }
 
+/// Arm each of `dirs` — directories of dependencies outside the root — that `armed` does
+/// not hold yet, with `watch`, and add it to `armed` once its watch is in place (#257).
+/// One whose watch fails is reported, named through [`shown_watched_dir`] with `root` and
+/// `vars`, and is left out of `armed`, so the next rebuild and the liveness tick arm it
+/// again: `armed` holds only directories the watcher holds.
+fn arm_external_dep_dirs<'a>(
+    dirs: impl IntoIterator<Item = &'a PathBuf>,
+    armed: &mut BTreeSet<PathBuf>,
+    mut watch: impl FnMut(&Path) -> notify::Result<()>,
+    root: RootPaths<'_>,
+    vars: Option<RootPaths<'_>>,
+) {
+    for dir in dirs {
+        if armed.contains(dir) {
+            continue;
+        }
+        match watch(dir) {
+            Ok(()) => {
+                armed.insert(dir.clone());
+            }
+            Err(e) => eprint_warning(&format!(
+                "warning: failed to watch external dep dir {}: {}",
+                safe_path(&shown_watched_dir(dir, root, vars)),
+                safe_inline(notify_cause(&e))
+            )),
+        }
+    }
+}
+
+/// Once a rebuild has run, arm the directories of the dependencies outside the root that
+/// are not armed — one its compile reported first, and one whose earlier watch failed — so
+/// an edit in one rebuilds at once, not only at an idle tick, which `--poll-interval 0`
+/// never runs (#257). A directory that does not exist is left to the liveness tick, which
+/// arms it when it reappears.
+fn arm_external_dirs_after_rebuild(
+    ctx: &DirWatchCtx,
+    watcher: &mut RecommendedWatcher,
+    liveness: &mut LivenessState,
+    state: &DirWatchState,
+) {
+    arm_external_dep_dirs(
+        state.external_dep_dirs.iter().filter(|dir| dir.exists()),
+        &mut liveness.armed_external_dirs,
+        |dir| watcher.watch(dir, RecursiveMode::NonRecursive),
+        ctx.root.root_paths(),
+        extra_vars_dir(
+            ctx.vars_dir_extra.as_deref(),
+            ctx.vars_path_typed.as_deref(),
+        ),
+    );
+}
+
 /// Run the idle-tick liveness probe for directory mode (reconcile rule, DD1).
 ///
 /// Re-arms root + external dirs + vars dir. Applies edge-triggered recovery
@@ -3753,6 +3820,7 @@ fn liveness_probe_dir(
         // content-changed gate, and one logical edit observed by both paths still warns
         // once — tests I17 and I19.
         rebuild_dir_batch(ctx, &batch, false /* vars_changed */, state);
+        arm_external_dirs_after_rebuild(ctx, watcher, liveness, state);
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
     // post-batch tracked set, and an empty batch means nothing appeared, was removed, or
@@ -3953,7 +4021,7 @@ fn run_watch_dir(root: WatchedPath, args: SessionArgs) -> Result<()> {
 mod dir_startup {
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::ops::ControlFlow;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -3966,11 +4034,12 @@ mod dir_startup {
     };
     use crate::output::{
         collect_mds_files, eprint_warning, is_partial, notify_cause, output_path_for, safe_inline,
-        safe_path, OutputBase, RootPaths,
+        safe_path, OutputBase,
     };
 
     use super::{
-        baseline_path, canonicalize_vars_path, graph_key, graph_keys, handle_fs_event_dir, live,
+        arm_external_dep_dirs, arm_external_dirs_after_rebuild, baseline_path,
+        canonicalize_vars_path, extra_vars_dir, graph_key, graph_keys, handle_fs_event_dir, live,
         liveness_probe_dir, resolve_output_base, settle_startup_error, shown_watched_dir,
         snapshot_state, startup_race_probe, DirEventOutcome, DirWatchCtx, DirWatchState, FileStamp,
         LivenessState, Msg, OutDirAnchor, SessionArgs, StampMap, StartupInto, StopReason,
@@ -4040,21 +4109,6 @@ mod dir_startup {
         watcher: RecommendedWatcher,
         state: DirWatchState,
         liveness: LivenessState,
-    }
-
-    /// The `--vars` file's directory armed on its own, outside the root, in the two forms a
-    /// message names it by ([`shown_watched_dir`]): the canonical directory armed, and the
-    /// file's directory as typed.
-    fn extra_vars_dir<'a>(
-        vars_dir_extra: Option<&'a Path>,
-        vars_path_typed: Option<&'a Path>,
-    ) -> Option<RootPaths<'a>> {
-        vars_dir_extra
-            .zip(vars_path_typed)
-            .map(|(walked, typed)| RootPaths {
-                typed: mds::effective_parent(typed),
-                walked,
-            })
     }
 
     /// Record the working directory, load `mds.json`, check the `--vars` file and the
@@ -4389,20 +4443,16 @@ mod dir_startup {
         // predates the read — the idle tick's content backstop compares against it and
         // recompiles (#321). `MDS_WATCH_READY` still marks the instant both detectors
         // cover every path, so tests can synchronise on arming rather than on a tick.
-        let vars_dir = extra_vars_dir(vars_dir_extra.as_deref(), vars_path_typed.as_deref());
-        for ext_dir in &state.external_dep_dirs {
-            if let Err(e) = watcher.watch(ext_dir, RecursiveMode::NonRecursive) {
-                eprint_warning(&format!(
-                    "warning: failed to watch external dep dir {}: {}",
-                    safe_path(&shown_watched_dir(
-                        ext_dir,
-                        watch_root.root_paths(),
-                        vars_dir
-                    )),
-                    safe_inline(notify_cause(&e))
-                ));
-            }
-        }
+        // Only a directory whose watch is in place is held as armed: one whose watch
+        // failed is tried again by the next rebuild and the liveness tick (#257).
+        let mut armed_external_dirs = BTreeSet::new();
+        arm_external_dep_dirs(
+            &state.external_dep_dirs,
+            &mut armed_external_dirs,
+            |dir| watcher.watch(dir, RecursiveMode::NonRecursive),
+            watch_root.root_paths(),
+            extra_vars_dir(vars_dir_extra.as_deref(), vars_path_typed.as_deref()),
+        );
 
         // Seed the content backstop's baseline (#321).
         //
@@ -4436,16 +4486,6 @@ mod dir_startup {
         }
         state.last_mtimes = last_mtimes;
 
-        // Track which external dep dirs were successfully armed during startup (lines above
-        // called watcher.watch() for each; treat all existing dirs as armed, missing ones
-        // as unarmed so the first tick arms them when they reappear).
-        let startup_armed_external: BTreeSet<PathBuf> = state
-            .external_dep_dirs
-            .iter()
-            .filter(|d| d.exists())
-            .cloned()
-            .collect();
-
         let liveness = LivenessState {
             first_tick: true,
             root_was_missing: !root.exists(),
@@ -4460,7 +4500,8 @@ mod dir_startup {
                 .filter(|d| !d.exists())
                 .cloned()
                 .collect(),
-            armed_external_dirs: startup_armed_external,
+            // The directories whose startup watch is in place, and only those.
+            armed_external_dirs,
         };
 
         let ctx = DirWatchCtx {
@@ -4523,7 +4564,16 @@ mod dir_startup {
 
         fn on_message(&mut self, msg: Msg, rx: &mpsc::Receiver<Msg>) -> ControlFlow<StopReason> {
             match handle_fs_event_dir(msg, &self.ctx, rx, &mut self.state) {
-                DirEventOutcome::Skip | DirEventOutcome::Done => ControlFlow::Continue(()),
+                DirEventOutcome::Skip => ControlFlow::Continue(()),
+                DirEventOutcome::Done => {
+                    arm_external_dirs_after_rebuild(
+                        &self.ctx,
+                        &mut self.watcher,
+                        &mut self.liveness,
+                        &self.state,
+                    );
+                    ControlFlow::Continue(())
+                }
                 DirEventOutcome::Stop => ControlFlow::Break(StopReason::Interrupted),
             }
         }
@@ -5032,6 +5082,56 @@ mod tests {
         assert_eq!(shown("/project/src/sub"), Path::new("src/sub"));
         assert_eq!(shown("cfg").as_os_str(), OsStr::new("cfg"));
         assert_eq!(shown("/project/shared"), Path::new("/project/shared"));
+    }
+
+    /// #257: a dependency directory outside the root is held as armed only once its
+    /// watch is in place. One whose watch failed, though it exists, is tried again by the
+    /// next call — the next rebuild's — and stays unarmed for the liveness tick to try; one
+    /// already armed is not watched again.
+    #[test]
+    fn an_external_dep_dir_is_armed_only_once_its_watch_succeeds() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (ok, refused) = (scratch.path().join("ok"), scratch.path().join("refused"));
+        std::fs::create_dir(&ok).unwrap();
+        std::fs::create_dir(&refused).unwrap();
+        let dirs = BTreeSet::from([ok.clone(), refused.clone()]);
+        let root = RootPaths {
+            typed: Path::new("src"),
+            walked: Path::new("/project/src"),
+        };
+
+        let mut armed = BTreeSet::new();
+        let mut watched = Vec::new();
+        let first = |dir: &Path| {
+            watched.push(dir.to_path_buf());
+            if dir == refused {
+                Err(notify::Error::generic("refused"))
+            } else {
+                Ok(())
+            }
+        };
+        arm_external_dep_dirs(&dirs, &mut armed, first, root, None);
+        // Control: both directories exist, so existence cannot tell them apart.
+        assert!(ok.is_dir() && refused.is_dir());
+        assert_eq!(watched, [ok.clone(), refused.clone()]);
+        assert_eq!(
+            armed,
+            BTreeSet::from([ok.clone()]),
+            "only the directory whose watch succeeded is armed"
+        );
+
+        let mut again = Vec::new();
+        let second = |dir: &Path| {
+            again.push(dir.to_path_buf());
+            Ok(())
+        };
+        arm_external_dep_dirs(&dirs, &mut armed, second, root, None);
+        assert_eq!(
+            again,
+            [refused],
+            "the refused directory is tried again, the armed one is not"
+        );
+        assert_eq!(armed, dirs);
     }
 
     // T-U3a: is_content_event filters Access events, passes Modify/Create/Remove/Any/Other.
