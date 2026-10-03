@@ -85,9 +85,10 @@
 //! regular `.mds` file there is a module by its name alone and is never read. A regular
 //! `.md` file there — each name's extension taken in any case, which on a case-insensitive
 //! volume names a `.md` or `.mds` file — is read as opened in that directory — on unix `openat(O_NOFOLLOW | O_NONBLOCK)` from the
-//! walk's descriptor, never by path — up to [`mds::MAX_FILE_SIZE`] bytes, and only when it
-//! starts with a frontmatter fence; one that cannot be read is refused, since nothing tells
-//! it is no module. Any regular file there is compared, on unix by its device and inode,
+//! walk's descriptor, never by path — past its first line only when that is a frontmatter
+//! fence, and then no further than the end of the frontmatter, all mds-core's check looks
+//! at, nor than [`mds::MAX_FILE_SIZE`] bytes; one that cannot be read is refused, since
+//! nothing tells it is no module. Any regular file there is compared, on unix by its device and inode,
 //! with each file the run reads, looked up by its path at that moment, so one an editor has
 //! replaced since it was read is the one compared, and a hard link to one is that file. A
 //! module or an input is refused, the write leaves no temporary file, and the file is left
@@ -800,26 +801,54 @@ fn as_windows_opens<T: Copy + Into<u32>>(name: &[T]) -> &[T] {
     }
 }
 
-/// Whether `file`, opened at a `.md` file's name ([`names_markdown`]) of `size` bytes, is
-/// an MDS module an output must never replace (#425): its frontmatter declares
-/// `type: mds`, as mds-core's own check takes a module ([`mds::check_module_type`]). It is
-/// read on only past a frontmatter fence, so an output's own bytes cost one short read,
-/// and no further than [`mds::MAX_FILE_SIZE`] bytes in all — more than mds reads of any
-/// module; bytes that are not UTF-8 are judged with each replaced.
-fn is_mds_module(file: &mut std::fs::File, size: u64) -> std::io::Result<bool> {
+/// Whether `file`, opened at a `.md` file's name ([`names_markdown`]), is an MDS module an
+/// output must never replace (#425): its frontmatter declares `type: mds`, as mds-core's
+/// own check takes a module ([`mds::check_module_type`]). That check looks no further
+/// than the frontmatter — from the fence on the first line to the first `\n---` after it —
+/// so no more is read: nothing past a first line that is no fence, and past a fence one
+/// read at a time until the close, at most one read beyond it, and no further than
+/// [`mds::MAX_FILE_SIZE`] bytes in all — a fence that does not close by then is no module,
+/// as mds-core reads no more of any module. Bytes that are not UTF-8 are judged with each
+/// replaced.
+fn is_mds_module(file: &mut std::fs::File) -> std::io::Result<bool> {
     /// The longest frontmatter fence: `---` and a CRLF.
     const FENCE: &[u8] = b"---\r\n";
+    /// What closes the frontmatter for mds-core: the first `---` that begins a line.
+    const CLOSE: &[u8] = b"\n---";
+    /// How much one read past the fence takes.
+    const ONE_READ: u64 = 8 * 1024;
     let fence = u64::try_from(FENCE.len()).unwrap_or(u64::MAX);
     let mut head = mds::read_at_most(file, fence, 0)?;
-    if !(head.starts_with(b"---\n") || head.starts_with(FENCE)) {
+    let after_fence = if head.starts_with(b"---\n") {
+        FENCE.len() - 1
+    } else if head.starts_with(FENCE) {
+        FENCE.len()
+    } else {
         return Ok(false);
+    };
+    // Where the close is looked for: from the end of the fence, then from just before the
+    // bytes the last read added, so a close split between two reads is found.
+    let mut from = after_fence;
+    for _ in 0..=mds::MAX_FILE_SIZE / ONE_READ {
+        if let Some(at) = head[from..]
+            .windows(CLOSE.len())
+            .position(|bytes| bytes == CLOSE)
+        {
+            head.truncate(from + at + CLOSE.len());
+            break;
+        }
+        let held = u64::try_from(head.len()).unwrap_or(u64::MAX);
+        let more = mds::read_at_most(
+            file,
+            ONE_READ.min(mds::MAX_FILE_SIZE.saturating_sub(held)),
+            0,
+        )?;
+        if more.is_empty() {
+            break;
+        }
+        from = head.len().saturating_sub(CLOSE.len() - 1).max(after_fence);
+        head.extend(more);
     }
-    let read = u64::try_from(head.len()).unwrap_or(u64::MAX);
-    head.extend(mds::read_at_most(
-        file,
-        mds::MAX_FILE_SIZE.saturating_sub(read),
-        size,
-    )?);
     Ok(declares_a_module(&String::from_utf8_lossy(&head)))
 }
 
@@ -1314,8 +1343,7 @@ mod unix {
             if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
                 return Ok(false);
             }
-            let size = u64::try_from(opened.st_size).unwrap_or(0);
-            super::is_mds_module(&mut file, size)
+            super::is_mds_module(&mut file)
         };
         judge().map_err(Failure::UnreadMarkdown)
     }
@@ -1870,8 +1898,7 @@ mod windows {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(e) => return Err(e),
             };
-            let size = file.metadata()?.len();
-            super::is_mds_module(&mut file, size)
+            super::is_mds_module(&mut file)
         };
         judge().map_err(Failure::UnreadMarkdown)
     }
@@ -3210,6 +3237,58 @@ mod tests {
         let wide: Vec<u16> = "lib.md .".encode_utf16().collect();
         let expected: Vec<u16> = "lib.md".encode_utf16().collect();
         assert_eq!(as_windows_opens(&wide), expected.as_slice(), "UTF-16");
+    }
+
+    /// The module check reads an existing output no further than the end of its
+    /// frontmatter, at most one read past it (#425): a `.md` file with frontmatter and a
+    /// 1 MiB body — whether it declares `type: mds` or not, with the close met inside a
+    /// read, across two reads, or after a frontmatter longer than one read — is judged
+    /// as mds-core judges it, and the body is left unread. A fence that never closes is
+    /// read no further than the cap and is no module. Control: a file with no fence is
+    /// read for the fence alone.
+    #[test]
+    fn the_module_check_reads_no_further_than_the_frontmatter() {
+        use std::io::Seek as _;
+        const ONE_READ: usize = 8 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.md");
+        let check = |text: &str| -> (bool, usize) {
+            std::fs::write(&path, text).unwrap();
+            let mut file = std::fs::File::open(&path).unwrap();
+            let module = is_mds_module(&mut file).unwrap();
+            let read = usize::try_from(file.stream_position().unwrap()).unwrap();
+            (module, read)
+        };
+        let body = "b\n".repeat(512 * 1024);
+        let straddle = format!("---\ntype: mds\n{}", "a".repeat(8181));
+        for (label, frontmatter, module) in [
+            ("no type", "---\ntitle: t\n---\n".to_owned(), false),
+            ("a module", "---\ntype: mds\n---\n".to_owned(), true),
+            ("CRLF", "---\r\ntype: mds\r\n---\r\n".to_owned(), true),
+            ("across two reads", format!("{straddle}\n---\n"), true),
+            (
+                "longer than one read",
+                format!("---\n{}type: mds\n---\n", "k: v\n".repeat(5000)),
+                true,
+            ),
+        ] {
+            let (judged, read) = check(&format!("{frontmatter}{body}"));
+            assert_eq!(judged, module, "{label}");
+            assert!(
+                read <= frontmatter.len() + ONE_READ,
+                "{label}: read {read} bytes of a {}-byte frontmatter",
+                frontmatter.len()
+            );
+        }
+
+        let cap = usize::try_from(mds::MAX_FILE_SIZE).unwrap();
+        let (judged, read) = check(&format!("---\ntype: mds\n{}", "u".repeat(cap + 1024)));
+        assert!(!judged, "a fence that never closes is no module");
+        assert!(read <= cap, "read {read} bytes, past the cap");
+
+        let (judged, read) = check(&format!("plain\n{body}"));
+        assert!(!judged, "control");
+        assert!(read <= 5, "control: read {read} bytes");
     }
 
     /// On Windows an output's target is judged as the file it opens (#425): `m.md.` and
