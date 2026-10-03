@@ -1343,9 +1343,9 @@ pub(crate) fn resolve_output_base(
 ///
 /// It is called once per output path actually computed for a write, so it is where the
 /// [`MirroredStem::Flattened`] arm is reported — a warning naming the source, the root
-/// and the flat output. [`output_base_no_ext`] computes the same stem for bookkeeping
-/// probes and stays silent; moving the report there would fire it on paths that are
-/// never written, several times per watch batch (#217).
+/// and the flat output. [`output_base_no_ext`] computes the same stem for bookkeeping —
+/// a directory build's source-map base — and stays silent; moving the report there would
+/// fire it for a stem no write is made at (#217).
 ///
 /// No live caller can reach the flattened arm: `build` walks `root` and hands the walk's
 /// own prefix back here; `watch` gates event paths on `starts_with(&ctx.root)` and its
@@ -2966,10 +2966,10 @@ mod tests {
     }
 
     /// #390: a root walked in another form than it was typed in — `mds watch` walks the
-    /// canonical directory — names an output next to its source, and the stem of a
-    /// deleted source's output, below the directory as typed, while both are written and
-    /// probed below the walked form; under an out-dir the typed root changes nothing. A
-    /// source outside the walked root has no typed form and keeps its own.
+    /// canonical directory — names an output next to its source, and the stem it is named
+    /// from, below the directory as typed, while both are written and probed below the
+    /// walked form; under an out-dir the typed root changes nothing. A source outside the
+    /// walked root has no typed form and keeps its own.
     #[test]
     fn an_output_next_to_its_source_is_named_below_the_root_as_typed() {
         let root = RootPaths {
@@ -3207,9 +3207,9 @@ mod tests {
 
     /// #217: the out-of-root flatten is reported from the WRITE oracle only.
     ///
-    /// `output_base_no_ext` is a probe: watch calls it to guess the output siblings of a
-    /// source it is about to forget, repeatedly per batch and for sources that are never
-    /// written. A warning there would fire on bookkeeping rather than on a write.
+    /// `output_base_no_ext` is a probe: a directory build takes a source map's base from
+    /// it, for a stem no output is written at. A warning there would fire on bookkeeping
+    /// rather than on a write.
     /// `output_path_for` is called once per output path actually computed for a write,
     /// so that is where the report belongs.
     ///
@@ -3232,8 +3232,8 @@ mod tests {
             oracle.contains(NEEDLE),
             "the write oracle's report must name the out-of-root condition; body: {oracle}"
         );
-        // Both probes: the stem, and the stem in both forms that names a deleted
-        // source's output (#390).
+        // Both probes: the stem, and the stem in both forms that an output beside its
+        // source is named from (#390).
         for header in ["fn output_base_no_ext(", "fn output_stem_for("] {
             let probe = fn_body(SRC, header)
                 .unwrap_or_else(|| panic!("non-vacuity: {header} must be present in this file"));

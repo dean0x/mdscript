@@ -209,8 +209,10 @@ shared partial rebuilds **all transitive importers** automatically.
   it still holds exactly what was written — when its source is deleted (directory mode), or
   when an edit changes the template's kind and the output moves to `<name>.json` or
   `<name>.md` (both modes; an explicit `-o` keeps its path). A hand-written `todo.json`
-  beside `todo.mds`, a partial's `_p.md`, or an output you edited is kept, with
+  beside `todo.mds`, or an output you edited, is kept, with
   `Kept <file>: not written by this session` or `Kept <file>: changed since it was written`.
+  A partial has no output, so a `_p.md` beside a deleted `_p.mds` is left as it is, and
+  nothing is printed for it.
   A save that unlinks the source and creates it again within one batch — some editors,
   `git checkout`, `git stash` — is an edit and removes nothing.
 - **Change of kind**: when an edit changes the template's kind mid-session, the new kind's
