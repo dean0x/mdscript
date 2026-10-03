@@ -166,8 +166,8 @@ such as a `--vars` file that cannot load or a directory with nothing to lint —
 stderr).
 
 **Never over an MDS module or an input** (#425): `mds build` and `mds watch` never write an
-output over a `.md` file whose frontmatter declares `type: mds` — a module a template can
-import — nor over a file the run reads: the entry, a module it imports, the `--vars` file or the
+output over an MDS module a template can import — a `.mds` file, or a `.md` file whose
+frontmatter declares `type: mds` — nor over a file the run reads: the entry, a module it imports, the `--vars` file or the
 `mds.json` in force (`mds build chat.mds --vars chat.json`, a messages template whose output is
 `chat.json`). It is refused (`mds::io`, `cannot write <file>: refusing to replace an MDS module`
 or `… refusing to replace a file this run reads`) and left as it is: `mds build <file>` exits 2,

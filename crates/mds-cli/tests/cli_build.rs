@@ -3263,6 +3263,79 @@ mod module_overwrite {
         );
     }
 
+    /// `mds build` never writes its output over a `.mds` file (#425): mds-core takes every
+    /// `.mds` file for an MDS module, so `-o b.mds` naming a source this run does not
+    /// import — for a template read from a file and from stdin — and `-o lib.mds` naming
+    /// the one it imports are refused, `mds::io`, exit 2, after the extension-mismatch
+    /// warning, and each is left as it is, with no temporary file. `b.mds` used to be
+    /// replaced, exit 0. Controls: `-o new.mds`, where nothing is, is written, with the
+    /// warning, and `-o notes.txt` writes over the file there.
+    #[test]
+    fn build_never_writes_over_an_mds_source() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let text = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+        std::fs::write(root.join("a.mds"), "Hello A\n").unwrap();
+        std::fs::write(root.join("b.mds"), "Hello B\n").unwrap();
+        std::fs::write(root.join("lib.mds"), "Shared\n").unwrap();
+        std::fs::write(
+            root.join("page.mds"),
+            "@import \"./lib.mds\" as l\n@include l\nPage\n",
+        )
+        .unwrap();
+        let before = entry_overwrite::snapshot(root);
+
+        for (args, name) in [
+            (["a.mds", "-o", "b.mds"], "b.mds"),
+            (["page.mds", "-o", "lib.mds"], "lib.mds"),
+        ] {
+            let (code, stderr) = build_in(root, &args);
+            assert_eq!(code, Some(2), "build {args:?}: stderr: {stderr}");
+            assert!(
+                refuses(&stderr, Path::new(name), MODULE_CAUSE),
+                "build {args:?}: the .mds file is refused by name; stderr: {stderr}"
+            );
+        }
+        let mut child = mds_bin()
+            .current_dir(root)
+            .args(["build", "-", "-o", "b.mds"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"Y\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "build -: stderr: {stderr}");
+        assert!(
+            refuses(&stderr, Path::new("b.mds"), MODULE_CAUSE),
+            "build -: the .mds file is refused by name; stderr: {stderr}"
+        );
+        assert_eq!(
+            entry_overwrite::snapshot(root),
+            before,
+            "nothing is written, and no temporary file is left"
+        );
+
+        let (code, stderr) = build_in(root, &["a.mds", "-o", "new.mds"]);
+        assert_eq!(code, Some(0), "control: stderr: {stderr}");
+        assert!(
+            stderr.contains(&entry_overwrite::extension_warning("new.mds")),
+            "control: the warning announces the write; stderr: {stderr}"
+        );
+        assert_eq!(text("new.mds"), "Hello A\n", "control: new.mds is written");
+        std::fs::write(root.join("notes.txt"), "notes\n").unwrap();
+        let (code, stderr) = build_in(root, &["a.mds", "-o", "notes.txt"]);
+        assert_eq!(code, Some(0), "control: stderr: {stderr}");
+        assert_eq!(
+            text("notes.txt"),
+            "Hello A\n",
+            "control: notes.txt is written"
+        );
+    }
+
     /// The `--vars` file that makes `gen.mds`'s output an MDS module: `{{fm}}` becomes
     /// frontmatter declaring `type: mds`.
     const GEN_VARS: &str = r#"{"fm":"---\ntype: mds\n---"}"#;
@@ -3355,11 +3428,13 @@ mod input_overwrite {
 
     /// `mds build` never writes its output over a file the run reads (#425): the `--vars`
     /// file `chat.json` at the default output of the messages template `chat.mds`, the
-    /// `mds.json` in force at the default output of `mds.mds`, a `.mds` module the
-    /// template imports named by `-o`, and the `--vars` file named by `-o` for a template
-    /// read from stdin — each refused, `mds::io`, exit 2, naming the output as its
-    /// `Compiled to` line would, the file left as it was. They used to be replaced, exit
-    /// 0. Control: with another `--vars` file, `chat.json` is written.
+    /// `mds.json` in force at the default output of `mds.mds`, and the `--vars` file named
+    /// by `-o` for a template read from stdin — each refused, `mds::io`, exit 2, naming the
+    /// output as its `Compiled to` line would, the file left as it was. They used to be
+    /// replaced, exit 0. (A module the template imports, named by `-o`, is refused as an MDS
+    /// module — `build_never_writes_over_an_mds_source` — or, for an output that is a
+    /// module itself, as a file the run reads — `build_rewrites_its_own_output_that_declares_type_mds`.)
+    /// Control: with another `--vars` file, `chat.json` is written.
     #[test]
     fn build_never_writes_over_a_file_it_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -3370,15 +3445,9 @@ mod input_overwrite {
         std::fs::write(root.join("chat.mds"), CHAT).unwrap();
         std::fs::write(cfg.join("mds.json"), CONFIG).unwrap();
         std::fs::write(cfg.join("mds.mds"), "@message user:\nHello\n@end\n").unwrap();
-        std::fs::write(root.join("lib.mds"), "Shared\n").unwrap();
-        std::fs::write(
-            root.join("page.mds"),
-            "@import \"./lib.mds\" as l\n@include l\nPage\n",
-        )
-        .unwrap();
         let text = |path: &Path| std::fs::read_to_string(path).unwrap();
 
-        let rows: [(&[&str], std::path::PathBuf, std::path::PathBuf, &str); 3] = [
+        let rows: [(&[&str], std::path::PathBuf, std::path::PathBuf, &str); 2] = [
             (
                 &["chat.mds", "--vars", "chat.json"],
                 Path::new(".").join("chat.json"),
@@ -3390,12 +3459,6 @@ mod input_overwrite {
                 Path::new("cfg").join("mds.json"),
                 cfg.join("mds.json"),
                 CONFIG,
-            ),
-            (
-                &["page.mds", "-o", "lib.mds"],
-                Path::new("lib.mds").to_path_buf(),
-                root.join("lib.mds"),
-                "Shared\n",
             ),
         ];
         for (args, shown, file, was) in rows {

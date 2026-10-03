@@ -74,16 +74,17 @@
 //! # Never over an MDS module or a file the run reads (#425)
 //!
 //! [`write_compiled`] renames an output over whatever file is at its target, except an MDS
-//! module — a `.md` file whose frontmatter declares `type: mds`, as mds-core judges one
-//! ([`mds::check_module_type`]), which a template may import — and a file the run reads
-//! ([`Inputs`]): its entry, the modules its compile imported, the `--vars` file and the
-//! `mds.json` in force. An output whose own frontmatter declares `type: mds` — a module a
-//! template generates — is one too, and replaces a module as it rewrites itself, whoever
-//! wrote the file there; it is judged the same way, by its text, and still never replaces
-//! a file the run reads. Just before the rename the file at the target is looked at in the
-//! directory the write is in, without following a symlink. A regular `.md` file there —
-//! the name's extension taken in any case, which on a case-insensitive volume names a
-//! `.md` file — is read as opened in that directory — on unix `openat(O_NOFOLLOW | O_NONBLOCK)` from the
+//! module — a `.mds` file, or a `.md` file whose frontmatter declares `type: mds`, as
+//! mds-core judges one ([`mds::check_module_type`]), which a template may import — and a
+//! file the run reads ([`Inputs`]): its entry, the modules its compile imported, the
+//! `--vars` file and the `mds.json` in force. An output whose own frontmatter declares
+//! `type: mds` — a module a template generates — is one too, and replaces a module as it
+//! rewrites itself, whoever wrote the file there; it is judged the same way, by its text,
+//! and still never replaces a file the run reads. Just before the rename the file at the
+//! target is looked at in the directory the write is in, without following a symlink. A
+//! regular `.mds` file there is a module by its name alone and is never read. A regular
+//! `.md` file there — each name's extension taken in any case, which on a case-insensitive
+//! volume names a `.md` or `.mds` file — is read as opened in that directory — on unix `openat(O_NOFOLLOW | O_NONBLOCK)` from the
 //! walk's descriptor, never by path — up to [`mds::MAX_FILE_SIZE`] bytes, and only when it
 //! starts with a frontmatter fence; one that cannot be read is refused, since nothing tells
 //! it is no module. Any regular file there is compared, on unix by its device and inode,
@@ -244,8 +245,9 @@ pub(crate) fn atomic_write_file(
 /// Write a compiled output, or its `.map` sidecar, to `target` as [`atomic_write_file`]
 /// writes one — [`Durability::RenameOnly`], since a rebuild reproduces it, creating the
 /// directories it goes in — but never over one of `inputs`, the files the run reads, nor,
-/// unless `content` is itself an MDS module, over one (#425; see the module docs): a `.md`
-/// file whose frontmatter declares `type: mds` is a source a template imports, and the
+/// unless `content` is itself an MDS module, over one (#425; see the module docs): a `.mds`
+/// file, or a `.md` file whose frontmatter declares `type: mds`, is a source a template
+/// imports, and the
 /// entry, an imported module, the `--vars` file or the `mds.json` in force is what the
 /// output was made from — none is an output to replace. An output that declares
 /// `type: mds` itself is a module a template generates, and replaces one as it rewrites
@@ -762,13 +764,22 @@ fn ends_as_a_directory(path: &Path) -> bool {
     }
 }
 
-/// Whether `name` can be a `.md` file's: the only name an MDS module an output could take
-/// has (#425). The extension is taken in any case, since on a case-insensitive volume
-/// `LIB.MD` is the file `lib.md`, which mds-core judges by its name on disk.
+/// Whether `name` can be a `.md` file's: an MDS module when its frontmatter declares
+/// `type: mds` (#425). The extension is taken in any case, since on a case-insensitive
+/// volume `LIB.MD` is the file `lib.md`, which mds-core judges by its name on disk.
 fn names_markdown(name: &OsStr) -> bool {
     Path::new(name)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
+/// Whether `name` can be a `.mds` file's: an MDS source, which mds-core takes for a module
+/// by its name alone, whatever it holds (#425). The extension is taken in any case, as
+/// [`names_markdown`] takes it.
+fn names_source(name: &OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mds"))
 }
 
 /// Whether `file`, opened at a `.md` file's name ([`names_markdown`]) of `size` bytes, is
@@ -1228,9 +1239,9 @@ mod unix {
     /// MDS module while the output is none (`module`) (#425). It is looked at without
     /// following a symlink: nothing there, a symlink — which the rename replaces, never
     /// writing through it — and anything else that is no regular file are neither. For an
-    /// output that is no module, a regular file with a `.md` file's name is read as opened
-    /// in `dir` ([`is_a_module`]); any regular file is compared with each of `inputs` by
-    /// its device and inode ([`is_an_input`]).
+    /// output that is no module, a regular file there is judged by its name and, for a
+    /// `.md` file's, read as opened in `dir` ([`is_a_module`]); any regular file is compared
+    /// with each of `inputs` by its device and inode ([`is_an_input`]).
     fn never_over_an_input(
         dir: BorrowedFd<'_>,
         name: &OsStr,
@@ -1242,7 +1253,7 @@ mod unix {
             Ok(_) | Err(Errno::NOENT) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        if !module && super::names_markdown(name) && is_a_module(dir, name)? {
+        if !module && is_a_module(dir, name)? {
             return Err(Failure::Module);
         }
         if is_an_input(inputs, &stat) {
@@ -1260,12 +1271,20 @@ mod unix {
         })
     }
 
-    /// Whether `name` in `dir`, a regular file a moment ago, is an MDS module (#425):
-    /// opened in `dir` — never by path — without following a symlink, and read there, that
-    /// [`super::is_mds_module`] takes for one. Gone since, a symlink or anything else that
-    /// is no regular file by then is none; a file that cannot be opened or read is
+    /// Whether `name` in `dir`, a regular file a moment ago, is an MDS module (#425): a
+    /// `.mds` file by its name alone ([`super::names_source`]), never read; a `.md` file
+    /// ([`super::names_markdown`]) opened in `dir` — never by path — without following a
+    /// symlink, and read there, that [`super::is_mds_module`] takes for one. Any other name
+    /// is none, and so is a `.md` file gone since, a symlink or anything else that is no
+    /// regular file by then; a `.md` file that cannot be opened or read is
     /// [`Failure::UnreadMarkdown`].
     fn is_a_module(dir: BorrowedFd<'_>, name: &OsStr) -> Result<bool, Failure> {
+        if super::names_source(name) {
+            return Ok(true);
+        }
+        if !super::names_markdown(name) {
+            return Ok(false);
+        }
         let judge = || -> std::io::Result<bool> {
             let mut file = match open_to_read(dir, name) {
                 Ok(file) => file,
@@ -1765,9 +1784,9 @@ mod windows {
     /// module while the output is none (`module`) (#425), by path. It is looked at without
     /// following a symlink: nothing there, a symlink — which the move replaces, never
     /// writing through it — and anything else that is no regular file are neither. For an
-    /// output that is no module, a regular file with a `.md` file's name is read
-    /// ([`is_a_module`]); any regular file is compared with each of `inputs`
-    /// ([`is_an_input`]).
+    /// output that is no module, a regular file there is judged by its name and, for a
+    /// `.md` file's, read ([`is_a_module`]); any regular file is compared with each of
+    /// `inputs` ([`is_an_input`]).
     fn never_over_an_input(target: &Path, inputs: &Inputs, module: bool) -> Result<(), Failure> {
         match std::fs::symlink_metadata(target) {
             Ok(meta) if meta.is_file() => {}
@@ -1775,8 +1794,7 @@ mod windows {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         }
-        if !module && target.file_name().is_some_and(super::names_markdown) && is_a_module(target)?
-        {
+        if !module && is_a_module(target)? {
             return Err(Failure::Module);
         }
         if is_an_input(inputs, target) {
@@ -1798,10 +1816,21 @@ mod windows {
             .any(|file| std::fs::canonicalize(file).is_ok_and(|file| file == target))
     }
 
-    /// Whether `target`, a regular file a moment ago, is an MDS module (#425): opened and
-    /// read by path, that [`super::is_mds_module`] takes for one. Gone since is none; a
+    /// Whether `target`, a regular file a moment ago, is an MDS module (#425): a `.mds` file
+    /// by its name alone ([`super::names_source`]), never read; a `.md` file
+    /// ([`super::names_markdown`]) opened and read by path, that [`super::is_mds_module`]
+    /// takes for one. Any other name is none, and so is a `.md` file gone since; a `.md`
     /// file that cannot be opened or read is [`Failure::UnreadMarkdown`].
     fn is_a_module(target: &Path) -> Result<bool, Failure> {
+        let Some(name) = target.file_name() else {
+            return Ok(false);
+        };
+        if super::names_source(name) {
+            return Ok(true);
+        }
+        if !super::names_markdown(name) {
+            return Ok(false);
+        }
         let judge = || -> std::io::Result<bool> {
             let mut file = match std::fs::File::open(target) {
                 Ok(file) => file,
@@ -2747,11 +2776,11 @@ mod tests {
 
     /// An output is never written over an MDS module (#425): a `.md` file that declares
     /// `type: mds` — bare, quoted, or with CRLF lines, and named with its extension in
-    /// another case, which on a case-insensitive volume is a `.md` file's name — is
-    /// refused, named as shown, and left as it is, with no temporary file. Controls: a
-    /// `.md` file with no frontmatter, one that declares another `type`, one with
-    /// `type: mds` below another key only, a `.mds` file that declares `type: mds`, and a
-    /// name nothing has are each written.
+    /// another case, which on a case-insensitive volume is a `.md` file's name — and any
+    /// `.mds` file, whatever it holds and in either case, are refused, named as shown, and
+    /// left as they are, with no temporary file. Controls: a `.md` file with no
+    /// frontmatter, one that declares another `type`, one with `type: mds` below another
+    /// key only, another kind of file, and names nothing has are each written.
     #[test]
     fn an_output_is_never_written_over_an_mds_module() {
         let dir = tempfile::tempdir().unwrap();
@@ -2771,6 +2800,9 @@ mod tests {
             ("crlf.md", "---\r\ntype: 'mds'\r\n---\r\nC\r\n"),
             ("UP.MD", "---\ntype: mds\n---\nU\n"),
             ("mixed.Md", "---\ntype: mds\n---\nX\n"),
+            ("source.mds", "---\ntype: mds\n---\nS\n"),
+            ("plain.mds", "Hello\n"),
+            ("UP.MDS", ""),
         ] {
             std::fs::write(dir.path().join(name), module).unwrap();
             assert_eq!(
@@ -2792,8 +2824,9 @@ mod tests {
             ("plain.md", Some("plain\n")),
             ("other.md", Some("---\ntype: other\n---\nO\n")),
             ("nested.md", Some("---\nconfig:\n  type: mds\n---\nN\n")),
-            ("source.mds", Some("---\ntype: mds\n---\nS\n")),
+            ("notes.txt", Some("---\ntype: mds\n---\nT\n")),
             ("new.md", None),
+            ("new.mds", None),
         ] {
             if let Some(other) = other {
                 std::fs::write(dir.path().join(name), other).unwrap();
@@ -2844,6 +2877,14 @@ mod tests {
 
         assert_eq!(write("m.md", GENERATED, &Inputs::default()), Ok(()));
         assert_eq!(text("m.md"), GENERATED, "a module replaces a module");
+        std::fs::write(path("lib.mds"), "Hello\n").unwrap();
+        assert_eq!(
+            write("lib.mds", "plain\n", &Inputs::default()),
+            Err(format!("cannot write lib.mds: {MODULE_REFUSAL}")),
+            "control: an output that is no module, over a .mds file"
+        );
+        assert_eq!(write("lib.mds", GENERATED, &Inputs::default()), Ok(()));
+        assert_eq!(text("lib.mds"), GENERATED, "a module replaces a .mds file");
         let crlf = "---\r\ntype: 'mds'\r\n---\r\nAgain\r\n";
         assert_eq!(write("m.md", crlf, &Inputs::default()), Ok(()));
         assert_eq!(text("m.md"), crlf, "and its own output again");
@@ -3027,8 +3068,9 @@ mod tests {
     /// tells it is no MDS module. `locked.md`, at mode 0o000, is refused, named as shown,
     /// with the read's cause, and left as it is, with no temporary file. Controls: the same
     /// file, readable again, is written; and `locked.json` at mode 0o000 — a name no
-    /// module has, so the write never opens it — is written. Skipped, with a reason, where
-    /// mode 0o000 does not stop a read (running as root).
+    /// module has, so the write never opens it — is written. `locked.mds` at mode 0o000 is
+    /// refused as a module, by its name, without a read. Skipped, with a reason, where mode
+    /// 0o000 does not stop a read (running as root).
     #[cfg(unix)]
     #[test]
     fn an_output_is_never_written_over_a_markdown_file_it_cannot_read() {
@@ -3091,6 +3133,24 @@ mod tests {
         );
         set_mode("locked.json", 0o644);
         assert_eq!(std::fs::read_to_string(path("locked.json")).unwrap(), "X");
+
+        // A `.mds` file is a module by its name alone: refused as one, never read.
+        std::fs::write(path("locked.mds"), "Hello\n").unwrap();
+        set_mode("locked.mds", 0o000);
+        let refused = write("locked.mds");
+        set_mode("locked.mds", 0o644);
+        assert_eq!(
+            refused,
+            Err(format!(
+                "cannot write {}: {MODULE_REFUSAL}",
+                shown("locked.mds").display()
+            )),
+            "a .mds file is never read to tell"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path("locked.mds")).unwrap(),
+            "Hello\n"
+        );
     }
 
     /// Each step of a new file's commit puts the file where nothing is, and never over a

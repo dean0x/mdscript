@@ -10367,30 +10367,58 @@ fn watch_never_writes_over_its_vars_file_or_the_mds_json_in_force() {
     drop(child);
 }
 
-/// `mds watch` never writes its output over a source its entry imports (#425): `-o
-/// lib.mds` names the module `page.mds` imports, which is refused at startup and by the
-/// rebuild an edit of `page.mds` makes, and `lib.mds` keeps what it held. It used to be
-/// replaced by the compiled page. Directory mode writes only `.md` and `.json` outputs, and
-/// a template imports only `.mds` files and `.md` modules — which no output replaces — so
-/// it has no such output.
+/// `mds watch` never writes its output over a source its entry imports (#425), even an
+/// output that declares `type: mds` itself, which may replace any other module — each
+/// source's `{{fm}}` the `--vars` file fills with that frontmatter. In file mode `-o
+/// lib.mds` names the module `page.mds` imports; in directory mode `lib.mds`'s own output
+/// `lib.md` is the module it imports. Each is refused at startup and by the rebuild an edit
+/// makes, as a file the run reads, and keeps what it held. In file mode it used to be
+/// replaced by the compiled page.
 #[test]
 fn watch_never_writes_over_a_source_its_entry_imports() {
+    const VARS: &str = r#"{"fm":"---\ntype: mds\n---"}"#;
+    const LIB: &str = "---\ntype: mds\n---\nShared\n";
     let base = notes_with(&[
         ("lib.mds", "Shared\n"),
-        ("page.mds", "@import \"./lib.mds\" as l\n@include l\nPage\n"),
+        (
+            "page.mds",
+            "@import \"./lib.mds\" as l\n{{fm}}\n@include l\nPage\n",
+        ),
+        ("v.json", VARS),
     ]);
     let notes = base.path().join("notes");
     let (page, lib) = (notes.join("page.mds"), notes.join("lib.mds"));
     assert_never_writes_over(
         "file mode",
         &notes,
-        &["watch", "page.mds", "-o", "lib.mds"],
+        &["watch", "page.mds", "-o", "lib.mds", "--vars", "v.json"],
         &[Guarded {
             source: &page,
-            edit: "@import \"./lib.mds\" as l\n@include l\nMore\n",
+            edit: "@import \"./lib.mds\" as l\n{{fm}}\n@include l\nMore\n",
             shown: "lib.mds".to_owned(),
             file: &lib,
             was: "Shared\n",
+        }],
+    );
+
+    let base = notes_with(&[
+        ("lib.mds", "@import \"./lib.md\" as l\n{{fm}}\nLib\n"),
+        ("lib.md", LIB),
+        ("v.json", VARS),
+    ]);
+    let notes = base.path().join("notes");
+    let (src, md) = (notes.join("lib.mds"), notes.join("lib.md"));
+    let vars = below("notes", "v.json");
+    assert_never_writes_over(
+        "directory mode",
+        base.path(),
+        &["watch", "notes", "--vars", vars.as_str()],
+        &[Guarded {
+            source: &src,
+            edit: "@import \"./lib.md\" as l\n{{fm}}\nLib again\n",
+            shown: below("notes", "lib.md"),
+            file: &md,
+            was: LIB,
         }],
     );
 }

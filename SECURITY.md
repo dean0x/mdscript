@@ -186,12 +186,12 @@ input. The compiler enforces several defense-in-depth controls:
   `mds build` and `mds watch` refuse an output that is the entry file itself —
   however `-o`, `--out-dir`, `build.output_dir` or the default output name it —
   before anything is written or any directory created (`mds::io`, exit 2, #425).
-  Nor do they write an output over an MDS module — a `.md` file whose frontmatter
-  declares `type: mds`, which a template can import — or over a file the run reads:
-  the entry, an imported module, the `--vars` file, the `mds.json` in force. Just
-  before the rename the file at the output path is looked at in the directory the
-  write walked to and, when it is a `.md` file, read as opened there (on Windows, by
-  path); it is compared with each file the run reads, looked up by its path then — on
+  Nor do they write an output over an MDS module — a `.mds` file, or a `.md` file
+  whose frontmatter declares `type: mds`, which a template can import — or over a
+  file the run reads: the entry, an imported module, the `--vars` file, the
+  `mds.json` in force. Just before the rename the file at the output path is looked
+  at in the directory the write walked to: a `.mds` file is a module by its name,
+  never read, and a `.md` file is read as opened there (on Windows, by path); it is compared with each file the run reads, looked up by its path then — on
   Unix by device and inode, on Windows by canonical path, so a hard link to an input
   is written over there. A module, a `.md` file that cannot be read to tell, and a
   file the run reads are refused and left as they are (`mds::io`, #425). One put
