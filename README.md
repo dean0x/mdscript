@@ -169,7 +169,8 @@ stderr).
 output over an MDS module a template can import — a `.mds` file, or a `.md` file whose
 frontmatter declares `type: mds` — nor over a file the run reads: the entry, a module it imports, the `--vars` file or the
 `mds.json` in force (`mds build chat.mds --vars chat.json`, a messages template whose output is
-`chat.json`). It is refused (`mds::io`, `cannot write <file>: refusing to replace an MDS module`
+`chat.json`) — in directory mode also the `mds.json` nearest each source, which `mds build
+<source>` would hold in force. It is refused (`mds::io`, `cannot write <file>: refusing to replace an MDS module`
 or `… refusing to replace a file this run reads`) and left as it is: `mds build <file>` exits 2,
 `mds build <dir>` goes on with the other files and exits 2, and `mds watch` reports it and
 keeps watching. Any other file there is written over as before. An output whose own

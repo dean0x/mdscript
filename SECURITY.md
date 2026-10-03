@@ -189,11 +189,13 @@ input. The compiler enforces several defense-in-depth controls:
   Nor do they write an output over an MDS module — a `.mds` file, or a `.md` file
   whose frontmatter declares `type: mds`, which a template can import — or over a
   file the run reads: the entry, an imported module, the `--vars` file, the
-  `mds.json` in force. Just before the rename the file at the output path is looked
-  at in the directory the write walked to: a `.mds` file is a module by its name,
-  never read, and a `.md` file is read as opened there (on Windows, by path); it is compared with each file the run reads, looked up by its path then — on
-  Unix by device and inode, on Windows by canonical path, so a hard link to an input
-  is written over there. A module, a `.md` file that cannot be read to tell, and a
+  `mds.json` in force — in directory mode also the `mds.json` nearest each source,
+  which a file-mode build of it would hold in force. Just before the rename the
+  file at the output path is looked at in the directory the write walked to: a
+  `.mds` file is a module by its name, never read, and a `.md` file is read as
+  opened there (on Windows, by path); it is compared with each file the run reads,
+  looked up by its path then — on Unix by device and inode, on Windows by canonical
+  path, so a hard link to an input is written over there. A module, a `.md` file that cannot be read to tell, and a
   file the run reads are refused and left as they are (`mds::io`, #425). One put
   there in the instant between that look and the rename is replaced. An output that
   itself declares `type: mds` — a module a template generates — replaces a module,

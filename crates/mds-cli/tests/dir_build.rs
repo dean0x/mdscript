@@ -2678,6 +2678,75 @@ fn dir_build_writes_a_module_output_over_a_module_but_never_over_its_import() {
     );
 }
 
+/// A directory build never writes an output over the `mds.json` nearest a source (#425) —
+/// the one `mds build <source>` holds in force — as file mode never does: `mds build .`
+/// refuses `sub/mds.mds`'s messages output `./sub/mds.json`, `mds::io`, leaves it as it
+/// was, goes on with `doc.mds` and exits 2, and `mds build sub/mds.mds` refuses it the
+/// same way. It used to be replaced by the directory build, exit 0 for that file. The
+/// nested `mds.json` is not otherwise read: one that is no JSON at all is refused just the
+/// same, unreported. Control: with no `sub/mds.json`, the directory build writes it, exit 0.
+#[test]
+fn dir_build_never_writes_over_a_nested_mds_json() {
+    let fixture = |nested: Option<&str>| {
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(base.path().join("mds.json"), "{}\n").unwrap();
+        fs::write(sub.join("mds.mds"), "@message user:\nSub\n@end\n").unwrap();
+        fs::write(base.path().join("doc.mds"), "Doc\n").unwrap();
+        if let Some(nested) = nested {
+            fs::write(sub.join("mds.json"), nested).unwrap();
+        }
+        base
+    };
+    let shown = Path::new(".").join("sub").join("mds.json");
+    for nested in ["{\"build\":{}}\n", "{ not json\n"] {
+        let base = fixture(Some(nested));
+        let (code, stderr) = build_in(base.path(), &["."]);
+        assert_eq!(code, Some(2), "{nested:?}: stderr: {stderr}");
+        assert!(
+            refuses(&stderr, &shown, "refusing to replace a file this run reads"),
+            "{nested:?}: the nested mds.json is refused by name; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(base.path().join("sub").join("mds.json")).unwrap(),
+            nested,
+            "{nested:?}: the nested mds.json is left as it was; stderr: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(base.path().join("doc.md")).unwrap(),
+            "Doc\n",
+            "{nested:?}: the build goes on with doc.mds; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 built, 1 failed") && !stderr.contains("invalid mds.json"),
+            "{nested:?}: one failure, and the nested mds.json is not read; stderr: {stderr}"
+        );
+    }
+
+    let base = fixture(Some("{\"build\":{}}\n"));
+    let (code, stderr) = build_in(base.path(), &["sub/mds.mds"]);
+    assert_eq!(code, Some(2), "file mode: stderr: {stderr}");
+    assert!(
+        refuses(
+            &stderr,
+            &Path::new("sub").join("mds.json"),
+            "refusing to replace a file this run reads"
+        ),
+        "file mode refuses it the same way; stderr: {stderr}"
+    );
+
+    let base = fixture(None);
+    let (code, stderr) = build_in(base.path(), &["."]);
+    assert_eq!(code, Some(0), "control: stderr: {stderr}");
+    assert!(
+        fs::read_to_string(base.path().join("sub").join("mds.json"))
+            .unwrap()
+            .contains("Sub"),
+        "control: with no nested mds.json, the output is written; stderr: {stderr}"
+    );
+}
+
 /// A directory build never writes an output over a file the run reads (#425), beside its
 /// sources or below `--out-dir`: the `--vars` file at the output of the messages template
 /// `chat.mds`, and the `mds.json` in force at the output of `mds.mds`, are each refused,

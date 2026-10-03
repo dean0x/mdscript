@@ -79,7 +79,8 @@ use mds::MdsError;
 use crate::build::{
     admit_output, auto_detect_mds_file, build_runtime_vars, compile_inputs, compile_to_content,
     emit_duplicate_var_warnings, load_config, resolve_dir_as_created, resolve_output_path_for_kind,
-    run_reads, write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
+    run_reads, source_reads, write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig,
+    RuntimeVarArgs,
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
@@ -2862,7 +2863,8 @@ struct DirWatchState {
     /// outputs go beside their sources.
     out_dir: Option<OutDirAnchor>,
     /// The files every compile reads besides its source's own — the `--vars` file and the
-    /// `mds.json` in force — which no output is written over (#425).
+    /// `mds.json` in force — which no output is written over (#425); each write adds the
+    /// `mds.json` nearest its source ([`source_reads`]).
     reads: Vec<PathBuf>,
     /// Parent dirs of dependencies located outside the watched root.
     /// Watched NonRecursive; re-armed by liveness probe.
@@ -3160,7 +3162,11 @@ fn compile_one_source(
                     OutDirNow::Unchanged | OutDirNow::New => write_output(
                         Some(&below_checked_out_dir(state.out_dir.as_ref(), &out)),
                         &compiled.content,
-                        &compile_inputs(Some(src), &compiled.dependencies, &state.reads),
+                        &compile_inputs(
+                            Some(src),
+                            &compiled.dependencies,
+                            &source_reads(&state.reads, src),
+                        ),
                         quiet,
                         false,
                     )
@@ -3825,7 +3831,11 @@ fn dir_watch_startup(
                     // write failed is errored instead, so the next rebuild with a real
                     // change writes it even when its content has not changed (#257) —
                     // and nothing it did not write is ever its to remove (#160).
-                    let inputs = compile_inputs(Some(&key), &compiled.dependencies, &state.reads);
+                    let inputs = compile_inputs(
+                        Some(&key),
+                        &compiled.dependencies,
+                        &source_reads(&state.reads, &key),
+                    );
                     if let Err(e) =
                         write_output(Some(&out), &compiled.content, &inputs, quiet, true)
                     {

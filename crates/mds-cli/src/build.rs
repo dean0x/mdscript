@@ -208,6 +208,75 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<ProjectConfig>> {
     // to return None after just 1–2 iterations, making grandparent mds.json
     // unreachable even when MAX_TRAVERSAL_DEPTH would allow it.  Canonicalize
     // to an absolute path first so every parent() step advances one real directory.
+    let Some((current, shown_dir)) = config_dir(start) else {
+        return Ok(None);
+    };
+    let candidate = current.join("mds.json");
+    let shown = crate::output::safe_path(&shown_dir.join("mds.json"));
+    // The size is taken from the opened file, and the read stops one byte past
+    // the cap into a buffer that never grows past it, so an oversized mds.json
+    // — or one that grows while it is read — is never held in memory whole
+    // (#428).
+    let cannot_read = |e: std::io::Error| {
+        miette::miette!(
+            "cannot read {shown}: {}",
+            crate::output::safe_inline(crate::output::io_cause(&e))
+        )
+    };
+    let too_large = |size: u64| {
+        miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MiB)")
+    };
+    let mut file = std::fs::File::open(&candidate).map_err(cannot_read)?;
+    let size = file.metadata().map_err(cannot_read)?.len();
+    if size > MAX_CONFIG_SIZE {
+        return Err(too_large(size));
+    }
+    let bytes = mds::read_at_most(&mut file, MAX_CONFIG_SIZE + 1, size).map_err(cannot_read)?;
+    if bytes.len() as u64 > MAX_CONFIG_SIZE {
+        return Err(too_large(bytes.len() as u64));
+    }
+    let raw = String::from_utf8(bytes).map_err(|e| {
+        miette::miette!(
+            "invalid UTF-8 in {shown}: {}",
+            crate::output::safe_inline(&e)
+        )
+    })?;
+    let config: MdsConfig = serde_json::from_str(&raw).map_err(|e| {
+        miette::miette!(
+            "invalid mds.json at {shown}: {}",
+            crate::output::safe_inline(&e)
+        )
+    })?;
+    // #265: a `build.output_dir` carrying a forbidden path character — as
+    // written, or in the form it resolves to under the config directory (a
+    // symlink into a hostile-named directory) — is refused
+    // here, at load — `mds::io`, exit 2 — so it never reaches output-path
+    // derivation. `load_config` is shared, so this fails every run that loads
+    // mds.json, not only the ones that write output: `build`, `watch`, `lint`
+    // (every input mode) and `fmt` directory mode. `check` does not load
+    // mds.json.
+    if let Some(output_dir) = &config.build.output_dir {
+        let typed = std::ffi::OsStr::new(output_dir);
+        crate::output::reject_forbidden_output_path("mds.json build.output_dir", typed)?;
+        crate::output::reject_forbidden_resolved_output_path(
+            "mds.json build.output_dir",
+            &current.join(output_dir),
+            typed,
+        )?;
+    }
+    Ok(Some(ProjectConfig {
+        config,
+        dir: current,
+        shown_dir,
+    }))
+}
+
+/// The directory [`load_config`] finds `mds.json` in for `start`, without reading it:
+/// walking up from `start` — its parent when it is no directory — made canonical first, at
+/// most [`MAX_TRAVERSAL_DEPTH`] directories, the first that holds a file named `mds.json`.
+/// Returned canonical, and as `start` leads to it (`.`, one `..` per step up); `None` when
+/// no directory on the way holds one.
+fn config_dir(start: &Path) -> Option<(PathBuf, PathBuf)> {
     let raw_start_dir = if start.is_dir() {
         start.to_path_buf()
     } else {
@@ -222,66 +291,8 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<ProjectConfig>> {
     };
     // Cap prevents unbounded traversal on unusual filesystems.
     for _ in 0..MAX_TRAVERSAL_DEPTH {
-        let candidate = current.join("mds.json");
-        if candidate.is_file() {
-            let shown = crate::output::safe_path(&shown_dir.join("mds.json"));
-            // The size is taken from the opened file, and the read stops one byte past
-            // the cap into a buffer that never grows past it, so an oversized mds.json
-            // — or one that grows while it is read — is never held in memory whole
-            // (#428).
-            let cannot_read = |e: std::io::Error| {
-                miette::miette!(
-                    "cannot read {shown}: {}",
-                    crate::output::safe_inline(crate::output::io_cause(&e))
-                )
-            };
-            let too_large = |size: u64| {
-                miette::miette!("mds.json at {shown} is too large ({size} bytes; maximum is 1 MiB)")
-            };
-            let mut file = std::fs::File::open(&candidate).map_err(cannot_read)?;
-            let size = file.metadata().map_err(cannot_read)?.len();
-            if size > MAX_CONFIG_SIZE {
-                return Err(too_large(size));
-            }
-            let bytes =
-                mds::read_at_most(&mut file, MAX_CONFIG_SIZE + 1, size).map_err(cannot_read)?;
-            if bytes.len() as u64 > MAX_CONFIG_SIZE {
-                return Err(too_large(bytes.len() as u64));
-            }
-            let raw = String::from_utf8(bytes).map_err(|e| {
-                miette::miette!(
-                    "invalid UTF-8 in {shown}: {}",
-                    crate::output::safe_inline(&e)
-                )
-            })?;
-            let config: MdsConfig = serde_json::from_str(&raw).map_err(|e| {
-                miette::miette!(
-                    "invalid mds.json at {shown}: {}",
-                    crate::output::safe_inline(&e)
-                )
-            })?;
-            // #265: a `build.output_dir` carrying a forbidden path character — as
-            // written, or in the form it resolves to under the config directory (a
-            // symlink into a hostile-named directory) — is refused
-            // here, at load — `mds::io`, exit 2 — so it never reaches output-path
-            // derivation. `load_config` is shared, so this fails every run that loads
-            // mds.json, not only the ones that write output: `build`, `watch`, `lint`
-            // (every input mode) and `fmt` directory mode. `check` does not load
-            // mds.json.
-            if let Some(output_dir) = &config.build.output_dir {
-                let typed = std::ffi::OsStr::new(output_dir);
-                crate::output::reject_forbidden_output_path("mds.json build.output_dir", typed)?;
-                crate::output::reject_forbidden_resolved_output_path(
-                    "mds.json build.output_dir",
-                    &current.join(output_dir),
-                    typed,
-                )?;
-            }
-            return Ok(Some(ProjectConfig {
-                config,
-                dir: current,
-                shown_dir,
-            }));
+        if current.join("mds.json").is_file() {
+            return Some((current, shown_dir));
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
@@ -289,7 +300,20 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<ProjectConfig>> {
         }
         shown_dir.push("..");
     }
-    Ok(None)
+    None
+}
+
+/// `reads`, the files a directory run reads, and the `mds.json` nearest `source` — the one
+/// `mds build <source>` or `mds watch <source>` would hold in force, found as
+/// [`load_config`] finds it — for [`compile_inputs`] (#425). A directory run reads one
+/// `mds.json`, from its directory argument upward, and never reads one nearer a source;
+/// but an output never replaces it either, as it would not in file mode.
+pub(crate) fn source_reads(reads: &[PathBuf], source: &Path) -> Vec<PathBuf> {
+    reads
+        .iter()
+        .cloned()
+        .chain(config_dir(source).map(|(dir, _)| dir.join("mds.json")))
+        .collect()
 }
 
 // ── Output path resolution ────────────────────────────────────────────────────
@@ -1980,8 +2004,9 @@ fn file_name_of(output: &WriteTarget) -> String {
 /// ([`crate::output::probe_and_remove_stale`], #160).
 ///
 /// No output is written over a file the run reads (#425): the source it was compiled
-/// from, the modules that compile imported, the `--vars` file `vars` came from and the
-/// `mds.json` in force ([`compile_inputs`]).
+/// from, the modules that compile imported, the `--vars` file `vars` came from, the
+/// `mds.json` in force ([`compile_inputs`]) and the `mds.json` nearest that source
+/// ([`source_reads`]).
 fn run_build_directory(
     dir: &Path,
     out_dir: Option<PathBuf>,
@@ -2099,7 +2124,11 @@ fn run_build_directory(
         match compiled {
             Ok(Ok(mut compiled)) => {
                 let ext = compiled.kind.extension();
-                let inputs = compile_inputs(Some(file), &compiled.dependencies, &reads);
+                let inputs = compile_inputs(
+                    Some(file),
+                    &compiled.dependencies,
+                    &source_reads(&reads, file),
+                );
                 let target = output_path_for(file, RootPaths::as_typed(dir), &output_base, ext);
 
                 // Set `file` field for this output path (sources already relativized by core).

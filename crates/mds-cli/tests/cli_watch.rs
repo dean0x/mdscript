@@ -10367,6 +10367,34 @@ fn watch_never_writes_over_its_vars_file_or_the_mds_json_in_force() {
     drop(child);
 }
 
+/// `mds watch` in directory mode never writes an output over the `mds.json` nearest a
+/// source (#425) — the one `mds watch <source>` holds in force: `notes/sub/mds.mds`'s
+/// messages output `notes/sub/mds.json` is refused at startup and by every rebuild of the
+/// same kind, and keeps what it held; the session keeps watching, and at Ctrl+C exits 0.
+/// It used to be replaced at startup.
+#[test]
+fn watch_never_writes_over_the_mds_json_nearest_a_source() {
+    const CONFIG: &str = "{\"build\":{}}\n";
+    let base = notes_with(&[("doc.mds", "Doc\n")]);
+    let sub = base.path().join("notes").join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("mds.mds"), "@message user:\nSub\n@end\n").unwrap();
+    std::fs::write(sub.join("mds.json"), CONFIG).unwrap();
+    let (src, config) = (sub.join("mds.mds"), sub.join("mds.json"));
+    assert_never_writes_over(
+        "directory mode",
+        base.path(),
+        &["watch", "notes"],
+        &[Guarded {
+            source: &src,
+            edit: "@message user:\nSub again\n@end\n",
+            shown: below(&below("notes", "sub"), "mds.json"),
+            file: &config,
+            was: CONFIG,
+        }],
+    );
+}
+
 /// `mds watch` never writes its output over a source its entry imports (#425), even an
 /// output that declares `type: mds` itself, which may replace any other module — each
 /// source's `{{fm}}` the `--vars` file fills with that frontmatter. In file mode `-o
