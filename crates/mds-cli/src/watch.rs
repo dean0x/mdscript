@@ -1176,7 +1176,8 @@ impl<'a> Record<'a> {
 /// elsewhere from refuses the removal — through no symlink and only as a regular file
 /// ([`remove_proven`]). A file this session did not write, one it wrote for another
 /// source, and one changed since it was written are kept, with one notice saying which
-/// (none under `--quiet`). A file that is not there is not mentioned.
+/// (none under `--quiet`). A name nothing has is not mentioned; a symlink there, live or
+/// dangling, is something there, and the session's own is refused with a warning.
 ///
 /// Returns whether the file is gone — removed, or not there — so that the record of it
 /// can go too; a file kept, or one whose removal failed, keeps its record.
@@ -1189,7 +1190,9 @@ fn retire_output(
     why: Retirement,
     quiet: bool,
 ) -> bool {
-    if !out.path.exists() {
+    // Looked at without following a symlink: a link at the output, live or dangling, is
+    // something there, and refused below as one.
+    if std::fs::symlink_metadata(&out.path).is_err() {
         return true;
     }
     let written = match record {

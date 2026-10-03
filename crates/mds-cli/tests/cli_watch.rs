@@ -9976,3 +9976,71 @@ fn watch_quiet_keeps_the_outputs_of_other_sources_and_changed_files_without_a_no
         "--quiet prints no notice; stderr: {stderr}"
     );
 }
+
+/// A symlink at a deleted source's output is never removed, and a dangling one is told
+/// as a live one is (#160): the user replaces `x.md`, which the session wrote, with a link
+/// to nothing, and `y.md` with a link to a file; deleting `x.mds` and `y.mds` keeps both
+/// links, each with `warning: could not remove <output>: refusing to remove a symlink`,
+/// and the link's target is left as it was. Control: the live link's warning.
+///
+/// Unix-only: it makes symlinks, which Windows allows only with a privilege.
+#[cfg(unix)]
+#[test]
+fn watch_reports_a_dangling_symlink_at_a_deleted_source_s_output() {
+    let base = notes_with(&[("x.mds", "Plain X\n"), ("y.mds", "Plain Y\n")]);
+    let notes = base.path().join("notes");
+    let target = base.path().join("target.txt");
+    std::fs::write(&target, HAND_WRITTEN).unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "notes", "--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    for (name, text) in [("x.md", "Plain X"), ("y.md", "Plain Y")] {
+        assert!(
+            wait_for_file_contains(&notes.join(name), text, TIMEOUT),
+            "control: the startup writes notes/{name}; stderr: {}",
+            tap.text()
+        );
+    }
+    for (name, to) in [
+        ("x.md", base.path().join("nowhere")),
+        ("y.md", target.clone()),
+    ] {
+        std::fs::remove_file(notes.join(name)).unwrap();
+        std::os::unix::fs::symlink(&to, notes.join(name)).unwrap();
+    }
+
+    // `y.mds` last: a batch handles its deletions in name order, so once its warning is
+    // printed the deletion of `x.mds` has been handled too.
+    for name in ["x.mds", "y.mds"] {
+        std::fs::remove_file(notes.join(name)).unwrap();
+    }
+    let warning = |name: &str| {
+        format!(
+            "warning: could not remove {}: refusing to remove a symlink",
+            below("notes", name)
+        )
+    };
+    wait_for_tap(&tap, &warning("y.md"), TIMEOUT);
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert!(
+        stderr.contains(&warning("x.md")),
+        "the dangling link at notes/x.md is told as a live one is; stderr: {stderr}"
+    );
+    for name in ["x.md", "y.md"] {
+        assert!(
+            std::fs::symlink_metadata(notes.join(name)).is_ok_and(|meta| meta.is_symlink()),
+            "the link at notes/{name} is left; stderr: {stderr}"
+        );
+    }
+    assert_eq!(
+        text_of(&target).as_deref(),
+        Some(HAND_WRITTEN),
+        "the live link's target is left as it was; stderr: {stderr}"
+    );
+}
