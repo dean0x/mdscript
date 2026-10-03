@@ -40,6 +40,17 @@
 //! so an unbounded window would starve the content backstop as well as the rebuild
 //! (#379).
 //!
+//! # Empty files
+//!
+//! An editor that saves by truncating and then writing leaves the file empty for a
+//! moment, at any `--debounce`. A rebuild that finds a watched file — the entry, a
+//! dependency, the `--vars` file, any source of a watched directory — empty where the
+//! baseline saw bytes is held back (`EmptyHold`): nothing is compiled, written or printed
+//! until a rebuild finds it written, or until a deadline one second after the first
+//! rebuild that found it emptied, when the files are compiled as they are. The deadline
+//! never moves, and the loop's driver waits for it like the tick, so neither a stream of
+//! events nor `--poll-interval 0` can postpone it (#380).
+//!
 //! # Key invariants
 //!
 //! - All content output → stdout ONLY when output resolves to stdout.
@@ -54,8 +65,9 @@
 //!   Every status line goes through the CLI's stderr writer, which never panics.
 //! - Compile errors during watching never terminate the watcher.
 //! - All loops have fixed upper bounds (reconcile rule / reliability.md): the idle tick
-//!   against an absolute deadline, and the debounce window against an absolute cap
-//!   (window <= cap) and a message bound (<= 10 000 per window).
+//!   against an absolute deadline, the debounce window against an absolute cap
+//!   (window <= cap) and a message bound (<= 10 000 per window), and a rebuild held
+//!   while a watched file is empty against an absolute deadline (#380).
 //! - All `.mds` reads go through `compile_to_content` (PF-004).
 //! - **Freshness rule** (design decision of 2026-06; kept in git history as legacy
 //!   decision 016 in `88ddbcc~1:.devflow/decisions/decisions.md`): the dependency set
@@ -617,6 +629,104 @@ fn create_ready_marker(tmp: &Path) -> std::io::Result<()> {
     file.write_all(READY_MARKER.as_bytes())
 }
 
+// ── Empty-file hold (#380) ────────────────────────────────────────────────────
+
+/// How long, at most, a rebuild is held while a watched file is empty (#380), counted
+/// from the rebuild that first found it emptied and never extended.
+///
+/// An editor that saves by truncating the file and then writing it leaves it empty in
+/// between, and a rebuild in that moment would publish an empty output nobody wrote. A
+/// file still empty this long after is taken to be empty on purpose, and is compiled as it
+/// is. One second is far past any editor's truncate-to-write gap and short enough that a
+/// file really emptied is published promptly. It is its own constant, not the debounce
+/// cap's floor: the two answer different questions and may change apart.
+const EMPTY_HOLD_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Whether a watched file went from non-empty to empty: the baseline saw bytes in it
+/// (`before`), and it has none `now` (#380). A file the baseline never saw, saw missing or
+/// saw empty — one empty from the start, or one compiled since it was emptied — has not,
+/// and neither has a file that is gone.
+fn went_empty(before: Option<&FileStamp>, now: &FileStamp) -> bool {
+    matches!((before.and_then(|stamp| stamp.1), now.1), (Some(had), Some(0)) if had > 0)
+}
+
+/// Whether any of `paths` went from non-empty to empty since `baseline` was taken
+/// ([`went_empty`]): one `stat` per path, stopping at the first that did.
+fn any_went_empty<'a>(paths: impl IntoIterator<Item = &'a PathBuf>, baseline: &StampMap) -> bool {
+    paths.into_iter().any(|path| {
+        let now = match std::fs::metadata(path) {
+            Ok(m) => (m.modified().ok(), Some(m.len())),
+            Err(_) => (None, None),
+        };
+        went_empty(baseline.get(path), &now)
+    })
+}
+
+/// A rebuild held while a watched file is empty, and the **absolute** deadline at which it
+/// runs anyway (#380).
+///
+/// The deadline is set by the rebuild that first finds a watched file emptied, and never
+/// moves: a later event, another truncation of the same file and an idle tick each find
+/// the hold running and leave it as it is. A deadline that moved with them would let a
+/// stream of events postpone the rebuild forever — the starvation #319 removed from the
+/// idle tick. The hold ends at the first rebuild that finds no watched file emptied, the
+/// content having been written, or at the deadline, when the files are compiled as they
+/// are. Either rebuild takes the baseline again, so a file that stays empty is not
+/// emptied any more, and a later truncation starts a hold of its own.
+///
+/// The hold never reads the clock: every instant is an argument. The rebuild that looks
+/// at the files passes the instant it looked; the watch loop's driver, [`TickClock`],
+/// waits for [`Self::deadline`] and wakes the session there — under `--poll-interval 0`
+/// too, where no tick would.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EmptyHold {
+    /// No rebuild is held.
+    #[default]
+    Off,
+    /// Rebuilds are held until this instant.
+    Until(Instant),
+}
+
+/// What a rebuild does, as [`EmptyHold::on_rebuild`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldVerdict {
+    /// Compile: no watched file is emptied, or the hold's deadline has come.
+    Compile,
+    /// Hold the rebuild back: a watched file is emptied and the deadline is still ahead.
+    Hold,
+}
+
+impl EmptyHold {
+    /// A rebuild at `now` found a watched file emptied (`emptied`), or found none.
+    fn on_rebuild(&mut self, emptied: bool, now: Instant) -> HoldVerdict {
+        match (*self, emptied) {
+            (_, false) => {
+                *self = Self::Off;
+                HoldVerdict::Compile
+            }
+            (Self::Off, true) => {
+                *self = Self::Until(now + EMPTY_HOLD_DEADLINE);
+                HoldVerdict::Hold
+            }
+            (Self::Until(until), true) if now < until => HoldVerdict::Hold,
+            (Self::Until(_), true) => {
+                *self = Self::Off;
+                HoldVerdict::Compile
+            }
+        }
+    }
+
+    /// When the held rebuild runs anyway, if a rebuild is held.
+    fn deadline(&self) -> Option<Instant> {
+        match *self {
+            Self::Off => None,
+            Self::Until(until) => Some(until),
+        }
+    }
+}
+
+// ── Idle tick ─────────────────────────────────────────────────────────────────
+
 /// The idle tick's schedule, holding an **absolute** deadline (#319).
 ///
 /// The liveness probe is the watcher's only backstop for a change that no filesystem
@@ -702,8 +812,58 @@ impl TickSchedule {
     }
 }
 
-/// Drives a [`TickSchedule`] on the real clock and the watch channel: the only place
-/// the idle tick reads `Instant::now()` or waits.
+/// What the watch loop's two deadlines — a held rebuild's ([`EmptyHold`]) and the idle
+/// tick's ([`TickSchedule`]) — say at a given instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakePoll {
+    /// The held rebuild's deadline has come: run it before taking another message, and
+    /// before a tick due at the same instant.
+    HoldDue,
+    /// The tick is due: run it before taking another message. The schedule has already
+    /// re-armed.
+    TickDue,
+    /// Nothing is due: wait at most `wait` for a message. The wait runs out at the held
+    /// rebuild's deadline when `hold`, else at the tick's.
+    Wait { wait: Duration, hold: bool },
+    /// No deadline at all — no rebuild held, and `--poll-interval 0`: wait for a message
+    /// for as long as it takes.
+    Never,
+}
+
+/// The watch loop's next wake at `now`: the held rebuild's deadline `hold`, if a rebuild
+/// is held, and the idle tick's `schedule`, whichever comes first (#380).
+///
+/// The hold is served first when both are due. Its deadline is the one a user waits on —
+/// an emptied file published within a second — and the rebuild it runs takes the baseline
+/// again, so a tick due at the same instant then finds nothing to do but re-arm watches.
+/// A tick left due is served on the very next poll, so neither postpones the other by
+/// more than one wake, and a channel that is never empty postpones neither.
+fn poll_wake(schedule: &mut TickSchedule, hold: Option<Instant>, now: Instant) -> WakePoll {
+    if hold.is_some_and(|until| now >= until) {
+        return WakePoll::HoldDue;
+    }
+    let until_hold = hold.map(|until| until - now);
+    match (schedule.poll(now), until_hold) {
+        (TickPoll::Due, _) => WakePoll::TickDue,
+        (TickPoll::Never, None) => WakePoll::Never,
+        (TickPoll::Never, Some(wait)) => WakePoll::Wait { wait, hold: true },
+        (TickPoll::Wait(tick), Some(wait)) if wait <= tick => WakePoll::Wait { wait, hold: true },
+        (TickPoll::Wait(wait), _) => WakePoll::Wait { wait, hold: false },
+    }
+}
+
+/// What wakes the watch loop ([`TickClock::recv_next`]).
+enum Wake {
+    /// A message arrived: a filesystem event, or Ctrl+C.
+    Message(Msg),
+    /// The idle tick came due ([`TickSchedule`]).
+    Tick,
+    /// The held rebuild's deadline came ([`EmptyHold`], #380).
+    HoldDue,
+}
+
+/// Drives a [`TickSchedule`] and a held rebuild's deadline on the real clock and the watch
+/// channel ([`poll_wake`]): the only place the watch loop reads `Instant::now()` or waits.
 struct TickClock {
     schedule: TickSchedule,
 }
@@ -715,29 +875,29 @@ impl TickClock {
         }
     }
 
-    /// Receive the next message from the watch channel.
+    /// Wait for the next wake: a message from the watch channel, the idle tick, or `hold`
+    /// — the deadline of a rebuild held while a watched file is empty (#380). A held
+    /// rebuild's deadline is waited for whatever the poll interval: under
+    /// `--poll-interval 0`, with no tick to wake the loop, nothing else would.
     ///
-    /// Returns:
-    /// - `Ok(Some(msg))` — a message arrived before the tick came due.
-    /// - `Ok(None)`      — idle tick (only when a poll interval is configured).
-    /// - `Err(_)`        — channel disconnected; caller should `break`.
+    /// `Err` means the channel disconnected; the caller stops.
     fn recv_next(
         &mut self,
         rx: &mpsc::Receiver<Msg>,
-    ) -> std::result::Result<Option<Msg>, mpsc::RecvTimeoutError> {
-        match self.schedule.poll(Instant::now()) {
-            TickPoll::Never => rx
-                .recv()
-                .map(Some)
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-            TickPoll::Due => Ok(None),
-            TickPoll::Wait(wait) => match rx.recv_timeout(wait) {
-                Ok(msg) => Ok(Some(msg)),
+        hold: Option<Instant>,
+    ) -> std::result::Result<Wake, mpsc::RecvError> {
+        match poll_wake(&mut self.schedule, hold, Instant::now()) {
+            WakePoll::HoldDue => Ok(Wake::HoldDue),
+            WakePoll::TickDue => Ok(Wake::Tick),
+            WakePoll::Never => rx.recv().map(Wake::Message),
+            WakePoll::Wait { wait, hold } => match rx.recv_timeout(wait) {
+                Ok(msg) => Ok(Wake::Message(msg)),
+                Err(mpsc::RecvTimeoutError::Timeout) if hold => Ok(Wake::HoldDue),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.schedule.rearm(Instant::now());
-                    Ok(None)
+                    Ok(Wake::Tick)
                 }
-                Err(e @ mpsc::RecvTimeoutError::Disconnected) => Err(e),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
             },
         }
     }
@@ -1745,9 +1905,9 @@ struct SessionArgs {
 mod live {
     use std::ops::ControlFlow;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{emit_ready_marker, stop_watching, Msg, StopReason, TickClock};
+    use super::{emit_ready_marker, stop_watching, Msg, StopReason, TickClock, Wake};
 
     /// What a live watch session does when the loop wakes it: each says whether the
     /// session goes on or stops, and why.
@@ -1755,8 +1915,17 @@ mod live {
         /// Whether the session runs under `--quiet`, which leaves out its last status line.
         fn is_quiet(&self) -> bool;
 
+        /// When the rebuild the session holds while a watched file is empty runs anyway, if
+        /// it holds one (#380): the loop wakes it there ([`Self::on_hold_due`]).
+        fn hold_deadline(&self) -> Option<Instant>;
+
         /// The idle tick came due ([`TickClock`]): the liveness probe (reconcile rule).
         fn on_tick(&mut self) -> ControlFlow<StopReason>;
+
+        /// The held rebuild's deadline came (#380): rebuild, compiling the files as they
+        /// are. The rebuild ends the hold — the loop wakes for a deadline that has come at
+        /// once, so one left standing would never let it wait.
+        fn on_hold_due(&mut self) -> ControlFlow<StopReason>;
 
         /// A message arrived — a filesystem event, or Ctrl+C. `rx` is the channel it came
         /// on, which a debounce window drains.
@@ -1807,9 +1976,9 @@ mod live {
         emit_ready_marker();
     }
 
-    /// The watch loop: one event batch, or one idle tick, at a time. It is bounded: it ends
-    /// on Ctrl+C, on the channel closing, or when a tick or a message ends the session
-    /// (stdout's reader gone), and returns why.
+    /// The watch loop: one event batch, one idle tick, or one held rebuild's deadline at a
+    /// time. It is bounded: it ends on Ctrl+C, on the channel closing, or when a wake ends
+    /// the session (stdout's reader gone), and returns why.
     fn watch_loop(
         rx: &mpsc::Receiver<Msg>,
         tick: Option<Duration>,
@@ -1817,12 +1986,11 @@ mod live {
     ) -> StopReason {
         let mut clock = TickClock::new(tick);
         loop {
-            let next = match clock.recv_next(rx) {
-                Err(mpsc::RecvTimeoutError::Disconnected) => break StopReason::Interrupted,
-                Ok(None) => session.on_tick(),
-                Ok(Some(msg)) => session.on_message(msg, rx),
-                // Unreachable: recv_timeout returns Ok(None) for Timeout, not an Err.
-                Err(mpsc::RecvTimeoutError::Timeout) => ControlFlow::Continue(()),
+            let next = match clock.recv_next(rx, session.hold_deadline()) {
+                Err(mpsc::RecvError) => break StopReason::Interrupted,
+                Ok(Wake::Tick) => session.on_tick(),
+                Ok(Wake::HoldDue) => session.on_hold_due(),
+                Ok(Wake::Message(msg)) => session.on_message(msg, rx),
             };
             if let ControlFlow::Break(why) = next {
                 break why;
@@ -1906,6 +2074,22 @@ fn shown_output(output: &Option<WriteTarget>) -> &Path {
     output
         .as_ref()
         .map_or(Path::new("<stdout>"), |target| target.shown.as_path())
+}
+
+/// Whether writing `after` empties an output: what the session last wrote there for the
+/// same source (`before`) had bytes, and `after` has none (#380). An output the session
+/// never wrote there, or wrote empty, is not emptied by an empty write.
+fn empties_output(before: Option<&str>, after: &str) -> bool {
+    after.is_empty() && before.is_some_and(|before| !before.is_empty())
+}
+
+/// Announce a rebuild's output, `shown` as its `Recompiled` line names it, when the write
+/// `emptied` it ([`empties_output`], #380) — as a held rebuild whose source stayed empty
+/// past its deadline does. Nothing under `--quiet`, as for every watch status line.
+fn announce_emptied_output(shown: &Path, emptied: bool, quiet: bool) {
+    if emptied && !quiet {
+        crate::output::ewriteln!("Wrote an empty output: {}", safe_path(shown));
+    }
 }
 
 /// Write `content` where the session writes: the output file, through [`write_output`]
@@ -2107,8 +2291,11 @@ struct FileWatchState {
     armed_dirs: BTreeSet<PathBuf>,
     /// Set of paths relevant to the current build (entry + deps + vars).
     foi: HashSet<PathBuf>,
-    /// Snapshot of `(mtime, size)` used by the liveness probe (reconcile rule).
+    /// Snapshot of `(mtime, size)` used by the liveness probe (reconcile rule), and by a
+    /// rebuild to tell a file of interest emptied since (#380).
     last_mtimes: StampMap,
+    /// The rebuild held while a file of interest is empty (#380).
+    hold: EmptyHold,
     /// What this session last wrote, by where it wrote it: what a later write may skip as
     /// unchanged, and the bytes a removal or a write after a change of kind asks the file
     /// to still hold (#160). An entry goes with its file, so a file kept — changed, or a
@@ -2271,16 +2458,26 @@ fn handle_fs_event_file(
 }
 
 /// Compile `entry`, resync watches, compare with last-written content, and write
-/// if changed.  Called from both the idle-tick and the FS-event arm of file mode's live
-/// session (`file_startup::FileSession`'s `on_tick` and `on_message`) — the single
-/// canonical implementation of the
-/// compile→resync→route→dedup→write→settle sequence for single-file mode.
+/// if changed.  Called from the idle-tick, the held-rebuild and the FS-event arms of file
+/// mode's live session (`file_startup::FileSession`'s `on_tick`, `on_hold_due` and
+/// `on_message`) — the single canonical implementation of the
+/// hold→compile→resync→route→dedup→write→settle sequence for single-file mode.
 ///
 /// `ctx` holds compile-time constants; `state` holds all mutable loop state;
 /// `watcher` is passed separately (non-Clone, distinct lifecycle role).
 ///
 /// Returns `Break` when the session must stop: `-o -` found stdout's reader gone
 /// (#157). Every other outcome, failures included, keeps watching.
+///
+/// # Holding while a file is empty (#380)
+///
+/// Before anything is read, a file of interest — the entry, a dependency, the `--vars`
+/// file — found empty where the baseline saw bytes holds the rebuild back: nothing is
+/// compiled, written or printed, and the baseline is left as it was ([`Settle::Defer`]),
+/// so the next event or tick finds the file again. The hold ends at the first rebuild that
+/// finds none emptied, or at its deadline ([`EmptyHold`]), when the files are compiled as
+/// they are; an output published empty over the non-empty one before it is announced
+/// ([`announce_emptied_output`]).
 ///
 /// # Invariants preserved
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output, by
@@ -2300,6 +2497,13 @@ fn rebuild_file(
     state: &mut FileWatchState,
 ) -> ControlFlow<StopReason> {
     ctx.working_dir.restore_if_recreated();
+    // #380: a file of interest emptied holds the rebuild back — before `kept` is taken,
+    // since a rebuild held is no rebuild.
+    let emptied = any_went_empty(&state.foi, &state.last_mtimes);
+    if state.hold.on_rebuild(emptied, Instant::now()) == HoldVerdict::Hold {
+        settle(SettleInto::File(state), None, Settle::Defer);
+        return ControlFlow::Continue(());
+    }
     // What the rebuild before this one kept from being written (#160): told again unless
     // this rebuild keeps the same once more, as another event of the same save does.
     let kept_before = state.kept.take();
@@ -2467,6 +2671,14 @@ fn rebuild_file(
                     elapsed
                 );
             }
+            announce_emptied_output(
+                shown_output(&output_path),
+                empties_output(
+                    state.last_written.get(&output_key).map(String::as_str),
+                    &compiled.content,
+                ),
+                ctx.quiet,
+            );
             state
                 .last_written
                 .insert(output_key.clone(), compiled.content);
@@ -2517,10 +2729,11 @@ fn rebuild_file(
 
 /// How `mds watch` settles a rebuild-time failure it keeps watching through (#257):
 /// reading the vars file, a compile — a panic included (#389) — the output route, a
-/// write. The site where the failure happens picks the action and hands it to [`settle`]
-/// with the state to apply it to ([`SettleInto`]). A startup failure settles through
-/// [`settle_startup_error`] instead: there is no baseline yet to take again, so
-/// [`Settle::Rebaseline`] has nothing to apply there. The repeat of a stdout failure
+/// write; and a rebuild held back while a watched file is empty (#380), which is no
+/// failure. The site picks the action and hands it to [`settle`] with the state to apply
+/// it to ([`SettleInto`]). A startup failure settles through [`settle_startup_error`]
+/// instead: there is no baseline yet to take again, so [`Settle::Rebaseline`] has nothing
+/// to apply there, and no startup compile is ever held. The repeat of a stdout failure
 /// reported already (#157) settles nothing, through neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settle<'a> {
@@ -2534,6 +2747,11 @@ enum Settle<'a> {
     /// compiles its one source again on every change anyway, so there it takes the
     /// baseline again, as [`Settle::Rebaseline`] does.
     MarkErrored(&'a Path),
+    /// The rebuild was held back, a watched file being empty (#380): nothing ran, so there
+    /// is nothing to report and nothing to record, and the baseline is left as it was —
+    /// the next event or tick then finds the emptied file again, and the rebuild is held
+    /// again or run.
+    Defer,
 }
 
 /// The rebuild state a [`Settle`] is applied to.
@@ -2568,11 +2786,12 @@ fn settle_reporting(
             state.last_mtimes = snapshot_state(&state.foi);
         }
         (SettleInto::Dir(state), Settle::Rebaseline) => {
-            state.last_mtimes = snapshot_state(&state.tracked_set());
+            state.last_mtimes = snapshot_state(&state.watched_set());
         }
         (SettleInto::Dir(state), Settle::MarkErrored(src)) => {
             state.record_error(src);
         }
+        (SettleInto::File(_) | SettleInto::Dir(_), Settle::Defer) => {}
     }
 }
 
@@ -2702,7 +2921,7 @@ mod file_startup {
     use std::ops::ControlFlow;
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use miette::Result;
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -2717,9 +2936,9 @@ mod file_startup {
         baseline_path, canonicalize_vars_path, compile_and_write, dirs_to_watch, files_of_interest,
         handle_fs_event_file, live, liveness_probe_file, rebuild_file, settle_startup_error,
         shown_watched_dir, snapshot_state, startup_race_probe, vars_dir_paths, written_path,
-        CompileWriteOutcome, FileCompileCtx, FileEventAction, FileWatchState, Msg, OutDirAnchor,
-        OutputKey, OutputRoute, SessionArgs, StampMap, StartupInto, StopReason, WatchedPath,
-        WorkingDir,
+        CompileWriteOutcome, EmptyHold, FileCompileCtx, FileEventAction, FileWatchState, Msg,
+        OutDirAnchor, OutputKey, OutputRoute, SessionArgs, StampMap, StartupInto, StopReason,
+        WatchedPath, WorkingDir,
     };
 
     /// The session's first watches armed and its first baseline taken, before anything is
@@ -3197,6 +3416,7 @@ mod file_startup {
             watched_dirs,
             foi,
             last_mtimes,
+            hold: EmptyHold::Off,
             last_written,
             written_to,
             kept: None,
@@ -3258,6 +3478,10 @@ mod file_startup {
             self.ctx.quiet
         }
 
+        fn hold_deadline(&self) -> Option<Instant> {
+            self.state.hold.deadline()
+        }
+
         fn on_tick(&mut self) -> ControlFlow<StopReason> {
             // Idle tick — run liveness probe (reconcile rule).
             if liveness_probe_file(&self.ctx, &mut self.watcher, &mut self.state) {
@@ -3265,6 +3489,18 @@ mod file_startup {
             } else {
                 ControlFlow::Continue(())
             }
+        }
+
+        fn on_hold_due(&mut self) -> ControlFlow<StopReason> {
+            // The rebuild decides the hold first, at an instant past its deadline, so it
+            // ends the hold whatever the files hold (#380).
+            let next = rebuild_file(&self.ctx, &mut self.watcher, &mut self.state);
+            assert_eq!(
+                self.state.hold,
+                EmptyHold::Off,
+                "a held rebuild's deadline must end the hold"
+            );
+            next
         }
 
         fn on_message(&mut self, msg: Msg, rx: &mpsc::Receiver<Msg>) -> ControlFlow<StopReason> {
@@ -3320,11 +3556,55 @@ struct DirWatchState {
     /// Parent dirs of dependencies located outside the watched root.
     /// Watched NonRecursive; re-armed by liveness probe.
     external_dep_dirs: BTreeSet<PathBuf>,
-    /// `(mtime, size)` baseline over [`DirWatchState::tracked_set`] — sources *and*
-    /// dependencies. Read by the idle tick's content backstop and re-written at the end
-    /// of every batch, so the tick reports only what the batch did not already handle
-    /// (#321).
+    /// The `--vars` file, canonical, if one is given: outside [`Self::tracked_set`], but
+    /// in [`Self::watched_set`], since a rebuild is held while it is empty as while a
+    /// source is (#380).
+    vars_file: Option<PathBuf>,
+    /// `(mtime, size)` baseline over [`DirWatchState::watched_set`] — sources,
+    /// dependencies and the `--vars` file. Read by the idle tick's content backstop over
+    /// the tracked set, and by a batch to tell a watched file emptied since (#380);
+    /// re-written at the end of every batch, so the tick reports only what the batch did
+    /// not already handle (#321).
     last_mtimes: StampMap,
+    /// The rebuild held while a watched file is empty (#380).
+    hold: EmptyHold,
+    /// What the batches held back carried, rebuilt with the batch that ends the hold
+    /// (#380).
+    held: HeldBatch,
+}
+
+/// What the batches held back while a watched file is empty carried (#380): every path
+/// they named, and whether one changed the `--vars` file. A directory-mode hold holds the
+/// whole batch back — a source that imports the emptied file, or reads the emptied vars
+/// file, would compile against nothing — and the batch that ends the hold rebuilds what
+/// they named with its own, so no change made during the hold waits for a later one.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HeldBatch {
+    /// The paths of the batches held back.
+    paths: BTreeSet<PathBuf>,
+    /// Whether one of them changed the `--vars` file.
+    vars_changed: bool,
+}
+
+impl HeldBatch {
+    /// Hold `batch` back, with `vars_changed`, beside the batches held before it.
+    fn hold(&mut self, batch: &BTreeSet<PathBuf>, vars_changed: bool) {
+        self.paths.extend(batch.iter().cloned());
+        self.vars_changed |= vars_changed;
+    }
+
+    /// The batch that ends the hold: `batch` and every batch held back, with whether any
+    /// of them changed the vars file. Nothing stays held.
+    fn release(
+        &mut self,
+        batch: &BTreeSet<PathBuf>,
+        vars_changed: bool,
+    ) -> (BTreeSet<PathBuf>, bool) {
+        let held = std::mem::take(self);
+        let mut paths = held.paths;
+        paths.extend(batch.iter().cloned());
+        (paths, vars_changed || held.vars_changed)
+    }
 }
 
 impl DirWatchState {
@@ -3435,6 +3715,16 @@ impl DirWatchState {
             tracked.extend(deps.iter().cloned());
         }
         tracked
+    }
+
+    /// Every path whose emptying holds a batch back (#380), and the domain of the
+    /// `last_mtimes` baseline: [`Self::tracked_set`] and the `--vars` file, which every
+    /// compile reads. The idle tick's content backstop diffs the tracked set alone — a
+    /// change to the vars file reaches a batch through its event.
+    fn watched_set(&self) -> HashSet<PathBuf> {
+        let mut watched = self.tracked_set();
+        watched.extend(self.vars_file.iter().cloned());
+        watched
     }
 
     /// Remove every GRAPH record of `src` — its forward edges, its error flag and its
@@ -3598,6 +3888,12 @@ fn compile_one_source(
             // file there whatever the record of it holds.
             let content_changed = previous.is_some()
                 || state.record(&out.path, src) != Record::Own(&compiled.content);
+            // Whether the write empties the output the session wrote there for `src`,
+            // decided before the write replaces the record (#380).
+            let emptied = match state.record(&out.path, src) {
+                Record::Own(before) => empties_output(Some(before), &compiled.content),
+                Record::Unwritten | Record::OtherSource => false,
+            };
 
             if content_changed {
                 let written = match out_dir {
@@ -3645,6 +3941,7 @@ fn compile_one_source(
                                 elapsed
                             );
                         }
+                        announce_emptied_output(&out.shown, emptied, quiet);
                         // A change of kind (#160): the output the session last wrote for
                         // `src`, the other kind's, is retired — removed only if the
                         // session's record says it wrote it for `src` and it still holds
@@ -3941,15 +4238,21 @@ fn liveness_probe_dir(
         arm_external_dirs_after_rebuild(ctx, watcher, liveness, state);
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
-    // post-batch tracked set, and an empty batch means nothing appeared, was removed, or
+    // post-batch watched set, and an empty batch means nothing appeared, was removed, or
     // changed — so the existing baseline is by definition still accurate.
 }
 
-/// Rebuild `batch` in directory mode — the one rebuild path of the event handler and of
-/// the idle tick's content backstop alike.
+/// Rebuild `batch` in directory mode — the one rebuild path of the event handler, of the
+/// idle tick's content backstop and of a held rebuild's deadline alike.
 ///
 /// A recreated working directory is restored first ([`WorkingDir::restore_if_recreated`]),
-/// before anything is read. The vars file is then reloaded (freshness rule), and a
+/// before anything is read. A watched file — a source, a dependency or the `--vars` file
+/// ([`DirWatchState::watched_set`]) — found empty where the baseline saw bytes then holds
+/// the whole batch back (#380): nothing is compiled, written or printed, the baseline is
+/// left as it was ([`Settle::Defer`]), and the batch is kept ([`HeldBatch`]) to be rebuilt
+/// with the one that ends the hold — the first to find no watched file emptied, or the
+/// first at or past its deadline ([`EmptyHold`]), which compiles the files as they are.
+/// The vars file is then reloaded (freshness rule), and a
 /// failure to read it is reported and settled: it may be temporarily absent (AC-W7 /
 /// AC-C5). `--set`/`--set-string` are fixed for the session and warned once at startup —
 /// discarded here (via `resolved.vars`). The vars file's duplicate keys are re-reported
@@ -3965,6 +4268,15 @@ fn rebuild_dir_batch(
     state: &mut DirWatchState,
 ) {
     ctx.working_dir.restore_if_recreated();
+
+    // #380: a watched file emptied holds the whole batch back.
+    let emptied = any_went_empty(&state.watched_set(), &state.last_mtimes);
+    if state.hold.on_rebuild(emptied, Instant::now()) == HoldVerdict::Hold {
+        state.held.hold(batch, vars_changed);
+        settle(SettleInto::Dir(state), None, Settle::Defer);
+        return;
+    }
+    let (batch, vars_changed) = state.held.release(batch, vars_changed);
 
     let resolved = match build_runtime_vars(RuntimeVarArgs {
         vars: ctx.vars_path_typed.clone(),
@@ -3985,7 +4297,7 @@ fn rebuild_dir_batch(
     // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
     // needed below, after this borrow ends, for the warning emission.
     let any_changed = process_dir_batch(
-        batch,
+        &batch,
         vars_changed,
         &ctx.root,
         &ctx.output_base,
@@ -4141,7 +4453,7 @@ mod dir_startup {
     use std::ops::ControlFlow;
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use miette::Result;
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -4158,10 +4470,10 @@ mod dir_startup {
     use super::{
         arm_external_dep_dirs, arm_external_dirs_after_rebuild, baseline_path,
         canonicalize_vars_path, extra_vars_dir, graph_key, graph_keys, handle_fs_event_dir, live,
-        liveness_probe_dir, resolve_output_base, settle_startup_error, shown_watched_dir,
-        snapshot_state, startup_race_probe, DirEventOutcome, DirWatchCtx, DirWatchState, FileStamp,
-        LivenessState, Msg, OutDirAnchor, SessionArgs, StampMap, StartupInto, StopReason,
-        WatchedPath, WorkingDir, MAX_COLLECT_DEPTH,
+        liveness_probe_dir, rebuild_dir_batch, resolve_output_base, settle_startup_error,
+        shown_watched_dir, snapshot_state, startup_race_probe, DirEventOutcome, DirWatchCtx,
+        DirWatchState, EmptyHold, FileStamp, HeldBatch, LivenessState, Msg, OutDirAnchor,
+        SessionArgs, StampMap, StartupInto, StopReason, WatchedPath, WorkingDir, MAX_COLLECT_DEPTH,
     };
 
     /// The root armed recursively, and the `--vars` file's directory outside it, before the
@@ -4420,7 +4732,10 @@ mod dir_startup {
             out_dir: None,
             reads: run_reads(vars_path.as_deref(), config.as_ref()),
             external_dep_dirs: BTreeSet::new(),
+            vars_file: vars_path.clone(),
             last_mtimes: HashMap::new(),
+            hold: EmptyHold::Off,
+            held: HeldBatch::default(),
         };
 
         // Capture the content baseline BEFORE the first read of any source, mirroring
@@ -4572,14 +4887,15 @@ mod dir_startup {
             extra_vars_dir(vars_dir_extra.as_deref(), vars_path_typed.as_deref()),
         );
 
-        // Seed the content backstop's baseline (#321).
+        // Seed the content backstop's baseline (#321), over the watched set: the `--vars`
+        // file too, so a batch can tell it emptied (#380).
         //
         // The merge DIRECTION is load-bearing, exactly as in single-file mode: the
         // pre-compile pairs in `pre_mtimes` overwrite the post-compile ones, because only
         // they predate the reads whose results were published. Inverting the merge — or
         // switching to one that keeps the value already present — would silently restore
         // the lost-save bug while every test still passes.
-        let mut last_mtimes = snapshot_state(&state.tracked_set());
+        let mut last_mtimes = snapshot_state(&state.watched_set());
         // Witness for the assertion below, taken before the merge consumes `pre_mtimes`.
         // Chosen by `min()` rather than by iteration order: a `HashMap` yields an arbitrary
         // first element, which would make a failure reproduce only sometimes.
@@ -4669,6 +4985,10 @@ mod dir_startup {
             self.ctx.quiet
         }
 
+        fn hold_deadline(&self) -> Option<Instant> {
+            self.state.hold.deadline()
+        }
+
         fn on_tick(&mut self) -> ControlFlow<StopReason> {
             // Idle tick — run liveness probe (reconcile rule, DD1).
             liveness_probe_dir(
@@ -4676,6 +4996,25 @@ mod dir_startup {
                 &mut self.watcher,
                 &mut self.liveness,
                 &mut self.state,
+            );
+            ControlFlow::Continue(())
+        }
+
+        fn on_hold_due(&mut self) -> ControlFlow<StopReason> {
+            // The batches held back, with nothing new: the rebuild decides the hold first,
+            // at an instant past its deadline, so it ends the hold whatever the files hold
+            // (#380).
+            rebuild_dir_batch(&self.ctx, &BTreeSet::new(), false, &mut self.state);
+            assert_eq!(
+                self.state.hold,
+                EmptyHold::Off,
+                "a held rebuild's deadline must end the hold"
+            );
+            arm_external_dirs_after_rebuild(
+                &self.ctx,
+                &mut self.watcher,
+                &mut self.liveness,
+                &self.state,
             );
             ControlFlow::Continue(())
         }
@@ -4728,7 +5067,9 @@ fn process_dir_batch(
         process_dir_batch_incremental(changed, watch_root, output_base, runtime_vars, quiet, state)
     };
 
-    // Re-baseline the content backstop over the post-batch tracked set (#321).
+    // Re-baseline the content backstop over the post-batch watched set (#321) — the
+    // tracked set and the `--vars` file, so a file the batch compiled empty is not taken
+    // for one emptied since (#380).
     //
     // This is the single settle point for `last_mtimes`, and it has to be here rather
     // than at each compile site: the batch is what the idle tick must not report again,
@@ -4736,7 +5077,7 @@ fn process_dir_batch(
     // the whole set, also settles the sources a *failed* compile touched (so an
     // unchanged broken file does not re-fire every tick) and drops keys for sources the
     // batch deleted, which `snapshot_state` achieves by replacing the map outright.
-    state.last_mtimes = snapshot_state(&state.tracked_set());
+    state.last_mtimes = snapshot_state(&state.watched_set());
     any_changed
 }
 
@@ -5957,23 +6298,328 @@ mod tests {
         );
     }
 
-    /// `--poll-interval 0` disables the tick entirely: `recv_next` blocks for a message.
+    /// `--poll-interval 0` with no rebuild held: `recv_next` blocks for a message.
     #[test]
     fn tick_clock_without_interval_never_ticks() {
         let (tx, rx) = mpsc::channel::<Msg>();
         let mut clock = TickClock::new(None);
         tx.send(Msg::Interrupt).expect("send failed");
         assert!(
-            matches!(clock.recv_next(&rx), Ok(Some(Msg::Interrupt))),
+            matches!(
+                clock.recv_next(&rx, None),
+                Ok(Wake::Message(Msg::Interrupt))
+            ),
             "with no poll interval the clock must deliver the message, never a tick"
         );
         drop(tx);
         assert!(
-            matches!(
-                clock.recv_next(&rx),
-                Err(mpsc::RecvTimeoutError::Disconnected)
-            ),
+            matches!(clock.recv_next(&rx, None), Err(mpsc::RecvError)),
             "a closed channel must report Disconnected rather than tick forever"
+        );
+    }
+
+    // ── Empty-file hold (#380) ───────────────────────────────────────────────
+    //
+    // A rebuild held while a watched file is empty runs at a deadline fixed by the first
+    // rebuild that found the file emptied. These run on synthetic instants, as the tick
+    // tests above do.
+
+    /// A file the baseline saw with bytes and finds with none went empty; nothing else
+    /// did.
+    #[test]
+    fn went_empty_is_a_file_with_bytes_found_with_none() {
+        let stamp = |size: Option<u64>| -> FileStamp { (Some(std::time::UNIX_EPOCH), size) };
+        assert!(
+            went_empty(Some(&stamp(Some(5))), &stamp(Some(0))),
+            "bytes, then none"
+        );
+        assert!(
+            !went_empty(Some(&stamp(Some(0))), &stamp(Some(0))),
+            "a file empty from the start, or compiled since it was emptied"
+        );
+        assert!(
+            !went_empty(None, &stamp(Some(0))),
+            "a file the baseline never saw"
+        );
+        assert!(
+            !went_empty(Some(&stamp(None)), &stamp(Some(0))),
+            "a file the baseline saw missing"
+        );
+        assert!(
+            !went_empty(Some(&stamp(Some(5))), &stamp(None)),
+            "a file that is gone"
+        );
+        assert!(
+            !went_empty(Some(&stamp(Some(5))), &stamp(Some(3))),
+            "a file that still has bytes"
+        );
+    }
+
+    /// The held rebuild's deadline is set by the first rebuild that finds a watched file
+    /// emptied, and no later one moves it: each finds the hold running until the deadline,
+    /// and the first at it compiles and ends the hold.
+    #[test]
+    fn empty_hold_deadline_is_fixed_at_the_first_empty_observation() {
+        let t0 = Instant::now();
+        let mut hold = EmptyHold::default();
+        assert_eq!(
+            hold.deadline(),
+            None,
+            "nothing is held before a file is emptied"
+        );
+        assert_eq!(hold.on_rebuild(true, t0), HoldVerdict::Hold);
+        assert_eq!(hold.deadline(), Some(t0 + EMPTY_HOLD_DEADLINE));
+        for k in 1..10u64 {
+            let now = t0 + ms(100 * k);
+            assert_eq!(hold.on_rebuild(true, now), HoldVerdict::Hold, "at {now:?}");
+            assert_eq!(
+                hold.deadline(),
+                Some(t0 + EMPTY_HOLD_DEADLINE),
+                "a rebuild {}ms in must not move the deadline",
+                100 * k
+            );
+        }
+        let just_before = t0 + EMPTY_HOLD_DEADLINE - Duration::from_nanos(1);
+        assert_eq!(hold.on_rebuild(true, just_before), HoldVerdict::Hold);
+        assert_eq!(
+            hold.on_rebuild(true, t0 + EMPTY_HOLD_DEADLINE),
+            HoldVerdict::Compile,
+            "at the deadline the files are compiled as they are"
+        );
+        assert_eq!(
+            hold.deadline(),
+            None,
+            "the rebuild at the deadline ends the hold"
+        );
+    }
+
+    /// An endless stream of rebuilds that each find the file still emptied — a truncation
+    /// every 2ms, every 100ms, every 999ms — compiles at the first rebuild at or past the
+    /// deadline the stream's first rebuild set: no stream moves it.
+    #[test]
+    fn empty_hold_compiles_an_endless_stream_at_its_first_deadline() {
+        for (every, compiled_at) in [
+            (ms(2), ms(1_000)),
+            (ms(100), ms(1_000)),
+            (ms(999), ms(1_998)),
+        ] {
+            let t0 = Instant::now();
+            let mut hold = EmptyHold::default();
+            // Endless, bounded only by the first compile (and a step cap).
+            let compiled = (0u32..)
+                .take(10_000)
+                .map(|k| t0 + every * k)
+                .find(|&now| hold.on_rebuild(true, now) == HoldVerdict::Compile);
+            assert_eq!(
+                compiled.map(|at| at - t0),
+                Some(compiled_at),
+                "a stream of rebuilds every {every:?} must compile at its first deadline"
+            );
+        }
+    }
+
+    /// A rebuild that finds no watched file emptied — the content written — compiles at once
+    /// and ends the hold; a later truncation then sets a deadline of its own.
+    #[test]
+    fn empty_hold_ends_when_no_watched_file_is_emptied() {
+        let t0 = Instant::now();
+        let mut hold = EmptyHold::default();
+        assert_eq!(
+            hold.on_rebuild(false, t0),
+            HoldVerdict::Compile,
+            "nothing emptied, nothing held"
+        );
+        assert_eq!(hold.deadline(), None);
+        assert_eq!(hold.on_rebuild(true, t0 + ms(10)), HoldVerdict::Hold);
+        assert_eq!(
+            hold.on_rebuild(false, t0 + ms(500)),
+            HoldVerdict::Compile,
+            "written: compiled at once, not at the deadline"
+        );
+        assert_eq!(hold.deadline(), None, "the write ends the hold");
+        assert_eq!(hold.on_rebuild(true, t0 + ms(600)), HoldVerdict::Hold);
+        assert_eq!(
+            hold.deadline(),
+            Some(t0 + ms(600) + EMPTY_HOLD_DEADLINE),
+            "a new truncation sets its own deadline"
+        );
+    }
+
+    /// What woke the loop in a [`wakes_under_saturation`] replay.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Woke {
+        Hold,
+        Tick,
+    }
+
+    /// Replays [`TickClock::recv_next`] with a rebuild held until `hold` (an offset) on a
+    /// channel that is never empty: every poll with nothing due takes a message, and
+    /// handling one moves the clock on by `per_message`. The held rebuild ends its hold
+    /// when it runs, as a session's `on_hold_due` does. Returns each wake before `until`,
+    /// as offsets.
+    fn wakes_under_saturation(
+        interval: Option<Duration>,
+        hold: Duration,
+        per_message: Duration,
+        until: Duration,
+    ) -> Vec<(Duration, Woke)> {
+        let t0 = Instant::now();
+        let mut schedule = TickSchedule::start(interval, t0);
+        let mut held = Some(t0 + hold);
+        let mut now = t0;
+        let mut wakes = Vec::new();
+        // Bounded: one step per message or wake.
+        for _ in 0..10_000 {
+            if now >= t0 + until {
+                return wakes;
+            }
+            match poll_wake(&mut schedule, held, now) {
+                WakePoll::HoldDue => {
+                    wakes.push((now - t0, Woke::Hold));
+                    held = None;
+                }
+                WakePoll::TickDue => wakes.push((now - t0, Woke::Tick)),
+                WakePoll::Wait { .. } | WakePoll::Never => now += per_message,
+            }
+        }
+        panic!("the replay did not reach {until:?} within 10 000 steps; wakes so far: {wakes:?}");
+    }
+
+    /// A held rebuild's deadline is served before the next message and before a tick due at
+    /// the same instant, the tick right after it; a channel that is never empty postpones
+    /// neither — under `--poll-interval 0` as well, where only the hold's own deadline can
+    /// wake the loop.
+    #[test]
+    fn wake_schedule_serves_a_held_rebuild_first_under_saturation() {
+        use Woke::{Hold, Tick};
+        assert_eq!(
+            wakes_under_saturation(Some(ms(50)), ms(120), ms(5), ms(210)),
+            [
+                (ms(50), Tick),
+                (ms(100), Tick),
+                (ms(120), Hold),
+                (ms(150), Tick),
+                (ms(200), Tick)
+            ],
+            "a saturated channel must postpone neither the tick nor the held rebuild"
+        );
+        assert_eq!(
+            wakes_under_saturation(Some(ms(50)), ms(100), ms(5), ms(160)),
+            [
+                (ms(50), Tick),
+                (ms(100), Hold),
+                (ms(100), Tick),
+                (ms(150), Tick)
+            ],
+            "a held rebuild due with a tick runs first, the tick straight after it"
+        );
+        assert_eq!(
+            wakes_under_saturation(None, ms(1_000), ms(7), ms(2_000)),
+            [(ms(1_001), Hold)],
+            "with no tick the held rebuild still runs at the first poll at or after its \
+             deadline"
+        );
+    }
+
+    /// With no message waiting the loop waits for whichever deadline comes first — the held
+    /// rebuild's even under `--poll-interval 0`, where nothing else would wake it — and
+    /// blocks with no deadline only when no rebuild is held and no tick runs.
+    #[test]
+    fn wake_schedule_waits_for_the_earlier_deadline() {
+        let t0 = Instant::now();
+        let held = Some(t0 + ms(1_000));
+        let mut off = TickSchedule::start(None, t0);
+        assert_eq!(
+            poll_wake(&mut off, held, t0),
+            WakePoll::Wait {
+                wait: ms(1_000),
+                hold: true
+            },
+            "--poll-interval 0 must still wait for the held rebuild"
+        );
+        assert_eq!(
+            poll_wake(&mut off, held, t0 + ms(999)),
+            WakePoll::Wait {
+                wait: ms(1),
+                hold: true
+            }
+        );
+        assert_eq!(poll_wake(&mut off, held, t0 + ms(1_000)), WakePoll::HoldDue);
+        assert_eq!(
+            poll_wake(&mut off, None, t0 + ms(1_000)),
+            WakePoll::Never,
+            "positive control: nothing held and no tick — a message, however long it takes"
+        );
+
+        let mut every = TickSchedule::start(Some(ms(50)), t0);
+        assert_eq!(
+            poll_wake(&mut every, Some(t0 + ms(30)), t0),
+            WakePoll::Wait {
+                wait: ms(30),
+                hold: true
+            },
+            "the held rebuild's deadline comes first"
+        );
+        assert_eq!(
+            poll_wake(&mut every, Some(t0 + ms(80)), t0),
+            WakePoll::Wait {
+                wait: ms(50),
+                hold: false
+            },
+            "the tick comes first"
+        );
+        assert_eq!(
+            poll_wake(&mut every, Some(t0 + ms(50)), t0),
+            WakePoll::Wait {
+                wait: ms(50),
+                hold: true
+            },
+            "a tie waits for the held rebuild, which is served first"
+        );
+        assert_eq!(
+            poll_wake(&mut every, None, t0),
+            WakePoll::Wait {
+                wait: ms(50),
+                hold: false
+            }
+        );
+    }
+
+    /// A directory-mode hold keeps every batch it holds back, and the batch that ends it
+    /// rebuilds them all with its own — a vars-file change among them makes it a full
+    /// rebuild — leaving nothing held.
+    #[test]
+    fn held_batches_are_rebuilt_with_the_batch_that_ends_the_hold() {
+        let paths =
+            |names: &[&str]| -> BTreeSet<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        let mut held = HeldBatch::default();
+        held.hold(&paths(&["/w/b.mds"]), false);
+        held.hold(&paths(&["/w/a.mds", "/w/b.mds"]), true);
+        assert_eq!(
+            held.release(&paths(&["/w/a.mds", "/w/c.mds"]), false),
+            (paths(&["/w/a.mds", "/w/b.mds", "/w/c.mds"]), true)
+        );
+        assert_eq!(held, HeldBatch::default(), "nothing stays held");
+        assert_eq!(
+            held.release(&paths(&["/w/c.mds"]), false),
+            (paths(&["/w/c.mds"]), false),
+            "positive control: with nothing held, a batch is its own"
+        );
+    }
+
+    /// An output the session wrote with bytes, written with none, is emptied; nothing else
+    /// is.
+    #[test]
+    fn empties_output_is_an_output_with_bytes_written_with_none() {
+        assert!(empties_output(Some("Page\n"), ""), "bytes, then none");
+        assert!(!empties_output(Some(""), ""), "an output already empty");
+        assert!(
+            !empties_output(None, ""),
+            "an output the session never wrote there"
+        );
+        assert!(
+            !empties_output(Some("Page\n"), "Other\n"),
+            "an output still with bytes"
         );
     }
 
@@ -6290,13 +6936,33 @@ mod tests {
         let t1 = Instant::now();
         let mut clock = TickClock::new(Some(ms(50)));
         assert!(
-            matches!(clock.recv_next(&rx), Ok(None)),
+            matches!(clock.recv_next(&rx, None), Ok(Wake::Tick)),
             "an idle channel must produce a tick"
         );
         assert!(
             t1.elapsed() >= ms(50),
             "the tick must not come due before its interval; got {:?}",
             t1.elapsed()
+        );
+
+        // `--poll-interval 0`: no tick, yet a held rebuild's deadline still wakes the loop
+        // (#380) — and not before it. A message sent long after the deadline bounds the
+        // wait: a driver that blocked for a message instead fails here, not hangs.
+        let late = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = late.send(Msg::Interrupt);
+        });
+        let t2 = Instant::now();
+        let mut clock = TickClock::new(None);
+        assert!(
+            matches!(clock.recv_next(&rx, Some(t2 + ms(30))), Ok(Wake::HoldDue)),
+            "a held rebuild's deadline must wake an idle loop with no tick"
+        );
+        assert!(
+            t2.elapsed() >= ms(30),
+            "the held rebuild must not run before its deadline; got {:?}",
+            t2.elapsed()
         );
         drop(tx);
     }
@@ -6359,7 +7025,10 @@ mod tests {
             out_dir: None,
             reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
+            vars_file: None,
             last_mtimes: HashMap::new(),
+            hold: EmptyHold::Off,
+            held: HeldBatch::default(),
         };
         state.known_files.insert(importer.clone());
         state
@@ -6399,7 +7068,10 @@ mod tests {
             out_dir: None,
             reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
+            vars_file: None,
             last_mtimes: HashMap::new(),
+            hold: EmptyHold::Off,
+            held: HeldBatch::default(),
         };
         state.record_success(&importer, vec![external.clone()], &root, None, None);
         assert!(state.external_dep_dirs.contains(Path::new("/w/shared")));
@@ -6462,7 +7134,10 @@ mod tests {
             out_dir: None,
             reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
+            vars_file: None,
             last_mtimes: HashMap::new(),
+            hold: EmptyHold::Off,
+            held: HeldBatch::default(),
         };
         state.known_files.insert(victim.clone());
         state.last_written.insert(
@@ -6537,7 +7212,10 @@ mod tests {
             out_dir: None,
             reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
+            vars_file: None,
             last_mtimes: HashMap::new(),
+            hold: EmptyHold::Off,
+            held: HeldBatch::default(),
         };
         let src = PathBuf::from("/w/root/broken.mds");
         state.record_error(&src);
@@ -6933,7 +7611,10 @@ mod tests {
             out_dir: None,
             reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
+            vars_file: None,
             last_mtimes: HashMap::new(),
+            hold: EmptyHold::Off,
+            held: HeldBatch::default(),
         }
     }
 
@@ -6944,6 +7625,7 @@ mod tests {
             armed_dirs: BTreeSet::new(),
             foi,
             last_mtimes: HashMap::new(),
+            hold: EmptyHold::Off,
             last_written: HashMap::new(),
             written_to: None,
             kept: None,
@@ -6971,7 +7653,7 @@ mod tests {
     /// rebuild states (#257).
     #[test]
     fn settle_rebaseline_takes_the_baseline_again_in_a_rebuild_only() {
-        let (_dir, src, dep) = source_and_dependency();
+        let (dir, src, dep) = source_and_dependency();
 
         // File mode: over the files of interest.
         let foi: HashSet<PathBuf> = [src.clone(), dep.clone()].into_iter().collect();
@@ -6986,18 +7668,75 @@ mod tests {
             file.last_mtimes
         );
 
-        // Directory mode: over the tracked set — the sources and their dependencies.
+        // Directory mode: over the watched set — the sources, their dependencies and the
+        // `--vars` file (#380).
+        let vars = dir.path().join("vars.json");
+        std::fs::write(&vars, r#"{"v": 1}"#).unwrap();
         let mut rebuild = empty_dir_state();
         rebuild.known_files.insert(src.clone());
         rebuild.forward_deps.insert(src.clone(), vec![dep.clone()]);
+        rebuild.vars_file = Some(vars.clone());
         settle(SettleInto::Dir(&mut rebuild), None, Settle::Rebaseline);
-        assert_eq!(rebuild.last_mtimes, snapshot_state(&rebuild.tracked_set()));
+        assert_eq!(rebuild.last_mtimes, snapshot_state(&rebuild.watched_set()));
         assert!(
-            rebuild.last_mtimes.contains_key(&dep),
-            "the dependency is in the baseline: {:?}",
+            rebuild.last_mtimes.contains_key(&dep) && rebuild.last_mtimes.contains_key(&vars),
+            "the dependency and the vars file are in the baseline: {:?}",
             rebuild.last_mtimes
         );
+        assert!(
+            !rebuild.tracked_set().contains(&vars),
+            "the vars file is outside the tracked set the idle tick diffs"
+        );
         assert!(rebuild.errored.is_empty(), "nothing is marked errored");
+    }
+
+    /// `Settle::Defer` — a rebuild held while a watched file is empty — reports nothing,
+    /// records nothing and leaves the baseline as it was in both modes, so the next event
+    /// or tick finds the emptied file again; `Settle::Rebaseline` on the same state takes
+    /// the empty file in (positive control) (#380).
+    #[test]
+    fn settle_defer_leaves_the_baseline_and_records_nothing() {
+        let (_dir, src, dep) = source_and_dependency();
+        let foi: HashSet<PathBuf> = [src.clone(), dep.clone()].into_iter().collect();
+        let before = snapshot_state(&foi);
+        std::fs::write(&dep, "").unwrap();
+        let report = |e: miette::Report| panic!("a deferral reports nothing; got {e:?}");
+
+        // File mode.
+        let mut file = file_state(foi.clone());
+        file.last_mtimes = before.clone();
+        settle_reporting(SettleInto::File(&mut file), None, Settle::Defer, report);
+        assert_eq!(file.last_mtimes, before, "the baseline is left as it was");
+        assert!(
+            any_went_empty(&file.foi, &file.last_mtimes),
+            "the next rebuild finds the dependency emptied again"
+        );
+        settle(SettleInto::File(&mut file), None, Settle::Rebaseline);
+        assert!(
+            !any_went_empty(&file.foi, &file.last_mtimes),
+            "positive control: a rebaseline takes the empty file in"
+        );
+
+        // Directory mode.
+        let mut rebuild = empty_dir_state();
+        rebuild.known_files.insert(src.clone());
+        rebuild.forward_deps.insert(src.clone(), vec![dep.clone()]);
+        rebuild.last_mtimes = before.clone();
+        settle_reporting(SettleInto::Dir(&mut rebuild), None, Settle::Defer, report);
+        assert_eq!(
+            rebuild.last_mtimes, before,
+            "the baseline is left as it was"
+        );
+        assert!(rebuild.errored.is_empty(), "nothing is marked errored");
+        assert!(
+            any_went_empty(&rebuild.watched_set(), &rebuild.last_mtimes),
+            "the next batch finds the dependency emptied again"
+        );
+        settle(SettleInto::Dir(&mut rebuild), None, Settle::Rebaseline);
+        assert!(
+            !any_went_empty(&rebuild.watched_set(), &rebuild.last_mtimes),
+            "positive control: a rebaseline takes the empty file in"
+        );
     }
 
     /// `Settle::MarkErrored` records a directory-mode source as errored in a rebuild,

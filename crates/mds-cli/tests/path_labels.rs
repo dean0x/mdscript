@@ -1478,6 +1478,54 @@ fn recompiled_and_removed_name_each_output_as_typed() {
     }
 }
 
+/// `Wrote an empty output: <output>` — what a rebuild prints when it writes an output
+/// empty over the non-empty one the session wrote there, as it does once a source emptied
+/// and closed stays empty past its hold (#380) — names the output as its `Recompiled`
+/// line does: beside the entry as typed, below `--out-dir` as typed, below the directory
+/// argument as typed. Run from the scratch directory with relative arguments, it names no
+/// spelling of it; each session first proves the line printed.
+#[test]
+fn an_emptied_output_is_named_as_its_recompiled_line_names_it() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "e1/page.mds", "Page\n");
+    put(root, "e2/page.mds", "Page\n");
+    put(root, "e3/sub/a.mds", "A\n");
+    put(root, "e4/sub/a.mds", "A\n");
+
+    // (cwd, args, the source emptied, the output as named)
+    let sessions: [(&str, &[&str], &str, &str); 4] = [
+        (".", &["watch", "e1/page.mds"], "e1/page.mds", "e1/page.md"),
+        ("e2", &["watch", "page.mds"], "page.mds", "./page.md"),
+        (
+            ".",
+            &["watch", "e3", "--out-dir", "o3"],
+            "e3/sub/a.mds",
+            "o3/sub/a.md",
+        ),
+        ("e4", &["watch", "."], "sub/a.mds", "./sub/a.md"),
+    ];
+    for (rel, args, emptied, output) in sessions {
+        let cwd = root.join(rel);
+        let args = typed_args(args);
+        let label = format!("(in {rel}) mds {}", args.join(" "));
+        let (mut child, tap, _) = watch_live(&cwd, &args, false);
+
+        // Truncate and close: the source stays empty, so its hold runs out and the empty
+        // output is written.
+        drop(std::fs::File::create(cwd.join(native(emptied))).expect("empty the source"));
+        common::wait_for_tap(&tap, "Wrote an empty output: ", WATCH_STEP);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            lines_starting(&stderr, "Wrote an empty output: "),
+            [format!("Wrote an empty output: {}", native(output))],
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(leak(&stderr, root), None, "{label}: stderr: {stderr}");
+    }
+}
+
 /// A source deleted in the same batch as an edit to the `--vars` file — the batch that
 /// recompiles every source — has its output named as typed in the `Removed … (source
 /// deleted)` line, as a deletion alone does.
@@ -2100,6 +2148,7 @@ const LABEL_TABLE: &[&[&str]] = &[
         "recompiled_and_removed_name_each_output_as_typed",
         "watching_names_a_path_reached_through_a_symlink_by_the_link",
     ],
+    &["an_emptied_output_is_named_as_its_recompiled_line_names_it"],
     &[
         "recompiled_and_removed_name_each_output_as_typed",
         "removed_names_the_output_as_typed_when_the_vars_file_changes_in_the_same_batch",

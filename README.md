@@ -118,7 +118,10 @@ Watch-only options:
                               than MS still coalesces into a single rebuild. The window is
                               capped at max(10 × MS, 1000) ms, so a file written to
                               continuously still rebuilds. 0 disables coalescing (every
-                              event rebuilds). Values above 60000 are clamped.
+                              event rebuilds). Values above 60000 are clamped. At any
+                              value, a rebuild waits while a watched file is empty (as
+                              during a truncate-then-write save) until it is written, or
+                              for at most 1000 ms, after which the empty file is compiled.
   --poll-interval <MS>        Liveness-probe interval in milliseconds (default: 1000).
                               0 disables self-heal (native events only). Clamped to ≥50ms.
                               The watcher self-heals after a watched dir/root is deleted and
@@ -238,6 +241,15 @@ shared partial rebuilds **all transitive importers** automatically.
   session; not overwritten`, the old output stays as it was, and the next save tries
   again. The startup write, and `-o`, write over whatever is there but an MDS module or a
   file the session reads, as `mds build` does.
+- **Truncating saves**: an editor that saves by truncating the file and then writing it
+  leaves it empty for a moment. While a watched file — the entry, an import, the `--vars`
+  file, any source of a watched directory — is empty after having content, rebuilds wait
+  (in directory mode, the whole batch waits), at every `--debounce`: nothing is compiled
+  or printed until the file is written, so no empty output is published in between. A
+  file still empty one second after the watcher first saw it emptied is compiled as it
+  is, however many events arrive meanwhile and under `--poll-interval 0` too. A rebuild
+  that empties an output it had written with content prints
+  `Wrote an empty output: <file>` (not under `--quiet`).
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.

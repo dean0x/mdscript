@@ -232,7 +232,9 @@ enum Commands {
         /// Each file change restarts the window, so a save burst longer than MS still
         /// coalesces into one rebuild; the window is capped at max(10 x MS, 1000) ms so
         /// continuous writes still rebuild. Use 0 to disable coalescing.
-        /// Values above 60000 are clamped.
+        /// Values above 60000 are clamped. At any value, a rebuild waits while a watched
+        /// file is empty, as during a truncate-then-write save, until it is written or
+        /// for at most 1000 ms, after which the empty file is compiled.
         #[arg(long = "debounce", value_name = "MS", default_value = "100")]
         debounce: u64,
         /// Self-heal poll interval in milliseconds (default 1000).

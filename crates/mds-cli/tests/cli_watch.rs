@@ -2134,14 +2134,12 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
 ///
 /// Uses the **default 100ms debounce**, not `--debounce 0`. One `fs::write` is a
 /// truncate followed by a write, which the kernel reports as two separate content
-/// events; under `--debounce 0` — documented as "immediate rebuilds", i.e. opting
-/// out of burst coalescing — the watcher may legitimately rebuild twice, so
-/// `Recompiled == 1` is not a property the product guarantees there. (Measured at
-/// ~6-12% of single edits under load, on both sides of the arm-before-publish
-/// change.) The debounce window is precisely the mechanism that collapses that pair,
-/// so running this assertion with coalescing enabled tests the intended invariant —
-/// one status line per rebuild, and loop rebuilds say "Recompiled", not "Compiled to"
-/// — instead of an incidental timing outcome.
+/// events; the debounce window is the mechanism that collapses that pair into one
+/// rebuild, so running this assertion with coalescing enabled tests the intended
+/// invariant — one status line per rebuild, and loop rebuilds say "Recompiled", not
+/// "Compiled to". (Under `--debounce 0` the pair once rebuilt twice, the empty moment
+/// between its two halves published as an output of its own; that moment is now held
+/// at every debounce, #380, and `cli_watch_truncate.rs` pins it.)
 #[test]
 fn watch_single_status_line_per_rebuild() {
     let dir = tempfile::tempdir().unwrap();
