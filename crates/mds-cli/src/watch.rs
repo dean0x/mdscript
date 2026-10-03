@@ -77,9 +77,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use mds::MdsError;
 
 use crate::build::{
-    admit_output, auto_detect_mds_file, build_runtime_vars, compile_to_content,
+    admit_output, auto_detect_mds_file, build_runtime_vars, compile_inputs, compile_to_content,
     emit_duplicate_var_warnings, load_config, resolve_dir_as_created, resolve_output_path_for_kind,
-    write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
+    run_reads, write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
@@ -87,8 +87,8 @@ use crate::output::{
     write_stdout, OutputBase, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
 use crate::write::{
-    remove_proven, write_over_own, DirIdentity, Durability, NotCreated, NotRemoved, Parents,
-    Removal,
+    remove_proven, write_over_own, DirIdentity, Durability, Inputs, NotCreated, NotRemoved,
+    Parents, Removal,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -1700,16 +1700,17 @@ fn shown_output(output: &Option<WriteTarget>) -> &Path {
 }
 
 /// Write `content` where the session writes: the output file, through [`write_output`]
-/// (`announce` prints its `Compiled to` line), or stdout for `-o -` (`output_path` is
-/// `None`).
+/// (`announce` prints its `Compiled to` line) and never over one of `inputs`, the files
+/// its compile read (#425), or stdout for `-o -` (`output_path` is `None`).
 fn write_session_output(
     output_path: Option<&WriteTarget>,
     content: &str,
+    inputs: &Inputs,
     quiet: bool,
     announce: bool,
 ) -> OutputWrite {
     match output_path {
-        Some(target) => match write_output(Some(target), content, quiet, announce) {
+        Some(target) => match write_output(Some(target), content, inputs, quiet, announce) {
             Ok(()) => OutputWrite::Written,
             Err(e) => OutputWrite::Failed(Some(e)),
         },
@@ -1738,7 +1739,9 @@ fn write_session_output(
 /// If `-o <path>` is given explicitly, that path is used verbatim, and once
 /// [`admit_output`] has admitted it an ext-mismatch warning is emitted when the
 /// extension contradicts the kind (AC-FUNC-11). If `-o -`, content is written to stdout.
-/// No source map is written: `mds watch` emits none.
+/// No source map is written: `mds watch` emits none. The output is never written over a
+/// file the compile read — the entry, a module it imported, or one of `reads`, the
+/// `--vars` file and the `mds.json` in force (#425); such a write fails as any other.
 ///
 /// # PF-004 compliance
 /// All file reads go through `compile_to_content` → `mds::compile_with_deps_opts`
@@ -1749,6 +1752,7 @@ fn compile_and_write(
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<ProjectConfig>,
+    reads: &[PathBuf],
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<CompileWriteOutcome> {
@@ -1766,8 +1770,15 @@ fn compile_and_write(
         quiet,
     )
     .map_err(miette::Error::from)?;
+    let inputs = compile_inputs(Some(&entry.canonical), &compiled.dependencies, reads);
     Ok(
-        match write_session_output(output_path.as_ref(), &compiled.content, quiet, true) {
+        match write_session_output(
+            output_path.as_ref(),
+            &compiled.content,
+            &inputs,
+            quiet,
+            true,
+        ) {
             OutputWrite::Written => CompileWriteOutcome::Written((
                 output_path,
                 graph_keys(&compiled.dependencies),
@@ -1800,6 +1811,9 @@ struct FileCompileCtx {
     /// Used for `RuntimeVarArgs.vars` so the vars-file duplicate-key warning displays
     /// (and reads) the as-typed path rather than its canonical form.
     vars_path_typed: Option<PathBuf>,
+    /// The files every compile reads besides the entry's own — the `--vars` file and the
+    /// `mds.json` in force — which no output is written over (#425).
+    reads: Vec<PathBuf>,
     static_set_vars: Vec<(String, String)>,
     static_set_string_vars: Vec<(String, String)>,
     quiet: bool,
@@ -2217,6 +2231,11 @@ fn rebuild_file(
                 .map(|target| below_checked_out_dir(state.out_dir.as_ref(), target))
                 .as_ref(),
             &compiled.content,
+            &compile_inputs(
+                Some(&ctx.entry.canonical),
+                &compiled.dependencies,
+                &ctx.reads,
+            ),
             ctx.quiet,
             false,
         ),
@@ -2555,7 +2574,18 @@ fn run_watch_file(
     // The outer `?` is an output route no rebuild can use — one that fails to resolve, or
     // the entry file itself (#425): refused at startup, exit 2, before anything is
     // written. A compile or write error is reported, and watching continues.
-    let startup = compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet)?;
+    // The files every compile reads besides the entry's own: the `--vars` file and the
+    // `mds.json` in force, which no output is written over (#425).
+    let reads = run_reads(vars_path.as_deref(), config.as_ref());
+    let startup = compile_and_write(
+        &entry,
+        &output,
+        &out_dir,
+        &config,
+        &reads,
+        runtime_vars,
+        quiet,
+    )?;
     // The route each output takes: an explicit `-o` names one whatever the kind; without
     // it, the route of each kind is resolved now and every output takes its own kind's
     // (#257, #160) — after a startup compile that failed, whose kind is unknown, and when
@@ -2739,6 +2769,7 @@ fn run_watch_file(
         working_dir,
         vars_path,
         vars_path_typed,
+        reads,
         static_set_vars,
         static_set_string_vars,
         quiet,
@@ -2830,6 +2861,9 @@ struct DirWatchState {
     /// The out-dir every output is written below, checked before each write; `None` when
     /// outputs go beside their sources.
     out_dir: Option<OutDirAnchor>,
+    /// The files every compile reads besides its source's own — the `--vars` file and the
+    /// `mds.json` in force — which no output is written over (#425).
+    reads: Vec<PathBuf>,
     /// Parent dirs of dependencies located outside the watched root.
     /// Watched NonRecursive; re-armed by liveness probe.
     external_dep_dirs: BTreeSet<PathBuf>,
@@ -3126,6 +3160,7 @@ fn compile_one_source(
                     OutDirNow::Unchanged | OutDirNow::New => write_output(
                         Some(&below_checked_out_dir(state.out_dir.as_ref(), &out)),
                         &compiled.content,
+                        &compile_inputs(Some(src), &compiled.dependencies, &state.reads),
                         quiet,
                         false,
                     )
@@ -3717,6 +3752,7 @@ fn dir_watch_startup(
         kept: HashMap::new(),
         // Recorded below, once the startup writes have made the out-dir.
         out_dir: None,
+        reads: run_reads(vars_path.as_deref(), config.as_ref()),
         external_dep_dirs: BTreeSet::new(),
         last_mtimes: HashMap::new(),
     };
@@ -3789,7 +3825,10 @@ fn dir_watch_startup(
                     // write failed is errored instead, so the next rebuild with a real
                     // change writes it even when its content has not changed (#257) —
                     // and nothing it did not write is ever its to remove (#160).
-                    if let Err(e) = write_output(Some(&out), &compiled.content, quiet, true) {
+                    let inputs = compile_inputs(Some(&key), &compiled.dependencies, &state.reads);
+                    if let Err(e) =
+                        write_output(Some(&out), &compiled.content, &inputs, quiet, true)
+                    {
                         settle_startup_error(StartupInto::Dir(&mut state), Some(e), &key);
                     } else {
                         state.wrote(&key, &out, compiled.content);
@@ -5471,6 +5510,7 @@ mod tests {
             outputs: HashMap::new(),
             kept: HashMap::new(),
             out_dir: None,
+            reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5510,6 +5550,7 @@ mod tests {
             outputs: HashMap::new(),
             kept: HashMap::new(),
             out_dir: None,
+            reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5572,6 +5613,7 @@ mod tests {
             outputs: HashMap::new(),
             kept: HashMap::new(),
             out_dir: None,
+            reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5646,6 +5688,7 @@ mod tests {
             outputs: HashMap::new(),
             kept: HashMap::new(),
             out_dir: None,
+            reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         };
@@ -5743,7 +5786,9 @@ mod tests {
             what: Watched::Entry,
         };
         let (_written_path, deps, _content) =
-            match compile_and_write(&watched, &Some(out_str), &None, &None, None, true).unwrap() {
+            match compile_and_write(&watched, &Some(out_str), &None, &None, &[], None, true)
+                .unwrap()
+            {
                 CompileWriteOutcome::Written(result) => result,
                 CompileWriteOutcome::CompileFailed(e) => panic!("the compile failed: {e:?}"),
                 CompileWriteOutcome::WriteFailed { failure, .. } => {
@@ -5800,7 +5845,7 @@ mod tests {
         };
         let name = |path: &Path| path.file_name().and_then(|n| n.to_str()).map(str::to_owned);
 
-        match compile_and_write(&watched, &None, &None, &None, None, true).unwrap() {
+        match compile_and_write(&watched, &None, &None, &None, &[], None, true).unwrap() {
             CompileWriteOutcome::WriteFailed { deps, failure } => {
                 let dep_names: Vec<_> = deps.iter().filter_map(|d| name(d)).collect();
                 assert!(
@@ -5826,7 +5871,7 @@ mod tests {
         std::fs::write(&entry, "Hello {{name\n").unwrap();
         assert!(
             matches!(
-                compile_and_write(&watched, &None, &None, &None, None, true).unwrap(),
+                compile_and_write(&watched, &None, &None, &None, &[], None, true).unwrap(),
                 CompileWriteOutcome::CompileFailed(Some(_))
             ),
             "a failed compile is reported as one"
@@ -6039,6 +6084,7 @@ mod tests {
             outputs: HashMap::new(),
             kept: HashMap::new(),
             out_dir: None,
+            reads: Vec::new(),
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
         }

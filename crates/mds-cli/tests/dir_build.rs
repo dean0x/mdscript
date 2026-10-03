@@ -2625,3 +2625,60 @@ fn dir_build_never_writes_over_an_mds_module() {
         );
     }
 }
+
+/// A directory build never writes an output over a file the run reads (#425), beside its
+/// sources or below `--out-dir`: the `--vars` file at the output of the messages template
+/// `chat.mds`, and the `mds.json` in force at the output of `mds.mds`, are each refused,
+/// `mds::io`, naming the output as its `Compiled to` line would, and left as they were;
+/// the build goes on with `b.mds` and exits 2. They used to be replaced, exit 0.
+#[test]
+fn dir_build_never_writes_over_a_file_it_reads() {
+    const VARS: &str = "{\"name\": \"Dean\"}\n";
+    const CONFIG: &str = "{\"build\":{\"source_map\":false}}\n";
+    // Where the outputs and the two files go, and the arguments after `build src`.
+    let legs: [(&str, &[&str]); 2] = [
+        ("src", &["--vars", "src/chat.json"]),
+        (".", &["--out-dir", ".", "--vars", "chat.json"]),
+    ];
+    for (outputs, extra) in legs {
+        let base = tempfile::tempdir().unwrap();
+        let src = base.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("chat.mds"), "@message user:\nHi {{name}}\n@end\n").unwrap();
+        fs::write(src.join("mds.mds"), "@message user:\nHello\n@end\n").unwrap();
+        fs::write(src.join("b.mds"), "Hello B\n").unwrap();
+        let at = base.path().join(outputs);
+        fs::write(at.join("chat.json"), VARS).unwrap();
+        fs::write(at.join("mds.json"), CONFIG).unwrap();
+        let shown = Path::new(outputs);
+
+        let mut args = vec!["src"];
+        args.extend(extra);
+        let (code, stderr) = build_in(base.path(), &args);
+        assert_eq!(code, Some(2), "{args:?}: stderr: {stderr}");
+        for (name, was) in [("chat.json", VARS), ("mds.json", CONFIG)] {
+            assert!(
+                refuses(
+                    &stderr,
+                    &shown.join(name),
+                    "refusing to replace a file this run reads"
+                ),
+                "{args:?}: {name} is refused by name; stderr: {stderr}"
+            );
+            assert_eq!(
+                fs::read_to_string(at.join(name)).unwrap(),
+                was,
+                "{args:?}: {name} is left as it was; stderr: {stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(at.join("b.md")).unwrap(),
+            "Hello B\n",
+            "{args:?}: control: b.md is written; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 built, 2 failed"),
+            "{args:?}: the build goes on with the other source; stderr: {stderr}"
+        );
+    }
+}

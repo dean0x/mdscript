@@ -71,20 +71,26 @@
 //! failure while it is written leaves the file partly written. Windows moves the
 //! temporary file into place without `MOVEFILE_REPLACE_EXISTING`.
 //!
-//! # Never over an MDS module (#425)
+//! # Never over an MDS module or a file the run reads (#425)
 //!
 //! [`write_compiled`] renames an output over whatever file is at its target, except an MDS
-//! module: a `.md` file whose frontmatter declares `type: mds`, as mds-core judges one
-//! ([`mds::check_module_type`]), which a template may import. Just before the rename the
-//! file at the target is looked at in the directory the write is in, without following a
-//! symlink, and a regular file there is read as opened in that directory — on unix
-//! `openat(O_NOFOLLOW | O_NONBLOCK)` from the walk's descriptor, never by path — up to
-//! [`mds::MAX_FILE_SIZE`] bytes, and only when it starts with a frontmatter fence: a module
-//! is refused, the write leaves no temporary file, and the module is left as it is. One
-//! that cannot be read is refused too, since nothing tells it is no module. A symlink put
-//! there by then is replaced, never written through, as for every write; a module put
-//! there in the instant between that look and the rename is replaced too. Windows looks
-//! and reads by path, as its write goes.
+//! module — a `.md` file whose frontmatter declares `type: mds`, as mds-core judges one
+//! ([`mds::check_module_type`]), which a template may import — and a file the run reads
+//! ([`Inputs`]): its entry, the modules its compile imported, the `--vars` file and the
+//! `mds.json` in force. Just before the rename the file at the target is looked at in the
+//! directory the write is in, without following a symlink. A regular `.md` file there is
+//! read as opened in that directory — on unix `openat(O_NOFOLLOW | O_NONBLOCK)` from the
+//! walk's descriptor, never by path — up to [`mds::MAX_FILE_SIZE`] bytes, and only when it
+//! starts with a frontmatter fence; one that cannot be read is refused, since nothing tells
+//! it is no module. Any regular file there is compared, on unix by its device and inode,
+//! with each file the run reads, looked up by its path at that moment, so one an editor has
+//! replaced since it was read is the one compared, and a hard link to one is that file. A
+//! module or an input is refused, the write leaves no temporary file, and the file is left
+//! as it is. A symlink put there by then is replaced, never written through, as for every
+//! write; a module or an input put there in the instant between that look and the rename
+//! is replaced too. Windows looks and reads by path, as its write goes, and compares the
+//! canonical paths of the target and of each input, since std gives no file index there: a
+//! hard link to an input is another path, and is written over by the rename.
 //!
 //! # Over the caller's own file, or as a new one (#160)
 //!
@@ -233,28 +239,51 @@ pub(crate) fn atomic_write_file(
 
 /// Write a compiled output, or its `.map` sidecar, to `target` as [`atomic_write_file`]
 /// writes one — [`Durability::RenameOnly`], since a rebuild reproduces it, creating the
-/// directories it goes in — but never over an MDS module (#425; see the module docs): a
-/// `.md` file whose frontmatter declares `type: mds` is a source a template imports, not
-/// an output to replace.
+/// directories it goes in — but never over an MDS module nor over one of `inputs`, the
+/// files the run reads (#425; see the module docs): a `.md` file whose frontmatter
+/// declares `type: mds` is a source a template imports, and the entry, an imported module,
+/// the `--vars` file or the `mds.json` in force is what the output was made from — none
+/// is an output to replace.
 ///
 /// # Errors
 ///
 /// As [`atomic_write_file`]; and a module at the target, or a regular `.md` file there that
-/// cannot be read to tell, is refused before the rename — `cannot write <file>: refusing
-/// to replace an MDS module`, or the read's cause — and left as it is, with no temporary
-/// file left behind.
+/// cannot be read to tell, and a file the run reads, are refused before the rename —
+/// `cannot write <file>: refusing to replace an MDS module`, the read's cause, or `cannot
+/// write <file>: refusing to replace a file this run reads` — and left as they are, with
+/// no temporary file left behind.
 pub(crate) fn write_compiled(
     target: &WriteTarget,
     content: &str,
+    inputs: &Inputs,
 ) -> std::result::Result<(), mds::MdsError> {
     write_below_anchor(
         target,
         content,
         Durability::RenameOnly,
         Parents::Create,
-        Commit::Output,
+        Commit::Output(inputs),
     )
     .map_err(|failure| worded(target, failure))
+}
+
+/// The files a run reads — its entry, the modules its compile imported, the `--vars` file
+/// and the `mds.json` in force — which [`write_compiled`] never writes an output over
+/// (#425). Each is held by its path and looked up again by every write, so the file there
+/// then is the one compared: an editor that saves by replacing the file leaves no stale
+/// identity behind.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Inputs {
+    files: Vec<PathBuf>,
+}
+
+impl Inputs {
+    /// The files at `files`, each as the run reads it — through a symlink.
+    pub(crate) fn new(files: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            files: files.into_iter().collect(),
+        }
+    }
 }
 
 /// Write `content` to `target` as [`atomic_write_file`] does, but only as a new file
@@ -342,7 +371,7 @@ fn write_below_anchor(
     content: &str,
     durability: Durability,
     parents: Parents,
-    commit: Commit<&imp::Stamp>,
+    commit: Commit<'_, &imp::Stamp>,
 ) -> std::result::Result<(), Failure> {
     let below = Below::of(target)?;
     let anchor = target.checked_anchor();
@@ -358,13 +387,13 @@ fn write_below_anchor(
 
 /// How the temporary file a write has filled takes the target's name.
 #[derive(Debug, Clone, Copy)]
-enum Commit<S> {
+enum Commit<'i, S> {
     /// Renamed over whatever file is there — for a rewrite, only while that file still
     /// holds the stamp `S` it was read with.
     Replace(Option<S>),
-    /// Renamed over whatever file is there, unless it is an MDS module ([`write_compiled`],
-    /// #425).
-    Output,
+    /// Renamed over whatever file is there, unless it is an MDS module or one of the files
+    /// the run reads ([`write_compiled`], #425).
+    Output(&'i Inputs),
     /// Given the name only where nothing has it ([`create_new`]).
     New,
 }
@@ -506,9 +535,10 @@ fn not_removed(target: &WriteTarget, failure: Failure) -> NotRemoved {
         )),
         Failure::LinkAtTarget => NotRemoved::Link,
         // Only a new file's commit meets a file at its name, and only an output's refuses a
-        // module; a removal never does either.
+        // module or an input; a removal never does either.
         Failure::Exists => NotRemoved::Failed(cause(&std::io::ErrorKind::AlreadyExists.into())),
         Failure::Module => NotRemoved::Failed(MODULE_REFUSAL.to_owned()),
+        Failure::Input => NotRemoved::Failed(INPUT_REFUSAL.to_owned()),
         Failure::Io(e) => NotRemoved::Failed(cause(&e)),
     }
 }
@@ -534,6 +564,7 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
         }
         Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
         Failure::Module => io_error(&target.shown, MODULE_REFUSAL.to_owned()),
+        Failure::Input => io_error(&target.shown, INPUT_REFUSAL.to_owned()),
         Failure::NotARegularFile => io_error(&target.shown, NOT_A_REGULAR_FILE.to_owned()),
         // Only a removal's look at its file, or its proof's read, fails as unreadable.
         Failure::Unreadable(e) | Failure::Io(e) => io_error(&target.shown, io_cause(&e)),
@@ -552,6 +583,9 @@ const SYMLINK_REMOVAL_REFUSAL: &str = "refusing to remove a symlink";
 
 /// Why [`write_compiled`] refuses to replace an MDS module (#425).
 const MODULE_REFUSAL: &str = "refusing to replace an MDS module";
+
+/// Why [`write_compiled`] refuses to replace one of the files the run reads (#425).
+const INPUT_REFUSAL: &str = "refusing to replace a file this run reads";
 
 /// Why [`remove_proven`] leaves a file whose name, by the time it was to be removed, was
 /// another file's than the one its proof read.
@@ -613,6 +647,8 @@ enum Failure {
     LinkAtTarget,
     /// An output's target is an MDS module ([`write_compiled`], #425).
     Module,
+    /// An output's target is one of the files the run reads ([`write_compiled`], #425).
+    Input,
     /// The target itself is a FIFO, a socket or a device — or, for a removal, a
     /// directory.
     NotARegularFile,
@@ -760,7 +796,8 @@ mod unix {
     use rustix::io::Errno;
 
     use super::{
-        Below, Commit, DirIdentity, Durability, Failure, Parents, Removal, TEMP_PREFIX, TEMP_SUFFIX,
+        Below, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal, TEMP_PREFIX,
+        TEMP_SUFFIX,
     };
 
     /// The anchor: a directory, resolved by path — through a symlink the user named.
@@ -816,7 +853,7 @@ mod unix {
         content: &[u8],
         durability: Durability,
         parents: Parents,
-        commit: Commit<&Stamp>,
+        commit: Commit<'_, &Stamp>,
     ) -> Result<(), Failure> {
         let dir = walk(below, anchor, parents)?;
         replace(dir, below.name, content, durability, commit)
@@ -1090,7 +1127,7 @@ mod unix {
         name: &OsStr,
         content: &[u8],
         durability: Durability,
-        commit: Commit<&Stamp>,
+        commit: Commit<'_, &Stamp>,
     ) -> Result<(), Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
         let existing = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -1119,7 +1156,7 @@ mod unix {
         }
         fill(file, content, durability)?;
         match commit {
-            Commit::Replace(_) | Commit::Output => {
+            Commit::Replace(_) | Commit::Output(_) => {
                 // The temporary file is unlinked again as `temp` drops.
                 ready_to_replace(dir.as_fd(), name, commit)?;
                 fs::renameat(dir.as_fd(), &temp.name, dir.as_fd(), name)?;
@@ -1141,33 +1178,60 @@ mod unix {
 
     /// Whether the rename over `name` in `dir` may go on, as `commit` says, looked at just
     /// before it: a rewrite's file must still hold the stamp it was read with, and an
-    /// output's target must be no MDS module (#425).
+    /// output's target must be neither an MDS module nor one of the files the run reads
+    /// (#425).
     fn ready_to_replace(
         dir: BorrowedFd<'_>,
         name: &OsStr,
-        commit: Commit<&Stamp>,
+        commit: Commit<'_, &Stamp>,
     ) -> Result<(), Failure> {
         match commit {
             Commit::Replace(Some(stamp)) if !stamp.holds(dir, name) => Err(Failure::Changed),
-            Commit::Output if is_a_module(dir, name)? => Err(Failure::Module),
+            Commit::Output(inputs) => never_over_an_input(dir, name, inputs),
             _ => Ok(()),
         }
     }
 
-    /// Whether `name` in `dir` is an MDS module (#425): a `.md` regular file, looked at
-    /// without following a symlink, then opened in `dir` — never by path — and read there,
-    /// that [`super::is_mds_module`] takes for one. Nothing there, a symlink — which the
-    /// rename replaces, never writing through it — and anything else that is no regular
-    /// file are none; a file that cannot be opened or read is an error.
-    fn is_a_module(dir: BorrowedFd<'_>, name: &OsStr) -> Result<bool, Failure> {
-        if !super::names_markdown(name) {
-            return Ok(false);
-        }
-        match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
-            Ok(_) | Err(Errno::NOENT) => return Ok(false),
+    /// Refuse the rename over `name` in `dir` when the file there is an MDS module or one
+    /// of `inputs` (#425). It is looked at without following a symlink: nothing there, a
+    /// symlink — which the rename replaces, never writing through it — and anything else
+    /// that is no regular file are neither. A regular file with a `.md` file's name is read
+    /// as opened in `dir` ([`is_a_module`]); any regular file is compared with each of
+    /// `inputs` by its device and inode ([`is_an_input`]).
+    fn never_over_an_input(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        inputs: &Inputs,
+    ) -> Result<(), Failure> {
+        let stat = match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => stat,
+            Ok(_) | Err(Errno::NOENT) => return Ok(()),
             Err(e) => return Err(e.into()),
+        };
+        if super::names_markdown(name) && is_a_module(dir, name)? {
+            return Err(Failure::Module);
         }
+        if is_an_input(inputs, &stat) {
+            return Err(Failure::Input);
+        }
+        Ok(())
+    }
+
+    /// Whether the file `stat` describes is one of `inputs`: the same device and inode as
+    /// the file each names now, looked up through a symlink as the run read it.
+    fn is_an_input(inputs: &Inputs, stat: &fs::Stat) -> bool {
+        inputs.files.iter().any(|file| {
+            fs::stat(file.as_path())
+                .is_ok_and(|input| input.st_dev == stat.st_dev && input.st_ino == stat.st_ino)
+        })
+    }
+
+    /// Whether `name` in `dir`, a regular file a moment ago, is an MDS module (#425):
+    /// opened in `dir` — never by path — without following a symlink, and read there, that
+    /// [`super::is_mds_module`] takes for one. Gone since, a symlink or anything else that
+    /// is no regular file by then is none; a file that cannot be opened or read is an
+    /// error.
+    fn is_a_module(dir: BorrowedFd<'_>, name: &OsStr) -> Result<bool, Failure> {
         let mut file = match open_to_read(dir, name) {
             Ok(file) => file,
             // Gone since the look, or a symlink put there since: no module to replace.
@@ -1426,7 +1490,8 @@ mod windows {
     use std::time::SystemTime;
 
     use super::{
-        Below, Commit, DirIdentity, Durability, Failure, Parents, Removal, TEMP_PREFIX, TEMP_SUFFIX,
+        Below, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal, TEMP_PREFIX,
+        TEMP_SUFFIX,
     };
 
     /// `ERROR_PATH_NOT_FOUND`: a directory that is not there, in the operating system's
@@ -1442,7 +1507,7 @@ mod windows {
         content: &[u8],
         durability: Durability,
         parents: Parents,
-        commit: Commit<&Stamp>,
+        commit: Commit<'_, &Stamp>,
     ) -> Result<(), Failure> {
         let dir = walk(below, anchor, parents)?;
         let target = dir.join(below.name);
@@ -1615,7 +1680,7 @@ mod windows {
         target: &Path,
         content: &[u8],
         durability: Durability,
-        commit: Commit<&Stamp>,
+        commit: Commit<'_, &Stamp>,
     ) -> Result<(), Failure> {
         let mut temp = tempfile::Builder::new()
             .prefix(TEMP_PREFIX)
@@ -1626,7 +1691,7 @@ mod windows {
             temp.as_file().sync_all()?;
         }
         match commit {
-            Commit::Replace(_) | Commit::Output => {
+            Commit::Replace(_) | Commit::Output(_) => {
                 // The temporary file is deleted again as `temp` drops.
                 ready_to_replace(target, commit)?;
                 temp.persist(target).map_err(|e| e.error)?;
@@ -1649,30 +1714,55 @@ mod windows {
 
     /// Whether the move over `target` may go on, as `commit` says, looked at by path just
     /// before it: a rewrite's file must still hold the stamp it was read with, and an
-    /// output's target must be no MDS module (#425).
-    fn ready_to_replace(target: &Path, commit: Commit<&Stamp>) -> Result<(), Failure> {
+    /// output's target must be neither an MDS module nor one of the files the run reads
+    /// (#425).
+    fn ready_to_replace(target: &Path, commit: Commit<'_, &Stamp>) -> Result<(), Failure> {
         match commit {
             Commit::Replace(Some(stamp)) if !stamp.holds(target) => Err(Failure::Changed),
-            Commit::Output if is_a_module(target)? => Err(Failure::Module),
+            Commit::Output(inputs) => never_over_an_input(target, inputs),
             _ => Ok(()),
         }
     }
 
-    /// Whether `target` is an MDS module (#425): a `.md` regular file, looked at without
-    /// following a symlink, then opened and read by path, that [`super::is_mds_module`]
-    /// takes for one. Nothing there, a symlink — which the move replaces, never writing
-    /// through it — and anything else that is no regular file are none; a file that cannot
-    /// be opened or read is an error.
-    fn is_a_module(target: &Path) -> Result<bool, Failure> {
-        if !target.file_name().is_some_and(super::names_markdown) {
-            return Ok(false);
-        }
+    /// Refuse the move over `target` when the file there is an MDS module or one of
+    /// `inputs` (#425), by path. It is looked at without following a symlink: nothing
+    /// there, a symlink — which the move replaces, never writing through it — and anything
+    /// else that is no regular file are neither. A regular file with a `.md` file's name is
+    /// read ([`is_a_module`]); any regular file is compared with each of `inputs`
+    /// ([`is_an_input`]).
+    fn never_over_an_input(target: &Path, inputs: &Inputs) -> Result<(), Failure> {
         match std::fs::symlink_metadata(target) {
             Ok(meta) if meta.is_file() => {}
-            Ok(_) => return Ok(false),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         }
+        if target.file_name().is_some_and(super::names_markdown) && is_a_module(target)? {
+            return Err(Failure::Module);
+        }
+        if is_an_input(inputs, target) {
+            return Err(Failure::Input);
+        }
+        Ok(())
+    }
+
+    /// Whether `target` is one of `inputs`, by canonical path: std gives no file index on
+    /// Windows, so a hard link to an input — another path — is not one (the residual the
+    /// module docs describe).
+    fn is_an_input(inputs: &Inputs, target: &Path) -> bool {
+        let Ok(target) = std::fs::canonicalize(target) else {
+            return false;
+        };
+        inputs
+            .files
+            .iter()
+            .any(|file| std::fs::canonicalize(file).is_ok_and(|file| file == target))
+    }
+
+    /// Whether `target`, a regular file a moment ago, is an MDS module (#425): opened and
+    /// read by path, that [`super::is_mds_module`] takes for one. Gone since is none; a
+    /// file that cannot be opened or read is an error.
+    fn is_a_module(target: &Path) -> Result<bool, Failure> {
         let mut file = match std::fs::File::open(target) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -2623,8 +2713,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shown = |name: &str| PathBuf::from("out").join(name);
         let write = |name: &str| {
-            write_compiled(&WriteTarget::new(dir.path().join(name), shown(name)), "X")
-                .map_err(|e| e.to_string())
+            write_compiled(
+                &WriteTarget::new(dir.path().join(name), shown(name)),
+                "X",
+                &Inputs::default(),
+            )
+            .map_err(|e| e.to_string())
         };
         let text = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
         for (name, module) in [
@@ -2717,7 +2811,7 @@ mod tests {
             if started.elapsed() > Duration::from_secs(10) {
                 break;
             }
-            match write_compiled(&target, "X") {
+            match write_compiled(&target, "X", &Inputs::default()) {
                 Ok(()) => written += 1,
                 Err(e) if e.to_string().contains(MODULE_REFUSAL) => refused += 1,
                 Err(_) => {}
@@ -2734,6 +2828,94 @@ mod tests {
         assert!(
             written > 0 && refused > 0,
             "the loop met both directories: {written} written, {refused} refused"
+        );
+    }
+
+    /// An output is never written over a file the run reads (#425): `vars.json`, one of
+    /// the inputs, is refused, named as shown, and left as it is, with no temporary file.
+    /// Controls: the same write with no inputs writes it, and a file that is no input is
+    /// written.
+    #[test]
+    fn an_output_is_never_written_over_a_file_the_run_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vars, other) = (dir.path().join("vars.json"), dir.path().join("other.json"));
+        std::fs::write(&vars, "{}\n").unwrap();
+        std::fs::write(&other, "{}\n").unwrap();
+        let inputs = Inputs::new([vars.clone()]);
+        let write = |path: &Path, inputs: &Inputs| {
+            write_compiled(
+                &WriteTarget::new(path.to_path_buf(), PathBuf::from("out/x.json")),
+                "X",
+                inputs,
+            )
+            .map_err(|e| e.to_string())
+        };
+
+        assert_eq!(
+            write(&vars, &inputs),
+            Err(format!(
+                "cannot write {}: {INPUT_REFUSAL}",
+                Path::new("out/x.json").display()
+            ))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&vars).unwrap(),
+            "{}\n",
+            "left as it is"
+        );
+        assert_eq!(
+            temp_residue(dir.path()),
+            Vec::<String>::new(),
+            "no temporary file"
+        );
+        assert_eq!(
+            write(&other, &inputs),
+            Ok(()),
+            "control: no input is written"
+        );
+        assert_eq!(
+            write(&vars, &Inputs::default()),
+            Ok(()),
+            "control: no inputs"
+        );
+        assert_eq!(std::fs::read_to_string(&vars).unwrap(), "X");
+    }
+
+    /// On unix an input is told by its device and inode (#425): a hard link to it is that
+    /// file and is refused, and so is the file an input named through a symlink leads to.
+    /// Control: a copy of it, another file with the same bytes, is written.
+    #[cfg(unix)]
+    #[test]
+    fn an_input_is_the_file_its_path_leads_to_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        std::fs::write(path("vars.json"), "{}\n").unwrap();
+        std::fs::hard_link(path("vars.json"), path("linked.json")).unwrap();
+        std::os::unix::fs::symlink(path("vars.json"), path("via.json")).unwrap();
+        std::fs::write(path("copy.json"), "{}\n").unwrap();
+        let write = |name: &str, inputs: &Inputs| {
+            write_compiled(
+                &WriteTarget::new(path(name), PathBuf::from(name)),
+                "X",
+                inputs,
+            )
+            .map_err(|e| e.to_string())
+        };
+
+        let refused = |name: &str| Err(format!("cannot write {name}: {INPUT_REFUSAL}"));
+        assert_eq!(
+            write("linked.json", &Inputs::new([path("vars.json")])),
+            refused("linked.json")
+        );
+        assert_eq!(
+            write("vars.json", &Inputs::new([path("via.json")])),
+            refused("vars.json")
+        );
+        assert_eq!(std::fs::read_to_string(path("vars.json")).unwrap(), "{}\n");
+        assert_eq!(
+            write("copy.json", &Inputs::new([path("vars.json")])),
+            Ok(()),
+            "control: a copy is another file"
         );
     }
 

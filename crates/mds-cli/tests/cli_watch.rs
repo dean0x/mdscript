@@ -10135,3 +10135,162 @@ fn watch_never_writes_over_an_mds_module() {
         );
     }
 }
+
+// ── #425: an output never replaces a file the run reads ──────────────────────
+
+/// An output a session must never write, over a file it reads: the source that compiles
+/// to it, a new text of the same kind for that source, the output as its `Recompiled`
+/// line would name it, the file, and what the file holds.
+struct Guarded<'a> {
+    source: &'a Path,
+    edit: &'a str,
+    shown: String,
+    file: &'a Path,
+    was: &'a str,
+}
+
+/// `mds watch` with `args`, run in `cwd`, refuses each of `guarded` at startup and again
+/// on the rebuild of the same kind its source's edit makes — `mds::io`, `cannot write
+/// <output>: refusing to replace a file this run reads` — and the file keeps what it
+/// held; the session keeps watching, and at Ctrl+C exits 0.
+fn assert_never_writes_over(label: &str, cwd: &Path, args: &[&str], guarded: &[Guarded<'_>]) {
+    const CAUSE: &str = "refusing to replace a file this run reads";
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(cwd)
+            .args(args)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    let refused_after = |one: &Guarded<'_>, n: usize, what: &str| {
+        let seen = poll_tap_until(&tap, TIMEOUT, |seen| refusals(seen, &one.shown, CAUSE) > n);
+        assert!(
+            seen.is_ok(),
+            "{label}: {what}: {} is refused; stderr: {}",
+            one.shown,
+            tap.text()
+        );
+        assert_eq!(
+            text_of(one.file).as_deref(),
+            Some(one.was),
+            "{label}: {what}: {} is left as it was; stderr: {}",
+            one.shown,
+            tap.text()
+        );
+    };
+    for one in guarded {
+        refused_after(one, 0, "the startup write");
+    }
+    for one in guarded {
+        let seen = refusals(&tap.text(), &one.shown, CAUSE);
+        write_atomic(one.source, one.edit);
+        refused_after(one, seen, "a rebuild of the same kind");
+    }
+    #[cfg(unix)]
+    {
+        interrupt(&child);
+        let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{label}: refused writes do not change the Ctrl+C exit; stderr: {}",
+            tap.text()
+        );
+    }
+    drop(tap.finish_text(&mut child));
+}
+
+/// `mds watch` never writes an output over its `--vars` file or the `mds.json` in force
+/// (#425), in file mode and in directory mode: the messages template `chat.mds`, given
+/// `--vars chat.json`, and `mds.mds` beside `mds.json` are refused at startup and by every
+/// rebuild of the same kind, and both files keep what they held; the session keeps
+/// watching. Both used to be replaced at startup — and every rebuild then read an array
+/// as its vars. Control: with another `--vars` file, `chat.json` is written.
+#[test]
+fn watch_never_writes_over_its_vars_file_or_the_mds_json_in_force() {
+    const VARS: &str = "{\"name\": \"Dean\"}\n";
+    const CONFIG: &str = "{\"build\":{\"source_map\":false}}\n";
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[
+            ("chat.mds", "@message user:\nHi {{name}}\n@end\n"),
+            ("chat.json", VARS),
+            ("mds.mds", "@message user:\nHello\n@end\n"),
+            ("mds.json", CONFIG),
+        ]);
+        let notes = base.path().join("notes");
+        let cwd = base.path().join(cwd);
+        let vars = below(shown_dir, "chat.json");
+        let (chat_src, chat_json) = (notes.join("chat.mds"), notes.join("chat.json"));
+        let (config_src, config) = (notes.join("mds.mds"), notes.join("mds.json"));
+        let chat = Guarded {
+            source: &chat_src,
+            edit: "@message user:\nHi again {{name}}\n@end\n",
+            shown: below(shown_dir, "chat.json"),
+            file: &chat_json,
+            was: VARS,
+        };
+        let in_force = Guarded {
+            source: &config_src,
+            edit: "@message user:\nHello again\n@end\n",
+            shown: below(shown_dir, "mds.json"),
+            file: &config,
+            was: CONFIG,
+        };
+        let mut with_vars = args.to_vec();
+        with_vars.extend(["--vars", vars.as_str()]);
+        if args.contains(&"notes") {
+            assert_never_writes_over(mode, &cwd, &with_vars, &[chat, in_force]);
+        } else {
+            assert_never_writes_over(mode, &cwd, &with_vars, &[chat]);
+            assert_never_writes_over(mode, &cwd, &["watch", "mds.mds"], &[in_force]);
+        }
+    }
+
+    // Control: another `--vars` file, and `chat.json` is the output it always was.
+    let base = notes_with(&[("chat.mds", "@message user:\nHi {{name}}\n@end\n")]);
+    let notes = base.path().join("notes");
+    std::fs::write(notes.join("chat.json"), VARS).unwrap();
+    let vars = Path::new("..").join("vars.json");
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&notes)
+            .args(["watch", "chat.mds", "--vars"])
+            .arg(&vars)
+            .args(["--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("chat.json"), "Hi one", TIMEOUT),
+        "control: chat.json is written; stderr: {}",
+        tap.text()
+    );
+    drop(child);
+}
+
+/// `mds watch` never writes its output over a source its entry imports (#425): `-o
+/// lib.mds` names the module `page.mds` imports, which is refused at startup and by the
+/// rebuild an edit of `page.mds` makes, and `lib.mds` keeps what it held. It used to be
+/// replaced by the compiled page. Directory mode writes only `.md` and `.json` outputs, and
+/// a template imports only `.mds` files and `.md` modules — which no output replaces — so
+/// it has no such output.
+#[test]
+fn watch_never_writes_over_a_source_its_entry_imports() {
+    let base = notes_with(&[
+        ("lib.mds", "Shared\n"),
+        ("page.mds", "@import \"./lib.mds\" as l\n@include l\nPage\n"),
+    ]);
+    let notes = base.path().join("notes");
+    let (page, lib) = (notes.join("page.mds"), notes.join("lib.mds"));
+    assert_never_writes_over(
+        "file mode",
+        &notes,
+        &["watch", "page.mds", "-o", "lib.mds"],
+        &[Guarded {
+            source: &page,
+            edit: "@import \"./lib.mds\" as l\n@include l\nMore\n",
+            shown: "lib.mds".to_owned(),
+            file: &lib,
+            was: "Shared\n",
+        }],
+    );
+}

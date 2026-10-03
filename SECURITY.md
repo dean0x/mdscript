@@ -187,11 +187,15 @@ input. The compiler enforces several defense-in-depth controls:
   however `-o`, `--out-dir`, `build.output_dir` or the default output name it —
   before anything is written or any directory created (`mds::io`, exit 2, #425).
   Nor do they write an output over an MDS module — a `.md` file whose frontmatter
-  declares `type: mds`, which a template can import: just before the rename the file
-  at the output path is read as opened in the directory the write walked to (on
-  Windows, by path), and a module, or a `.md` file that cannot be read to tell, is
-  refused and left as it is (`mds::io`, #425). A module put there in the instant
-  between that read and the rename is replaced.
+  declares `type: mds`, which a template can import — or over a file the run reads:
+  the entry, an imported module, the `--vars` file, the `mds.json` in force. Just
+  before the rename the file at the output path is looked at in the directory the
+  write walked to and, when it is a `.md` file, read as opened there (on Windows, by
+  path); it is compared with each file the run reads, looked up by its path then — on
+  Unix by device and inode, on Windows by canonical path, so a hard link to an input
+  is written over there. A module, a `.md` file that cannot be read to tell, and a
+  file the run reads are refused and left as they are (`mds::io`, #425). One put
+  there in the instant between that look and the rename is replaced.
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
 

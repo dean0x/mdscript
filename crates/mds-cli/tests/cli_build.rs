@@ -3221,3 +3221,114 @@ mod module_overwrite {
         );
     }
 }
+
+// ── #425: an output never replaces a file the run reads ──────────────────────
+
+mod input_overwrite {
+    use super::module_overwrite::{build_in, refuses};
+    use super::*;
+    use std::io::Write as _;
+    use std::path::Path;
+
+    /// Why an output is not written over a file the run reads.
+    const INPUT_CAUSE: &str = "refusing to replace a file this run reads";
+    /// A `--vars` file.
+    const VARS: &str = "{\"name\": \"Dean\"}\n";
+    /// A messages template, whose output is `<stem>.json`.
+    const CHAT: &str = "@message user:\nHi {{name}}\n@end\n";
+    /// An `mds.json`.
+    const CONFIG: &str = "{\"build\":{\"source_map\":false}}\n";
+
+    /// `mds build` never writes its output over a file the run reads (#425): the `--vars`
+    /// file `chat.json` at the default output of the messages template `chat.mds`, the
+    /// `mds.json` in force at the default output of `mds.mds`, a `.mds` module the
+    /// template imports named by `-o`, and the `--vars` file named by `-o` for a template
+    /// read from stdin — each refused, `mds::io`, exit 2, naming the output as its
+    /// `Compiled to` line would, the file left as it was. They used to be replaced, exit
+    /// 0. Control: with another `--vars` file, `chat.json` is written.
+    #[test]
+    fn build_never_writes_over_a_file_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = root.join("cfg");
+        std::fs::create_dir(&cfg).unwrap();
+        std::fs::write(root.join("chat.json"), VARS).unwrap();
+        std::fs::write(root.join("chat.mds"), CHAT).unwrap();
+        std::fs::write(cfg.join("mds.json"), CONFIG).unwrap();
+        std::fs::write(cfg.join("mds.mds"), "@message user:\nHello\n@end\n").unwrap();
+        std::fs::write(root.join("lib.mds"), "Shared\n").unwrap();
+        std::fs::write(
+            root.join("page.mds"),
+            "@import \"./lib.mds\" as l\n@include l\nPage\n",
+        )
+        .unwrap();
+        let text = |path: &Path| std::fs::read_to_string(path).unwrap();
+
+        let rows: [(&[&str], std::path::PathBuf, std::path::PathBuf, &str); 3] = [
+            (
+                &["chat.mds", "--vars", "chat.json"],
+                Path::new(".").join("chat.json"),
+                root.join("chat.json"),
+                VARS,
+            ),
+            (
+                &["cfg/mds.mds"],
+                Path::new("cfg").join("mds.json"),
+                cfg.join("mds.json"),
+                CONFIG,
+            ),
+            (
+                &["page.mds", "-o", "lib.mds"],
+                Path::new("lib.mds").to_path_buf(),
+                root.join("lib.mds"),
+                "Shared\n",
+            ),
+        ];
+        for (args, shown, file, was) in rows {
+            let (code, stderr) = build_in(root, args);
+            assert_eq!(code, Some(2), "build {args:?}: stderr: {stderr}");
+            assert!(
+                refuses(&stderr, &shown, INPUT_CAUSE),
+                "build {args:?}: the file is refused by name; stderr: {stderr}"
+            );
+            assert_eq!(
+                text(&file),
+                was,
+                "build {args:?}: the file is left as it was"
+            );
+        }
+
+        let mut child = mds_bin()
+            .current_dir(root)
+            .args(["build", "-", "-o", "chat.json", "--vars", "chat.json"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(CHAT.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "build -: stderr: {stderr}");
+        assert!(
+            refuses(&stderr, Path::new("chat.json"), INPUT_CAUSE),
+            "build -: the --vars file is refused by name; stderr: {stderr}"
+        );
+        assert_eq!(text(&root.join("chat.json")), VARS);
+
+        // Control: another `--vars` file, and `chat.json` is the output it always was.
+        std::fs::write(root.join("data.json"), VARS).unwrap();
+        let (code, stderr) = build_in(root, &["chat.mds", "--vars", "data.json"]);
+        assert_eq!(code, Some(0), "control: stderr: {stderr}");
+        assert!(
+            text(&root.join("chat.json")).contains("Hi Dean"),
+            "control: chat.json is written; stderr: {stderr}"
+        );
+        assert_eq!(text(&root.join("data.json")), VARS);
+    }
+}
