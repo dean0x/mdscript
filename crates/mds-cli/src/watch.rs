@@ -2535,16 +2535,17 @@ fn vars_dir_paths<'a>(
 fn run_watch_file(entry: WatchedPath, output: Option<String>, args: SessionArgs) -> Result<()> {
     let quiet = args.quiet;
     let armed = file_startup::arm_pre_read(entry, output, args)?;
-    let compiled = match file_startup::startup_compile(&armed)? {
+    let compiled = match file_startup::startup_compile(armed)? {
         ControlFlow::Continue(compiled) => compiled,
         // stdout's reader is gone before the session went live: it stops here, and its
-        // verdict is 0 — a closed pipe never changes the exit code (#157).
-        ControlFlow::Break(why) => {
+        // verdict is 0 — a closed pipe never changes the exit code (#157). The armed
+        // watches it hands back are dropped after the stop line.
+        ControlFlow::Break((why, _armed)) => {
             stop_watching(quiet, why);
             return Ok(());
         }
     };
-    file_startup::arm_deps_and_seed(armed, compiled)?.go_live();
+    file_startup::arm_deps_and_seed(compiled)?.go_live();
     Ok(())
 }
 
@@ -2555,12 +2556,14 @@ fn run_watch_file(entry: WatchedPath, output: Option<String>, args: SessionArgs)
 /// [`Armed`](file_startup::Armed) comes only from [`file_startup::arm_pre_read`], a
 /// [`Compiled`](file_startup::Compiled) only from [`file_startup::startup_compile`] given an
 /// `Armed`, a [`Seeded`](file_startup::Seeded) only from [`file_startup::arm_deps_and_seed`]
-/// given both, and the session goes live only from a `Seeded`
+/// given a `Compiled`, and the session goes live only from a `Seeded`
 /// ([`file_startup::Seeded::go_live`]). That is the order the session's change detection
 /// rests on: the directories of the entry and the `--vars` file armed, and their
 /// `(mtime, size)` baseline taken, before either is read; a dependency's baseline taken and
 /// its directory armed once the compile reports it; Ctrl+C wired last, with nothing but the
-/// loop after it.
+/// loop after it. The compile takes the `Armed` and carries it on inside the `Compiled`, so
+/// one `Armed` is compiled once, and a `Compiled` is seeded with the very watches it was
+/// compiled under.
 mod file_startup {
     use std::collections::{BTreeSet, HashMap};
     use std::ops::ControlFlow;
@@ -2622,6 +2625,9 @@ mod file_startup {
     /// The startup compile done, and its output written when it could be: made only by
     /// [`startup_compile`].
     pub(super) struct Compiled {
+        /// The watches and baseline the compile ran under, handed on to
+        /// [`arm_deps_and_seed`] with what it produced.
+        armed: Armed,
         /// The `mds.json` in force, looked up from the entry as typed.
         config: Option<ProjectConfig>,
         /// The files every compile reads besides the entry's own (#425).
@@ -2804,8 +2810,11 @@ mod file_startup {
 
     /// The startup compile, once [`arm_pre_read`] has armed what it reads, and its write.
     /// A compile or write error is reported, and watching continues. `Break` when stdout's
-    /// reader is gone: the session stops.
-    pub(super) fn startup_compile(armed: &Armed) -> Result<ControlFlow<StopReason, Compiled>> {
+    /// reader is gone: the session stops, and the `Armed` comes back with the reason so
+    /// its watches are dropped where they were before, after the stop line.
+    pub(super) fn startup_compile(
+        armed: Armed,
+    ) -> Result<ControlFlow<(StopReason, Armed), Compiled>> {
         let Armed {
             entry,
             output,
@@ -2816,7 +2825,7 @@ mod file_startup {
             static_set_string_vars,
             quiet,
             ..
-        } = armed;
+        } = &armed;
         let quiet = *quiet;
 
         // Initial compile: compile first, derive output path from kind (compile-then-route).
@@ -2868,7 +2877,7 @@ mod file_startup {
             // stdout's reader is gone before the session went live: it stops, and its
             // verdict is 0 — a closed pipe never changes the exit code (#157).
             CompileWriteOutcome::StdoutClosed => {
-                return Ok(ControlFlow::Break(StopReason::StdoutClosed));
+                return Ok(ControlFlow::Break((StopReason::StdoutClosed, armed)));
             }
             // Compiled and routed, but not written: report it and keep watching, with the
             // dependencies the compile reported — an edit to one rebuilds (#257). Nothing
@@ -2908,6 +2917,7 @@ mod file_startup {
         };
 
         Ok(ControlFlow::Continue(Compiled {
+            armed,
             config,
             reads,
             output_route,
@@ -2920,7 +2930,15 @@ mod file_startup {
     /// directories — one that cannot be armed ends the session at startup — then seed what
     /// every rebuild reads: the content-dedup map, the files of interest and the merged
     /// baseline.
-    pub(super) fn arm_deps_and_seed(armed: Armed, compiled: Compiled) -> Result<Seeded> {
+    pub(super) fn arm_deps_and_seed(compiled: Compiled) -> Result<Seeded> {
+        let Compiled {
+            armed,
+            config,
+            reads,
+            output_route,
+            initial_written,
+            initial_deps,
+        } = compiled;
         let Armed {
             entry,
             output,
@@ -2941,13 +2959,6 @@ mod file_startup {
             mut pre_mtimes,
             entry_was_missing,
         } = armed;
-        let Compiled {
-            config,
-            reads,
-            output_route,
-            initial_written,
-            initial_deps,
-        } = compiled;
 
         // Baseline the dependencies the compile just reported, before anything else runs.
         //
@@ -3917,8 +3928,8 @@ fn handle_fs_event_dir(
 /// [`dir_startup::Seeded::go_live`] goes live and watches until the session stops.
 fn run_watch_dir(root: WatchedPath, args: SessionArgs) -> Result<()> {
     let armed = dir_startup::arm_pre_read(root, args)?;
-    let compiled = dir_startup::startup_compile(&armed)?;
-    dir_startup::arm_deps_and_seed(armed, compiled).go_live();
+    let compiled = dir_startup::startup_compile(armed)?;
+    dir_startup::arm_deps_and_seed(compiled).go_live();
     Ok(())
 }
 
@@ -3929,14 +3940,16 @@ fn run_watch_dir(root: WatchedPath, args: SessionArgs) -> Result<()> {
 /// [`Armed`](dir_startup::Armed) comes only from [`dir_startup::arm_pre_read`], a
 /// [`Compiled`](dir_startup::Compiled) only from [`dir_startup::startup_compile`] given an
 /// `Armed`, a [`Seeded`](dir_startup::Seeded) only from [`dir_startup::arm_deps_and_seed`]
-/// given both, and the session goes live only from a `Seeded`
+/// given a `Compiled`, and the session goes live only from a `Seeded`
 /// ([`dir_startup::Seeded::go_live`]). That is the order the session's change detection
 /// rests on: the root armed recursively, and the `--vars` file's directory outside it,
 /// before the tree is walked or any source read; every source's `(mtime, size)` baseline
 /// taken before the first of them is read, and a dependency's as soon as the compile that
 /// reports it returns; the directories of the dependencies outside the root armed once
 /// every startup output is published; Ctrl+C wired last, with nothing but the loop after
-/// it.
+/// it. The compile takes the `Armed` and carries it on inside the `Compiled`, so one
+/// `Armed` is compiled once, and a `Compiled` is seeded with the very watches it was
+/// compiled under.
 mod dir_startup {
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::ops::ControlFlow;
@@ -4000,6 +4013,9 @@ mod dir_startup {
     /// Every source compiled once, and its output written when it could be: made only by
     /// [`startup_compile`].
     pub(super) struct Compiled {
+        /// The watches the compile ran under, handed on to [`arm_deps_and_seed`] with what
+        /// it produced.
+        armed: Armed,
         /// The dependency graph, what was written and where, and the sources errored.
         state: DirWatchState,
         /// Every source's `(mtime, size)`, taken before the first of them was read, and each
@@ -4194,7 +4210,7 @@ mod dir_startup {
     /// take every source's baseline before the first is read, then compile each source once
     /// and write its output. A source whose compile or write fails is reported and marked
     /// errored, and watching continues.
-    pub(super) fn startup_compile(armed: &Armed) -> Result<Compiled> {
+    pub(super) fn startup_compile(armed: Armed) -> Result<Compiled> {
         let Armed {
             root: watch_root,
             out_dir,
@@ -4206,7 +4222,7 @@ mod dir_startup {
             output_base,
             exclude_prefix,
             ..
-        } = armed;
+        } = &armed;
         let root = watch_root.canonical.as_path();
         let quiet = armed.quiet;
 
@@ -4325,13 +4341,22 @@ mod dir_startup {
         // write compares (#160).
         state.out_dir = OutDirAnchor::record(out_dir.as_deref(), config.as_ref());
 
-        Ok(Compiled { state, pre_mtimes })
+        Ok(Compiled {
+            armed,
+            state,
+            pre_mtimes,
+        })
     }
 
     /// Arm the directories of the dependencies outside the root that the startup compile
     /// reported — one that cannot be armed is a warning — then seed what every rebuild
     /// reads: the merged baseline, the liveness probe's state and the session's context.
-    pub(super) fn arm_deps_and_seed(armed: Armed, compiled: Compiled) -> Seeded {
+    pub(super) fn arm_deps_and_seed(compiled: Compiled) -> Seeded {
+        let Compiled {
+            armed,
+            mut state,
+            pre_mtimes,
+        } = compiled;
         let Armed {
             root: watch_root,
             out_dir: _,
@@ -4352,10 +4377,6 @@ mod dir_startup {
             rx,
             mut watcher,
         } = armed;
-        let Compiled {
-            mut state,
-            pre_mtimes,
-        } = compiled;
         let root = watch_root.canonical.as_path();
 
         // All startup outputs are now published — the positive-control injection point.
