@@ -150,7 +150,12 @@ input. The compiler enforces several defense-in-depth controls:
   wrote that file and it still holds exactly the bytes written (#160): a file it did not
   write, hand-written or left by another run, and one changed since are kept with a
   notice. The proof is the content, so a file holding exactly those bytes is removed as
-  the session's own. `mds build <dir>` removes the stale `.json` of a source whose kind
+  the session's own. After a change of kind, `mds watch` writes the new kind's output
+  only where nothing has that name at the commit — the same never-replacing commit as
+  `mds init` — or over the file the session wrote there while it still holds exactly
+  those bytes, by the same stamped replace as `mds fmt` (#160): anything else there,
+  hand-written, left by another run or changed since, is kept with a notice.
+  `mds build <dir>` removes the stale `.json` of a source whose kind
   changed only when it holds exactly what mds writes for a messages output — read
   no further than 10 MiB, parsed and written back to the same bytes — and never a stale
   `.md`: anything else at that name, a symlink, a FIFO or a directory included, is kept

@@ -86,7 +86,10 @@ use crate::output::{
     notify_cause, output_path_for, resolve_output_base, safe_inline, safe_path, stdout_failure,
     write_stdout, OutputBase, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
-use crate::write::{remove_proven, DirIdentity, NotRemoved, Removal};
+use crate::write::{
+    remove_proven, write_over_own, DirIdentity, Durability, NotCreated, NotRemoved, Parents,
+    Removal,
+};
 
 // ── Public args struct ────────────────────────────────────────────────────────
 
@@ -1199,6 +1202,50 @@ fn retire_output(
     }
 }
 
+/// Write `content` to `out`, the output of a source's new kind after a change of kind
+/// (#160) — `written`, what this session last wrote there, if it wrote there at all —
+/// only where nothing is, or over the file this session wrote there while it still holds
+/// exactly that ([`write_over_own`]), as an output is written: below the directory the
+/// caller's out-dir check found, with the directories it goes in created. Anything else
+/// there — a file this session did not write, one changed since, a symlink, a directory —
+/// is kept, with one notice saying which (none under `--quiet`, and none when `told`: the
+/// same content was kept from the same source's output before), and nothing is written:
+/// `Ok(false)`, so a later save tries again. The output of the old kind is the caller's
+/// to retire, and only once the new one is written.
+fn write_after_change_of_kind(
+    out: &WriteTarget,
+    written: Option<&str>,
+    content: &str,
+    told: bool,
+    quiet: bool,
+) -> std::result::Result<bool, MdsError> {
+    match write_over_own(
+        out,
+        written,
+        content,
+        Durability::RenameOnly,
+        Parents::Create,
+    ) {
+        Ok(()) => Ok(true),
+        Err(NotCreated::Exists) => {
+            if !told && !quiet {
+                match written {
+                    Some(_) => crate::output::ewriteln!(
+                        "Kept {}: changed since it was written; not overwritten",
+                        safe_path(&out.shown)
+                    ),
+                    None => crate::output::ewriteln!(
+                        "Kept {}: not written by this session; not overwritten",
+                        safe_path(&out.shown)
+                    ),
+                }
+            }
+            Ok(false)
+        }
+        Err(NotCreated::Failed(e)) => Err(e),
+    }
+}
+
 /// Whether `file` holds exactly `written`: read no further than one byte past it.
 fn holds_exactly(file: &mut std::fs::File, written: &str) -> std::io::Result<bool> {
     let len = written.len() as u64;
@@ -1781,6 +1828,14 @@ struct FileWatchState {
     last_mtimes: StampMap,
     /// Content-dedup map: what was last written, by where it was written.
     last_written: HashMap<OutputKey, String>,
+    /// Where this session last wrote its output, if it has: a rebuild whose route is
+    /// another — a change of kind — writes only where nothing is, or over its own file
+    /// ([`write_after_change_of_kind`], #160).
+    written_to: Option<OutputKey>,
+    /// What a change of kind last kept from being written, the file there not being the
+    /// session's (#160): a rebuild of the same again — another event of the same save —
+    /// tries again but tells it no more. Cleared by every write.
+    kept: Option<String>,
     /// Where every rebuild writes ([`OutputRoute::of`]), and the output a change of kind
     /// leaves behind ([`OutputRoute::other_than`]).
     output: OutputRoute,
@@ -1994,7 +2049,8 @@ fn rebuild_file(
     let entry = &ctx.entry;
     let routed = entry.compile(runtime_vars, ctx.quiet).and_then(|compiled| {
         // The compiled kind's route, re-decided by every rebuild: one whose kind changed
-        // is written to that kind's output, as at startup (#257, #160).
+        // is written to that kind's output (#257) — only where nothing is, or over the
+        // file this session wrote there (#160).
         let output_path = state.output.of(compiled.kind).clone();
         // #425: a rebuild never writes over the entry — reachable after a failed startup
         // compile, which refuses no route, and after a change of kind: the route of the
@@ -2062,10 +2118,32 @@ fn rebuild_file(
     if !content_changed {
         return ControlFlow::Continue(());
     }
+    // A change of kind (#160): the route is not the one this session last wrote to, so
+    // the file there is written over only if it is the session's own.
+    let kind_changed = state
+        .written_to
+        .as_ref()
+        .is_some_and(|key| *key != output_key);
     let written = match (out_dir, output_path.as_ref()) {
         (OutDirNow::Elsewhere, Some(target)) => OutputWrite::Failed(Some(miette::Report::new(
             crate::write::out_dir_moved(target),
         ))),
+        (_, Some(target)) if kind_changed => match write_after_change_of_kind(
+            &below_checked_out_dir(state.out_dir.as_ref(), target),
+            state.last_written.get(&output_key).map(String::as_str),
+            &compiled.content,
+            state.kept.as_ref() == Some(&compiled.content),
+            ctx.quiet,
+        ) {
+            Ok(true) => OutputWrite::Written,
+            // Kept: nothing is written and nothing retired, and `last_written` is left as
+            // it was, so a later save tries again.
+            Ok(false) => {
+                state.kept = Some(compiled.content);
+                return ControlFlow::Continue(());
+            }
+            Err(e) => OutputWrite::Failed(Some(miette::Report::new(e))),
+        },
         (_, target) => write_session_output(
             target
                 .map(|target| below_checked_out_dir(state.out_dir.as_ref(), target))
@@ -2087,7 +2165,11 @@ fn rebuild_file(
                     elapsed
                 );
             }
-            state.last_written.insert(output_key, compiled.content);
+            state
+                .last_written
+                .insert(output_key.clone(), compiled.content);
+            state.written_to = Some(output_key);
+            state.kept = None;
             if let Some(anchor) = &mut state.out_dir {
                 anchor.written();
             }
@@ -2503,14 +2585,16 @@ fn run_watch_file(
 
     // Record the dedup baseline. The event loop has not started, so nothing can
     // consult this map before it is populated (guard 3 above).
-    // Reuse the content the startup wrote (issue 3 — no second compile needed). When the
-    // initial compile or write failed (above) nothing was written, and an empty output is
-    // not recorded either: last_written stays empty so the next successful rebuild always
-    // writes.
+    // Reuse the content the startup wrote (issue 3 — no second compile needed), an empty
+    // one included: what the startup wrote is the session's, as a rebuild's is (#160).
+    // When the initial compile or write failed (above) nothing was written: last_written
+    // stays empty, so the next successful rebuild writes, and is no change of kind.
     let mut last_written: HashMap<OutputKey, String> = HashMap::new();
-    if let Some((written, content)) = initial_written.filter(|(_, content)| !content.is_empty()) {
-        last_written.insert(OutputKey::of(written.as_ref()), content);
-    }
+    let written_to = initial_written.map(|(written, content)| {
+        let key = OutputKey::of(written.as_ref());
+        last_written.insert(key.clone(), content);
+        key
+    });
 
     let foi = files_of_interest(&entry.canonical, &initial_deps, vars_path.as_deref());
 
@@ -2556,6 +2640,8 @@ fn run_watch_file(
         foi,
         last_mtimes,
         last_written,
+        written_to,
+        kept: None,
         output: output_route,
         // After the startup write, so the directory it made is the one the first rebuild
         // compares; `-o` names its own path, which no out-dir is below.
@@ -2656,6 +2742,10 @@ struct DirWatchState {
     /// source's outputs are looked for (#160). A source with no entry — a partial, a
     /// dependency outside the root, one never written — has none to remove.
     outputs: HashMap<PathBuf, WriteTarget>,
+    /// By source: what a change of kind last kept from being written, the file there not
+    /// being the session's (#160) — a rebuild of the same again tries again but tells it no
+    /// more. Cleared by the source's next write, and when it is forgotten.
+    kept: HashMap<PathBuf, String>,
     /// The out-dir every output is written below, checked before each write; `None` when
     /// outputs go beside their sources.
     out_dir: Option<OutDirAnchor>,
@@ -2704,6 +2794,7 @@ impl DirWatchState {
     fn wrote(&mut self, src: &Path, out: &WriteTarget, content: String) {
         self.last_written.insert(out.path.clone(), content);
         self.outputs.insert(src.to_path_buf(), out.clone());
+        self.kept.remove(src);
     }
 
     /// Record a compile error for `src`, **keeping** whatever dep set the last
@@ -2766,6 +2857,7 @@ impl DirWatchState {
         if let Some(out) = self.outputs.remove(src) {
             self.last_written.remove(&out.path);
         }
+        self.kept.remove(src);
         self.forget_graph(src);
     }
 
@@ -2892,19 +2984,44 @@ fn compile_one_source(
                 .is_none_or(|prev| *prev != compiled.content);
 
             if content_changed {
+                // A change of kind (#160): the output this session last wrote for `src` is
+                // the other kind's, so the file at `out` is written over only if it is the
+                // session's own.
+                let kind_changed = state
+                    .outputs
+                    .get(src)
+                    .is_some_and(|last| last.path != out.path);
                 let written = match out_dir {
                     OutDirNow::Elsewhere => {
                         Err(miette::Report::new(crate::write::out_dir_moved(&out)))
+                    }
+                    OutDirNow::Unchanged | OutDirNow::New if kind_changed => {
+                        write_after_change_of_kind(
+                            &below_checked_out_dir(state.out_dir.as_ref(), &out),
+                            state.last_written.get(&out.path).map(String::as_str),
+                            &compiled.content,
+                            state.kept.get(src) == Some(&compiled.content),
+                            quiet,
+                        )
+                        .map_err(miette::Report::new)
                     }
                     OutDirNow::Unchanged | OutDirNow::New => write_output(
                         Some(&below_checked_out_dir(state.out_dir.as_ref(), &out)),
                         &compiled.content,
                         quiet,
                         false,
-                    ),
+                    )
+                    .map(|()| true),
                 };
                 match written {
-                    Ok(()) => {
+                    // Kept: nothing is written and nothing retired, and the record of the
+                    // old kind's output stays, so a later save tries again.
+                    Ok(false) => {
+                        state.kept.insert(src.to_path_buf(), compiled.content);
+                        state.record_success(src, dep_paths, root, None, None);
+                        return false;
+                    }
+                    Ok(true) => {
                         if let Some(anchor) = &mut state.out_dir {
                             anchor.written();
                         }
@@ -3487,6 +3604,7 @@ fn dir_watch_startup(
         known_files: BTreeSet::new(),
         last_written: HashMap::new(),
         outputs: HashMap::new(),
+        kept: HashMap::new(),
         // Recorded below, once the startup writes have made the out-dir.
         out_dir: None,
         external_dep_dirs: BTreeSet::new(),
@@ -5241,6 +5359,7 @@ mod tests {
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
             outputs: HashMap::new(),
+            kept: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5279,6 +5398,7 @@ mod tests {
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
             outputs: HashMap::new(),
+            kept: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5340,6 +5460,7 @@ mod tests {
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
             outputs: HashMap::new(),
+            kept: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5409,6 +5530,7 @@ mod tests {
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
             outputs: HashMap::new(),
+            kept: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5801,6 +5923,7 @@ mod tests {
             known_files: BTreeSet::new(),
             last_written: HashMap::new(),
             outputs: HashMap::new(),
+            kept: HashMap::new(),
             out_dir: None,
             external_dep_dirs: BTreeSet::new(),
             last_mtimes: HashMap::new(),
@@ -5815,6 +5938,8 @@ mod tests {
             foi,
             last_mtimes: HashMap::new(),
             last_written: HashMap::new(),
+            written_to: None,
+            kept: None,
             output: OutputRoute::Named(None),
             out_dir: None,
             entry_was_missing: false,

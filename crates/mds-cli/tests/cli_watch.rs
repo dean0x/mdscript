@@ -9205,3 +9205,230 @@ fn watch_treats_a_source_unlinked_and_created_again_as_an_edit() {
         "control: the edit is one rebuild; stderr: {stderr}"
     );
 }
+
+// ── A change of kind writes only where nothing is, or over the session's own file (#160) ─
+
+/// A template that compiles to messages other than [`MESSAGES_KIND`]'s.
+const OTHER_MESSAGES: &str = "@message user:\nWhat is 4+4?\n@end\n";
+
+/// `notes/chat.mds` watched as a file and as part of its directory: the mode, the
+/// directory below the base the session runs in, the arguments that watch it, and the
+/// directory a status line names its outputs below.
+const CHAT_SESSIONS: [(&str, &str, &[&str], &str); 2] = [
+    ("file mode", "notes", &["watch", "chat.mds"], "."),
+    ("directory mode", "", &["watch", "notes"], "notes"),
+];
+
+/// A source edited into the other kind mid-session never overwrites a file the session
+/// did not write at that kind's output path (#160): a hand-written `chat.md` beside the
+/// messages source `chat.mds` is kept, with one notice, when the source is edited into
+/// Markdown, and the old output `chat.json` is kept as it was; edited back into messages,
+/// `chat.json` is written again and `chat.md` is still untouched. Both modes. Control:
+/// once `chat.md` is gone, the next save writes it, and `chat.json`, which the session
+/// wrote and left as it was, is removed.
+#[test]
+fn watch_never_writes_over_a_file_it_did_not_write_when_the_kind_changes() {
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", MESSAGES_KIND), ("chat.md", HAND_WRITTEN)]);
+        let notes = base.path().join("notes");
+        let (src, md, json) = (
+            notes.join("chat.mds"),
+            notes.join("chat.md"),
+            notes.join("chat.json"),
+        );
+        let shown_md = below(shown_dir, "chat.md");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path().join(cwd))
+                .args(args)
+                .args(["--debounce", "0", "--poll-interval", "0"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+            "{mode}: control: the startup writes chat.json; stderr: {}",
+            tap.text()
+        );
+        let startup_json = text_of(&json);
+
+        write_atomic(&src, "Hello\n");
+        let seen = poll_tap_until(&tap, TIMEOUT, |seen| {
+            seen.contains(&format!("Recompiled {shown_md} ("))
+                || seen.contains(&format!("Kept {shown_md}:"))
+        });
+        assert!(
+            seen.is_ok(),
+            "{mode}: the edit into Markdown reported nothing; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(HAND_WRITTEN),
+            "{mode}: chat.md, which the session did not write, is not overwritten; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&json),
+            startup_json,
+            "{mode}: chat.json, the old kind's output, is kept as it was; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&src, OTHER_MESSAGES);
+        assert!(
+            wait_for_file_contains(&json, "What is 4+4?", TIMEOUT),
+            "{mode}: edited back into messages, it writes chat.json; stderr: {}",
+            tap.text()
+        );
+        assert_eq!(
+            text_of(&md).as_deref(),
+            Some(HAND_WRITTEN),
+            "{mode}: chat.md is still untouched; stderr: {}",
+            tap.text()
+        );
+
+        // Control: nothing at chat.md, and the next save writes it.
+        std::fs::remove_file(&md).unwrap();
+        write_atomic(&src, "Hello\n");
+        assert!(
+            wait_for_file_contains(&md, "Hello", TIMEOUT) && wait_for_file_gone(&json, TIMEOUT),
+            "{mode}: control: with chat.md gone, the next save writes it and removes \
+             chat.json; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&src, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [format!(
+                "Kept {shown_md}: not written by this session; not overwritten"
+            )],
+            "{mode}: one notice; stderr: {stderr}"
+        );
+        let recompiled = |name: &str| {
+            lines_starting(&stderr, &format!("Recompiled {} (", below(shown_dir, name))).len()
+        };
+        assert_eq!(
+            (recompiled("chat.json"), recompiled("chat.md")),
+            (1, 1),
+            "{mode}: one rebuild of each kind is written; stderr: {stderr}"
+        );
+    }
+}
+
+/// `--quiet` prints no notice for a file a change of kind keeps (#160), and keeps it all
+/// the same: a hand-written `chat.md` beside `chat.mds`, edited into Markdown. Control:
+/// `talk.mds`, edited into Markdown with it, has nothing at `talk.md`, so `talk.md` is
+/// written and the session's `talk.json` removed.
+#[test]
+fn watch_quiet_keeps_a_file_a_change_of_kind_would_overwrite_without_a_notice() {
+    let base = notes_with(&[
+        ("chat.mds", MESSAGES_KIND),
+        ("chat.md", HAND_WRITTEN),
+        ("talk.mds", MESSAGES_KIND),
+    ]);
+    let notes = base.path().join("notes");
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args([
+                "watch",
+                "notes",
+                "-q",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    for name in ["chat.json", "talk.json"] {
+        assert!(
+            wait_for_file_contains(&notes.join(name), "What is 3+3?", TIMEOUT),
+            "control: the startup writes {name}; stderr: {}",
+            tap.text()
+        );
+    }
+    let startup_json = text_of(&notes.join("chat.json"));
+    write_atomic(&notes.join("chat.mds"), "Hello\n");
+    write_atomic(&notes.join("talk.mds"), "Hello\n");
+    assert!(
+        wait_for_file_contains(&notes.join("talk.md"), "Hello", TIMEOUT)
+            && wait_for_file_gone(&notes.join("talk.json"), TIMEOUT),
+        "control: talk.md is written and talk.json removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&notes.join("chat.md")).as_deref(),
+        Some(HAND_WRITTEN),
+        "the hand-written chat.md is not overwritten; stderr: {stderr}"
+    );
+    assert_eq!(
+        text_of(&notes.join("chat.json")),
+        startup_json,
+        "chat.json, the old kind's output, is kept as it was; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Kept "),
+        "--quiet prints no notice; stderr: {stderr}"
+    );
+}
+
+/// An empty output the startup wrote is the session's like any other (#160): `chat.mds`
+/// compiles to empty Markdown, so the startup writes an empty `chat.md`; edited into
+/// messages, it writes `chat.json`, and `chat.md`, written and left as it was, is
+/// removed without a notice.
+#[test]
+fn watch_removes_an_empty_startup_output_when_the_kind_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, md, json) = (
+        dir.path().join("chat.mds"),
+        dir.path().join("chat.md"),
+        dir.path().join("chat.json"),
+    );
+    std::fs::write(&src, "").unwrap();
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(dir.path())
+            .args([
+                "watch",
+                "chat.mds",
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    assert_eq!(
+        text_of(&md).as_deref(),
+        Some(""),
+        "control: the startup writes an empty chat.md; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, MESSAGES_KIND);
+    assert!(
+        wait_for_file_contains(&json, "What is 3+3?", TIMEOUT),
+        "control: edited into messages, it writes chat.json; stderr: {}",
+        tap.text()
+    );
+    assert!(
+        wait_for_file_gone(&md, TIMEOUT),
+        "the empty chat.md the startup wrote is removed; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        Vec::<String>::new(),
+        "stderr: {stderr}"
+    );
+}

@@ -1009,6 +1009,112 @@ fn init_never_replaces_a_file_that_appears_after_its_check() {
     );
 }
 
+/// The lines of `stderr` that are a kept file's notice.
+fn kept_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("Kept "))
+        .collect()
+}
+
+/// A file that appears at the output path of a watched file's new kind while `mds watch`
+/// writes it there is never overwritten (#160): that write gives its file the name only
+/// where nothing has it at the commit, so a `chat.json` put there after the session found
+/// nothing is kept — with one notice, none under `--quiet` — and the old output `chat.md`
+/// is kept as it was, since nothing replaced it. Control: with `chat.json` gone, the next
+/// save writes it, and removes the `chat.md` the session wrote.
+#[test]
+fn watch_never_writes_over_a_file_that_appears_while_a_change_of_kind_is_written() {
+    const APPEARED: &str = "Written by another program while watch ran\n";
+    const MESSAGES: &str = "@message user:\nWhat is 3+3?\n@end\n";
+    for quiet in [false, true] {
+        let dir = scratch();
+        let root = dir.path();
+        let src = put(root, "src/chat.mds", "Hello\n");
+        let (md, json) = (
+            root.join(native("src/chat.md")),
+            root.join(native("src/chat.json")),
+        );
+        let (go, paused) = (root.join("go"), root.join("go.paused"));
+        let mut cmd = mds_bin();
+        cmd.current_dir(root)
+            .args(["watch", native("src/chat.mds").as_str()])
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env(PAUSE, &go)
+            .stdout(Stdio::null());
+        if quiet {
+            cmd.arg("-q");
+        }
+        let (child, tap, _) = common::spawn_watch_ready(&mut cmd);
+        let mut child = common::ChildGuard(child);
+        assert_eq!(
+            read(&md),
+            "Hello\n",
+            "quiet {quiet}: control: the startup writes chat.md"
+        );
+
+        common::write_atomic(&src, MESSAGES);
+        // Bounded by TIMEOUT.
+        let deadline = Instant::now() + TIMEOUT;
+        while !paused.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "quiet {quiet}: the write of chat.json did not pause; chat.json holds {:?}; \
+                 stderr: {}",
+                std::fs::read_to_string(&json).ok(),
+                tap.text()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(&json, APPEARED).expect("put a file where the write goes");
+        std::fs::write(&go, "").expect("let the write go on");
+        common::write_atomic(&src, common::ORDER_MARKER_SOURCE);
+        let seen = common::wait_for_tap(&tap, common::ORDER_MARKER_LINE, TIMEOUT);
+
+        assert_eq!(
+            read(&json),
+            APPEARED,
+            "quiet {quiet}: the file that appeared keeps its bytes; stderr: {seen}"
+        );
+        assert_eq!(
+            read(&md),
+            "Hello\n",
+            "quiet {quiet}: the old output is kept as it was; stderr: {seen}"
+        );
+        assert_eq!(
+            entries(&root.join("src")),
+            ["chat.json", "chat.md", "chat.mds"],
+            "quiet {quiet}: no temporary file is left"
+        );
+        let notice = format!(
+            "Kept {}: not written by this session; not overwritten",
+            native("src/chat.json")
+        );
+        let expected: Vec<&str> = if quiet { vec![] } else { vec![notice.as_str()] };
+        assert_eq!(kept_lines(&seen), expected, "quiet {quiet}: stderr: {seen}");
+
+        // Control: nothing at chat.json, and the next save writes it.
+        std::fs::remove_file(&json).expect("remove the file that appeared");
+        common::write_atomic(&src, "@message user:\nWhat is 4+4?\n@end\n");
+        let deadline = Instant::now() + TIMEOUT;
+        while md.exists() || !std::fs::read_to_string(&json).is_ok_and(|t| t.contains("4+4")) {
+            assert!(
+                Instant::now() < deadline,
+                "quiet {quiet}: control: the next save writes chat.json and removes chat.md; \
+                 stderr: {}",
+                tap.text()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stderr = tap.finish_text(&mut child);
+        assert_eq!(
+            kept_lines(&stderr),
+            expected,
+            "quiet {quiet}: control: no other notice; stderr: {stderr}"
+        );
+    }
+}
+
 // ── Windows ──────────────────────────────────────────────────────────────────
 
 /// Windows: a directory symlink, and a junction, below `--out-dir` are refused as the

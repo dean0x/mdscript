@@ -1,7 +1,8 @@
 //! The one write primitive: every file `mds` writes goes through it —
 //! [`atomic_write_file`] for `mds build` and `mds watch` outputs and `.map` sidecars and
 //! `mds init --force`'s starter, [`create_new`] for `mds init`'s starter without
-//! `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix` rewrites (#227,
+//! `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix` rewrites,
+//! [`write_over_own`] for an `mds watch` output after its source's change of kind (#227,
 //! #160) — and every file it removes, through [`remove_proven`]. `tests/write_funnel.rs`
 //! keeps it the only one.
 //!
@@ -69,6 +70,13 @@
 //! O_EXCL | O_NOFOLLOW`) — still never over another file, but no longer all or nothing: a
 //! failure while it is written leaves the file partly written. Windows moves the
 //! temporary file into place without `MOVEFILE_REPLACE_EXISTING`.
+//!
+//! # Over the caller's own file, or as a new one (#160)
+//!
+//! [`write_over_own`] replaces a file only while it holds exactly what its caller last
+//! wrote there — read again as a rewrite reads its file, and replaced as a rewrite
+//! replaces it, only while it is still that file — and otherwise writes as [`create_new`]
+//! does: a file the caller did not write, or one changed since, is never replaced.
 //!
 //! # A removal proves its file first (#160)
 //!
@@ -228,13 +236,56 @@ pub(crate) fn create_new(
     })
 }
 
-/// Why [`create_new`] did not create its file.
+/// Why [`create_new`], or [`write_over_own`], did not write its file.
 #[derive(Debug)]
 pub(crate) enum NotCreated {
-    /// Something has the target's name: it was there, or it appeared while the write ran.
+    /// Something has the target's name: it was there, or it appeared while the write ran
+    /// — for [`write_over_own`], anything but the caller's own file, unchanged.
     Exists,
     /// The write failed, as [`atomic_write_file`] words a failure.
     Failed(mds::MdsError),
+}
+
+/// Write `content` to `target` over the file its caller wrote there — while it still holds
+/// exactly `own`, what was last written, and only until the rename, as
+/// [`replace_if_unchanged`] replaces the file it read — or else only where nothing has the
+/// target's name, as [`create_new`] writes (#160). `own` is `None` when the caller wrote
+/// nothing there. `mds watch` writes the output of a source's new kind so: a file the
+/// session did not write, or one changed since it wrote it, is never replaced.
+///
+/// # Errors
+///
+/// [`NotCreated::Exists`] for anything else at the target — a file with other bytes, or
+/// one changed before the rename, a symlink, a directory, a FIFO, a socket or a device —
+/// left as it is, with no temporary file left behind. Any other failure is
+/// [`NotCreated::Failed`], worded as [`atomic_write_file`] words it.
+pub(crate) fn write_over_own(
+    target: &WriteTarget,
+    own: Option<&str>,
+    content: &str,
+    durability: Durability,
+    parents: Parents,
+) -> std::result::Result<(), NotCreated> {
+    // A file not shown to hold `own` — other bytes, gone, a symlink, not a regular file,
+    // not to be read at all — is not the caller's: then only a new file may take the
+    // name, and the commit, never this read, finds whether something has it.
+    let held = own.and_then(|own| {
+        let below = Below::of(target).ok()?;
+        imp::read_stamped(&below, target.checked_anchor(), own.as_bytes()).ok()
+    });
+    let written = match held {
+        Some(held) => {
+            pause_before_replace();
+            imp::replace_held(held, content.as_bytes(), durability)
+        }
+        None => write_below_anchor(target, content, durability, parents, Commit::New),
+    };
+    written.map_err(|failure| match failure {
+        Failure::Exists | Failure::Changed | Failure::LinkAtTarget | Failure::NotARegularFile => {
+            NotCreated::Exists
+        }
+        failure => NotCreated::Failed(worded(target, failure)),
+    })
 }
 
 /// [`atomic_write_file`] and [`create_new`] share this: resolve `target` below its anchor,
@@ -297,7 +348,8 @@ pub(crate) fn read_stamped(
     read: &str,
 ) -> std::result::Result<ReadForRewrite, mds::MdsError> {
     let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
-    let held = imp::read_stamped(&below, read.as_bytes()).map_err(|f| worded(target, f))?;
+    let held = imp::read_stamped(&below, target.checked_anchor(), read.as_bytes())
+        .map_err(|f| worded(target, f))?;
     Ok(ReadForRewrite {
         target: target.clone(),
         held,
@@ -745,11 +797,16 @@ mod unix {
         stamp: Stamp,
     }
 
-    /// Read `below.name` again in the directory [`walk`] opens, without following a
-    /// symlink, and hold it if its bytes are `read`: the stamp is taken of the file opened,
-    /// before its bytes are read, so a change made while they are read changes it too.
-    pub(super) fn read_stamped(below: &Below<'_>, read: &[u8]) -> Result<Held, Failure> {
-        let dir = walk(below, None, Parents::Existing)?;
+    /// Read `below.name` again in the directory [`walk`] opens — below `anchor`, the
+    /// directory checked, when there is one — without following a symlink, and hold it if
+    /// its bytes are `read`: the stamp is taken of the file opened, before its bytes are
+    /// read, so a change made while they are read changes it too.
+    pub(super) fn read_stamped(
+        below: &Below<'_>,
+        anchor: Option<DirIdentity>,
+        read: &[u8],
+    ) -> Result<Held, Failure> {
+        let dir = walk(below, anchor, Parents::Existing)?;
         let mut file = match open_to_read(dir.as_fd(), below.name) {
             Ok(file) => file,
             Err(Errno::LOOP) => return Err(Failure::LinkAtTarget),
@@ -1293,10 +1350,15 @@ mod windows {
         stamp: Stamp,
     }
 
-    /// Read `below.name` again in the directory [`walk`] checks, by path, refusing a
-    /// symlink there, and hold it if its bytes are `read`.
-    pub(super) fn read_stamped(below: &Below<'_>, read: &[u8]) -> Result<Held, Failure> {
-        let dir = walk(below, None, Parents::Existing)?;
+    /// Read `below.name` again in the directory [`walk`] checks — below `anchor`, the
+    /// directory checked, when there is one — by path, refusing a symlink there, and hold
+    /// it if its bytes are `read`.
+    pub(super) fn read_stamped(
+        below: &Below<'_>,
+        anchor: Option<DirIdentity>,
+        read: &[u8],
+    ) -> Result<Held, Failure> {
+        let dir = walk(below, anchor, Parents::Existing)?;
         let target = dir.join(below.name);
         match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
@@ -1486,7 +1548,8 @@ mod windows {
 /// `MDS_TEST_PAUSE_BEFORE_REPLACE`: how a debug build is made to stop between a rewrite's
 /// read and its replace, so that a test can change the file, or swap its directory, in
 /// that window, and between [`create_new`]'s look at its target and its commit, so that a
-/// test can put a file there (`tests/anchored_writes.rs`). A release build has none of it.
+/// test can put a file there (`tests/anchored_writes.rs`) — [`write_over_own`] stops at
+/// the same two places. A release build has none of it.
 #[cfg(debug_assertions)]
 mod pause_trigger {
     use std::path::PathBuf;
@@ -2232,6 +2295,120 @@ mod tests {
             );
             assert!(!elsewhere.exists(), "nothing is written through the link");
         }
+    }
+
+    /// [`write_over_own`] of `target`, its directories already there, with what it did
+    /// not write as text: `kept` for [`NotCreated::Exists`], else the error's.
+    fn over_own(target: &WriteTarget, own: Option<&str>, content: &str) -> Result<(), String> {
+        write_over_own(
+            target,
+            own,
+            content,
+            Durability::RenameOnly,
+            Parents::Existing,
+        )
+        .map_err(|not_written| match not_written {
+            NotCreated::Exists => "kept".to_owned(),
+            NotCreated::Failed(e) => e.to_string(),
+        })
+    }
+
+    /// [`write_over_own`] replaces only the caller's own file, unchanged, and otherwise
+    /// writes only where nothing is (#160): nothing there — whether or not the caller wrote
+    /// there before — and the file is created; the file holding exactly what the caller
+    /// wrote is replaced; a file the caller did not write, one changed since, one with
+    /// more bytes, a directory and a symlink — even to a file holding the caller's bytes —
+    /// are kept ([`NotCreated::Exists`]), each as it was, nothing written through the
+    /// link, and no temporary file left.
+    #[test]
+    fn a_write_over_its_own_file_replaces_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        let target = WriteTarget::new(file.clone(), PathBuf::from("a.md"));
+        let text = || std::fs::read_to_string(&file).unwrap();
+        let kept = Err("kept".to_owned());
+
+        assert_eq!(over_own(&target, None, "first"), Ok(()), "nothing there");
+        assert_eq!(text(), "first");
+        assert_eq!(over_own(&target, None, "second"), kept, "not the caller's");
+        assert_eq!(text(), "first");
+        assert_eq!(
+            over_own(&target, Some("first"), "second"),
+            Ok(()),
+            "the caller's own, unchanged"
+        );
+        assert_eq!(text(), "second");
+        assert_eq!(
+            over_own(&target, Some("first"), "third"),
+            kept,
+            "changed since the caller wrote it"
+        );
+        assert_eq!(
+            over_own(&target, Some("secon"), "third"),
+            kept,
+            "more bytes"
+        );
+        assert_eq!(text(), "second");
+        assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(over_own(&target, Some("second"), "third"), Ok(()), "gone");
+        assert_eq!(text(), "third");
+
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert_eq!(
+            over_own(&target, Some("third"), "fourth"),
+            kept,
+            "a directory"
+        );
+        assert!(file.is_dir(), "the directory is left");
+        std::fs::remove_dir(&file).unwrap();
+
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "third").unwrap();
+        if make_symlink(&elsewhere, &file) {
+            for own in [Some("third"), None] {
+                assert_eq!(over_own(&target, own, "fourth"), kept, "a symlink, {own:?}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&elsewhere).unwrap(),
+                "third",
+                "nothing is written through the link"
+            );
+            assert!(std::fs::symlink_metadata(&file)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
+    }
+
+    /// A FIFO at the target of [`write_over_own`] is kept, never opened — the write does
+    /// not wait on it — whether or not the caller wrote there (#160).
+    #[cfg(unix)]
+    #[test]
+    fn a_write_over_its_own_file_keeps_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&file)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo a.md");
+        let target = WriteTarget::new(file.clone(), PathBuf::from("a.md"));
+        for own in [Some("first"), None] {
+            assert_eq!(
+                over_own(&target, own, "second"),
+                Err("kept".to_owned()),
+                "{own:?}"
+            );
+        }
+        assert_eq!(
+            entries(dir.path()),
+            ["a.md"],
+            "the FIFO is left, and no temporary file"
+        );
     }
 
     /// Each step of a new file's commit puts the file where nothing is, and never over a

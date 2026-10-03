@@ -2110,6 +2110,8 @@ const LABEL_TABLE: &[&[&str]] = &[
         "watch_keeps_an_output_edited_since_the_session_wrote_it",
         "watch_removes_the_old_output_of_a_changed_kind_only_when_it_wrote_it",
         "watch_writes_a_file_whose_kind_changed_to_that_kinds_output",
+        "watch_never_writes_over_a_file_it_did_not_write_when_the_kind_changes",
+        "watch_never_writes_over_a_file_that_appears_while_a_change_of_kind_is_written",
     ],
     &["an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk"],
     &["a_watched_directory_is_named_as_the_user_typed_it"],
