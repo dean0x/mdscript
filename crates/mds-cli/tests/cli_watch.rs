@@ -4208,8 +4208,8 @@ fn watch_dir_skips_symlinked_source_file() {
 // ── ESC-injection: watch initial-compile-error stderr sanitization ────────────
 
 /// T-Watch-ESC [AC-F-W1]: the `eprint_error` call at the non-loop
-/// initial-compile-error path in `run_watch_file` (watch.rs line ~937) must
-/// sanitize any raw control bytes before writing to stderr.
+/// startup-compile-error path (`file_startup::startup_compile`, through
+/// `settle_startup_error`) must sanitize any raw control bytes before writing to stderr.
 ///
 /// Vector: a `.mds` file containing a raw ESC byte (U+001B) in an unclosed
 /// `@define` — guaranteed syntax error — so the initial compile fails and
@@ -4785,9 +4785,10 @@ fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
     );
 }
 
-/// File mode: same property. The gate is the `Watching …` line, which `run_watch_file`
-/// prints before it creates the watcher and therefore before the startup compile; the
-/// entry imports enough partials that the compile is still running when SIGINT lands.
+/// File mode: same property. The gate is the `Watching …` line, which
+/// `file_startup::arm_pre_read` prints before it creates the watcher and therefore before
+/// the startup compile; the entry imports enough partials that the compile is still
+/// running when SIGINT lands.
 ///
 /// `#[cfg(unix)]`: sends SIGINT via `libc::kill` and asserts termination-by-signal
 /// via `ExitStatusExt::signal()`; Windows has no signal-death `ExitStatus` (#147).
@@ -4893,13 +4894,14 @@ fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::p
 /// Two arms, the same signal, opposite verdicts:
 ///
 /// - **CONTROL.** [`spawn_unsynchronized`], with SIGINT gated on the `Watching …`
-///   line. `run_watch_file` prints that line before it even creates the watcher, and
-///   therefore long before `ctrlc::set_handler`, so the signal lands in the
-///   pre-handler window where the default disposition still applies: death by SIGINT.
+///   line. `file_startup::arm_pre_read` prints that line before it even creates the
+///   watcher, and therefore long before `live::go_live` calls `ctrlc::set_handler`, so
+///   the signal lands in the pre-handler window where the default disposition still
+///   applies: death by SIGINT.
 ///   If this arm ever exits cleanly, the window is no longer being hit and the
 ///   treatment arm below proves nothing.
 /// - **TREATMENT.** [`spawn_ready`], with SIGINT sent the instant the handshake
-///   returns. `set_handler` precedes `emit_ready_marker` in `run_watch_file`, so once
+///   returns. `set_handler` precedes `emit_ready_marker` in `live::go_live`, so once
 ///   the marker exists the handler provably does too: exit 0 and `Stopped watching.`.
 ///
 /// `N = 20` is a live discriminator, not a rate bound — a single clean control exit
@@ -5006,7 +5008,7 @@ fn watch_readiness_handshake_makes_ctrl_c_exit_deterministic() {
             status.success(),
             "treatment arm, iteration {iteration}: after the readiness handshake the \
              ctrl-c handler provably exists (`set_handler` precedes \
-             `emit_ready_marker` in `run_watch_file`), so SIGINT must exit 0; got \
+             `emit_ready_marker` in `live::go_live`), so SIGINT must exit 0; got \
              {status:?}; stderr:\n{}",
             tap.text()
         );

@@ -1374,13 +1374,13 @@ fn check_stdin_resource_limit_exits_3() {
 /// timing-flaky on Linux CI.
 ///
 /// Synchronised on the `MDS_TEST_READY` handshake (#318), not on the artifact.
-/// `run_watch_file` publishes the startup output well before it writes the marker, so
-/// once [`spawn_watch_ready`] returns, `hello.md` is already on disk and is read
-/// **once**, directly. The previous shape polled the output file for up to 10s, which
-/// is the defect the issue names: polling turns "the startup compile wrote the file"
-/// into "something wrote the file eventually", so a startup path that resolved the
-/// bare filename only on a later retry — or a rebuild — still passed. A shorter poll
-/// would preserve that; only removing the loop removes it.
+/// `file_startup::startup_compile` publishes the startup output well before
+/// `live::go_live` writes the marker, so once [`spawn_watch_ready`] returns, `hello.md`
+/// is already on disk and is read **once**, directly. The previous shape polled the
+/// output file for up to 10s, which is the defect the issue names: polling turns "the
+/// startup compile wrote the file" into "something wrote the file eventually", so a
+/// startup path that resolved the bare filename only on a later retry — or a rebuild —
+/// still passed. A shorter poll would preserve that; only removing the loop removes it.
 #[test]
 fn watch_bare_filename_from_cwd_succeeds() {
     use std::process::Stdio;
