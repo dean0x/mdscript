@@ -807,10 +807,12 @@ fn a_rewrite_never_writes_over_a_file_it_did_not_read() {
 // ── `mds init` never replaces a file that appears after its check ───────────
 
 /// A file that appears between `mds init`'s look at its target and the commit of the
-/// starter file is not replaced (#160): the run refuses (`mds::io`, exit 2), naming the
-/// file as typed, the file keeps its bytes, and no temporary file is left. Controls: with
-/// nothing put there in that window, the same run creates the starter file; and `--force`
-/// replaces a file that is there.
+/// starter file is not replaced (#160), and is refused exactly as a file already there
+/// when `mds init` looks is: the same message, naming the file as typed, on the same
+/// stream, with the same exit code (1) and no error code. The file keeps its bytes, and no
+/// temporary file is left. Controls: a run that finds the file there at its look — the
+/// refusal this one must match — names the file; with nothing put there in that window,
+/// the same run creates the starter file; and `--force` replaces a file that is there.
 #[test]
 fn init_never_replaces_a_file_that_appears_after_its_check() {
     const APPEARED: &str = "Written by another program while init ran\n";
@@ -829,16 +831,33 @@ fn init_never_replaces_a_file_that_appears_after_its_check() {
         APPEARED,
         "the file that appeared keeps its bytes; stderr: {stderr}"
     );
-    assert_eq!(code, Some(2), "stderr: {stderr}");
-    let refusal = format!("{typed} already exists (use --force to overwrite)");
-    assert!(
-        stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refusal)),
-        "the refusal names the file as typed; stderr: {stderr}"
-    );
     assert_eq!(
         entries(&root.join("sub")),
         ["new.mds"],
         "no temporary file is left"
+    );
+
+    // The refusal of a file already there when init looks: the outcome to match.
+    let found = run(root, &args);
+    let found_stderr = text(&found.stderr);
+    let refusal = format!("{typed} already exists (use --force to overwrite)");
+    assert_eq!(
+        found.status.code(),
+        Some(1),
+        "found: stderr: {found_stderr}"
+    );
+    assert!(
+        squash(&found_stderr).contains(&squash(&refusal)) && !found_stderr.contains("mds::"),
+        "found: the refusal names the file as typed, with no error code; stderr: \
+         {found_stderr}"
+    );
+    assert!(found.stdout.is_empty(), "found: nothing on stdout");
+    assert_eq!(read(&file), APPEARED, "found: the file keeps its bytes");
+
+    assert_eq!(
+        (code, stderr.as_str()),
+        (Some(1), found_stderr.as_str()),
+        "a file that appeared during the write is refused as one already there"
     );
 
     // Control: nothing appears in the window, and the starter file is created.

@@ -103,9 +103,9 @@ input. The compiler enforces several defense-in-depth controls:
   nearest directory above it once it has been deleted (the out-dir is then created
   below that one without following a symlink), or, for `build.output_dir`, the
   directory that contains `mds.json` — and the write refuses an anchor it opens that
-  is another directory: on Unix compared on the descriptor it opened, so a link
-  swapped onto the path between the check and the write is refused rather than
-  followed. Nothing below the anchor is
+  is another directory, and one gone by then, which it does not make again: on Unix
+  compared on the descriptor it opened, so a link swapped onto the path between the
+  check and the write is refused rather than followed. Nothing below the anchor is
   followed (#160): on Unix each directory below the anchor is opened from the one above
   without following a symlink (`openat` with `O_NOFOLLOW`), and the temp file is
   created (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
@@ -124,19 +124,21 @@ input. The compiler enforces several defense-in-depth controls:
   the rewrite is renamed into that directory, whatever its path leads to by then, so a
   directory swapped after the read never receives another file's content. Just before
   the rename the file is looked at again in that directory and compared with a stamp
-  taken when it was read — device and inode, size, and modification and status-change
-  times — and a file edited in between is left as edited and the rewrite refused
+  taken when it was read — on Unix device and inode, size, and modification and
+  status-change times; on Windows size, and modification and creation times — and a
+  file edited in between is left as edited and the rewrite refused
   (`mds::io`, `"<path>" changed since it was read; not written`). Residuals: an edit
   that lands between that comparison and the rename is replaced; on a filesystem whose
   clock is coarser than the time between two writes (one-second timestamps, say), an
   edit that keeps the file's size within the same tick is not seen; and on Windows the
-  second read, the comparison and the rename all go by path.
+  second read, the comparison and the rename all go by path, and an edit that keeps the
+  file's size and sets its modification time back is not seen.
   `mds init` without `--force` never replaces a file (#160): the starter is given its
   name only where nothing has it at that moment — by a rename that never replaces on
   Linux, Android and Apple platforms, else by a hard link, and on Windows by a move
   without replace — so a file that appears after its existence check is left as it is
-  and the run refused (`mds::io`); on a filesystem without hard links the starter is
-  written in place into a file created exclusively, which keeps that guarantee but
+  and refused as one already there is; on a filesystem without hard links the starter
+  is written in place into a file created exclusively, which keeps that guarantee but
   not atomicity.
   **Windows residual**: the standard library has no descriptor-relative walk on
   Windows. Each directory below the anchor is checked and refused when it is a

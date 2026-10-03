@@ -161,8 +161,9 @@ fn init_does_not_overwrite_existing_file() {
 }
 
 /// T-D1-1 (#386): `mds init --force` at a live symlink is refused; the link and its
-/// target survive untouched. Positive control in the same test: `mds init` on a plain
-/// (non-symlink) path still succeeds normally.
+/// target survive untouched. Without `--force` the link is refused as a file already there
+/// (#160). Positive control in the same test: `mds init` on a plain (non-symlink) path
+/// still succeeds normally.
 #[test]
 fn init_force_symlink_target_refused_plain_path_created() {
     let dir = tempfile::tempdir().unwrap();
@@ -199,6 +200,30 @@ fn init_force_symlink_target_refused_plain_path_created() {
             .file_type()
             .is_symlink(),
         "the symlink itself must survive the refusal"
+    );
+
+    // Without `--force` the same live link is a file already there (#160): refused as
+    // one, exit 1 with no error code, and nothing is written through it.
+    let found = mds_bin()
+        .current_dir(dir.path())
+        .args(["init", "link.mds"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&found.stderr);
+    assert_eq!(
+        found.status.code(),
+        Some(1),
+        "init onto a live symlink without --force; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("link.mds already exists (use --force to overwrite)")
+            && !stderr.contains("mds::"),
+        "refused as a file already there, with no error code; got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "REAL",
+        "nothing is written through the link without --force"
     );
 
     // Positive control: init on a plain (non-symlink) path still succeeds.

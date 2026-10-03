@@ -24,7 +24,7 @@
 //! watch` refuses a write whose out-dir, as the user named it, now leads to another
 //! directory ([`out_dir_moved`]), and names the directory its check found to the write,
 //! which refuses an anchor it opens that is not that one — on unix by the descriptor it
-//! opened ([`DirIdentity`]). Nothing
+//! opened ([`DirIdentity`]) — and one that is gone, without making it again. Nothing
 //! below it is: each directory is opened from the one above it without following a
 //! symlink, and the file is created, checked and renamed in the last one. A symlink
 //! planted below the anchor, or swapped in while the write runs, is refused (`mds::io`,
@@ -175,8 +175,8 @@ impl DirIdentity {
 /// shown form — `cannot write out/sub: refusing to follow a symlink` — and one at the
 /// target says `refusing to replace a symlink`; a FIFO, a socket or a device there says
 /// `not a regular file`; an anchor that is not the directory the caller checked
-/// ([`WriteTarget::below_checked_anchor`]) is refused as [`out_dir_moved`] words it,
-/// before anything below it is opened.
+/// ([`WriteTarget::below_checked_anchor`]), or that is gone — it is not made again — is
+/// refused as [`out_dir_moved`] words it, before anything below it is opened.
 pub(crate) fn atomic_write_file(
     target: &WriteTarget,
     content: &str,
@@ -184,6 +184,7 @@ pub(crate) fn atomic_write_file(
     parents: Parents,
 ) -> std::result::Result<(), mds::MdsError> {
     write_below_anchor(target, content, durability, parents, Commit::Replace(None))
+        .map_err(|failure| worded(target, failure))
 }
 
 /// Write `content` to `target` as [`atomic_write_file`] does, but only as a new file
@@ -193,30 +194,44 @@ pub(crate) fn atomic_write_file(
 ///
 /// # Errors
 ///
-/// As [`atomic_write_file`]'s, and, for a target that is there — before the write or
-/// appearing while it runs — `mds::io` `<file> already exists (use --force to
-/// overwrite)`, the file named by `target.shown`; the file is left as it is and no
-/// temporary file is left behind. A symlink at the target is refused as
-/// [`atomic_write_file`] refuses one.
+/// [`NotCreated::Exists`] for a target that is there — before the write or appearing
+/// while it runs: the file is left as it is and no temporary file is left behind, and the
+/// caller words the refusal, as it words its own earlier look's. Any other failure is
+/// [`NotCreated::Failed`], worded as [`atomic_write_file`] words it — a symlink at the
+/// target is refused as it refuses one.
 pub(crate) fn create_new(
     target: &WriteTarget,
     content: &str,
     durability: Durability,
     parents: Parents,
-) -> std::result::Result<(), mds::MdsError> {
-    write_below_anchor(target, content, durability, parents, Commit::New)
+) -> std::result::Result<(), NotCreated> {
+    write_below_anchor(target, content, durability, parents, Commit::New).map_err(|failure| {
+        match failure {
+            Failure::Exists => NotCreated::Exists,
+            failure => NotCreated::Failed(worded(target, failure)),
+        }
+    })
+}
+
+/// Why [`create_new`] did not create its file.
+#[derive(Debug)]
+pub(crate) enum NotCreated {
+    /// Something has the target's name: it was there, or it appeared while the write ran.
+    Exists,
+    /// The write failed, as [`atomic_write_file`] words a failure.
+    Failed(mds::MdsError),
 }
 
 /// [`atomic_write_file`] and [`create_new`] share this: resolve `target` below its anchor,
-/// then write through it as `commit` says, wording any failure as the write's own.
+/// then write through it as `commit` says.
 fn write_below_anchor(
     target: &WriteTarget,
     content: &str,
     durability: Durability,
     parents: Parents,
     commit: Commit<&imp::Stamp>,
-) -> std::result::Result<(), mds::MdsError> {
-    let below = Below::of(target).map_err(|e| io_error(&target.shown, io_cause(&e)))?;
+) -> std::result::Result<(), Failure> {
+    let below = Below::of(target)?;
     let anchor = target.checked_anchor();
     imp::write(
         &below,
@@ -226,7 +241,6 @@ fn write_below_anchor(
         parents,
         commit,
     )
-    .map_err(|failure| worded(target, failure))
 }
 
 /// How the temporary file a write has filled takes the target's name.
@@ -305,9 +319,12 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
                 safe_path(&target.shown)
             ),
         },
-        Failure::Exists => mds::MdsError::Io {
-            message: format!("{} {ALREADY_EXISTS}", safe_path(&target.shown)),
-        },
+        // Only a new file's commit meets a file at its target, and [`create_new`] hands that
+        // to its caller to word; any other write that did would have failed like any other.
+        Failure::Exists => io_error(
+            &target.shown,
+            io_cause(&std::io::ErrorKind::AlreadyExists.into()),
+        ),
         Failure::LinkBelowAnchor { depth } => {
             io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
         }
@@ -318,8 +335,8 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
     }
 }
 
-/// Why [`create_new`] — and `mds init`'s own check before it — refuses a target that is
-/// there, after the file's name.
+/// Why `mds init` refuses a target that is there — found by its own look, or met by
+/// [`create_new`]'s commit ([`NotCreated::Exists`]) — after the file's name.
 pub(crate) const ALREADY_EXISTS: &str = "already exists (use --force to overwrite)";
 
 /// Why [`atomic_write_file`] refuses to replace a symlink at its target.
@@ -550,17 +567,24 @@ mod unix {
     }
 
     /// Open the directory `below.name` is in: the anchor by path — and, when `anchor`
-    /// names the directory it must be, refuse another — then each directory below it from
-    /// the one above without following a symlink.
+    /// names the directory it must be, refuse another, and one gone, which is never made
+    /// again by path — then each directory below it from the one above without following
+    /// a symlink.
     fn walk(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
         parents: Parents,
     ) -> Result<OwnedFd, Failure> {
-        let mut dir = open_anchor(&below.anchor, parents)?;
-        if let Some(checked) = anchor {
-            dir = opened_as_checked(dir, checked)?;
-        }
+        let mut dir = match anchor {
+            Some(checked) => match open_anchor(&below.anchor, Parents::Existing) {
+                Ok(dir) => opened_as_checked(dir, checked)?,
+                Err(Failure::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Failure::AnchorMoved)
+                }
+                Err(failure) => return Err(failure),
+            },
+            None => open_anchor(&below.anchor, parents)?,
+        };
         for (depth, name) in below.dirs.iter().enumerate() {
             let next = open_below(dir.as_fd(), name, parents)
                 .map_err(|errno| below_failure(dir.as_fd(), name, depth, errno))?;
@@ -1176,14 +1200,15 @@ mod windows {
     }
 
     /// The directory `below.name` is in: the anchor, created first when `parents` says
-    /// so — refused when `anchor` names another directory than the one there — then each
-    /// directory below it, refused when it is a symlink or a junction; all by path.
+    /// so — refused when `anchor` names another directory than the one there, or one
+    /// gone, which is never made again — then each directory below it, refused when it is
+    /// a symlink or a junction; all by path.
     fn walk(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
         parents: Parents,
     ) -> Result<PathBuf, Failure> {
-        if parents == Parents::Create {
+        if parents == Parents::Create && anchor.is_none() {
             // A name on the anchor's path taken by a link that leads nowhere — the anchor
             // then resolves to nothing — is a directory that is not there, as on unix; a
             // file there keeps the error creating the directory met.
@@ -1716,6 +1741,34 @@ mod tests {
         assert_eq!(std::fs::read_to_string(out.join("x.md")).unwrap(), "X");
     }
 
+    /// An anchor a check found is never made again by path (#160): a write that finds it
+    /// gone is refused with the out-dir refusal and creates nothing, so no directory is
+    /// made wherever that path leads by then; the next check finds the directory above it.
+    /// Control: the same target, named with no directory to expect, is created by path,
+    /// as any output's anchor is.
+    #[test]
+    fn a_checked_anchor_that_is_gone_is_not_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let identity = DirIdentity::of(&out).expect("a directory");
+        std::fs::remove_dir(&out).unwrap();
+        let target = WriteTarget::below(&out, Path::new("o"), Path::new("x.md"));
+
+        let checked = target.below_checked_anchor(&out, 0, identity);
+        let err = atomic_write_file(&checked, "X", Durability::RenameOnly, Parents::Create)
+            .expect_err("the anchor checked is gone")
+            .to_string();
+        assert_eq!(
+            err,
+            format!("cannot write {}: {OUT_DIR_MOVED}", safe_path(&target.shown))
+        );
+        assert!(!out.exists(), "nothing is made by path");
+
+        atomic_write_file(&target, "X", Durability::RenameOnly, Parents::Create).unwrap();
+        assert_eq!(std::fs::read_to_string(out.join("x.md")).unwrap(), "X");
+    }
+
     /// A bounded swap loop (#160): while a thread swaps a directory below the anchor
     /// between a directory and a symlink, at most 2,000 writes in at most 10 s land
     /// nothing in the link's target. Controls: the loop met both states — some writes
@@ -1913,26 +1966,27 @@ mod tests {
 
     // ── A new file, never over another ───────────────────────────────────────────
 
-    /// [`create_new`] puts a file where nothing is, and refuses a target that is there:
-    /// `<file> already exists (use --force to overwrite)`, the file left as it is and no
-    /// temporary file (#160). A symlink there is refused as a symlink, and nothing is
-    /// written through it. Control: [`atomic_write_file`] replaces the same file.
+    /// [`create_new`] puts a file where nothing is, and refuses a target that is there
+    /// ([`NotCreated::Exists`]), the file left as it is and no temporary file (#160). A
+    /// symlink there is refused as a symlink, and nothing is written through it. Control:
+    /// [`atomic_write_file`] replaces the same file.
     #[test]
     fn a_new_file_is_never_put_where_a_file_is() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.mds");
         let target = WriteTarget::new(file.clone(), PathBuf::from("a.mds"));
         let new = |content: &str| {
-            create_new(&target, content, Durability::RenameOnly, Parents::Existing)
-                .map_err(|e| e.to_string())
+            create_new(&target, content, Durability::RenameOnly, Parents::Existing).map_err(
+                |not_created| match not_created {
+                    NotCreated::Exists => "exists".to_owned(),
+                    NotCreated::Failed(e) => e.to_string(),
+                },
+            )
         };
 
         new("first").unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
-        assert_eq!(
-            new("second"),
-            Err(format!("{} {ALREADY_EXISTS}", safe_path(&target.shown)))
-        );
+        assert_eq!(new("second"), Err("exists".to_owned()));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
         assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
 

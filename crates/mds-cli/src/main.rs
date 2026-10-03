@@ -466,14 +466,10 @@ fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
             "init filename must not contain '..' components"
         ));
     }
-    // A friendly early answer only: a file that appears after this look is refused by the
-    // commit itself (`write::create_new`, #160).
+    // An early answer only: a file that appears after this look is refused by the commit
+    // itself (`write::create_new`, #160), in the same way.
     if filename.exists() && !force {
-        return Err(miette::miette!(
-            "{} {}",
-            output::safe_path(&filename),
-            write::ALREADY_EXISTS
-        ));
+        return Err(init_target_exists(&filename));
     }
     let starter = "\
 ---
@@ -497,17 +493,17 @@ Your items:
     // fixed public template a re-run reproduces. Anchored at the typed parent, which must
     // exist: init creates no directory (#160).
     let target = output::WriteTarget::as_typed(filename.clone());
-    let commit = if force {
-        write::atomic_write_file
+    let (durability, parents) = (write::Durability::RenameOnly, write::Parents::Existing);
+    if force {
+        write::atomic_write_file(&target, starter, durability, parents)?;
     } else {
-        write::create_new
-    };
-    commit(
-        &target,
-        starter,
-        write::Durability::RenameOnly,
-        write::Parents::Existing,
-    )?;
+        write::create_new(&target, starter, durability, parents).map_err(|not_created| {
+            match not_created {
+                write::NotCreated::Exists => init_target_exists(&filename),
+                write::NotCreated::Failed(e) => miette::Report::new(e),
+            }
+        })?;
+    }
     if !quiet {
         output::ewriteln!(
             "Created {}\n  Try: mds build {}",
@@ -516,6 +512,13 @@ Your items:
         );
     }
     Ok(())
+}
+
+/// `mds init`'s refusal of a file at its target (#160): `<file> already exists (use
+/// --force to overwrite)`, exit 1, no error code — one answer whether its look found the
+/// file there or the commit met one that appeared after that look.
+fn init_target_exists(filename: &std::path::Path) -> miette::Report {
+    miette::miette!("{} {}", output::safe_path(filename), write::ALREADY_EXISTS)
 }
 
 fn run(cli: Cli) -> Result<()> {
