@@ -10045,6 +10045,134 @@ fn watch_reports_a_dangling_symlink_at_a_deleted_source_s_output() {
     );
 }
 
+/// The debug build's pause between a directory batch's split and its compile (#160): the
+/// file it names ends the pause, and the same name with `.paused` appended says the batch
+/// has stopped.
+#[cfg(debug_assertions)]
+const BATCH_PAUSE: &str = "MDS_TEST_PAUSE_AFTER_BATCH_SPLIT";
+
+/// Wait until the session's rebuild batch has stopped at its pause ([`BATCH_PAUSE`]) and
+/// said so at `paused`. Bounded by [`TIMEOUT`].
+#[cfg(debug_assertions)]
+#[track_caller]
+fn wait_paused(paused: &Path, child: &mut ChildGuard, tap: &StderrTap, label: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !paused.exists() {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!(
+                "{label}: setup: the session ended ({status}) before a batch paused; \
+                 stderr: {}",
+                tap.text()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: setup: no batch paused; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A source deleted while a batch is rebuilding it is a deleted source (#160): its
+/// output is retired as any deleted source's is — `same.md`, left as the session wrote
+/// it, is removed with `Removed … (source deleted)`, and `edited.md`, which the user
+/// edited, is kept with a notice — with no `file not found` error for it, and the session
+/// keeps watching. Both sources are deleted while the batch is paused once it has told
+/// the sources still there from those gone ([`BATCH_PAUSE`]): a batch of edits, paused
+/// after its partition, used to forget a source it found gone without retiring its
+/// output, and a batch that recompiles every source for a `--vars` edit, paused at the
+/// first compile, reported the source it could no longer read as `file not found`.
+#[cfg(debug_assertions)]
+#[test]
+fn watch_handles_a_source_deleted_during_its_rebuild_as_deleted() {
+    for (label, extra, edit_vars) in DELETION_BATCHES {
+        let base = notes_with(&[("edited.mds", "Edited\n"), ("same.mds", "Same\n")]);
+        let notes = base.path().join("notes");
+        let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path())
+                .args(["watch", "notes", "--poll-interval", "0"])
+                .args(extra)
+                .env(BATCH_PAUSE, &go)
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&notes.join("edited.md"), "Edited", TIMEOUT)
+                && wait_for_file_contains(&notes.join("same.md"), "Same", TIMEOUT),
+            "{label}: control: the startup writes both outputs; stderr: {}",
+            tap.text()
+        );
+        std::fs::write(notes.join("edited.md"), USER_EDIT).unwrap();
+
+        // The batch: both sources saved as they are, or the vars file edited.
+        if edit_vars {
+            write_atomic(&base.path().join("vars.json"), r#"{"name": "two"}"#);
+        } else {
+            write_atomic(&notes.join("edited.mds"), "Edited\n");
+            write_atomic(&notes.join("same.mds"), "Same\n");
+        }
+        wait_paused(&paused, &mut child, &tap, label);
+        for name in ["edited.mds", "same.mds"] {
+            std::fs::remove_file(notes.join(name)).unwrap();
+        }
+        std::fs::write(&go, "").unwrap();
+
+        let kept = format!(
+            "Kept {}: changed since it was written",
+            below("notes", "edited.md")
+        );
+        let removed = format!("Removed {} (source deleted)", below("notes", "same.md"));
+        wait_for_tap(&tap, &kept, TIMEOUT);
+        wait_for_tap(&tap, &removed, TIMEOUT);
+        write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{label}: the session keeps watching; stderr: {}",
+            tap.text()
+        );
+        #[cfg(unix)]
+        {
+            interrupt(&child);
+            let status = wait_bounded(&mut child, SESSION_END_TIMEOUT, "Ctrl+C");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{label}: Ctrl+C ends the session with exit 0; stderr: {}",
+                tap.text()
+            );
+        }
+        let stderr = tap.finish_text(&mut child);
+
+        assert!(
+            !stderr.contains("file not found"),
+            "{label}: a source deleted during its rebuild is no compile error; \
+             stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [kept],
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            [removed],
+            "{label}: stderr: {stderr}"
+        );
+        assert_eq!(
+            text_of(&notes.join("edited.md")).as_deref(),
+            Some(USER_EDIT),
+            "{label}: the output the user edited survives; stderr: {stderr}"
+        );
+        assert!(
+            !notes.join("same.md").exists(),
+            "{label}: the output left as written is gone; stderr: {stderr}"
+        );
+    }
+}
+
 // ── #425: an output never replaces an MDS module ─────────────────────────────
 
 /// An MDS module: a `.md` file whose frontmatter declares `type: mds`.

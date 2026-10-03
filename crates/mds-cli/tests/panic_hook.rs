@@ -1731,6 +1731,66 @@ fn the_pause_before_a_replace_is_compiled_only_into_debug_builds() {
     }
 }
 
+/// The pause between a directory watch batch's split and its compile (#160) compiles only
+/// into a debug build, as the pause before a replace does: every mention of
+/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` sits inside `mod batch_pause_trigger`, whose
+/// attributes hold `#[cfg(debug_assertions)]`, and `pause_after_batch_split` has a release
+/// build's stub that does nothing.
+///
+/// Controls: the module without its `cfg`, a mention outside it, a release stub that does
+/// something, and no release stub are each reported.
+#[test]
+fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
+    let watch = read_source("src/watch.rs");
+    let sources = crate_sources();
+    let found = gate_findings(&sources, &BATCH_PAUSE_TRIGGER);
+    assert!(
+        found.is_empty(),
+        "the pause after a batch's split must be compiled only into debug builds:\n{}",
+        found.join("\n")
+    );
+
+    let with = |from: &str, to: &str| -> Vec<(String, String)> {
+        let planted = watch.replacen(from, to, 1);
+        assert_ne!(planted, watch, "precondition: watch.rs holds {from:?}");
+        sources
+            .iter()
+            .map(|(name, src)| {
+                let src = if name == "watch.rs" { &planted } else { src };
+                (name.clone(), src.clone())
+            })
+            .collect()
+    };
+    let stub = "fn pause_after_batch_split() {}";
+    for (planted, what) in [
+        (
+            with(
+                "#[cfg(debug_assertions)]\nmod batch_pause_trigger",
+                "mod batch_pause_trigger",
+            ),
+            "a pause module without `#[cfg(debug_assertions)]`",
+        ),
+        (
+            with(
+                stub,
+                "fn pause_after_batch_split() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_PAUSE_AFTER_BATCH_SPLIT\");\n}",
+            ),
+            "the pause's variable outside its module",
+        ),
+        (
+            with(stub, "fn pause_after_batch_split() {\n    let _ = 1;\n}"),
+            "a release stub that does something",
+        ),
+        (with(stub, ""), "a pause without a release stub"),
+    ] {
+        assert!(
+            !gate_findings(&planted, &BATCH_PAUSE_TRIGGER).is_empty(),
+            "{what} must be reported"
+        );
+    }
+}
+
 /// A panic in one file's compile fails that file alone (#389), so each per-file catch — a
 /// `catch_compile` call — wraps that compile and nothing else: its closure is
 /// `AssertUnwindSafe(|| <one call>)`, the call is one of [`COMPILE_CALLS`] as written
@@ -2652,6 +2712,14 @@ const PAUSE_TRIGGER: DebugGate = DebugGate {
     module: "pause_trigger",
     needles: &[("MDS_TEST_PAUSE_BEFORE_REPLACE", true)],
     fns: &["pause_before_replace"],
+};
+
+/// The pause between a directory watch batch's split and its compile (#160):
+/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, in `mod batch_pause_trigger`.
+const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
+    module: "batch_pause_trigger",
+    needles: &[("MDS_TEST_PAUSE_AFTER_BATCH_SPLIT", true)],
+    fns: &["pause_after_batch_split"],
 };
 
 /// What is wrong with `gate`'s gating across `sources`; empty when nothing is: its module

@@ -3070,7 +3070,9 @@ struct LivenessState {
 ///
 /// A partial refreshes the graph and writes no output of its own; any other source's
 /// output is written when its content changed. A compile that succeeds records the
-/// dependencies it reported even when its write fails (#257).
+/// dependencies it reported even when its write fails (#257). A compile that fails
+/// because `src` is gone since the batch found it there retires it as a deleted source
+/// ([`DirWatchState::retire_deleted`], #160).
 ///
 /// # Invariants preserved
 /// - Freshness rule: dep set recomputed from fresh `compile_to_content` output.
@@ -3100,6 +3102,8 @@ fn compile_one_source(
     // What the rebuild of `src` before this one kept from being written (#160): told again
     // unless this rebuild keeps the same once more, as another event of the same save does.
     let kept_before = state.kept.remove(src);
+    // A debug build's test pause (#160): the batch found `src` there, and has not read it.
+    pause_after_batch_split();
     let failure = match watch_root.compile_source(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths = graph_keys(&compiled.dependencies);
@@ -3224,6 +3228,15 @@ fn compile_one_source(
                 state.record_success(src, dep_paths, root, None, None);
                 return false;
             }
+        }
+        // The source went after the batch found it there (#160): whatever the compile
+        // said of a file that is no longer there — `file not found`, or a read that
+        // failed — it is a deleted source, retired by the same rule, never a compile
+        // error. A source still there, or one whose presence cannot be told, fails as
+        // any other compile does.
+        Err(CompileFailure::Error(_)) if matches!(src.try_exists(), Ok(false)) => {
+            state.retire_deleted(src, quiet);
+            return false;
         }
         Err(failure) => failure.unreported(),
     };
@@ -4078,7 +4091,8 @@ fn process_dir_batch(
 /// Also runs the same deletion cleanup that `process_dir_batch_incremental` does so
 /// that a `.mds` deleted in the same debounce window as a vars edit does not orphan its
 /// output `.md` or leave stale `last_written` / `forward_deps` / `errored` entries
-/// (rust.md / reliability issue #3 fix).
+/// (rust.md / reliability issue #3 fix). A source found gone later in the batch — before
+/// its compile, during it, or after it — is retired the same way (#160).
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
 ///
@@ -4107,15 +4121,24 @@ fn process_dir_batch_vars_changed(
     state.external_dep_dirs.clear();
 
     for src in &all_sources {
-        if src.exists()
-            && compile_one_source(src, watch_root, output_base, runtime_vars, quiet, state)
-        {
+        // A source gone since the pass above is a deleted source too (#160).
+        if !src.exists() {
+            state.retire_deleted(src, quiet);
+            continue;
+        }
+        if compile_one_source(src, watch_root, output_base, runtime_vars, quiet, state) {
             any_changed = true;
         }
     }
 
-    // Prune known_files to currently-existing sources.
-    state.known_files = all_sources.into_iter().filter(|p| p.exists()).collect();
+    // Keep the sources still there. One gone since its compile is a deleted source as
+    // well, retired by the same rule rather than dropped with its outputs left (#160).
+    let (present, gone): (BTreeSet<PathBuf>, BTreeSet<PathBuf>) =
+        all_sources.into_iter().partition(|p| p.exists());
+    for src in &gone {
+        state.retire_deleted(src, quiet);
+    }
+    state.known_files = present;
     any_changed
 }
 
@@ -4125,7 +4148,8 @@ fn process_dir_batch_vars_changed(
 /// 1. Partition changed paths into `existing` / `deleted`.
 /// 2. Compute seeds = existing ∪ deleted ∪ (errored ∩ real-change batch).
 /// 3. Compute affected = transitive importers of seeds (freshness-rule snapshot).
-/// 4. Compile each affected source that exists and is not an external-only dep.
+/// 4. Compile each affected source that exists and is not an external-only dep; one in
+///    the root found gone here, or by its compile, is retired as a deleted source (#160).
 /// 5. Delete outputs for removed sources.
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
@@ -4161,6 +4185,10 @@ fn process_dir_batch_incremental(
     // 3. Affected = seeds ∪ transitive importers (uses start-of-batch graph snapshot).
     let affected = affected_sources(&state.forward_deps, &seeds);
 
+    // A debug build's test pause (#160): the batch has told its sources still there from
+    // those gone, and has compiled none of them.
+    pause_after_batch_split();
+
     // 4. Compile each affected source that exists and is not an external-only dep.
     for src in &affected {
         // External-only deps are graph nodes but never emit output (DD3).
@@ -4182,15 +4210,18 @@ fn process_dir_batch_incremental(
         }
 
         if !src.exists() {
-            // If `src` is in the `deleted` set, it will be cleaned up in step 5.
-            // If it is NOT in `deleted` (e.g. it was seeded from `errored` but its
-            // delete event was never delivered — issue #7), prune it from `errored`,
-            // `forward_deps`, and `known_files` now so it doesn't accumulate as a ghost
-            // entry and waste per-batch allocation on every subsequent real-change event.
+            // If `src` is in the `deleted` set, it is retired in step 5. If it is NOT —
+            // deleted since this batch's partition, or seeded from `errored` while its
+            // delete event never came (issue #7) — a source in the root is a deleted
+            // source all the same: its outputs are retired now, by the same rule, and its
+            // records go with them, so it does not stay a ghost entry (#160). An external
+            // dependency has no output (#217), and is only forgotten.
             if !deleted.contains(src) {
-                // Its output, if it had one, is the one recorded for it: an external dep
-                // has none, so nothing an in-root source wrote is forgotten for it (#217).
-                state.forget(src);
+                if is_in_root {
+                    state.retire_deleted(src, quiet);
+                } else {
+                    state.forget(src);
+                }
             }
             continue;
         }
@@ -4250,6 +4281,64 @@ fn process_dir_batch_incremental(
     state.external_dep_dirs = live_ext_dirs;
     any_changed
 }
+
+// ── Test-only pause between a directory batch's split and its compile (#160) ──
+
+/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`: how a debug build is made to stop a directory
+/// watch's rebuild batch once it has told the sources still there from the sources gone,
+/// and before it compiles them — after an incremental batch's partition, and again just
+/// before each source's compile — so that a test can delete a source in that window
+/// (`tests/cli_watch.rs`). A release build has none of it.
+#[cfg(debug_assertions)]
+mod batch_pause_trigger {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crate::output::WriteTarget;
+    use crate::write::{atomic_write_file, Durability, Parents};
+
+    /// The variable naming the file that ends the pause. The run writes the same name with
+    /// `.paused` appended once it has stopped, for the test to wait for.
+    const VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_BATCH_SPLIT";
+
+    /// How long the pause waits between two looks for the file that ends it.
+    const POLL: Duration = Duration::from_millis(5);
+
+    /// How many looks the pause makes before the batch goes on regardless: ten seconds.
+    const MAX_POLLS: u32 = 2_000;
+
+    /// Stop here when `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` names a file: say so by writing
+    /// `<file>.paused`, then wait until `<file>` exists, or until [`MAX_POLLS`] looks have
+    /// found none.
+    pub(super) fn pause_after_batch_split() {
+        let Some(go) = std::env::var_os(VARIABLE).map(PathBuf::from) else {
+            return;
+        };
+        let mut paused = go.clone().into_os_string();
+        paused.push(".paused");
+        // A marker that cannot be written leaves the test waiting for it, which the test
+        // reports as a batch that never paused.
+        let _ = atomic_write_file(
+            &WriteTarget::as_typed(PathBuf::from(paused)),
+            "",
+            Durability::RenameOnly,
+            Parents::Existing,
+        );
+        for _ in 0..MAX_POLLS {
+            if go.exists() {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+use batch_pause_trigger::pause_after_batch_split;
+
+/// A release build's pause between a directory batch's split and its compile: none.
+#[cfg(not(debug_assertions))]
+fn pause_after_batch_split() {}
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
