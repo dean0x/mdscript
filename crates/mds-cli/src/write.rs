@@ -1,11 +1,13 @@
-//! The one write primitive: every file `mds` writes goes through it —
+//! The one write primitive: every file a release build of `mds` writes goes through it —
 //! [`write_compiled`] for `mds build` and `mds watch` outputs and `.map` sidecars (#425),
 //! [`write_compiled_and_look`] for a directory build's outputs below an out-dir (#160),
 //! [`atomic_write_file`] for `mds init --force`'s starter, [`create_new`] for `mds init`'s
 //! starter without `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix`
 //! rewrites, [`write_over_own`] for an `mds watch` output after its source's change of kind
-//! (#227, #160) — and every file it removes, through [`remove_proven`].
-//! `tests/write_funnel.rs` keeps it the only one.
+//! (#227, #160) — and every file it removes, through [`remove_proven`]. A debug build also
+//! writes, by path and outside it, the readiness marker `mds watch` creates for the test
+//! suite (`MDS_TEST_READY`). `tests/write_funnel.rs` keeps it the only one, that marker's
+//! module aside.
 //!
 //! # Replace by rename
 //!
