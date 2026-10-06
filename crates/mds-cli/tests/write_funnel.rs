@@ -14,7 +14,9 @@
 //! `remove_proven` removes a file only below its anchor, through no symlink, once it is
 //! proven. A raw `std::fs::write` — or a raw `create_dir_all`, `create_dir`, `mkdirat`,
 //! `openat`, `rename`, `renameat`, `renameat_with`, `linkat`, `unlinkat`, path-based
-//! `fs::set_permissions` or `remove_file` — at any *one* remaining site
+//! `fs::set_permissions`, `remove_file`, `fs::copy`, `hard_link`, `remove_dir` or
+//! `remove_dir_all`, or tempfile's `tempfile_in`, `persist` or `persist_noclobber` — at
+//! any *one* remaining site
 //! silently forfeits all of that for the artifact it touches, and "did we remember every
 //! write site?" is an unbounded search that three reviewers can each answer differently.
 //! This test converts it into a machine-checked invariant: a raw write in
@@ -32,11 +34,19 @@
 //! `mod tests;`, or a test-only `fn` — up to its own closing brace or `;` (test code
 //! legitimately writes fixtures with `std::fs::write`). It therefore does NOT catch:
 //!
-//! - `OpenOptions::new(…).write(true)` without `.create_new(` — a hand-opened `File` that
-//!   may already exist — followed by `write_all`. No such site exists in this crate
-//!   today. Needling `OpenOptions::new(` was rejected deliberately: it would fire on
-//!   read-only opens too, and an allow-list full of read-only entries is an allow-list
-//!   nobody reads.
+//! - A file a hand-built `OpenOptions` (or `File::options()`) opens to write without
+//!   `.create_new(` — with `.write(true)`, `.create(true)`, `.truncate(true)` or
+//!   `.append(true)`, a file that may already exist — and then writes. Needling
+//!   `OpenOptions::new(` was rejected deliberately: it would fire on read-only opens too,
+//!   and an allow-list full of read-only entries is an allow-list nobody reads.
+//! - A symlink made with `symlink(` (`std::os::unix::fs::symlink`), or on Windows with
+//!   `symlink_file(` or `symlink_dir(`: the bare name is part of `is_symlink(`, which the
+//!   crate calls to read a file's type, so a needle on it fires on reads.
+//! - Any other call that writes, links or removes a file and is no needle — rustix's
+//!   path-based `open` with `OFlags::CREATE`, `mkdir`, `link`, `unlink` or `chmod`, or
+//!   another of tempfile's constructors (`NamedTempFile::new`, `Builder::tempfile`) or its
+//!   `keep`. The needles are the calls a raw write in this crate has used or a review has
+//!   named; a new kind of call needs a needle of its own when it is first used.
 //! - A write reached through an alias (`use std::fs::write as w;`) or a helper in another
 //!   crate.
 //! - Production code after a `#[cfg(test)]` on an item with neither a body nor a `;` of
@@ -60,10 +70,16 @@ use std::path::{Path, PathBuf};
 /// `renameat(` relative to a descriptor, `renameat_with(` with flags; `fs::linkat(` gives
 /// a file a second name relative to a descriptor, and `unlinkat(` removes one;
 /// `remove_file(` — `std::fs::remove_file(` and an imported `fs::remove_file(` alike —
-/// removes a file by path, through any symlink on the way. `create_dir(`
+/// removes a file by path, through any symlink on the way; `fs::copy(` writes a file by
+/// path, `hard_link(` gives one a second name by path, and `remove_dir(` and
+/// `remove_dir_all(` remove a directory by path, the second with everything below it;
+/// tempfile's `tempfile_in(` creates a temporary file, which `.persist(` moves over a
+/// file by path and `persist_noclobber(` moves to a name no file has. `create_dir(`
 /// is not part of `create_dir_all(`, nor `fs::rename(` of `fs::renameat(`, nor `renameat(`
 /// of `renameat_with(`, nor `fs::linkat(` of `fs::unlinkat(` — which is why the link's
-/// needle is the qualified spelling — so each call is counted once.
+/// needle is the qualified spelling — nor `remove_dir(` of `remove_dir_all(`, nor
+/// `.persist(` of `.persist_noclobber(`, nor `hard_link(` of the primitive's
+/// `no_hard_links(`, so each call is counted once.
 const NEEDLES: &[&str] = &[
     "fs::write(",
     "File::create(",
@@ -79,6 +95,13 @@ const NEEDLES: &[&str] = &[
     "fs::linkat(",
     "unlinkat(",
     "remove_file(",
+    "fs::copy(",
+    "hard_link(",
+    "remove_dir(",
+    "remove_dir_all(",
+    "tempfile_in(",
+    ".persist(",
+    "persist_noclobber(",
 ];
 
 /// Production sites that may keep a raw write: `(file basename, needle, max hits, why)`.
@@ -187,6 +210,27 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
         "`remove_proven`'s Windows arm: a file proven, removed by path once each directory \
          below the anchor is checked not to be a link — the residual SECURITY.md documents \
          (#160)",
+    ),
+    (
+        "write.rs",
+        "tempfile_in(",
+        1,
+        "the primitive's Windows arm: the temporary file, created new beside the target in \
+         the directory the walk checked (#160)",
+    ),
+    (
+        "write.rs",
+        ".persist(",
+        1,
+        "the primitive's Windows arm: the temporary file moved over the target by path, \
+         once the target is checked, when the commit may replace it (#160)",
+    ),
+    (
+        "write.rs",
+        "persist_noclobber(",
+        1,
+        "a new file's commit on Windows: the temporary file moved onto the target by path \
+         without replacing, which fails on a file there (#160)",
     ),
 ];
 
@@ -375,9 +419,25 @@ fn the_guard_flags_a_planted_raw_write() {
         "fn f(d: BorrowedFd, a: &OsStr) { let _ = rustix::fs::unlinkat(d, a, AtFlags::empty()); }",
         "fn f(p: &Path) { let _ = std::fs::remove_file(p); }",
         "fn f(p: &Path) { let _ = fs::remove_file(p); }",
+        // A copy, a second name and a directory removed, by path; a temporary file made
+        // and moved into place with the tempfile crate — each counted once.
+        "fn f(a: &Path, b: &Path) { let _ = std::fs::copy(a, b); }",
+        "fn f(a: &Path, b: &Path) { let _ = std::fs::hard_link(a, b); }",
+        "fn f(p: &Path) { let _ = std::fs::remove_dir(p); }",
+        "fn f(p: &Path) { let _ = std::fs::remove_dir_all(p); }",
+        "fn f(d: &Path) { let _ = tempfile::Builder::new().tempfile_in(d); }",
+        "fn f(d: &Path) { let _ = tempfile::tempfile_in(d); }",
+        "fn f(t: NamedTempFile, p: &Path) { let _ = t.persist(p); }",
+        "fn f(t: NamedTempFile, p: &Path) { let _ = t.persist_noclobber(p); }",
     ] {
         assert_eq!(scan_violation_count(planted), 1, "must be flagged: {planted}");
     }
+    // The primitive's own test for a filesystem without hard links makes none.
+    assert_eq!(
+        scan_violation_count("fn f(e: Errno) -> bool { no_hard_links(e) }"),
+        0,
+        "`no_hard_links(` is not `hard_link(`"
+    );
     // A mode set through the file's own descriptor is not a path-based call.
     assert_eq!(
         scan_violation_count(
