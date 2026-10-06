@@ -758,29 +758,25 @@ fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
 const PAUSE: &str = "MDS_TEST_PAUSE_BEFORE_REPLACE";
 
 /// A source a rewrite changes, as written and as rewritten.
-#[cfg(unix)]
 struct Source {
     written: &'static str,
     rewritten: &'static str,
 }
 
 /// What `mds fmt` rewrites, and how.
-#[cfg(unix)]
 const UNFORMATTED: Source = Source {
     written: "Alpha\r\n",
     rewritten: "Alpha\n",
 };
 
 /// What `mds lint --fix` rewrites, and how.
-#[cfg(unix)]
 const UNFIXED: Source = Source {
     written: "@if \"x\" == \"y\":\nhidden\n@end\nAlpha\n",
     rewritten: "Alpha\n",
 };
 
 /// Each rewrite of `src/a.mds`: `mds fmt` and `mds lint --fix`, given the file and given
-/// its directory.
-#[cfg(unix)]
+/// its directory. A path in them is written with `/`.
 const REWRITES: [(&[&str], &Source); 4] = [
     (&["fmt", "src/a.mds"], &UNFORMATTED),
     (&["fmt", "src"], &UNFORMATTED),
@@ -838,7 +834,6 @@ fn rewrite_paused(root: &Path, args: &[&str], meanwhile: impl FnOnce()) -> (Opti
 }
 
 /// The refusal of a rewrite whose file changed after it was read, the file as typed.
-#[cfg(unix)]
 fn changed(file: &str) -> String {
     format!(
         "\"{}\" changed since it was read; not written",
@@ -850,11 +845,18 @@ fn changed(file: &str) -> String {
 /// and `mds lint --fix`, given the file or its directory, refuse (`mds::io`, exit 2),
 /// the edit survives, and no temporary file is left (#160). Control: with no edit in
 /// that window, the same run rewrites the file.
-#[cfg(unix)]
+///
+/// Runs on every platform: on Windows the check is the stamp a rewrite takes by path —
+/// the file's size and times — and each edit here changes the size. Each path argument is
+/// typed in the platform's separator, so the file argument and the directory's entry are
+/// both named as [`changed`] names them.
 #[test]
 fn a_rewrite_refuses_a_file_edited_after_it_was_read() {
     const EDIT: &str = "Edited by hand while the rewrite ran\n";
     for (args, source) in REWRITES {
+        let typed: Vec<String> = args.iter().map(|arg| native(arg)).collect();
+        let typed: Vec<&str> = typed.iter().map(String::as_str).collect();
+        let args = typed.as_slice();
         let dir = scratch();
         let root = dir.path();
         let file = put(root, "src/a.mds", source.written);

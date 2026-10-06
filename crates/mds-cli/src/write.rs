@@ -3713,7 +3713,9 @@ mod tests {
     ///
     /// Each edit changes the file's size: a filesystem whose clock is coarser than the
     /// time between two writes can give an edit of the same size the same times.
-    #[cfg(unix)]
+    ///
+    /// Runs on every platform, so the Windows stamp — size and times, by path — is held to
+    /// the same rule as the unix one; only the symlink arm waits on [`make_symlink`].
     #[test]
     fn a_rewrite_replaces_only_the_file_as_it_was_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -3751,15 +3753,16 @@ mod tests {
 
         std::fs::remove_file(&file).unwrap();
         assert_eq!(refused("EDITED"), changed, "gone");
-        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &file).unwrap();
-        assert_eq!(
-            refused("EDITED"),
-            format!(
-                "cannot write {}: {SYMLINK_REFUSAL}",
-                safe_path(&target.shown)
-            ),
-            "a symlink in its place"
-        );
+        if make_symlink(&dir.path().join("elsewhere"), &file) {
+            assert_eq!(
+                refused("EDITED"),
+                format!(
+                    "cannot write {}: {SYMLINK_REFUSAL}",
+                    safe_path(&target.shown)
+                ),
+                "a symlink in its place"
+            );
+        }
     }
 
     // ── A new file, never over another ───────────────────────────────────────────
