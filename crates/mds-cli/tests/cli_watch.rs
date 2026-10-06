@@ -1427,6 +1427,57 @@ fn watch_dir_mode_compiles_a_source_created_with_a_vars_change() {
     drop(child);
 }
 
+/// #380: a directory batch the `--vars` file cannot be read for is reported, and what it
+/// carried is rebuilt with the next batch — so a source created while the file is broken
+/// is compiled by the edit that fixes it, a batch that carries only the vars change, and
+/// not left unbuilt until it is edited again.
+#[test]
+fn watch_dir_mode_compiles_a_source_created_while_the_vars_file_is_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.mds"), "A {{v}}\n").unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let out = dir.path().join("out");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .arg("--vars")
+            .arg(&vars)
+            // Each edit below in a window of its own; no idle tick, whose first full walk
+            // would find the new source whatever the batches did.
+            .args(["--debounce", "100", "--poll-interval", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+        "a.md is written at startup"
+    );
+
+    write_atomic(&vars, r#"{"v": "#);
+    wait_for_tap_count(&tap, "mds::invalid_vars", 1, TIMEOUT);
+    std::fs::write(root.join("new.mds"), "New {{v}}\n").unwrap();
+    wait_for_tap_count(&tap, "mds::invalid_vars", 2, TIMEOUT);
+    write_atomic(&vars, r#"{"v": "two"}"#);
+
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "A two", TIMEOUT),
+        "positive control: the vars fix recompiles the known source"
+    );
+    assert!(
+        wait_for_file_contains(&out.join("new.md"), "New two", TIMEOUT),
+        "the source created while the vars file was broken is compiled; new.md: {:?}",
+        std::fs::read_to_string(out.join("new.md")).ok()
+    );
+
+    drop(child);
+}
+
 // ── AC-A5: Quiet mode keeps compile errors visible ────────────────────────
 
 /// Under `-q`, compile errors must still appear on stderr; the watcher stays alive.

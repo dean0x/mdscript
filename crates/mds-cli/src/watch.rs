@@ -3650,8 +3650,9 @@ struct DirWatchState {
     last_mtimes: StampMap,
     /// The rebuild held while a watched file is empty (#380).
     hold: EmptyHold,
-    /// What the batches held back carried, rebuilt with the batch that ends the hold
-    /// (#380).
+    /// What the batches held back carried, rebuilt with the batch that ends the hold — and
+    /// what a batch the `--vars` file could not be read for carried, rebuilt with the next
+    /// batch (#380).
     held: HeldBatch,
 }
 
@@ -3660,6 +3661,10 @@ struct DirWatchState {
 /// whole batch back — a source that imports the emptied file, or reads the emptied vars
 /// file, would compile against nothing — and the batch that ends the hold rebuilds what
 /// they named with its own, so no change made during the hold waits for a later one.
+///
+/// A batch the `--vars` file cannot be read for is kept here too, with no hold running,
+/// and the next batch rebuilds what it named — the one that fixes the file compiles a
+/// source created meanwhile, which no other record names.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HeldBatch {
     /// The paths of the batches held back.
@@ -3675,8 +3680,9 @@ impl HeldBatch {
         self.vars_changed |= vars_changed;
     }
 
-    /// The batch that ends the hold: `batch` and every batch held back, with whether any
-    /// of them changed the vars file. Nothing stays held.
+    /// The batch that ends the hold, or the next after a batch the vars file could not be
+    /// read for: `batch` and every batch kept, with whether any of them changed the vars
+    /// file. Nothing stays held.
     fn release(
         &mut self,
         batch: &BTreeSet<PathBuf>,
@@ -4382,7 +4388,9 @@ fn liveness_probe_dir(
 /// a single edit can generate more than one raw FS event, each reaching the event handler
 /// separately, and the idle tick can observe the same edit again, so the warning is
 /// emitted after `process_dir_batch` reports whether anything actually changed rather
-/// than unconditionally — one logical edit warns once.
+/// than unconditionally — one logical edit warns once. A batch the vars file cannot be
+/// read for is kept ([`HeldBatch`]) and rebuilt with the next one, so a source created
+/// while the file cannot be read is compiled by the batch that reads it again (#380).
 fn rebuild_dir_batch(
     ctx: &DirWatchCtx,
     batch: &BTreeSet<PathBuf>,
@@ -4417,6 +4425,10 @@ fn rebuild_dir_batch(
     }) {
         Ok(v) => v,
         Err(e) => {
+            // Keep the batch, as a held one is kept, for the next batch to rebuild (#380):
+            // a source created while the vars file cannot be read is in no other record,
+            // so the batch that reads the file again would leave it unbuilt.
+            state.held.hold(&batch, vars_changed);
             // Re-baseline so the idle-tick content backstop does not report the same
             // change again and turn one unreadable vars file into per-tick error spam.
             settle(SettleInto::Dir(state), Some(e), Settle::Rebaseline);
@@ -5230,7 +5242,8 @@ fn names_a_source(root: &Path, path: &Path) -> bool {
 
 /// Full recompile of every source triggered by a vars-file change: the known ones, and
 /// those `changed` names that no walk has found ([`names_a_source`]) — one created in the
-/// same batch, or in a batch held with it, which is then known as the walk's are (#380).
+/// same batch, in a batch held with it, or in one the vars file could not be read for,
+/// which is then known as the walk's are (#380).
 /// A dependency `changed` names is recompiled through its importers, which all are.
 ///
 /// Recomputes the entire forward-deps graph, external-dep-dirs, and errored set
@@ -8192,6 +8205,130 @@ mod tests {
             read("x.md").is_some_and(|text| text.contains("X two")),
             "the file found emptied is rebuilt with it; out/x.md: {:?}",
             read("x.md")
+        );
+    }
+
+    /// #380: a directory batch the `--vars` file cannot be read for is reported, and what
+    /// it carried is rebuilt with the next batch: a source created while the file is
+    /// broken is compiled by the batch that reads it again — which carries only the vars
+    /// change — and is then known; a source deleted meanwhile is retired by it.
+    #[test]
+    fn a_batch_the_vars_file_could_not_be_read_for_is_rebuilt_with_the_next() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_vars_dir, vars_dir) = canonical_tempdir();
+        let vars = vars_dir.join("vars.json");
+        let known = root.join("known.mds");
+        let gone = root.join("gone.mds");
+        let created = root.join("created.mds");
+        std::fs::write(&known, "Known {{v}}\n").unwrap();
+        std::fs::write(&gone, "Gone {{v}}\n").unwrap();
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let ctx = DirWatchCtx {
+            vars_path: Some(vars.clone()),
+            vars_path_typed: Some(vars.clone()),
+            ..dir_ctx(&root, &out)
+        };
+        let mut state = empty_dir_state();
+        state.vars_file = Some(vars.clone());
+        state.known_files.extend([known.clone(), gone.clone()]);
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).ok();
+        assert!(
+            read("gone.md").is_some_and(|text| text.contains("Gone one")),
+            "control: the session wrote out/gone.md; {:?}",
+            read("gone.md")
+        );
+
+        // The vars file broken: neither the batch that broke it nor the next one can read
+        // it — the next one creates a source and deletes another.
+        std::fs::write(&vars, r#"{"v": "#).unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        std::fs::write(&created, "Created {{v}}\n").unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let batch = BTreeSet::from([created.clone(), gone.clone()]);
+        rebuild_dir_batch(&ctx, &batch, false, &mut state, None);
+        assert_eq!(
+            read("created.md"),
+            None,
+            "control: nothing is compiled while the vars file cannot be read"
+        );
+
+        // The vars file fixed: the batch that reads it again carries only that change.
+        std::fs::write(&vars, r#"{"v": "two"}"#).unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+
+        assert!(
+            read("known.md").is_some_and(|text| text.contains("Known two")),
+            "positive control: the vars fix recompiles the known source; out/known.md: {:?}",
+            read("known.md")
+        );
+        assert!(
+            read("created.md").is_some_and(|text| text.contains("Created two")),
+            "the source created while the vars file was broken is compiled; \
+             out/created.md: {:?}",
+            read("created.md")
+        );
+        assert!(
+            state.known_files.contains(&created) && !state.known_files.contains(&gone),
+            "the created source is known, the deleted one not; known: {:?}",
+            state.known_files
+        );
+        assert_eq!(
+            read("gone.md"),
+            None,
+            "the source deleted while the vars file was broken is retired"
+        );
+        assert_eq!(state.held, HeldBatch::default(), "nothing stays held");
+    }
+
+    /// #380: a batch the `--vars` file could not be read for keeps that it changed the
+    /// file, so the next batch rebuilds as a vars change even when its own events name a
+    /// source only — the fixing save's event lost — and every known source is compiled
+    /// against the file as it then reads, not only the source edited.
+    #[test]
+    fn a_vars_change_kept_for_the_next_batch_recompiles_every_known_source() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_vars_dir, vars_dir) = canonical_tempdir();
+        let vars = vars_dir.join("vars.json");
+        let (a, b) = (root.join("a.mds"), root.join("b.mds"));
+        std::fs::write(&a, "A {{v}}\n").unwrap();
+        std::fs::write(&b, "B {{v}}\n").unwrap();
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let ctx = DirWatchCtx {
+            vars_path: Some(vars.clone()),
+            vars_path_typed: Some(vars.clone()),
+            ..dir_ctx(&root, &out)
+        };
+        let mut state = empty_dir_state();
+        state.vars_file = Some(vars.clone());
+        state.known_files.extend([a.clone(), b.clone()]);
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).ok();
+        assert!(
+            read("b.md").is_some_and(|text| text.contains("B one")),
+            "control: out/b.md is compiled against the first vars; {:?}",
+            read("b.md")
+        );
+
+        std::fs::write(&vars, r#"{"v": "#).unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        // The vars file fixed, that event lost; a source edited.
+        std::fs::write(&vars, r#"{"v": "two"}"#).unwrap();
+        std::fs::write(&a, "A again {{v}}\n").unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+
+        assert!(
+            read("a.md").is_some_and(|text| text.contains("A again two")),
+            "positive control: the edited source is compiled; out/a.md: {:?}",
+            read("a.md")
+        );
+        assert!(
+            read("b.md").is_some_and(|text| text.contains("B two")),
+            "the vars change kept from the batch that could not read it recompiles the \
+             other known source; out/b.md: {:?}",
+            read("b.md")
         );
     }
 
