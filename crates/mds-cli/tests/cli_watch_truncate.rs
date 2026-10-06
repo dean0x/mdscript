@@ -499,8 +499,9 @@ fn held_truncate_after_the_look(case: &DependencyCase<'_>) {
 
 /// Save `saved` as it is, truncate the dependency while the rebuild that save starts is
 /// stopped at the debug build's `pause` — the variable of the pause after a rebuild's look,
-/// or of the one after a directory batch's split — then write it: no diagnostic, no
-/// `Recompiled`, the output untouched, and one rebuild follows the write.
+/// of the one after a directory batch's split, or of the one after a file rebuild's reads —
+/// then write it: no diagnostic, no `Recompiled`, the output untouched, and one rebuild
+/// follows the write.
 #[cfg(debug_assertions)]
 fn held_truncate_in_a_pause(case: &DependencyCase<'_>, saved: &Path, pause: &str) {
     let what = case.what;
@@ -658,6 +659,68 @@ fn dir_mode_an_imported_partial_truncated_after_the_look_triggers_nothing_until_
         before: "Partial one",
         after: "Partial two",
     });
+}
+
+// ── A file truncated after its file rebuild read it ─────────────────────────
+
+/// The entry truncated while its rebuild finishes — after the compile read it whole and no
+/// file was found emptied, before the rebuild took its baseline — holds the rebuilds its own
+/// events start, as a look that found it empty does: the rebuild must not take the empty
+/// file for the one it read, or those rebuilds publish it empty. The debug build's pause
+/// after a file rebuild's reads (`MDS_TEST_PAUSE_AFTER_READ`) makes the window certain;
+/// outside a test, a truncating save that lands as an earlier event's rebuild finishes
+/// opens it.
+#[cfg(debug_assertions)]
+#[test]
+fn the_entry_truncated_after_its_rebuild_read_it_never_publishes_an_empty_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "Entry one\n").unwrap();
+
+    held_truncate_in_a_pause(
+        &DependencyCase {
+            what: "the entry, truncated after its rebuild read it",
+            watched: &entry,
+            source: &entry,
+            output: &dir.path().join("t.md"),
+            dependency: &entry,
+            rewrite: "Entry two\n",
+            extra: &[],
+            before: "Entry one",
+            after: "Entry two",
+        },
+        &entry,
+        "MDS_TEST_PAUSE_AFTER_READ",
+    );
+}
+
+/// The `--vars` file truncated after a file rebuild read it whole, before the rebuild took
+/// its baseline, holds the rebuilds its own events start: they report nothing while it is
+/// empty (`MDS_TEST_PAUSE_AFTER_READ`, as above).
+#[cfg(debug_assertions)]
+#[test]
+fn the_vars_file_truncated_after_its_rebuild_read_it_triggers_nothing_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "Vars {{v}}\n").unwrap();
+
+    held_truncate_in_a_pause(
+        &DependencyCase {
+            what: "the vars file, truncated after its rebuild read it",
+            watched: &entry,
+            source: &entry,
+            output: &dir.path().join("t.md"),
+            dependency: &vars,
+            rewrite: r#"{"v": "two"}"#,
+            extra: &["--vars", vars.to_str().unwrap()],
+            before: "Vars one",
+            after: "Vars two",
+        },
+        &entry,
+        "MDS_TEST_PAUSE_AFTER_READ",
+    );
 }
 
 // ── A file truncated while a directory batch runs ───────────────────────────

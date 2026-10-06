@@ -1731,15 +1731,17 @@ fn the_pause_before_a_replace_is_compiled_only_into_debug_builds() {
     }
 }
 
-/// The pause between a directory watch batch's split and its compile (#160) and the pause
-/// between a watch rebuild's look and its reads (#380) compile only into a debug build, as
-/// the pause before a replace does: every mention of `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` and
-/// of `MDS_TEST_PAUSE_AFTER_LOOK` sits inside `mod batch_pause_trigger`, whose attributes
-/// hold `#[cfg(debug_assertions)]`, and `pause_after_batch_split` and `pause_after_look`
-/// each have a release build's stub that does nothing.
+/// The pause between a directory watch batch's split and its compile (#160), the pause
+/// between a watch rebuild's look and its reads (#380) and the pause between a file
+/// rebuild's reads and its baseline (#380) compile only into a debug build, as the pause
+/// before a replace does: every mention of `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, of
+/// `MDS_TEST_PAUSE_AFTER_LOOK` and of `MDS_TEST_PAUSE_AFTER_READ` sits inside
+/// `mod batch_pause_trigger`, whose attributes hold `#[cfg(debug_assertions)]`, and
+/// `pause_after_batch_split`, `pause_after_look` and `pause_after_read` each have a release
+/// build's stub that does nothing.
 ///
-/// Controls: the module without its `cfg`, a mention of either variable outside it, a
-/// release stub that does something, and no release stub for either pause are each
+/// Controls: the module without its `cfg`, a mention of any of the variables outside it, a
+/// release stub that does something, and no release stub for any of the pauses are each
 /// reported.
 #[test]
 fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
@@ -1748,8 +1750,8 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     let found = gate_findings(&sources, &BATCH_PAUSE_TRIGGER);
     assert!(
         found.is_empty(),
-        "the pauses after a batch's split and after a rebuild's look must be compiled only \
-         into debug builds:\n{}",
+        "the pauses after a batch's split, after a rebuild's look and after a file \
+         rebuild's reads must be compiled only into debug builds:\n{}",
         found.join("\n")
     );
 
@@ -1766,6 +1768,7 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     };
     let stub = "fn pause_after_batch_split() {}";
     let look_stub = "fn pause_after_look() {}";
+    let read_stub = "fn pause_after_read() {}";
     for (planted, what) in [
         (
             with(
@@ -1796,6 +1799,15 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
             "the look pause's variable outside its module",
         ),
         (with(look_stub, ""), "a look pause without a release stub"),
+        (
+            with(
+                read_stub,
+                "fn pause_after_read() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_PAUSE_AFTER_READ\");\n}",
+            ),
+            "the read pause's variable outside its module",
+        ),
+        (with(read_stub, ""), "a read pause without a release stub"),
     ] {
         assert!(
             !gate_findings(&planted, &BATCH_PAUSE_TRIGGER).is_empty(),
@@ -2813,15 +2825,21 @@ const PAUSE_TRIGGER: DebugGate = DebugGate {
 };
 
 /// The pause between a directory watch batch's split and its compile (#160),
-/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, and the pause between a watch rebuild's look and its
-/// reads (#380), `MDS_TEST_PAUSE_AFTER_LOOK`, both in `mod batch_pause_trigger`.
+/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, the pause between a watch rebuild's look and its
+/// reads (#380), `MDS_TEST_PAUSE_AFTER_LOOK`, and the pause between a file rebuild's reads
+/// and its baseline (#380), `MDS_TEST_PAUSE_AFTER_READ`, all in `mod batch_pause_trigger`.
 const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
     module: "batch_pause_trigger",
     needles: &[
         ("MDS_TEST_PAUSE_AFTER_BATCH_SPLIT", true),
         ("MDS_TEST_PAUSE_AFTER_LOOK", true),
+        ("MDS_TEST_PAUSE_AFTER_READ", true),
     ],
-    fns: &["pause_after_batch_split", "pause_after_look"],
+    fns: &[
+        "pause_after_batch_split",
+        "pause_after_look",
+        "pause_after_read",
+    ],
 };
 
 /// The readiness marker `mds watch` creates once it is watching (#390): `MDS_TEST_READY`,

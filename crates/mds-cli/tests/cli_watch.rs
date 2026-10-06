@@ -4445,6 +4445,100 @@ fn watch_dir_mode_cross_root_edit_during_startup_window_is_not_lost() {
     drop(child);
 }
 
+/// Directory mode: the `--vars` file truncated in the startup window — after the startup
+/// read it, before the session took its first baseline — holds the rebuilds its own events
+/// start, as a truncation once the session is live does: nothing is reported while it is
+/// empty, and the content written is compiled (#380). The baseline keeps the stamp taken
+/// before the startup read the file; one taken after the truncation would see an empty file
+/// as the one the startup read, so no rebuild would find it emptied, and each event until
+/// the write would report the empty file as invalid.
+///
+/// Sensitivity, like the #317 tests above, comes from the `startup-race-probe` feature: it
+/// holds the startup for 200ms once its outputs are published, before the baseline is
+/// taken, which is what lets a truncation made as soon as the output appears land in that
+/// window. Without it the window is a few statements wide, and the truncation lands after
+/// it, where the hold is the ordinary one.
+#[test]
+fn watch_dir_mode_vars_truncated_during_startup_is_held_until_written() {
+    use std::io::Write as _;
+
+    /// How long the vars file is held truncated before its content is written: half the
+    /// watcher's one-second deadline for an emptied file, as a slow save.
+    const HOLD: Duration = Duration::from_millis(500);
+    /// The watcher's deadline for an emptied file, after which it compiles it as it is.
+    const DEADLINE: Duration = Duration::from_secs(1);
+
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&root).unwrap();
+    let vars = base.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let src = root.join("t.mds");
+    std::fs::write(&src, "Vars {{v}}\n").unwrap();
+    let out = out_dir.join("t.md");
+
+    let (mut child, tap) = spawn_unsynchronized(
+        mds_bin()
+            .args([
+                "watch",
+                root.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--vars",
+                vars.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+            ])
+            .stdout(Stdio::null()),
+    );
+    // The published startup output IS the start of the window.
+    assert!(
+        wait_for_file_contains_tight(&out, "Vars one", STARTUP_WINDOW_TIMEOUT),
+        "startup compile should publish 'Vars one'"
+    );
+
+    // Truncate now — inside the window under the probe — and write through the same
+    // handle later, as a slow save does.
+    let started = Instant::now();
+    let mut held = std::fs::File::create(&vars).unwrap();
+    std::thread::sleep(HOLD);
+    held.write_all(br#"{"v": "two"}"#).unwrap();
+    let held_for = started.elapsed();
+    drop(held);
+    assert!(
+        wait_for_file_contains(&out, "Vars two", STARTUP_WINDOW_TIMEOUT),
+        "the content written to the vars file is compiled; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+    assert!(
+        count_occurrences(&stderr, "mds::") > 0,
+        "positive control: the order marker's diagnostic is counted; stderr: {stderr}"
+    );
+    if held_for >= DEADLINE {
+        eprintln!(
+            "the vars file was held for {held_for:?}, past the {DEADLINE:?} deadline (the \
+             test thread was descheduled); the watcher may report it, so nothing is checked"
+        );
+        return;
+    }
+    // Everything before the order marker's diagnostic, whose code line opens it.
+    let head = &stderr[..stderr.find(ORDER_MARKER_LINE).unwrap()];
+    let before = head.rfind("mds::").map_or(head, |code| &head[..code]);
+    assert_eq!(
+        count_occurrences(before, "mds::"),
+        0,
+        "the vars file truncated during startup is held, not reported as invalid, until \
+         it is written; stderr: {stderr}"
+    );
+}
+
 /// Single-file mode: the same end-to-end property for a dependency outside the entry's
 /// directory — an edit in the startup window must still reach the output.
 ///

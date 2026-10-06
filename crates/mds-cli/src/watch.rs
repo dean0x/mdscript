@@ -699,12 +699,45 @@ fn emptied_paths<'a>(
         .collect()
 }
 
+/// The files `look` — the stamps a rebuild's look took — finds emptied since `baseline`
+/// was taken ([`went_empty`]): the look's stamps are compared, nothing is `stat`ed again.
+fn emptied_in<'a>(look: &'a StampMap, baseline: &'a StampMap) -> impl Iterator<Item = &'a PathBuf> {
+    look.iter()
+        .filter(move |(path, now)| went_empty(baseline.get(*path), now))
+        .map(|(path, _)| path)
+}
+
+/// The baseline over `domain` from `taken`, the stamps taken before the rebuild read
+/// anything — its look's, laid over the baseline before it (#380). Each file keeps the
+/// stamp taken; only one none was taken for — a file the rebuild's compile discovered — is
+/// stamped now, and a file outside `domain` is dropped. A file changed since its stamp was
+/// taken — truncated after a compile read it whole, or while a rebuild was not reading it —
+/// therefore still differs from the baseline, and the next look sees it: a baseline never
+/// takes a file as it is after the read it describes.
+fn baseline_over<'a>(
+    mut taken: StampMap,
+    domain: impl IntoIterator<Item = &'a PathBuf>,
+) -> StampMap {
+    let mut baseline = StampMap::with_capacity(taken.len());
+    for path in domain {
+        if baseline.contains_key(path) {
+            continue;
+        }
+        let (path, stamp) = taken
+            .remove_entry(path)
+            .unwrap_or_else(|| (path.clone(), stamp_now(path)));
+        baseline.insert(path, stamp);
+    }
+    baseline
+}
+
 /// The baseline a directory batch leaves (#380): `fresh`, except that a file gone empty
-/// since `before` keeps the stamp that saw its bytes, so the next look finds it emptied
-/// still — a file truncated while the batch ran, after its look, whether the batch had read
-/// it already or did not read it, and one whose source the batch held. A file `before` never
-/// saw takes its fresh stamp. A file the hold's deadline compiles as it is was taken into
-/// `before` empty when the batch began ([`rebuild_dir_batch`]), so it is not emptied here.
+/// since `before` — the batch's baseline, its look's stamps — keeps the stamp that saw its
+/// bytes, so the next look finds it emptied still: a file truncated while the batch ran,
+/// after its look, whether the batch had read it already or did not read it, and one whose
+/// source the batch held. A file `before` never saw takes its fresh stamp. A file the hold's
+/// deadline compiles as it is was taken into `before` empty by the batch's look
+/// ([`rebuild_dir_batch`]), so it is not emptied here.
 fn baseline_keeping_emptied(before: &StampMap, mut fresh: StampMap) -> StampMap {
     for (path, now) in &mut fresh {
         if let Some(old) = before.get(path).filter(|old| went_empty(Some(*old), now)) {
@@ -2406,6 +2439,15 @@ struct FileWatchState {
     missing_watched_dirs: BTreeSet<PathBuf>,
 }
 
+impl FileWatchState {
+    /// Take the baseline over the files of interest again, from the stamps the rebuild's
+    /// look took ([`baseline_over`], #380).
+    fn rebaseline(&mut self) {
+        let taken = std::mem::take(&mut self.last_mtimes);
+        self.last_mtimes = baseline_over(taken, &self.foi);
+    }
+}
+
 /// Outcome returned by `handle_fs_event_file` to tell the loop what to do next.
 enum FileEventAction {
     /// Skip this message (Access event or irrelevant path) — go back to `recv_next`.
@@ -2563,7 +2605,10 @@ fn handle_fs_event_file(
 /// ([`announce_emptied_output`]). A file the `--vars` load or the compile read found
 /// emptied after that look — a truncation that began between the two — holds the rebuild
 /// the same way, whether the read then failed or not, unless the deadline ended the hold in
-/// it ([`EmptyHold::on_late_empty`]). `due` is the hold's
+/// it ([`EmptyHold::on_late_empty`]). A rebuild the look lets run takes the look's stamps
+/// as its baseline before it reads anything, and keeps them however it ends
+/// ([`baseline_over`]), so a file truncated after the compile read it whole is found
+/// emptied by the next rebuild too. `due` is the hold's
 /// deadline when that deadline runs this rebuild, which then ends the hold
 /// ([`not_before`]); `None` for an event or a tick.
 ///
@@ -2587,8 +2632,9 @@ fn rebuild_file(
 ) -> ControlFlow<StopReason> {
     ctx.working_dir.restore_if_recreated();
     // #380: a file of interest emptied holds the rebuild back — before `kept` is taken,
-    // since a rebuild held is no rebuild.
-    let emptied = any_went_empty(&state.foi, &state.last_mtimes);
+    // since a rebuild held is no rebuild. The look stamps each file of interest once.
+    let look = snapshot_state(&state.foi);
+    let emptied = emptied_in(&look, &state.last_mtimes).next().is_some();
     let verdict = state
         .hold
         .on_rebuild(emptied, not_before(Instant::now(), due));
@@ -2600,6 +2646,12 @@ fn rebuild_file(
         settle(SettleInto::File(state), None, Settle::Defer);
         return ControlFlow::Continue(());
     }
+    // The look's stamps are the rebuild's baseline from here, taken before anything is read:
+    // every later look compares with them and every settle keeps them, so a file changed
+    // after the look — one truncated after the compile read it whole included — is seen
+    // again by the next look (#380). A file the look found emptied is in it empty: the
+    // deadline compiles it as it is, and it is not held again.
+    state.last_mtimes.extend(look);
     // A debug build's test pause (#380): the rebuild found no file emptied, and has read none.
     pause_after_look();
     // What the rebuild before this one kept from being written (#160): told again unless
@@ -2701,8 +2753,12 @@ fn rebuild_file(
     // dirs removed by resync_watches are no longer in watched_dirs.
     state.armed_dirs = state.watched_dirs.clone();
     state.foi = foi;
-    // Update mtime snapshot after a compile (even if content unchanged).
-    state.last_mtimes = snapshot_state(&state.foi);
+    // A debug build's test pause (#380): the compile read every file, and none was found
+    // emptied.
+    pause_after_read();
+    // The baseline over the files of interest the compile reported, even when its output is
+    // unchanged: the stamps the look took, a file the compile discovered stamped now (#380).
+    state.rebaseline();
 
     // The compiled kind's route, re-decided by every rebuild: one whose kind changed is
     // written to that kind's output (#257) — only where nothing is, or over the file this
@@ -2871,7 +2927,9 @@ fn rebuild_file(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settle<'a> {
     /// Take the `(mtime, size)` baseline again, so the idle tick does not fire again on
-    /// files that have not changed since.
+    /// files that have not changed since — from the stamps the rebuild's look took before
+    /// it read anything, never from the files as they are once it has read them, so a file
+    /// truncated since is found emptied by the next look (#380).
     Rebaseline,
     /// The source failed, and a later change must compile it again even when the source
     /// itself has not changed. Directory mode records it as errored — re-seeded into every
@@ -2881,9 +2939,10 @@ enum Settle<'a> {
     /// baseline again, as [`Settle::Rebaseline`] does.
     MarkErrored(&'a Path),
     /// The rebuild was held back, a watched file being empty (#380): nothing ran, so there
-    /// is nothing to report and nothing to record, and the baseline is left as it was —
-    /// the next event or tick then finds the emptied file again, and the rebuild is held
-    /// again or run.
+    /// is nothing to report and nothing to record, and the baseline is left as it is — as
+    /// it was before a rebuild its look held, the look's stamps for one held by a file found
+    /// emptied after the look — so the next event or tick finds the emptied file again, and
+    /// the rebuild is held again or run.
     Defer,
 }
 
@@ -2916,10 +2975,10 @@ fn settle_reporting(
     }
     match (into, how) {
         (SettleInto::File(state), Settle::Rebaseline | Settle::MarkErrored(_)) => {
-            state.last_mtimes = snapshot_state(&state.foi);
+            state.rebaseline();
         }
         (SettleInto::Dir(state), Settle::Rebaseline) => {
-            state.last_mtimes = snapshot_state(&state.watched_set());
+            state.rebaseline();
         }
         (SettleInto::Dir(state), Settle::MarkErrored(src)) => {
             state.record_error(src);
@@ -3879,6 +3938,13 @@ impl DirWatchState {
         watched
     }
 
+    /// Take the baseline over the watched set again, from the stamps the batch's look took
+    /// ([`baseline_over`], #380).
+    fn rebaseline(&mut self) {
+        let taken = std::mem::take(&mut self.last_mtimes);
+        self.last_mtimes = baseline_over(taken, &self.watched_set());
+    }
+
     /// Remove every GRAPH record of `src` — its forward edges, its error flag and its
     /// known-files membership.
     fn forget_graph(&mut self, src: &Path) {
@@ -4453,7 +4519,10 @@ fn liveness_probe_dir(
 /// the look holds the whole batch. A file emptied while the batch runs, after its look, that
 /// no compile read empty — read whole before, or not read — stays emptied in the baseline
 /// the batch leaves ([`baseline_keeping_emptied`]), so the rebuild its own events start is
-/// held; only a file the deadline compiles as it is is taken in empty. `due` is
+/// held; only a file the deadline compiles as it is is taken in empty. The batch takes the
+/// look's stamps as its baseline before it reads anything, so one whose `--vars` load fails
+/// settles with them ([`Settle::Rebaseline`]), and a file truncated after that load read
+/// it whole is found emptied by the next rebuild. `due` is
 /// the hold's deadline when that deadline runs this rebuild, which then ends the hold
 /// ([`not_before`]); `None` for an event or a tick.
 /// The vars file is then reloaded (freshness rule), and a
@@ -4476,8 +4545,10 @@ fn rebuild_dir_batch(
 ) {
     ctx.working_dir.restore_if_recreated();
 
-    // #380: a watched file emptied holds the whole batch back, and joins it.
-    let emptied = emptied_paths(&state.watched_set(), &state.last_mtimes);
+    // #380: a watched file emptied holds the whole batch back, and joins it. The look stamps
+    // each watched file once.
+    let look = snapshot_state(&state.watched_set());
+    let emptied: BTreeSet<PathBuf> = emptied_in(&look, &state.last_mtimes).cloned().collect();
     let verdict = state
         .hold
         .on_rebuild(!emptied.is_empty(), not_before(Instant::now(), due));
@@ -4492,12 +4563,12 @@ fn rebuild_dir_batch(
         settle(SettleInto::Dir(state), None, Settle::Defer);
         return;
     }
-    // The hold's deadline runs this batch if the look found a file emptied: it compiles the
-    // file as it is, and the baseline takes it so — the batch's own end keeps the stamp
-    // that saw an emptied file's bytes, and a file left empty must not be held again.
-    for path in &emptied {
-        state.last_mtimes.insert(path.clone(), stamp_now(path));
-    }
+    // The look's stamps are the batch's baseline from here, taken before anything is read:
+    // every later look compares with them, a `--vars` load that fails keeps them, and the
+    // batch's end keeps the stamp of a file emptied since (#380). A file the look found
+    // emptied — the hold's deadline runs this batch — is in it empty: the batch compiles it
+    // as it is, and it is not held again.
+    state.last_mtimes.extend(look);
     let (batch, vars_changed) = state.held.release(&batch, vars_changed);
     // A debug build's test pause (#380): the batch found no file emptied, and has read none.
     pause_after_look();
@@ -4758,8 +4829,9 @@ mod dir_startup {
         armed: Armed,
         /// The dependency graph, what was written and where, and the sources errored.
         state: DirWatchState,
-        /// Every source's `(mtime, size)`, taken before the first of them was read, and each
-        /// dependency's, taken as the compile that reported it returned.
+        /// Every source's `(mtime, size)` and the `--vars` file's, taken before the first of
+        /// them was read, and each dependency's, taken as the compile that reported it
+        /// returned.
         pre_mtimes: StampMap,
     }
 
@@ -4953,6 +5025,34 @@ mod dir_startup {
 
         // Startup compile: compile all .mds files found under root.
         let all_files = collect_mds_files(root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
+
+        // Capture the content baseline BEFORE the first read of any watched file — the
+        // `--vars` file, which is loaded first, and every source — mirroring single-file
+        // mode (#321). What makes the backstop sound is that this snapshot is strictly
+        // older than the reads whose results were published: an edit that lands anywhere
+        // after this point therefore registers as a difference on the first idle tick,
+        // even when no filesystem event announced it, and a truncation of a file the
+        // startup read whole is found emptied by the first rebuild (#380).
+        //
+        // Taking it afterwards instead would be worse than useless — it would record the
+        // *post*-edit state as the baseline, so the watcher would believe an output
+        // compiled from the pre-edit content was up to date, and hold that belief forever.
+        //
+        // Keys go through `graph_key`, exactly as `known_files` below does. `tracked_set`
+        // is built from those canonical keys, so a raw key here would never match one of
+        // them — every source would read as "not in the baseline", i.e. changed, and the
+        // first idle tick would recompile the whole tree. `collect_mds_files` walks a root
+        // that is already canonical, but a symlinked subdirectory inside it still resolves
+        // to something else, and the rest of this function does not assume otherwise. The
+        // `--vars` file's key is its canonical path, as `watched_set` holds it.
+        let mut pre_mtimes = snapshot_state(
+            &all_files
+                .iter()
+                .map(|p| graph_key(p))
+                .chain(vars_path.iter().cloned())
+                .collect::<HashSet<_>>(),
+        );
+
         let resolved = build_runtime_vars(RuntimeVarArgs {
             vars: vars_path_typed.clone(),
             set_vars: static_set_vars.clone(),
@@ -4978,29 +5078,6 @@ mod dir_startup {
             hold: EmptyHold::Off,
             held: HeldBatch::default(),
         };
-
-        // Capture the content baseline BEFORE the first read of any source, mirroring
-        // single-file mode (#321). What makes the backstop sound is that this snapshot is
-        // strictly older than the reads whose results were published: an edit that lands
-        // anywhere after this point therefore registers as a difference on the first idle
-        // tick, even when no filesystem event announced it.
-        //
-        // Taking it afterwards instead would be worse than useless — it would record the
-        // *post*-edit state as the baseline, so the watcher would believe an output
-        // compiled from the pre-edit content was up to date, and hold that belief forever.
-        //
-        // Keys go through `graph_key`, exactly as `known_files` below does. `tracked_set`
-        // is built from those canonical keys, so a raw key here would never match one of
-        // them — every source would read as "not in the baseline", i.e. changed, and the
-        // first idle tick would recompile the whole tree. `collect_mds_files` walks a root
-        // that is already canonical, but a symlinked subdirectory inside it still resolves
-        // to something else, and the rest of this function does not assume otherwise.
-        let mut pre_mtimes = snapshot_state(
-            &all_files
-                .iter()
-                .map(|p| graph_key(p))
-                .collect::<HashSet<_>>(),
-        );
 
         for source in &all_files {
             let key = graph_key(source);
@@ -5575,7 +5652,11 @@ fn process_dir_batch_incremental(
 /// (`tests/cli_watch.rs`). `MDS_TEST_PAUSE_AFTER_LOOK`: how it is made to stop a rebuild,
 /// in either mode, once it has looked for emptied files and found none, before it reads
 /// any — so that a test can truncate a file the rebuild is about to read
-/// (`tests/cli_watch_truncate.rs`, #380). A release build has none of it.
+/// (`tests/cli_watch_truncate.rs`, #380). `MDS_TEST_PAUSE_AFTER_READ`: how it is made to
+/// stop a file-mode rebuild once its compile has read every file and none was found
+/// emptied, before the rebuild takes its baseline — so that a test can truncate a file the
+/// rebuild has read whole (`tests/cli_watch_truncate.rs`, #380). A release build has none
+/// of it.
 #[cfg(debug_assertions)]
 mod batch_pause_trigger {
     use std::path::PathBuf;
@@ -5593,6 +5674,10 @@ mod batch_pause_trigger {
     /// it has stopped in the same way.
     const LOOK_VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_LOOK";
 
+    /// The variable naming the file that ends the pause after a file rebuild's reads, which
+    /// says it has stopped in the same way.
+    const READ_VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_READ";
+
     /// How long the pause waits between two looks for the file that ends it.
     const POLL: Duration = Duration::from_millis(5);
 
@@ -5607,6 +5692,11 @@ mod batch_pause_trigger {
     /// Stop here when `MDS_TEST_PAUSE_AFTER_LOOK` names a file ([`pause_on`]).
     pub(super) fn pause_after_look() {
         pause_on(LOOK_VARIABLE);
+    }
+
+    /// Stop here when `MDS_TEST_PAUSE_AFTER_READ` names a file ([`pause_on`]).
+    pub(super) fn pause_after_read() {
+        pause_on(READ_VARIABLE);
     }
 
     /// Stop here when `variable` names a file: say so by writing `<file>.paused`, then wait
@@ -5635,7 +5725,7 @@ mod batch_pause_trigger {
 }
 
 #[cfg(debug_assertions)]
-use batch_pause_trigger::{pause_after_batch_split, pause_after_look};
+use batch_pause_trigger::{pause_after_batch_split, pause_after_look, pause_after_read};
 
 /// A release build's pause between a directory batch's split and its compile: none.
 #[cfg(not(debug_assertions))]
@@ -5644,6 +5734,10 @@ fn pause_after_batch_split() {}
 /// A release build's pause between a rebuild's look and its reads: none.
 #[cfg(not(debug_assertions))]
 fn pause_after_look() {}
+
+/// A release build's pause between a file rebuild's reads and its baseline: none.
+#[cfg(not(debug_assertions))]
+fn pause_after_read() {}
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -8228,8 +8322,8 @@ mod tests {
 
     /// `Settle::Defer` — a rebuild held while a watched file is empty — reports nothing,
     /// records nothing and leaves the baseline as it was in both modes, so the next event
-    /// or tick finds the emptied file again; `Settle::Rebaseline` on the same state takes
-    /// the empty file in (positive control) (#380).
+    /// or tick finds the emptied file again; `Settle::Rebaseline` on the same state, after a
+    /// look that saw the file empty, takes the empty file in (positive control) (#380).
     #[test]
     fn settle_defer_leaves_the_baseline_and_records_nothing() {
         let (_dir, src, dep) = source_and_dependency();
@@ -8247,10 +8341,11 @@ mod tests {
             any_went_empty(&file.foi, &file.last_mtimes),
             "the next rebuild finds the dependency emptied again"
         );
+        file.last_mtimes.extend(snapshot_state(&foi));
         settle(SettleInto::File(&mut file), None, Settle::Rebaseline);
         assert!(
             !any_went_empty(&file.foi, &file.last_mtimes),
-            "positive control: a rebaseline takes the empty file in"
+            "positive control: a rebaseline after a look that saw it empty takes it in"
         );
 
         // Directory mode.
@@ -8268,10 +8363,84 @@ mod tests {
             any_went_empty(&rebuild.watched_set(), &rebuild.last_mtimes),
             "the next batch finds the dependency emptied again"
         );
+        rebuild
+            .last_mtimes
+            .extend(snapshot_state(&rebuild.watched_set()));
         settle(SettleInto::Dir(&mut rebuild), None, Settle::Rebaseline);
         assert!(
             !any_went_empty(&rebuild.watched_set(), &rebuild.last_mtimes),
-            "positive control: a rebaseline takes the empty file in"
+            "positive control: a rebaseline after a look that saw it empty takes it in"
+        );
+    }
+
+    /// #380: a rebuild that settles by taking the baseline again takes the stamps its look
+    /// took before it read anything — never the files as they are once it has read them. A
+    /// file truncated since keeps the stamp that saw its bytes, so the next look finds it
+    /// emptied: in file mode through `Settle::Rebaseline` (a `--vars` file that failed to
+    /// load) and `Settle::MarkErrored` (a failed compile), in directory mode through
+    /// `Settle::Rebaseline` (a batch whose `--vars` file failed to load). A file no look
+    /// stamped is stamped then (positive control), and one the mode no longer watches is
+    /// dropped.
+    #[test]
+    fn settle_rebaseline_keeps_the_stamps_the_look_took() {
+        let (dir, src, dep) = source_and_dependency();
+        let gone = dir.path().join("gone.mds");
+        // What the look stamped, before the rebuild read anything: the dependency, with
+        // its bytes, and a file the mode no longer watches.
+        let mut look = snapshot_state(&HashSet::from([dep.clone()]));
+        look.insert(gone.clone(), (None, Some(4)));
+        // Truncated once the rebuild had read it.
+        std::fs::write(&dep, "").unwrap();
+        let kept = |baseline: &StampMap, what: &str| {
+            assert_eq!(
+                baseline.get(&dep),
+                look.get(&dep),
+                "{what}: the look's stamp, not the emptied file's"
+            );
+            assert!(
+                baseline.contains_key(&src),
+                "{what}: positive control: a file no look stamped is stamped; {baseline:?}"
+            );
+            assert!(
+                !baseline.contains_key(&gone),
+                "{what}: a file the mode no longer watches is dropped; {baseline:?}"
+            );
+        };
+
+        // File mode.
+        let foi: HashSet<PathBuf> = [src.clone(), dep.clone()].into_iter().collect();
+        for (how, what) in [
+            (Settle::Rebaseline, "file mode, a rebaseline"),
+            (Settle::MarkErrored(&src), "file mode, a failed compile"),
+        ] {
+            let mut file = file_state(foi.clone());
+            file.last_mtimes = look.clone();
+            settle(SettleInto::File(&mut file), None, how);
+            kept(&file.last_mtimes, what);
+            assert!(
+                any_went_empty(&file.foi, &file.last_mtimes),
+                "{what}: the next rebuild finds the dependency emptied"
+            );
+        }
+
+        // Directory mode: over the watched set, the `--vars` file included.
+        let vars = dir.path().join("vars.json");
+        std::fs::write(&vars, r#"{"v": 1}"#).unwrap();
+        let mut rebuild = empty_dir_state();
+        rebuild.known_files.insert(src.clone());
+        rebuild.forward_deps.insert(src.clone(), vec![dep.clone()]);
+        rebuild.vars_file = Some(vars.clone());
+        rebuild.last_mtimes = look.clone();
+        settle(SettleInto::Dir(&mut rebuild), None, Settle::Rebaseline);
+        kept(&rebuild.last_mtimes, "directory mode, a rebaseline");
+        assert!(
+            rebuild.last_mtimes.contains_key(&vars),
+            "the vars file is stamped: {:?}",
+            rebuild.last_mtimes
+        );
+        assert!(
+            any_went_empty(&rebuild.watched_set(), &rebuild.last_mtimes),
+            "the next batch finds the dependency emptied"
         );
     }
 
@@ -8775,6 +8944,68 @@ mod tests {
                 assert_eq!(state.hold.deadline(), None, "nothing is held");
             }
         }
+    }
+
+    /// File mode's rebuild context for `entry`: no `--vars`, quiet.
+    fn file_ctx(entry: &Path) -> FileCompileCtx {
+        FileCompileCtx {
+            entry: WatchedPath {
+                typed: entry.to_path_buf(),
+                canonical: entry.to_path_buf(),
+                what: Watched::Entry,
+            },
+            working_dir: WorkingDir { canonical: None },
+            vars_path: None,
+            vars_path_typed: None,
+            reads: Vec::new(),
+            static_set_vars: Vec::new(),
+            static_set_string_vars: Vec::new(),
+            quiet: true,
+        }
+    }
+
+    /// #380: a rebuild takes the stamps its look took as its baseline, in both modes: a
+    /// baseline that saw a watched file otherwise — a change the tick found, or an edit whose
+    /// event came — holds what the look saw once the rebuild is done, so the idle tick does
+    /// not find the same change again.
+    #[test]
+    fn a_rebuild_takes_its_look_s_stamps_as_its_baseline() {
+        let stale: FileStamp = (None, Some(99));
+
+        // File mode.
+        let (_dir, root) = canonical_tempdir();
+        let entry = root.join("page.mds");
+        let out = root.join("page.md");
+        std::fs::write(&entry, "Page.\n").unwrap();
+        let mut watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default())
+                .unwrap();
+        let mut state = file_state(std::iter::once(entry.clone()).collect());
+        state.output = OutputRoute::Named(Some(WriteTarget::as_typed(out.clone())));
+        state.last_mtimes.insert(entry.clone(), stale);
+        let _ = rebuild_file(&file_ctx(&entry), &mut watcher, &mut state, None);
+        assert!(
+            std::fs::read_to_string(&out).is_ok_and(|text| text.contains("Page.")),
+            "control: the rebuild ran"
+        );
+        assert_eq!(
+            state.last_mtimes.get(&entry),
+            Some(&stamp_now(&entry)),
+            "file mode: the look's stamp, not the one the baseline held"
+        );
+
+        // Directory mode.
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (ctx, mut state) = two_compiled_sources(&root, &out);
+        let a = root.join("a.mds");
+        state.last_mtimes.insert(a.clone(), stale);
+        rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+        assert_eq!(
+            state.last_mtimes.get(&a),
+            Some(&stamp_now(&a)),
+            "directory mode: the look's stamp, not the one the baseline held"
+        );
     }
 
     /// #380: a directory source whose compile read itself emptied since the batch looked is
