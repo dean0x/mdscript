@@ -37,13 +37,13 @@
 mod common;
 use common::{
     closed_pipe, count_occurrences, dup_vars_file_warning, make_symlink, mds_bin,
-    most_debounce_windows, poll_tap_until, record_run_flag, spawn_watch_ready,
-    spawn_watch_ready_stderr_untapped, spawn_watch_unsynchronized, tap_reader, wait_for_tap,
-    wait_for_tap_count, write_atomic, ChildGuard, RunFlag, StderrTap, StdoutTap, WriteCadence,
-    ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
+    most_debounce_windows, poll_tap_until, record_run_flag, remove_symlink, spawn_watch_ready,
+    spawn_watch_ready_at, spawn_watch_ready_stderr_untapped, spawn_watch_unsynchronized,
+    tap_reader, wait_for_tap, wait_for_tap_count, write_atomic, ChildGuard, RunFlag, StderrTap,
+    StdoutTap, WriteCadence, ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
 };
 #[cfg(unix)]
-use common::{full_file, limit_file_growth, spawn_watch_ready_at};
+use common::{full_file, limit_file_growth};
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -5926,9 +5926,6 @@ fn watch_ready_with_large_piped_stdout_does_not_deadlock() {
 /// file the link points to keeps its bytes and the marker is a file of its own. Control:
 /// the watcher still signals readiness — the harness returns only once the marker holds
 /// its text.
-///
-/// Unix-only: it plants a symlink, which Windows creates only with a privilege.
-#[cfg(unix)]
 #[test]
 fn a_symlink_at_the_readiness_file_s_temporary_path_does_not_redirect_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -5937,7 +5934,9 @@ fn a_symlink_at_the_readiness_file_s_temporary_path_does_not_redirect_it() {
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, "VICTIM\n").unwrap();
     let marker = dir.path().join("ready");
-    std::os::unix::fs::symlink(&victim, dir.path().join("ready.tmp")).unwrap();
+    if !make_symlink(&victim, &dir.path().join("ready.tmp")) {
+        return;
+    }
 
     let (child, _tap, _) = spawn_watch_ready_at(
         mds_bin()
@@ -8292,9 +8291,6 @@ fn assert_one_rebuild(args: &[&str], stderr: &str) {
 /// one edit, one rebuild. The target lies outside the directory argument, so directory
 /// mode watches it as an out-of-root dependency directory; a `.mdsroot` marker above both
 /// keeps the import inside the project.
-///
-/// Unix-only: it creates a directory symlink.
-#[cfg(unix)]
 #[test]
 fn watch_rebuilds_once_when_a_dependency_behind_a_symlinked_directory_changes() {
     for args in ENTRY_AND_DIRECTORY {
@@ -8304,7 +8300,9 @@ fn watch_rebuilds_once_when_a_dependency_behind_a_symlinked_directory_changes() 
         std::fs::create_dir_all(base.join("src")).unwrap();
         std::fs::create_dir_all(base.join("real-lib")).unwrap();
         std::fs::write(base.join("real-lib/x.mds"), "X one\n").unwrap();
-        std::os::unix::fs::symlink(base.join("real-lib"), base.join("src/lib-link")).unwrap();
+        if !make_symlink(&base.join("real-lib"), &base.join("src").join("lib-link")) {
+            return;
+        }
         std::fs::write(
             base.join("src/a.mds"),
             "@import \"./lib-link/x.mds\" as x\n@include x\n",
@@ -8703,8 +8701,7 @@ fn out_dir_session_base(config: bool) -> tempfile::TempDir {
     base
 }
 
-/// The names in `dir`, sorted. Unix-only, as the symlink tests that call it are.
-#[cfg(unix)]
+/// The names in `dir`, sorted.
 fn names_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -8715,9 +8712,7 @@ fn names_in(dir: &Path) -> Vec<String> {
 }
 
 /// The refusal of a write below an out-dir that now leads elsewhere, naming the output
-/// `shown` as its status line does, squashed for comparison. Unix-only, as the symlink
-/// tests that call it are.
-#[cfg(unix)]
+/// `shown` as its status line does, squashed for comparison.
 fn out_dir_moved_refusal(shown: &Path) -> String {
     squash(&format!(
         "mds::io × cannot write {}: the output directory now resolves to a different \
@@ -8888,12 +8883,14 @@ fn watch_writes_into_a_new_directory_made_in_place_of_the_out_dir() {
 /// link's new target or to the directory the session started with, and watching goes
 /// on. Control: once the link leads back to that directory, an edit is written there.
 ///
-/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
-#[cfg(unix)]
+/// Runs on every OS: the refusal turns on where `--out-dir`, as typed, resolves now,
+/// compared canonical with canonical — on Windows as on unix. Windows' caveat lies
+/// elsewhere: it tells the directory a write is anchored at from another put at the
+/// same path by creation time alone (`DirIdentity`, `src/write.rs`), so a swap there
+/// between the check and the write is caught only when their creation times differ; the
+/// retarget here is caught by the path.
 #[test]
 fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
-    use std::os::unix::fs::symlink;
-
     for args in [
         &["watch", "src/x.mds", "--out-dir", "lnk"][..],
         &["watch", "src", "--out-dir", "lnk"],
@@ -8910,7 +8907,9 @@ fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
             base.join("a").join("x.md"),
             base.join("b"),
         );
-        symlink("a", &lnk).unwrap();
+        if !make_symlink(Path::new("a"), &lnk) {
+            return;
+        }
         let (child, tap) = spawn_ready(
             mds_bin()
                 .current_dir(base)
@@ -8924,8 +8923,8 @@ fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
             tap.text()
         );
 
-        std::fs::remove_file(&lnk).unwrap();
-        symlink("b", &lnk).unwrap();
+        remove_symlink(&lnk);
+        assert!(make_symlink(Path::new("b"), &lnk), "retarget the link to b");
         write_atomic(&source, "X two\n");
         let refusal = out_dir_moved_refusal(&Path::new("lnk").join("x.md"));
         let refused = poll_tap_until(&tap, TIMEOUT, |text| squash(text).contains(&refusal));
@@ -8944,8 +8943,11 @@ fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
             "{args:?}: nor to the directory the session started with"
         );
 
-        std::fs::remove_file(&lnk).unwrap();
-        symlink("a", &lnk).unwrap();
+        remove_symlink(&lnk);
+        assert!(
+            make_symlink(Path::new("a"), &lnk),
+            "lead the link back to a"
+        );
         write_atomic(&source, "X three\n");
         assert!(
             wait_for_file_contains(&a_out, "X three", TIMEOUT),
@@ -8969,12 +8971,12 @@ fn watch_refuses_an_out_dir_link_retargeted_mid_session() {
 /// symlink below an anchor is, named below the directory `mds.json` was reached by.
 /// Control: a real directory made back in its place is written into.
 ///
-/// Unix-only: it makes a directory symlink; the rule itself is platform-independent.
-#[cfg(unix)]
+/// Runs on every OS: `--out-dir` is refused by where it resolves now, as the retargeted
+/// link is ([`watch_refuses_an_out_dir_link_retargeted_mid_session`], which says what
+/// Windows tells apart by creation time alone), and `build.output_dir`'s link by the
+/// walk below the directory `mds.json` is in, which refuses a symlink on Windows too.
 #[test]
 fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
-    use std::os::unix::fs::symlink;
-
     for (args, config) in OUT_DIR_SESSIONS {
         let base = out_dir_session_base(config);
         let base = base.path();
@@ -9001,7 +9003,9 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
         // out-dir is deleted, writes into a recreated one, and the link then cannot be made.
         settle_queued_events(&tap, &source, "barrier");
         std::fs::remove_dir_all(&out).unwrap();
-        symlink("victim", &out).unwrap();
+        if !make_symlink(Path::new("victim"), &out) {
+            return;
+        }
         write_atomic(&source, "A two\n");
         let refusal = if config {
             squash(&format!(
@@ -9023,7 +9027,7 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
             "{args:?}: nothing is written into the directory the link leads to"
         );
 
-        std::fs::remove_file(&out).unwrap();
+        remove_symlink(&out);
         std::fs::create_dir(&out).unwrap();
         write_atomic(&source, "A three\n");
         assert!(
@@ -10462,9 +10466,6 @@ fn watch_quiet_keeps_the_outputs_of_other_sources_and_changed_files_without_a_no
 /// to nothing, and `y.md` with a link to a file; deleting `x.mds` and `y.mds` keeps both
 /// links, each with `warning: could not remove <output>: refusing to remove a symlink`,
 /// and the link's target is left as it was. Control: the live link's warning.
-///
-/// Unix-only: it makes symlinks, which Windows allows only with a privilege.
-#[cfg(unix)]
 #[test]
 fn watch_reports_a_dangling_symlink_at_a_deleted_source_s_output() {
     let base = notes_with(&[("x.mds", "Plain X\n"), ("y.mds", "Plain Y\n")]);
@@ -10489,7 +10490,9 @@ fn watch_reports_a_dangling_symlink_at_a_deleted_source_s_output() {
         ("y.md", target.clone()),
     ] {
         std::fs::remove_file(notes.join(name)).unwrap();
-        std::os::unix::fs::symlink(&to, notes.join(name)).unwrap();
+        if !make_symlink(&to, &notes.join(name)) {
+            return;
+        }
     }
 
     // `y.mds` last: a batch handles its deletions in name order, so once its warning is

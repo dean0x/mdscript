@@ -49,6 +49,11 @@ pub fn closed_pipe() -> std::io::PipeWriter {
 /// `CI` env var is unset, printing a one-line reason. Returns `false` when the
 /// caller should skip the rest of the test.
 ///
+/// Windows makes a link to a directory and a link to a file differently, so the
+/// target is looked at first — a relative one from the link's directory, where the
+/// link will resolve it, not from the working directory. A target that is not there
+/// gets a file link.
+///
 /// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
 /// name and contract (#147); duplicated rather than shared because
 /// `mds-core`'s helper is `pub(crate)` to that crate and each `mds-cli`
@@ -58,10 +63,15 @@ pub fn make_symlink(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
-    let result = if target.is_dir() {
-        std::os::windows::fs::symlink_dir(target, link)
-    } else {
-        std::os::windows::fs::symlink_file(target, link)
+    let result = {
+        let resolved = link
+            .parent()
+            .map_or_else(|| target.to_path_buf(), |dir| dir.join(target));
+        if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
     };
 
     match result {
@@ -86,6 +96,29 @@ pub fn make_symlink(target: &Path, link: &Path) -> bool {
             );
         }
     }
+}
+
+/// Removes the symlink at `link` — the link, never what it points to.
+///
+/// Windows keeps a link to a directory as a directory entry, which `remove_dir` removes,
+/// not `remove_file`; every other link, and every link on unix, is removed with
+/// `remove_file`.
+#[allow(dead_code)]
+pub fn remove_symlink(link: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+
+        let linked = std::fs::symlink_metadata(link)
+            .unwrap_or_else(|e| panic!("look at the link {}: {e}", link.display()));
+        if linked.file_type().is_symlink_dir() {
+            std::fs::remove_dir(link)
+                .unwrap_or_else(|e| panic!("remove the link {}: {e}", link.display()));
+            return;
+        }
+    }
+    std::fs::remove_file(link)
+        .unwrap_or_else(|e| panic!("remove the link {}: {e}", link.display()));
 }
 
 // ── Frontmatter YAML bounds builders (#162) ──────────────────────────────────
