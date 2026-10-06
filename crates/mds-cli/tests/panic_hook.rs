@@ -225,7 +225,6 @@ fn a_panic_with_stderr_closed_exits_101_not_by_a_signal() {
 mod default_output {
     use super::*;
     use crate::common::count_occurrences;
-    #[cfg(unix)]
     use crate::common::{
         spawn_watch_ready, spawn_watch_unsynchronized, wait_for_tap_count, write_atomic,
         ChildGuard, PipeTap,
@@ -919,13 +918,11 @@ mod default_output {
 
     /// Failure bound for one step of a watch session: going live, or what an edit leads
     /// to. A step takes milliseconds.
-    #[cfg(unix)]
     const WATCH_STEP: Duration = Duration::from_secs(20);
 
     /// `mds watch --quiet --poll-interval 0 <args>` in `dir`, asking for a panic at
     /// `panic_at`, once it is live. `--quiet` leaves the panic's text the only thing on
     /// stderr, and without an idle tick only an edit starts a rebuild.
-    #[cfg(unix)]
     fn watch_live(dir: &Path, args: &[&str], panic_at: Option<&str>) -> (ChildGuard, PipeTap) {
         let mut cmd = watch_command(dir, args, panic_at);
         cmd.env_remove(RUST_BACKTRACE);
@@ -935,7 +932,6 @@ mod default_output {
 
     /// [`watch_live`]'s session, not waited for: `ready` is the file it creates once it is
     /// live.
-    #[cfg(unix)]
     fn watch_starting(
         dir: &Path,
         args: &[&str],
@@ -949,7 +945,6 @@ mod default_output {
     }
 
     /// The `mds watch` command [`watch_live`] and [`watch_starting`] spawn.
-    #[cfg(unix)]
     fn watch_command(dir: &Path, args: &[&str], panic_at: Option<&str>) -> std::process::Command {
         let mut cmd = mds_bin();
         cmd.args(["watch", "--quiet", "--poll-interval", "0"])
@@ -966,6 +961,9 @@ mod default_output {
 
     /// Ctrl-C the session, and return its exit code. Panics when it has not ended within
     /// [`WATCH_STEP`].
+    ///
+    /// Unix-only: it sends SIGINT with `libc::kill`; Windows has no way for a test to send
+    /// one child process a Ctrl-C.
     #[cfg(unix)]
     fn interrupt(session: &mut ChildGuard) -> Option<i32> {
         let pid = libc::pid_t::try_from(session.id()).expect("a pid fits pid_t");
@@ -977,6 +975,8 @@ mod default_output {
     }
 
     /// The session's exit code once it ends, within `bound`; panics when it has not.
+    ///
+    /// Unix-only: [`interrupt`] is its only caller.
     #[cfg(unix)]
     fn exit_code_within(session: &mut ChildGuard, bound: Duration) -> Option<i32> {
         let deadline = Instant::now() + bound;
@@ -993,13 +993,11 @@ mod default_output {
     }
 
     /// Whether the session is still running.
-    #[cfg(unix)]
     fn running(session: &mut ChildGuard) -> bool {
         session.0.try_wait().expect("poll the session").is_none()
     }
 
     /// Wait until `path` holds `text`, within [`WATCH_STEP`].
-    #[cfg(unix)]
     fn wait_for_file(path: &Path, text: &str) -> bool {
         let deadline = Instant::now() + WATCH_STEP;
         loop {
@@ -1015,7 +1013,6 @@ mod default_output {
 
     /// A quiet session's whole stderr after `panics` or more panics: the text, once per
     /// panic, and nothing else.
-    #[cfg(unix)]
     fn assert_only_the_text(stderr: &str, panics: usize, what: &str) {
         let printed = count_occurrences(stderr, ICE_TEXT);
         assert!(
@@ -1030,15 +1027,15 @@ mod default_output {
     }
 
     /// `mds watch <file>` whose compile panics goes on watching (#389): the startup compile
-    /// prints the text, an edit starts a rebuild that prints it again, the session stays
-    /// live, and it exits 101 when stopped. No output is written, and nothing but the text
-    /// reports a panic.
+    /// prints the text, an edit starts a rebuild that prints it again, and the session
+    /// stays live. No output is written, and nothing but the text reports a panic. The
+    /// session is killed: its exit code at Ctrl-C is
+    /// [`a_watch_session_that_caught_a_compile_panic_exits_101_at_ctrl_c`]'s to pin.
     ///
-    /// Control: without the trigger the session writes the output, rebuilds it on the edit
-    /// and exits 0 when stopped.
-    #[cfg(unix)]
+    /// Control: without the trigger the session writes the output and rebuilds it on the
+    /// edit.
     #[test]
-    fn a_watched_file_whose_compile_panics_is_watched_on_and_the_session_exits_101() {
+    fn a_watched_file_whose_compile_panics_is_watched_on() {
         let control_dir = tempfile::tempdir().expect("tempdir");
         let source = control_dir.path().join("x.mds");
         std::fs::write(&source, "Hello\n").expect("write x.mds");
@@ -1050,7 +1047,6 @@ mod default_output {
             wait_for_file(&output, "Hello again\n"),
             "control: the edit rebuilds"
         );
-        assert_eq!(interrupt(&mut control), Some(0), "control: exit 0");
         assert_eq!(stderr.finish_text(&mut control), "", "control: --quiet");
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1067,11 +1063,6 @@ mod default_output {
             running(&mut session),
             "a compile that panics does not end the session"
         );
-        assert_eq!(
-            interrupt(&mut session),
-            Some(101),
-            "stopped, a session that caught a panic exits 101"
-        );
         assert_only_the_text(&stderr.finish_text(&mut session), before + 1, "file");
         assert!(
             !dir.path().join("x.md").exists(),
@@ -1080,14 +1071,14 @@ mod default_output {
     }
 
     /// `mds watch <dir>` goes on past a source whose compile panics (#389): the startup
-    /// writes the other source's output, an edit to it rebuilds it, the session stays live,
-    /// and it exits 101 when stopped. Nothing but the text reports a panic.
+    /// writes the other source's output, an edit to it rebuilds it, and the session stays
+    /// live. Nothing but the text reports a panic. The session is killed: its exit code at
+    /// Ctrl-C is [`a_watch_session_that_caught_a_compile_panic_exits_101_at_ctrl_c`]'s to
+    /// pin.
     ///
-    /// Control: without the trigger both outputs are written, the edit rebuilds, and the
-    /// session exits 0 when stopped.
-    #[cfg(unix)]
+    /// Control: without the trigger both outputs are written and the edit rebuilds.
     #[test]
-    fn a_watched_directory_goes_on_past_a_source_whose_compile_panics_and_exits_101() {
+    fn a_watched_directory_goes_on_past_a_source_whose_compile_panics() {
         let sources = || {
             let dir = tempfile::tempdir().expect("tempdir");
             let d = dir.path().join("d");
@@ -1113,7 +1104,6 @@ mod default_output {
             wait_for_file(&d.join("b.md"), "Hello again b\n"),
             "control: the edit rebuilds"
         );
-        assert_eq!(interrupt(&mut control), Some(0), "control: exit 0");
         assert_eq!(stderr.finish_text(&mut control), "", "control: --quiet");
 
         let dir = sources();
@@ -1133,11 +1123,6 @@ mod default_output {
             running(&mut session),
             "a compile that panics does not end the session"
         );
-        assert_eq!(
-            interrupt(&mut session),
-            Some(101),
-            "stopped, a session that caught a panic exits 101"
-        );
         assert_only_the_text(&stderr.finish_text(&mut session), 1, "directory");
         assert!(
             !d.join("a.md").exists(),
@@ -1145,10 +1130,48 @@ mod default_output {
         );
     }
 
+    /// A watch session that caught a panic compiling a source exits 101 when Ctrl-C stops
+    /// it, watching a file or a directory (#389); nothing but the text reports the panic.
+    ///
+    /// Control: without the trigger Ctrl-C stops the session with 0.
+    ///
+    /// Unix-only: Ctrl-C is SIGINT sent by [`interrupt`]; what needs no Ctrl-C runs on every
+    /// OS in [`a_watched_file_whose_compile_panics_is_watched_on`] and
+    /// [`a_watched_directory_goes_on_past_a_source_whose_compile_panics`].
+    #[cfg(unix)]
+    #[test]
+    fn a_watch_session_that_caught_a_compile_panic_exits_101_at_ctrl_c() {
+        for watched in [Watched::File, Watched::Directory] {
+            let fixture = WatchFixture::new(watched);
+            let (mut control, stderr) = watch_live(fixture.dir(), fixture.args(), None);
+            assert_eq!(interrupt(&mut control), Some(0), "control ({watched:?})");
+            assert_eq!(
+                stderr.finish_text(&mut control),
+                "",
+                "control ({watched:?}): --quiet"
+            );
+
+            let fixture = WatchFixture::new(watched);
+            let (mut session, stderr) =
+                watch_live(fixture.dir(), fixture.args(), Some("compile:x"));
+            wait_for_tap_count(&stderr, ICE_TEXT, 1, WATCH_STEP);
+            assert_eq!(
+                interrupt(&mut session),
+                Some(101),
+                "{watched:?}: stopped, a session that caught a panic exits 101"
+            );
+            assert_only_the_text(
+                &stderr.finish_text(&mut session),
+                1,
+                &format!("{watched:?}"),
+            );
+        }
+    }
+
     // ── A panic on a watch session's own threads ends it at once ──────────────
 
-    /// How `mds watch` is started for a thread-trigger test: on a file, or on a directory.
-    #[cfg(unix)]
+    /// How `mds watch` is started for a test that runs it both ways: on a file, or on a
+    /// directory.
     #[derive(Clone, Copy, Debug)]
     enum Watched {
         File,
@@ -1156,13 +1179,11 @@ mod default_output {
     }
 
     /// A working directory for a [`Watched`] session: `x.mds`, or `d/x.mds`.
-    #[cfg(unix)]
     struct WatchFixture {
         dir: tempfile::TempDir,
         watched: Watched,
     }
 
-    #[cfg(unix)]
     impl WatchFixture {
         fn new(watched: Watched) -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1203,6 +1224,9 @@ mod default_output {
     /// stopped — within [`PANIC_EXIT_BOUND`].
     ///
     /// Control: without the trigger Ctrl-C stops the session with 0.
+    ///
+    /// Unix-only: the panic is raised by the Ctrl-C a test sends as SIGINT ([`interrupt`]),
+    /// which it cannot send one child process on Windows.
     #[cfg(unix)]
     #[test]
     fn a_panic_in_the_watch_ctrl_c_handler_ends_the_session_with_101() {
@@ -1242,8 +1266,8 @@ mod default_output {
     /// without its events. The session's own startup write can be the first event;
     /// otherwise an edit is.
     ///
-    /// Control: without the trigger an edit reaches the callback and rebuilds.
-    #[cfg(unix)]
+    /// Control: without the trigger an edit reaches the callback and rebuilds; that session
+    /// is then killed, its exit code no part of the control.
     #[test]
     fn a_panic_in_the_watch_file_event_callback_ends_the_session_with_101() {
         for watched in [Watched::File, Watched::Directory] {
@@ -1258,7 +1282,6 @@ mod default_output {
                 wait_for_file(&fixture.output_file(), "Hello again\n"),
                 "control ({watched:?}): the edit reaches the callback"
             );
-            assert_eq!(interrupt(&mut control), Some(0), "control ({watched:?})");
             assert_eq!(
                 stderr.finish_text(&mut control),
                 "",
