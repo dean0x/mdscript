@@ -70,7 +70,8 @@
 //! replaces either, and the temporary name removed; and on a filesystem without hard
 //! links, the content written in place into a target created exclusively (`O_CREAT |
 //! O_EXCL | O_NOFOLLOW`) — still never over another file, but no longer all or nothing: a
-//! failure while it is written leaves the file partly written. Windows moves the
+//! write that fails part-way removes the file again while its name is still that file,
+//! and a crash or a kill while it is written leaves it partly written. Windows moves the
 //! temporary file into place without `MOVEFILE_REPLACE_EXISTING`.
 //!
 //! # Never over an MDS module or a file the run reads (#425)
@@ -1542,18 +1543,24 @@ mod unix {
     /// never over a file that has it.
     pub(super) type Step<'s> = &'s dyn Fn(BorrowedFd<'_>, &OsStr, &OsStr) -> Result<(), Errno>;
 
+    /// How a new file's commit writes its content in place, where it must ([`fill`]).
+    pub(super) type Fill<'s> = &'s dyn Fn(File, &[u8], Durability) -> std::io::Result<()>;
+
     /// The steps a new file's commit takes, in order (#160): a rename that never replaces,
     /// then a hard link, which never replaces either; each is passed over when it is not
-    /// to be had (see [`commit_new`]).
+    /// to be had (see [`commit_new`]), and then the content is written in place with
+    /// `fill`.
     pub(super) struct NewSteps<'s> {
         pub(super) rename: Step<'s>,
         pub(super) link: Step<'s>,
+        pub(super) fill: Fill<'s>,
     }
 
     /// The steps a new file's commit takes.
     pub(super) const NO_CLOBBER: NewSteps<'static> = NewSteps {
         rename: &rename_noreplace,
         link: &link_new,
+        fill: &fill,
     };
 
     /// Give `temp`'s file the name `name` in the directory it is in, only where nothing has
@@ -1580,7 +1587,7 @@ mod unix {
             Err(errno) if no_such_rename(errno) => match (steps.link)(dir, &temp.name, name) {
                 Ok(()) => Ok(()),
                 Err(errno) if no_hard_links(errno) => {
-                    write_in_place(dir, name, content, durability)
+                    write_in_place(dir, name, content, durability, steps.fill)
                 }
                 Err(errno) => Err(refused_if_there(errno)),
             },
@@ -1624,19 +1631,43 @@ mod unix {
         fs::linkat(dir, from, dir, to, AtFlags::empty())
     }
 
-    /// Write `content` to `name` in `dir`, created exclusively and without following a
-    /// symlink: a new file's commit on a filesystem without hard links. No file there is
-    /// replaced, but the write is not all or nothing — one that fails part-way leaves the
-    /// file partly written.
+    /// Write `content` to `name` in `dir` with `fill`, created exclusively and without
+    /// following a symlink: a new file's commit on a filesystem without hard links. No file
+    /// there is replaced, but the write is not all or nothing: one that fails part-way
+    /// removes the file it created again, while the name is still that file
+    /// ([`remove_if_still`]), and a crash or a kill while it is written leaves the file
+    /// partly written.
     fn write_in_place(
         dir: BorrowedFd<'_>,
         name: &OsStr,
         content: &[u8],
         durability: Durability,
+        fill: Fill<'_>,
     ) -> Result<(), Failure> {
-        let file = fs::openat(dir, name, IN_PLACE, NEW_FILE).map_err(refused_if_there)?;
-        fill(File::from(file), content, durability)?;
-        Ok(())
+        let file = File::from(fs::openat(dir, name, IN_PLACE, NEW_FILE).map_err(refused_if_there)?);
+        // Which file the write created, taken before it is written: a look that fails
+        // leaves nothing to tell it by, and a failed write then leaves the file.
+        let created = fs::fstat(&file).ok();
+        fill(file, content, durability).map_err(|e| {
+            if let Some(created) = &created {
+                remove_if_still(dir, name, created);
+            }
+            Failure::from(e)
+        })
+    }
+
+    /// Remove `name` from `dir` while it is still the file `created` describes — the same
+    /// device and inode; its size and times are the failed write's own, and are not
+    /// compared — best effort: the write has already failed, and a failure here is not the
+    /// one it reports. A file put at the name since is left as it is; one put there in the
+    /// instant between that look and the removal is removed instead, as by any removal by
+    /// name.
+    fn remove_if_still(dir: BorrowedFd<'_>, name: &OsStr, created: &fs::Stat) {
+        let still = fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|now| now.st_dev == created.st_dev && now.st_ino == created.st_ino);
+        if still {
+            let _ = fs::unlinkat(dir, name, AtFlags::empty());
+        }
     }
 
     /// Whether `errno`, from a rename that never replaces, says there is no such rename.
@@ -3768,6 +3799,7 @@ mod tests {
             let steps = NewSteps {
                 rename: &forced_rename,
                 link: &forced_link,
+                fill: NO_CLOBBER.fill,
             };
             let temp_name = OsString::from(format!("{TEMP_PREFIX}step{TEMP_SUFFIX}"));
             let (temp, mut written) =
@@ -3860,6 +3892,102 @@ mod tests {
             commit(Some(Errno::INVAL), Some(Errno::IO), false),
             failed(&["rename", "link"]),
             "a failed link is no reason to write in place"
+        );
+    }
+
+    /// A new file's commit that writes its content in place — no rename that never
+    /// replaces, no hard links — and fails part-way removes the file it created again
+    /// (#160): left partly written, `mds watch` would keep it as a file it did not write
+    /// for the rest of the session. The write's own failure is reported, and no temporary
+    /// file is left. A file put at the name before that removal is left as it is: only the
+    /// file the write created is removed. Control: the same commit, its content written
+    /// whole, leaves the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_written_in_place_that_fails_part_way_is_removed_again() {
+        use std::ffi::OsString;
+        use std::fs::File;
+        use std::io::Write as _;
+        use std::os::fd::{AsFd as _, BorrowedFd};
+
+        use rustix::fs::{Mode, OFlags};
+        use rustix::io::Errno;
+
+        use super::unix::{commit_new, create_temp, Fill, NewSteps, NO_CLOBBER};
+
+        const CONTENT: &[u8] = b"new content";
+        // What a commit of `CONTENT` to `a.mds` in `dir`, written in place by `fill`, came
+        // to: its outcome, and each name left with its bytes.
+        let in_place = |dir: &Path, fill: Fill<'_>| {
+            let fd =
+                rustix::fs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+            let no_rename = |_: BorrowedFd<'_>, _: &OsStr, _: &OsStr| Err(Errno::INVAL);
+            let no_link = |_: BorrowedFd<'_>, _: &OsStr, _: &OsStr| Err(Errno::PERM);
+            let steps = NewSteps {
+                rename: &no_rename,
+                link: &no_link,
+                fill,
+            };
+            let temp_name = OsString::from(format!("{TEMP_PREFIX}step{TEMP_SUFFIX}"));
+            let (temp, mut written) =
+                create_temp(fd.as_fd(), Mode::from_raw_mode(0o644), [temp_name]).unwrap();
+            written.write_all(CONTENT).unwrap();
+            drop(written);
+            let result = commit_new(
+                temp,
+                OsStr::new("a.mds"),
+                CONTENT,
+                Durability::RenameOnly,
+                &steps,
+            )
+            .map_err(|failure| match failure {
+                Failure::Io(e) => format!("{:?}", Errno::from_io_error(&e)),
+                other => format!("{other:?}"),
+            });
+            let left: Vec<(String, String)> = entries(dir)
+                .into_iter()
+                .map(|name| {
+                    let text = std::fs::read_to_string(dir.join(&name)).unwrap();
+                    (name, text)
+                })
+                .collect();
+            (result, left)
+        };
+        let no_space = format!("{:?}", Some(Errno::NOSPC));
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            in_place(dir.path(), NO_CLOBBER.fill),
+            (Ok(()), vec![("a.mds".to_owned(), "new content".to_owned())]),
+            "control: written whole"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let part_way = |mut file: File, content: &[u8], _: Durability| {
+            file.write_all(&content[..3])?;
+            Err(Errno::NOSPC.into())
+        };
+        assert_eq!(
+            in_place(dir.path(), &part_way),
+            (Err(no_space.clone()), Vec::new()),
+            "removed again"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("theirs");
+        let replaced_meanwhile = |mut file: File, content: &[u8], _: Durability| {
+            file.write_all(&content[..3])?;
+            std::fs::write(&theirs, "theirs")?;
+            std::fs::rename(&theirs, dir.path().join("a.mds"))?;
+            Err(Errno::NOSPC.into())
+        };
+        assert_eq!(
+            in_place(dir.path(), &replaced_meanwhile),
+            (
+                Err(no_space),
+                vec![("a.mds".to_owned(), "theirs".to_owned())]
+            ),
+            "a file put at the name since is left"
         );
     }
 

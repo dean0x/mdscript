@@ -139,7 +139,10 @@ input. The compiler enforces several defense-in-depth controls:
   without replace — so a file that appears after its existence check is left as it is
   and refused as one already there is; on a filesystem without hard links the starter
   is written in place into a file created exclusively, which keeps that guarantee but
-  not atomicity.
+  not atomicity: a write that fails part-way removes the file again while its name is
+  still the file it created, but a crash or kill while it is written can leave it
+  partly written. `mds watch`'s write of a source's output after a change of kind
+  (below) uses the same commit, with the same residual.
   A stale output, a stale `.map` sidecar and, in `mds watch`, a deleted source's output
   are removed below their anchor in the same way (#160), only as a regular file, never
   through a symlink nor one at the file, and, in `mds watch`, only below the out-dir it

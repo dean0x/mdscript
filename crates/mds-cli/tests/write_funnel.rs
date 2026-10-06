@@ -166,11 +166,13 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "write.rs",
         "unlinkat(",
-        2,
+        3,
         "the temporary file's guard: a temporary file not renamed over its target — a \
          failed write's, or a linked one's — removed from the directory the walk opened; \
-         and `remove_proven`'s unix arm: a file proven, removed from the directory the \
-         walk opened while its name is still that file (#160)",
+         `remove_proven`'s unix arm: a file proven, removed from the directory the walk \
+         opened while its name is still that file; and a new file written in place whose \
+         write failed part-way, removed from that directory while its name is still the \
+         file it created (#160)",
     ),
     (
         "write.rs",
