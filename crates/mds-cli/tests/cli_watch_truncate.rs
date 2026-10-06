@@ -512,25 +512,24 @@ fn dir_mode_held_truncate_defers_the_whole_batch() {
     b_log.wait_for(&b_out, "B one", TIMEOUT);
 
     let hold = Hold::start(&a);
-    // Into the hold, edit the other source, then keep reading both outputs.
+    // Into the hold, edit the other source, then keep reading both outputs. The edit is
+    // always made, before a.mds is written, however late a descheduled thread comes back.
     let edit_after = TRUNCATE_HOLD / 5;
     let edit_at = hold.started + edit_after;
     let until = hold.started + TRUNCATE_HOLD;
-    let mut edited = false;
-    // Bounded by TRUNCATE_HOLD: at most TRUNCATE_HOLD / OUTPUT_POLL iterations.
-    while Instant::now() < until {
-        if !edited && Instant::now() >= edit_at {
+    let mut edited_at: Option<Instant> = None;
+    // Bounded by TRUNCATE_HOLD: at most TRUNCATE_HOLD / OUTPUT_POLL iterations, and one
+    // more that edits when the thread came back after `until` without having edited.
+    while edited_at.is_none() || Instant::now() < until {
+        if edited_at.is_none() && Instant::now() >= edit_at {
             write_atomic(&b, "B two\n");
-            edited = true;
+            edited_at = Some(Instant::now());
         }
         a_log.record(&a_out);
         b_log.record(&b_out);
         std::thread::sleep(OUTPUT_POLL);
     }
-    assert!(
-        edited,
-        "harness: the other source was edited during the hold"
-    );
+    let edited_at = edited_at.expect("the loop edits before it ends");
     let timing = hold.write_and_close("A two\n");
     a_log.wait_for(&a_out, "A two", TIMEOUT);
     b_log.wait_for(&b_out, "B two", TIMEOUT);
@@ -538,7 +537,10 @@ fn dir_mode_held_truncate_defers_the_whole_batch() {
     let stderr = stderr_through_the_marker(&a, tap, &mut child);
     let what = "directory mode";
     assert_no_empty_before_the_deadline(&a_log, timing.started, what);
-    if strict_claims_apply(&timing, what) {
+    // An edit made once the deadline could have passed may be published at once, as an
+    // empty output then may: the strict claims need both in time.
+    let edited_in_time = edited_at.duration_since(timing.started) < EMPTY_HOLD_DEADLINE;
+    if strict_claims_apply(&timing, what) && edited_in_time {
         assert!(
             a_log.first_empty.is_none(),
             "{what}: a.md must never be empty while a.mds is held truncated; states: {:?}",
