@@ -1804,6 +1804,76 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     }
 }
 
+/// The readiness marker `mds watch` creates for the test suite once it is watching (#390)
+/// compiles only into a debug build, as the pauses do: every mention of `MDS_TEST_READY`,
+/// and every mention of `create_ready_marker`, which writes the marker, sits inside
+/// `mod ready_trigger`, whose attributes hold `#[cfg(debug_assertions)]`, and
+/// `emit_ready_marker` has a release build's stub that does nothing.
+///
+/// Controls: the module without its `cfg`, the variable outside it, the marker's writer
+/// called outside it, a release stub that does something, and no release stub are each
+/// reported.
+#[test]
+fn the_readiness_marker_is_compiled_only_into_debug_builds() {
+    let watch = read_source("src/watch.rs");
+    let sources = crate_sources();
+    let found = gate_findings(&sources, &READY_TRIGGER);
+    assert!(
+        found.is_empty(),
+        "the readiness marker must be compiled only into debug builds:\n{}",
+        found.join("\n")
+    );
+
+    let with = |from: &str, to: &str| -> Vec<(String, String)> {
+        let planted = watch.replacen(from, to, 1);
+        assert_ne!(planted, watch, "precondition: watch.rs holds {from:?}");
+        sources
+            .iter()
+            .map(|(name, src)| {
+                let src = if name == "watch.rs" { &planted } else { src };
+                (name.clone(), src.clone())
+            })
+            .collect()
+    };
+    let stub = "fn emit_ready_marker() {}";
+    for (planted, what) in [
+        (
+            with(
+                "#[cfg(debug_assertions)]\nmod ready_trigger",
+                "mod ready_trigger",
+            ),
+            "a readiness module without `#[cfg(debug_assertions)]`",
+        ),
+        (
+            with(
+                stub,
+                "fn emit_ready_marker() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_READY\");\n}",
+            ),
+            "the readiness variable outside its module",
+        ),
+        (
+            with(
+                stub,
+                &format!(
+                    "{stub}\n\nfn planted(p: &Path) {{\n    let _ = create_ready_marker(p);\n}}"
+                ),
+            ),
+            "the marker's writer called outside its module",
+        ),
+        (
+            with(stub, "fn emit_ready_marker() {\n    let _ = 1;\n}"),
+            "a release stub that does something",
+        ),
+        (with(stub, ""), "a readiness marker without a release stub"),
+    ] {
+        assert!(
+            !gate_findings(&planted, &READY_TRIGGER).is_empty(),
+            "{what} must be reported"
+        );
+    }
+}
+
 /// A panic in one file's compile fails that file alone (#389), so each per-file catch — a
 /// `catch_compile` call — wraps that compile and nothing else: its closure is
 /// `AssertUnwindSafe(|| <one call>)`, the call is one of [`COMPILE_CALLS`] as written
@@ -2737,6 +2807,15 @@ const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
         ("MDS_TEST_PAUSE_AFTER_LOOK", true),
     ],
     fns: &["pause_after_batch_split", "pause_after_look"],
+};
+
+/// The readiness marker `mds watch` creates once it is watching (#390): `MDS_TEST_READY`,
+/// and `create_ready_marker`, which writes the marker by path and has no release stub
+/// because only `emit_ready_marker` calls it, both in `mod ready_trigger`.
+const READY_TRIGGER: DebugGate = DebugGate {
+    module: "ready_trigger",
+    needles: &[("MDS_TEST_READY", true), ("create_ready_marker", false)],
+    fns: &["emit_ready_marker"],
 };
 
 /// What is wrong with `gate`'s gating across `sources`; empty when nothing is: its module

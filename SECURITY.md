@@ -325,6 +325,10 @@ A release build therefore does not contain it — the variable is never read —
 profile turns debug assertions on. Build with debug assertions for development, not for
 anything you ship.
 
+So is `MDS_TEST_READY`, with which the test suite has `mds watch` create a file once it
+is watching — by path, outside the write primitive's checks: a release build never reads
+the variable, which `panic_hook.rs` pins as well.
+
 **Never enable `debug-panics` in a published or production build.** Panic messages
 can contain absolute filesystem paths and other internal details that should not be
 exposed to template authors or end users. The feature is off unless opted into

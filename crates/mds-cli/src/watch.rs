@@ -552,84 +552,102 @@ fn startup_race_probe() {
 #[cfg(not(feature = "startup-race-probe"))]
 fn startup_race_probe() {}
 
-/// Environment variable that enables the test-only readiness handshake.
-///
-/// Its value is the **absolute path of a file** to create once the watch is armed.
-/// Test-only: `mds` never sets it itself and it adds no CLI surface.
-const READY_MARKER_ENV: &str = "MDS_TEST_READY";
+// ── Test-only readiness marker (#390) ─────────────────────────────────────────
 
-/// Contents written to the readiness file named by [`READY_MARKER_ENV`].
-const READY_MARKER: &str = "MDS_WATCH_READY";
+/// `MDS_TEST_READY`: how a debug build tells the test suite that it is watching, by
+/// creating the file the variable names (`tests/common/mod.rs` waits for it). A release
+/// build has none of it: it never reads the variable and never writes the file.
+#[cfg(debug_assertions)]
+mod ready_trigger {
+    use std::path::{Path, PathBuf};
 
-/// Signal readiness by creating the file named by `MDS_TEST_READY`.
-///
-/// Called by both watch modes at the single instant where **every** file of
-/// interest is covered by at least one detector: its parent directory is armed
-/// with the OS watcher *and* its `(mtime, size)` baseline has been captured.
-/// An edit made after this file appears is guaranteed to be observed.
-///
-/// This exists because no pre-existing output line is a sound readiness signal:
-/// `"Watching {path}"` is printed *before* the startup compile, and
-/// `"Recompiled …"` only ever appears after a successful *rebuild*. Tests that
-/// keyed off either raced the tail of startup.
-///
-/// # Why a file and not stderr
-///
-/// The handshake must not perturb the streams the suite asserts on. A marker line
-/// on stderr would have to bypass `--quiet` (the suite runs with `-q`), which puts
-/// bytes into the exact stream two tests inspect for *emptiness* — that stderr
-/// carries a compile error through `-q`, and that the initial-compile-error path
-/// emits something at all. Both assertions silently become unfalsifiable the moment
-/// anything else is written there unconditionally. A side channel has no such
-/// coupling: stdout and stderr stay byte-for-byte what a real user would see.
-///
-/// Write-then-rename so a test polling for the path can never observe a partially
-/// written marker. The temporary file is created new ([`create_ready_marker`]), so a
-/// symlink planted at `<marker>.tmp` never redirects the write (#390). Failures are
-/// ignored: this is a test affordance, and a watcher that cannot create the file must
-/// still watch.
-fn emit_ready_marker() {
-    let Some(raw) = std::env::var_os(READY_MARKER_ENV) else {
-        return;
-    };
-    let path = PathBuf::from(raw);
-    // Absolute paths only. A relative value would resolve against the watcher's cwd
-    // — which under `cargo test` is the crate root — and litter the source tree.
-    if !path.is_absolute() {
-        return;
-    }
-    let mut tmp = path.clone().into_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    if create_ready_marker(&tmp).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
+    /// Environment variable that enables the test-only readiness handshake.
+    ///
+    /// Its value is the **absolute path of a file** to create once the watch is armed.
+    /// Test-only: `mds` never sets it itself and it adds no CLI surface.
+    const READY_MARKER_ENV: &str = "MDS_TEST_READY";
 
-/// Create `tmp` new, holding [`READY_MARKER`]: never through an entry already at it,
-/// which a write that opens the path would follow if it were a symlink (#390). An entry
-/// there — a leftover, or a planted link — is removed (the entry itself, never what a link
-/// points to) and the file created once more; another entry in between ends the attempt.
-///
-/// A raw write, not `atomic_write_file`'s, by design (#227): the rename that follows it
-/// is the atomic step. Allow-listed in tests/write_funnel.rs.
-fn create_ready_marker(tmp: &Path) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let create = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(tmp)
-    };
-    let mut file = match create() {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(tmp)?;
-            create()?
+    /// Contents written to the readiness file named by [`READY_MARKER_ENV`].
+    const READY_MARKER: &str = "MDS_WATCH_READY";
+
+    /// Signal readiness by creating the file named by `MDS_TEST_READY`.
+    ///
+    /// Called by both watch modes at the single instant where **every** file of
+    /// interest is covered by at least one detector: its parent directory is armed
+    /// with the OS watcher *and* its `(mtime, size)` baseline has been captured.
+    /// An edit made after this file appears is guaranteed to be observed.
+    ///
+    /// This exists because no pre-existing output line is a sound readiness signal:
+    /// `"Watching {path}"` is printed *before* the startup compile, and
+    /// `"Recompiled …"` only ever appears after a successful *rebuild*. Tests that
+    /// keyed off either raced the tail of startup.
+    ///
+    /// # Why a file and not stderr
+    ///
+    /// The handshake must not perturb the streams the suite asserts on. A marker line
+    /// on stderr would have to bypass `--quiet` (the suite runs with `-q`), which puts
+    /// bytes into the exact stream two tests inspect for *emptiness* — that stderr
+    /// carries a compile error through `-q`, and that the initial-compile-error path
+    /// emits something at all. Both assertions silently become unfalsifiable the moment
+    /// anything else is written there unconditionally. A side channel has no such
+    /// coupling: stdout and stderr stay byte-for-byte what a real user would see.
+    ///
+    /// Write-then-rename so a test polling for the path can never observe a partially
+    /// written marker. The temporary file is created new ([`create_ready_marker`]), so a
+    /// symlink planted at `<marker>.tmp` never redirects the write (#390). Failures are
+    /// ignored: this is a test affordance, and a watcher that cannot create the file must
+    /// still watch.
+    pub(super) fn emit_ready_marker() {
+        let Some(raw) = std::env::var_os(READY_MARKER_ENV) else {
+            return;
+        };
+        let path = PathBuf::from(raw);
+        // Absolute paths only. A relative value would resolve against the watcher's cwd
+        // — which under `cargo test` is the crate root — and litter the source tree.
+        if !path.is_absolute() {
+            return;
         }
-        created => created?,
-    };
-    file.write_all(READY_MARKER.as_bytes())
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if create_ready_marker(&tmp).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Create `tmp` new, holding [`READY_MARKER`]: never through an entry already at it,
+    /// which a write that opens the path would follow if it were a symlink (#390). An
+    /// entry there — a leftover, or a planted link — is removed (the entry itself, never
+    /// what a link points to) and the file created once more; another entry in between
+    /// ends the attempt.
+    ///
+    /// A raw write, not `atomic_write_file`'s, by design (#227): the rename that follows
+    /// it is the atomic step. Allow-listed in tests/write_funnel.rs, in this module alone.
+    fn create_ready_marker(tmp: &Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let create = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(tmp)
+        };
+        let mut file = match create() {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(tmp)?;
+                create()?
+            }
+            created => created?,
+        };
+        file.write_all(READY_MARKER.as_bytes())
+    }
 }
+
+#[cfg(debug_assertions)]
+use ready_trigger::emit_ready_marker;
+
+/// A release build's readiness marker: none.
+#[cfg(not(debug_assertions))]
+fn emit_ready_marker() {}
 
 // ── Empty-file hold (#380) ────────────────────────────────────────────────────
 

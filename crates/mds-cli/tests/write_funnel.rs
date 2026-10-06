@@ -21,7 +21,8 @@
 //! write site?" is an unbounded search that three reviewers can each answer differently.
 //! This test converts it into a machine-checked invariant: a raw write in
 //! `crates/mds-cli/src/**` is a failure unless it appears in [`ALLOWED_RAW_WRITES`] with a
-//! written justification.
+//! written justification — and, in a file [`LICENCE_SCOPES`] names, inside the module it
+//! names.
 //!
 //! It also pins the tail of the primitive itself ([`primitive_pin_violations`]): the unix
 //! arm syncs the temporary file and then its directory, renames with `renameat` and
@@ -115,23 +116,26 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
         "watch.rs",
         ".create_new(",
         1,
-        "test-only readiness marker: created new at <path>.tmp, never through an entry \
-         already there, then renamed — already atomic",
+        "the readiness marker a debug build creates for the test suite, in `mod \
+         ready_trigger` (#390): created new at <path>.tmp, never through an entry already \
+         there, then renamed — already atomic",
     ),
     (
         "watch.rs",
         "fs::rename(",
         1,
-        "test-only readiness marker: <path>.tmp, created new, renamed onto the marker path \
-         an absolute environment variable names — the rename is its atomic step",
+        "the readiness marker a debug build creates for the test suite, in `mod \
+         ready_trigger` (#390): <path>.tmp, created new, renamed onto the marker path an \
+         absolute environment variable names — the rename is its atomic step",
     ),
     (
         "watch.rs",
         "remove_file(",
         1,
-        "test-only readiness marker: an entry already at <path>.tmp — a leftover, or a \
-         planted link, the entry itself and never what a link points to — removed before \
-         the marker is created new once more; no file mds writes",
+        "the readiness marker a debug build creates for the test suite, in `mod \
+         ready_trigger` (#390): an entry already at <path>.tmp — a leftover, or a planted \
+         link, the entry itself and never what a link points to — removed before the \
+         marker is created new once more; no file mds writes",
     ),
     (
         "write.rs",
@@ -234,6 +238,13 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
 ];
 
+/// Files whose licences cover one module alone: `(file basename, module)`. A raw write in
+/// such a file outside `mod <module> { … }` is a violation whatever [`ALLOWED_RAW_WRITES`]
+/// licenses there, so a licence for code only a debug build compiles cannot cover a raw
+/// write added beside it. `tests/panic_hook.rs` pins each such module under
+/// `#[cfg(debug_assertions)]`.
+const LICENCE_SCOPES: &[(&str, &str)] = &[("watch.rs", "ready_trigger")];
+
 #[test]
 fn write_sites_are_funnelled() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -273,27 +284,7 @@ fn write_sites_are_funnelled() {
             durability_pin_checked = true;
         }
 
-        for needle in NEEDLES {
-            let hits = needle_lines(&code, needle);
-            if hits.is_empty() {
-                continue;
-            }
-            let allowed = match ALLOWED_RAW_WRITES
-                .iter()
-                .position(|(f, n, _, _)| *f == name && n == needle)
-            {
-                Some(idx) => {
-                    allowed_seen[idx] += hits.len();
-                    ALLOWED_RAW_WRITES[idx].2
-                }
-                None => 0,
-            };
-            for line in hits.iter().skip(allowed) {
-                violations.push(format!(
-                    "  {name}:{line}: raw `{needle}` ({allowed} allow-listed for this file)"
-                ));
-            }
-        }
+        violations.extend(file_violations(name, &code, &mut allowed_seen));
     }
 
     assert!(
@@ -325,6 +316,43 @@ fn write_sites_are_funnelled() {
         violations.len(),
         violations.join("\n")
     );
+}
+
+/// The raw writes in the file `name`, whose masked and test-blanked text is `code`, that
+/// no licence covers: one line each, and every one outside the module [`LICENCE_SCOPES`]
+/// confines the file's licences to. Each hit a licence covers is counted in
+/// `allowed_seen`, indexed in step with [`ALLOWED_RAW_WRITES`].
+fn file_violations(name: &str, code: &str, allowed_seen: &mut [usize]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let (licensed, unlicensed, scope) = licensed_split(name, code);
+    for needle in NEEDLES {
+        for line in needle_lines(&unlicensed, needle) {
+            violations.push(format!(
+                "  {name}:{line}: raw `{needle}` outside `mod {scope}`, which alone this \
+                 file's licences cover"
+            ));
+        }
+        let hits = needle_lines(&licensed, needle);
+        if hits.is_empty() {
+            continue;
+        }
+        let allowed = match ALLOWED_RAW_WRITES
+            .iter()
+            .position(|(f, n, _, _)| *f == name && n == needle)
+        {
+            Some(idx) => {
+                allowed_seen[idx] += hits.len();
+                ALLOWED_RAW_WRITES[idx].2
+            }
+            None => 0,
+        };
+        for line in hits.iter().skip(allowed) {
+            violations.push(format!(
+                "  {name}:{line}: raw `{needle}` ({allowed} allow-listed for this file)"
+            ));
+        }
+    }
+    violations
 }
 
 /// Positive self-check (the guard must be observed rejecting something before "no
@@ -448,6 +476,43 @@ fn the_guard_flags_a_planted_raw_write() {
     );
 }
 
+/// The readiness marker's licences cover `mod ready_trigger` alone, the module only a
+/// debug build compiles: a raw write in it is licensed; the same write beside it, or in a
+/// module of another name, is not. A file whose licences have no scope keeps them
+/// throughout.
+#[test]
+fn a_licence_scoped_to_a_module_covers_that_module_alone() {
+    let rename = "fn f(a: &Path, b: &Path) { let _ = std::fs::rename(a, b); }";
+    let violations = |name: &str, code: &str| {
+        let masked = blank_cfg_test_items(&mask_comments_and_strings(code));
+        file_violations(name, &masked, &mut vec![0usize; ALLOWED_RAW_WRITES.len()])
+    };
+    let inside = format!("#[cfg(debug_assertions)]\nmod ready_trigger {{\n    {rename}\n}}\n");
+    assert_eq!(
+        violations("watch.rs", &inside),
+        Vec::<String>::new(),
+        "the marker's rename inside its module is licensed"
+    );
+    let beside = format!("{inside}{rename}\n");
+    assert_eq!(
+        violations("watch.rs", &beside).len(),
+        1,
+        "a rename beside the module is not"
+    );
+    let renamed = inside.replace("mod ready_trigger", "mod elsewhere");
+    assert_eq!(
+        violations("watch.rs", &renamed).len(),
+        1,
+        "a rename in a module of another name is not"
+    );
+    let unscoped = "fn f(p: &Path) { let _ = std::fs::remove_file(p); }";
+    assert_eq!(
+        violations("write.rs", unscoped),
+        Vec::<String>::new(),
+        "write.rs's licences have no scope"
+    );
+}
+
 /// The primitive's tail, pinned on synthetic sources: a unix arm that syncs the temporary
 /// file and its directory, renames with `renameat` and restores a mode with `fchmod`, and
 /// a Windows arm that syncs the temporary file and persists it, pass; each one dropped,
@@ -554,15 +619,38 @@ fn primitive_pin_violations(code: &str) -> Vec<String> {
 
 /// The body of `mod name { … }` in already-masked source, brace-matched.
 fn module_block<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    module_range(code, name).map(|range| &code[range])
+}
+
+/// The byte range of `mod name { … }` in already-masked source, from `mod` to the brace
+/// matching its `{`.
+fn module_range(code: &str, name: &str) -> Option<std::ops::Range<usize>> {
     let header = format!("mod {name} {{");
     let start = code.find(&header)?;
-    let open = start + header.len() - 1;
-    let close = match_brace(code, open)?;
-    Some(&code[open..=close])
+    let close = match_brace(code, start + header.len() - 1)?;
+    Some(start..close + 1)
+}
+
+/// The already-masked `code` of the file `name` in two parts, each the whole text with
+/// the other part blanked — what the file's licences cover, and what they do not — and
+/// the module [`LICENCE_SCOPES`] confines them to. A file with no scope is licensed
+/// throughout, and its module is empty; a file whose module is gone is licensed nowhere.
+fn licensed_split(name: &str, code: &str) -> (String, String, &'static str) {
+    let Some(&(_, module)) = LICENCE_SCOPES.iter().find(|(file, _)| *file == name) else {
+        return (code.to_owned(), String::new(), "");
+    };
+    match module_range(code, module) {
+        Some(range) => (
+            blank_ranges(code, &[0..range.start, range.end..code.len()]),
+            blank_ranges(code, &[range]),
+            module,
+        ),
+        None => (String::new(), code.to_owned(), module),
+    }
 }
 
 /// Anti-rot companion: every allow-list entry names a file that exists and still contains
-/// at least one masked hit of its needle.
+/// exactly its count of masked hits of its needle, where the file's licences cover.
 #[test]
 fn every_allowlist_entry_is_live() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -575,7 +663,8 @@ fn every_allowlist_entry_is_live() {
         );
         let raw = std::fs::read_to_string(&path).expect("source must be readable");
         let code = blank_cfg_test_items(&mask_comments_and_strings(&raw));
-        let hits = count_occurrences(&code, needle);
+        let (licensed, _, _) = licensed_split(file, &code);
+        let hits = count_occurrences(&licensed, needle);
         assert_eq!(
             hits, *max,
             "allow-list expects {max} raw `{needle}` in {file}, found {hits} \
