@@ -3972,9 +3972,10 @@ fn compile_one_source(
             //
             // Invariant: `src` is strictly below `root`, so this never takes the
             // out-of-root flatten arm and never emits its report (#217). Every path that
-            // reaches here passed `is_in_root` in `process_dir_batch_incremental` or the
-            // equivalent gate in `process_dir_batch_vars_changed`; out-of-root deps take
-            // the dep-refresh-only branch above and never call this function.
+            // reaches here is a source: one `names_a_source` admits, in both passes, or a
+            // known one in `process_dir_batch_vars_changed`; out-of-root deps take the
+            // dep-refresh-only branch and in-root ones that are no source are left to their
+            // importers, so neither calls this function (#380).
             let ext = compiled.kind.extension();
             let out = output_path_for(src, watch_root.root_paths(), output_base, ext);
 
@@ -5325,8 +5326,11 @@ fn process_dir_batch_vars_changed(
 /// 1. Partition changed paths into `existing` / `deleted`.
 /// 2. Compute seeds = existing ∪ deleted ∪ (errored ∩ real-change batch).
 /// 3. Compute affected = transitive importers of seeds (freshness-rule snapshot).
-/// 4. Compile each affected source that exists and is not an external-only dep; one in
-///    the root found gone here, or by its compile, is retired as a deleted source (#160).
+/// 4. Compile each affected source ([`names_a_source`]) that exists; one in the root
+///    found gone here, or by its compile, is retired as a deleted source (#160). An
+///    affected dependency is no source: one outside the root or in a skipped directory
+///    gets a quiet refresh of its own edges, and one in the root — a `type: mds` `.md`
+///    module — none, its importers being affected with it (#380).
 /// 5. Delete outputs for removed sources.
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
@@ -5366,7 +5370,8 @@ fn process_dir_batch_incremental(
     // those gone, and has compiled none of them.
     pause_after_batch_split();
 
-    // 4. Compile each affected source that exists and is not an external-only dep.
+    // 4. Compile each affected source that exists; refresh each dependency outside the
+    //    root or in a skipped directory, and leave one in the root to its importers.
     for src in &affected {
         // External-only deps are graph nodes but never emit output (DD3).
         let is_in_root = src.starts_with(root);
@@ -5422,6 +5427,14 @@ fn process_dir_batch_incremental(
                     );
                 }
             }
+            continue;
+        }
+
+        // An in-root dependency that is no source — a `type: mds` `.md` module, which the
+        // idle tick's content check or a file found emptied puts in a batch, the event path
+        // keeping `.mds` paths alone — is rebuilt through its importers, which `affected`
+        // holds, and never compiled as a source (#380).
+        if !names_a_source(root, src) {
             continue;
         }
 
@@ -8445,6 +8458,141 @@ mod tests {
                 state.errored
             );
         }
+    }
+
+    /// A liveness state past its first tick, with the root armed: an idle tick that runs
+    /// only the content check.
+    fn idle_liveness() -> LivenessState {
+        LivenessState {
+            first_tick: false,
+            root_was_missing: false,
+            root_armed: true,
+            missing_external_dirs: BTreeSet::new(),
+            armed_external_dirs: BTreeSet::new(),
+        }
+    }
+
+    /// #380: a dependency below the root that is no source — a `type: mds` `.md` module a
+    /// source `@include`s, or one whose function a source calls — edited reaches a batch
+    /// through the idle tick's content check, the event path keeping `.mds` paths alone.
+    /// That batch rebuilds its importers and never compiles the module as a source: no
+    /// output is written for it, and it is neither known nor errored.
+    #[test]
+    fn an_idle_tick_rebuilds_the_importers_of_a_changed_module_never_the_module() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let notes = root.join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let (a, b) = (root.join("a.mds"), root.join("b.mds"));
+        let (inc, lib) = (notes.join("inc.md"), notes.join("lib.md"));
+        std::fs::write(&a, "@import \"./notes/inc.md\" as inc\nA.\n@include inc\n").unwrap();
+        std::fs::write(&b, "@import \"./notes/lib.md\" as lib\nB {{lib.hi()}}\n").unwrap();
+        std::fs::write(&inc, "---\ntype: mds\n---\nIncluded one\n").unwrap();
+        std::fs::write(&lib, "---\ntype: mds\n---\n@define hi():\nLib one\n@end\n").unwrap();
+        let ctx = dir_ctx(&root, &out);
+        let mut state = empty_dir_state();
+        state.known_files.extend([a.clone(), b.clone()]);
+        let sources = BTreeSet::from([a.clone(), b.clone()]);
+        rebuild_dir_batch(&ctx, &sources, false, &mut state, None);
+        let read = |rel: &Path| std::fs::read_to_string(out.join(rel)).ok();
+        let tracked = state.tracked_set();
+        assert!(
+            read(Path::new("a.md")).is_some_and(|text| text.contains("Included one"))
+                && read(Path::new("b.md")).is_some_and(|text| text.contains("B Lib one"))
+                && tracked.contains(&inc)
+                && tracked.contains(&lib),
+            "control: both importers are compiled and both modules are tracked, so the \
+             tick's content check looks at them; out/a.md: {:?}, out/b.md: {:?}, \
+             tracked: {tracked:?}",
+            read(Path::new("a.md")),
+            read(Path::new("b.md"))
+        );
+
+        // Both modules edited, each to a new size, and no event delivered.
+        std::fs::write(&inc, "---\ntype: mds\n---\nIncluded two, longer\n").unwrap();
+        std::fs::write(
+            &lib,
+            "---\ntype: mds\n---\n@define hi():\nLib two, longer\n@end\n",
+        )
+        .unwrap();
+        let mut watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default())
+                .unwrap();
+        liveness_probe_dir(&ctx, &mut watcher, &mut idle_liveness(), &mut state);
+
+        assert!(
+            read(Path::new("a.md")).is_some_and(|text| text.contains("Included two, longer")),
+            "positive control: the tick rebuilds the module's importer; out/a.md: {:?}",
+            read(Path::new("a.md"))
+        );
+        assert!(
+            read(Path::new("b.md")).is_some_and(|text| text.contains("B Lib two, longer")),
+            "positive control: the tick rebuilds the importer of the module whose function \
+             it calls; out/b.md: {:?}",
+            read(Path::new("b.md"))
+        );
+        for module in [&inc, &lib] {
+            // Where its output would be written had it been compiled as a source.
+            let rel = module.strip_prefix(&root).unwrap();
+            assert_eq!(
+                read(rel),
+                None,
+                "{}: a module that is no source is never compiled as one",
+                rel.display()
+            );
+            assert!(
+                !state.known_files.contains(module) && !state.errored.contains(module),
+                "{}: neither known nor errored; known: {:?}, errored: {:?}",
+                rel.display(),
+                state.known_files,
+                state.errored
+            );
+        }
+    }
+
+    /// #380: a dependency below the root edited into a plain `.md` — no MDS file at all —
+    /// and found by the idle tick's content check is refused through its importer, whose
+    /// import now fails, and never compiled as a source of its own: it is not errored.
+    #[test]
+    fn an_idle_tick_refuses_a_plain_md_dependency_only_through_its_importer() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let notes = root.join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let a = root.join("a.mds");
+        let inc = notes.join("inc.md");
+        std::fs::write(&a, "@import \"./notes/inc.md\" as inc\nA.\n@include inc\n").unwrap();
+        std::fs::write(&inc, "---\ntype: mds\n---\nIncluded one\n").unwrap();
+        let ctx = dir_ctx(&root, &out);
+        let mut state = empty_dir_state();
+        state.known_files.insert(a.clone());
+        rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+        assert!(
+            state.tracked_set().contains(&inc) && state.errored.is_empty(),
+            "control: the importer compiled and the module is tracked; errored: {:?}",
+            state.errored
+        );
+
+        // Its frontmatter dropped, at a new size, and no event delivered.
+        std::fs::write(&inc, "Plain text now, with no frontmatter at all\n").unwrap();
+        let mut watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default())
+                .unwrap();
+        liveness_probe_dir(&ctx, &mut watcher, &mut idle_liveness(), &mut state);
+
+        assert!(
+            state.errored.contains(&a),
+            "positive control: the tick rebuilds the importer, whose import is refused; \
+             errored: {:?}",
+            state.errored
+        );
+        assert!(
+            !state.errored.contains(&inc) && !state.known_files.contains(&inc),
+            "the plain `.md` is no source, so it is never compiled as one; errored: {:?}, \
+             known: {:?}",
+            state.errored,
+            state.known_files
+        );
     }
 
     /// #380: a file rebuild whose compile read a file of interest emptied after the

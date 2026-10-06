@@ -202,6 +202,7 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// - `i19_dir_watch_liveness_self_heal_rebuild_warns_about_vars_file_duplicate`
 /// - `watch_help_example_src_poll_interval_500_self_heals`
 /// - `watch_dir_failed_rebuild_write_keeps_the_compiled_dependencies`
+/// - `watch_dir_mode_tick_rebuilds_an_md_module_s_importer_and_never_the_module`
 ///
 /// Every other wait in this file is satisfied by an inotify event on a watch that was
 /// never lost, and keeps [`TIMEOUT`].
@@ -1522,6 +1523,65 @@ fn watch_dir_mode_recompiles_a_failed_source_on_a_vars_change() {
         wait_for_file_contains(&out.join("new.md"), "Hello World", TIMEOUT),
         "the source whose compile failed is recompiled by the vars edit; new.md: {:?}",
         std::fs::read_to_string(out.join("new.md")).ok()
+    );
+
+    drop(child);
+}
+
+/// #380: a `type: mds` `.md` module below the root that a source `@include`s is no
+/// source. An edit to it is found by the idle tick's content check, which rebuilds the
+/// source that includes it and never compiles the module as a source of its own — no
+/// output is written for it.
+#[test]
+fn watch_dir_mode_tick_rebuilds_an_md_module_s_importer_and_never_the_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    let notes = root.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        root.join("a.mds"),
+        "@import \"./notes/inc.md\" as inc\nA.\n@include inc\n",
+    )
+    .unwrap();
+    let module = notes.join("inc.md");
+    std::fs::write(&module, "---\ntype: mds\n---\nIncluded one\n").unwrap();
+    let out = dir.path().join("out");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "0", "--poll-interval", "100", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "Included one", TIMEOUT),
+        "a.md is written at startup; stderr: {}",
+        tap.text()
+    );
+    // A late event for a.mds, rebuilt after the edit below, would take the module's new
+    // stamp into the baseline before the tick looks, and the tick would find nothing.
+    settle_queued_events(&tap, &root.join("barrier.mds"), "settle");
+
+    write_atomic(&module, "---\ntype: mds\n---\nIncluded two\n");
+
+    // TICK-DEPENDENT: the module is no `.mds` file, so no event batch names it; the idle
+    // tick's content check finds the edit.
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "Included two", TICK_TIMEOUT),
+        "positive control: the tick rebuilds the source that includes the module; \
+         stderr: {}",
+        tap.text()
+    );
+    let module_out = out.join("notes").join("inc.md");
+    assert!(
+        !module_out.exists(),
+        "the module is never compiled as a source; {} holds {:?}; stderr: {}",
+        module_out.display(),
+        std::fs::read_to_string(&module_out).ok(),
+        tap.text()
     );
 
     drop(child);
