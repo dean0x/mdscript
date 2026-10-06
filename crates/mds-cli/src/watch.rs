@@ -5180,8 +5180,9 @@ mod dir_startup {
 /// Process a batch of changed `.mds` paths in directory mode.
 ///
 /// Thin dispatcher: delegates to `process_dir_batch_vars_changed` when every source
-/// must be recompiled (vars file changed) — the known ones and those the batch names —
-/// or to `process_dir_batch_incremental` for a normal seed-and-propagate pass.
+/// must be recompiled (vars file changed) — the known ones, those the batch names and
+/// those whose last compile failed — or to `process_dir_batch_incremental` for a normal
+/// seed-and-propagate pass.
 ///
 /// Called by both the event path and the reconcile path so the same state
 /// transitions apply uniformly.
@@ -5243,8 +5244,10 @@ fn names_a_source(root: &Path, path: &Path) -> bool {
 /// Full recompile of every source triggered by a vars-file change: the known ones, and
 /// those `changed` names that no walk has found ([`names_a_source`]) — one created in the
 /// same batch, in a batch held with it, or in one the vars file could not be read for,
-/// which is then known as the walk's are (#380).
-/// A dependency `changed` names is recompiled through its importers, which all are.
+/// which is then known as the walk's are (#380) — and those whose last compile failed,
+/// which only `errored` may name: one created by a batch whose compile failed (#380).
+/// A dependency `changed` names is recompiled through its importers, which all are; an
+/// errored dependency is no source, and is left to its importers the same way.
 ///
 /// Recomputes the entire forward-deps graph, external-dep-dirs, and errored set
 /// from scratch (prunes stale entries left over from deleted sources).
@@ -5272,7 +5275,13 @@ fn process_dir_batch_vars_changed(
     let all_sources: BTreeSet<PathBuf> = state
         .known_files
         .iter()
-        .chain(changed.iter().filter(|path| names_a_source(root, path)))
+        .chain(
+            state
+                .errored
+                .iter()
+                .chain(changed)
+                .filter(|path| names_a_source(root, path)),
+        )
         .cloned()
         .collect();
 
@@ -8330,6 +8339,112 @@ mod tests {
              other known source; out/b.md: {:?}",
             read("b.md")
         );
+    }
+
+    /// #380: a batch whose `--vars` file changed recompiles the sources whose last compile
+    /// failed as well as the known ones: a source created by a batch whose compile failed
+    /// is known to no walk, only as errored, and the vars change that fixes it compiles it
+    /// and makes it known. A source still failing stays errored. A path errored that is no
+    /// source below the root — a dependency outside it, or one in a directory the walk
+    /// skips — is not compiled as one.
+    #[test]
+    fn a_vars_changed_batch_recompiles_the_sources_whose_last_compile_failed() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_vars_dir, vars_dir) = canonical_tempdir();
+        let (_elsewhere_dir, elsewhere) = canonical_tempdir();
+        let vars = vars_dir.join("vars.json");
+        let known = root.join("known.mds");
+        let created = root.join("created.mds");
+        let failing = root.join("failing.mds");
+        let excluded = root.join("node_modules").join("dep.mds");
+        let outside = elsewhere.join("outside.mds");
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(&known, "Known {{v}}\n").unwrap();
+        std::fs::write(&excluded, "Excluded {{x}}\n").unwrap();
+        std::fs::write(&outside, "Outside {{x}}\n").unwrap();
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let ctx = DirWatchCtx {
+            vars_path: Some(vars.clone()),
+            vars_path_typed: Some(vars.clone()),
+            ..dir_ctx(&root, &out)
+        };
+        let mut state = empty_dir_state();
+        state.vars_file = Some(vars.clone());
+        state.known_files.insert(known.clone());
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        let read = |rel: &Path| std::fs::read_to_string(out.join(rel)).ok();
+        assert!(
+            read(Path::new("known.md")).is_some_and(|text| text.contains("Known one")),
+            "control: out/known.md is compiled against the first vars; {:?}",
+            read(Path::new("known.md"))
+        );
+
+        // Two sources created, each reading a variable the vars file does not define.
+        std::fs::write(&created, "Created {{x}}\n").unwrap();
+        std::fs::write(&failing, "Failing {{missing}}\n").unwrap();
+        let batch = BTreeSet::from([created.clone(), failing.clone()]);
+        rebuild_dir_batch(&ctx, &batch, false, &mut state, None);
+        assert!(
+            read(Path::new("created.md")).is_none()
+                && state.errored.contains(&created)
+                && !state.known_files.contains(&created),
+            "control: the created source's compile failed, and it is errored, not known; \
+             errored: {:?}, known: {:?}",
+            state.errored,
+            state.known_files
+        );
+        // Errored paths that are no sources below the root, as a dependency's failed
+        // refresh leaves them.
+        state.errored.extend([excluded.clone(), outside.clone()]);
+
+        // The vars file defines the variable: a batch that carries only that change.
+        std::fs::write(&vars, r#"{"v": "two", "x": "World"}"#).unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+
+        assert!(
+            read(Path::new("known.md")).is_some_and(|text| text.contains("Known two")),
+            "positive control: the vars change recompiles the known source; \
+             out/known.md: {:?}",
+            read(Path::new("known.md"))
+        );
+        assert!(
+            read(Path::new("created.md")).is_some_and(|text| text.contains("Created World")),
+            "the source whose last compile failed is recompiled; out/created.md: {:?}",
+            read(Path::new("created.md"))
+        );
+        assert!(
+            state.known_files.contains(&created) && !state.errored.contains(&created),
+            "and is known, no longer errored; known: {:?}, errored: {:?}",
+            state.known_files,
+            state.errored
+        );
+        assert!(
+            read(Path::new("failing.md")).is_none() && state.errored.contains(&failing),
+            "a source still failing stays errored; errored: {:?}",
+            state.errored
+        );
+        // Where each would be written had it been compiled as a source.
+        for rel in [
+            Path::new("node_modules").join("dep.md"),
+            PathBuf::from("outside.md"),
+        ] {
+            assert_eq!(
+                read(&rel),
+                None,
+                "{}: an errored path that is no source below the root is not compiled as one",
+                rel.display()
+            );
+        }
+        for path in [&excluded, &outside] {
+            assert!(
+                !state.known_files.contains(path) && !state.errored.contains(path),
+                "{}: neither known nor errored; known: {:?}, errored: {:?}",
+                path.display(),
+                state.known_files,
+                state.errored
+            );
+        }
     }
 
     /// #380: a file rebuild whose compile read a file of interest emptied after the

@@ -1478,6 +1478,55 @@ fn watch_dir_mode_compiles_a_source_created_while_the_vars_file_is_broken() {
     drop(child);
 }
 
+/// #380: a source whose last compile failed is recompiled by a `--vars` edit, as every
+/// known source is — one created with a variable the vars file does not define yet is
+/// known to no walk, only as failed, and the edit that defines the variable compiles it
+/// rather than leaving it unbuilt until it is edited again.
+#[test]
+fn watch_dir_mode_recompiles_a_failed_source_on_a_vars_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.mds"), "A {{v}}\n").unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let out = dir.path().join("out");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .arg("--vars")
+            .arg(&vars)
+            // Each edit below in a window of its own; no idle tick, whose first full walk
+            // would find the failed source whatever the vars edit did.
+            .args(["--debounce", "100", "--poll-interval", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "A one", TIMEOUT),
+        "a.md is written at startup"
+    );
+
+    write_atomic(&root.join("new.mds"), "Hello {{x}}\n");
+    wait_for_tap_count(&tap, "undefined variable 'x'", 1, TIMEOUT);
+    write_atomic(&vars, r#"{"v": "two", "x": "World"}"#);
+
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "A two", TIMEOUT),
+        "positive control: the vars edit recompiles the known source"
+    );
+    assert!(
+        wait_for_file_contains(&out.join("new.md"), "Hello World", TIMEOUT),
+        "the source whose compile failed is recompiled by the vars edit; new.md: {:?}",
+        std::fs::read_to_string(out.join("new.md")).ok()
+    );
+
+    drop(child);
+}
+
 // ── AC-A5: Quiet mode keeps compile errors visible ────────────────────────
 
 /// Under `-q`, compile errors must still appear on stderr; the watcher stays alive.
