@@ -1115,6 +1115,92 @@ fn watch_never_writes_over_a_file_that_appears_while_a_change_of_kind_is_written
     }
 }
 
+// ── A directory the user may write to but not list ──────────────────────────
+
+/// Set `dir`'s mode to `mode`, and say whether it now refuses a listing: a run as root,
+/// whom no mode refuses, cannot show what the mode does, and its test is skipped.
+#[cfg(unix)]
+fn unlistable(dir: &Path, mode: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("set the mode");
+    std::fs::read_dir(dir).is_err()
+}
+
+/// Make `dir` listable and writable again, so its scratch directory can be removed.
+#[cfg(unix)]
+fn restore(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+        .expect("restore the mode");
+}
+
+/// A directory the user may write to and search but not list — a drop box, mode `0o333`
+/// — takes an output on Linux, as it did before the write walked below its anchor (#160):
+/// there each directory on the way is opened for search alone. Other Unix systems open
+/// each to read, which such a directory refuses: `cannot write box/x.md: Permission
+/// denied (os error 13)`, `mds::io`, exit 2, and nothing written. Control: once the box
+/// can be listed, the same build writes it everywhere.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_listed_takes_an_output_on_linux_alone() {
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "x.mds", "Hello\n");
+    let drop_box = root.join("box");
+    std::fs::create_dir(&drop_box).expect("create the box");
+    if !unlistable(&drop_box, 0o333) {
+        restore(&drop_box);
+        eprintln!(
+            "skipped: {} can be listed at mode 0o333 (running as root?)",
+            drop_box.display()
+        );
+        return;
+    }
+    let out = run(root, &["build", "x.mds", "-o", "box/x.md"]);
+    // Read by path, which the box's search permission allows.
+    let landed = std::fs::read_to_string(drop_box.join("x.md")).ok();
+    restore(&drop_box);
+    let stderr = text(&out.stderr);
+
+    if cfg!(target_os = "linux") {
+        assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+        assert_eq!(landed.as_deref(), Some("Hello\n"), "the output is written");
+        assert_eq!(
+            entries(&drop_box),
+            ["x.md"],
+            "and no temporary file is left"
+        );
+    } else {
+        assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+        assert!(
+            stderr.contains("mds::io")
+                && squash(&stderr).contains(&squash(&format!(
+                    "cannot write {}: Permission denied (os error 13)",
+                    native("box/x.md")
+                ))),
+            "refused, named as typed; stderr: {stderr}"
+        );
+        assert_eq!(landed, None, "nothing is written");
+        assert_eq!(
+            entries(&drop_box),
+            Vec::<String>::new(),
+            "no temporary file is left"
+        );
+    }
+
+    std::fs::remove_file(drop_box.join("x.md")).ok();
+    let out = run(root, &["build", "x.mds", "-o", "box/x.md"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "control; stderr: {}",
+        text(&out.stderr)
+    );
+    assert_eq!(read(&drop_box.join("x.md")), "Hello\n", "control writes it");
+}
+
 // ── Windows ──────────────────────────────────────────────────────────────────
 
 /// Windows: a directory symlink, and a junction, below `--out-dir` are refused as the

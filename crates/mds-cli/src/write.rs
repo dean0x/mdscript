@@ -36,7 +36,10 @@
 //! replaced between two writes is the one the next write finds.
 //!
 //! On unix the walk is `openat(O_DIRECTORY | O_NOFOLLOW)` from the anchor's descriptor
-//! (`mkdirat` first for a directory an output needs), then `fstatat(AT_SYMLINK_NOFOLLOW)` on
+//! (`mkdirat` first for a directory an output needs) — each directory, the anchor
+//! included, opened for search alone (`O_PATH`) on Linux and Android, so one the user may
+//! write to and search but not list takes a write, and to read elsewhere, where such a
+//! directory refuses it — then `fstatat(AT_SYMLINK_NOFOLLOW)` on
 //! the target — never an open of it, which a FIFO would block, and a FIFO, a socket or a
 //! device is refused — the temporary file `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` beside it —
 //! unlinked again if anything after that fails — `fchmod` to the permission bits of the
@@ -1029,15 +1032,30 @@ mod unix {
         TEMP_PREFIX, TEMP_SUFFIX,
     };
 
+    /// How the walk opens a directory: for search alone (`O_PATH`) on Linux and Android, so
+    /// a directory the user may write to and search but not list — a drop box, `-wx` —
+    /// takes a write, as it did before the walk; rustix offers no such open elsewhere, so
+    /// there the directory is opened to read, which such a directory refuses.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const SEARCH: OFlags = OFlags::PATH;
+
+    /// How the walk opens a directory: to read, as no search-only open is to be had here.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const SEARCH: OFlags = OFlags::RDONLY;
+
     /// The anchor: a directory, resolved by path — through a symlink the user named.
-    const ANCHOR: OFlags = OFlags::RDONLY
-        .union(OFlags::DIRECTORY)
-        .union(OFlags::CLOEXEC);
+    const ANCHOR: OFlags = SEARCH.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC);
 
     /// A directory below the anchor: never through a symlink.
-    const BELOW: OFlags = OFlags::RDONLY
+    const BELOW: OFlags = SEARCH
         .union(OFlags::DIRECTORY)
         .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+
+    /// The directory a rewrite's rename was made in, opened again from the walk's
+    /// descriptor to read, the one way it can be synced: an `O_PATH` descriptor cannot be.
+    const TO_SYNC: OFlags = OFlags::RDONLY
+        .union(OFlags::DIRECTORY)
         .union(OFlags::CLOEXEC);
 
     /// The temporary file: a new file, never through a symlink.
@@ -1303,7 +1321,12 @@ mod unix {
     /// instead): it is reported as the missing directory it is, not as the name creating
     /// it found.
     fn open_anchor(anchor: &Path, parents: Parents) -> Result<OwnedFd, Failure> {
-        match fs::openat(CWD, anchor, ANCHOR, Mode::empty()) {
+        let open = || {
+            search_or_read(ANCHOR, SEARCH, |flags| {
+                fs::openat(CWD, anchor, flags, Mode::empty())
+            })
+        };
+        match open() {
             Err(Errno::NOENT) if parents == Parents::Create => {
                 std::fs::create_dir_all(anchor).map_err(|e| {
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -1312,9 +1335,25 @@ mod unix {
                         e
                     }
                 })?;
-                Ok(fs::openat(CWD, anchor, ANCHOR, Mode::empty())?)
+                Ok(open()?)
             }
             opened => Ok(opened?),
+        }
+    }
+
+    /// A directory opened with `flags` by `open`; where they hold `search` — a flag of its
+    /// own, `O_PATH` — and a kernel or a filesystem refuses that open (`EINVAL`), opened
+    /// again without it, to read.
+    pub(super) fn search_or_read<T>(
+        flags: OFlags,
+        search: OFlags,
+        open: impl Fn(OFlags) -> Result<T, Errno>,
+    ) -> Result<T, Errno> {
+        match open(flags) {
+            Err(Errno::INVAL) if !search.is_empty() && flags.contains(search) => {
+                open(flags.difference(search))
+            }
+            opened => opened,
         }
     }
 
@@ -1353,13 +1392,18 @@ mod unix {
     /// Open the directory `name` in `dir` without following a symlink, creating it first
     /// when it is missing and `parents` says so.
     fn open_below(dir: BorrowedFd<'_>, name: &OsStr, parents: Parents) -> Result<OwnedFd, Errno> {
-        match fs::openat(dir, name, BELOW, Mode::empty()) {
+        let open = || {
+            search_or_read(BELOW, SEARCH, |flags| {
+                fs::openat(dir, name, flags, Mode::empty())
+            })
+        };
+        match open() {
             Err(Errno::NOENT) if parents == Parents::Create => {
                 match fs::mkdirat(dir, name, NEW_DIR) {
                     Ok(()) | Err(Errno::EXIST) => {}
                     Err(e) => return Err(e),
                 }
-                fs::openat(dir, name, BELOW, Mode::empty())
+                open()
             }
             opened => opened,
         }
@@ -1769,7 +1813,9 @@ mod unix {
         })
     }
 
-    /// Make the rename itself durable by syncing the directory it happened in.
+    /// Make the rename itself durable by syncing the directory it happened in: `dir`, as
+    /// the walk opened it, opened again to read ([`TO_SYNC`]) — a descriptor opened for
+    /// search alone cannot be synced — which a directory the user may not list refuses.
     ///
     /// `File::sync_all` is `F_FULLFSYNC` on Apple platforms, which a filesystem may refuse
     /// for a directory (`ENOTSUP`, `EOPNOTSUPP`, `EINVAL`); a plain `fsync` is the fallback
@@ -1777,12 +1823,12 @@ mod unix {
     /// has landed, so the write stands. Any other failure is the write's. The directory is
     /// given back.
     fn sync_directory(dir: OwnedFd) -> std::io::Result<OwnedFd> {
-        let dir = File::from(dir);
+        let readable = File::from(fs::openat(&dir, ".", TO_SYNC, Mode::empty())?);
         settle_directory_sync(
-            || dir.sync_all(),
-            || fs::fsync(&dir).map_err(std::io::Error::from),
+            || readable.sync_all(),
+            || fs::fsync(&readable).map_err(std::io::Error::from),
         )?;
-        Ok(OwnedFd::from(dir))
+        Ok(dir)
     }
 
     /// The directory sync's outcome, from `full`, the sync asked for first, and `plain`,
@@ -2569,6 +2615,102 @@ mod tests {
                 "{errno:?} of a directory is the write's own failure"
             );
         }
+    }
+
+    /// A directory the user may write to and search but not list — a drop box, mode
+    /// `0o333` — takes a write on Linux and Android, as the anchor and as a directory below
+    /// it, since the walk opens each for search alone (#160). Elsewhere the walk opens each
+    /// to read, which such a directory refuses: `Permission denied`, and nothing written.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_listed_takes_a_write_on_linux_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let drop_box = dir.path().join("box");
+        std::fs::create_dir(&drop_box).unwrap();
+        let mode =
+            |mode| std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(mode));
+        mode(0o333).unwrap();
+        if std::fs::read_dir(&drop_box).is_ok() {
+            mode(0o755).unwrap();
+            crate::output::ewriteln!("running as root; mode 0o333 does not stop a listing");
+            return;
+        }
+        let as_anchor = WriteTarget::as_typed(drop_box.join("anchor.md"));
+        let below = WriteTarget::below(dir.path(), Path::new("out"), Path::new("box/below.md"));
+        let written = [&as_anchor, &below].map(|target| {
+            atomic_write_file(target, "X", Durability::RenameOnly, Parents::Existing)
+                .map_err(|e| e.to_string())
+        });
+        // Read by path, which the directory's search permission allows.
+        let landed =
+            ["anchor.md", "below.md"].map(|name| std::fs::read_to_string(drop_box.join(name)).ok());
+        // Restored before anything is asserted, so the scratch directory can be removed.
+        mode(0o755).unwrap();
+
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            assert_eq!(written, [Ok(()), Ok(())]);
+            assert_eq!(landed, [Some("X".to_owned()), Some("X".to_owned())]);
+            assert_eq!(entries(&drop_box), ["anchor.md", "below.md"]);
+        } else {
+            let denied = "Permission denied (os error 13)";
+            let [anchor_err, below_err] = written.map(|w| w.expect_err("a drop box is refused"));
+            assert!(
+                anchor_err.starts_with("cannot write ") && anchor_err.ends_with(denied),
+                "{anchor_err}"
+            );
+            assert_eq!(
+                below_err,
+                format!("cannot write out/box/below.md: {denied}")
+            );
+            assert_eq!(landed, [None, None]);
+            assert_eq!(entries(&drop_box), Vec::<String>::new());
+        }
+    }
+
+    /// The walk's search-only open, refused by a kernel or a filesystem (`EINVAL`), is made
+    /// again to read; any other failure is the open's, and an open whose search flag is
+    /// none of its own — a platform without one — is never made twice.
+    #[cfg(unix)]
+    #[test]
+    fn a_search_only_open_that_is_refused_is_made_again_to_read() {
+        use std::cell::RefCell;
+
+        use rustix::fs::OFlags;
+        use rustix::io::Errno;
+
+        // A stand-in for `O_PATH`, which this platform may not have.
+        let search = OFlags::NONBLOCK;
+        let flags = OFlags::DIRECTORY | search;
+        let opens = |refusal: Errno, search: OFlags| {
+            let asked = RefCell::new(Vec::new());
+            let opened = super::unix::search_or_read(flags, search, |with: OFlags| {
+                asked.borrow_mut().push(with);
+                if with.contains(OFlags::NONBLOCK) {
+                    Err(refusal)
+                } else {
+                    Ok(())
+                }
+            });
+            (opened, asked.into_inner())
+        };
+
+        assert_eq!(
+            opens(Errno::INVAL, search),
+            (Ok(()), vec![flags, OFlags::DIRECTORY]),
+            "refused: opened again to read"
+        );
+        assert_eq!(
+            opens(Errno::ACCESS, search),
+            (Err(Errno::ACCESS), vec![flags]),
+            "any other failure is the open's"
+        );
+        assert_eq!(
+            opens(Errno::INVAL, OFlags::empty()),
+            (Err(Errno::INVAL), vec![flags]),
+            "no search flag of its own: nothing to open again without"
+        );
     }
 
     /// The Fsync tier's directory sync, after the rename has landed: a sync refused for a

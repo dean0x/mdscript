@@ -131,14 +131,16 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "write.rs",
         "openat(",
-        7,
-        "the primitive's unix walk: the anchor (opened, then again once created), each \
-         directory below it without following a symlink (opened, then again once \
-         created), the temporary file, created new without following one, the file a \
-         rewrite reads again before it replaces it, or a removal's proof reads before it \
-         is removed, opened read-only without following one, and the file a new file's \
-         commit writes in place on a filesystem without hard links, created new without \
-         following one (#160)",
+        6,
+        "the primitive's unix walk: the anchor, and each directory below it without \
+         following a symlink — one call each, made again once the directory is created, \
+         or to read where a search-only open is refused — the directory a rewrite's \
+         rename was made in, opened again to read so it can be synced, the temporary \
+         file, created new without following one, the file a rewrite reads again before \
+         it replaces it, or a removal's proof reads before it is removed, opened \
+         read-only without following one, and the file a new file's commit writes in \
+         place on a filesystem without hard links, created new without following one \
+         (#160)",
     ),
     (
         "write.rs",

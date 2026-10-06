@@ -107,7 +107,9 @@ input. The compiler enforces several defense-in-depth controls:
   compared on the descriptor it opened, so a link swapped onto the path between the
   check and the write is refused rather than followed. Nothing below the anchor is
   followed (#160): on Unix each directory below the anchor is opened from the one above
-  without following a symlink (`openat` with `O_NOFOLLOW`), and the temp file is
+  without following a symlink (`openat` with `O_NOFOLLOW`) — for search alone
+  (`O_PATH`) on Linux, and to read on other Unix systems, so there a directory the user
+  may write to but not list refuses the write — and the temp file is
   created (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
   descriptor, and renamed (`renameat`) in the last one, so a symlink below the anchor
   — planted before the run or swapped in while a write runs — and a symlink at the
