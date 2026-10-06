@@ -61,9 +61,11 @@
 //! diff it lost counts under "with errors" (#157).
 //!
 //! A `--fix` rewrite that lands in a directory it cannot then sync is reported the same
-//! way (#160): `Fixed:` names the file and its residual counts as for any fix that landed,
-//! then the failed sync is reported once as `mds::io`, and the funnel lifts the code to at
-//! least 2.
+//! way (#160): its residual counts as for any fix that landed, the failed sync is reported
+//! once as `mds::io`, and the funnel lifts the code to at least 2. Given a file, `Fixed:`
+//! names it first. A directory run syncs each directory once, after the last of its entries,
+//! and shows those entries' `Fixed:` lines only then: the failed sync takes the place of
+//! each one's.
 //!
 //! A panic ends the run with 101 through the funnel (#389). A panic in an entry's
 //! analysis — `mds::lint` on a directory's entry, or the fix pipeline — fails that input
@@ -88,7 +90,10 @@ use crate::output::{
     catch_compile, collect_mds_files_detailed, eprint_warning, render_unified_diff, safe_inline,
     safe_path, Panicked, RootPaths, WriteTarget, STDIN_DISPLAY_LABEL,
 };
-use crate::write::{read_stamped, replace_if_unchanged, Durability, Rewritten};
+use crate::write::{
+    read_stamped, replace_if_unchanged, replace_owing_sync, DirectorySyncs, Durability, Flushed,
+    ReadForRewrite, Renamed, Rewritten, Synced,
+};
 
 // AC-224-15: No local rule-name list. The single source of truth is
 // mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
@@ -1053,12 +1058,12 @@ enum Rewrite {
     /// Nothing to fix; the findings stand.
     Unchanged,
     /// The fixed source was written. `residual` is what it is left with; `partial` holds the
-    /// applied and planned edit counts when not every edit applied; `not_synced` is the
-    /// error of a directory that could not be synced after the rename landed (#160).
+    /// applied and planned edit counts when not every edit applied; `sync` is how its
+    /// directory's sync after the rename went, or that it is owed (#160).
     Written {
         residual: Residual,
         partial: Option<(usize, usize)>,
-        not_synced: Option<MdsError>,
+        sync: DirectorySync,
     },
     /// The fixed source could not be written. `residual` is what it would have been left
     /// with, shown before the failure in a human report. A JSON output records each input
@@ -1068,6 +1073,26 @@ enum Rewrite {
         error: MdsError,
         residual: Option<Residual>,
     },
+}
+
+/// The sync of the directory a `--fix` rewrite was renamed in, which makes the rename
+/// durable (#160).
+enum DirectorySync {
+    /// A file argument's, made as the rewrite landed: `Some` with the error of a directory
+    /// that could not be synced.
+    Made(Option<MdsError>),
+    /// A directory's entry's, owed: [`run_lint_directory`] makes it once for every fix in
+    /// that directory, after the last of its entries there, and only then shows those
+    /// fixes' `Fixed:` lines.
+    Owed(Renamed),
+}
+
+/// A fix [`render`] has shown the findings of, whose directory's sync is owed
+/// ([`DirectorySync::Owed`]): its `Fixed:` line — or, if the sync fails, that failure —
+/// is shown once the sync is made.
+struct OwedFix {
+    renamed: Renamed,
+    partial: Option<(usize, usize)>,
 }
 
 /// The findings a fixed source is left with, and that source: the text their spans index
@@ -1169,8 +1194,9 @@ fn lint_input<'a>(
     let outcome = if flags.check || flags.diff {
         preview_fix(&input, result, text, fix, flags)
     } else {
-        // A file argument's rewrite is anchored at its typed parent, a directory entry's at
-        // the directory argument (#160).
+        // A file argument's rewrite is anchored at its typed parent and its directory synced
+        // as it lands; a directory entry's is anchored at the directory argument, and its
+        // directory's sync is owed to the run (#160).
         match input {
             LintSource::Stdin => fix_stdin(result, text, fix),
             LintSource::File { typed, .. } => apply_fix(
@@ -1179,6 +1205,7 @@ fn lint_input<'a>(
                 text,
                 fix,
                 flags.format,
+                rewrite_synced,
             ),
             LintSource::DirEntry { root, path, .. } => apply_fix(
                 &WriteTarget::walked_below(RootPaths::as_typed(root), path),
@@ -1186,6 +1213,7 @@ fn lint_input<'a>(
                 text,
                 fix,
                 flags.format,
+                rewrite_owing_sync,
             ),
         }
     };
@@ -1231,7 +1259,30 @@ fn preview_fix(
     }
 }
 
-/// `--fix`: rewrite the input's file, `target`, with the fixed source. Stdin is a filter
+/// A file argument's `--fix` rewrite: the file `read` replaced with `fixed`, and its
+/// directory synced as it lands (#160).
+fn rewrite_synced(
+    read: ReadForRewrite,
+    fixed: &str,
+) -> std::result::Result<DirectorySync, MdsError> {
+    let rewritten = replace_if_unchanged(read, fixed, Durability::Fsync)?;
+    Ok(DirectorySync::Made(match rewritten {
+        Rewritten::Done => None,
+        Rewritten::NotSynced(error) => Some(error),
+    }))
+}
+
+/// A directory entry's `--fix` rewrite: the file `read` replaced with `fixed`, and the sync
+/// of its directory owed to the run (#160).
+fn rewrite_owing_sync(
+    read: ReadForRewrite,
+    fixed: &str,
+) -> std::result::Result<DirectorySync, MdsError> {
+    replace_owing_sync(read, fixed).map(DirectorySync::Owed)
+}
+
+/// `--fix`: rewrite the input's file, `target`, with the fixed source, by `rewrite`, which
+/// replaces the file read with it and says how its directory's sync went. Stdin is a filter
 /// instead ([`fix_stdin`]).
 fn apply_fix(
     target: &WriteTarget,
@@ -1239,6 +1290,7 @@ fn apply_fix(
     text: String,
     fix: FixPipelineOutcome,
     format: LintFormat,
+    rewrite: impl FnOnce(ReadForRewrite, &str) -> std::result::Result<DirectorySync, MdsError>,
 ) -> Outcome {
     let (new_source, residual, partial) = match fix {
         FixPipelineOutcome::Fixed {
@@ -1273,16 +1325,11 @@ fn apply_fix(
         fixed: new_source,
     };
     // Only over the bytes the fix was made from, in the directory they were read in (#160).
-    let fix = match read_stamped(target, &text)
-        .and_then(|read| replace_if_unchanged(read, &residual.fixed, Durability::Fsync))
-    {
-        Ok(rewritten) => Rewrite::Written {
+    let fix = match read_stamped(target, &text).and_then(|read| rewrite(read, &residual.fixed)) {
+        Ok(sync) => Rewrite::Written {
             residual,
             partial,
-            not_synced: match rewritten {
-                Rewritten::Done => None,
-                Rewritten::NotSynced(error) => Some(error),
-            },
+            sync,
         },
         Err(error) => {
             // A JSON output records each input once — a directory's entry, a file
@@ -1345,16 +1392,20 @@ fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -
 /// - A rewrite that landed shows the findings the file is left with, rendered against the
 ///   fixed source, then `Fixed:` — never before, so no line claims a fix the file did not
 ///   get — then, for one whose directory could not be synced after it, that failure
-///   (#160). One that failed shows those findings, where the output keeps them, rendered
-///   against the source it failed to write, then the failure.
+///   (#160). A directory's entry, whose directory's sync is owed, shows its findings here
+///   and comes back as [`Shown::owed`]: its `Fixed:` line, or the failed sync in its place,
+///   is [`run_lint_directory`]'s to show once the sync is made. One that failed shows those
+///   findings, where the output keeps them, rendered against the source it failed to write,
+///   then the failure.
 /// - The stdin filter shows its status line, then its findings, rendered against the
 ///   source it emits, then that source.
-fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
+fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> Shown {
     let FileReport {
         input,
         capped,
         outcome,
     } = report;
+    let mut owed = None;
     if let Some(notice) = capped {
         sink.cap_reached(&input, notice);
     }
@@ -1426,12 +1477,17 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
             Rewrite::Written {
                 residual,
                 partial,
-                not_synced,
+                sync,
             } => {
                 sink.findings(&input, &residual.findings, Some(&residual.fixed), truncated);
-                sink.fixed(&input, partial);
-                if let Some(error) = not_synced {
-                    sink.not_synced(&input, error);
+                match sync {
+                    DirectorySync::Made(not_synced) => {
+                        sink.fixed(&input, partial);
+                        if let Some(error) = not_synced {
+                            sink.not_synced(&input, error);
+                        }
+                    }
+                    DirectorySync::Owed(renamed) => owed = Some(OwedFix { renamed, partial }),
                 }
                 (tally_from_result(&residual.findings), false)
             }
@@ -1458,10 +1514,33 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
             (tally_from_result(&findings), false)
         }
     };
-    InputVerdict {
-        tally,
-        would_fix,
-        truncated,
+    Shown {
+        verdict: InputVerdict {
+            tally,
+            would_fix,
+            truncated,
+        },
+        owed,
+    }
+}
+
+/// What [`render`] made of an input's report: what the input came to, and, for a
+/// directory's entry whose fix landed, that fix, whose directory's sync is owed (#160).
+/// Stdin and a file argument owe none: stdin is never rewritten, and a file argument's
+/// rewrite syncs its directory as it lands.
+struct Shown {
+    verdict: InputVerdict,
+    owed: Option<OwedFix>,
+}
+
+impl Shown {
+    /// The exit code of a run over this one input, stdin or a file argument.
+    fn exit_code(self) -> i32 {
+        debug_assert!(
+            self.owed.is_none(),
+            "stdin and a file argument owe no directory sync"
+        );
+        self.verdict.exit_code()
     }
 }
 
@@ -1816,11 +1895,30 @@ fn run_lint_directory(
     };
 
     // Each entry comes to exactly one report and one verdict, and the summary is their
-    // fold: its counts add up to the entries by construction.
+    // fold: its counts add up to the entries by construction. Each directory a fix lands
+    // in is synced once, after the last entry in it, and only then are its fixes' `Fixed:`
+    // lines shown (#160).
     sink.start_document();
+    let mut syncs = DirectorySyncs::new(keyed.iter().map(|(path, _)| path.as_path()));
     let summary = keyed
         .iter()
-        .map(|(path, key)| render(lint_dir_entry(dir, path, key, &ctx), sink))
+        .enumerate()
+        .map(|(place, (path, key))| {
+            let Shown { verdict, owed } = render(lint_dir_entry(dir, path, key, &ctx), sink);
+            if let Some(OwedFix { renamed, partial }) = owed {
+                let fixed = FixedEntry {
+                    entry: LintSource::DirEntry {
+                        root: dir,
+                        path,
+                        key,
+                    },
+                    partial,
+                };
+                show_synced(syncs.landed(place, renamed, fixed), sink);
+            }
+            show_synced(syncs.past(place), sink);
+            verdict
+        })
         .fold(DirSummary::default(), DirSummary::count);
 
     // The JSON document first, so consumers always receive it on stdout whatever the
@@ -1832,6 +1930,26 @@ fn run_lint_directory(
     // preview the tallies are the residuals', so a tree whose fixes would leave
     // error-severity findings behind exits 2 even though every file "would fix".
     summary.exit_code()
+}
+
+/// A directory's entry whose fix landed, its directory's sync owed (#160), and the applied
+/// and planned edit counts of a partial fix: what [`show_synced`] shows once the sync is made.
+struct FixedEntry<'a> {
+    entry: LintSource<'a>,
+    partial: Option<(usize, usize)>,
+}
+
+/// Show the fixes one directory sync of a directory run was made for (#160): `Fixed:` or
+/// `Partially fixed:` when the directory was synced; otherwise, in its place, the failed
+/// sync, recorded so the run exits at least 2. Either way the entry counts by the findings
+/// its fix left, as it did when they were shown.
+fn show_synced(flushed: Option<Flushed<FixedEntry<'_>>>, sink: &mut impl ResultSink) {
+    for synced in flushed.into_iter().flatten() {
+        match synced {
+            Synced::Durable(FixedEntry { entry, partial }) => sink.fixed(&entry, partial),
+            Synced::NotSynced(FixedEntry { entry, .. }, error) => sink.not_synced(&entry, error),
+        }
+    }
 }
 
 /// Read and lint one entry of a directory, and report what it came to: [`lint_input`]'s
@@ -1914,10 +2032,10 @@ fn lint_dir_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fix, fix_stdin, lint_input, render, run_fix_pipeline, set_diag_display_path,
-        CapNotice, DirSummary, FileReport, FileTally, FilterFix, FixPipelineOutcome, InputVerdict,
-        LintFlags, LintFormat, LintSource, Linted, Outcome, PreviewFix, Residual, ReverifyGate,
-        Rewrite, SourceText,
+        apply_fix, fix_stdin, lint_input, render, rewrite_owing_sync, rewrite_synced,
+        run_fix_pipeline, set_diag_display_path, CapNotice, DirSummary, DirectorySync, FileReport,
+        FileTally, FilterFix, FixPipelineOutcome, InputVerdict, LintFlags, LintFormat, LintSource,
+        Linted, Outcome, PreviewFix, Residual, ReverifyGate, Rewrite, SourceText,
     };
     use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
     use crate::output::{safe_path, STDIN_DISPLAY_LABEL};
@@ -2350,6 +2468,7 @@ mod tests {
             FIX_LEAVES_A_FINDING.to_string(),
             outcome,
             DIR_JSON_FIX.format,
+            rewrite_owing_sync,
         );
         let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
         sink.start_document();
@@ -2358,7 +2477,7 @@ mod tests {
             capped: None,
             outcome,
         };
-        let verdict = render(report, &mut sink);
+        let verdict = render(report, &mut sink).verdict;
         (verdict, sink.document().to_vec())
     }
 
@@ -2462,7 +2581,7 @@ mod tests {
             };
             let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
             sink.start_document();
-            let verdict = render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink);
+            let verdict = render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink).verdict;
             (verdict, sink.document().to_vec())
         };
 
@@ -2533,7 +2652,7 @@ mod tests {
             };
             let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
             sink.start_document();
-            let verdict = render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink);
+            let verdict = render(lint_input(linted, DIR_JSON_FIX, &None), &mut sink).verdict;
             (verdict, sink.document().to_vec())
         };
 
@@ -2631,11 +2750,22 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         calls: Vec<String>,
+        /// How many directory syncs this thread had started at each `fixed` and `not
+        /// synced` call, in order ([`crate::write::sync_probe`]).
+        #[cfg(unix)]
+        syncs_seen: Vec<usize>,
     }
 
     impl Recorder {
         fn record(&mut self, call: &str, input: &LintSource<'_>) {
             self.calls.push(format!("{call} {}", input.display_label()));
+        }
+
+        /// Note how many directory syncs this thread has started.
+        fn note_syncs(&mut self) {
+            #[cfg(unix)]
+            self.syncs_seen
+                .push(crate::write::sync_probe::directory_syncs());
         }
     }
 
@@ -2670,6 +2800,7 @@ mod tests {
 
         fn not_synced(&mut self, input: &LintSource<'_>, _: MdsError) {
             self.record("not synced", input);
+            self.note_syncs();
         }
 
         fn clean(&mut self, input: &LintSource<'_>, _: &LintResult) {
@@ -2707,6 +2838,7 @@ mod tests {
         fn fixed(&mut self, input: &LintSource<'_>, partial: Option<(usize, usize)>) {
             let call = format!("fixed {partial:?}");
             self.record(&call, input);
+            self.note_syncs();
         }
 
         fn diff(&mut self, _: &str) -> bool {
@@ -2910,7 +3042,7 @@ mod tests {
                 rewritten(Rewrite::Written {
                     residual: fixed(uncapped()),
                     partial: None,
-                    not_synced: None,
+                    sync: DirectorySync::Made(None),
                 }),
                 false,
             ),
@@ -2919,7 +3051,7 @@ mod tests {
                 rewritten(Rewrite::Written {
                     residual: fixed(capped()),
                     partial: Some((1, 2)),
-                    not_synced: None,
+                    sync: DirectorySync::Made(None),
                 }),
                 true,
             ),
@@ -2963,7 +3095,7 @@ mod tests {
                 outcome,
             };
             let mut sink = Recorder::default();
-            let verdict = render(report, &mut sink);
+            let verdict = render(report, &mut sink).verdict;
             seen.push((what, verdict.truncated, sink.calls.first().cloned()));
             expected.push((what, truncated, Some("cap reached x.mds".to_string())));
         }
@@ -2992,12 +3124,12 @@ mod tests {
                             fixed: String::new(),
                         },
                         partial: None,
-                        not_synced,
+                        sync: DirectorySync::Made(not_synced),
                     },
                 },
             };
             let mut sink = Recorder::default();
-            let verdict = render(report, &mut sink);
+            let verdict = render(report, &mut sink).verdict;
             (sink.calls, verdict.tally == FileTally::Clean)
         };
         let not_synced = MdsError::Io {
@@ -3026,6 +3158,73 @@ mod tests {
             ),
             "control: synced"
         );
+    }
+
+    /// `mds lint --fix <dir>` syncs each directory its fixes landed in once, after the run
+    /// is past its last file there, and only then shows those files' `Fixed:` lines, so a
+    /// line shown still means the fix is synced (#160). `src` holds `a.mds`, `b.mds` and
+    /// `z.mds`, `src/sub` holds `c.mds`, each fixed: `sub/c.mds` is synced and shown when the
+    /// run is past it, `src`'s three once the run is past `z.mds` — two syncs for four
+    /// fixes, each file's findings shown in its place. When the syncs fail, each file of the
+    /// directory is shown as written but not synced, once, with no `Fixed:` line, and counts
+    /// by the findings it is left with — none here, so the run's verdict is clean.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_fix_syncs_each_directory_once_and_then_shows_its_files() {
+        use crate::write::sync_probe::{directory_syncs, failing_with};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().canonicalize().unwrap().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let files = ["a.mds", "b.mds", "sub/c.mds", "z.mds"].map(|file| src.join(file));
+        // The calls the run makes of its sink, the directory syncs it started, how many it
+        // had started at each `fixed` and `not synced` call, and its verdict's exit code.
+        let fix = || {
+            for file in &files {
+                std::fs::write(file, "@if \"x\" == \"y\":\nhidden\n@end\nAlpha\n").unwrap();
+            }
+            let mut sink = Recorder::default();
+            let before = directory_syncs();
+            let code = super::run_lint_directory(&src, DIR_JSON_FIX, None, &mut sink);
+            for file in &files {
+                assert_eq!(
+                    std::fs::read_to_string(file).unwrap(),
+                    "Alpha\n",
+                    "{file:?}"
+                );
+            }
+            let seen = sink
+                .syncs_seen
+                .iter()
+                .map(|n| n - before)
+                .collect::<Vec<_>>();
+            (sink.calls, directory_syncs() - before, seen, code)
+        };
+        let calls = |shown: &str| {
+            [
+                "start document".to_string(),
+                "findings (0) a.mds".to_string(),
+                "findings (0) b.mds".to_string(),
+                "findings (0) sub/c.mds".to_string(),
+                format!("{shown} sub/c.mds"),
+                "findings (0) z.mds".to_string(),
+                format!("{shown} a.mds"),
+                format!("{shown} b.mds"),
+                format!("{shown} z.mds"),
+                "end document".to_string(),
+            ]
+            .to_vec()
+        };
+
+        assert_eq!(fix(), (calls("fixed None"), 2, vec![1, 2, 2, 2], 0));
+
+        let failing = failing_with(5);
+        assert_eq!(
+            fix(),
+            (calls("not synced"), 2, vec![1, 2, 2, 2], 0),
+            "a failed sync shows each file of its directory once, and no `Fixed:` line"
+        );
+        drop(failing);
     }
 
     /// The environment variable that makes a test run as the child [`in_a_child`] starts;
@@ -3099,7 +3298,7 @@ mod tests {
                     text,
                 },
             };
-            let verdict = render(report, &mut HumanSink::new(false));
+            let verdict = render(report, &mut HumanSink::new(false)).verdict;
             assert!(
                 verdict.tally == FileTally::Error,
                 "the error-severity finding counts"
@@ -3185,13 +3384,14 @@ mod tests {
                 text,
                 fix,
                 LintFormat::Human,
+                rewrite_synced,
             );
             let report = FileReport {
                 input,
                 capped: None,
                 outcome,
             };
-            let verdict = render(report, &mut HumanSink::new(false));
+            let verdict = render(report, &mut HumanSink::new(false)).verdict;
             assert!(
                 verdict.tally == FileTally::WarnOnly,
                 "the file counts by the warning the fix left"
@@ -3257,7 +3457,7 @@ mod tests {
                 capped: None,
                 outcome,
             };
-            let verdict = render(report, &mut HumanSink::new(false));
+            let verdict = render(report, &mut HumanSink::new(false)).verdict;
             assert!(
                 verdict.tally == FileTally::WarnOnly,
                 "stdin counts by the warning the fix left"

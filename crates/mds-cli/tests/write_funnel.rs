@@ -2,8 +2,9 @@
 //! go through the single atomic choke point in `crate::write` — `atomic_write_file`, or,
 //! for a compiled output or a sidecar, which never replaces an MDS module (#425),
 //! `write_compiled`, or `write_compiled_and_look`, for a directory build's outputs below
-//! an out-dir, or, for a rewrite of a file just read, `replace_if_unchanged`, or, for a
-//! new file that must never replace one, `create_new`, or, for `mds watch`'s output after
+//! an out-dir, or, for a rewrite of a file just read, `replace_if_unchanged` — or, in a
+//! directory run, `replace_owing_sync`, which leaves its directory's sync to the run — or,
+//! for a new file that must never replace one, `create_new`, or, for `mds watch`'s output after
 //! a change of kind, `write_over_own`, which share its tail — and every file it removes
 //! through `remove_proven`, below the same anchor. The one carve-out is the readiness
 //! marker a debug build's `mds watch` creates for the test suite (`MDS_TEST_READY`), whose

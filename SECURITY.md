@@ -126,7 +126,12 @@ input. The compiler enforces several defense-in-depth controls:
   rewrite the file is read again below its anchor, without following a symlink, and
   must hold the bytes formatted or fixed; on Unix the directory it is in stays open and
   the rewrite is renamed into that directory, whatever its path leads to by then, so a
-  directory swapped after the read never receives another file's content. Just before
+  directory swapped after the read never receives another file's content. That
+  directory is then synced, which makes the rename durable — at once for a file
+  argument, and in a directory run once for all its rewrites there, when the run is past
+  the last of its files, the directory held open until then — so the sync is always made
+  on the directory the renames went into, never on one swapped in at its path, and a
+  rewrite's `Formatted:` or `Fixed:` line is shown only after it. Just before
   the rename the file is looked at again in that directory and compared with a stamp
   taken when it was read — on Unix device and inode, size, and modification and
   status-change times; on Windows size, and modification and creation times — and a

@@ -3,7 +3,8 @@
 //! [`write_compiled_and_look`] for a directory build's outputs below an out-dir (#160),
 //! [`atomic_write_file`] for `mds init --force`'s starter, [`create_new`] for `mds init`'s
 //! starter without `--force`, [`replace_if_unchanged`] for `mds fmt` and `mds lint --fix`
-//! rewrites, [`write_over_own`] for an `mds watch` output after its source's change of kind
+//! rewrites of a file argument and [`replace_owing_sync`] for those of a directory run's
+//! files, [`write_over_own`] for an `mds watch` output after its source's change of kind
 //! (#227, #160) — and every file it removes, through [`remove_proven`]. A debug build also
 //! writes, by path and outside it, the readiness marker `mds watch` creates for the test
 //! suite (`MDS_TEST_READY`). `tests/write_funnel.rs` keeps it the only one, that marker's
@@ -37,8 +38,10 @@
 //! symlink, and the file is created, checked and renamed in the last one. A symlink
 //! planted below the anchor, or swapped in while the write runs, is refused (`mds::io`,
 //! exit 2) by the path the user knows it by, and nothing is written through it. The walk
-//! is made for every write and nothing is held open between writes, so a directory
-//! replaced between two writes is the one the next write finds.
+//! is made for every write and nothing it opens is held for the next write — a directory
+//! run of `mds fmt` or `mds lint --fix` holds a directory its rewrites went in only to sync
+//! it once they are all made ([`DirectorySyncs`]) — so a directory replaced between two
+//! writes is the one the next write finds.
 //!
 //! On unix the walk is `openat(O_DIRECTORY | O_NOFOLLOW)` from the anchor's descriptor
 //! (`mkdirat` first for a directory an output needs) — each directory, the anchor
@@ -66,6 +69,12 @@
 //! a stamp of the file; [`replace_if_unchanged`] renames the rewrite into that directory
 //! only while the file there is still the one read, so an edit made after the read is not
 //! overwritten and a directory swapped after it never receives the rewrite.
+//!
+//! The rewrite's bytes are synced before the rename, and its directory after it
+//! ([`Durability::Fsync`]): [`replace_if_unchanged`] syncs the directory at once, for a
+//! file argument; [`replace_owing_sync`] leaves that to a directory run, which syncs each
+//! directory once, after the last of its files, and shows a rewrite's status line only then
+//! ([`DirectorySyncs`]).
 //!
 //! # A new file, never over another (#160)
 //!
@@ -164,6 +173,7 @@
 //! and `.mds` sources.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -187,8 +197,9 @@ pub(crate) enum Durability {
     /// its directory after it — where the filesystem can sync a directory at all: one that refuses it
     /// does not fail a write that has landed, and a directory sync that fails otherwise
     /// leaves the write landed, said apart from one that failed
-    /// ([`Rewritten::NotSynced`]). For files whose content exists nowhere else:
-    /// `mds fmt` and `mds lint --fix` rewrite the user's hand-authored `.mds` source in
+    /// ([`Rewritten::NotSynced`]). A directory run's rewrites sync each directory once,
+    /// after all of them in it ([`DirectorySyncs`]). For files whose content exists nowhere
+    /// else: `mds fmt` and `mds lint --fix` rewrite the user's hand-authored `.mds` source in
     /// place, so bytes lost to a power failure are lost for good.
     Fsync,
     /// Rename only. For **derived** artifacts — compiled outputs and `.map` sidecars —
@@ -656,6 +667,176 @@ pub(crate) enum Rewritten {
     /// `<file> written, but its directory could not be synced: <cause>`, for the caller to
     /// report after it says the file was written — the run exits 2.
     NotSynced(mds::MdsError),
+}
+
+/// Replace the file `read` holds with `content` as [`replace_if_unchanged`] does in the
+/// [`Durability::Fsync`] tier — its bytes synced before the rename — but leave the sync of
+/// the directory it is renamed in, which makes the rename itself durable, to the caller
+/// (#160): the [`Renamed`] given back owes it, and a directory run of `mds fmt` or `mds lint
+/// --fix` makes it through [`DirectorySyncs`], once for all its rewrites in that directory.
+///
+/// # Errors
+///
+/// As [`replace_if_unchanged`].
+pub(crate) fn replace_owing_sync(
+    read: ReadForRewrite,
+    content: &str,
+) -> std::result::Result<Renamed, mds::MdsError> {
+    pause_before_replace();
+    let ReadForRewrite { target, held } = read;
+    let dir = imp::rename_held(held, content.as_bytes()).map_err(|f| worded(&target, f))?;
+    Ok(Renamed { target, dir })
+}
+
+/// A rewrite [`replace_owing_sync`] made: its file holds the new bytes, and the sync of the
+/// directory they were renamed in is still owed — until [`DirectorySyncs`] makes it, a crash
+/// may undo the rename. On unix it holds that directory open.
+#[must_use]
+pub(crate) struct Renamed {
+    target: WriteTarget,
+    dir: imp::Dir,
+}
+
+/// The directory syncs a directory run of `mds fmt` or `mds lint --fix` owes its rewrites
+/// (#160). Each directory a rewrite was renamed in is synced once, when the run is past the
+/// last of its files there — every file of the run counts, rewritten or not — rather than
+/// once for each rewrite, and only then is each of those rewrites given back to be shown
+/// ([`Synced`]): a status line shown for a rewrite still means its rename is durable.
+///
+/// The directory synced is the one its first owed rewrite was renamed in, held open on
+/// unix; a later rewrite renamed into another directory at the same path — one swapped in
+/// meanwhile — has the owed ones before it synced first, and starts owing anew. In the order
+/// both runs take their files — the walk's, and `mds lint`'s sorted keys — the files below a
+/// directory come together, so only the directories of the current file and of those above
+/// it owe a sync at once: a run holds no more of them open than its walk is deep.
+pub(crate) struct DirectorySyncs<T> {
+    /// For each file of the run, by its place in the run, its directory: an index into
+    /// `last` and `owed`.
+    directory_of: Vec<usize>,
+    /// For each directory, the place of the run's last file in it.
+    last: Vec<usize>,
+    /// For each directory, the rewrites renamed in it whose sync is owed.
+    owed: Vec<Option<Owed<T>>>,
+}
+
+/// Rewrites whose directory's sync is owed, and that directory.
+struct Owed<T> {
+    dir: imp::Dir,
+    files: Vec<(WriteTarget, T)>,
+}
+
+impl<T> DirectorySyncs<T> {
+    /// What a run over `files`, in the order it takes them, owes: nothing yet. A file's
+    /// directory is its path's parent, as the run names it.
+    pub(crate) fn new<'p>(files: impl IntoIterator<Item = &'p Path>) -> Self {
+        let files = files.into_iter();
+        let mut directories: HashMap<&Path, usize> = HashMap::new();
+        let mut directory_of = Vec::with_capacity(files.size_hint().0);
+        let mut last: Vec<usize> = Vec::new();
+        for (place, file) in files.enumerate() {
+            let parent = file.parent().unwrap_or(Path::new(""));
+            let directory = *directories.entry(parent).or_insert_with(|| {
+                last.push(place);
+                last.len() - 1
+            });
+            if let Some(at) = last.get_mut(directory) {
+                *at = place;
+            }
+            directory_of.push(directory);
+        }
+        let owed = std::iter::repeat_with(|| None).take(last.len()).collect();
+        Self {
+            directory_of,
+            last,
+            owed,
+        }
+    }
+
+    /// `renamed` is the rewrite of the run's file at `place`, and `item` what its caller
+    /// shows for it once its directory is synced: owed until the run is past its
+    /// directory's last file ([`DirectorySyncs::past`]). What comes back is what was owed
+    /// before it in another directory at the same path, synced now ([`Flushed`]); a place
+    /// the run did not name is synced at once, and comes back itself.
+    pub(crate) fn landed(&mut self, place: usize, renamed: Renamed, item: T) -> Option<Flushed<T>> {
+        let Renamed { target, dir } = renamed;
+        let owed = self
+            .directory_of
+            .get(place)
+            .and_then(|&directory| self.owed.get_mut(directory));
+        let Some(owed) = owed else {
+            return Some(flush(Owed {
+                dir,
+                files: vec![(target, item)],
+            }));
+        };
+        if let Some(batch) = owed
+            .as_mut()
+            .filter(|batch| imp::same_directory(&batch.dir, &dir))
+        {
+            // One directory: the one already held is synced for both.
+            batch.files.push((target, item));
+            return None;
+        }
+        owed.replace(Owed {
+            dir,
+            files: vec![(target, item)],
+        })
+        .map(flush)
+    }
+
+    /// The run is past its file at `place`: when that was the last of its directory's
+    /// files, what is owed there is synced now, and comes back ([`Flushed`]).
+    pub(crate) fn past(&mut self, place: usize) -> Option<Flushed<T>> {
+        let &directory = self.directory_of.get(place)?;
+        if self.last.get(directory) != Some(&place) {
+            return None;
+        }
+        self.owed.get_mut(directory)?.take().map(flush)
+    }
+}
+
+/// Sync `owed`'s directory, then close it.
+fn flush<T>(owed: Owed<T>) -> Flushed<T> {
+    let Owed { dir, files } = owed;
+    let failure = imp::sync_owed(&dir).err();
+    drop(dir);
+    Flushed {
+        files: files.into_iter(),
+        failure,
+    }
+}
+
+/// The rewrites one directory sync was made for, in the order they were renamed: each comes
+/// out once, as [`Synced`] says that sync went.
+pub(crate) struct Flushed<T> {
+    files: std::vec::IntoIter<(WriteTarget, T)>,
+    failure: Option<std::io::Error>,
+}
+
+impl<T> Iterator for Flushed<T> {
+    type Item = Synced<T>;
+
+    fn next(&mut self) -> Option<Synced<T>> {
+        let (target, item) = self.files.next()?;
+        Some(match &self.failure {
+            None => Synced::Durable(item),
+            Some(cause) => Synced::NotSynced(item, not_synced(&target, cause)),
+        })
+    }
+}
+
+/// What became of a rewrite whose directory's sync a run owed ([`DirectorySyncs`]), with what
+/// its caller shows for it.
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum Synced<T> {
+    /// Its directory is synced: the caller shows the rewrite done.
+    Durable(T),
+    /// Its directory could not be synced — the one failure for every rewrite owed there — so
+    /// a crash may still undo it, though the file holds it: the `mds::io` error `<file>
+    /// written, but its directory could not be synced: <cause>`, for the caller to report in
+    /// place of the rewrite's status line — the run exits 2.
+    NotSynced(T, mds::MdsError),
 }
 
 /// Remove `target` once it is shown to be a regular file `proof` accepts, below its anchor
@@ -1318,6 +1499,30 @@ mod unix {
         replace(held.dir, &held.name, content, durability, commit)
     }
 
+    /// Replace the file `held` was read from with `content` as [`replace_held`] does in the
+    /// [`Durability::Fsync`] tier, but without the directory's sync after the rename: the
+    /// directory is given back for its caller to sync ([`sync_owed`]).
+    pub(super) fn rename_held(held: Held, content: &[u8]) -> Result<Dir, Failure> {
+        let commit = Commit::Replace(Some(&held.stamp));
+        put(held.dir, &held.name, content, Durability::Fsync, commit)
+    }
+
+    /// Sync `dir`, a directory a rewrite was renamed into by [`rename_held`]
+    /// ([`sync_directory`]).
+    pub(super) fn sync_owed(dir: &Dir) -> std::io::Result<()> {
+        sync_directory(dir.as_fd())
+    }
+
+    /// Whether `a` and `b` are one directory: the same device and inode, which neither can
+    /// lose to another directory while it is open. One that cannot be looked at is taken
+    /// for another, so that each is synced.
+    pub(super) fn same_directory(a: &Dir, b: &Dir) -> bool {
+        match (fs::fstat(a), fs::fstat(b)) {
+            (Ok(a), Ok(b)) => a.st_dev == b.st_dev && a.st_ino == b.st_ino,
+            _ => false,
+        }
+    }
+
     /// Remove `below.name` from the directory [`walk`] opens — creating none — once it is
     /// a regular file `proof` accepts, and only while the name is still that file (#160).
     /// It is looked at without following a symlink first, so anything but a regular file
@@ -1511,6 +1716,23 @@ mod unix {
         durability: Durability,
         commit: Commit<'_, &Stamp>,
     ) -> Result<Landed, Failure> {
+        let dir = put(dir, name, content, durability, commit)?;
+        let not_synced = match durability {
+            Durability::Fsync => sync_directory(dir.as_fd()).err(),
+            Durability::RenameOnly => None,
+        };
+        Ok(Landed { dir, not_synced })
+    }
+
+    /// All [`replace`] does before the directory's sync: put `content` at `name` in `dir`,
+    /// the file synced as `durability` asks, and give `dir` back.
+    fn put(
+        dir: OwnedFd,
+        name: &OsStr,
+        content: &[u8],
+        durability: Durability,
+        commit: Commit<'_, &Stamp>,
+    ) -> Result<OwnedFd, Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
         let replaced = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => match (FileType::from_raw_mode(stat.st_mode), commit) {
@@ -1546,11 +1768,7 @@ mod unix {
                 commit_new(temp, name, content, durability, &NO_CLOBBER)?;
             }
         }
-        let not_synced = match durability {
-            Durability::Fsync => sync_directory(dir.as_fd()).err(),
-            Durability::RenameOnly => None,
-        };
-        Ok(Landed { dir, not_synced })
+        Ok(dir)
     }
 
     /// The temporary file that is to replace the regular file `replaced` describes, in
@@ -1925,6 +2143,8 @@ mod unix {
     /// failure. Any other failure — the open's included — is the sync's: the rename has
     /// landed, and the caller says the file is written but not synced.
     fn sync_directory(dir: BorrowedFd<'_>) -> std::io::Result<()> {
+        #[cfg(test)]
+        super::sync_probe::directory_sync()?;
         let readable = File::from(fs::openat(dir, ".", TO_SYNC, Mode::empty())?);
         settle_directory_sync(
             || readable.sync_all(),
@@ -2098,6 +2318,25 @@ mod windows {
             dir: held.dir,
             not_synced: None,
         })
+    }
+
+    /// Replace the file `held` was read from with `content` as [`replace_held`] does in the
+    /// [`Durability::Fsync`] tier, and give its directory back.
+    pub(super) fn rename_held(held: Held, content: &[u8]) -> Result<Dir, Failure> {
+        let commit = Commit::Replace(Some(&held.stamp));
+        replace(&held.dir, &held.file, content, Durability::Fsync, commit)?;
+        Ok(held.dir)
+    }
+
+    /// A directory's sync after a rewrite's rename: none here, as for every write on
+    /// Windows.
+    pub(super) fn sync_owed(_dir: &Dir) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Whether `a` and `b` are one directory, by path: no directory is synced here.
+    pub(super) fn same_directory(a: &Dir, b: &Dir) -> bool {
+        a == b
     }
 
     /// Remove `below.name`, in the directory [`walk`] checks — creating none — once it is
@@ -2416,6 +2655,50 @@ pub(crate) use pause_trigger::pause_before_replace;
 /// A release build's pause before a rewrite's replace or a new file's commit: none.
 #[cfg(not(debug_assertions))]
 pub(crate) fn pause_before_replace() {}
+
+/// The unit tests' view of the directory syncs a rewrite makes on unix (#160): how many
+/// this thread has started, and an error for each to fail with instead, so that a test
+/// can count them and fail them without a filesystem that refuses one.
+#[cfg(all(test, unix))]
+pub(crate) mod sync_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STARTED: Cell<usize> = const { Cell::new(0) };
+        static FAILING: Cell<Option<i32>> = const { Cell::new(None) };
+    }
+
+    /// How many directory syncs this thread has started.
+    pub(crate) fn directory_syncs() -> usize {
+        STARTED.with(Cell::get)
+    }
+
+    /// Make this thread's directory syncs fail with the OS error `errno` until the guard
+    /// it gives back drops.
+    pub(crate) fn failing_with(errno: i32) -> Failing {
+        FAILING.with(|failing| failing.set(Some(errno)));
+        Failing
+    }
+
+    /// While it lives, this thread's directory syncs fail ([`failing_with`]).
+    #[must_use]
+    pub(crate) struct Failing;
+
+    impl Drop for Failing {
+        fn drop(&mut self) {
+            FAILING.with(|failing| failing.set(None));
+        }
+    }
+
+    /// Count a directory sync about to be made, and fail it as [`failing_with`] asked.
+    pub(super) fn directory_sync() -> std::io::Result<()> {
+        STARTED.with(|started| started.set(started.get() + 1));
+        match FAILING.with(Cell::get) {
+            Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            None => Ok(()),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2883,6 +3166,168 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "NEW");
         assert_eq!(entries(&src), ["a.mds"]);
+    }
+
+    /// `file`, below the anchor `root` and shown below `d`, written `OLD` and rewritten
+    /// `NEW`, the sync of its directory owed ([`replace_owing_sync`]).
+    #[cfg(unix)]
+    fn owing(root: &Path, file: &str) -> Renamed {
+        std::fs::write(root.join(file), "OLD").unwrap();
+        let target = WriteTarget::below(root, Path::new("d"), Path::new(file));
+        replace_owing_sync(read_stamped(&target, "OLD").unwrap(), "NEW").unwrap()
+    }
+
+    /// What `flushed` gives back, each rewrite as its caller would show it: `synced <file>`,
+    /// or the error that takes the place of its status line.
+    #[cfg(unix)]
+    fn shown(flushed: Option<Flushed<&str>>) -> Vec<String> {
+        flushed
+            .into_iter()
+            .flatten()
+            .map(|synced| match synced {
+                Synced::Durable(file) => format!("synced {file}"),
+                Synced::NotSynced(file, e) => format!("{file}: {e}"),
+            })
+            .collect()
+    }
+
+    /// A directory run's rewrites owe their directory's sync until the run is past the last
+    /// of its files there, every file of the run counted: then that directory is synced
+    /// once, and its rewrites come back, each once, in the order they were renamed (#160).
+    /// Here `sub/x.mds` lies between `src`'s files, as a walk can find it: `sub` is synced
+    /// when the run is past `x.mds`, the anchor's directory when it is past `c.mds` — two
+    /// syncs for four rewrites, each file holding its rewrite. When the syncs fail, each
+    /// rewrite comes back with the error that names it, `d/<file> written, but its
+    /// directory could not be synced: <cause>`, and still only once.
+    #[cfg(unix)]
+    #[test]
+    fn owed_syncs_are_made_once_for_each_directory_after_its_last_file() {
+        use sync_probe::{directory_syncs, failing_with};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let files = ["a.mds", "sub/x.mds", "b.mds", "c.mds"];
+        // What each place of the run gave back, where it gave anything, and the syncs made.
+        let run = || {
+            let mut syncs = DirectorySyncs::new(files.iter().map(Path::new));
+            let before = directory_syncs();
+            let mut at = Vec::new();
+            for (place, &file) in files.iter().enumerate() {
+                let mut back = shown(syncs.landed(place, owing(root, file), file));
+                back.extend(shown(syncs.past(place)));
+                if !back.is_empty() {
+                    at.push((place, back));
+                }
+            }
+            for file in files {
+                assert_eq!(std::fs::read_to_string(root.join(file)).unwrap(), "NEW");
+            }
+            (at, directory_syncs() - before)
+        };
+
+        let synced = |file: &str| format!("synced {file}");
+        assert_eq!(
+            run(),
+            (
+                vec![
+                    (1, vec![synced("sub/x.mds")]),
+                    (3, ["a.mds", "b.mds", "c.mds"].map(synced).to_vec()),
+                ],
+                2
+            )
+        );
+
+        let failing = failing_with(5);
+        let cause = std::io::Error::from_raw_os_error(5);
+        let not_synced = |file: &str| {
+            format!("{file}: d/{file} written, but its directory could not be synced: {cause}")
+        };
+        assert_eq!(
+            run(),
+            (
+                vec![
+                    (1, vec![not_synced("sub/x.mds")]),
+                    (3, ["a.mds", "b.mds", "c.mds"].map(not_synced).to_vec()),
+                ],
+                2
+            ),
+            "a failed sync comes back for each rewrite owed there, once"
+        );
+        drop(failing);
+    }
+
+    /// A rewrite renamed into another directory than the one its directory's owed rewrites
+    /// went in — the same path, a directory swapped in between — has those synced at once,
+    /// in their own directory, and owes a sync of its own (#160): two syncs, the first when
+    /// it lands. Control: the same two rewrites in one directory are one sync, made when the
+    /// run is past the second.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_into_a_directory_swapped_in_syncs_the_one_before_it_first() {
+        use sync_probe::directory_syncs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("s")).unwrap();
+        let files = ["s/a.mds", "s/b.mds"];
+        // What landing `s/b.mds` gave back, then the run's being past it, and the syncs.
+        let run = |swap: bool| {
+            let mut syncs = DirectorySyncs::new(files.iter().map(Path::new));
+            let before = directory_syncs();
+            assert!(shown(syncs.landed(0, owing(root, files[0]), files[0])).is_empty());
+            assert!(
+                shown(syncs.past(0)).is_empty(),
+                "s/a.mds is not s's last file"
+            );
+            if swap {
+                std::fs::rename(root.join("s"), root.join("s-old")).unwrap();
+                std::fs::create_dir(root.join("s")).unwrap();
+            }
+            let landed = shown(syncs.landed(1, owing(root, files[1]), files[1]));
+            let past = shown(syncs.past(1));
+            (landed, past, directory_syncs() - before)
+        };
+
+        assert_eq!(
+            run(false),
+            (
+                Vec::new(),
+                vec!["synced s/a.mds".to_string(), "synced s/b.mds".to_string()],
+                1
+            ),
+            "control: one directory"
+        );
+        assert_eq!(
+            run(true),
+            (
+                vec!["synced s/a.mds".to_string()],
+                vec!["synced s/b.mds".to_string()],
+                2
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("s-old/a.mds")).unwrap(),
+            "NEW"
+        );
+    }
+
+    /// A rewrite at a place the run did not name has no directory's last file to wait for:
+    /// it is synced as it lands, and comes back at once (#160).
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_at_a_place_the_run_did_not_name_is_synced_at_once() {
+        use sync_probe::directory_syncs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut syncs = DirectorySyncs::new([Path::new("a.mds")]);
+        let before = directory_syncs();
+        assert_eq!(
+            shown(syncs.landed(1, owing(dir.path(), "x.mds"), "x.mds")),
+            ["synced x.mds"]
+        );
+        assert_eq!(directory_syncs() - before, 1);
+        assert!(shown(syncs.past(0)).is_empty(), "nothing is owed for a.mds");
     }
 
     /// The Fsync tier's sync of a file's bytes before the rename: the full sync asked for

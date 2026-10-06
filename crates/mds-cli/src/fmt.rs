@@ -22,8 +22,11 @@
 //! - 2: file not found / not `.mds` / I/O / bad UTF-8 — a rewrite or a stdout write
 //!   that fails included, in directory mode too, where one such file makes the run
 //!   exit 2 (#157); a closed stdout is not a failure. So is a rewrite that lands in a
-//!   directory it cannot then sync (#160): `Formatted:` names it, a directory run counts
-//!   it formatted, and the failed sync is reported after it
+//!   directory it cannot then sync (#160): given the file, `Formatted:` names it and the
+//!   failed sync is reported after it; a directory run — which syncs each directory once,
+//!   after the last of its files, and shows their `Formatted:` lines only then — reports
+//!   the failed sync in place of each such file's `Formatted:` line, and counts it
+//!   formatted
 //! - 3: oversized source (in directory mode, a failed file that leaves the run at 1)
 
 use std::panic::AssertUnwindSafe;
@@ -37,7 +40,10 @@ use crate::output::{
     catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path, stdout_failure,
     write_stdout, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
-use crate::write::{read_stamped, replace_if_unchanged, Durability, Rewritten};
+use crate::write::{
+    read_stamped, replace_if_unchanged, replace_owing_sync, DirectorySyncs, Durability, Renamed,
+    Rewritten, Synced,
+};
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -210,8 +216,9 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
 
 /// Outcome of formatting a single file in directory mode; tallied by the caller.
 enum FileOutcome {
-    /// Normal mode: the file was reformatted and written.
-    Formatted,
+    /// Normal mode: the file was reformatted and written; the sync of its directory, and
+    /// its `Formatted:` line, are owed (#160).
+    Formatted(Renamed),
     /// Normal mode: the file was already formatted (no write needed).
     Unchanged,
     /// `--check` / `--diff` mode: the file would change.
@@ -225,8 +232,9 @@ enum FileOutcome {
 
 /// Format one file in directory mode: read → format → (optional) diff → (optional) write.
 ///
-/// All per-file error and status lines are printed as side effects so the
-/// directory loop only needs to tally the returned [`FileOutcome`].
+/// Every per-file error line is printed here as a side effect, so the directory loop
+/// only needs to tally the returned [`FileOutcome`] — and show the `Formatted:` line of
+/// a rewrite once its directory is synced.
 ///
 /// A diff-output failure other than a closed stdout, and a rewrite that fails, are
 /// returned as [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
@@ -235,16 +243,16 @@ enum FileOutcome {
 /// file-system class. A failing stdout is reported once per failure episode — the first
 /// failed write since the run began or since a write last landed; every file whose diff
 /// it lost counts as failed. A closed stdout is not a failure: the diff has no reader,
-/// and the file's outcome stands (#157). A rewrite that lands in a directory it cannot
-/// then sync is [`FileOutcome::Formatted`] — the file holds it — and its failed sync is
-/// reported after `Formatted:` and recorded as an I/O failure (#160).
+/// and the file's outcome stands (#157). A rewrite that lands is
+/// [`FileOutcome::Formatted`], whose directory's sync — and with it the file's
+/// `Formatted:` line — the run makes later ([`run_fmt_directory`], #160).
 ///
 /// `file` is the walk's path, below the directory argument as typed: the label of its
 /// error frames and of its `--diff` header, as a file argument typed that way is named
 /// (#390). Its rewrite is anchored at `root`, the directory argument, so a directory
 /// between the two that turned into a symlink after the walk is refused (#160).
 fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
-    let FmtFlags { check, diff, quiet } = flags;
+    let FmtFlags { check, diff, .. } = flags;
     let file_name = safe_path(file);
     let source = match read_source_file(file) {
         Ok(s) => s,
@@ -301,19 +309,9 @@ fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
         // only over the bytes formatted, in the directory they were read in (#160).
         let target = WriteTarget::walked_below(RootPaths::as_typed(root), file);
         match read_stamped(&target, &source)
-            .and_then(|read| replace_if_unchanged(read, &result.formatted, Durability::Fsync))
+            .and_then(|read| replace_owing_sync(read, &result.formatted))
         {
-            Ok(rewritten) => {
-                if !quiet {
-                    crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(file));
-                }
-                // The file holds the rewrite, and counts as formatted; a directory that
-                // could not then be synced is reported after it and recorded (exit 2).
-                if let Rewritten::NotSynced(e) = rewritten {
-                    crate::output::eprint_io_failure(e);
-                }
-                FileOutcome::Formatted
-            }
+            Ok(renamed) => FileOutcome::Formatted(renamed),
             Err(e) => {
                 crate::output::eprint_io_failure(e);
                 FileOutcome::Failed
@@ -371,11 +369,33 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     let mut unchanged_count: usize = 0;
     let mut fail_count: usize = 0;
 
-    for file in &files {
-        match format_one_file(dir, file, flags) {
-            FileOutcome::Formatted | FileOutcome::WouldChange => changed_count += 1,
-            FileOutcome::Unchanged | FileOutcome::NoChange => unchanged_count += 1,
-            FileOutcome::Failed => fail_count += 1,
+    // Each directory a rewrite lands in is synced once, after the last file of the walk
+    // in it, and only then are its rewrites' `Formatted:` lines shown (#160).
+    let mut syncs = DirectorySyncs::new(files.iter().map(PathBuf::as_path));
+    for (place, file) in files.iter().enumerate() {
+        let landed = match format_one_file(dir, file, flags) {
+            FileOutcome::Formatted(renamed) => {
+                changed_count += 1;
+                syncs.landed(place, renamed, file.as_path())
+            }
+            FileOutcome::WouldChange => {
+                changed_count += 1;
+                None
+            }
+            FileOutcome::Unchanged | FileOutcome::NoChange => {
+                unchanged_count += 1;
+                None
+            }
+            FileOutcome::Failed => {
+                fail_count += 1;
+                None
+            }
+        };
+        for synced in landed.into_iter().flatten() {
+            show_synced(synced, flags.quiet);
+        }
+        for synced in syncs.past(place).into_iter().flatten() {
+            show_synced(synced, flags.quiet);
         }
     }
 
@@ -401,6 +421,21 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
         crate::output::exit(1);
     }
     Ok(())
+}
+
+/// Show a directory run's rewrite of `file` once its directory's sync is made (#160):
+/// `Formatted:` when it was synced, not under `--quiet`; otherwise, in its place, the
+/// failed sync, recorded as an I/O failure (exit 2). Either way the file holds the
+/// rewrite, and counts as formatted.
+fn show_synced(synced: Synced<&Path>, quiet: bool) {
+    match synced {
+        Synced::Durable(file) => {
+            if !quiet {
+                crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(file));
+            }
+        }
+        Synced::NotSynced(_, e) => crate::output::eprint_io_failure(e),
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -472,5 +507,59 @@ mod tests {
             format_source_named("Hello!\r\n\r\n\r\n\r\nBye.\r\n", None, "<source>").unwrap();
         assert!(result.changed);
         assert!(!result.formatted.contains('\r'));
+    }
+
+    /// A directory run syncs each directory its rewrites landed in once, after the run is
+    /// past its last file there, not once for each rewrite (#160): three files reformatted
+    /// in `src` are one sync, and `src/sub`, with a rewrite of its own, one more — four
+    /// rewrites, two syncs — and each file holds its rewrite. Control: the same four files
+    /// given one at a time are a sync each.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_run_syncs_each_directory_once() {
+        use crate::write::sync_probe::directory_syncs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let files = ["a.mds", "b.mds", "sub/c.mds", "z.mds"].map(|file| src.join(file));
+        let unformatted = || {
+            for file in &files {
+                std::fs::write(file, "Alpha\r\n").unwrap();
+            }
+        };
+        let flags = FmtFlags {
+            check: false,
+            diff: false,
+            quiet: true,
+        };
+
+        unformatted();
+        let before = directory_syncs();
+        run_fmt_directory(&src, flags).unwrap();
+        assert_eq!(
+            directory_syncs() - before,
+            2,
+            "one sync for src and one for src/sub"
+        );
+        for file in &files {
+            assert_eq!(
+                std::fs::read_to_string(file).unwrap(),
+                "Alpha\n",
+                "{file:?}"
+            );
+        }
+
+        unformatted();
+        let before = directory_syncs();
+        for file in &files {
+            run_fmt_file(file, flags).unwrap();
+        }
+        assert_eq!(
+            directory_syncs() - before,
+            files.len(),
+            "control: a file argument's rewrite syncs its directory itself"
+        );
     }
 }
