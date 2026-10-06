@@ -2728,7 +2728,6 @@ mod tests {
     }
 
     /// The names in `dir`, sorted.
-    #[cfg(unix)]
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -4966,54 +4965,60 @@ mod tests {
     /// dangling — is never removed: each is refused, the directory by the path the user
     /// knows it by, and the file a link leads to is left (#160). Control: the same name
     /// below a real directory is removed.
-    #[cfg(unix)]
+    ///
+    /// Runs on every platform, so the Windows removal's looks — at each directory below
+    /// the anchor and at the file, by path — are held to it; the refusals wait on
+    /// [`make_symlink`], and the refused directory is named in the platform's separator.
     #[test]
     fn a_removal_through_a_symlink_or_of_one_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path().join("out");
+        let real = anchor.join("real");
         let victim = dir.path().join("victim");
-        std::fs::create_dir_all(anchor.join("real")).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
         std::fs::create_dir(&victim).unwrap();
         std::fs::write(victim.join("x.json"), "victim").unwrap();
-        std::os::unix::fs::symlink(&victim, anchor.join("sub")).unwrap();
-        std::os::unix::fs::symlink(victim.join("x.json"), anchor.join("real/live.json")).unwrap();
-        std::os::unix::fs::symlink(dir.path().join("nowhere"), anchor.join("real/gone.json"))
-            .unwrap();
+        let linked = make_symlink(&victim, &anchor.join("sub"))
+            && make_symlink(&victim.join("x.json"), &real.join("live.json"))
+            && make_symlink(&dir.path().join("nowhere"), &real.join("gone.json"));
+        // The links left in `real`, which no removal here may take.
+        let links: &[&str] = if linked {
+            &["gone.json", "live.json"]
+        } else {
+            &[]
+        };
 
-        assert_eq!(
-            remove_proven(&to_remove(&anchor, "sub/x.json"), |_| Ok(true)),
-            Err(NotRemoved::Failed(format!("{FOLLOW_REFUSAL} at o/sub")))
-        );
-        for link in ["real/live.json", "real/gone.json"] {
-            let removal = remove_proven(&to_remove(&anchor, link), |_| Ok(true));
-            assert_eq!(removal, Err(NotRemoved::Link), "{link}");
+        if linked {
             assert_eq!(
-                removal.unwrap_err().cause(),
-                SYMLINK_REMOVAL_REFUSAL,
-                "{link}"
+                remove_proven(&to_remove(&anchor, "sub/x.json"), |_| Ok(true)),
+                Err(NotRemoved::Failed(format!(
+                    "{FOLLOW_REFUSAL} at {}",
+                    Path::new("o").join("sub").display()
+                )))
             );
+            for link in ["real/live.json", "real/gone.json"] {
+                let removal = remove_proven(&to_remove(&anchor, link), |_| Ok(true));
+                assert_eq!(removal, Err(NotRemoved::Link), "{link}");
+                assert_eq!(
+                    removal.unwrap_err().cause(),
+                    SYMLINK_REMOVAL_REFUSAL,
+                    "{link}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(victim.join("x.json")).unwrap(),
+                "victim",
+                "nothing is removed through a symlink"
+            );
+            assert_eq!(entries(&real), links, "no symlink is removed");
         }
-        assert_eq!(
-            std::fs::read_to_string(victim.join("x.json")).unwrap(),
-            "victim",
-            "nothing is removed through a symlink"
-        );
-        assert_eq!(
-            entries(&anchor.join("real")),
-            ["gone.json", "live.json"],
-            "no symlink is removed"
-        );
 
-        std::fs::write(anchor.join("real/x.json"), "stale").unwrap();
+        std::fs::write(real.join("x.json"), "stale").unwrap();
         assert_eq!(
             remove_proven(&to_remove(&anchor, "real/x.json"), |_| Ok(true)),
             Ok(Removal::Removed)
         );
-        assert_eq!(
-            entries(&anchor.join("real")),
-            ["gone.json", "live.json"],
-            "control: the file is removed"
-        );
+        assert_eq!(entries(&real), links, "control: the file is removed");
     }
 
     /// A FIFO or a directory at the name is no file to remove: refused as not a regular
@@ -5052,7 +5057,9 @@ mod tests {
     /// A file put at the name after the one there was opened — between its proof and its
     /// removal — is not removed: the removal is refused, and the file put there is left
     /// (#160). Control: with nothing put there, the file proven is removed.
-    #[cfg(unix)]
+    ///
+    /// Runs on every platform, so the Windows removal's second look — by path, at the
+    /// file's size and times — is held to it.
     #[test]
     fn a_file_put_in_the_place_of_the_one_proven_is_not_removed() {
         let dir = tempfile::tempdir().unwrap();
@@ -5063,7 +5070,10 @@ mod tests {
         let target = to_remove(dir.path(), "x.json");
 
         let swapped = remove_proven(&target, |_| {
-            std::fs::rename(&other, &file)?;
+            // On Windows the file proven is still open here, shared for deletion as std
+            // opens every file: the rename relies on std's fallback to a POSIX-semantics
+            // rename to replace it. A rename that fails is the fixture's, not the removal's.
+            std::fs::rename(&other, &file).expect("put another file at the name");
             Ok(true)
         });
         assert_eq!(
