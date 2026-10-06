@@ -60,6 +60,11 @@
 //! `mds::io`, and the funnel lifts the code to at least 2; in directory mode a file whose
 //! diff it lost counts under "with errors" (#157).
 //!
+//! A `--fix` rewrite that lands in a directory it cannot then sync is reported the same
+//! way (#160): `Fixed:` names the file and its residual counts as for any fix that landed,
+//! then the failed sync is reported once as `mds::io`, and the funnel lifts the code to at
+//! least 2.
+//!
 //! A panic ends the run with 101 through the funnel (#389). A panic in an entry's
 //! analysis — `mds::lint` on a directory's entry, or the fix pipeline — fails that input
 //! alone: a directory counts it under "with errors" and goes on to its other entries.
@@ -83,7 +88,7 @@ use crate::output::{
     catch_compile, collect_mds_files_detailed, eprint_warning, render_unified_diff, safe_inline,
     safe_path, Panicked, RootPaths, WriteTarget, STDIN_DISPLAY_LABEL,
 };
-use crate::write::{read_stamped, replace_if_unchanged, Durability};
+use crate::write::{read_stamped, replace_if_unchanged, Durability, Rewritten};
 
 // AC-224-15: No local rule-name list. The single source of truth is
 // mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
@@ -1048,10 +1053,12 @@ enum Rewrite {
     /// Nothing to fix; the findings stand.
     Unchanged,
     /// The fixed source was written. `residual` is what it is left with; `partial` holds the
-    /// applied and planned edit counts when not every edit applied.
+    /// applied and planned edit counts when not every edit applied; `not_synced` is the
+    /// error of a directory that could not be synced after the rename landed (#160).
     Written {
         residual: Residual,
         partial: Option<(usize, usize)>,
+        not_synced: Option<MdsError>,
     },
     /// The fixed source could not be written. `residual` is what it would have been left
     /// with, shown before the failure in a human report. A JSON output records each input
@@ -1269,7 +1276,14 @@ fn apply_fix(
     let fix = match read_stamped(target, &text)
         .and_then(|read| replace_if_unchanged(read, &residual.fixed, Durability::Fsync))
     {
-        Ok(()) => Rewrite::Written { residual, partial },
+        Ok(rewritten) => Rewrite::Written {
+            residual,
+            partial,
+            not_synced: match rewritten {
+                Rewritten::Done => None,
+                Rewritten::NotSynced(error) => Some(error),
+            },
+        },
         Err(error) => {
             // A JSON output records each input once — a directory's entry, a file
             // argument's document — so a rewrite that failed is recorded as the failure
@@ -1330,7 +1344,8 @@ fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -
 ///   findings.
 /// - A rewrite that landed shows the findings the file is left with, rendered against the
 ///   fixed source, then `Fixed:` — never before, so no line claims a fix the file did not
-///   get. One that failed shows those findings, where the output keeps them, rendered
+///   get — then, for one whose directory could not be synced after it, that failure
+///   (#160). One that failed shows those findings, where the output keeps them, rendered
 ///   against the source it failed to write, then the failure.
 /// - The stdin filter shows its status line, then its findings, rendered against the
 ///   source it emits, then that source.
@@ -1408,9 +1423,16 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> InputVerdict {
                 sink.clean(&input, &findings);
                 (tally_from_result(&findings), false)
             }
-            Rewrite::Written { residual, partial } => {
+            Rewrite::Written {
+                residual,
+                partial,
+                not_synced,
+            } => {
                 sink.findings(&input, &residual.findings, Some(&residual.fixed), truncated);
                 sink.fixed(&input, partial);
+                if let Some(error) = not_synced {
+                    sink.not_synced(&input, error);
+                }
                 (tally_from_result(&residual.findings), false)
             }
             Rewrite::WriteFailed { error, residual } => {
@@ -2646,6 +2668,10 @@ mod tests {
             self.record("write failed", input);
         }
 
+        fn not_synced(&mut self, input: &LintSource<'_>, _: MdsError) {
+            self.record("not synced", input);
+        }
+
         fn clean(&mut self, input: &LintSource<'_>, _: &LintResult) {
             self.record("clean", input);
         }
@@ -2884,6 +2910,7 @@ mod tests {
                 rewritten(Rewrite::Written {
                     residual: fixed(uncapped()),
                     partial: None,
+                    not_synced: None,
                 }),
                 false,
             ),
@@ -2892,6 +2919,7 @@ mod tests {
                 rewritten(Rewrite::Written {
                     residual: fixed(capped()),
                     partial: Some((1, 2)),
+                    not_synced: None,
                 }),
                 true,
             ),
@@ -2940,6 +2968,64 @@ mod tests {
             expected.push((what, truncated, Some("cap reached x.mds".to_string())));
         }
         assert_eq!(seen, expected);
+    }
+
+    /// A fix that landed in a directory that could not then be synced (#160) shows what any
+    /// fix that landed shows — the findings the file is left with, then `Fixed:` — and then
+    /// that failure, and the file counts as those findings say, not as a failed write.
+    /// Control: a fix whose directory was synced shows no failure.
+    #[test]
+    fn a_fix_whose_directory_cannot_be_synced_shows_fixed_then_the_failure() {
+        let shown = |not_synced| {
+            let report = FileReport {
+                input: LintSource::File {
+                    typed: Path::new("x.mds"),
+                    name: "x.mds",
+                },
+                capped: None,
+                outcome: Outcome::Rewritten {
+                    findings: LintResult::new(vec![]),
+                    text: String::new(),
+                    fix: Rewrite::Written {
+                        residual: Residual {
+                            findings: LintResult::new(vec![]),
+                            fixed: String::new(),
+                        },
+                        partial: None,
+                        not_synced,
+                    },
+                },
+            };
+            let mut sink = Recorder::default();
+            let verdict = render(report, &mut sink);
+            (sink.calls, verdict.tally == FileTally::Clean)
+        };
+        let not_synced = MdsError::Io {
+            message: "x.mds written, but its directory could not be synced: EIO".to_string(),
+        };
+
+        assert_eq!(
+            shown(Some(not_synced)),
+            (
+                vec![
+                    "findings (0) x.mds".to_string(),
+                    "fixed None x.mds".to_string(),
+                    "not synced x.mds".to_string(),
+                ],
+                true
+            )
+        );
+        assert_eq!(
+            shown(None),
+            (
+                vec![
+                    "findings (0) x.mds".to_string(),
+                    "fixed None x.mds".to_string()
+                ],
+                true
+            ),
+            "control: synced"
+        );
     }
 
     /// The environment variable that makes a test run as the child [`in_a_child`] starts;

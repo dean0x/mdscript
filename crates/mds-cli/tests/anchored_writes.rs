@@ -1201,6 +1201,90 @@ fn a_directory_that_cannot_be_listed_takes_an_output_on_linux_alone() {
     assert_eq!(read(&drop_box.join("x.md")), "Hello\n", "control writes it");
 }
 
+/// A rewrite that lands in a directory it then cannot sync is reported as written (#160):
+/// `src` made `-wx` while the rewrite paused before its rename, so `mds fmt`'s and `mds lint
+/// --fix`'s directory sync cannot open it to read. The file holds the rewrite and no
+/// temporary file is left; the status line — `Formatted:`, `Fixed:` — says so as for any
+/// rewrite that lands, and then `mds::io`, `src/a.mds written, but its directory could not
+/// be synced: Permission denied (os error 13)`, exit 2. A directory run counts the file as
+/// what it holds — formatted, clean — and exits 2 for the failed sync. Control: the same run
+/// with `src` left alone syncs it, exit 0.
+#[cfg(unix)]
+#[test]
+fn a_rewrite_whose_directory_cannot_be_synced_is_reported_written() {
+    for (args, source) in REWRITES {
+        let dir = scratch();
+        let root = dir.path();
+        let file = put(root, "src/a.mds", source.written);
+        let src = root.join("src");
+        let mut listable = true;
+        let (code, stderr) = rewrite_paused(root, args, || listable = !unlistable(&src, 0o333));
+        // Read by path, which the directory's search permission allows.
+        let landed = std::fs::read_to_string(&file).ok();
+        restore(&src);
+        if listable {
+            eprintln!(
+                "skipped: {} can be listed at mode 0o333 (running as root?)",
+                src.display()
+            );
+            return;
+        }
+
+        assert_eq!(code, Some(2), "{args:?}: stderr: {stderr}");
+        assert_eq!(
+            landed.as_deref(),
+            Some(source.rewritten),
+            "{args:?}: the rewrite landed"
+        );
+        assert_eq!(
+            entries(&src),
+            ["a.mds"],
+            "{args:?}: no temporary file is left"
+        );
+        let status = match args[0] {
+            "fmt" => format!("Formatted: {}", native("src/a.mds")),
+            _ => format!("Fixed: {}", native("src/a.mds")),
+        };
+        let not_synced = format!(
+            "{} written, but its directory could not be synced: Permission denied (os error 13)",
+            native("src/a.mds")
+        );
+        let squashed = squash(&stderr);
+        let at = |needle: &str| squashed.find(&squash(needle));
+        assert!(
+            stderr.contains("mds::io") && at(&not_synced).is_some(),
+            "{args:?}: the failed sync is reported, the file named as typed; stderr: {stderr}"
+        );
+        assert!(
+            matches!((at(&status), at(&not_synced)), (Some(s), Some(n)) if s < n),
+            "{args:?}: the status line comes first; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("cannot write"),
+            "{args:?}: not a failed write; stderr: {stderr}"
+        );
+        if args.contains(&"src") {
+            let summary = match args[0] {
+                "fmt" => "1 formatted, 0 unchanged, 0 failed",
+                _ => "1 clean, 0 with warnings, 0 with errors, 0 resource-limited",
+            };
+            assert!(
+                stderr.contains(summary),
+                "{args:?}: counted as what it holds; stderr: {stderr}"
+            );
+        }
+
+        std::fs::write(&file, source.written).unwrap();
+        let (code, stderr) = rewrite_paused(root, args, || {});
+        assert_eq!(code, Some(0), "{args:?}: control; stderr: {stderr}");
+        assert_eq!(
+            read(&file),
+            source.rewritten,
+            "{args:?}: control rewrites it"
+        );
+    }
+}
+
 // ── Windows ──────────────────────────────────────────────────────────────────
 
 /// Windows: a directory symlink, and a junction, below `--out-dir` are refused as the

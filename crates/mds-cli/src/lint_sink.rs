@@ -76,6 +76,15 @@ pub(crate) trait ResultSink {
         self.failed(input, error);
     }
 
+    /// A `--fix` rewrite that landed, in a directory that could not then be synced (#160):
+    /// after `Fixed:`, the one `mds::io` error the write gives it, `<file> written, but its
+    /// directory could not be synced: <cause>`, on stderr in both formats — the file holds
+    /// the fix, so its findings stay the input's record — and recorded, so the run exits at
+    /// least 2. Not `--quiet`: it is an error.
+    fn not_synced(&mut self, _input: &LintSource<'_>, error: MdsError) {
+        eprint_io_failure(error);
+    }
+
     /// `Clean:`, for an input with no findings — a file argument's human report says so.
     fn clean(&mut self, input: &LintSource<'_>, findings: &mds::LintResult);
 

@@ -179,7 +179,9 @@ use crate::output::{io_cause, safe_inline, safe_path, WriteTarget};
 pub(crate) enum Durability {
     /// `sync_all()` on the temporary file before the rename and, on unix, on its directory
     /// after it — where the filesystem can sync a directory at all: one that refuses it
-    /// does not fail a write that has landed. For files whose content exists nowhere else:
+    /// does not fail a write that has landed, and a directory sync that fails otherwise
+    /// leaves the write landed, said apart from one that failed
+    /// ([`Rewritten::NotSynced`]). For files whose content exists nowhere else:
     /// `mds fmt` and `mds lint --fix` rewrite the user's hand-authored `.mds` source in
     /// place, so bytes lost to a power failure are lost for good.
     Fsync,
@@ -259,6 +261,11 @@ impl DirIdentity {
 /// `not a regular file`; an anchor that is not the directory the caller checked
 /// ([`WriteTarget::below_checked_anchor`]), or that is gone — it is not made again — is
 /// refused as [`out_dir_moved`] words it, before anything below it is opened.
+///
+/// In the [`Durability::Fsync`] tier a directory that cannot be synced after the rename is
+/// an error too, though the file holds `content`: `<file> written, but its directory could
+/// not be synced: <cause>` ([`replace_if_unchanged`] gives it back apart, as
+/// [`Rewritten::NotSynced`]).
 pub(crate) fn atomic_write_file(
     target: &WriteTarget,
     content: &str,
@@ -266,8 +273,9 @@ pub(crate) fn atomic_write_file(
     parents: Parents,
 ) -> std::result::Result<(), mds::MdsError> {
     write_below_anchor(target, content, durability, parents, Commit::Replace(None))
+        .map_err(|failure| worded(target, failure))?
+        .synced(target)
         .map(drop)
-        .map_err(|failure| worded(target, failure))
 }
 
 /// Write a compiled output, or its `.map` sidecar, to `target` as [`atomic_write_file`]
@@ -314,7 +322,8 @@ fn write_compiled_in(
             module: declares_a_module(content),
         },
     )
-    .map_err(|failure| worded(target, failure))
+    .map_err(|failure| worded(target, failure))?
+    .synced(target)
 }
 
 /// Write a compiled output as [`write_compiled`] does, then look at `beside`, a file in the
@@ -432,12 +441,11 @@ pub(crate) fn create_new(
     durability: Durability,
     parents: Parents,
 ) -> std::result::Result<(), NotCreated> {
-    write_below_anchor(target, content, durability, parents, Commit::New)
-        .map(drop)
-        .map_err(|failure| match failure {
-            Failure::Exists => NotCreated::Exists,
-            failure => NotCreated::Failed(worded(target, failure)),
-        })
+    match write_below_anchor(target, content, durability, parents, Commit::New) {
+        Ok(landed) => landed.synced(target).map(drop).map_err(NotCreated::Failed),
+        Err(Failure::Exists) => Err(NotCreated::Exists),
+        Err(failure) => Err(NotCreated::Failed(worded(target, failure))),
+    }
 }
 
 /// Why [`create_new`], or [`write_over_own`], did not write its file.
@@ -483,15 +491,16 @@ pub(crate) fn write_over_own(
         }
         // Only a new file may take the name, and the commit, never the read, finds whether
         // something has it.
-        Ok(None) => write_below_anchor(target, content, durability, parents, Commit::New).map(drop),
+        Ok(None) => write_below_anchor(target, content, durability, parents, Commit::New),
         Err(failure) => Err(failure),
     };
-    written.map_err(|failure| match failure {
-        Failure::Exists | Failure::Changed | Failure::LinkAtTarget | Failure::NotARegularFile => {
-            NotCreated::Exists
-        }
-        failure => NotCreated::Failed(worded(target, failure)),
-    })
+    match written {
+        Ok(landed) => landed.synced(target).map(drop).map_err(NotCreated::Failed),
+        Err(
+            Failure::Exists | Failure::Changed | Failure::LinkAtTarget | Failure::NotARegularFile,
+        ) => Err(NotCreated::Exists),
+        Err(failure) => Err(NotCreated::Failed(worded(target, failure))),
+    }
 }
 
 /// [`write_over_own`]'s read of `target`, as a rewrite reads its file: held when it holds
@@ -518,7 +527,7 @@ fn write_below_anchor(
     durability: Durability,
     parents: Parents,
     commit: Commit<'_, &imp::Stamp>,
-) -> std::result::Result<imp::Dir, Failure> {
+) -> std::result::Result<Landed, Failure> {
     let below = Below::of(target)?;
     let anchor = target.checked_anchor();
     imp::write(
@@ -529,6 +538,26 @@ fn write_below_anchor(
         parents,
         commit,
     )
+}
+
+/// A write that landed: its file holds the new bytes. `dir` is the directory it went in —
+/// on unix still open — and `not_synced` the cause of a failed sync of that directory after
+/// the rename, which only the [`Durability::Fsync`] tier makes, and only on unix.
+struct Landed {
+    dir: imp::Dir,
+    not_synced: Option<std::io::Error>,
+}
+
+impl Landed {
+    /// The directory the file went in, once it is synced as its tier asks; one that could
+    /// not be synced is [`not_synced`]'s error instead, for a caller that has no way to say
+    /// a write landed but was not synced.
+    fn synced(self, target: &WriteTarget) -> std::result::Result<imp::Dir, mds::MdsError> {
+        match self.not_synced {
+            None => Ok(self.dir),
+            Some(cause) => Err(not_synced(target, &cause)),
+        }
+    }
 }
 
 /// How the temporary file a write has filled takes the target's name.
@@ -587,18 +616,40 @@ pub(crate) fn read_stamped(
 /// refuses the rewrite, leaving the file — the edit made to it — as it is, and no
 /// temporary file.
 ///
+/// A rewrite whose rename landed is [`Rewritten`], whether or not the directory could then
+/// be synced: the file holds `content` either way, and the caller says so before it reports
+/// a sync that failed ([`Rewritten::NotSynced`]).
+///
 /// # Errors
 ///
-/// `mds::io`: `"<file>" changed since it was read; not written` for a file that changed,
-/// else as [`atomic_write_file`] words a failure.
+/// `mds::io`, the file left as it was: `"<file>" changed since it was read; not written`
+/// for a file that changed, else as [`atomic_write_file`] words a failure.
 pub(crate) fn replace_if_unchanged(
     read: ReadForRewrite,
     content: &str,
     durability: Durability,
-) -> std::result::Result<(), mds::MdsError> {
+) -> std::result::Result<Rewritten, mds::MdsError> {
     pause_before_replace();
     let ReadForRewrite { target, held } = read;
-    imp::replace_held(held, content.as_bytes(), durability).map_err(|f| worded(&target, f))
+    let landed =
+        imp::replace_held(held, content.as_bytes(), durability).map_err(|f| worded(&target, f))?;
+    Ok(match landed.not_synced {
+        None => Rewritten::Done,
+        Some(cause) => Rewritten::NotSynced(not_synced(&target, &cause)),
+    })
+}
+
+/// A rewrite [`replace_if_unchanged`] made: its file holds the new bytes.
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum Rewritten {
+    /// As its [`Durability`] tier asks.
+    Done,
+    /// The rename landed, but in the [`Durability::Fsync`] tier the directory it was made
+    /// in could not be synced after it, so a crash may still undo it: the `mds::io` error
+    /// `<file> written, but its directory could not be synced: <cause>`, for the caller to
+    /// report after it says the file was written — the run exits 2.
+    NotSynced(mds::MdsError),
 }
 
 /// Remove `target` once it is shown to be a regular file `proof` accepts, below its anchor
@@ -772,6 +823,24 @@ pub(crate) fn out_dir_moved(target: &WriteTarget) -> mds::MdsError {
 fn io_error(shown: &Path, cause: String) -> mds::MdsError {
     mds::MdsError::Io {
         message: format!("cannot write {}: {}", safe_path(shown), safe_inline(cause)),
+    }
+}
+
+/// Why a write that landed may not survive a crash, after the file's name: the directory
+/// its rename was made in could not be synced ([`Durability::Fsync`]).
+const NOT_SYNCED: &str = "written, but its directory could not be synced";
+
+/// The `mds::io` error for a write of `target` that landed in a directory that could not
+/// then be synced, `e` the sync's failure: `<file> written, but its directory could not be
+/// synced: <cause>`, the file named by `target.shown` and both escaped, as a failed write
+/// names them ([`io_error`]).
+fn not_synced(target: &WriteTarget, e: &std::io::Error) -> mds::MdsError {
+    mds::MdsError::Io {
+        message: format!(
+            "{} {NOT_SYNCED}: {}",
+            safe_path(&target.shown),
+            safe_inline(io_cause(e))
+        ),
     }
 }
 
@@ -1028,7 +1097,7 @@ mod unix {
     use rustix::io::Errno;
 
     use super::{
-        Below, Beside, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal,
+        Below, Beside, Commit, DirIdentity, Durability, Failure, Inputs, Landed, Parents, Removal,
         TEMP_PREFIX, TEMP_SUFFIX,
     };
 
@@ -1114,7 +1183,7 @@ mod unix {
         durability: Durability,
         parents: Parents,
         commit: Commit<'_, &Stamp>,
-    ) -> Result<Dir, Failure> {
+    ) -> Result<Landed, Failure> {
         let dir = walk(below, anchor, parents)?;
         replace(dir, below.name, content, durability, commit)
     }
@@ -1238,9 +1307,9 @@ mod unix {
         held: Held,
         content: &[u8],
         durability: Durability,
-    ) -> Result<(), Failure> {
+    ) -> Result<Landed, Failure> {
         let commit = Commit::Replace(Some(&held.stamp));
-        replace(held.dir, &held.name, content, durability, commit).map(drop)
+        replace(held.dir, &held.name, content, durability, commit)
     }
 
     /// Remove `below.name` from the directory [`walk`] opens — creating none — once it is
@@ -1426,14 +1495,16 @@ mod unix {
     /// says: renamed over the file there — when it stamps the file a rewrite read, only if
     /// the file there still holds it, and for an output only if it is no MDS module, each
     /// looked at just before the rename ([`ready_to_replace`]) — or given the name only
-    /// where nothing has it ([`commit_new`]); and give `dir` back.
+    /// where nothing has it ([`commit_new`]); and give `dir` back. In the
+    /// [`Durability::Fsync`] tier `dir` is then synced ([`sync_directory`]): the rename has
+    /// landed by then, so a sync that fails is told apart from a write that failed.
     fn replace(
         dir: OwnedFd,
         name: &OsStr,
         content: &[u8],
         durability: Durability,
         commit: Commit<'_, &Stamp>,
-    ) -> Result<Dir, Failure> {
+    ) -> Result<Landed, Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
         let replaced = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => match (FileType::from_raw_mode(stat.st_mode), commit) {
@@ -1469,10 +1540,11 @@ mod unix {
                 commit_new(temp, name, content, durability, &NO_CLOBBER)?;
             }
         }
-        if durability == Durability::Fsync {
-            return Ok(sync_directory(dir)?);
-        }
-        Ok(dir)
+        let not_synced = match durability {
+            Durability::Fsync => sync_directory(dir.as_fd()).err(),
+            Durability::RenameOnly => None,
+        };
+        Ok(Landed { dir, not_synced })
     }
 
     /// The temporary file that is to replace the regular file `replaced` describes, in
@@ -1819,16 +1891,15 @@ mod unix {
     ///
     /// `File::sync_all` is `F_FULLFSYNC` on Apple platforms, which a filesystem may refuse
     /// for a directory (`ENOTSUP`, `EOPNOTSUPP`, `EINVAL`); a plain `fsync` is the fallback
-    /// for those. A filesystem that refuses that too cannot sync a directory: the rename
-    /// has landed, so the write stands. Any other failure is the write's. The directory is
-    /// given back.
-    fn sync_directory(dir: OwnedFd) -> std::io::Result<OwnedFd> {
-        let readable = File::from(fs::openat(&dir, ".", TO_SYNC, Mode::empty())?);
+    /// for those. A filesystem that refuses that too cannot sync a directory, which is no
+    /// failure. Any other failure — the open's included — is the sync's: the rename has
+    /// landed, and the caller says the file is written but not synced.
+    fn sync_directory(dir: BorrowedFd<'_>) -> std::io::Result<()> {
+        let readable = File::from(fs::openat(dir, ".", TO_SYNC, Mode::empty())?);
         settle_directory_sync(
             || readable.sync_all(),
             || fs::fsync(&readable).map_err(std::io::Error::from),
-        )?;
-        Ok(dir)
+        )
     }
 
     /// The directory sync's outcome, from `full`, the sync asked for first, and `plain`,
@@ -1868,7 +1939,7 @@ mod windows {
     use std::time::SystemTime;
 
     use super::{
-        Below, Beside, Commit, DirIdentity, Durability, Failure, Inputs, Parents, Removal,
+        Below, Beside, Commit, DirIdentity, Durability, Failure, Inputs, Landed, Parents, Removal,
         TEMP_PREFIX, TEMP_SUFFIX,
     };
 
@@ -1881,7 +1952,7 @@ mod windows {
 
     /// Write `content` to `below.name`, in the directory [`walk`] checks, by path (the
     /// residual the module docs describe), as `commit` says, refusing a symlink at the
-    /// target; and give that directory back.
+    /// target; and give that directory back. No directory is synced here.
     pub(super) fn write(
         below: &Below<'_>,
         anchor: Option<DirIdentity>,
@@ -1889,7 +1960,7 @@ mod windows {
         durability: Durability,
         parents: Parents,
         commit: Commit<'_, &Stamp>,
-    ) -> Result<Dir, Failure> {
+    ) -> Result<Landed, Failure> {
         let dir = walk(below, anchor, parents)?;
         let target = dir.join(below.name);
         match (std::fs::symlink_metadata(&target), commit) {
@@ -1900,7 +1971,10 @@ mod windows {
             _ => {}
         }
         replace(&dir, &target, content, durability, commit)?;
-        Ok(dir)
+        Ok(Landed {
+            dir,
+            not_synced: None,
+        })
     }
 
     /// Whether anything has `name` in `dir`, looked at by path without following a
@@ -1985,14 +2059,18 @@ mod windows {
     }
 
     /// Replace the file `held` was read from with `content`, unless its stamp has changed
-    /// by the time it is replaced.
+    /// by the time it is replaced. No directory is synced here.
     pub(super) fn replace_held(
         held: Held,
         content: &[u8],
         durability: Durability,
-    ) -> Result<(), Failure> {
+    ) -> Result<Landed, Failure> {
         let commit = Commit::Replace(Some(&held.stamp));
-        replace(&held.dir, &held.file, content, durability, commit)
+        replace(&held.dir, &held.file, content, durability, commit)?;
+        Ok(Landed {
+            dir: held.dir,
+            not_synced: None,
+        })
     }
 
     /// Remove `below.name`, in the directory [`walk`] checks — creating none — once it is
@@ -2713,11 +2791,78 @@ mod tests {
         );
     }
 
+    /// A rewrite whose rename landed in a directory that could not then be synced — made
+    /// `-wx` between the rewrite's read and its replace, so the sync cannot open it to
+    /// read — is [`Rewritten::NotSynced`]: the file holds the rewrite, and the error names
+    /// it with the sync's cause (#160). Controls: the rename-only tier syncs no directory
+    /// and is done; the same rewrite in a directory left alone is synced, and no temporary
+    /// file is left either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_whose_directory_cannot_be_synced_is_written_and_said_so() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let file = src.join("a.mds");
+        let target = WriteTarget::below(dir.path(), Path::new("out"), Path::new("src/a.mds"));
+        let mode = |mode| std::fs::set_permissions(&src, std::fs::Permissions::from_mode(mode));
+        // The rewrite's outcome — the error of a directory not synced, if any — what the
+        // file holds, and whether the directory could be listed while it was `-wx`.
+        let rewrite_unlistable = |durability| {
+            std::fs::write(&file, "OLD").unwrap();
+            let read = read_stamped(&target, "OLD").unwrap();
+            mode(0o333).unwrap();
+            let rewritten = replace_if_unchanged(read, "NEW", durability).map(|r| match r {
+                Rewritten::Done => None,
+                Rewritten::NotSynced(e) => Some(e.to_string()),
+            });
+            // Read by path, which the directory's search permission allows.
+            let landed = std::fs::read_to_string(&file).unwrap();
+            let listable = std::fs::read_dir(&src).is_ok();
+            mode(0o755).unwrap();
+            (rewritten.map_err(|e| e.to_string()), landed, listable)
+        };
+
+        let (fsync, landed, listable) = rewrite_unlistable(Durability::Fsync);
+        if listable {
+            crate::output::ewriteln!("running as root; mode 0o333 does not stop a listing");
+            return;
+        }
+        assert_eq!(
+            fsync,
+            Ok(Some(
+                "out/src/a.mds written, but its directory could not be synced: Permission \
+                 denied (os error 13)"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(landed, "NEW", "the rewrite landed");
+        assert_eq!(
+            rewrite_unlistable(Durability::RenameOnly),
+            (Ok(None), "NEW".to_owned(), false),
+            "control: the rename-only tier syncs no directory"
+        );
+
+        std::fs::write(&file, "OLD").unwrap();
+        let read = read_stamped(&target, "OLD").unwrap();
+        assert!(
+            matches!(
+                replace_if_unchanged(read, "NEW", Durability::Fsync),
+                Ok(Rewritten::Done)
+            ),
+            "control: a directory left alone is synced"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "NEW");
+        assert_eq!(entries(&src), ["a.mds"]);
+    }
+
     /// The Fsync tier's directory sync, after the rename has landed: a sync refused for a
     /// directory (`ENOTSUP`, `EOPNOTSUPP`, `EINVAL`) falls back to a plain one, and a
     /// filesystem that refuses that too cannot sync a directory at all — the write stands,
-    /// with no error. Any other failure, of either sync, is the write's; the fallback is
-    /// made only after a refusal.
+    /// with no error. Any other failure, of either sync, is the sync's, which the write
+    /// reports as written but not synced; the fallback is made only after a refusal.
     #[cfg(unix)]
     #[test]
     fn a_directory_sync_the_filesystem_refuses_twice_does_not_fail_the_write() {
@@ -2751,13 +2896,13 @@ mod tests {
             assert_eq!(
                 settle(fail(refusal), Some(fail(Errno::IO))),
                 (Err(Some(Errno::IO)), true),
-                "{refusal:?}, then a plain sync that fails: the write's error"
+                "{refusal:?}, then a plain sync that fails: the sync's error"
             );
         }
         assert_eq!(
             settle(fail(Errno::IO), None),
             (Err(Some(Errno::IO)), false),
-            "a failed sync is the write's error, with no fallback"
+            "a failed sync is the sync's error, with no fallback"
         );
     }
 
@@ -3078,7 +3223,10 @@ mod tests {
         assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
 
         let read = read_stamped(&target, "edited").unwrap();
-        replace_if_unchanged(read, "EDITED", Durability::Fsync).unwrap();
+        assert!(matches!(
+            replace_if_unchanged(read, "EDITED", Durability::Fsync),
+            Ok(Rewritten::Done)
+        ));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "EDITED");
 
         std::fs::remove_file(&file).unwrap();

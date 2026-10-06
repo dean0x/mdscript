@@ -21,7 +21,9 @@
 //!   `FormatterInvariant`) via `Err` -> `exit_code`
 //! - 2: file not found / not `.mds` / I/O / bad UTF-8 — a rewrite or a stdout write
 //!   that fails included, in directory mode too, where one such file makes the run
-//!   exit 2 (#157); a closed stdout is not a failure
+//!   exit 2 (#157); a closed stdout is not a failure. So is a rewrite that lands in a
+//!   directory it cannot then sync (#160): `Formatted:` names it, a directory run counts
+//!   it formatted, and the failed sync is reported after it
 //! - 3: oversized source (in directory mode, a failed file that leaves the run at 1)
 
 use std::panic::AssertUnwindSafe;
@@ -35,7 +37,7 @@ use crate::output::{
     catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path, stdout_failure,
     write_stdout, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
-use crate::write::{read_stamped, replace_if_unchanged, Durability};
+use crate::write::{read_stamped, replace_if_unchanged, Durability, Rewritten};
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -175,9 +177,14 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
             // if it still holds the bytes formatted, in the directory it was read in
             // (#160).
             let read = read_stamped(&WriteTarget::as_typed(path.to_path_buf()), &source)?;
-            replace_if_unchanged(read, &result.formatted, Durability::Fsync)?;
+            let rewritten = replace_if_unchanged(read, &result.formatted, Durability::Fsync)?;
             if !quiet {
                 crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
+            }
+            // The file holds the rewrite; a directory that could not then be synced is the
+            // run's failure, reported after it (exit 2).
+            if let Rewritten::NotSynced(e) = rewritten {
+                return Err(e.into());
             }
         } else if !quiet {
             crate::output::ewriteln!("Unchanged: {}", crate::output::safe_path(path));
@@ -228,7 +235,9 @@ enum FileOutcome {
 /// file-system class. A failing stdout is reported once per failure episode — the first
 /// failed write since the run began or since a write last landed; every file whose diff
 /// it lost counts as failed. A closed stdout is not a failure: the diff has no reader,
-/// and the file's outcome stands (#157).
+/// and the file's outcome stands (#157). A rewrite that lands in a directory it cannot
+/// then sync is [`FileOutcome::Formatted`] — the file holds it — and its failed sync is
+/// reported after `Formatted:` and recorded as an I/O failure (#160).
 ///
 /// `file` is the walk's path, below the directory argument as typed: the label of its
 /// error frames and of its `--diff` header, as a file argument typed that way is named
@@ -294,9 +303,14 @@ fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
         match read_stamped(&target, &source)
             .and_then(|read| replace_if_unchanged(read, &result.formatted, Durability::Fsync))
         {
-            Ok(()) => {
+            Ok(rewritten) => {
                 if !quiet {
                     crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(file));
+                }
+                // The file holds the rewrite, and counts as formatted; a directory that
+                // could not then be synced is reported after it and recorded (exit 2).
+                if let Rewritten::NotSynced(e) = rewritten {
+                    crate::output::eprint_io_failure(e);
                 }
                 FileOutcome::Formatted
             }
