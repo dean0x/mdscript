@@ -7653,6 +7653,10 @@ fn watch_with_stderr_closed_keeps_watching() {
 /// 2. An edit fails again: no second report, and no `Recompiled`. The edited entry
 ///    `@include`s an empty module, whose warning shows on stderr that it was compiled.
 /// 3. The test makes room and saves the SAME text again: the write lands.
+///
+/// Unix-only: step 3 makes stdout writable again, which needs the file-size limit, and the
+/// session is stopped by Ctrl+C ([`interrupt`]); steps 1 and 2 run on every OS in
+/// [`watch_to_a_failing_stdout_reports_once_and_keeps_watching`].
 #[cfg(unix)]
 #[test]
 fn watch_to_a_failing_stdout_reports_once_and_retries_the_same_content() {
@@ -7763,6 +7767,94 @@ fn watch_to_a_failing_stdout_reports_once_and_retries_the_same_content() {
     );
 }
 
+/// `mds watch -o -` into a stdout that fails other than by a closed pipe, on every OS: the
+/// failure is reported once, as `mds::io` naming stdout with the operating system's
+/// cause, and the session keeps watching — an edit compiles, its write fails again, and
+/// that is neither reported again nor announced as a rebuild (#157).
+///
+/// Vector: on unix a file already as long as the child's file-size limit, as in
+/// [`watch_to_a_failing_stdout_reports_once_and_retries_the_same_content`] ("file too
+/// large"); on Windows, which has no such limit, a file handle opened to read alone
+/// ("access is denied", os error 5), which fails every write for as long as the session
+/// runs.
+#[test]
+fn watch_to_a_failing_stdout_reports_once_and_keeps_watching() {
+    let include_warning = "@include of 'e' produced empty output";
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("empty.mds"), "").unwrap();
+    let src = dir.path().join("page.mds");
+    std::fs::write(&src, "Hello one\n").unwrap();
+    // Outside the watched directory, so the output's own writes raise no events there.
+    let stdout_dir = tempfile::tempdir().unwrap();
+    let stdout_path = stdout_dir.path().join("stdout");
+
+    let mut cmd = mds_bin();
+    cmd.args([
+        "watch",
+        src.to_str().unwrap(),
+        "-o",
+        "-",
+        "--debounce",
+        "0",
+        // No idle tick: its first-tick recompile would write on its own schedule.
+        "--poll-interval",
+        "0",
+    ]);
+    #[cfg(unix)]
+    let (held, cause) = {
+        const LIMIT: usize = 64;
+        cmd.stdout(Stdio::from(full_file(&stdout_path, LIMIT)));
+        limit_file_growth(&mut cmd, LIMIT as libc::rlim_t);
+        (vec![b'#'; LIMIT], "File too large (os error 27)")
+    };
+    #[cfg(windows)]
+    let (held, cause) = {
+        std::fs::write(&stdout_path, "").unwrap();
+        let read_only = std::fs::File::open(&stdout_path).unwrap();
+        cmd.stdout(Stdio::from(read_only));
+        (Vec::<u8>::new(), "(os error 5)")
+    };
+    let (mut guard, tap) = spawn_ready(&mut cmd);
+
+    // The startup write failed and was reported. An edit fails again; the marker orders
+    // the tap: every rebuild of the edit finished before the marker's compile.
+    wait_for_tap(&tap, "cannot write to stdout", TIMEOUT);
+    write_atomic(
+        &src,
+        "@import \"./empty.mds\" as e\n@include e\nHello two\n",
+    );
+    wait_for_tap(&tap, include_warning, TIMEOUT);
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    assert!(
+        guard.0.try_wait().unwrap().is_none(),
+        "the session keeps watching; stderr:\n{}",
+        tap.text()
+    );
+
+    let stderr = tap.finish_text(&mut guard);
+    assert_eq!(
+        count_occurrences(&stderr, "cannot write to stdout"),
+        1,
+        "a stdout failure is reported once however many writes it fails; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("mds::io") && stderr.contains(cause),
+        "the report is `mds::io` with the cause, {cause}; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, "Recompiled"),
+        0,
+        "a write stdout lost is not a rebuild; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&stdout_path).unwrap(),
+        held,
+        "precondition: no write reached stdout"
+    );
+}
+
 /// `mds watch -o -` into a stdout that fails, recovers and fails again reports both
 /// failures: a write that lands ends the first one, so the second is new, not a repeat
 /// to stay silent about (#157).
@@ -7776,6 +7868,10 @@ fn watch_to_a_failing_stdout_reports_once_and_retries_the_same_content() {
 /// 3. The test fills the file; a new edit fails: report two.
 /// 4. A further edit fails again: no third report, and no `Recompiled`. It `@include`s
 ///    an empty module, whose warning shows on stderr that it was compiled.
+///
+/// Unix-only: stdout recovers and fails again by the file-size limit, which Windows has
+/// no counterpart of — a handle opened to read alone fails for good — and the session is
+/// stopped by Ctrl+C ([`interrupt`]).
 #[cfg(unix)]
 #[test]
 fn watch_to_stdout_reports_a_new_failure_after_stdout_recovers() {
@@ -7891,21 +7987,25 @@ fn watch_to_stdout_reports_a_new_failure_after_stdout_recovers() {
     );
 }
 
-/// A rebuild whose output file cannot be written, in a live session, is reported and
-/// does not change the Ctrl+C exit: 0 (#157).
+/// A live session on `page.mds`, writing `page.md` in a directory of its own, once a
+/// rebuild's write of that output has failed and been reported (#157). Returns the
+/// session, its stderr, its source and the directories it runs in.
 ///
 /// Vector: the output path is replaced by a non-empty directory, which no write can
 /// rename a file over — no permissions involved, so it holds under root too.
-#[cfg(unix)]
-#[test]
-fn watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed() {
+fn a_session_whose_rebuild_write_failed() -> (
+    ChildGuard,
+    StderrTap,
+    std::path::PathBuf,
+    [tempfile::TempDir; 2],
+) {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("page.mds");
     std::fs::write(&src, "Hello one\n").unwrap();
     let out_dir = tempfile::tempdir().unwrap();
     let out = out_dir.path().join("page.md");
 
-    let (mut guard, tap) = spawn_ready(
+    let (guard, tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -7931,6 +8031,19 @@ fn watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed() {
         !seen.contains("Recompiled"),
         "the failed write is reported, not announced; stderr:\n{seen}"
     );
+    (guard, tap, src, [dir, out_dir])
+}
+
+/// A rebuild whose output file cannot be written, in a live session, is reported and
+/// does not change the Ctrl+C exit: 0 (#157). The session is
+/// [`a_session_whose_rebuild_write_failed`]'s.
+///
+/// Unix-only: it stops the session with Ctrl+C ([`interrupt`]); what needs no Ctrl+C runs
+/// on every OS in [`watch_reports_a_rebuild_write_that_failed_and_keeps_watching`].
+#[cfg(unix)]
+#[test]
+fn watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed() {
+    let (mut guard, tap, _, _dirs) = a_session_whose_rebuild_write_failed();
 
     interrupt(&guard);
     let status = wait_bounded(
@@ -7947,6 +8060,29 @@ fn watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed() {
     assert!(
         stderr.ends_with("Stopped watching.\n"),
         "the session ends as any Ctrl+C does; stderr: {stderr:?}"
+    );
+}
+
+/// A rebuild whose output file cannot be written, in a live session, on every OS: it is
+/// reported, never announced as a rebuild, and the session keeps watching — a later
+/// edit is compiled (#157). The session is [`a_session_whose_rebuild_write_failed`]'s;
+/// its Ctrl+C exit is pinned on unix by
+/// [`watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed`].
+#[test]
+fn watch_reports_a_rebuild_write_that_failed_and_keeps_watching() {
+    let (mut guard, tap, src, _dirs) = a_session_whose_rebuild_write_failed();
+
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    assert!(
+        guard.0.try_wait().unwrap().is_none(),
+        "the session keeps watching; stderr:\n{}",
+        tap.text()
+    );
+    let stderr = tap.finish_text(&mut guard);
+    assert!(
+        stderr.contains("mds::io") && !stderr.contains("Recompiled"),
+        "the failed write is reported, and never announced; stderr: {stderr:?}"
     );
 }
 
