@@ -103,6 +103,8 @@
 //! the target and of each input, since std gives no file index there: a hard link to an
 //! input is another path, and is written over by the rename; a target whose canonical
 //! path cannot be had, but that is not gone, is refused, as a look that fails is on unix.
+//! A name holding a `:`, stream syntax there — `lib.mds::$DATA` is `lib.mds` itself — is
+//! refused on Windows before anything is opened ([`names_a_stream`]).
 //!
 //! # Over the caller's own file, or as a new one (#160)
 //!
@@ -845,7 +847,8 @@ impl<'a> Below<'a> {
     /// directory, never a file) or the path ends in a separator, or in a separator and a
     /// `.` (`out/`, `out/.`), which `Path::components` drops; "invalid input" when one above
     /// it is not a name, or when the path has fewer components than the target says lie
-    /// below its anchor.
+    /// below its anchor; and on Windows "invalid filename" when the name is in stream
+    /// syntax ([`names_a_stream`]).
     fn of(target: &'a WriteTarget) -> std::io::Result<Self> {
         if ends_as_a_directory(&target.path) {
             return Err(std::io::ErrorKind::IsADirectory.into());
@@ -864,6 +867,9 @@ impl<'a> Below<'a> {
         let Component::Normal(name) = *last else {
             return Err(std::io::ErrorKind::IsADirectory.into());
         };
+        if cfg!(windows) && names_a_stream(name) {
+            return Err(std::io::ErrorKind::InvalidFilename.into());
+        }
         let dirs = dirs
             .iter()
             .map(|component| match component {
@@ -878,6 +884,15 @@ impl<'a> Below<'a> {
         };
         Ok(Self { anchor, dirs, name })
     }
+}
+
+/// Whether `name` holds a `:`, which Windows reads as NTFS stream syntax (#425):
+/// `lib.mds::$DATA` names the file `lib.mds` itself and `lib.md:x` a stream of `lib.md`,
+/// so a write by such a name lands on a file its name does not say — one the module check,
+/// which goes by the name, would not see. [`Below::of`] refuses such a name there; on unix
+/// a `:` is an ordinary character.
+fn names_a_stream(name: &OsStr) -> bool {
+    name.as_encoded_bytes().contains(&b':')
 }
 
 /// Whether `path` ends in a separator, or in a separator and a `.`: the spelling of a
@@ -2413,6 +2428,45 @@ mod tests {
                 "{typed:?}"
             );
         }
+    }
+
+    /// A name holding a `:` is NTFS stream syntax on Windows — `lib.mds::$DATA` is the file
+    /// `lib.mds` itself, `lib.md:x` a stream of `lib.md` — and is refused there before
+    /// anything is opened, as an invalid file name (#425): a write by that name would land
+    /// on a file its name does not say. On unix a `:` is an ordinary character, and such
+    /// a name splits like any other. Control: a name without one.
+    #[test]
+    fn a_name_in_stream_syntax_is_refused_on_windows_alone() {
+        assert!(names_a_stream(OsStr::new("lib.mds::$DATA")));
+        assert!(names_a_stream(OsStr::new("lib.md:x")));
+        assert!(!names_a_stream(OsStr::new("lib.md")));
+
+        for name in ["lib.mds::$DATA", "lib.md:x"] {
+            let target = WriteTarget::below(Path::new("out"), Path::new("o"), Path::new(name));
+            let split = Below::of(&target).map(|below| below.name.to_owned());
+            if cfg!(windows) {
+                assert_eq!(
+                    split.map_err(|e| e.kind()),
+                    Err(std::io::ErrorKind::InvalidFilename),
+                    "{name}"
+                );
+            } else {
+                assert_eq!(split.unwrap(), OsStr::new(name));
+            }
+        }
+        let plain = WriteTarget::below(Path::new("out"), Path::new("o"), Path::new("lib.md"));
+        assert_eq!(Below::of(&plain).unwrap().name, OsStr::new("lib.md"));
+    }
+
+    /// On unix a file whose name holds a `:` is written like any other (#425): the
+    /// refusal of stream syntax is Windows' alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_with_a_colon_is_written_on_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a:b.md");
+        write_as_typed(&file, "written", Durability::RenameOnly).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "written");
     }
 
     /// A refused directory is named below the anchor's shown form, cut after the level the

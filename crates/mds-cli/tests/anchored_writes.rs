@@ -1166,6 +1166,46 @@ fn a_directory_symlink_or_junction_below_the_out_dir_is_refused() {
     }
 }
 
+/// Windows: an output named in NTFS stream syntax is refused before anything is written
+/// (#425): `lib.mds::$DATA` is the file `lib.mds` itself and `lib.md::$DATA` the file
+/// `lib.md`, each an MDS module, which a write by that name would replace while its name
+/// says it is neither. Each is refused, `mds::io`, exit 2, as an invalid file name; the
+/// modules are left as they are, and no temporary file is left. Control: `-o out.md`
+/// beside them is written.
+#[cfg(windows)]
+#[test]
+fn an_output_named_in_stream_syntax_is_refused() {
+    const MODULE: &str = "---\ntype: mds\n---\nLib\n";
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "page.mds", "Hello\n");
+    put(root, "lib.mds", "Lib\n");
+    put(root, "lib.md", MODULE);
+    let invalid = std::io::Error::from(std::io::ErrorKind::InvalidFilename).to_string();
+
+    for name in ["lib.mds::$DATA", "lib.md::$DATA"] {
+        let out = run(root, &["build", "page.mds", "-o", name]);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{name}: stderr: {stderr}");
+        assert!(
+            stderr.contains("mds::io")
+                && squash(&stderr).contains(&squash(&format!("cannot write {name}: {invalid}"))),
+            "{name}: refused as an invalid file name; stderr: {stderr}"
+        );
+    }
+    assert_eq!(read(&root.join("lib.mds")), "Lib\n");
+    assert_eq!(read(&root.join("lib.md")), MODULE);
+    assert_eq!(
+        entries(root),
+        ["lib.md", "lib.mds", "page.mds"],
+        "nothing is written, and no temporary file is left"
+    );
+
+    let out = run(root, &["build", "page.mds", "-o", "out.md"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", text(&out.stderr));
+    assert_eq!(read(&root.join("out.md")), "Hello\n");
+}
+
 // ── Probes (ignored: run with `--run-ignored only`) ─────────────────────────
 
 /// The binary a probe runs: `MDS_PROBE_BIN` when set — another build of `mds` to compare

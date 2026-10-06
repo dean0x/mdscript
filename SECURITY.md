@@ -202,7 +202,10 @@ input. The compiler enforces several defense-in-depth controls:
   file the run reads are refused and left as they are (`mds::io`, #425). One put
   there in the instant between that look and the rename is replaced. An output that
   itself declares `type: mds` — a module a template generates — replaces a module,
-  its own or one written by hand, though never a file the run reads.
+  its own or one written by hand, though never a file the run reads. On Windows a
+  name holding a `:` — NTFS stream syntax, `lib.mds::$DATA` being `lib.mds` itself —
+  is refused before anything is written (`invalid filename`), so no write reaches a
+  module by a name the check does not take for one.
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
   are not preserved (permission bits are, on Unix — read, write and execute alone,
   never a setuid, setgid or sticky bit, and only from a file the user running mds owns:
