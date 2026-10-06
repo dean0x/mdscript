@@ -1675,29 +1675,50 @@ fn an_output_that_cannot_be_removed_is_named_as_typed() {
     }
 }
 
+/// Say that `test` was skipped, and why, where a passing run cannot hide it: a `SKIPPED`
+/// line on stderr and, under GitHub Actions, a warning in the job summary, as the lint
+/// goldens do. The summary write is best effort.
+fn announce_skip(test: &str, reason: &str) {
+    eprintln!("SKIPPED {test}: {reason}");
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut summary) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            let _ = writeln!(summary, ":warning: path labels: skipped {test}: {reason}");
+        }
+    }
+}
+
 /// An entry typed in another case than its name on a case-insensitive volume: `mds watch`
 /// derives its output's file name from the name the volume holds — the file it resolves
 /// the entry to — and writes and names the output by it, beside the entry as typed or
 /// below `--out-dir` as typed; `mds build` keeps the case as typed.
 ///
-/// Unix-only, and skipped with a reason where the volume tells case apart (Linux, a
-/// case-sensitive macOS volume).
-#[cfg(unix)]
+/// Runs on every platform, but means something only where the volume folds case: NTFS —
+/// the Windows CI job runs it — and a default macOS volume. Where the volume tells case
+/// apart (Linux, a case-sensitive macOS volume) it is skipped, and says so where a passing
+/// run cannot hide it ([`announce_skip`]).
 #[test]
 fn an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk() {
     let dir = scratch();
     let root = dir.path();
     put(root, "b/page.mds", "Page\n");
-    if !root.join("b/PAGE.mds").exists() {
-        eprintln!("skipped: {} tells case apart", root.display());
+    if !root.join(native("b/PAGE.mds")).exists() {
+        announce_skip(
+            "an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk",
+            "the volume of the temporary directory tells case apart",
+        );
         return;
     }
 
     let build = run(&root.join("b"), &["build", "PAGE.mds"]);
     let built = String::from_utf8_lossy(&build.stderr);
+    let control = format!("Compiled to {}", native("./PAGE.md"));
     assert!(
-        built.lines().any(|line| line == "Compiled to ./PAGE.md"),
-        "control: mds build names the output by the case typed; stderr: {built}"
+        built.lines().any(|line| line == control),
+        "control: mds build names the output by the case typed, {control:?}; stderr: {built}"
     );
 
     // (the session's directory, its arguments, the output as named, where it is written)
@@ -1710,6 +1731,7 @@ fn an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk() {
             "o/out",
         ),
     ] {
+        let output = native(output);
         put(root, &format!("{cwd}/page.mds"), "Page\n");
         let (mut child, tap, _) = watch_live(&root.join(cwd), args, false);
         write_atomic(&root.join(cwd).join("page.mds"), "Edited\n");
@@ -1734,7 +1756,7 @@ fn an_entry_typed_in_another_case_names_its_output_by_the_name_on_disk() {
                     .all(|line| line.starts_with(&format!("Recompiled {output} ("))),
             "{args:?}: every rebuild names the output by the name on disk; stderr: {stderr}"
         );
-        let names: Vec<String> = std::fs::read_dir(root.join(written))
+        let names: Vec<String> = std::fs::read_dir(root.join(native(written)))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.ends_with(".md"))
