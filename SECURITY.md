@@ -201,7 +201,11 @@ input. The compiler enforces several defense-in-depth controls:
   itself declares `type: mds` — a module a template generates — replaces a module,
   its own or one written by hand, though never a file the run reads.
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
-  are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
+  are not preserved (permission bits are, on Unix — read, write and execute alone,
+  never a setuid, setgid or sticky bit, and only from a file the user running mds owns:
+  one another user owns lends none, so a file another user plants at an output path in
+  a shared directory cannot choose the mode of the output that replaces it) — see spec
+  §7.2 "Output writing".
 
 The symlink, containment, NUL-byte, forbidden-character, path-encoding and
 segment-count rules above are specified normatively — with their error codes, the

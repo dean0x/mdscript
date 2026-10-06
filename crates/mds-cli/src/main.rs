@@ -491,9 +491,9 @@ Your items:
 ";
     // #386: the same primitive as every other CLI write — a symlink at `filename` (live
     // under `--force`, dangling without it) is refused instead of written through;
-    // `--force` replaces a regular file by rename with its mode preserved, and without it
-    // the starter is committed only where nothing is, so a file that appeared after the
-    // check above is refused, not replaced (#160). `RenameOnly` because the starter is a
+    // `--force` replaces a regular file by rename with its permission bits kept, and
+    // without it the starter is committed only where nothing is, so a file that appeared
+    // after the check above is refused, not replaced (#160). `RenameOnly` because the starter is a
     // fixed public template a re-run reproduces. Anchored at the typed parent, which must
     // exist: init creates no directory (#160).
     let target = output::WriteTarget::as_typed(filename.clone());

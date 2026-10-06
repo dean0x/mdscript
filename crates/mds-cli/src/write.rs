@@ -39,8 +39,9 @@
 //! (`mkdirat` first for a directory an output needs), then `fstatat(AT_SYMLINK_NOFOLLOW)` on
 //! the target — never an open of it, which a FIFO would block, and a FIFO, a socket or a
 //! device is refused — the temporary file `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` beside it —
-//! unlinked again if anything after that fails — `fchmod` to the mode of the file it
-//! replaces, the durability tier's syncs, and `renameat` (`mod unix`).
+//! unlinked again if anything after that fails — `fchmod` to the permission bits of the
+//! file it replaces when one user owns both, the durability tier's syncs, and `renameat`
+//! (`mod unix`).
 //!
 //! Windows has no descriptor-relative walk in std: each directory below the anchor is
 //! checked with `symlink_metadata` and refused when it is a symlink or a junction — the
@@ -142,9 +143,12 @@
 //! This is replace-by-rename, not an in-place rewrite. The target receives a NEW inode, so
 //! the write does NOT preserve hard links (other links keep the old content), ACLs,
 //! extended attributes (xattrs), or owner/group of the original file; only the permission
-//! bits are carried over (unix). Hard-link preservation is out of scope by construction (it
-//! would require truncate-in-place and forfeit crash safety); ACL/xattr/owner-group
-//! preservation is not planned — MDS only rewrites its own outputs and `.mds` sources.
+//! bits are carried over (unix) — never a setuid, setgid or sticky bit, and only from a
+//! file the user who writes owns: one another user owns lends none, and the new file has
+//! the mode a new file is created with. Hard-link preservation is out of scope by
+//! construction (it would require truncate-in-place and forfeit crash safety);
+//! ACL/xattr/owner-group preservation is not planned — MDS only rewrites its own outputs
+//! and `.mds` sources.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -231,9 +235,10 @@ impl DirIdentity {
 ///
 /// A symlink at the target itself — live or dangling — is refused rather than replaced,
 /// and so, on unix, is a FIFO, a socket or a device, which the write never opens.
-/// An existing file keeps its permission bits (unix); a new one is created with mode
-/// `0666 & !umask`, as `std::fs::write` creates one. `parents` says whether missing
-/// directories are created; `durability` whether the write is synced.
+/// An existing file the user owns keeps its permission bits, never a setuid, setgid or
+/// sticky bit (unix); a new one — and one replacing a file another user owns — is
+/// created with mode `0666 & !umask`, as `std::fs::write` creates one. `parents` says
+/// whether missing directories are created; `durability` whether the write is synced.
 ///
 /// # Errors
 ///
@@ -1028,6 +1033,14 @@ mod unix {
     /// `std::fs::write`.
     const NEW_FILE: Mode = Mode::from_raw_mode(0o666);
 
+    /// The mode a file that replaces another is created with: owner-only, so its bytes are
+    /// never readable by anyone the file it replaces did not allow.
+    const OWNER_ONLY: Mode = Mode::RUSR.union(Mode::WUSR);
+
+    /// The bits of its mode a replaced file lends the file that replaces it: read, write
+    /// and execute for its owner, its group and others — never setuid, setgid or sticky.
+    const PERMISSION_BITS: fs::RawMode = 0o777;
+
     /// The mode a directory a write creates asks for: `0777`, narrowed by the umask.
     const NEW_DIR: Mode = Mode::from_raw_mode(0o777);
 
@@ -1333,12 +1346,12 @@ mod unix {
         commit: Commit<'_, &Stamp>,
     ) -> Result<Dir, Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
-        let existing = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        let replaced = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => match (FileType::from_raw_mode(stat.st_mode), commit) {
                 (FileType::Symlink, _) => return Err(Failure::LinkAtTarget),
                 // A new file is never put where anything is.
                 (_, Commit::New) => return Err(Failure::Exists),
-                (FileType::RegularFile, _) => Some(Mode::from_raw_mode(stat.st_mode)),
+                (FileType::RegularFile, _) => Some(stat),
                 // A directory has no mode a file should take: the rename below refuses to
                 // replace it, and the temporary file is unlinked again.
                 (FileType::Directory, _) => None,
@@ -1347,16 +1360,10 @@ mod unix {
             Err(Errno::NOENT) => None,
             Err(e) => return Err(e.into()),
         };
-        // A file that replaces another is created owner-only and then given that file's
-        // mode, so its bytes are never readable by anyone the old file did not allow.
-        let create = match existing {
-            Some(_) => Mode::RUSR.union(Mode::WUSR),
-            None => NEW_FILE,
+        let (mut temp, file) = match &replaced {
+            Some(replaced) => create_replacement(dir.as_fd(), replaced)?,
+            None => create_temp(dir.as_fd(), NEW_FILE, temp_names())?,
         };
-        let (mut temp, file) = create_temp(dir.as_fd(), create, temp_names())?;
-        if let Some(mode) = existing {
-            fs::fchmod(&file, mode)?;
-        }
         fill(file, content, durability)?;
         match commit {
             Commit::Replace(_) | Commit::Output { .. } => {
@@ -1377,6 +1384,37 @@ mod unix {
             return Ok(sync_directory(dir)?);
         }
         Ok(dir)
+    }
+
+    /// The temporary file that is to replace the regular file `replaced` describes, in
+    /// `dir` (#160): created owner-only, then given that file's permission bits when the
+    /// user who owns that file owns this one too ([`kept_mode`]). Beside a file another
+    /// user owns it is made again as a new file is, its mode the umask's: that user chose
+    /// that file's mode, and lends it to no one else's file.
+    fn create_replacement<'d>(
+        dir: BorrowedFd<'d>,
+        replaced: &fs::Stat,
+    ) -> Result<(Temp<'d>, File), Failure> {
+        let (temp, file) = create_temp(dir, OWNER_ONLY, temp_names())?;
+        let same_owner = fs::fstat(&file)?.st_uid == replaced.st_uid;
+        match kept_mode(replaced.st_mode, same_owner) {
+            Some(mode) => {
+                fs::fchmod(&file, mode)?;
+                Ok((temp, file))
+            }
+            None => {
+                // Unlinked again as it drops, before the new file is created.
+                drop((temp, file));
+                Ok(create_temp(dir, NEW_FILE, temp_names())?)
+            }
+        }
+    }
+
+    /// The mode a file with mode `st_mode` lends the file that replaces it: its permission
+    /// bits alone ([`PERMISSION_BITS`]), and only when one user owns both (`same_owner`) —
+    /// else none.
+    pub(super) fn kept_mode(st_mode: fs::RawMode, same_owner: bool) -> Option<Mode> {
+        same_owner.then(|| Mode::from_raw_mode(st_mode & PERMISSION_BITS))
     }
 
     /// Whether the rename over `name` in `dir` may go on, as `commit` says, looked at just
@@ -4202,6 +4240,89 @@ mod tests {
             assert_eq!(mode, kept, "existing mode must be preserved; got 0{mode:o}");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
         }
+    }
+
+    /// A replaced file lends its replacement its permission bits alone, never its setuid,
+    /// setgid or sticky bit (#160): a `0o4755`, a `0o2755` and a `0o1755` file the user
+    /// owns are each replaced by a `0o755` one. Each bit is read back after it is set, so
+    /// the file replaced held it. (Writing to a file clears its setuid and setgid bits for
+    /// a writer without the privilege to keep them, so for most users only the sticky bit
+    /// would otherwise reach the replacement.)
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_lends_only_its_permission_bits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        for special in [0o4755, 0o2755, 0o1755] {
+            let target = dir.path().join(format!("tool-{special:o}.md"));
+            let mode = || std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+            std::fs::write(&target, "OLD").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(special)).unwrap();
+            assert_eq!(mode(), special, "the file replaced holds the bit");
+
+            write_as_typed(&target, "NEW", Durability::RenameOnly).unwrap();
+
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+            assert_eq!(mode(), 0o755, "0{special:o} replaced: got 0{:o}", mode());
+        }
+    }
+
+    /// A replaced file lends its permission bits only to a file its own owner writes
+    /// (#160): from a file another user owns — which only that user chose the mode of —
+    /// none, and the replacement keeps the mode a new file is created with. Control: the
+    /// same modes, one owner, lend their permission bits and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_file_its_writer_owns_lends_its_mode() {
+        use rustix::fs::RawMode;
+
+        use super::unix::kept_mode;
+
+        /// `st_mode`'s file type for a regular file, as `stat` gives it above the mode.
+        const REGULAR: RawMode = 0o100_000;
+        let kept = |st_mode: RawMode, same_owner: bool| {
+            kept_mode(st_mode, same_owner).map(|mode| mode.bits())
+        };
+        assert_eq!(kept(REGULAR | 0o640, true), Some(0o640));
+        assert_eq!(kept(REGULAR | 0o7755, true), Some(0o755));
+        assert_eq!(kept(REGULAR | 0o666, false), None);
+        assert_eq!(kept(REGULAR | 0o4755, false), None);
+        assert_eq!(kept(REGULAR | 0o600, false), None);
+    }
+
+    /// A file another user owns is replaced by one with the mode a new file is created
+    /// with, never that file's (#160): `0o777` lent to the replacement would leave its
+    /// bytes open to everyone whatever the writer's umask. Only a writer allowed to give a
+    /// file away can set one up, so this runs as root and is skipped, with a reason,
+    /// otherwise; [`only_a_file_its_writer_owns_lends_its_mode`] pins the rule everywhere.
+    /// Control: a file `std::fs::write` creates beside it has the same mode — never an
+    /// execute bit, so never the mode lent.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_another_user_owns_lends_its_replacement_no_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        if std::fs::metadata(dir.path()).unwrap().uid() != 0 {
+            crate::output::ewriteln!("not running as root; cannot give a file to another user");
+            return;
+        }
+        let target = dir.path().join("shared.md");
+        let fresh = dir.path().join("fresh.md");
+        std::fs::write(&target, "OLD").unwrap();
+        std::os::unix::fs::chown(&target, Some(65_534), None).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(std::fs::metadata(&target).unwrap().uid(), 65_534);
+        assert_eq!(mode(&target), 0o777);
+
+        write_as_typed(&target, "NEW", Durability::RenameOnly).unwrap();
+        std::fs::write(&fresh, "NEW").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+        assert_eq!(mode(&target), mode(&fresh), "got 0{:o}", mode(&target));
+        assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
     }
 
     /// T-U4: a symlink at the target is refused, never written through. The control writes
