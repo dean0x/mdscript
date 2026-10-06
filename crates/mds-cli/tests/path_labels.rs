@@ -1566,19 +1566,52 @@ fn removed_names_the_output_as_typed_when_the_vars_file_changes_in_the_same_batc
     assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
 }
 
-/// A deleted source's output that cannot be removed — its directory is read-only — is
-/// named as typed in the warning that says so, as a removed one is in `Removed`: after a
-/// deletion alone, and after one in the same batch as an edit to the `--vars` file.
+/// `mds watch d --out-dir o <extra>` in `cwd`, over the one source `d/sub/b.mds`: once the
+/// session has written its output `o/sub/b.md`, `block` is given `o/sub` to keep that
+/// output from being removed — it returns `false` where it cannot — then the source is
+/// deleted, the `--vars` file `vars.json` edited too when `edit_vars`, and the session's
+/// stderr given back once it says it could not remove the output. `None` when `block`
+/// could not keep the output.
+fn retire_a_kept_output(
+    cwd: &Path,
+    extra: &[&str],
+    edit_vars: bool,
+    block: impl FnOnce(&Path) -> bool,
+) -> Option<String> {
+    put(cwd, "d/sub/b.mds", "B\n");
+    put(cwd, "vars.json", r#"{"name": "one"}"#);
+    let (child, tap, _) = common::spawn_watch_ready(
+        mds_bin()
+            .current_dir(cwd)
+            .args(["watch", "d", "--out-dir", "o"])
+            .args(extra)
+            .stdout(Stdio::null()),
+    );
+    let mut child = common::ChildGuard(child);
+    if !block(&cwd.join("o").join("sub")) {
+        return None;
+    }
+    std::fs::remove_file(cwd.join(native("d/sub/b.mds"))).expect("delete the source");
+    if edit_vars {
+        write_atomic(&cwd.join("vars.json"), r#"{"name": "two"}"#);
+    }
+    common::wait_for_tap(&tap, "could not remove", WATCH_STEP);
+    Some(tap.finish_text(&mut child))
+}
+
+/// A deleted source's output that cannot be removed is named as typed in the warning that
+/// says so, as a removed one is in `Removed`: after a deletion alone, and after one in the
+/// same batch as an edit to the `--vars` file. What keeps it is a directory put at its path
+/// after the session wrote it — refused as no regular file — or its directory made
+/// read-only.
 ///
-/// Unix-only: it makes a directory read-only; skipped with a reason where the mode does
-/// not stop a removal (running as root).
-#[cfg(unix)]
+/// The directory arm runs on every platform. The read-only arm is unix-only, and skipped
+/// with a reason where the mode does not stop a removal (running as root).
 #[test]
 fn an_output_that_cannot_be_removed_is_named_as_typed() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let dir = scratch();
     let root = dir.path();
+    let shown = native("o/sub/b.md");
     // (fixture directory, the extra arguments, whether the `--vars` file is edited too)
     for (fixture, extra, edit_vars) in [
         ("alone", &["--debounce", "0"][..], false),
@@ -1588,45 +1621,57 @@ fn an_output_that_cannot_be_removed_is_named_as_typed() {
             true,
         ),
     ] {
-        let cwd = root.join(fixture);
-        put(&cwd, "d/sub/b.mds", "B\n");
-        put(&cwd, "vars.json", r#"{"name": "one"}"#);
-        let (child, tap, _) = common::spawn_watch_ready(
-            mds_bin()
-                .current_dir(&cwd)
-                .args(["watch", "d", "--out-dir", "o"])
-                .args(extra)
-                .stdout(Stdio::null()),
-        );
-        let mut child = common::ChildGuard(child);
-        let sub = cwd.join("o/sub");
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let _writable = Writable(sub.clone());
-        if std::fs::write(sub.join(".write-probe"), b"").is_ok() {
-            let _ = std::fs::remove_file(sub.join(".write-probe"));
-            eprintln!(
-                "skipped: {} is writable at mode 0o555 (running as root?)",
-                sub.display()
-            );
-            return;
-        }
-
-        std::fs::remove_file(cwd.join("d/sub/b.mds")).expect("delete the source");
-        if edit_vars {
-            write_atomic(&cwd.join("vars.json"), r#"{"name": "two"}"#);
-        }
-        common::wait_for_tap(&tap, "could not remove", WATCH_STEP);
-        let stderr = tap.finish_text(&mut child);
-
+        let cwd = root.join(fixture).join("directory");
+        let stderr = retire_a_kept_output(&cwd, extra, edit_vars, |sub| {
+            std::fs::remove_file(sub.join("b.md")).expect("remove the session's output");
+            std::fs::create_dir(sub.join("b.md")).expect("put a directory in its place");
+            true
+        })
+        .expect("a directory always keeps the output");
+        let warning = format!("warning: could not remove {shown}: not a regular file\n");
         assert!(
-            stderr.contains("warning: could not remove o/sub/b.md: "),
-            "{fixture}: the output is named below the out-dir as typed; stderr: {stderr}"
+            stderr.contains(&warning),
+            "{fixture}: the output is named below the out-dir as typed, {warning:?}; \
+             stderr: {stderr}"
         );
         assert!(
-            sub.join("b.md").is_file(),
-            "{fixture}: the output is still there"
+            cwd.join(&shown).is_dir(),
+            "{fixture}: the directory is still there"
         );
         assert_eq!(leak(&stderr, root), None, "{fixture}: stderr: {stderr}");
+
+        // Unix-only: it sets a directory's mode bits, which Windows has no counterpart of.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let cwd = root.join(fixture).join("read-only");
+            let _writable = Writable(cwd.join("o").join("sub"));
+            let stderr = retire_a_kept_output(&cwd, extra, edit_vars, |sub| {
+                std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+                if std::fs::write(sub.join(".write-probe"), b"").is_ok() {
+                    let _ = std::fs::remove_file(sub.join(".write-probe"));
+                    eprintln!(
+                        "skipped the read-only arm: {} is writable at mode 0o555 (running as \
+                         root?)",
+                        sub.display()
+                    );
+                    return false;
+                }
+                true
+            });
+            if let Some(stderr) = stderr {
+                assert!(
+                    stderr.contains(&format!("warning: could not remove {shown}: ")),
+                    "{fixture}: the output is named below the out-dir as typed; stderr: {stderr}"
+                );
+                assert!(
+                    cwd.join(&shown).is_file(),
+                    "{fixture}: the output is still there"
+                );
+                assert_eq!(leak(&stderr, root), None, "{fixture}: stderr: {stderr}");
+            }
+        }
     }
 }
 
@@ -1773,21 +1818,22 @@ const WATCHER_REFUSAL: &str = if cfg!(windows) {
 // ── The text of an error writing an output ───────────────────────────────────
 
 /// `path`'s refusal as a symlink at an output's path.
-#[cfg(unix)]
 fn refused(path: &str) -> String {
     format!("cannot write {path}: refusing to replace a symlink")
 }
 
-/// Plant a symlink at `root/rel` to a regular file, creating `rel`'s directories.
-#[cfg(unix)]
-fn plant_symlink(root: &Path, rel: &str) {
+/// Plant a symlink at `root/rel` (`rel` written with `/`) to a regular file, creating
+/// `rel`'s directories: `false` where this platform lets no test make one
+/// (`common::make_symlink`).
+#[must_use]
+fn plant_symlink(root: &Path, rel: &str) -> bool {
     let target = root.join("target.md");
     if !target.exists() {
         put(root, "target.md", "T\n");
     }
-    let at = root.join(rel);
+    let at = root.join(native(rel));
     std::fs::create_dir_all(at.parent().expect("a path below the root")).unwrap();
-    std::os::unix::fs::symlink(target, at).expect("plant a symlink");
+    common::make_symlink(&target, &at)
 }
 
 /// The text of an error writing an output names it as its `Compiled to` line does, and
@@ -1810,16 +1856,16 @@ fn an_error_writing_an_output_names_it_as_its_status_line_does() {
     let dir = scratch();
     let root = dir.path();
     put(root, "src/a.mds", "A\n");
-    plant_symlink(root, "out/a.md");
+    assert!(plant_symlink(root, "out/a.md"));
     put(root, "proj/mds.json", r#"{"build":{"output_dir":"dist"}}"#);
     put(root, "proj/p.mds", "P\n");
     put(root, "proj/src/q.mds", "Q\n");
-    plant_symlink(root, "proj/dist/p.md");
-    plant_symlink(root, "proj/dist/q.md");
+    assert!(plant_symlink(root, "proj/dist/p.md"));
+    assert!(plant_symlink(root, "proj/dist/q.md"));
     put(root, "nts/n.mds", "N\n");
-    plant_symlink(root, "nts/n.md");
-    plant_symlink(root, "o4/a.md");
-    plant_symlink(root, "o5/y.md");
+    assert!(plant_symlink(root, "nts/n.md"));
+    assert!(plant_symlink(root, "o4/a.md"));
+    assert!(plant_symlink(root, "o5/y.md"));
 
     // (working directory, arguments, the output as its status line names it)
     for (cwd, args, shown) in [
@@ -1903,72 +1949,108 @@ fn an_error_writing_an_output_names_it_as_its_status_line_does() {
 /// `mds watch` names an output in the text of an error writing it as its `Compiled to`
 /// line does (#390): beside the entry and beside a directory argument's source, where the
 /// write goes to the canonical path, as well as under `-o` and below file mode's
-/// `--out-dir`; and below a directory argument's `--out-dir` in the warning that a stale
-/// output of the other kind could not be removed, as the `Recompiled` line beside it
-/// does. Each error's presence is the control for the absence of the scratch directory.
+/// `--out-dir`, whether a directory or a symlink stands at the output's path; and below a
+/// directory argument's `--out-dir` in the warning that a stale output of the other kind
+/// could not be removed, as the `Recompiled` line beside it does. Each error's presence is
+/// the control for the absence of the scratch directory.
 ///
-/// Unix-only: it plants symlinks.
-#[cfg(unix)]
+/// Runs on every platform; the symlink arm waits on `common::make_symlink`. The cause after
+/// a directory's path is the operating system's, which words it its own way, so the line is
+/// pinned up to it, and the cause is checked to name no temporary file.
 #[test]
 fn watch_names_an_output_as_its_status_line_does_in_an_error_writing_it() {
     let dir = scratch();
     let root = dir.path();
-    for (source, output) in [
-        ("d1/a.mds", "d1/a.md"),
-        ("w1/page.mds", "w1/page.md"),
-        ("w2/page.mds", "o2/y.md"),
-        ("w3/page.mds", "o3/page.md"),
-    ] {
-        put(root, source, "Page\n");
-        plant_symlink(root, output);
-    }
-
-    // (arguments, the output the startup write refuses, as its status line names it)
-    for (args, shown) in [
-        (&["watch", "d1"][..], "d1/a.md"),
-        (&["watch", "w1/page.mds"][..], "w1/page.md"),
-        (&["watch", "w2/page.mds", "-o", "o2/y.md"][..], "o2/y.md"),
+    // (the source, the arguments, the output the startup write refuses, as its status line
+    // names it — and as it is planted)
+    let cases: [(&str, &[&str], &str); 4] = [
+        ("d1/a.mds", &["watch", "d1"], "d1/a.md"),
+        ("w1/page.mds", &["watch", "w1/page.mds"], "w1/page.md"),
         (
-            &["watch", "w3/page.mds", "--out-dir", "o3"][..],
+            "w2/page.mds",
+            &["watch", "w2/page.mds", "-o", "o2/y.md"],
+            "o2/y.md",
+        ),
+        (
+            "w3/page.mds",
+            &["watch", "w3/page.mds", "--out-dir", "o3"],
             "o3/page.md",
         ),
-    ] {
-        let (child, tap, _) = common::spawn_watch_unsynchronized(
-            mds_bin()
-                .current_dir(root)
-                .args(args)
-                .args(["--debounce", "0"])
-                .stdout(Stdio::null()),
-        );
-        let mut child = common::ChildGuard(child);
-        // The refusal's last word: an error frame may wrap the line between any two.
-        common::wait_for_tap(&tap, "symlink", WATCH_STEP);
-        let stderr = tap.finish_text(&mut child);
-        let error = refused(shown);
-        assert!(
-            squash(&stderr).contains(&squash(&error)),
-            "{args:?}: {error:?}; stderr: {stderr}"
-        );
-        assert_eq!(leak(&stderr, root), None, "{args:?}: stderr: {stderr}");
+    ];
+    for link in [false, true] {
+        let cwd = root.join(if link { "link" } else { "directory" });
+        let mut planted = true;
+        for (source, _, output) in cases {
+            put(&cwd, source, "Page\n");
+            if link {
+                planted = planted && plant_symlink(&cwd, output);
+            } else {
+                put(&cwd, &format!("{output}/keep"), "keep\n");
+            }
+        }
+        if !planted {
+            // Only where this platform lets no test make a link (`common::make_symlink`).
+            continue;
+        }
+
+        for (_, args, output) in cases {
+            let args = typed_args(args);
+            let label = format!("(link: {link}) mds {}", args.join(" "));
+            let shown = native(output);
+            let (child, tap, _) = common::spawn_watch_unsynchronized(
+                mds_bin()
+                    .current_dir(&cwd)
+                    .args(&args)
+                    .args(["--debounce", "0"])
+                    .stdout(Stdio::null()),
+            );
+            let mut child = common::ChildGuard(child);
+            let error = if link {
+                refused(&shown)
+            } else {
+                format!("cannot write {shown}: ")
+            };
+            // An error frame may wrap the line between any two words.
+            let printed = common::poll_tap_until(&tap, WATCH_STEP, |text| {
+                squash(text).contains(&squash(&error))
+            });
+            let stderr = tap.finish_text(&mut child);
+            assert!(printed.is_ok(), "{label}: {error:?}; stderr: {stderr}");
+            assert!(
+                !stderr.contains(".mds-tmp-"),
+                "{label}: no temporary file is named; stderr: {stderr}"
+            );
+            assert_eq!(leak(&stderr, root), None, "{label}: stderr: {stderr}");
+            if !link {
+                assert!(
+                    cwd.join(&shown).join("keep").is_file(),
+                    "{label}: the directory is left as it was"
+                );
+            }
+        }
     }
 
     // The stale output this session wrote, replaced by a directory no file removal
     // removes, when its source turns into a messages template.
     put(root, "d5/a.mds", "A\n");
     let (mut child, tap, _) = watch_live(root, &["watch", "d5", "--out-dir", "o5"], false);
-    std::fs::remove_file(root.join("o5/a.md")).expect("remove the startup output");
+    std::fs::remove_file(root.join(native("o5/a.md"))).expect("remove the startup output");
     put(root, "o5/a.md/keep", "keep\n");
-    write_atomic(&root.join("d5/a.mds"), "@message user:\nHi\n@end\n");
+    write_atomic(&root.join(native("d5/a.mds")), "@message user:\nHi\n@end\n");
     common::wait_for_tap(&tap, "stale", WATCH_STEP);
     let stderr = tap.finish_text(&mut child);
-    let warning = "warning: could not remove stale output o5/a.md: ";
-    assert!(
-        squash(&stderr).contains(&squash(warning)),
-        "{warning:?}; stderr: {stderr}"
+    let warning = format!(
+        "warning: could not remove stale output {}: ",
+        native("o5/a.md")
     );
     assert!(
-        stderr.contains("Recompiled o5/a.json ("),
-        "the rebuild names the output as typed; stderr: {stderr}"
+        squash(&stderr).contains(&squash(&warning)),
+        "{warning:?}; stderr: {stderr}"
+    );
+    let recompiled = format!("Recompiled {} (", native("o5/a.json"));
+    assert!(
+        stderr.contains(&recompiled),
+        "the rebuild names the output as typed, {recompiled:?}; stderr: {stderr}"
     );
     assert_eq!(leak(&stderr, root), None, "stderr: {stderr}");
 }
