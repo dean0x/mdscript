@@ -1731,14 +1731,16 @@ fn the_pause_before_a_replace_is_compiled_only_into_debug_builds() {
     }
 }
 
-/// The pause between a directory watch batch's split and its compile (#160) compiles only
-/// into a debug build, as the pause before a replace does: every mention of
-/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` sits inside `mod batch_pause_trigger`, whose
-/// attributes hold `#[cfg(debug_assertions)]`, and `pause_after_batch_split` has a release
-/// build's stub that does nothing.
+/// The pause between a directory watch batch's split and its compile (#160) and the pause
+/// between a watch rebuild's look and its reads (#380) compile only into a debug build, as
+/// the pause before a replace does: every mention of `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` and
+/// of `MDS_TEST_PAUSE_AFTER_LOOK` sits inside `mod batch_pause_trigger`, whose attributes
+/// hold `#[cfg(debug_assertions)]`, and `pause_after_batch_split` and `pause_after_look`
+/// each have a release build's stub that does nothing.
 ///
-/// Controls: the module without its `cfg`, a mention outside it, a release stub that does
-/// something, and no release stub are each reported.
+/// Controls: the module without its `cfg`, a mention of either variable outside it, a
+/// release stub that does something, and no release stub for either pause are each
+/// reported.
 #[test]
 fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     let watch = read_source("src/watch.rs");
@@ -1746,7 +1748,8 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     let found = gate_findings(&sources, &BATCH_PAUSE_TRIGGER);
     assert!(
         found.is_empty(),
-        "the pause after a batch's split must be compiled only into debug builds:\n{}",
+        "the pauses after a batch's split and after a rebuild's look must be compiled only \
+         into debug builds:\n{}",
         found.join("\n")
     );
 
@@ -1762,6 +1765,7 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
             .collect()
     };
     let stub = "fn pause_after_batch_split() {}";
+    let look_stub = "fn pause_after_look() {}";
     for (planted, what) in [
         (
             with(
@@ -1783,6 +1787,15 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
             "a release stub that does something",
         ),
         (with(stub, ""), "a pause without a release stub"),
+        (
+            with(
+                look_stub,
+                "fn pause_after_look() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_PAUSE_AFTER_LOOK\");\n}",
+            ),
+            "the look pause's variable outside its module",
+        ),
+        (with(look_stub, ""), "a look pause without a release stub"),
     ] {
         assert!(
             !gate_findings(&planted, &BATCH_PAUSE_TRIGGER).is_empty(),
@@ -2714,12 +2727,16 @@ const PAUSE_TRIGGER: DebugGate = DebugGate {
     fns: &["pause_before_replace"],
 };
 
-/// The pause between a directory watch batch's split and its compile (#160):
-/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, in `mod batch_pause_trigger`.
+/// The pause between a directory watch batch's split and its compile (#160),
+/// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, and the pause between a watch rebuild's look and its
+/// reads (#380), `MDS_TEST_PAUSE_AFTER_LOOK`, both in `mod batch_pause_trigger`.
 const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
     module: "batch_pause_trigger",
-    needles: &[("MDS_TEST_PAUSE_AFTER_BATCH_SPLIT", true)],
-    fns: &["pause_after_batch_split"],
+    needles: &[
+        ("MDS_TEST_PAUSE_AFTER_BATCH_SPLIT", true),
+        ("MDS_TEST_PAUSE_AFTER_LOOK", true),
+    ],
+    fns: &["pause_after_batch_split", "pause_after_look"],
 };
 
 /// What is wrong with `gate`'s gating across `sources`; empty when nothing is: its module

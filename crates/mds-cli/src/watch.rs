@@ -2539,9 +2539,10 @@ fn handle_fs_event_file(
 /// so the next event or tick finds the file again. The hold ends at the first rebuild that
 /// finds none emptied, or at its deadline ([`EmptyHold`]), when the files are compiled as
 /// they are; an output published empty over the non-empty one before it is announced
-/// ([`announce_emptied_output`]). A file the compile read found emptied after that look —
-/// a truncation that began between the two — holds the rebuild the same way, unless the
-/// deadline ended the hold in it ([`EmptyHold::on_late_empty`]). `due` is the hold's
+/// ([`announce_emptied_output`]). A file the `--vars` load or the compile read found
+/// emptied after that look — a truncation that began between the two — holds the rebuild
+/// the same way, whether the read then failed or not, unless the deadline ended the hold in
+/// it ([`EmptyHold::on_late_empty`]). `due` is the hold's
 /// deadline when that deadline runs this rebuild, which then ends the hold
 /// ([`not_before`]); `None` for an event or a tick.
 ///
@@ -2578,6 +2579,8 @@ fn rebuild_file(
         settle(SettleInto::File(state), None, Settle::Defer);
         return ControlFlow::Continue(());
     }
+    // A debug build's test pause (#380): the rebuild found no file emptied, and has read none.
+    pause_after_look();
     // What the rebuild before this one kept from being written (#160): told again unless
     // this rebuild keeps the same once more, as another event of the same save does.
     let kept_before = state.kept.take();
@@ -2602,6 +2605,17 @@ fn rebuild_file(
     }) {
         Ok(v) => v,
         Err(e) => {
+            // #380: the vars file emptied since the look above — a truncation that began
+            // between the two, so the load read it empty — holds the rebuild back as the
+            // look would have, with nothing reported or recorded, unless the deadline ended
+            // the hold in this rebuild.
+            if any_went_empty(&state.foi, &state.last_mtimes)
+                && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
+            {
+                state.kept = kept_before;
+                settle(SettleInto::File(state), None, Settle::Defer);
+                return ControlFlow::Continue(());
+            }
             settle(SettleInto::File(state), Some(e), Settle::Rebaseline);
             return ControlFlow::Continue(());
         }
@@ -2617,6 +2631,18 @@ fn rebuild_file(
     let compiled = match entry.compile(runtime_vars, ctx.quiet) {
         Ok(compiled) => compiled,
         Err(failure) => {
+            // #380: a file of interest emptied since the look above — one the compile read
+            // empty and failed on, a truncation that began between the two — holds the
+            // rebuild back as the look would have, with nothing reported or recorded,
+            // unless the deadline ended the hold in this rebuild. A failed compile reports
+            // no dependencies, so the files of interest are those of the compile before.
+            if any_went_empty(&state.foi, &state.last_mtimes)
+                && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
+            {
+                state.kept = kept_before;
+                settle(SettleInto::File(state), None, Settle::Defer);
+                return ControlFlow::Continue(());
+            }
             settle(
                 SettleInto::File(state),
                 failure.unreported(),
@@ -3925,7 +3951,9 @@ struct LivenessState {
 /// output is written when its content changed. A compile that succeeds records the
 /// dependencies it reported even when its write fails (#257). A compile that fails
 /// because `src` is gone since the batch found it there retires it as a deleted source
-/// ([`DirWatchState::retire_deleted`], #160).
+/// ([`DirWatchState::retire_deleted`], #160). A compile that read a file emptied since the
+/// batch looked — whether it then failed or would write — holds `src` back, unless the
+/// deadline ended the hold in this rebuild ([`EmptyHold::on_late_empty`], #380).
 ///
 /// # Invariants preserved
 /// - Freshness rule: dep set recomputed from fresh `compile_to_content` output.
@@ -4113,7 +4141,28 @@ fn compile_one_source(
             state.retire_deleted(src, quiet);
             return false;
         }
-        Err(failure) => failure.unreported(),
+        Err(failure) => {
+            // #380: a file the compile read, emptied since the batch looked — a truncation
+            // that began between the two, read empty and failed on — holds `src` back as
+            // the look would have, unless the deadline ended the hold in this rebuild:
+            // nothing reported or recorded, `src` kept to be rebuilt with the batch that
+            // ends the hold. A failed compile reports no dependencies, so the files it read
+            // are taken to be those its last compile reported.
+            let source = src.to_path_buf();
+            let reads = std::iter::once(&source)
+                .chain(state.forward_deps.get(src).into_iter().flatten())
+                .chain(state.vars_file.as_ref());
+            if any_went_empty(reads, &state.last_mtimes)
+                && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
+            {
+                if let Some(kept) = kept_before {
+                    state.kept.insert(source.clone(), kept);
+                }
+                state.held.hold([&source], false);
+                return false;
+            }
+            failure.unreported()
+        }
     };
     // The compile failed, or writing its output did: settled alike.
     settle(SettleInto::Dir(state), failure, Settle::MarkErrored(src));
@@ -4378,7 +4427,9 @@ fn liveness_probe_dir(
 /// first at or past its deadline ([`EmptyHold`]), which compiles the files as they are.
 /// Every file the look finds emptied joins the batch, its own event lost or not
 /// ([`join_emptied`]), so that batch rebuilds it. A source whose compile read a file
-/// emptied after the look is held the same way, alone ([`compile_one_source`]). `due` is
+/// emptied after the look is held the same way, alone, whether the compile then failed or
+/// not ([`compile_one_source`]), and a `--vars` load that failed on the file emptied after
+/// the look holds the whole batch. `due` is
 /// the hold's deadline when that deadline runs this rebuild, which then ends the hold
 /// ([`not_before`]); `None` for an event or a tick.
 /// The vars file is then reloaded (freshness rule), and a
@@ -4418,6 +4469,8 @@ fn rebuild_dir_batch(
         return;
     }
     let (batch, vars_changed) = state.held.release(&batch, vars_changed);
+    // A debug build's test pause (#380): the batch found no file emptied, and has read none.
+    pause_after_look();
 
     let resolved = match build_runtime_vars(RuntimeVarArgs {
         vars: ctx.vars_path_typed.clone(),
@@ -4426,6 +4479,19 @@ fn rebuild_dir_batch(
     }) {
         Ok(v) => v,
         Err(e) => {
+            // #380: a watched file emptied since the look above — the vars file the load read
+            // empty, a truncation that began between the two — holds the whole batch back as
+            // the look would have, every file found emptied joined to it, with nothing
+            // reported or recorded, unless the deadline ended the hold in this rebuild.
+            let emptied = emptied_paths(&state.watched_set(), &state.last_mtimes);
+            if !emptied.is_empty() && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
+            {
+                let (batch, vars_changed) =
+                    join_emptied(&batch, vars_changed, &emptied, state.vars_file.as_deref());
+                state.held.hold(&batch, vars_changed);
+                settle(SettleInto::Dir(state), None, Settle::Defer);
+                return;
+            }
             // Keep the batch, as a held one is kept, for the next batch to rebuild (#380):
             // a source created while the vars file cannot be read is in no other record,
             // so the batch that reads the file again would leave it unbuilt.
@@ -5478,7 +5544,10 @@ fn process_dir_batch_incremental(
 /// watch's rebuild batch once it has told the sources still there from the sources gone,
 /// and before it compiles them — after an incremental batch's partition, and again just
 /// before each source's compile — so that a test can delete a source in that window
-/// (`tests/cli_watch.rs`). A release build has none of it.
+/// (`tests/cli_watch.rs`). `MDS_TEST_PAUSE_AFTER_LOOK`: how it is made to stop a rebuild,
+/// in either mode, once it has looked for emptied files and found none, before it reads
+/// any — so that a test can truncate a file the rebuild is about to read
+/// (`tests/cli_watch_truncate.rs`, #380). A release build has none of it.
 #[cfg(debug_assertions)]
 mod batch_pause_trigger {
     use std::path::PathBuf;
@@ -5487,9 +5556,14 @@ mod batch_pause_trigger {
     use crate::output::WriteTarget;
     use crate::write::{atomic_write_file, Durability, Parents};
 
-    /// The variable naming the file that ends the pause. The run writes the same name with
-    /// `.paused` appended once it has stopped, for the test to wait for.
+    /// The variable naming the file that ends the pause after a batch's split. The run
+    /// writes the same name with `.paused` appended once it has stopped, for the test to
+    /// wait for.
     const VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_BATCH_SPLIT";
+
+    /// The variable naming the file that ends the pause after a rebuild's look, which says
+    /// it has stopped in the same way.
+    const LOOK_VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_LOOK";
 
     /// How long the pause waits between two looks for the file that ends it.
     const POLL: Duration = Duration::from_millis(5);
@@ -5497,11 +5571,20 @@ mod batch_pause_trigger {
     /// How many looks the pause makes before the batch goes on regardless: ten seconds.
     const MAX_POLLS: u32 = 2_000;
 
-    /// Stop here when `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` names a file: say so by writing
-    /// `<file>.paused`, then wait until `<file>` exists, or until [`MAX_POLLS`] looks have
-    /// found none.
+    /// Stop here when `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` names a file ([`pause_on`]).
     pub(super) fn pause_after_batch_split() {
-        let Some(go) = std::env::var_os(VARIABLE).map(PathBuf::from) else {
+        pause_on(VARIABLE);
+    }
+
+    /// Stop here when `MDS_TEST_PAUSE_AFTER_LOOK` names a file ([`pause_on`]).
+    pub(super) fn pause_after_look() {
+        pause_on(LOOK_VARIABLE);
+    }
+
+    /// Stop here when `variable` names a file: say so by writing `<file>.paused`, then wait
+    /// until `<file>` exists, or until [`MAX_POLLS`] looks have found none.
+    fn pause_on(variable: &str) {
+        let Some(go) = std::env::var_os(variable).map(PathBuf::from) else {
             return;
         };
         let mut paused = go.clone().into_os_string();
@@ -5524,11 +5607,15 @@ mod batch_pause_trigger {
 }
 
 #[cfg(debug_assertions)]
-use batch_pause_trigger::pause_after_batch_split;
+use batch_pause_trigger::{pause_after_batch_split, pause_after_look};
 
 /// A release build's pause between a directory batch's split and its compile: none.
 #[cfg(not(debug_assertions))]
 fn pause_after_batch_split() {}
+
+/// A release build's pause between a rebuild's look and its reads: none.
+#[cfg(not(debug_assertions))]
+fn pause_after_look() {}
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 

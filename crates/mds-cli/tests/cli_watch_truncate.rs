@@ -481,6 +481,176 @@ fn dir_mode_held_truncate_of_the_vars_file_triggers_nothing_until_written() {
     });
 }
 
+// ── A dependency truncated after its rebuild looked ─────────────────────────
+
+/// Hold a dependency of a source truncated while a rebuild is under way — after it looked
+/// and found every file full, before it read any — then write it. The debug build's pause
+/// between a rebuild's look and its reads (`MDS_TEST_PAUSE_AFTER_LOOK`) makes the window
+/// certain; outside a test, a save that lands while an earlier event's rebuild runs opens
+/// it. The rebuild reads the file empty and fails — the `--vars` file cannot be loaded, or
+/// the import no longer defines what the source uses — and is held as a rebuild whose look
+/// found the file empty is: no diagnostic, no `Recompiled`, the output untouched, and one
+/// rebuild follows the write.
+#[cfg(debug_assertions)]
+fn held_truncate_after_the_look(case: &DependencyCase<'_>) {
+    let what = case.what;
+    let out = case.output;
+    // Outside every watched directory, so the pause's files raise no event.
+    let gate = tempfile::tempdir().unwrap();
+    let (go, paused) = (gate.path().join("go"), gate.path().join("go.paused"));
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(case.watched)
+            .args(case.extra)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &go)
+            .stdout(Stdio::null()),
+    );
+    let mut log = OutputLog::default();
+    log.wait_for(out, case.before, TIMEOUT);
+
+    // The source saved as it is: its rebuild looks, finds every file full, and pauses
+    // before it reads any.
+    let source = std::fs::read_to_string(case.source).unwrap();
+    write_atomic(case.source, &source);
+    let paused_by = Instant::now() + TIMEOUT;
+    // Bounded by TIMEOUT: at most TIMEOUT / OUTPUT_POLL iterations.
+    while !paused.exists() {
+        assert!(
+            Instant::now() < paused_by,
+            "{what}: setup: no rebuild paused after its look; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(OUTPUT_POLL);
+    }
+    let hold = Hold::start(case.dependency);
+    std::fs::write(&go, "").unwrap();
+    log.poll_for(out, TRUNCATE_HOLD);
+    let timing = hold.write_and_close(case.rewrite);
+    log.wait_for(out, case.after, TIMEOUT);
+
+    let stderr = stderr_through_the_marker(case.source, tap, &mut child);
+    assert_no_empty_before_the_deadline(&log, timing.started, what);
+    if strict_claims_apply(&timing, what) {
+        assert_eq!(
+            log.states.len(),
+            2,
+            "{what}: the output changes once, from the old content straight to the new; \
+             states read: {:?}",
+            log.contents()
+        );
+        assert_holding_printed_nothing(&stderr, 1, what);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn an_imported_partial_truncated_after_the_look_triggers_nothing_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let partial = dir.path().join("_p.mds");
+    std::fs::write(
+        &partial,
+        "@define val():\nPartial one\n@end\n\n@export val\n",
+    )
+    .unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "@import \"./_p.mds\" as p\n{{p.val()}}\n").unwrap();
+
+    held_truncate_after_the_look(&DependencyCase {
+        what: "an imported partial, truncated after the look",
+        watched: &entry,
+        source: &entry,
+        output: &dir.path().join("t.md"),
+        dependency: &partial,
+        rewrite: "@define val():\nPartial two\n@end\n\n@export val\n",
+        extra: &[],
+        before: "Partial one",
+        after: "Partial two",
+    });
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn the_vars_file_truncated_after_the_look_triggers_nothing_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "Vars {{v}}\n").unwrap();
+
+    held_truncate_after_the_look(&DependencyCase {
+        what: "the vars file, truncated after the look",
+        watched: &entry,
+        source: &entry,
+        output: &dir.path().join("t.md"),
+        dependency: &vars,
+        rewrite: r#"{"v": "two"}"#,
+        extra: &["--vars", vars.to_str().unwrap()],
+        before: "Vars one",
+        after: "Vars two",
+    });
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_the_vars_file_truncated_after_the_look_triggers_nothing_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("t.mds");
+    std::fs::write(&source, "Vars {{v}}\n").unwrap();
+    let out = dir.path().join("out");
+
+    held_truncate_after_the_look(&DependencyCase {
+        what: "directory mode, the vars file, truncated after the look",
+        watched: &root,
+        source: &source,
+        output: &out.join("t.md"),
+        dependency: &vars,
+        rewrite: r#"{"v": "two"}"#,
+        extra: &[
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--vars",
+            vars.to_str().unwrap(),
+        ],
+        before: "Vars one",
+        after: "Vars two",
+    });
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_an_imported_partial_truncated_after_the_look_triggers_nothing_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let partial = root.join("_p.mds");
+    std::fs::write(
+        &partial,
+        "@define val():\nPartial one\n@end\n\n@export val\n",
+    )
+    .unwrap();
+    let source = root.join("t.mds");
+    std::fs::write(&source, "@import \"./_p.mds\" as p\n{{p.val()}}\n").unwrap();
+    let out = dir.path().join("out");
+
+    held_truncate_after_the_look(&DependencyCase {
+        what: "directory mode, an imported partial, truncated after the look",
+        watched: &root,
+        source: &source,
+        output: &out.join("t.md"),
+        dependency: &partial,
+        rewrite: "@define val():\nPartial two\n@end\n\n@export val\n",
+        extra: &["--out-dir", out.to_str().unwrap()],
+        before: "Partial one",
+        after: "Partial two",
+    });
+}
+
 // ── Directory mode defers the whole batch ───────────────────────────────────
 
 /// In directory mode a source held truncated defers every rebuild, not only its own:
