@@ -108,7 +108,9 @@
 //! [`write_over_own`] replaces a file only while it holds exactly what its caller last
 //! wrote there — read again as a rewrite reads its file, and replaced as a rewrite
 //! replaces it, only while it is still that file — and otherwise writes as [`create_new`]
-//! does: a file the caller did not write, or one changed since, is never replaced.
+//! does: a file the caller did not write, or one changed since, is never replaced. A file
+//! there that cannot be read again is neither, as nothing tells which: the write fails
+//! with the read's cause, and the file is left as it is.
 //!
 //! # A removal proves its file first (#160)
 //!
@@ -454,7 +456,9 @@ pub(crate) enum NotCreated {
 /// [`NotCreated::Exists`] for anything else at the target — a file with other bytes, or
 /// one changed before the rename, a symlink, a directory, a FIFO, a socket or a device —
 /// left as it is, with no temporary file left behind. Any other failure is
-/// [`NotCreated::Failed`], worded as [`atomic_write_file`] words it.
+/// [`NotCreated::Failed`], worded as [`atomic_write_file`] words it — a file at the
+/// target that cannot be read again included, with the read's cause: whether it is still
+/// the caller's cannot be told, and it is left as it is.
 pub(crate) fn write_over_own(
     target: &WriteTarget,
     own: Option<&str>,
@@ -462,19 +466,19 @@ pub(crate) fn write_over_own(
     durability: Durability,
     parents: Parents,
 ) -> std::result::Result<(), NotCreated> {
-    // A file not shown to hold `own` — other bytes, gone, a symlink, not a regular file,
-    // not to be read at all — is not the caller's: then only a new file may take the
-    // name, and the commit, never this read, finds whether something has it.
-    let held = own.and_then(|own| {
-        let below = Below::of(target).ok()?;
-        imp::read_stamped(&below, target.checked_anchor(), own.as_bytes()).ok()
-    });
+    let held = match own {
+        Some(own) => own_file(target, own),
+        None => Ok(None),
+    };
     let written = match held {
-        Some(held) => {
+        Ok(Some(held)) => {
             pause_before_replace();
             imp::replace_held(held, content.as_bytes(), durability)
         }
-        None => write_below_anchor(target, content, durability, parents, Commit::New).map(drop),
+        // Only a new file may take the name, and the commit, never the read, finds whether
+        // something has it.
+        Ok(None) => write_below_anchor(target, content, durability, parents, Commit::New).map(drop),
+        Err(failure) => Err(failure),
     };
     written.map_err(|failure| match failure {
         Failure::Exists | Failure::Changed | Failure::LinkAtTarget | Failure::NotARegularFile => {
@@ -482,6 +486,21 @@ pub(crate) fn write_over_own(
         }
         failure => NotCreated::Failed(worded(target, failure)),
     })
+}
+
+/// [`write_over_own`]'s read of `target`, as a rewrite reads its file: held when it holds
+/// exactly `own`; `None` when it is not the caller's — other bytes, gone, a symlink,
+/// anything but a regular file — or when nothing is on the way to it, a directory below
+/// the anchor gone since; and a read that fails otherwise — the file may not be read,
+/// say — is the write's failure, never taken for a file that is not the caller's.
+fn own_file(target: &WriteTarget, own: &str) -> std::result::Result<Option<imp::Held>, Failure> {
+    let below = Below::of(target)?;
+    match imp::read_stamped(&below, target.checked_anchor(), own.as_bytes()) {
+        Ok(held) => Ok(Some(held)),
+        Err(Failure::Changed | Failure::LinkAtTarget | Failure::NotARegularFile) => Ok(None),
+        Err(Failure::Io(e)) if imp::nothing_below(&e) => Ok(None),
+        Err(failure) => Err(failure),
+    }
 }
 
 /// [`atomic_write_file`], [`write_compiled`] and [`create_new`] share this: resolve
@@ -1158,6 +1177,9 @@ mod unix {
             Ok(file) => file,
             Err(Errno::LOOP) => return Err(Failure::LinkAtTarget),
             Err(Errno::NOENT) => return Err(Failure::Changed),
+            // A socket refuses the open, and so can a device: no longer the file read, as
+            // nothing but a regular file is (below) — not a file that cannot be read.
+            Err(_) if is_no_regular_file(dir.as_fd(), below.name) => return Err(Failure::Changed),
             Err(e) => return Err(e.into()),
         };
         let stat = fs::fstat(&file)?;
@@ -1247,9 +1269,9 @@ mod unix {
         }
     }
 
-    /// Whether `e`, from the walk to a file to be removed, says a directory on its way is
-    /// not there, or is no directory: then no file is there to remove.
-    fn nothing_below(e: &std::io::Error) -> bool {
+    /// Whether `e`, from the walk to a file to be removed or read again, says a directory
+    /// on its way is not there, or is no directory: then no file is there.
+    pub(super) fn nothing_below(e: &std::io::Error) -> bool {
         matches!(Errno::from_io_error(e), Some(Errno::NOENT | Errno::NOTDIR))
     }
 
@@ -1331,6 +1353,13 @@ mod unix {
     fn is_symlink(dir: BorrowedFd<'_>, name: &OsStr) -> bool {
         fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
             .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink)
+    }
+
+    /// Whether `name` in `dir`, looked at without following a symlink, is something other
+    /// than a regular file; a look that fails tells nothing, and is not.
+    fn is_no_regular_file(dir: BorrowedFd<'_>, name: &OsStr) -> bool {
+        fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile)
     }
 
     /// Put `content` at `name` in `dir`, by way of a temporary file beside it, as `commit`
@@ -1839,6 +1868,9 @@ mod windows {
         let target = dir.join(below.name);
         match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.file_type().is_symlink() => return Err(Failure::LinkAtTarget),
+            // A directory, which an open as a file refuses: no longer the file read, as
+            // nothing but a regular file is (below) — not a file that cannot be read.
+            Ok(meta) if !meta.is_file() => return Err(Failure::Changed),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Failure::Changed),
             Err(e) => return Err(e.into()),
@@ -1922,9 +1954,9 @@ mod windows {
         }
     }
 
-    /// Whether `e`, from the walk to a file to be removed, says a directory on its way is
-    /// not there, or is no directory: then no file is there to remove.
-    fn nothing_below(e: &std::io::Error) -> bool {
+    /// Whether `e`, from the walk to a file to be removed or read again, says a directory
+    /// on its way is not there, or is no directory: then no file is there.
+    pub(super) fn nothing_below(e: &std::io::Error) -> bool {
         matches!(
             e.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
@@ -2996,6 +3028,98 @@ mod tests {
             ["a.md"],
             "the FIFO is left, and no temporary file"
         );
+    }
+
+    /// A socket at the target of [`write_over_own`] is kept, whether or not the caller wrote
+    /// there (#160): a socket refuses the read's open, and is no file of the caller's, as a
+    /// FIFO is none.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_over_its_own_file_keeps_a_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        let _socket = std::os::unix::net::UnixListener::bind(&file).unwrap();
+        let target = WriteTarget::new(file.clone(), PathBuf::from("a.md"));
+        for own in [Some("first"), None] {
+            assert_eq!(
+                over_own(&target, own, "second"),
+                Err("kept".to_owned()),
+                "{own:?}"
+            );
+        }
+        assert_eq!(
+            entries(dir.path()),
+            ["a.md"],
+            "the socket is left, and no temporary file"
+        );
+    }
+
+    /// A file the caller wrote at the target of [`write_over_own`] that cannot be read is
+    /// reported with the read's cause (#160), never kept as a file changed since — the
+    /// caller cannot tell — and left as it is, with no temporary file. Control: the same
+    /// file, readable again, is replaced. Skipped, with a reason, where mode 0o200 does not
+    /// stop a read (running as root).
+    #[cfg(unix)]
+    #[test]
+    fn a_write_over_its_own_file_reports_a_file_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        let target = WriteTarget::new(file.clone(), PathBuf::from("a.md"));
+        let set_mode = |mode: u32| {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        std::fs::write(&file, "first").unwrap();
+        set_mode(0o200);
+        let Err(denied) = std::fs::File::open(&file) else {
+            crate::output::ewriteln!("running as root; mode 0o200 does not stop a read");
+            return;
+        };
+
+        let failed = over_own(&target, Some("first"), "second");
+        set_mode(0o644);
+        assert_eq!(
+            failed,
+            Err(format!(
+                "cannot write {}: {}",
+                safe_path(&target.shown),
+                io_cause(&denied)
+            ))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first", "left");
+        assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
+
+        assert_eq!(over_own(&target, Some("first"), "second"), Ok(()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    }
+
+    /// A directory gone since the caller wrote below it is no failure of
+    /// [`write_over_own`] (#160): nothing is there, so the file is written as a new one,
+    /// the directory made again where the caller makes its directories.
+    #[test]
+    fn a_write_over_its_own_file_in_a_directory_gone_since_makes_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sub").join("a.md");
+        let target = WriteTarget::below(dir.path(), Path::new("o"), Path::new("sub/a.md"));
+        let written = |own: Option<&str>| {
+            write_over_own(
+                &target,
+                own,
+                "second",
+                Durability::RenameOnly,
+                Parents::Create,
+            )
+            .map_err(|not_written| match not_written {
+                NotCreated::Exists => "kept".to_owned(),
+                NotCreated::Failed(e) => e.to_string(),
+            })
+        };
+        assert_eq!(written(None), Ok(()), "control: made where nothing is");
+        std::fs::remove_dir_all(dir.path().join("sub")).unwrap();
+
+        assert_eq!(written(Some("second")), Ok(()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
     }
 
     // ── Never over an MDS module (#425) ─────────────────────────────────────────
