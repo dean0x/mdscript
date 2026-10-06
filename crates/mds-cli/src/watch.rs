@@ -49,7 +49,9 @@
 //! until a rebuild finds it written, or until a deadline one second after the first
 //! rebuild that found it emptied, when the files are compiled as they are. The deadline
 //! never moves, and the loop's driver waits for it like the tick, so neither a stream of
-//! events nor `--poll-interval 0` can postpone it (#380).
+//! events nor `--poll-interval 0` can move it; a debounce window already collecting events
+//! when it comes finishes first, so the held rebuild can run later by at most that window's
+//! cap (#380).
 //!
 //! # Key invariants
 //!
@@ -920,7 +922,10 @@ enum Wake {
 }
 
 /// Drives a [`TickSchedule`] and a held rebuild's deadline on the real clock and the watch
-/// channel ([`poll_wake`]): the only place the watch loop reads `Instant::now()` or waits.
+/// channel ([`poll_wake`]): where the watch loop waits for its next wake. It is not the
+/// only reader of `Instant::now()`: the debounce window's driver ([`drain_debounce`])
+/// reads it too, and so does a rebuild, for the instant it looks at the files to time a
+/// hold (#380).
 struct TickClock {
     schedule: TickSchedule,
 }

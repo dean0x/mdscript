@@ -233,8 +233,10 @@ enum Commands {
         /// coalesces into one rebuild; the window is capped at max(10 x MS, 1000) ms so
         /// continuous writes still rebuild. Use 0 to disable coalescing.
         /// Values above 60000 are clamped. At any value, a rebuild waits while a watched
-        /// file is empty, as during a truncate-then-write save, until it is written or
-        /// for at most 1000 ms, after which the empty file is compiled.
+        /// file is empty after having had content, as during a truncate-then-write save,
+        /// until it is written or for about 1000 ms, after which the empty file is
+        /// compiled; longer only while a debounce window opened before then is still
+        /// collecting events, by at most that window's cap.
         #[arg(long = "debounce", value_name = "MS", default_value = "100")]
         debounce: u64,
         /// Self-heal poll interval in milliseconds (default 1000).

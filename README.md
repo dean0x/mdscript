@@ -119,9 +119,12 @@ Watch-only options:
                               capped at max(10 × MS, 1000) ms, so a file written to
                               continuously still rebuilds. 0 disables coalescing (every
                               event rebuilds). Values above 60000 are clamped. At any
-                              value, a rebuild waits while a watched file is empty (as
-                              during a truncate-then-write save) until it is written, or
-                              for at most 1000 ms, after which the empty file is compiled.
+                              value, a rebuild waits while a watched file is empty after
+                              having had content (as during a truncate-then-write save)
+                              until it is written, or for about 1000 ms, after which the
+                              empty file is compiled — longer only while a debounce window
+                              opened before then is still collecting events, by at most
+                              that window's cap.
   --poll-interval <MS>        Liveness-probe interval in milliseconds (default: 1000).
                               0 disables self-heal (native events only). Clamped to ≥50ms.
                               The watcher self-heals after a watched dir/root is deleted and
@@ -247,7 +250,9 @@ shared partial rebuilds **all transitive importers** automatically.
   (in directory mode, the whole batch waits), at every `--debounce`: nothing is compiled
   or printed until the file is written, so no empty output is published in between. A
   file still empty one second after the watcher first saw it emptied is compiled as it
-  is, however many events arrive meanwhile and under `--poll-interval 0` too. A rebuild
+  is, however many events arrive meanwhile and under `--poll-interval 0` too — later only
+  while a debounce window opened before that second ended is still collecting events, by
+  at most the window's cap of max(10 × `--debounce`, 1000) ms. A rebuild
   that empties an output it had written with content prints
   `Wrote an empty output: <file>` (not under `--quiet`).
 
