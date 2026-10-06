@@ -26,6 +26,14 @@ name: Watch soak (manual)
 # without running a single test -- a `filter` that matches nothing -- is tallied as
 # FAILED: a pass that tested nothing would read as a clean soak.
 #
+# A test whose claim depends on the runner's cadence judges it only when the run's
+# MEASURED cadence can decide it, and passes otherwise; either way it appends one
+# `<test>: conclusive: ...` or `<test>: inconclusive: ...` line to the file named by
+# MDS_TEST_FLAG_LOG, which this workflow also sets per iteration. Those flags are
+# tallied apart from passed, failed and skipped: an iteration with any inconclusive
+# line is INCONCLUSIVE, one with conclusive lines only is CONCLUSIVE, one with none
+# is UNFLAGGED.
+#
 # GitHub runs every `run:` block as `bash --noprofile --norc -eo pipefail`, so -e is
 # on in the soak loop whatever its own `set` line says. A failing iteration is the
 # data, so the loop captures each exit code in a form -e does not abort on. The loop
@@ -165,6 +173,11 @@ jobs:
           skipped_iters=""
           no_test_iters=""
           last_class=""
+          conclusive=0
+          inconclusive=0
+          unflagged=0
+          inconclusive_iters=""
+          last_flag=""
 
           # ran_tests LOG
           # True when LOG shows a test binary that ran at least one test and none
@@ -206,18 +219,46 @@ jobs:
             fi
           }
 
+          # record_flags ITERATION FLAG_LOG
+          # INCONCLUSIVE when FLAG_LOG holds an inconclusive line, CONCLUSIVE when
+          # it holds conclusive lines only, UNFLAGGED when it holds neither. Counted
+          # apart from record_iteration's classes: a flag says whether a run could
+          # judge a claim that depends on the runner's cadence, not whether the test
+          # passed. Sets last_flag. Call it directly, like record_iteration.
+          record_flags() {
+            local iter="$1" flag_log="$2" yes=0 no=0
+            if [ -f "$flag_log" ]; then
+              yes=$(grep -c -F ': conclusive: ' "$flag_log" || true)
+              no=$(grep -c -F ': inconclusive: ' "$flag_log" || true)
+            fi
+            if [ "$no" -gt 0 ]; then
+              inconclusive=$((inconclusive + 1))
+              inconclusive_iters="$inconclusive_iters $iter"
+              last_flag=INCONCLUSIVE
+            elif [ "$yes" -gt 0 ]; then
+              conclusive=$((conclusive + 1))
+              last_flag=CONCLUSIVE
+            else
+              unflagged=$((unflagged + 1))
+              last_flag=UNFLAGGED
+            fi
+          }
+
           # soak_iteration ITERATION DIR LABEL COMMAND [ARG...]
-          # Runs COMMAND once with MDS_TEST_SKIP_LOG set and its output in
-          # DIR/iter-NNN.log, then records and reports the iteration. DIR must be
-          # absolute: cargo test runs the binary from the crate directory.
+          # Runs COMMAND once with MDS_TEST_SKIP_LOG and MDS_TEST_FLAG_LOG set and its
+          # output in DIR/iter-NNN.log, then records and reports the iteration. DIR
+          # must be absolute: cargo test runs the binary from the crate directory.
+          # Flag logs are kept: they carry each run's measured cadence.
           soak_iteration() {
-            local iter="$1" dir="$2" label="$3" tag log skip_log rc=0
+            local iter="$1" dir="$2" label="$3" tag log skip_log flag_log rc=0
             shift 3
             tag=$(printf '%03d' "$iter")
             log="$dir/iter-$tag.log"
             skip_log="$dir/skips-iter-$tag.log"
-            MDS_TEST_SKIP_LOG="$skip_log" "$@" > "$log" 2>&1 || rc=$?
+            flag_log="$dir/flags-iter-$tag.log"
+            MDS_TEST_SKIP_LOG="$skip_log" MDS_TEST_FLAG_LOG="$flag_log" "$@" > "$log" 2>&1 || rc=$?
             record_iteration "$iter" "$rc" "$skip_log" "$log"
+            record_flags "$iter" "$flag_log"
             case "$last_class" in
               PASS)
                 rm -f "$log"
@@ -241,6 +282,10 @@ jobs:
                 grep -E 'panicked at|\.\.\. FAILED|test result: FAILED' "$log" || true
                 ;;
             esac
+            if [ "$last_flag" = INCONCLUSIVE ]; then
+              printf 'iter %3d inconclusive\n' "$iter"
+              grep -F ': inconclusive: ' "$flag_log" || true
+            fi
           }
 
           # soak_loop COUNT DIR LABEL COMMAND [ARG...]
@@ -302,11 +347,48 @@ jobs:
           fi
           echo "tally self-check passed: a planted skip counted as skipped, a run of zero tests as failed"
 
+          # The flags, on planted flag logs. Lines in the shape the tests write:
+          # `<test>: <flag>: <details>`.
+          flags_yes="$dir/flags-yes.log"
+          printf 'planted_test: conclusive: planted by the flag self-check\n' > "$flags_yes"
+          flags_no="$dir/flags-no.log"
+          {
+            printf 'planted_test: conclusive: planted by the flag self-check\n'
+            printf 'planted_test: inconclusive: planted by the flag self-check\n'
+          } > "$flags_no"
+
+          # expect_flag ITERATION FLAG CONCLUSIVE INCONCLUSIVE UNFLAGGED
+          expect_flag() {
+            if [ "$last_flag" != "$2" ] || [ "$conclusive" -ne "$3" ] \
+              || [ "$inconclusive" -ne "$4" ] || [ "$unflagged" -ne "$5" ]; then
+              echo "::error::flag self-check, iteration $1: got flag=$last_flag conclusive=$conclusive inconclusive=$inconclusive unflagged=$unflagged; want flag=$2 conclusive=$3 inconclusive=$4 unflagged=$5"
+              exit 1
+            fi
+          }
+
+          # A conclusive line alone: conclusive.
+          record_flags 1 "$flags_yes"
+          expect_flag 1 CONCLUSIVE 1 0 0
+          # The planted inconclusive line, beside a conclusive one: inconclusive.
+          record_flags 2 "$flags_no"
+          expect_flag 2 INCONCLUSIVE 1 1 0
+          # No flag log at all: unflagged.
+          record_flags 3 "$dir/absent.log"
+          expect_flag 3 UNFLAGGED 1 1 1
+          if [ "$inconclusive_iters" != " 2" ]; then
+            echo "::error::flag self-check: inconclusive iterations '$inconclusive_iters'; want ' 2'"
+            exit 1
+          fi
+          # The flags left pass, fail and skip where the tally put them.
+          expect 5 NO_TESTS 1 3 1 2 2
+          echo "flag self-check passed: a planted inconclusive line counted as inconclusive, apart from passed, failed and skipped"
+
           # The loop, run as the Soak step runs it, in a child started with the flags
           # GitHub starts every run: block with. A planted command stands in for cargo
-          # test -- pass, fail with 101, skip, pass, then exit 0 having run no test --
-          # and all five must be recorded. A loop that reads $? after a plain call
-          # dies at the second.
+          # test -- pass with a conclusive flag, fail with 101, skip, pass with an
+          # inconclusive flag, then exit 0 having run no test -- and all five must be
+          # recorded, flags included. A loop that reads $? after a plain call dies at
+          # the second.
           cat > "$dir/planted-cargo.sh" <<'PLANTED'
           # Stands in for cargo test in the loop self-check: one outcome per call.
           calls="$1"
@@ -317,6 +399,10 @@ jobs:
           n=$((n + 1))
           echo "$n" > "$calls"
           case "$n" in
+            1)
+              printf 'planted_test: conclusive: planted by the loop self-check\n' >> "$MDS_TEST_FLAG_LOG"
+              printf '\nrunning 3 tests\n'
+              ;;
             2)
               printf '\nrunning 3 tests\n'
               printf "thread 'planted' panicked at planted.rs:1:1\n"
@@ -324,6 +410,10 @@ jobs:
               ;;
             3)
               printf 'planted_test: SKIPPED (planted by the loop self-check)\n' >> "$MDS_TEST_SKIP_LOG"
+              printf '\nrunning 3 tests\n'
+              ;;
+            4)
+              printf 'planted_test: inconclusive: planted by the loop self-check\n' >> "$MDS_TEST_FLAG_LOG"
               printf '\nrunning 3 tests\n'
               ;;
             5)
@@ -346,9 +436,10 @@ jobs:
           dir="$2"
           mkdir -p "$dir/loop"
           soak_loop 5 "$dir/loop" self-check bash --noprofile --norc "$dir/planted-cargo.sh" "$dir/calls"
-          printf 'pass=%s fail=%s skipped=%s no_tests=%s skip_lines=%s failed=[%s] skipped=[%s] no_tests=[%s] calls=%s\n' \
+          printf 'pass=%s fail=%s skipped=%s no_tests=%s skip_lines=%s failed=[%s] skipped=[%s] no_tests=[%s] calls=%s conclusive=%s inconclusive=%s unflagged=%s inconclusive_at=[%s]\n' \
             "$pass" "$fail" "$skipped" "$no_tests" "$skip_lines" \
-            "$failed_iters" "$skipped_iters" "$no_test_iters" "$(cat "$dir/calls")" > "$dir/loop.result"
+            "$failed_iters" "$skipped_iters" "$no_test_iters" "$(cat "$dir/calls")" \
+            "$conclusive" "$inconclusive" "$unflagged" "$inconclusive_iters" > "$dir/loop.result"
           DRIVER
           rc=0
           bash --noprofile --norc -eo pipefail "$dir/loop-under-e.sh" "$RUNNER_TEMP/soak-loop.sh" "$dir" \
@@ -360,7 +451,7 @@ jobs:
             echo "::error::loop self-check: the driver exited $rc before the soak loop recorded all five planted iterations"
             exit 1
           fi
-          want='pass=2 fail=2 skipped=1 no_tests=1 skip_lines=1 failed=[ 2 5] skipped=[ 3] no_tests=[ 5] calls=5'
+          want='pass=2 fail=2 skipped=1 no_tests=1 skip_lines=1 failed=[ 2 5] skipped=[ 3] no_tests=[ 5] calls=5 conclusive=1 inconclusive=1 unflagged=3 inconclusive_at=[ 4]'
           got=$(cat "$dir/loop.result")
           if [ "$got" != "$want" ]; then
             echo "::error::loop self-check: got '$got'; want '$want'"
@@ -370,7 +461,11 @@ jobs:
             echo "::error::loop self-check: a passing iteration's log must be deleted and each failing one kept"
             exit 1
           fi
-          echo "loop self-check passed: under bash -eo pipefail the loop recorded all five planted iterations, the failure and the run of zero tests included"
+          if [ ! -f "$dir/loop/flags-iter-001.log" ] || [ ! -f "$dir/loop/flags-iter-004.log" ]; then
+            echo "::error::loop self-check: each iteration's flag log must be kept"
+            exit 1
+          fi
+          echo "loop self-check passed: under bash -eo pipefail the loop recorded all five planted iterations, the failure, the run of zero tests and the inconclusive flag included"
 
       # Compile once so the loop measures the SUITE and not rustc.
       - name: Build the test binary once
@@ -432,6 +527,10 @@ jobs:
             echo "failed at:  $failed_iters"
             echo "no tests at:$no_test_iters"
             echo "skipped at: $skipped_iters"
+            echo "conclusive:  $conclusive"
+            echo "inconclusive: $inconclusive"
+            echo "unflagged:   $unflagged"
+            echo "inconclusive at:$inconclusive_iters"
           } > soak/summary.txt
           cat soak/summary.txt
 
@@ -457,6 +556,12 @@ jobs:
             if [ "$skipped" -gt 0 ]; then
               echo "| skipped iterations |$skipped_iters |"
             fi
+            echo "| conclusive | $conclusive |"
+            echo "| **inconclusive** | **$inconclusive** |"
+            echo "| unflagged | $unflagged |"
+            if [ "$inconclusive" -gt 0 ]; then
+              echo "| inconclusive iterations |$inconclusive_iters |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$fail" -gt 0 ]; then
@@ -466,7 +571,10 @@ jobs:
           if [ "$skipped" -gt 0 ]; then
             echo "::warning title=watch-soak::$skipped of $ITERATIONS iterations skipped on leg $LABEL"
           fi
-          echo "soak done: $pass passed, $skipped skipped, of $ITERATIONS on leg $LABEL"
+          if [ "$inconclusive" -gt 0 ]; then
+            echo "::notice title=watch-soak::$inconclusive of $ITERATIONS iterations inconclusive on leg $LABEL"
+          fi
+          echo "soak done: $pass passed, $skipped skipped, of $ITERATIONS on leg $LABEL; $conclusive conclusive, $inconclusive inconclusive, $unflagged unflagged"
 
       - name: Upload failing logs and the tally
         if: always()

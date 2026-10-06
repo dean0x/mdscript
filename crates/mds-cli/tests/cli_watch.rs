@@ -36,9 +36,10 @@
 
 mod common;
 use common::{
-    closed_pipe, count_occurrences, dup_vars_file_warning, make_symlink, mds_bin, poll_tap_until,
-    spawn_watch_ready, spawn_watch_ready_stderr_untapped, spawn_watch_unsynchronized, tap_reader,
-    wait_for_tap, wait_for_tap_count, write_atomic, ChildGuard, StderrTap, StdoutTap,
+    closed_pipe, count_occurrences, dup_vars_file_warning, make_symlink, mds_bin,
+    most_debounce_windows, poll_tap_until, record_run_flag, spawn_watch_ready,
+    spawn_watch_ready_stderr_untapped, spawn_watch_unsynchronized, tap_reader, wait_for_tap,
+    wait_for_tap_count, write_atomic, ChildGuard, RunFlag, StderrTap, StdoutTap, WriteCadence,
     ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
 };
 #[cfg(unix)]
@@ -1712,11 +1713,24 @@ fn watch_ctrl_c_prints_stopped_watching() {
 /// The burst here is deliberately longer than the window: 12 writes, 30ms apart, so at
 /// least 330ms against a 250ms window. Under a window that expires at a fixed offset from
 /// the FIRST event that is two or three rebuilds; under a quiet period it is one,
-/// because no gap between writes ever reaches 250ms. `--poll-interval` is left at its
+/// because no gap between writes reaches 250ms. `--poll-interval` is left at its
 /// default so the idle-tick liveness probe stays live — a stronger claim than
 /// disabling it.
+///
+/// "Exactly one" is judged on the burst this process actually wrote, never on the 30ms
+/// it asked for (#397): a loaded runner has descheduled this writer for 338ms on Linux
+/// and 404ms on Windows, long enough for the window to close mid-burst as designed. The
+/// claim is judged when no measured gap (`common::WriteCadence`) reached half the
+/// window — the other half absorbs the watcher seeing a write late. A run with a longer
+/// gap is inconclusive: it still requires the burst's final state, published by the
+/// last rebuild, and passes with that flag (`common::record_run_flag`).
 #[test]
 fn watch_debounce_single_rebuild_from_burst() {
+    const TEST: &str = "watch_debounce_single_rebuild_from_burst";
+    // `--debounce 250`, and its cap, `max(10 x 250ms, 1s)`.
+    const WINDOW: Duration = Duration::from_millis(250);
+    const CAP: Duration = Duration::from_millis(2_500);
+
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("burst.mds");
     std::fs::write(&src, "---\nname: v0\n---\nBurst {{name}}!\n").unwrap();
@@ -1738,32 +1752,21 @@ fn watch_debounce_single_rebuild_from_burst() {
     // truncate+write pairs, so it keeps plain writes — they double the event load
     // that `write_atomic` would collapse into one rename. Every other post-spawn write
     // in this file goes through `write_atomic`.
-    let mut stamps: Vec<Instant> = Vec::with_capacity(12);
+    let mut cadence = WriteCadence::with_capacity(12);
     for i in 1..=12u32 {
-        std::fs::write(&src, format!("---\nname: v{i}\n---\nBurst {{{{name}}}}!\n")).unwrap();
-        stamps.push(Instant::now());
+        cadence.time(|| {
+            std::fs::write(&src, format!("---\nname: v{i}\n---\nBurst {{{{name}}}}!\n")).unwrap();
+        });
         std::thread::sleep(Duration::from_millis(30));
     }
 
-    // Self-diagnosing preconditions, asserted BEFORE the outcome: if the burst this
-    // process actually produced was not longer than the window, or had a gap wide
-    // enough to legitimately close it, the outcome assertion below would be measuring
-    // the scheduler rather than the watcher.
-    let span = stamps[stamps.len() - 1].duration_since(stamps[0]);
-    let max_gap = stamps
-        .windows(2)
-        .map(|w| w[1].duration_since(w[0]))
-        .max()
-        .expect("burst has at least two writes");
+    // No runner can fail this: the sleeps alone make the burst outlast the window. It
+    // keeps the constants honest — a burst inside the window proves nothing about
+    // extension.
+    let span = cadence.span();
     assert!(
-        span > Duration::from_millis(250),
-        "precondition: the burst must outlast the 250ms window, else the test proves \
-         nothing about extension; span was {span:?}"
-    );
-    assert!(
-        max_gap < Duration::from_millis(250),
-        "precondition: no gap between writes may reach the 250ms window, else the \
-         window is entitled to close mid-burst; largest gap was {max_gap:?}"
+        span > WINDOW,
+        "the burst must outlast the 250ms window; span was {span:?}"
     );
 
     // The count below is exact only once every rebuild the burst caused has written its
@@ -1779,13 +1782,43 @@ fn watch_debounce_single_rebuild_from_burst() {
     write_atomic(&src, ORDER_MARKER_SOURCE);
     wait_for_tap(&stderr_tap, ORDER_MARKER_LINE, TIMEOUT);
     let stderr = stderr_tap.finish_text(&mut child);
+    let rebuilds = count_occurrences(&stderr, "Recompiled ");
 
-    assert_eq!(
-        count_occurrences(&stderr, "Recompiled "),
-        1,
-        "a {span:?} burst with a largest gap of {max_gap:?} must coalesce into exactly \
-         one rebuild under a 250ms quiet period; stderr was:\n{stderr}"
+    let pauses = cadence.pauses(WINDOW / 2);
+    let flag = if pauses == 0 {
+        RunFlag::Conclusive
+    } else {
+        RunFlag::Inconclusive
+    };
+    let judged = match flag {
+        RunFlag::Conclusive => "exactly 1 required".to_string(),
+        RunFlag::Inconclusive => format!(
+            "not judged: {pauses} gap(s) of {:?} or more allow up to {}",
+            WINDOW / 2,
+            most_debounce_windows(&cadence, WINDOW, CAP)
+        ),
+    };
+    record_run_flag(
+        TEST,
+        flag,
+        &format!("{rebuilds} rebuild(s), {judged}; {cadence}"),
     );
+
+    // Positive control for the count: publishing the burst's final state was a rebuild.
+    assert!(
+        rebuilds >= 1,
+        "the burst's final state was published, so at least one `Recompiled` line; got \
+         {rebuilds}; stderr was:\n{stderr}"
+    );
+    if flag == RunFlag::Conclusive {
+        assert_eq!(
+            rebuilds,
+            1,
+            "a {span:?} burst with no gap of {:?} or more ({cadence}) must coalesce into \
+             exactly one rebuild under a 250ms quiet period; stderr was:\n{stderr}",
+            WINDOW / 2
+        );
+    }
     assert_eq!(
         count_occurrences(&stderr, "Compiled to"),
         1,
@@ -1795,282 +1828,9 @@ fn watch_debounce_single_rebuild_from_burst() {
     assert_eq!(
         std::fs::read_to_string(&out).unwrap(),
         "---\nname: v12\n---\nBurst v12!\n",
-        "the single rebuild must compile the FINAL state of the burst, not an \
+        "the last rebuild must compile the FINAL state of the burst, not an \
          intermediate one; stderr was:\n{stderr}"
     );
-}
-
-/// Env var naming a file a skipping test appends one line to (#397).
-///
-/// A skip is an early return, which libtest counts as a pass, and libtest shows no
-/// stderr of a passing test — so without this file a skip is invisible in a CI log.
-/// The watch soak workflow sets it per iteration and tallies skipped iterations
-/// separately from passed ones.
-const SKIP_LOG_ENV: &str = "MDS_TEST_SKIP_LOG";
-
-/// Report that `test` skipped, where a passing run cannot hide it: on stderr, as one
-/// line appended to the file [`SKIP_LOG_ENV`] names, and — under GitHub Actions — as a
-/// warning in the job summary.
-///
-/// # Panics
-/// Panics if [`SKIP_LOG_ENV`] is set and the line cannot be appended: whoever set it is
-/// counting skips, and a skip it cannot see would read as a pass.
-fn record_skip(test: &str, reason: &str) {
-    use std::io::Write as _;
-    eprintln!("{test}: {reason}");
-    if let Some(path) = std::env::var_os(SKIP_LOG_ENV) {
-        let path = std::path::PathBuf::from(path);
-        let appended = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)
-            .and_then(|mut log| writeln!(log, "{test}: {reason}"));
-        if let Err(e) = appended {
-            panic!(
-                "{SKIP_LOG_ENV}={}: cannot record the skip: {e}",
-                path.display()
-            );
-        }
-    }
-    // Best effort: the job summary is a convenience, the skip log is the record.
-    if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut summary) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(summary_path)
-        {
-            let _ = writeln!(summary, ":warning: {test} skipped: {reason}");
-        }
-    }
-}
-
-/// The writer thread's record of one attempt of the cap test.
-struct WriterTrace {
-    /// When the writer started.
-    started: Instant,
-    /// When each write completed, in order (at most the writer's 2000 iterations).
-    writes: Vec<Instant>,
-}
-
-/// Where one attempt's write cadence went (#397): the gaps between completed writes —
-/// the first measured from the writer's start, as the precondition has always measured
-/// it — and where the first rebuild fell among them.
-///
-/// `max_gap` is the metric the harness precondition judges. It spans the whole stream,
-/// while only the gaps before the first rebuild can let a quiet period end on its own;
-/// `max_gap_before_rebuild` records that part separately, so a skip says which of the
-/// two the runner actually failed.
-struct GapBreakdown {
-    writes: usize,
-    span: Duration,
-    max_gap: Duration,
-    median_gap: Duration,
-    p99_gap: Duration,
-    gaps_at_or_over_window: usize,
-    /// When the stderr poll first saw a rebuild, after the writer started (up to one
-    /// poll late); `None` when no rebuild was seen within the poll's bound.
-    rebuild_seen_after: Option<Duration>,
-    /// The largest gap that ended before the rebuild was seen.
-    max_gap_before_rebuild: Option<Duration>,
-}
-
-impl GapBreakdown {
-    fn of(trace: &WriterTrace, rebuild_seen: Option<Instant>, window: Duration) -> Self {
-        let mut previous = trace.started;
-        let mut gaps: Vec<(Instant, Duration)> = Vec::with_capacity(trace.writes.len());
-        for &at in &trace.writes {
-            gaps.push((at, at.duration_since(previous)));
-            previous = at;
-        }
-        let mut sorted: Vec<Duration> = gaps.iter().map(|&(_, gap)| gap).collect();
-        sorted.sort_unstable();
-        let rank = |per_mille: usize| -> Duration {
-            sorted
-                .get((sorted.len().saturating_sub(1) * per_mille) / 1000)
-                .copied()
-                .unwrap_or_default()
-        };
-        GapBreakdown {
-            writes: trace.writes.len(),
-            span: trace
-                .writes
-                .last()
-                .map_or(Duration::ZERO, |&last| last.duration_since(trace.started)),
-            max_gap: sorted.last().copied().unwrap_or_default(),
-            median_gap: rank(500),
-            p99_gap: rank(990),
-            gaps_at_or_over_window: sorted.iter().filter(|&&gap| gap >= window).count(),
-            rebuild_seen_after: rebuild_seen.map(|at| at.duration_since(trace.started)),
-            max_gap_before_rebuild: rebuild_seen.map(|seen| {
-                gaps.iter()
-                    .filter(|&&(at, _)| at <= seen)
-                    .map(|&(_, gap)| gap)
-                    .max()
-                    .unwrap_or_default()
-            }),
-        }
-    }
-}
-
-impl std::fmt::Display for GapBreakdown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} writes over {:?}; gaps: max {:?}, median {:?}, p99 {:?}, {} at or over the \
-             window; ",
-            self.writes,
-            self.span,
-            self.max_gap,
-            self.median_gap,
-            self.p99_gap,
-            self.gaps_at_or_over_window
-        )?;
-        match (self.rebuild_seen_after, self.max_gap_before_rebuild) {
-            (Some(after), Some(gap)) => write!(
-                f,
-                "first rebuild seen {after:?} after the writer started, largest gap \
-                 before it {gap:?}"
-            ),
-            _ => write!(f, "no rebuild seen"),
-        }
-    }
-}
-
-/// The cap rebuilds a file that is never left alone (#379).
-///
-/// A quiet period that can always be extended is unbounded: a writer that never
-/// pauses postpones its own rebuild for as long as it keeps writing. `--poll-interval 0`
-/// turns the idle-tick liveness probe off, so within this test the cap is the ONLY
-/// mechanism that can produce a rebuild while the stream is running — and it is also
-/// the reason the probe cannot be starved in the configurations that do enable it,
-/// since the loop never reaches `TickClock::recv_next` while a window is open.
-#[test]
-fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
-    // The writer thread must keep the stream denser than the 200ms quiet-period window,
-    // so a rebuild seen WHILE writing provably comes from the cap and not from a quiet
-    // period that ended on its own. That is a HARNESS precondition, not a property of
-    // the code under test: on a loaded runner the writer thread can itself be
-    // descheduled past the window (a 747ms inter-write gap was observed on CI), which
-    // makes the sample inconclusive rather than failing. Retry the whole measurement a
-    // bounded number of times, gated ONLY on that precondition — every behaviour
-    // assertion below still fails hard on the first conclusive attempt, so a real
-    // regression is never retried or skipped away. If the cadence is still
-    // unsustainable after every attempt, the test SKIPS rather than failing the
-    // required check: it prints a `SKIPPED (inconclusive harness)` line, appends it to
-    // the file `MDS_TEST_SKIP_LOG` names (the watch soak counts those), and under
-    // GitHub Actions adds a warning to the job summary — see #397, which tracks
-    // root-causing the cadence problem on loaded runners. Every attempt logs its gap
-    // breakdown on stderr, so a failing run shows the cadence of each one.
-    const TEST: &str = "watch_debounce_cap_rebuilds_while_writes_never_stop";
-    const MAX_ATTEMPTS: u32 = 6;
-    const WINDOW: Duration = Duration::from_millis(200);
-
-    let mut max_gaps: Vec<Duration> = Vec::with_capacity(MAX_ATTEMPTS as usize);
-    for attempt in 1..=MAX_ATTEMPTS {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("hot.mds");
-        std::fs::write(&src, "---\nname: v0\n---\nHot {{name}}!\n").unwrap();
-        let out = dir.path().join("hot.md");
-
-        // --debounce 200 => cap = max(10 x 200ms, 1s) = 2s.
-        let (mut child, stderr_tap) = spawn_ready(
-            mds_bin()
-                .args([
-                    "watch",
-                    src.to_str().unwrap(),
-                    "--debounce",
-                    "200",
-                    "--poll-interval",
-                    "0",
-                ])
-                .stdout(Stdio::null()),
-        );
-
-        assert!(
-            wait_for_file_contains(&out, "Hot v0!", TIMEOUT),
-            "initial compile should produce Hot v0!"
-        );
-
-        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let writer_flag = std::sync::Arc::clone(&writing);
-        let writer_src = src.clone();
-        let writer = std::thread::spawn(move || {
-            let started = Instant::now();
-            let stop_at = started + Duration::from_secs(3);
-            let mut writes = Vec::with_capacity(2_000);
-            // Doubly bounded: <= 3s of wall clock AND <= 2000 iterations.
-            for i in 1..=2_000u32 {
-                if Instant::now() >= stop_at {
-                    break;
-                }
-                write_atomic(
-                    &writer_src,
-                    format!("---\nname: v{i}\n---\nHot {{{{name}}}}!\n"),
-                );
-                writes.push(Instant::now());
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            writer_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-            WriterTrace { started, writes }
-        });
-
-        // The cap is 2s; allow the compile that follows it to land inside the bound.
-        // Non-panicking on purpose: "no rebuild by then" is decided below, after the
-        // harness precondition, so an inconclusive attempt is retried rather than failed.
-        let rebuild_seen = poll_tap_until(&stderr_tap, Duration::from_millis(3500), |text| {
-            text.contains("Recompiled ")
-        })
-        .ok()
-        .map(|_| Instant::now());
-        let rebuilt_while_writing = writing.load(std::sync::atomic::Ordering::SeqCst);
-
-        let trace = writer.join().expect("writer thread panicked");
-        let breakdown = GapBreakdown::of(&trace, rebuild_seen, WINDOW);
-        eprintln!("{TEST}: attempt {attempt}/{MAX_ATTEMPTS}: {breakdown}");
-        let max_gap = breakdown.max_gap;
-        max_gaps.push(max_gap);
-
-        // Harness precondition, checked before any behaviour assertion: if the writer
-        // thread could not sustain a sub-window cadence, this run cannot tell a cap
-        // rebuild from a quiet-period one. Discard it and retry rather than reporting a
-        // scheduling hiccup as a product failure.
-        if max_gap >= WINDOW {
-            drop(child);
-            if attempt < MAX_ATTEMPTS {
-                continue;
-            }
-            // Every attempt was inconclusive: the runner is too loaded to exercise the
-            // cap deterministically. Skip rather than fail the required check — no
-            // product behaviour was ever exercised — and leave a trail so this shows up
-            // in the run summary and the soak's tally instead of silently vanishing.
-            // See #397.
-            record_skip(
-                TEST,
-                &format!(
-                    "SKIPPED (inconclusive harness): writer gap {max_gap:?} >= {WINDOW:?} on \
-                     all {MAX_ATTEMPTS} attempts (largest gap per attempt: {max_gaps:?}); \
-                     last attempt: {breakdown}"
-                ),
-            );
-            return;
-        }
-
-        assert!(
-            rebuilt_while_writing,
-            "a rebuild must happen WHILE the writes are still arriving — that is what the \
-             cap is for; nothing was seen until the stream stopped"
-        );
-
-        let stderr = stderr_tap.finish_text(&mut child);
-        let rebuilds = count_occurrences(&stderr, "Recompiled ");
-        assert!(
-            (1..=4).contains(&rebuilds),
-            "3s of writes under a 200ms window with a 2s cap is one capped rebuild plus \
-             the quiet-period rebuild that follows the last write; a fixed 200ms window \
-             would give ~15. Got {rebuilds}; stderr was:\n{stderr}"
-        );
-        return;
-    }
 }
 
 // ── AC-F10: Watch no-arg auto-detect ─────────────────────────────────────

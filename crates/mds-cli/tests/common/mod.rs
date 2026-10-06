@@ -418,10 +418,9 @@ const TAP_POLL: Duration = Duration::from_millis(20);
 /// Poll `tap` until `done` holds for its text, or `timeout` elapses. Never panics.
 ///
 /// `Ok` carries the text that satisfied `done`; `Err` carries the last text seen when
-/// the time ran out. This is for the one caller that treats an unmet condition as
-/// data rather than as a failure — the watch cap test, which must tell "no rebuild
-/// yet" apart from a broken harness. Every other wait goes through [`wait_for_tap`] or
-/// [`wait_for_tap_count`], which fail at the caller.
+/// the time ran out. This is for a caller that treats an unmet condition as data
+/// rather than as a failure; a wait whose timeout is a failure goes through
+/// [`wait_for_tap`] or [`wait_for_tap_count`], which fail at the caller.
 #[allow(dead_code)]
 pub fn poll_tap_until(
     tap: &PipeTap,
@@ -513,6 +512,224 @@ pub const ORDER_MARKER_SOURCE: &str = "Order marker {{__order_marker__}}\n";
 /// count it.
 #[allow(dead_code)]
 pub const ORDER_MARKER_LINE: &str = "undefined variable '__order_marker__'";
+
+// ── Write cadence and run flags (#397) ───────────────────────────────────────
+
+/// When each write of a test's writer began and when it completed.
+///
+/// A watcher sees a write's events at some instant between the two, so the longest
+/// pause it can have seen between two successive writes runs from the START of the one
+/// to the END of the next ([`WriteCadence::gaps`]). A claim that depends on how often a
+/// test managed to write is judged on these MEASURED gaps, never on the cadence the
+/// test asked for: a loaded runner can deschedule a writer for longer than any window
+/// under test.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct WriteCadence {
+    /// `(began, completed)` for each write, in order.
+    writes: Vec<(Instant, Instant)>,
+}
+
+#[allow(dead_code)]
+impl WriteCadence {
+    /// An empty record with room for `writes` writes.
+    pub fn with_capacity(writes: usize) -> Self {
+        Self {
+            writes: Vec::with_capacity(writes),
+        }
+    }
+
+    /// A record of writes timed elsewhere, as `(began, completed)` in order.
+    ///
+    /// # Panics
+    /// Panics if a write completes before it begins, or begins before the one before it
+    /// completed: one writer writes one file at a time.
+    pub fn of(writes: Vec<(Instant, Instant)>) -> Self {
+        for (i, &(began, completed)) in writes.iter().enumerate() {
+            assert!(began <= completed, "write {i} completes before it begins");
+            if let Some(&(_, previous)) = i.checked_sub(1).and_then(|p| writes.get(p)) {
+                assert!(
+                    previous <= began,
+                    "write {i} begins before the write before it completed"
+                );
+            }
+        }
+        Self { writes }
+    }
+
+    /// Run `write`, recording when it began and when it completed.
+    pub fn time<T>(&mut self, write: impl FnOnce() -> T) -> T {
+        let began = Instant::now();
+        let done = write();
+        self.writes.push((began, Instant::now()));
+        done
+    }
+
+    /// How many writes were recorded.
+    pub fn writes(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// From the start of the first write to the end of the last: the longest the
+    /// writes' events can have been spread over. Zero with no write.
+    pub fn span(&self) -> Duration {
+        match (self.writes.first(), self.writes.last()) {
+            (Some(&(began, _)), Some(&(_, completed))) => completed.duration_since(began),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// For each two successive writes, the longest pause a watcher can have seen
+    /// between their events: from the start of the first to the end of the second.
+    pub fn gaps(&self) -> Vec<Duration> {
+        self.writes
+            .windows(2)
+            .map(|pair| pair[1].1.duration_since(pair[0].0))
+            .collect()
+    }
+
+    /// How many [`Self::gaps`] are `at_least` long.
+    pub fn pauses(&self, at_least: Duration) -> usize {
+        self.gaps()
+            .into_iter()
+            .filter(|&gap| gap >= at_least)
+            .count()
+    }
+}
+
+impl std::fmt::Display for WriteCadence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut gaps = self.gaps();
+        gaps.sort_unstable();
+        let rank = |per_mille: usize| -> Duration {
+            gaps.get(gaps.len().saturating_sub(1) * per_mille / 1000)
+                .copied()
+                .unwrap_or_default()
+        };
+        write!(
+            f,
+            "{} writes over {:?}; gaps: max {:?}, median {:?}, p99 {:?}",
+            self.writes.len(),
+            self.span(),
+            rank(1000),
+            rank(500),
+            rank(990)
+        )
+    }
+}
+
+/// The most debounce windows that can have closed over a stream with this `cadence`,
+/// under a quiet period of `window` that a cap ends at most `cap` after it opened.
+///
+/// It holds while the watcher drains each write's events within half a window of the
+/// write:
+/// - A window the cap closed lasted the whole cap, and its last event came no earlier
+///   than one window before the cap's end. Such windows do not overlap, and they lie
+///   between the first write and one and a half windows after the last, so at most
+///   `(span + window + window / 2) / cap` of them close at the cap.
+/// - A window closes quietly only after a whole window without a drained event. With
+///   each drain at most half a window late, that takes a measured gap of at least half
+///   a window ([`WriteCadence::pauses`]) — or the end of the stream: one more.
+///
+/// A window can also close at the watcher's message limit, which no cadence measures; a
+/// caller that cannot rule that out adds an allowance of its own.
+///
+/// # Panics
+/// Panics unless `window` is nonzero and `cap` is at least `window`.
+#[allow(dead_code)]
+pub fn most_debounce_windows(cadence: &WriteCadence, window: Duration, cap: Duration) -> usize {
+    assert!(
+        !window.is_zero() && cap >= window,
+        "a debounce cap is at least its nonzero window"
+    );
+    let reach = cadence.span() + window + window / 2;
+    let cap_closes = usize::try_from(reach.as_nanos() / cap.as_nanos()).unwrap_or(usize::MAX);
+    cap_closes
+        .saturating_add(cadence.pauses(window / 2))
+        .saturating_add(1)
+}
+
+/// Env var naming a file that a test judging its own run appends one line to.
+///
+/// A claim that depends on the runner's cadence is judged only on a run whose measured
+/// cadence can decide it; any other run passes INCONCLUSIVE — it neither fails on the
+/// runner's speed nor skips. The watch soak workflow sets this per iteration and counts
+/// conclusive and inconclusive iterations apart from passed, failed and skipped ones.
+#[allow(dead_code)]
+pub const RUN_FLAG_LOG_ENV: &str = "MDS_TEST_FLAG_LOG";
+
+/// Whether a run could decide the claim it flags.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFlag {
+    /// The measured cadence let the run judge the claim, and it did.
+    Conclusive,
+    /// The measured cadence left the claim undecided; the run passed without judging it.
+    Inconclusive,
+}
+
+impl std::fmt::Display for RunFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RunFlag::Conclusive => "conclusive",
+            RunFlag::Inconclusive => "inconclusive",
+        })
+    }
+}
+
+/// The one line that flags a run of `test`: `<test>: <flag>: <details>`. The watch
+/// soak counts the lines holding `: conclusive: ` and those holding `: inconclusive: `.
+///
+/// # Panics
+/// Panics if `test` or `details` holds a line break: a flag is one line.
+#[allow(dead_code)]
+pub fn run_flag_line(test: &str, flag: RunFlag, details: &str) -> String {
+    assert!(
+        !test.contains(['\n', '\r']) && !details.contains(['\n', '\r']),
+        "a run flag is one line"
+    );
+    format!("{test}: {flag}: {details}")
+}
+
+/// Append `line` and a newline to the file at `path`, creating it if it is missing.
+#[allow(dead_code)]
+pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
+/// Report whether this run of `test` was conclusive, where a passing run cannot hide
+/// it: on stderr, and as one line appended to the file [`RUN_FLAG_LOG_ENV`] names.
+/// Without that file under GitHub Actions — a CI run, not a soak that counts the lines
+/// itself — an inconclusive run also adds its line to the job summary.
+///
+/// # Panics
+/// Panics if [`RUN_FLAG_LOG_ENV`] is set and the line cannot be appended: whoever set
+/// it is counting flags, and a flag it cannot see would read as a run that never
+/// reported one.
+#[allow(dead_code)]
+pub fn record_run_flag(test: &str, flag: RunFlag, details: &str) {
+    let line = run_flag_line(test, flag, details);
+    eprintln!("{line}");
+    if let Some(path) = std::env::var_os(RUN_FLAG_LOG_ENV) {
+        let path = PathBuf::from(path);
+        if let Err(e) = append_line(&path, &line) {
+            panic!(
+                "{RUN_FLAG_LOG_ENV}={}: cannot record the run's flag: {e}",
+                path.display()
+            );
+        }
+    } else if flag == RunFlag::Inconclusive {
+        // Best effort: the job summary is a convenience; a soak's flag log is the record.
+        if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+            let _ = append_line(Path::new(&summary), &format!(":information_source: {line}"));
+        }
+    }
+}
 
 /// Spawn a `mds watch` command and drain its stderr, WITHOUT waiting for readiness.
 ///
