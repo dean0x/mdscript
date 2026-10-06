@@ -8767,6 +8767,9 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
             tap.text()
         );
 
+        // A late event for a save made before the session started, rebuilt after the
+        // out-dir is deleted, writes into a recreated one, and the link then cannot be made.
+        settle_queued_events(&tap, &source, "barrier");
         std::fs::remove_dir_all(&out).unwrap();
         symlink("victim", &out).unwrap();
         write_atomic(&source, "A two\n");
