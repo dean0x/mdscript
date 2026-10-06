@@ -87,8 +87,10 @@ input. The compiler enforces several defense-in-depth controls:
 - **Replace-by-rename writes, below an anchor**: `mds fmt`, `mds lint --fix`, `mds init`,
   and `mds build`/`mds watch` outputs and `.map` sidecars are written to a
   same-directory temp file and renamed over the target (`mds-cli/src/write.rs`,
-  `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so a
-  crash never leaves a truncated target. Every write is made below an anchor —
+  `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so on a
+  local filesystem a crash or kill of the run never leaves a truncated target (a
+  network or FUSE filesystem can report a full disk only when the file is closed, which
+  the write does not check). Every write is made below an anchor —
   the parent of a file argument or of `-o`, `--out-dir`, a directory argument's root,
   or, for `build.output_dir`, the directory that contains `mds.json` — which is
   resolved by path, so a symlinked anchor the user named is followed: as typed, or,

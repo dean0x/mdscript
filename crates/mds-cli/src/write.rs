@@ -9,10 +9,13 @@
 //!
 //! # Replace by rename
 //!
-//! The bytes go to a temporary file beside the target, which is then renamed over it: a
-//! crash, a kill or a full disk never leaves a truncated file, and a reader sees the whole
-//! old file or the whole new one. [`Durability`] says whether the bytes, and the rename,
-//! are also forced to stable storage first.
+//! The bytes go to a temporary file beside the target, which is then renamed over it: on a
+//! local filesystem a crash or a kill of the run, or a full disk, never leaves a truncated
+//! file, and a reader sees the whole old file or the whole new one. A network or FUSE
+//! filesystem can report a full disk only when the file is closed, which the write does
+//! not check, so there a write that is not synced ([`Durability::RenameOnly`]) can rename
+//! a truncated file into place. [`Durability`] says whether the bytes, and the rename, are
+//! also forced to stable storage first.
 //!
 //! # Below the anchor (#160)
 //!
@@ -1662,7 +1665,8 @@ mod unix {
     }
 
     /// Write `content` to `file` and, in the [`Durability::Fsync`] tier, sync it; then
-    /// close it.
+    /// close it, unchecked — a full disk that a network or FUSE filesystem reports only
+    /// then goes unseen by a write that is not synced (the module docs' scope).
     fn fill(mut file: File, content: &[u8], durability: Durability) -> std::io::Result<()> {
         file.write_all(content)?;
         if durability == Durability::Fsync {
