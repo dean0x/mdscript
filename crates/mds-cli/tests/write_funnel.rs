@@ -28,7 +28,8 @@
 //! # Scope and lexical limits (what this guard does NOT see)
 //!
 //! The scan is lexical. It matches the needles in [`NEEDLES`] after masking comment and
-//! string-literal text and stripping `#[cfg(test)] mod … { … }` blocks (test code
+//! string-literal text and blanking every `#[cfg(test)]` item — a `mod tests { … }` or
+//! `mod tests;`, or a test-only `fn` — up to its own closing brace or `;` (test code
 //! legitimately writes fixtures with `std::fs::write`). It therefore does NOT catch:
 //!
 //! - `OpenOptions::new(…).write(true)` without `.create_new(` — a hand-opened `File` that
@@ -38,9 +39,12 @@
 //!   nobody reads.
 //! - A write reached through an alias (`use std::fs::write as w;`) or a helper in another
 //!   crate.
-//! - `#[cfg(test)] fn` items outside a `mod tests` block (the crate has none).
+//! - Production code after a `#[cfg(test)]` on an item with neither a body nor a `;` of
+//!   its own — a struct field, say: the blanking runs on to the next `;`, or to the end
+//!   of the next braced block, and hides everything up to there.
 //!
-//! The scanner helpers below are copied from `crates/mds-core/tests/yaml_funnel.rs`:
+//! The scanner helpers below are copied from `crates/mds-core/tests/yaml_funnel.rs`, and
+//! the `#[cfg(test)]` blanking from `crates/mds-core/tests/output_cap_funnel.rs`:
 //! integration-test binaries are separate crates and cannot share code across crates.
 
 use std::path::{Path, PathBuf};
@@ -210,7 +214,7 @@ fn write_sites_are_funnelled() {
             .and_then(|n| n.to_str())
             .expect("source file names are UTF-8");
         let raw = std::fs::read_to_string(file).expect("source must be readable");
-        let code = strip_cfg_test_mods(&mask_comments_and_strings(&raw));
+        let code = blank_cfg_test_items(&mask_comments_and_strings(&raw));
 
         // Lexical pin for the tail of the primitive itself: the funnel is only worth
         // enforcing while what sits at the end of it still syncs and renames.
@@ -298,6 +302,29 @@ fn the_guard_flags_a_planted_raw_write() {
         ),
         0,
         "a write inside #[cfg(test)] mod tests must not be flagged"
+    );
+
+    // A test-only item ends at its own closing brace or `;`, never at a later `mod`: the
+    // production code between a `#[cfg(test)] fn` and `mod tests` is scanned, and so is
+    // the code after a `#[cfg(test)] mod tests;` declaration.
+    for planted in [
+        "#[cfg(test)]\nfn h() {}\nfn prod(p: &Path) { std::fs::write(p, \"x\").unwrap(); }\n#[cfg(test)]\nmod tests {}\n",
+        "impl S {\n    #[cfg(test)]\n    fn h(&self) -> &[u8] { &self.0 }\n}\nfn prod(p: &Path) { std::fs::write(p, \"x\").unwrap(); }\n#[cfg(test)]\nmod tests {}\n",
+        "#[cfg(test)]\nmod tests;\nfn prod(p: &Path) { std::fs::write(p, \"x\").unwrap(); }\n",
+    ] {
+        assert_eq!(
+            scan_violation_count(planted),
+            1,
+            "a raw write after a test-only item must be flagged: {planted:?}"
+        );
+    }
+    // The test-only function itself is not scanned.
+    assert_eq!(
+        scan_violation_count(
+            "#[cfg(test)]\nfn h(p: &Path) { std::fs::write(p, \"x\").unwrap(); }\nfn prod() {}\n"
+        ),
+        0,
+        "a write inside a #[cfg(test)] fn must not be flagged"
     );
 
     // Inside a line comment it is not.
@@ -487,7 +514,7 @@ fn every_allowlist_entry_is_live() {
             src_dir.display()
         );
         let raw = std::fs::read_to_string(&path).expect("source must be readable");
-        let code = strip_cfg_test_mods(&mask_comments_and_strings(&raw));
+        let code = blank_cfg_test_items(&mask_comments_and_strings(&raw));
         let hits = count_occurrences(&code, needle);
         assert_eq!(
             hits, *max,
@@ -499,9 +526,9 @@ fn every_allowlist_entry_is_live() {
 
 // ── Scanner ───────────────────────────────────────────────────────────────────
 
-/// Total needle hits in `src` after masking and `#[cfg(test)]` stripping.
+/// Total needle hits in `src` after masking and `#[cfg(test)]` blanking.
 fn scan_violation_count(src: &str) -> usize {
-    let code = strip_cfg_test_mods(&mask_comments_and_strings(src));
+    let code = blank_cfg_test_items(&mask_comments_and_strings(src));
     NEEDLES.iter().map(|n| count_occurrences(&code, n)).sum()
 }
 
@@ -558,7 +585,7 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 /// Replace the CONTENT of line comments, block comments, string literals and char
 /// literals with spaces, preserving overall length and newlines. This keeps needles that
 /// appear in rustdoc or inside a string from counting, and makes the brace matching in
-/// [`strip_cfg_test_mods`] safe (no braces hide inside strings/comments).
+/// [`cfg_test_ranges`] safe (no braces hide inside strings/comments).
 fn mask_comments_and_strings(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = vec![b' '; b.len()];
@@ -661,46 +688,53 @@ fn mask_comments_and_strings(src: &str) -> String {
     String::from_utf8(out).expect("masking preserves UTF-8 boundaries on ASCII delimiters")
 }
 
-/// Remove every `#[cfg(test)]`-guarded item from already-masked source. Handles both an
-/// inline `mod name { ... }` (brace-matched) and a `mod name;` / `#[path=...] mod name;`
-/// declaration. Individual `#[cfg(test)] fn ...` items are left in place; this crate
-/// places all test code inside `mod tests`.
-fn strip_cfg_test_mods(code: &str) -> String {
-    let mut result = code.to_string();
-    // Bounded: at most one removal per `#[cfg(test)]` occurrence, and each iteration
-    // either removes a block or blanks the attribute, so no occurrence is seen twice.
-    while let Some(attr) = result.find("#[cfg(test)]") {
-        // Find the next `mod` keyword after the attribute.
-        let after = attr + "#[cfg(test)]".len();
-        let Some(mod_rel) = result[after..].find("mod ") else {
-            // No module follows (e.g. a cfg(test) fn) — blank the attribute and move on.
-            result.replace_range(attr..after, &" ".repeat(after - attr));
-            continue;
+/// Already-masked `code` with every `#[cfg(test)]`-guarded item blanked: each byte but a
+/// newline replaced by a space, so byte offsets and line numbers stay where they were.
+fn blank_cfg_test_items(code: &str) -> String {
+    blank_ranges(code, &cfg_test_ranges(code))
+}
+
+/// Byte ranges of every `#[cfg(test)]`-guarded item in fully masked source, from the
+/// attribute to the item's end: its first `;` (a `mod name;` declaration) or the brace
+/// matching its first `{` (an inline `mod tests { … }`, or a test-only `fn`). The item
+/// ends there, never at a later `mod` — a `#[cfg(test)] fn` above `mod tests` would
+/// otherwise hide all the production code between them. Ported from
+/// `crates/mds-core/tests/output_cap_funnel.rs`.
+fn cfg_test_ranges(code: &str) -> Vec<std::ops::Range<usize>> {
+    const ATTR: &str = "#[cfg(test)]";
+    let mut ranges = Vec::new();
+    let mut from = 0usize;
+    // Bounded: each iteration moves `from` past the attribute it examined.
+    while let Some(rel) = code[from..].find(ATTR) {
+        let attr = from + rel;
+        let item = attr + ATTR.len();
+        from = item;
+        let end = match (code[item..].find('{'), code[item..].find(';')) {
+            (Some(bo), semi) if semi.is_none_or(|s| bo < s) => {
+                match_brace(code, item + bo).map(|close| close + 1)
+            }
+            (_, Some(so)) => Some(item + so + 1),
+            _ => None,
         };
-        let mod_start = after + mod_rel;
-        // Look for the block-open `{` or the statement-terminating `;`.
-        let brace = result[mod_start..].find('{');
-        let semi = result[mod_start..].find(';');
-        match (brace, semi) {
-            (Some(bo), semi_opt) if semi_opt.is_none_or(|s| bo < s) => {
-                let open = mod_start + bo;
-                if let Some(close) = match_brace(&result, open) {
-                    result.replace_range(attr..=close, "");
-                } else {
-                    result.replace_range(attr..open, "");
-                }
-            }
-            (_, Some(so)) => {
-                // `mod name;` declaration — remove the attribute + statement.
-                let end = mod_start + so + 1;
-                result.replace_range(attr..end, "");
-            }
-            _ => {
-                result.replace_range(attr..after, &" ".repeat(after - attr));
+        if let Some(end) = end {
+            ranges.push(attr..end);
+            from = end;
+        }
+    }
+    ranges
+}
+
+/// `text` with every byte in `ranges` (except newlines) replaced by a space.
+fn blank_ranges(text: &str, ranges: &[std::ops::Range<usize>]) -> String {
+    let mut out = text.as_bytes().to_vec();
+    for range in ranges {
+        for byte in &mut out[range.clone()] {
+            if *byte != b'\n' {
+                *byte = b' ';
             }
         }
     }
-    result
+    String::from_utf8(out).expect("blanking with ASCII spaces keeps UTF-8 valid")
 }
 
 /// Is the byte before `i` part of an identifier (so `r` is a suffix, not a raw-string
