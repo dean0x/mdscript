@@ -2095,51 +2095,66 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
 /// `mds-cli`'s manifest names it as a value, so no `default` feature and no other feature
 /// turns it on, however the list is written.
 ///
-/// Controls: each way of turning it on, a declaration that enables something, and a
-/// manifest that does not declare it are reported; a mention in a comment is not.
+/// Controls ([`assert_never_on_by_default`]): each way of turning it on, a declaration
+/// that enables something, and a manifest that does not declare it are reported; a mention
+/// in a comment is not.
 #[test]
 fn debug_panics_is_never_on_by_default() {
+    assert_never_on_by_default("debug-panics", "startup-race-probe");
+}
+
+/// `startup-race-probe`, which delays `mds watch`'s startup on purpose, must never ship
+/// enabled either, and is held to the same rule as `debug-panics`, with the same controls.
+#[test]
+fn startup_race_probe_is_never_on_by_default() {
+    assert_never_on_by_default("startup-race-probe", "debug-panics");
+}
+
+/// `feature` has no finding in `mds-cli`'s manifest ([`feature_findings`]), and every
+/// planted way of turning it on — `other` is another feature the manifest declares — is
+/// reported, while a mention in a comment is not.
+fn assert_never_on_by_default(feature: &str, other: &str) {
     let manifest = read_source("Cargo.toml");
-    let found = feature_findings(&manifest);
+    let found = feature_findings(&manifest, feature);
     assert!(
         found.is_empty(),
-        "mds-cli's `debug-panics` feature must stay off by default:\n{}",
+        "mds-cli's `{feature}` feature must stay off by default:\n{}",
         found.join("\n")
     );
-    let declared = "debug-panics = []";
+    let declared = format!("{feature} = []");
     let after_declared =
-        |extra: &str| manifest.replacen(declared, &format!("{declared}\n{extra}"), 1);
+        |extra: &str| manifest.replacen(&declared, &format!("{declared}\n{extra}"), 1);
     let plants = [
         (
-            after_declared("default = [\"debug-panics\"]"),
+            after_declared(&format!("default = [\"{feature}\"]")),
             "a default that enables it",
         ),
         (
-            after_declared("default = [\n    \"debug-panics\",\n]"),
+            after_declared(&format!("default = [\n    \"{feature}\",\n]")),
             "a default over several lines that enables it",
         ),
         (
-            after_declared("default = ['debug-panics']"),
+            after_declared(&format!("default = ['{feature}']")),
             "a default that names it in a literal string",
         ),
         (
-            after_declared("verbose = [\"startup-race-probe\", \"debug-panics\"]"),
+            after_declared(&format!("verbose = [\"{other}\", \"{feature}\"]")),
             "another feature that enables it",
         ),
         (
-            after_declared("verbose = [\"a#b\", \"debug-panics\"]"),
+            after_declared(&format!("verbose = [\"a#b\", \"{feature}\"]")),
             "a feature that enables it after a `#` inside a string",
         ),
         (
-            format!("features.default = [\"debug-panics\"]\n{manifest}"),
+            format!("features.default = [\"{feature}\"]\n{manifest}"),
             "a dotted `features.default` that enables it",
         ),
         (
-            manifest.replacen(declared, "debug-panics = [\"startup-race-probe\"]", 1),
+            manifest.replacen(&declared, &format!("{feature} = [\"{other}\"]"), 1),
             "a declaration that enables another feature",
         ),
         (
-            manifest.replacen(declared, "", 1),
+            manifest.replacen(&declared, "", 1),
             "a manifest that does not declare it",
         ),
     ];
@@ -2147,21 +2162,21 @@ fn debug_panics_is_never_on_by_default() {
     for (planted, what) in &plants {
         assert_ne!(
             planted, &manifest,
-            "precondition: the plant changes Cargo.toml ({what})"
+            "precondition: the plant changes Cargo.toml ({feature}: {what})"
         );
-        if feature_findings(planted).is_empty() {
+        if feature_findings(planted, feature).is_empty() {
             missed.push(*what);
         }
     }
     assert!(
         missed.is_empty(),
-        "each of these must be reported; missed: {missed:?}"
+        "each of these must be reported for `{feature}`; missed: {missed:?}"
     );
-    let commented = after_declared("# default = [\"debug-panics\"]");
+    let commented = after_declared(&format!("# default = [\"{feature}\"]"));
     assert_eq!(
-        feature_findings(&commented),
+        feature_findings(&commented, feature),
         Vec::<String>::new(),
-        "a mention in a comment turns nothing on"
+        "a mention of `{feature}` in a comment turns nothing on"
     );
 }
 
@@ -2907,24 +2922,22 @@ fn gate_findings(sources: &[(String, String)], gate: &DebugGate) -> Vec<String> 
 /// handler.
 const TRIGGER_FNS: &[&str] = &["panic_on_request", "panic_on_compile", "panic_in_handler"];
 
-/// What is wrong with `debug-panics` in `manifest`; empty when nothing is (see
-/// [`debug_panics_is_never_on_by_default`]): every line, comments left out, that names it
-/// in quotes — a value, which is how a feature turns another on, whether the list sits on
-/// one line or several and whatever key holds it (`default`, `features.default`) — and a
-/// `[features]` table that does not declare it as `debug-panics = []`. The declaration's
-/// key is bare, so it is no quoted mention; a key written in quotes is reported too.
-fn feature_findings(manifest: &str) -> Vec<String> {
+/// What is wrong with the test-only `feature` in `manifest`; empty when nothing is (see
+/// [`assert_never_on_by_default`]): every line, comments left out, that names it in
+/// quotes — a value, which is how a feature turns another on, whether the list sits on one
+/// line or several and whatever key holds it (`default`, `features.default`) — and a
+/// `[features]` table that does not declare it as `<feature> = []`. The declaration's key
+/// is bare, so it is no quoted mention; a key written in quotes is reported too.
+fn feature_findings(manifest: &str, feature: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut in_features = false;
     let mut declared = false;
+    let quoted = [format!("\"{feature}\""), format!("'{feature}'")];
     for (index, line) in manifest.lines().enumerate() {
         let line = toml_code(line).trim();
-        if ["\"debug-panics\"", "'debug-panics'"]
-            .iter()
-            .any(|quoted| line.contains(quoted))
-        {
+        if quoted.iter().any(|quoted| line.contains(quoted.as_str())) {
             found.push(format!(
-                "Cargo.toml:{}: `{line}` names `debug-panics` as a value, which turns it on",
+                "Cargo.toml:{}: `{line}` names `{feature}` as a value, which turns it on",
                 index + 1
             ));
         }
@@ -2935,16 +2948,18 @@ fn feature_findings(manifest: &str) -> Vec<String> {
         let Some((key, value)) = line.split_once('=').filter(|_| in_features) else {
             continue;
         };
-        if key.trim() == "debug-panics" {
+        if key.trim() == feature {
             declared = true;
             let value = value.trim();
             if value != "[]" {
-                found.push(format!("`debug-panics` must enable nothing; it is {value}"));
+                found.push(format!("`{feature}` must enable nothing; it is {value}"));
             }
         }
     }
     if !declared {
-        found.push("Cargo.toml's [features] does not declare `debug-panics`".to_string());
+        found.push(format!(
+            "Cargo.toml's [features] does not declare `{feature}`"
+        ));
     }
     found
 }
