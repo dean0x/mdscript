@@ -357,6 +357,7 @@ struct DependencyCase<'a> {
     source: &'a Path,
     /// The source's output.
     output: &'a Path,
+    /// The file held truncated: a dependency of the source, or the source itself.
     dependency: &'a Path,
     /// What is written through the held handle.
     rewrite: &'a str,
@@ -493,6 +494,15 @@ fn dir_mode_held_truncate_of_the_vars_file_triggers_nothing_until_written() {
 /// rebuild follows the write.
 #[cfg(debug_assertions)]
 fn held_truncate_after_the_look(case: &DependencyCase<'_>) {
+    held_truncate_in_a_pause(case, case.source, "MDS_TEST_PAUSE_AFTER_LOOK");
+}
+
+/// Save `saved` as it is, truncate the dependency while the rebuild that save starts is
+/// stopped at the debug build's `pause` — the variable of the pause after a rebuild's look,
+/// or of the one after a directory batch's split — then write it: no diagnostic, no
+/// `Recompiled`, the output untouched, and one rebuild follows the write.
+#[cfg(debug_assertions)]
+fn held_truncate_in_a_pause(case: &DependencyCase<'_>, saved: &Path, pause: &str) {
     let what = case.what;
     let out = case.output;
     // Outside every watched directory, so the pause's files raise no event.
@@ -504,16 +514,15 @@ fn held_truncate_after_the_look(case: &DependencyCase<'_>) {
             .arg(case.watched)
             .args(case.extra)
             .args(["--debounce", "0", "--poll-interval", "0"])
-            .env("MDS_TEST_PAUSE_AFTER_LOOK", &go)
+            .env(pause, &go)
             .stdout(Stdio::null()),
     );
     let mut log = OutputLog::default();
     log.wait_for(out, case.before, TIMEOUT);
 
-    // The source saved as it is: its rebuild looks, finds every file full, and pauses
-    // before it reads any.
-    let source = std::fs::read_to_string(case.source).unwrap();
-    write_atomic(case.source, &source);
+    // The file saved as it is: its rebuild looks, finds every file full, and pauses.
+    let content = std::fs::read_to_string(saved).unwrap();
+    write_atomic(saved, &content);
     let paused_by = Instant::now() + TIMEOUT;
     // Bounded by TIMEOUT: at most TIMEOUT / OUTPUT_POLL iterations.
     while !paused.exists() {
@@ -649,6 +658,84 @@ fn dir_mode_an_imported_partial_truncated_after_the_look_triggers_nothing_until_
         before: "Partial one",
         after: "Partial two",
     });
+}
+
+// ── A file truncated while a directory batch runs ───────────────────────────
+
+/// In directory mode, the `--vars` file truncated while a batch runs — after the batch read
+/// it whole, before the batch ends — holds the rebuilds its own events start, as a look
+/// that found it empty does: the batch compiled with what it read and ended with the file
+/// empty, which it must not take for the file it read. The debug build's pause between a
+/// batch's split and its compile (`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`), after the batch's
+/// `--vars` load, makes the window certain; outside a test, a truncating save that lands
+/// while an earlier event's batch compiles opens it.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_the_vars_file_truncated_after_its_batch_read_it_triggers_nothing_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("t.mds");
+    std::fs::write(&source, "Vars {{v}}\n").unwrap();
+    let out = dir.path().join("out");
+
+    held_truncate_in_a_pause(
+        &DependencyCase {
+            what: "directory mode, the vars file, truncated after its batch read it",
+            watched: &root,
+            source: &source,
+            output: &out.join("t.md"),
+            dependency: &vars,
+            rewrite: r#"{"v": "two"}"#,
+            extra: &[
+                "--out-dir",
+                out.to_str().unwrap(),
+                "--vars",
+                vars.to_str().unwrap(),
+            ],
+            before: "Vars one",
+            after: "Vars two",
+        },
+        &source,
+        "MDS_TEST_PAUSE_AFTER_BATCH_SPLIT",
+    );
+}
+
+/// In directory mode, a source truncated while a batch that rebuilds another source runs —
+/// after the batch looked, before it ends — is held when its own events come, as one a
+/// look found empty is: the batch never read it and ended with it empty, which it must not
+/// take for the file the session last saw. The debug build's pause after a batch's look
+/// (`MDS_TEST_PAUSE_AFTER_LOOK`) makes the window certain; outside a test, a truncating
+/// save that lands while an earlier event's batch rebuilds another source opens it.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_source_truncated_while_a_batch_rebuilds_another_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let a = root.join("a.mds");
+    let b = root.join("b.mds");
+    std::fs::write(&a, "A one\n").unwrap();
+    std::fs::write(&b, "B one\n").unwrap();
+    let out = dir.path().join("out");
+
+    held_truncate_in_a_pause(
+        &DependencyCase {
+            what: "directory mode, a source truncated while another's batch runs",
+            watched: &root,
+            source: &a,
+            output: &out.join("a.md"),
+            dependency: &a,
+            rewrite: "A two\n",
+            extra: &["--out-dir", out.to_str().unwrap()],
+            before: "A one",
+            after: "A two",
+        },
+        &b,
+        "MDS_TEST_PAUSE_AFTER_LOOK",
+    );
 }
 
 // ── Directory mode defers the whole batch ───────────────────────────────────

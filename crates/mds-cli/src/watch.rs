@@ -699,9 +699,12 @@ fn emptied_paths<'a>(
         .collect()
 }
 
-/// The baseline a batch leaves while a rebuild is held (#380): `fresh`, except that a file
-/// gone empty since `before` keeps the stamp that saw its bytes, so the next look finds it
-/// emptied still. A file `before` never saw takes its fresh stamp.
+/// The baseline a directory batch leaves (#380): `fresh`, except that a file gone empty
+/// since `before` keeps the stamp that saw its bytes, so the next look finds it emptied
+/// still — a file truncated while the batch ran, after its look, whether the batch had read
+/// it already or did not read it, and one whose source the batch held. A file `before` never
+/// saw takes its fresh stamp. A file the hold's deadline compiles as it is was taken into
+/// `before` empty when the batch began ([`rebuild_dir_batch`]), so it is not emptied here.
 fn baseline_keeping_emptied(before: &StampMap, mut fresh: StampMap) -> StampMap {
     for (path, now) in &mut fresh {
         if let Some(old) = before.get(path).filter(|old| went_empty(Some(*old), now)) {
@@ -4447,7 +4450,10 @@ fn liveness_probe_dir(
 /// ([`join_emptied`]), so that batch rebuilds it. A source whose compile read a file
 /// emptied after the look is held the same way, alone, whether the compile then failed or
 /// not ([`compile_one_source`]), and a `--vars` load that failed on the file emptied after
-/// the look holds the whole batch. `due` is
+/// the look holds the whole batch. A file emptied while the batch runs, after its look, that
+/// no compile read empty — read whole before, or not read — stays emptied in the baseline
+/// the batch leaves ([`baseline_keeping_emptied`]), so the rebuild its own events start is
+/// held; only a file the deadline compiles as it is is taken in empty. `due` is
 /// the hold's deadline when that deadline runs this rebuild, which then ends the hold
 /// ([`not_before`]); `None` for an event or a tick.
 /// The vars file is then reloaded (freshness rule), and a
@@ -4485,6 +4491,12 @@ fn rebuild_dir_batch(
         state.held.hold(&batch, vars_changed);
         settle(SettleInto::Dir(state), None, Settle::Defer);
         return;
+    }
+    // The hold's deadline runs this batch if the look found a file emptied: it compiles the
+    // file as it is, and the baseline takes it so — the batch's own end keeps the stamp
+    // that saw an emptied file's bytes, and a file left empty must not be held again.
+    for path in &emptied {
+        state.last_mtimes.insert(path.clone(), stamp_now(path));
     }
     let (batch, vars_changed) = state.held.release(&batch, vars_changed);
     // A debug build's test pause (#380): the batch found no file emptied, and has read none.
@@ -5304,15 +5316,13 @@ fn process_dir_batch(
     // unchanged broken file does not re-fire every tick) and drops keys for sources the
     // batch deleted, which `snapshot_state` achieves by replacing the map outright.
     //
-    // A source held back because its compile read a file emptied since the batch looked
-    // leaves the hold running (#380): an emptied file then keeps the stamp that saw its
-    // bytes, so the next look finds it emptied still and the hold is kept.
+    // A file emptied since the batch looked keeps the stamp that saw its bytes (#380), so
+    // the next look finds it emptied still: one truncated while the batch ran — after the
+    // batch read it, or in a batch that does not read it — whose own events would otherwise
+    // rebuild against an empty file taken for the one the session saw, publishing it empty
+    // or reporting it, and one whose compile read it emptied, which held its source.
     let fresh = snapshot_state(&state.watched_set());
-    state.last_mtimes = if state.hold.deadline().is_some() {
-        baseline_keeping_emptied(&state.last_mtimes, fresh)
-    } else {
-        fresh
-    };
+    state.last_mtimes = baseline_keeping_emptied(&state.last_mtimes, fresh);
     any_changed
 }
 
@@ -8908,9 +8918,9 @@ mod tests {
         );
     }
 
-    /// #380: while a rebuild is held, a batch's baseline keeps the stamp that saw an
-    /// emptied file's bytes; every other file — one with bytes, one the old baseline never
-    /// saw, one it saw empty — takes its fresh stamp.
+    /// #380: a batch's baseline keeps the stamp that saw an emptied file's bytes; every
+    /// other file — one with bytes, one the old baseline never saw, one it saw empty —
+    /// takes its fresh stamp.
     #[test]
     fn a_held_baseline_keeps_the_stamp_that_saw_an_emptied_file_s_bytes() {
         let path = |name: &str| PathBuf::from("/w").join(name);
@@ -8935,6 +8945,94 @@ mod tests {
             assert_eq!(kept.get(&path(name)), fresh.get(&path(name)), "{name}");
         }
         assert_eq!(kept.len(), fresh.len());
+    }
+
+    /// Directory mode's state with `a.mds` (`A one`) and `b.mds` (`B one`) below `root`,
+    /// both compiled to `out` by a first batch, as a session's startup leaves them.
+    fn two_compiled_sources(root: &Path, out: &Path) -> (DirWatchCtx, DirWatchState) {
+        std::fs::write(root.join("a.mds"), "A one\n").unwrap();
+        std::fs::write(root.join("b.mds"), "B one\n").unwrap();
+        let ctx = dir_ctx(root, out);
+        let mut state = empty_dir_state();
+        let both = BTreeSet::from([root.join("a.mds"), root.join("b.mds")]);
+        rebuild_dir_batch(&ctx, &both, false, &mut state, None);
+        (ctx, state)
+    }
+
+    /// #380: a directory batch that ends with a watched file emptied since it looked — a
+    /// truncation that landed while it ran, whether it had read the file already or does
+    /// not read it — keeps the stamp that saw the file's bytes, so the rebuild the file's
+    /// own event starts finds it emptied and is held rather than publishing it empty.
+    /// `process_dir_batch` is what a batch runs once its look is done.
+    #[test]
+    fn a_batch_keeps_a_file_emptied_since_its_look_found_emptied() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (ctx, mut state) = two_compiled_sources(&root, &out);
+        let (a, b) = (root.join("a.mds"), root.join("b.mds"));
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).ok();
+        assert!(
+            read("a.md").is_some_and(|text| text.contains("A one")),
+            "control: a is compiled; out/a.md: {:?}",
+            read("a.md")
+        );
+
+        // A batch for b, past its look, with a emptied meanwhile.
+        std::fs::write(&b, "B two\n").unwrap();
+        std::fs::write(&a, "").unwrap();
+        process_dir_batch(
+            &BTreeSet::from([b.clone()]),
+            false,
+            &ctx.root,
+            &ctx.output_base,
+            &None,
+            true,
+            &mut state,
+        );
+        assert!(
+            read("b.md").is_some_and(|text| text.contains("B two")),
+            "positive control: the batch rebuilds b; out/b.md: {:?}",
+            read("b.md")
+        );
+
+        // a's own event.
+        rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+        assert!(
+            read("a.md").is_some_and(|text| text.contains("A one")),
+            "a file emptied while a batch ran is held, not published empty; out/a.md: {:?}",
+            read("a.md")
+        );
+        assert!(state.hold.deadline().is_some(), "{:?}", state.hold);
+    }
+
+    /// #380: the batch the hold's deadline runs compiles a file found emptied as it is, and
+    /// takes it into the baseline so: a later batch is not held for a file left empty.
+    #[test]
+    fn a_deadline_batch_takes_a_file_it_compiled_empty_into_the_baseline() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (ctx, mut state) = two_compiled_sources(&root, &out);
+        let (a, b) = (root.join("a.mds"), root.join("b.mds"));
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).ok();
+
+        std::fs::write(&a, "").unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+        let deadline = state.hold.deadline().expect("control: the batch is held");
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), false, &mut state, Some(deadline));
+        assert_eq!(
+            read("a.md").as_deref(),
+            Some(""),
+            "control: the deadline compiles a as it is"
+        );
+
+        std::fs::write(&b, "B two\n").unwrap();
+        rebuild_dir_batch(&ctx, &BTreeSet::from([b.clone()]), false, &mut state, None);
+        assert!(
+            read("b.md").is_some_and(|text| text.contains("B two")),
+            "a batch after the deadline is not held for a file left empty; out/b.md: {:?}",
+            read("b.md")
+        );
+        assert_eq!(state.hold.deadline(), None, "{:?}", state.hold);
     }
 
     /// #380: the paths found emptied since a baseline: those it saw with bytes that have
