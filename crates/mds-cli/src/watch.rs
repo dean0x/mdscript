@@ -3740,13 +3740,13 @@ struct DirWatchState {
     /// Parent dirs of dependencies located outside the watched root.
     /// Watched NonRecursive; re-armed by liveness probe.
     external_dep_dirs: BTreeSet<PathBuf>,
-    /// The `--vars` file, canonical, if one is given: outside [`Self::tracked_set`], but
+    /// The `--vars` file, canonical, if one is given: outside [`Self::tracked_paths`], but
     /// in [`Self::watched_set`], since a rebuild is held while it is empty as while a
-    /// source is (#380).
+    /// source is, and the idle tick looks for a change to it as to a source's (#380).
     vars_file: Option<PathBuf>,
     /// `(mtime, size)` baseline over [`DirWatchState::watched_set`] — sources,
     /// dependencies and the `--vars` file. Read by the idle tick's content backstop over
-    /// the tracked set, and by a batch to tell a watched file emptied since (#380);
+    /// that set, and by a batch to tell a watched file emptied since (#380);
     /// re-written at the end of every batch, so the tick reports only what the batch did
     /// not already handle (#321).
     last_mtimes: StampMap,
@@ -3909,29 +3909,29 @@ impl DirWatchState {
 
     /// Every path whose **content** the watcher must react to: all known sources
     /// plus every dependency they pull in, including cross-root ones outside the
-    /// watched root.
+    /// watched root — a dependency several sources import comes once for each.
     ///
-    /// This is the domain of the idle-tick content backstop and of the `last_mtimes`
-    /// baseline that feeds it (#321). `known_files` alone cannot serve: it holds
-    /// exactly what `collect_mds_files(root)` returns, so a cross-root dependency is
-    /// never in it, and a probe diffing only that walk can see such a file appear or
-    /// vanish but never *change*.
-    fn tracked_set(&self) -> HashSet<PathBuf> {
-        self.tracked_paths().cloned().collect()
-    }
-
-    /// [`Self::tracked_set`]'s paths, borrowed: a dependency several sources import comes
-    /// once for each.
+    /// With the `--vars` file, these are the domain of the idle-tick content backstop and
+    /// of the `last_mtimes` baseline that feeds it (#321, [`Self::watched_set`]).
+    /// `known_files` alone cannot serve: it holds exactly what `collect_mds_files(root)`
+    /// returns, so a cross-root dependency is never in it, and a probe diffing only that
+    /// walk can see such a file appear or vanish but never *change*.
     fn tracked_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.known_files
             .iter()
             .chain(self.forward_deps.values().flatten())
     }
 
+    /// [`Self::tracked_paths`], as a set.
+    #[cfg(test)]
+    fn tracked_set(&self) -> HashSet<PathBuf> {
+        self.tracked_paths().cloned().collect()
+    }
+
     /// Every path whose emptying holds a batch back (#380), and the domain of the
-    /// `last_mtimes` baseline: [`Self::tracked_set`] and the `--vars` file, which every
-    /// compile reads. The idle tick's content backstop diffs the tracked set alone — a
-    /// change to the vars file reaches a batch through its event.
+    /// `last_mtimes` baseline and of the idle tick's content backstop:
+    /// [`Self::tracked_paths`] and the `--vars` file, which every compile reads — so a
+    /// change to the vars file whose event was lost still reaches a batch (#380).
     fn watched_set(&self) -> HashSet<PathBuf> {
         self.watched_paths().cloned().collect()
     }
@@ -4058,7 +4058,7 @@ struct LivenessState {
 /// - PF-004: all reads go through `compile_to_content`.
 ///
 /// Does **not** touch `state.last_mtimes`: the content backstop's baseline is settled
-/// once per batch by `process_dir_batch`, over the whole tracked set (#321).
+/// once per batch by `process_dir_batch`, over the whole watched set (#321).
 ///
 /// Compile success/failure is already signalled via `state.errored`; the caller uses
 /// that set for error tracking.
@@ -4477,16 +4477,26 @@ fn liveness_probe_dir(
     // cross-root dependency is discovered by the compile that reads it, so its
     // directory cannot be armed until after that first read.
     //
-    // Cost is one `stat` per tracked path per tick, short-circuited by nothing — the
+    // Cost is one `stat` per watched path per tick, short-circuited by nothing — the
     // full set is walked so every changed path joins the same batch. That is the same
     // price single-file mode has always paid via `state_differs` on its
     // files-of-interest, and it is O(sources + deps), not O(tree).
-    let tracked = state.tracked_set();
-    let mut batch: BTreeSet<PathBuf> = tracked
+    //
+    // The watched set holds the `--vars` file too, as single-file mode's files of interest
+    // do (#380): its event can be lost like any other — to an inotify queue overflow, to
+    // an FSEvents stream restart — and nothing else would ever rebuild the outputs with
+    // the file as it now reads. A change found there is a vars change, which recompiles
+    // every source, as the batch of its event does.
+    let watched = state.watched_set();
+    let mut batch: BTreeSet<PathBuf> = watched
         .iter()
         .filter(|p| path_state_differs(p, &state.last_mtimes))
         .cloned()
         .collect();
+    let vars_changed = state
+        .vars_file
+        .as_ref()
+        .is_some_and(|vars| batch.remove(vars));
 
     // 4. Full reconcile (appeared/removed), only on a recovery edge.
     //
@@ -4510,13 +4520,13 @@ fn liveness_probe_dir(
         state.known_files = current;
     }
 
-    if !batch.is_empty() {
+    if !batch.is_empty() || vars_changed {
         // The event handler's rebuild path, so a recompile driven purely by this
         // content-backstop/full-reconcile tick (no FS event ever delivered, e.g. after a
         // root delete+recreate) re-reports the vars-file duplicate keys under the same
         // content-changed gate, and one logical edit observed by both paths still warns
         // once — tests I17 and I19.
-        rebuild_dir_batch(ctx, &batch, false /* vars_changed */, state, None);
+        rebuild_dir_batch(ctx, &batch, vars_changed, state, None);
         arm_external_dirs_after_rebuild(ctx, watcher, liveness, state);
     }
     // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
@@ -4698,6 +4708,15 @@ fn handle_fs_event_dir(
     }
     changed.extend(drained.paths);
 
+    // Check if the vars file changed — before the filters below drop the paths in the
+    // out-dir and in the hidden directories and `node_modules/` below the root: a `--vars`
+    // file there is read by every compile all the same (#380).
+    let vars_changed = ctx
+        .vars_path
+        .as_deref()
+        .map(|vf| changed.contains(vf))
+        .unwrap_or(false);
+
     // Defense-in-depth: ignore events from inside the out-dir subtree.
     if let OutputBase::Dir {
         canonical: ref od, ..
@@ -4712,13 +4731,6 @@ fn handle_fs_event_dir(
     // events would cause spurious rebuilds (e.g. npm install writing to
     // node_modules/ triggers a full re-scan on every package update).
     changed.retain(|p| !is_within_default_excluded_dir(&ctx.root.canonical, p));
-
-    // Check if the vars file changed.
-    let vars_changed = ctx
-        .vars_path
-        .as_deref()
-        .map(|vf| changed.contains(vf))
-        .unwrap_or(false);
 
     // Collect .mds paths that are either under root OR in known external dep dirs.
     let mds_changed: BTreeSet<PathBuf> = changed
@@ -5068,7 +5080,7 @@ mod dir_startup {
         // *post*-edit state as the baseline, so the watcher would believe an output
         // compiled from the pre-edit content was up to date, and hold that belief forever.
         //
-        // Keys go through `graph_key`, exactly as `known_files` below does. `tracked_set`
+        // Keys go through `graph_key`, exactly as `known_files` below does. `watched_set`
         // is built from those canonical keys, so a raw key here would never match one of
         // them — every source would read as "not in the baseline", i.e. changed, and the
         // first idle tick would recompile the whole tree. `collect_mds_files` walks a root
@@ -8349,7 +8361,7 @@ mod tests {
         );
         assert!(
             !rebuild.tracked_set().contains(&vars),
-            "the vars file is outside the tracked set the idle tick diffs"
+            "the vars file is outside the tracked set: no source and no dependency"
         );
         assert!(rebuild.errored.is_empty(), "nothing is marked errored");
     }
@@ -8843,8 +8855,7 @@ mod tests {
     /// the `--vars` file's directory on every tick. A repeat watch of a held path is no
     /// no-op: macOS restarts its event stream, dropping the events that land meanwhile, and
     /// Windows opens another handle, which delivers every event once more. A directory the
-    /// watcher does not hold is watched once, and again only once it has vanished and
-    /// come back.
+    /// watcher does not hold is watched once.
     #[test]
     fn a_tick_watches_a_directory_only_when_the_watcher_does_not_hold_it() {
         let (_root_dir, root) = canonical_tempdir();
@@ -8877,9 +8888,34 @@ mod tests {
             "six ticks watch each directory the watcher did not hold once — the positive \
              control — and nothing else"
         );
+    }
 
-        // The `--vars` file's directory vanishes, then comes back.
-        watcher.calls.clear();
+    /// #257: the `--vars` file's directory outside the root that vanishes is no longer
+    /// held, its watch gone with it, and the first tick that finds it back watches it once
+    /// more; the ticks after that leave it alone.
+    #[test]
+    fn a_vars_directory_back_from_vanishing_is_watched_once_more() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_vars_parent, vars_parent) = canonical_tempdir();
+        let vars_dir = vars_parent.join("cfg");
+        let vars = vars_dir.join("vars.json");
+        std::fs::create_dir(&vars_dir).unwrap();
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+        let mut liveness = LivenessState {
+            armed_dirs: BTreeSet::from([vars_dir.clone()]),
+            ..idle_liveness()
+        };
+        let mut watcher = RecordingWatcher::default();
+        liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
+        assert_eq!(
+            watcher.calls,
+            [],
+            "control: the held directory is not watched"
+        );
+
+        // The directory vanishes, then comes back.
         std::fs::remove_dir_all(&vars_dir).unwrap();
         liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
         assert_eq!(watcher.calls, [], "a directory that is gone is not watched");
@@ -8938,6 +8974,101 @@ mod tests {
              file's is left as it is"
         );
         assert_eq!(liveness.armed_dirs, BTreeSet::from([shared]));
+    }
+
+    /// #380: an idle tick rebuilds with a `--vars` edit whose event was lost — to an inotify
+    /// queue overflow, or to an FSEvents stream restart — as it does with a source's: its
+    /// content check looks at the `--vars` file too, and a change it finds there recompiles
+    /// every source against the file as it then reads.
+    #[test]
+    fn an_idle_tick_rebuilds_with_a_vars_edit_whose_event_was_lost() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_vars_dir, vars_dir) = canonical_tempdir();
+        let vars = vars_dir.join("vars.json");
+        let a = root.join("a.mds");
+        std::fs::write(&a, "A {{v}}\n").unwrap();
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+        state.known_files.insert(a.clone());
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        let read = || std::fs::read_to_string(out.join("a.md")).ok();
+        assert!(
+            read().is_some_and(|text| text.contains("A one")),
+            "control: the source is compiled with the vars file; out/a.md: {:?}",
+            read()
+        );
+
+        // The vars file edited, to a new size, and no event delivered.
+        std::fs::write(&vars, r#"{"v": "two, longer"}"#).unwrap();
+        let mut watcher = RecordingWatcher::default();
+        liveness_probe_dir(&ctx, &mut watcher, &mut idle_liveness(), &mut state);
+
+        assert!(
+            read().is_some_and(|text| text.contains("A two, longer")),
+            "the tick rebuilds with the vars file as it now reads; out/a.md: {:?}",
+            read()
+        );
+    }
+
+    /// #380: the `--vars` file's event rebuilds wherever the file is — in a hidden directory
+    /// or `node_modules/` below the root, or below the out-dir — though every other path's
+    /// event there is dropped: every compile reads the file all the same.
+    #[test]
+    fn a_vars_file_s_event_rebuilds_where_other_paths_events_are_dropped() {
+        for place in [".config", "node_modules", "the out-dir"] {
+            let (_root_dir, root) = canonical_tempdir();
+            let (_out_dir, out) = canonical_tempdir();
+            let (vars_dir, inside_root) = match place {
+                "the out-dir" => (out.clone(), false),
+                hidden => (root.join(hidden), true),
+            };
+            std::fs::create_dir_all(&vars_dir).unwrap();
+            let vars = vars_dir.join("vars.json");
+            let a = root.join("a.mds");
+            std::fs::write(&a, "A {{v}}\n").unwrap();
+            std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+            let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+            let ctx = DirWatchCtx {
+                vars_dir_extra: (!inside_root).then(|| vars_dir.clone()),
+                ..ctx
+            };
+            state.known_files.insert(a.clone());
+            rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+            let read = || std::fs::read_to_string(out.join("a.md")).ok();
+            assert!(
+                read().is_some_and(|text| text.contains("A one")),
+                "{place}: control: the source is compiled; out/a.md: {:?}",
+                read()
+            );
+            let (_tx, rx) = mpsc::channel::<Msg>();
+            let beside = vars_dir.join("beside.mds");
+            std::fs::write(&beside, "Beside.\n").unwrap();
+            let outcome = handle_fs_event_dir(
+                modify_event(beside.to_str().unwrap()),
+                &ctx,
+                &rx,
+                &mut state,
+            );
+            assert!(
+                matches!(outcome, DirEventOutcome::Skip),
+                "{place}: positive control: a source's event there is dropped"
+            );
+
+            std::fs::write(&vars, r#"{"v": "two"}"#).unwrap();
+            let outcome =
+                handle_fs_event_dir(modify_event(vars.to_str().unwrap()), &ctx, &rx, &mut state);
+
+            assert!(
+                matches!(outcome, DirEventOutcome::Done),
+                "{place}: the vars file's event rebuilds"
+            );
+            assert!(
+                read().is_some_and(|text| text.contains("A two")),
+                "{place}: with the vars file as it now reads; out/a.md: {:?}",
+                read()
+            );
+        }
     }
 
     /// #380: a dependency below the root that is no source — a `type: mds` `.md` module a
