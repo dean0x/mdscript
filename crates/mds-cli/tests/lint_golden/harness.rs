@@ -22,7 +22,9 @@
 //!    doubled or forward-slash separators) is replaced by `$TMP`, and the number of
 //!    replacements is part of the golden;
 //! 2. an atomic-write temp file name `.mds-tmp-` + six ASCII alphanumerics + `.tmp` is
-//!    replaced by `.mds-tmp-RANDOM.tmp`, and that count is part of the golden too;
+//!    replaced by `.mds-tmp-RANDOM.tmp`, and that count is part of the golden too.
+//!    Both counts are leaked paths, and `no_golden_records_a_leaked_path` holds them at
+//!    zero in every golden, so a leak cannot come back by regenerating the goldens alone;
 //! 3. on Windows only, path separators are rewritten to `/` (a doubled, escaped
 //!    backslash first, then a single one).
 //!
@@ -1286,7 +1288,7 @@ pub const TMP_TOKEN: &str = "$TMP";
 const TMP_NAME_PREFIX: &str = ".mds-tmp-";
 const TMP_NAME_SUFFIX: &str = ".tmp";
 const TMP_NAME_RANDOM_LEN: usize = 6;
-const TMP_NAME_REPLACEMENT: &str = ".mds-tmp-RANDOM.tmp";
+pub const TMP_NAME_REPLACEMENT: &str = ".mds-tmp-RANDOM.tmp";
 
 /// Rewrites the spellings of one temporary directory.
 pub struct Normalizer {

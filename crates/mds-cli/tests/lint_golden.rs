@@ -363,6 +363,86 @@ fn golden_storage_stays_within_bounds() {
     );
 }
 
+/// What a golden's counts and stored strings record of a leaked path: a temporary
+/// directory replaced by `$TMP`, an atomic-write temp name replaced by
+/// `.mds-tmp-RANDOM.tmp`, or either replacement in a stored string. Empty when nothing.
+fn leaked_paths(tmp_paths: u32, tmp_names: u32, strings: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    if tmp_paths != 0 {
+        found.push(format!(
+            "{tmp_paths} temporary-directory path(s) replaced by {}",
+            harness::TMP_TOKEN
+        ));
+    }
+    if tmp_names != 0 {
+        found.push(format!(
+            "{tmp_names} atomic-write temp name(s) replaced by {}",
+            harness::TMP_NAME_REPLACEMENT
+        ));
+    }
+    for text in strings {
+        for token in [harness::TMP_TOKEN, harness::TMP_NAME_REPLACEMENT] {
+            if text.contains(token) {
+                found.push(format!("a stored string holds {token}: {text:?}"));
+            }
+        }
+    }
+    found
+}
+
+/// No golden records a leaked path. A cell's `$TMP` and temp-name counts are part of its
+/// golden, so a leak that came back and was regenerated into the goldens would otherwise
+/// pass as the new truth; with this test it needs an edit here as well.
+///
+/// Controls: a run's stream naming a real temporary directory, and one naming an
+/// atomic-write temp file, normalized as every cell's streams are, are each reported;
+/// the same stream naming neither is not.
+#[test]
+fn no_golden_records_a_leaked_path() {
+    let dir = harness::fixture_dir();
+    let normalizer = Normalizer::for_dir(dir.path());
+    let leaked = format!(
+        "error writing {}: denied\n",
+        dir.path().join("x.mds").display()
+    );
+    let (text, paths, names) = normalizer.apply(&leaked);
+    assert_eq!(
+        (paths, names),
+        (1, 0),
+        "control: the tempdir is counted in {text:?}"
+    );
+    let found = leaked_paths(paths, names, &[&text]);
+    assert_eq!(
+        found.len(),
+        2,
+        "control: the count and the token: {found:?}"
+    );
+    let (text, paths, names) = normalizer.apply("error writing d/.mds-tmp-Ab3dE9.tmp: denied\n");
+    let found = leaked_paths(paths, names, &[&text]);
+    assert_eq!(found.len(), 2, "control: the count and the name: {found:?}");
+    let (text, paths, names) = normalizer.apply("error writing d/x.mds: denied\n");
+    assert_eq!(leaked_paths(paths, names, &[&text]), Vec::<String>::new());
+
+    let mut leaks = Vec::new();
+    for (i, g) in single::GOLDENS.iter().enumerate() {
+        let found = leaked_paths(g.tmp_paths, g.tmp_names, &harness::golden_strings(g));
+        leaks.extend(
+            found
+                .into_iter()
+                .map(|f| format!("single.rs golden {i}: {f}")),
+        );
+    }
+    for (i, g) in dir::GOLDENS.iter().enumerate() {
+        let found = leaked_paths(g.tmp_paths, g.tmp_names, &harness::dir_golden_strings(g));
+        leaks.extend(found.into_iter().map(|f| format!("dir.rs golden {i}: {f}")));
+    }
+    assert!(
+        leaks.is_empty(),
+        "a golden records a leaked path; fix the leak, never regenerate it into the data:\n{}",
+        leaks.join("\n")
+    );
+}
+
 // ── Comparator and normalizer positive controls ──────────────────────────────
 
 /// XOR the lowest bit of the ASCII byte at `at` (the result stays ASCII, so UTF-8).
