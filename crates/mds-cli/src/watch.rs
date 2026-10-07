@@ -812,6 +812,7 @@ enum EmptyHold {
 }
 
 /// What a rebuild does, as [`EmptyHold::on_rebuild`] decides it.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HoldVerdict {
     /// Compile: no watched file is emptied, or the hold's deadline has come.

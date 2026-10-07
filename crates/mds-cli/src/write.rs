@@ -417,6 +417,7 @@ impl Inputs {
     /// These inputs and the file `find` finds from `from`. The search is made only by a
     /// write that meets a file at its target, and then at that moment, after the files
     /// named: where nothing is, nothing is replaced, so nothing needs to be found.
+    #[must_use = "the search is part of the inputs only in the value returned"]
     pub(crate) fn and_found_from(self, from: &Path, find: fn(&Path) -> Option<PathBuf>) -> Self {
         Self {
             found: Some(Found {
