@@ -3886,8 +3886,8 @@ impl DirWatchState {
     /// successful compile recorded (an empty one when there has never been one).
     ///
     /// Discarding the dep set here is what made a cross-root edit unrecoverable
-    /// (#321). `process_dir_batch_incremental` recomputes `external_dep_dirs` from
-    /// `forward_deps` after every batch, so clearing an importer's deps on a failed
+    /// (#321). Every batch recomputes `external_dep_dirs` from `forward_deps`
+    /// ([`Self::dep_dirs_outside`]), so clearing an importer's deps on a failed
     /// compile also dropped the external directory those deps live in. The next
     /// event for that directory was then rejected by `handle_fs_event_dir` as
     /// "neither under root nor in a known external dep dir", and the liveness probe
@@ -3905,6 +3905,19 @@ impl DirWatchState {
     fn record_error(&mut self, src: &Path) {
         self.errored.insert(src.to_path_buf());
         self.forward_deps.entry(src.to_path_buf()).or_default();
+    }
+
+    /// The directories outside `root` that the recorded dependencies live in: what
+    /// `external_dep_dirs` holds once a batch is done, so a directory no source imports
+    /// from any more leaves it (#257).
+    fn dep_dirs_outside(&self, root: &Path) -> BTreeSet<PathBuf> {
+        self.forward_deps
+            .values()
+            .flatten()
+            .filter_map(|dep| dep.parent())
+            .filter(|parent| !parent.starts_with(root))
+            .map(Path::to_path_buf)
+            .collect()
     }
 
     /// Every path whose **content** the watcher must react to: all known sources
@@ -5540,7 +5553,9 @@ fn names_a_source(root: &Path, path: &Path) -> bool {
 /// errored dependency is no source, and is left to its importers the same way.
 ///
 /// Recomputes the entire forward-deps graph, external-dep-dirs, and errored set
-/// from scratch (prunes stale entries left over from deleted sources).
+/// from scratch (prunes stale entries left over from deleted sources) — but a source whose
+/// compile fails, or is held, keeps the dependencies its last compile reported, as an
+/// incremental batch keeps them (#380).
 ///
 /// Also runs the same deletion cleanup that `process_dir_batch_incremental` does so
 /// that a `.mds` deleted in the same debounce window as a vars edit does not orphan its
@@ -5581,11 +5596,13 @@ fn process_dir_batch_vars_changed(
         state.retire_deleted(del_src, quiet);
     }
 
-    // Snapshot the old maps, clear them so compile_one_source's record_success
-    // fills fresh copies (ensures stale entries from deleted sources are pruned).
-    state.forward_deps.clear();
+    // The graph is built again by the compiles below, so the records of a path that is no
+    // source any more go. A source whose compile fails, or is held because a file it read
+    // was emptied since the batch looked, reports no dependencies of its own: it keeps the
+    // ones its last compile reported (#380), so the directory of one outside the root stays
+    // watched, and a failed compile's look for a file emptied since takes them in.
+    let mut previous = std::mem::take(&mut state.forward_deps);
     state.errored.clear();
-    state.external_dep_dirs.clear();
 
     for src in &all_sources {
         // A source gone since the pass above is a deleted source too (#160).
@@ -5593,10 +5610,15 @@ fn process_dir_batch_vars_changed(
             state.retire_deleted(src, quiet);
             continue;
         }
+        // A compile that succeeds records the dependencies it reported in their place.
+        if let Some(deps) = previous.remove(src) {
+            state.forward_deps.insert(src.clone(), deps);
+        }
         if compile_one_source(src, watch_root, output_base, runtime_vars, quiet, state) {
             any_changed = true;
         }
     }
+    state.external_dep_dirs = state.dep_dirs_outside(root);
 
     // Keep the sources still there. One gone since its compile is a deleted source as
     // well, retired by the same rule rather than dropped with its outputs left (#160).
@@ -5747,17 +5769,11 @@ fn process_dir_batch_incremental(
     // forever. Recompute from the current `forward_deps` after each batch so abandoned
     // external dirs are unwatched and removed (applies the reconcile rule / mirrors the prune
     // already done in `process_dir_batch_vars_changed`).
-    let live_ext_dirs: BTreeSet<PathBuf> = state
-        .forward_deps
-        .values()
-        .flatten()
-        .filter_map(|dep| dep.parent().map(Path::to_path_buf))
-        .filter(|parent| !parent.starts_with(root))
-        .collect();
+    //
     // The watcher is not in scope here: every rebuild is followed by
     // `arm_external_dirs_after_rebuild`, which unwatches the dirs no longer live — under
     // `--poll-interval 0` too, where no liveness tick runs (#257).
-    state.external_dep_dirs = live_ext_dirs;
+    state.external_dep_dirs = state.dep_dirs_outside(root);
     any_changed
 }
 
@@ -9081,6 +9097,231 @@ mod tests {
              nothing else is unwatched or watched"
         );
         assert_eq!(liveness.armed_dirs, BTreeSet::from([vars_dir, kept]));
+    }
+
+    /// A directory watch of `<base>/root`, whose `page.mds` imports `<base>/shared/_x.mds`
+    /// from beside the root and reads `v` from `--vars <base>/vars.json`, after a first
+    /// batch compiled it ([`cross_root_page`]).
+    struct CrossRootPage {
+        /// The temporary base and out-dir, removed when dropped.
+        dirs: (tempfile::TempDir, tempfile::TempDir),
+        base: PathBuf,
+        out: PathBuf,
+        page: PathBuf,
+        module: PathBuf,
+        shared: PathBuf,
+        vars: PathBuf,
+        ctx: DirWatchCtx,
+        state: DirWatchState,
+    }
+
+    /// A [`CrossRootPage`], its first batch run: control — it tracks the dependency outside
+    /// the root, and knows the directory that dependency is in.
+    fn cross_root_page() -> CrossRootPage {
+        let (base_dir, base) = canonical_tempdir();
+        let (out_dir, out) = canonical_tempdir();
+        let (root, shared) = (base.join("root"), base.join("shared"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        // The project's root marker, so the source may import from beside the root.
+        std::fs::write(base.join(".mdsroot"), "").unwrap();
+        let (page, module) = (root.join("page.mds"), shared.join("_x.mds"));
+        std::fs::write(
+            &page,
+            "@import \"../shared/_x.mds\" as x\n{{x.greet()}} {{v}}\n",
+        )
+        .unwrap();
+        std::fs::write(&module, "@define greet():\nX\n@end\n\n@export greet\n").unwrap();
+        let vars = base.join("vars.json");
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+        state.known_files.insert(page.clone());
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        assert!(
+            state.tracked_set().contains(&module) && state.external_dep_dirs.contains(&shared),
+            "control: the first batch tracks the dependency outside the root; out/page.md: {:?}",
+            std::fs::read_to_string(out.join("page.md")).ok()
+        );
+        CrossRootPage {
+            dirs: (base_dir, out_dir),
+            base,
+            out,
+            page,
+            module,
+            shared,
+            vars,
+            ctx,
+            state,
+        }
+    }
+
+    /// #257: a batch after which no source imports from a directory outside the root forgets
+    /// that directory, and the rebuild unwatches it — a batch of the source's edit, and one
+    /// whose `--vars` file changed with it. The vars file's directory, held for that file,
+    /// stays watched.
+    #[test]
+    fn a_batch_forgets_a_directory_no_source_imports_any_more() {
+        for vars_changed in [false, true] {
+            let CrossRootPage {
+                dirs: _dirs,
+                base,
+                out,
+                page,
+                module,
+                shared,
+                vars,
+                ctx,
+                mut state,
+            } = cross_root_page();
+
+            // The import edited away, and the vars file with it or not.
+            std::fs::write(&page, "Page {{v}}\n").unwrap();
+            if vars_changed {
+                std::fs::write(&vars, r#"{"v": "two"}"#).unwrap();
+            }
+            let batch = BTreeSet::from([page.clone()]);
+            rebuild_dir_batch(&ctx, &batch, vars_changed, &mut state, None);
+            let written = std::fs::read_to_string(out.join("page.md")).ok();
+            assert!(
+                written
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("Page ")),
+                "vars changed: {vars_changed}: control: the source compiled without the \
+                 import; out/page.md: {written:?}"
+            );
+            assert!(
+                !state.tracked_set().contains(&module)
+                    && !state.external_dep_dirs.contains(&shared),
+                "vars changed: {vars_changed}: the directory no source imports from is \
+                 forgotten; known: {:?}",
+                state.external_dep_dirs
+            );
+
+            let mut liveness = LivenessState {
+                armed_dirs: BTreeSet::from([base.clone(), shared.clone()]),
+                ..idle_liveness()
+            };
+            let mut watcher = RecordingWatcher::default();
+            arm_external_dirs_after_rebuild(&ctx, &mut watcher, &mut liveness, &state);
+            assert_eq!(
+                watcher.calls,
+                [WatchCall::Unwatch(shared)],
+                "vars changed: {vars_changed}: the rebuild unwatches it, and leaves the vars \
+                 file's directory watched"
+            );
+        }
+    }
+
+    /// #380: a batch whose `--vars` file changed keeps the dependencies the last compile of
+    /// a source reported when the source's compile fails, or when it is held because a file
+    /// it read was emptied since the batch looked — neither reports dependencies of its own.
+    /// The dependency outside the root stays tracked and its directory known, so the
+    /// rebuild leaves it watched and the edit that fixes the source still reaches a batch;
+    /// and a failed compile's look for a file emptied since the batch looked takes that
+    /// dependency in, so a compile that failed on it emptied is held, not reported. The
+    /// files are emptied after the batch's look: the batch is run from past it, as
+    /// `rebuild_dir_batch` runs it once the look lets it.
+    #[test]
+    fn a_vars_change_keeps_the_dependencies_of_a_source_that_failed_or_was_held() {
+        // The case, the vars file the batch reads, and whether the source or its
+        // dependency is emptied since the batch looked.
+        let cases = [
+            ("a failed compile", r#"{"w": "two"}"#, false, false),
+            (
+                "a compile held on its source",
+                r#"{"v": "two"}"#,
+                true,
+                false,
+            ),
+            (
+                "a compile failed on its dependency",
+                r#"{"v": "two"}"#,
+                false,
+                true,
+            ),
+        ];
+        for (label, vars_text, empties_source, empties_dependency) in cases {
+            let (_gone_dir, gone) = canonical_tempdir();
+            let CrossRootPage {
+                dirs: _dirs,
+                base,
+                out: _,
+                page,
+                module,
+                shared,
+                vars,
+                ctx,
+                mut state,
+            } = cross_root_page();
+
+            std::fs::write(&vars, vars_text).unwrap();
+            if empties_source {
+                std::fs::write(&page, "").unwrap();
+            }
+            if empties_dependency {
+                std::fs::write(&module, "").unwrap();
+            }
+            let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+                vars: Some(vars.clone()),
+                set_vars: Vec::new(),
+                set_string_vars: Vec::new(),
+            })
+            .unwrap()
+            .vars;
+            process_dir_batch(
+                &BTreeSet::new(),
+                true,
+                &ctx.root,
+                &ctx.output_base,
+                &runtime_vars,
+                true,
+                &mut state,
+            );
+
+            let (held, errored) = (
+                state.held.paths.contains(&page),
+                state.errored.contains(&page),
+            );
+            if empties_source || empties_dependency {
+                assert!(
+                    held && !errored,
+                    "{label}: the source is held, not reported; held: {:?}, errored: {:?}",
+                    state.held,
+                    state.errored
+                );
+            } else {
+                assert!(
+                    errored && !held,
+                    "{label}: control: the compile failed; errored: {:?}",
+                    state.errored
+                );
+            }
+            assert!(
+                state.tracked_set().contains(&module),
+                "{label}: the dependency outside the root is still tracked; tracked: {:?}",
+                state.tracked_set()
+            );
+            assert!(
+                state.external_dep_dirs.contains(&shared),
+                "{label}: its directory is still known; {:?}",
+                state.external_dep_dirs
+            );
+
+            // The rebuild's arming: the watcher holds the vars file's directory, the
+            // dependency's, and one no source imports.
+            let mut liveness = LivenessState {
+                armed_dirs: BTreeSet::from([base.clone(), shared.clone(), gone.clone()]),
+                ..idle_liveness()
+            };
+            let mut watcher = RecordingWatcher::default();
+            arm_external_dirs_after_rebuild(&ctx, &mut watcher, &mut liveness, &state);
+            assert_eq!(
+                watcher.calls,
+                [WatchCall::Unwatch(gone.clone())],
+                "{label}: the directory nothing imports is unwatched — the positive control — \
+                 and the dependency's stays watched"
+            );
+        }
     }
 
     /// A watch that fails, as notify reports one the OS refused.
