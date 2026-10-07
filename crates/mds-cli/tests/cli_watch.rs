@@ -10097,6 +10097,10 @@ fn watch_dir_vars_duplicate_warning_comes_once_before_a_batch_s_recompiled_lines
         "control: the startup writes both outputs; stderr: {}",
         tap.text()
     );
+    // A late event for a fixture write made before the spawn, rebuilt after the edit
+    // below, would rebuild a.mds alone with the edited vars file: a batch of its own,
+    // with a warning of its own.
+    settle_queued_events(&tap, &notes.join("barrier.mds"), "settle");
 
     write_atomic(&base.path().join("vars.json"), r#"{"x": 3, "x": 4}"#);
     assert!(
