@@ -1121,9 +1121,12 @@ fn watch_live(
 }
 
 /// Makes a directory writable again on drop, so the scratch directory can go.
+///
+/// Unix-only: it sets unix mode bits, for the read-only fixtures, which are unix's.
 #[cfg(unix)]
 struct Writable(PathBuf);
 
+// Unix-only: as `Writable` is.
 #[cfg(unix)]
 impl Drop for Writable {
     fn drop(&mut self) {

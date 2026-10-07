@@ -3048,6 +3048,10 @@ mod working_directory {
 /// `<stem>.md.map` (257 bytes) cannot exist, so there is no stale map to look at and the
 /// build exits 0. Control: with a 248-byte stem the sidecar's name fits (255 bytes), and
 /// the map a `--source-map` build wrote is removed by the next build without it.
+///
+/// Unix-only: it is sized to the 255-byte name limit of unix file systems; on Windows a
+/// name too long is pinned by the `write.rs` unit test
+/// `a_name_too_long_for_the_file_system_is_nothing_to_remove`.
 #[cfg(unix)]
 #[test]
 fn a_stale_map_name_too_long_for_the_file_system_is_no_file() {

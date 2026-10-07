@@ -106,6 +106,9 @@ fn refused(component: &str) -> String {
 /// in the out-dir, is written; the link itself is left in place; and a file written
 /// through the link by hand does show up in the directory it points at, so the check
 /// that nothing did can see one.
+///
+/// Unix-only: it makes its link with `std::os::unix::fs::symlink`; its Windows twin is
+/// [`a_directory_symlink_or_junction_below_the_out_dir_is_refused`].
 #[cfg(unix)]
 #[test]
 fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
@@ -150,6 +153,8 @@ fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
 /// `--out-dir`, as the directory of `-o`, or as a file argument's `--out-dir`, is followed
 /// and written through. (`mds.json`'s `build.output_dir` is no path the user typed: a
 /// symlink there is refused, below.)
+///
+/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
 #[cfg(unix)]
 #[test]
 fn a_symlinked_anchor_the_user_named_is_still_followed() {
@@ -196,8 +201,8 @@ fn a_symlinked_anchor_the_user_named_is_still_followed() {
 /// An `-o` that ends in a separator, or in a separator and a `.`, names a directory: it is
 /// refused as one (`mds::io`, exit 2), and no file of the name before that ending is
 /// created, nor an existing one replaced. Control: the same directory with a file name
-/// below it is written.
-#[cfg(unix)]
+/// below it is written. Each path is typed in the platform's separator, as `-o` is
+/// printed as typed.
 #[test]
 fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
     let dir = scratch();
@@ -205,11 +210,11 @@ fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
     put(root, "page.mds", "Hello\n");
     put(root, "other.md", "Other\n");
 
-    for typed in ["newdir/", "newdir/.", "other.md/"] {
-        let out = run(root, &["build", "page.mds", "-o", typed]);
+    for typed in ["newdir/", "newdir/.", "other.md/"].map(native) {
+        let out = run(root, &["build", "page.mds", "-o", typed.as_str()]);
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{typed}: stderr: {stderr}");
-        let refusal = format!("cannot write {}: is a directory", native(typed));
+        let refusal = format!("cannot write {typed}: is a directory");
         assert!(
             stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refusal)),
             "{typed}: refused as a directory; stderr: {stderr}"
@@ -225,7 +230,10 @@ fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
         "other.md was left alone"
     );
     // The entry itself, so spelled, is refused before any write is attempted.
-    let out = run(root, &["build", "page.mds", "-o", "page.mds/"]);
+    let out = run(
+        root,
+        &["build", "page.mds", "-o", native("page.mds/").as_str()],
+    );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", text(&out.stderr));
     assert_eq!(
         read(&root.join("page.mds")),
@@ -234,7 +242,10 @@ fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
     );
 
     // Control: the same route writes a file below that directory.
-    let out = run(root, &["build", "page.mds", "-o", "newdir/page.md"]);
+    let out = run(
+        root,
+        &["build", "page.mds", "-o", native("newdir/page.md").as_str()],
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", text(&out.stderr));
     assert_eq!(read(&root.join(native("newdir/page.md"))), "Hello\n");
 }
@@ -242,6 +253,8 @@ fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
 /// A FIFO at the output path is no file a write replaces: it is refused (`mds::io`, exit
 /// 2) without being opened — the run does not block on it — and left in place. Control:
 /// a regular file at the same path is replaced.
+///
+/// Unix-only: Windows has no FIFO.
 #[cfg(unix)]
 #[test]
 fn a_fifo_at_the_output_path_is_refused_and_left_in_place() {
@@ -310,6 +323,8 @@ fn a_fifo_at_the_output_path_is_refused_and_left_in_place() {
 /// symlink committed at `dist` is refused — `mds build` of a file and of a directory, and
 /// `mds watch` of a directory — and the directory it points at is left alone. The
 /// refusal names the link below the directory `mds.json` was reached by, as an output is.
+///
+/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
 #[cfg(unix)]
 #[test]
 fn a_symlink_committed_as_build_output_dir_is_refused() {
@@ -416,6 +431,8 @@ fn a_build_output_dir_must_be_relative() {
 
 /// `mds watch` refuses a symlink that replaced a directory below `--out-dir` when it
 /// rebuilds into it. Control: the startup write landed in that directory before the swap.
+///
+/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
 #[cfg(unix)]
 #[test]
 fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
@@ -465,6 +482,8 @@ fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
 /// removal otherwise asks of a file (#160). Controls: earlier in the same session, a
 /// deleted source's output below a real directory is removed; and the link is left in
 /// place.
+///
+/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
 #[cfg(unix)]
 #[test]
 fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
@@ -525,6 +544,8 @@ fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
 /// refused as such a write is, naming the output as typed, and the file of that name
 /// where the link leads is left as it was. Control: earlier in the same session, a
 /// deleted source's output in the out-dir as it started is removed.
+///
+/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
 #[cfg(unix)]
 #[test]
 fn watch_never_removes_an_output_through_an_out_dir_replaced_by_a_symlink() {
@@ -584,6 +605,8 @@ fn watch_never_removes_an_output_through_an_out_dir_replaced_by_a_symlink() {
 
 /// A pipe filled to the brim, and its ends: a child given the write end as a stream
 /// blocks on its first write to it, until the read end is drained.
+///
+/// Unix-only: it fills the pipe through `fcntl`'s `O_NONBLOCK`, which Windows lacks.
 #[cfg(unix)]
 fn a_full_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
     use std::io::Write as _;
@@ -622,6 +645,8 @@ fn a_full_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
 /// Sources for a directory rewrite: the first file, the second one (in `sub/`), and the
 /// file of the same name in the directory the link will point at — each as written, and
 /// the first as rewritten.
+///
+/// Unix-only: so are the tests that use it.
 #[cfg(unix)]
 struct Rewrite {
     first: &'static str,
@@ -635,6 +660,8 @@ struct Rewrite {
 /// its stderr is a full pipe, so the status line it prints after the first rewrite holds
 /// it there until the swap is done. Returns the scratch directory, the exit code and
 /// stderr.
+///
+/// Unix-only: it holds the run on [`a_full_pipe`] and links with the unix call.
 #[cfg(unix)]
 fn rewrite_with_sub_swapped(
     args: &[&str],
@@ -701,6 +728,8 @@ fn rewrite_with_sub_swapped(
 /// What a rewrite with `src/sub` swapped for a link must come to: refused by the path the
 /// user knows the link by, nothing written through it, and nothing written into the
 /// directory it replaced either.
+///
+/// Unix-only: so are the tests that call it.
 #[cfg(unix)]
 fn assert_refused_after_the_swap(dir: &Path, code: Option<i32>, stderr: &str, files: &Rewrite) {
     assert_eq!(
@@ -722,6 +751,8 @@ fn assert_refused_after_the_swap(dir: &Path, code: Option<i32>, stderr: &str, fi
 
 /// `mds fmt <dir>` refuses to rewrite a file below a directory that was swapped for a
 /// symlink after the walk found it. Control: the file before it was rewritten.
+///
+/// Unix-only: it runs [`rewrite_with_sub_swapped`].
 #[cfg(unix)]
 #[test]
 fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
@@ -737,6 +768,8 @@ fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
 
 /// `mds lint --fix <dir>` refuses to rewrite a file below a directory that was swapped for
 /// a symlink after the walk found it. Control: the file before it was fixed.
+///
+/// Unix-only: it runs [`rewrite_with_sub_swapped`].
 #[cfg(unix)]
 #[test]
 fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
@@ -895,6 +928,9 @@ fn a_rewrite_refuses_a_file_edited_after_it_was_read() {
 /// write the file it read over another (#160): with `src` moved away and `other` put in
 /// its place — as a directory, or as a symlink to it — `other/a.mds` is left as it was,
 /// and the file read, in the directory it was read in, is the one rewritten (control).
+///
+/// Unix-only: it expects the rewrite in the directory the file was read in, wherever that
+/// went; a Windows rewrite goes by path, the residual spec.md names.
 #[cfg(unix)]
 #[test]
 fn a_rewrite_never_writes_over_a_file_it_did_not_read() {
@@ -1121,6 +1157,8 @@ fn watch_never_writes_over_a_file_that_appears_while_a_change_of_kind_is_written
 
 /// Set `dir`'s mode to `mode`, and say whether it now refuses a listing: a run as root,
 /// whom no mode refuses, cannot show what the mode does, and its test is skipped.
+///
+/// Unix-only: it sets unix mode bits.
 #[cfg(unix)]
 fn unlistable(dir: &Path, mode: u32) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1130,6 +1168,8 @@ fn unlistable(dir: &Path, mode: u32) -> bool {
 }
 
 /// Make `dir` listable and writable again, so its scratch directory can be removed.
+///
+/// Unix-only: it sets unix mode bits.
 #[cfg(unix)]
 fn restore(dir: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1144,6 +1184,8 @@ fn restore(dir: &Path) {
 /// each to read, which such a directory refuses: `cannot write box/x.md: Permission
 /// denied (os error 13)`, `mds::io`, exit 2, and nothing written. Control: once the box
 /// can be listed, the same build writes it everywhere.
+///
+/// Unix-only: a directory that takes a write but refuses a listing is a unix mode (`-wx`).
 #[cfg(unix)]
 #[test]
 fn a_directory_that_cannot_be_listed_takes_an_output_on_linux_alone() {
@@ -1213,6 +1255,8 @@ fn a_directory_that_cannot_be_listed_takes_an_output_on_linux_alone() {
 /// none: the run counts the file as what it holds — formatted, clean — and exits 2 for the
 /// failed sync. Control: the same run with `src` left alone syncs it, shows the status
 /// line, exit 0.
+///
+/// Unix-only: it makes `src` unlistable with unix mode bits (`-wx`).
 #[cfg(unix)]
 #[test]
 fn a_rewrite_whose_directory_cannot_be_synced_is_reported_written() {
@@ -1452,6 +1496,8 @@ fn probe_a_500_file_directory_watch_startup() {
 /// symlink to `victim`, `mds build src --out-dir out` runs repeatedly, and every run whose
 /// output landed in `victim` is counted. Prints the count; for this crate's own binary
 /// there must be none (#160).
+///
+/// Unix-only: it races the unix walk, which never follows a link; Windows' goes by path.
 #[cfg(unix)]
 #[test]
 #[ignore = "probe: run with --run-ignored only --no-capture"]

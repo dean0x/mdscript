@@ -939,6 +939,10 @@ fn dir_build_out_dir_partial_removes_nothing() {
 /// `out/<stem>.json` (256 bytes) cannot exist, so the build has nothing to look at there
 /// and exits 0. Control: with a 250-byte stem, `<stem>.json` fits, and the stale `.json`
 /// the first build wrote is removed once the source compiles to Markdown.
+///
+/// Unix-only: it is sized to the 255-byte name limit of unix file systems; on Windows a
+/// name too long is pinned by the `write.rs` unit test
+/// `a_name_too_long_for_the_file_system_is_nothing_to_remove`.
 #[cfg(unix)]
 #[test]
 fn dir_build_out_dir_a_stale_name_too_long_for_the_file_system_is_no_file() {
