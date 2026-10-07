@@ -534,6 +534,45 @@ fn watch_edit_entry_updates_output() {
     drop(child);
 }
 
+// ── An output another program holds open is replaced (#160) ──────────────────
+
+/// A rebuild replaces an output that another program holds open as std opens a file —
+/// an editor, a viewer, a virus scanner, the reads of a test (#160). On Windows the write
+/// moved its temporary file over the output with a `MoveFileExW` alone, which fails while
+/// any handle is open on the target, so every rebuild failed with os error 5 for as long
+/// as the output was held, and nothing retried until the next edit. A rename on Unix
+/// replaces an open file, so there this test passes either way.
+#[test]
+fn watch_replaces_an_output_another_program_holds_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    std::fs::write(&src, "---\nname: Alice\n---\nHello {{name}}!\n").unwrap();
+    let out = dir.path().join("hello.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out, "Hello Alice!", TIMEOUT),
+        "control: the startup compile writes the output; stderr: {}",
+        stderr_tap.text()
+    );
+
+    // Held open across the rebuild, as another program would hold it.
+    let held = std::fs::File::open(&out).unwrap();
+    write_atomic(&src, "---\nname: Bob\n---\nHello {{name}}!\n");
+    assert!(
+        wait_for_file_contains(&out, "Hello Bob!", TIMEOUT),
+        "the rebuild must replace the output held open; stderr: {}",
+        stderr_tap.text()
+    );
+
+    drop(held);
+    drop(child);
+}
+
 // ── T-I3: Edit imported dep → entry output updates ─────────────────────────
 
 #[test]

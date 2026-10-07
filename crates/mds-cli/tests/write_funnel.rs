@@ -19,8 +19,9 @@
 //! proven. A raw `std::fs::write` — or a raw `create_dir_all`, `create_dir`, `mkdirat`,
 //! `openat`, `rename`, `renameat`, `renameat_with`, `linkat`, `unlinkat`, path-based
 //! `fs::set_permissions`, `remove_file`, `fs::copy`, `hard_link`, `remove_dir` or
-//! `remove_dir_all`, or tempfile's `tempfile_in`, `persist` or `persist_noclobber`, or a
-//! symlink made with `fs::symlink`, `symlinkat`, `soft_link`, `symlink_file` or
+//! `remove_dir_all`, or tempfile's `tempfile_in`, `make_in`, `persist` or
+//! `persist_noclobber`, or a symlink made with `fs::symlink`, `symlinkat`, `soft_link`,
+//! `symlink_file` or
 //! `symlink_dir` — at any *one* remaining site
 //! silently forfeits all of that for the artifact it touches, and "did we remember every
 //! write site?" is an unbounded search that three reviewers can each answer differently.
@@ -31,7 +32,9 @@
 //!
 //! It also pins the tail of the primitive itself ([`primitive_pin_violations`]): the unix
 //! arm syncs the temporary file and then its directory, renames with `renameat` and
-//! restores a mode with `fchmod`; the Windows arm syncs the temporary file and persists it.
+//! restores a mode with `fchmod`; the Windows arm syncs the temporary file and renames it
+//! with std's `fs::rename` — write.rs's one rename by path — which replaces a file another
+//! program holds open, where tempfile's `persist` fails (#160).
 //!
 //! # Scope and lexical limits (what this guard does NOT see)
 //!
@@ -83,8 +86,9 @@ use std::path::{Path, PathBuf};
 /// removes a file by path, through any symlink on the way; `fs::copy(` writes a file by
 /// path, `hard_link(` gives one a second name by path, and `remove_dir(` and
 /// `remove_dir_all(` remove a directory by path, the second with everything below it;
-/// tempfile's `tempfile_in(` creates a temporary file, which `.persist(` moves over a
-/// file by path and `persist_noclobber(` moves to a name no file has. `fs::symlink(` —
+/// tempfile's `tempfile_in(` creates a temporary file, and `make_in(` one the caller's own
+/// open creates, which `.persist(` moves over a file by path and `persist_noclobber(`
+/// moves to a name no file has. `fs::symlink(` —
 /// `std::os::unix::fs::symlink(` and rustix's alike — makes a symbolic link by path,
 /// `symlinkat(` one relative to a descriptor, std's deprecated `soft_link(` one by path,
 /// and on Windows `symlink_file(` and `symlink_dir(` a link to a file or a directory; the
@@ -115,6 +119,7 @@ const NEEDLES: &[&str] = &[
     "remove_dir(",
     "remove_dir_all(",
     "tempfile_in(",
+    "make_in(",
     ".persist(",
     "persist_noclobber(",
     "fs::symlink(",
@@ -236,17 +241,27 @@ const ALLOWED_RAW_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "write.rs",
-        "tempfile_in(",
+        "make_in(",
         1,
-        "the primitive's Windows arm: the temporary file, created new beside the target in \
-         the directory the walk checked (#160)",
+        "the primitive's Windows arm: the temporary file, given a name of tempfile's beside \
+         the target in the directory the walk checked (#160)",
     ),
     (
         "write.rs",
-        ".persist(",
+        ".create_new(",
         1,
-        "the primitive's Windows arm: the temporary file moved over the target by path, \
-         once the target is checked, when the commit may replace it (#160)",
+        "the primitive's Windows arm: the temporary file `make_in` names, created new — a \
+         plain file, never one tempfile marks temporary, which a rename by std would leave \
+         marked (#160)",
+    ),
+    (
+        "write.rs",
+        "fs::rename(",
+        1,
+        "the primitive's Windows arm: the temporary file renamed over the target by path, \
+         once the target is checked, when the commit may replace it — std's rename, which \
+         replaces a file another program holds open where tempfile's `persist` fails; the \
+         primitive pin holds it in `mod windows` (#160)",
     ),
     (
         "write.rs",
@@ -474,6 +489,7 @@ fn the_guard_flags_a_planted_raw_write() {
         "fn f(p: &Path) { let _ = std::fs::remove_dir_all(p); }",
         "fn f(d: &Path) { let _ = tempfile::Builder::new().tempfile_in(d); }",
         "fn f(d: &Path) { let _ = tempfile::tempfile_in(d); }",
+        "fn f(d: &Path) { let _ = tempfile::Builder::new().make_in(d, |p| File::open(p)); }",
         "fn f(t: NamedTempFile, p: &Path) { let _ = t.persist(p); }",
         "fn f(t: NamedTempFile, p: &Path) { let _ = t.persist_noclobber(p); }",
         // A symlink made by path or relative to a descriptor, through std or rustix, on
@@ -551,12 +567,13 @@ fn a_licence_scoped_to_a_module_covers_that_module_alone() {
 
 /// The primitive's tail, pinned on synthetic sources: a unix arm that syncs the temporary
 /// file and its directory, renames with `renameat` and restores a mode with `fchmod`, and
-/// a Windows arm that syncs the temporary file and persists it, pass; each one dropped,
-/// alone, fails.
+/// a Windows arm that syncs the temporary file and renames it with std's `fs::rename`,
+/// pass; each one dropped, alone, fails, and so does a Windows arm that moves the file
+/// with tempfile's `persist` in place of that rename, or renames it twice.
 #[test]
 fn the_primitive_pins_flag_a_tail_that_stopped_syncing() {
     let unix = |body: &str| {
-        format!("mod unix {{ fn w() {{ {body} }} }}\nmod windows {{ fn w() {{ t.as_file().sync_all(); t.persist(p); }} }}")
+        format!("mod unix {{ fn w() {{ {body} }} }}\nmod windows {{ fn w() {{ t.as_file().sync_all(); std::fs::rename(t.path(), p); }} }}")
     };
     let complete =
         unix("fs::fchmod(&f, m); f.sync_all(); fs::renameat(d, t, d, n); dir.sync_all();");
@@ -588,11 +605,26 @@ fn the_primitive_pins_flag_a_tail_that_stopped_syncing() {
         1,
         "the Windows sync"
     );
-    let windows = complete.replace("t.persist(p);", "");
+    let windows = complete.replace("std::fs::rename(t.path(), p);", "");
     assert_eq!(
         primitive_pin_violations(&windows).len(),
         1,
-        "the Windows persist"
+        "the Windows rename"
+    );
+    let windows = complete.replace("std::fs::rename(t.path(), p);", "t.persist(p);");
+    assert_eq!(
+        primitive_pin_violations(&windows).len(),
+        1,
+        "tempfile's persist in place of the Windows rename"
+    );
+    let windows = complete.replace(
+        "std::fs::rename(t.path(), p);",
+        "std::fs::rename(t.path(), p); std::fs::rename(p, q);",
+    );
+    assert_eq!(
+        primitive_pin_violations(&windows).len(),
+        1,
+        "a second Windows rename"
     );
     assert_eq!(
         primitive_pin_violations("fn f() {}").len(),
@@ -605,7 +637,10 @@ fn the_primitive_pins_flag_a_tail_that_stopped_syncing() {
 /// pin missed. The unix arm (`mod unix`) must call `.sync_all()` exactly twice — the
 /// temporary file before the rename and its directory after it, the durable tier's two
 /// syncs — rename with `renameat(` and restore a replaced file's mode with `fchmod(`;
-/// the Windows arm (`mod windows`) must call `.sync_all()` exactly once and `.persist(`.
+/// the Windows arm (`mod windows`) must call `.sync_all()` exactly once and `fs::rename(`
+/// exactly once — std's rename, never tempfile's `persist`, which fails over a file
+/// another program holds open (#160). With write.rs's one `fs::rename(` licence, that
+/// rename is the only one write.rs makes by path.
 fn primitive_pin_violations(code: &str) -> Vec<String> {
     let mut missed = Vec::new();
     match module_block(code, "unix") {
@@ -637,14 +672,12 @@ fn primitive_pin_violations(code: &str) -> Vec<String> {
     match module_block(code, "windows") {
         Some(windows) => {
             let syncs = count_occurrences(windows, ".sync_all()");
-            if syncs != 1 || !windows.contains(".persist(") {
+            let renames = count_occurrences(windows, "fs::rename(");
+            if syncs != 1 || renames != 1 {
                 missed.push(format!(
-                    "  mod windows: {syncs} .sync_all() call(s) and .persist( {}",
-                    if windows.contains(".persist(") {
-                        "present"
-                    } else {
-                        "missing"
-                    }
+                    "  mod windows: {syncs} .sync_all() call(s) and {renames} fs::rename( \
+                     call(s); the temporary file needs one sync, and one rename by std, which \
+                     replaces a file another program holds open"
                 ));
             }
         }

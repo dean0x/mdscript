@@ -2411,10 +2411,20 @@ mod windows {
     }
 
     /// Put `content` at `target` in `dir`, by way of a temporary file beside it, as
-    /// `commit` says: persisted over the file there — when it stamps the file a rewrite
-    /// read, only if `target` still holds it, and for an output only if it is no MDS
-    /// module, each looked at just before ([`ready_to_replace`]) — or moved into place
-    /// without `MOVEFILE_REPLACE_EXISTING`, which fails on a file that is there.
+    /// `commit` says: renamed over the file there with [`std::fs::rename`] — when it
+    /// stamps the file a rewrite read, only if `target` still holds it, and for an output
+    /// only if it is no MDS module, each looked at just before ([`ready_to_replace`]) — or
+    /// moved into place without `MOVEFILE_REPLACE_EXISTING`, which fails on a file that is
+    /// there.
+    ///
+    /// The rename is std's, not tempfile's `persist` (#160). Both first move the file with
+    /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which fails with `ERROR_ACCESS_DENIED`
+    /// while another program — an editor, a viewer, a virus scanner, an indexer — holds
+    /// the target open, even one that shares it for delete; std's rename then replaces it
+    /// with POSIX semantics, where the file system has them and that program shares it
+    /// for delete, as std opens every file. The temporary file is therefore a plain new
+    /// file: tempfile's own marks its file temporary — a hint that its bytes need never
+    /// reach the disk — and only tempfile's moves clear that mark again.
     fn replace(
         dir: &Path,
         target: &Path,
@@ -2425,16 +2435,23 @@ mod windows {
         let mut temp = tempfile::Builder::new()
             .prefix(TEMP_PREFIX)
             .suffix(TEMP_SUFFIX)
-            .tempfile_in(dir)?;
+            .make_in(dir, |path| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+            })?;
         temp.as_file_mut().write_all(content)?;
         if durability == Durability::Fsync {
             temp.as_file().sync_all()?;
         }
         match commit {
             Commit::Replace(_) | Commit::Output { .. } => {
-                // The temporary file is deleted again as `temp` drops.
+                // The temporary file is deleted again as `temp` drops, until it is renamed.
                 ready_to_replace(target, commit)?;
-                temp.persist(target).map_err(|e| e.error)?;
+                std::fs::rename(temp.path(), target)?;
+                // Renamed: nothing is left at its temporary name to delete.
+                temp.disable_cleanup(true);
             }
             Commit::New => {
                 // A file that appears while the run pauses here is met by the move itself.
@@ -4609,6 +4626,63 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path("lib.mds")).unwrap(), "Hello\n");
         assert_eq!(write("plain.md."), Ok(()), "control");
         assert_eq!(std::fs::read_to_string(path("plain.md")).unwrap(), "X");
+    }
+
+    /// On Windows a file another program holds open is still replaced (#160): an output
+    /// ([`write_compiled`]) and then a rewrite ([`replace_if_unchanged`]) each land over a
+    /// target held open as std opens a file — shared for read, write and delete, as an
+    /// editor, a viewer or a test's reads hold one — and a fresh read by path finds the
+    /// new bytes, with no temporary file left. Control: tempfile's `persist`, a
+    /// `MoveFileExW` alone, fails over the same held target with `ERROR_ACCESS_DENIED`
+    /// (os error 5), the failure `mds watch` met while a reader held its output open. Were
+    /// that move to succeed, the hazard is not the one this test names, and the test
+    /// fails to say so.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_file_another_program_holds_open_is_still_replaced() {
+        use std::io::Write as _;
+
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("out.md");
+        std::fs::write(&file, "old\n").unwrap();
+        let held = std::fs::File::open(&file).unwrap();
+
+        let mut control = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        control.write_all(b"control\n").unwrap();
+        let refused = control
+            .persist(&file)
+            .expect_err("control: persist over a file held open must fail");
+        assert_eq!(
+            refused.error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED),
+            "control: {}",
+            refused.error
+        );
+        drop(refused);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n", "control");
+
+        let target = WriteTarget::new(file.clone(), PathBuf::from("out.md"));
+        assert_eq!(
+            write_compiled(&target, "output\n", &Inputs::default()).map_err(|e| e.to_string()),
+            Ok(()),
+            "an output"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "output\n");
+
+        // The file the output's rename put there, held open in its turn.
+        let held_again = std::fs::File::open(&file).unwrap();
+        let read = read_stamped(&target, "output\n").unwrap();
+        assert!(
+            matches!(
+                replace_if_unchanged(read, "rewrite\n", Durability::Fsync),
+                Ok(Rewritten::Done)
+            ),
+            "a rewrite"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "rewrite\n");
+        assert_eq!(temp_residue(dir.path()), Vec::<String>::new());
+        drop((held, held_again));
     }
 
     /// Each step of a new file's commit puts the file where nothing is, and never over a
