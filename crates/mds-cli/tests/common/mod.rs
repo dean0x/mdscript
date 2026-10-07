@@ -733,6 +733,10 @@ pub fn run_flag_line(test: &str, flag: RunFlag, details: &str) -> String {
 }
 
 /// Append `line` and a newline to the file at `path`, creating it if it is missing.
+///
+/// Line and newline go out in ONE write: the tests of a binary run at once and append to
+/// the same log, and an appending write lands whole at the end, while two writes per line
+/// let another writer's line fall between a line and its newline.
 #[allow(dead_code)]
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -740,7 +744,7 @@ pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
         .append(true)
         .create(true)
         .open(path)?;
-    writeln!(file, "{line}")
+    file.write_all(format!("{line}\n").as_bytes())
 }
 
 /// Report whether this run of `test` was conclusive, where a passing run cannot hide

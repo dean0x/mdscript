@@ -458,3 +458,43 @@ fn a_run_flag_is_one_line_the_soak_can_count() {
     // Control: a directory where the log should be cannot be appended to.
     assert!(append_line(dir.path(), &yes).is_err());
 }
+
+/// The tests of one binary run at once and flag into the one log the soak counts, each
+/// opening it for itself: every flag must land as a line of its own, never merged with
+/// another writer's.
+#[test]
+fn flags_appended_at_once_stay_one_per_line() {
+    const WRITERS: usize = 8;
+    const FLAGS: usize = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("flags.log");
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let log = &log;
+            scope.spawn(move || {
+                for flag in 0..FLAGS {
+                    let line = run_flag_line(
+                        &format!("writer_{writer}"),
+                        RunFlag::Conclusive,
+                        &format!("flag {flag}"),
+                    );
+                    append_line(log, &line).expect("append a flag");
+                }
+            });
+        }
+    });
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let malformed: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| count_occurrences(line, ": conclusive: ") != 1)
+        .take(3)
+        .collect();
+    assert!(
+        malformed.is_empty() && lines.len() == WRITERS * FLAGS,
+        "{} lines for {} flags; first malformed: {malformed:?}",
+        lines.len(),
+        WRITERS * FLAGS
+    );
+}
