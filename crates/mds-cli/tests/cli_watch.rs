@@ -1721,14 +1721,20 @@ fn watch_ctrl_c_prints_stopped_watching() {
 /// and 404ms on Windows, long enough for the window to close mid-burst as designed. The
 /// claim is judged when no measured gap (`common::WriteCadence`) reached half the
 /// window — the other half absorbs the watcher seeing a write late. A run with a longer
-/// gap is inconclusive: it still requires the burst's final state, published by the
-/// last rebuild, and passes with that flag (`common::record_run_flag`).
+/// gap is inconclusive about "exactly one" and passes with that flag
+/// (`common::record_run_flag`), but it still requires the burst's final state, published
+/// by the last rebuild, and no more rebuilds than its measured cadence allows
+/// (`common::most_debounce_windows`, which counts a window for every such gap), so a
+/// debounce switched off — about a rebuild per write — fails slow runs too.
 #[test]
 fn watch_debounce_single_rebuild_from_burst() {
     const TEST: &str = "watch_debounce_single_rebuild_from_burst";
     // `--debounce 250`, and its cap, `max(10 x 250ms, 1s)`.
     const WINDOW: Duration = Duration::from_millis(250);
     const CAP: Duration = Duration::from_millis(2_500);
+    /// One window more than an inconclusive run's measured cadence allows, for what the
+    /// writer cannot measure: a watcher descheduled for half a window while it was not.
+    const ALLOWANCE: usize = 1;
 
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("burst.mds");
@@ -1784,6 +1790,7 @@ fn watch_debounce_single_rebuild_from_burst() {
     let rebuilds = count_occurrences(&stderr, "Recompiled ");
 
     let pauses = cadence.pauses(WINDOW / 2);
+    let most = most_debounce_windows(&cadence, WINDOW, CAP) + ALLOWANCE;
     let flag = if pauses == 0 {
         RunFlag::Conclusive
     } else {
@@ -1792,9 +1799,8 @@ fn watch_debounce_single_rebuild_from_burst() {
     let judged = match flag {
         RunFlag::Conclusive => "exactly 1 required".to_string(),
         RunFlag::Inconclusive => format!(
-            "not judged: {pauses} gap(s) of {:?} or more allow up to {}",
-            WINDOW / 2,
-            most_debounce_windows(&cadence, WINDOW, CAP)
+            "exactly 1 not judged: {pauses} gap(s) of {:?} or more allow at most {most}",
+            WINDOW / 2
         ),
     };
     record_run_flag(
@@ -1815,6 +1821,14 @@ fn watch_debounce_single_rebuild_from_burst() {
             1,
             "a {span:?} burst with no gap of {:?} or more ({cadence}) must coalesce into \
              exactly one rebuild under a 250ms quiet period; stderr was:\n{stderr}",
+            WINDOW / 2
+        );
+    } else {
+        assert!(
+            rebuilds <= most,
+            "a {span:?} burst with {pauses} gap(s) of {:?} or more ({cadence}) allows at \
+             most {most} rebuilds under a 250ms quiet period; got {rebuilds}; stderr \
+             was:\n{stderr}",
             WINDOW / 2
         );
     }

@@ -18,13 +18,14 @@
 //!    published it, and the run's flag says the claim went unjudged.
 //! 2. The stream's final state is published once the stream ends.
 //! 3. The rebuilds number no more than the stream's MEASURED cadence allows
-//!    (`common::most_debounce_windows`) — a bound a window that never extends, or a cap
-//!    that ends windows early, exceeds. It is judged only when the writer never paused
-//!    for half a window: a longer pause may have let a window close quietly, and a
-//!    runner that descheduled the writer may have descheduled the watcher too, which the
-//!    writer cannot measure. Such a run is inconclusive about the bound: it passes with
-//!    the bound logged and not judged. No run fails on the runner's speed, and none
-//!    skips.
+//!    (`common::most_debounce_windows`), with one window to spare for what the writer
+//!    cannot measure ([`ALLOWANCE`]). The bound counts a window for every measured pause
+//!    of half a window, as a pause may let a window close quietly, so every run judges
+//!    it, and one with no such pause judges it at its tightest: a window that never
+//!    extends, or a cap that ends windows early, exceeds it. A run whose writer paused is
+//!    judged against a looser bound, which a debounce switched off still exceeds but a
+//!    cap that ends windows early may not, and is flagged inconclusive. No run fails on
+//!    the runner's speed, and none skips.
 //!
 //! Every run reports which it was in one line (`common::record_run_flag`); the watch
 //! soak counts them. The test has a binary of its own because `cargo test` runs one
@@ -190,7 +191,7 @@ fn claim_1(stream: &Stream) -> (bool, String) {
 
 /// A source written to without pause is still rebuilt while the writing goes on, and
 /// no more often than the stream's measured cadence allows (#379, #397); see the
-/// module docs for the three claims and when the third is judged.
+/// module docs for the three claims and how a run's cadence decides what it proves.
 ///
 /// `--poll-interval 0` turns the idle tick off, so while the stream lasts only a
 /// closing window can rebuild. The loop never reaches the tick while a window is open,
@@ -249,7 +250,7 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
     let judged = match flag {
         RunFlag::Conclusive => format!("at most {most} allowed"),
         RunFlag::Inconclusive => format!(
-            "the bound of {most} not judged: {pauses} gap(s) of {:?} or more",
+            "at most {most} allowed, loosened by {pauses} gap(s) of {:?} or more",
             WINDOW / 2
         ),
     };
@@ -294,16 +295,14 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
         "a rebuild during the stream and the one that published its final state make \
          at least two `Recompiled` lines; got {rebuilds}; stderr was:\n{stderr}"
     );
-    if flag == RunFlag::Conclusive {
-        assert!(
-            rebuilds <= most,
-            "{} with no gap of {:?} or more allow at most {most} rebuilds under a \
-             {WINDOW:?} quiet period capped at {CAP:?} — a window that never extended \
-             would close about once per window; got {rebuilds}; stderr was:\n{stderr}",
-            stream.cadence,
-            WINDOW / 2
-        );
-    }
+    assert!(
+        rebuilds <= most,
+        "{} with {pauses} gap(s) of {:?} or more allow at most {most} rebuilds under a \
+         {WINDOW:?} quiet period capped at {CAP:?} — a window that never extended would \
+         close about once per window; got {rebuilds}; stderr was:\n{stderr}",
+        stream.cadence,
+        WINDOW / 2
+    );
 }
 
 // ── The measuring helpers ───────────────────────────────────────────────────
