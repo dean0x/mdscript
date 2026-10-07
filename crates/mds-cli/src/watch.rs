@@ -94,7 +94,7 @@ use mds::MdsError;
 use crate::build::{
     admit_output, auto_detect_mds_file, build_runtime_vars, compile_inputs, compile_to_content,
     resolve_dir_as_created, resolve_output_path_for_kind, source_inputs, write_output,
-    CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
+    CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs, RuntimeVars,
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
@@ -4151,6 +4151,47 @@ struct LivenessState {
     failing_dirs: BTreeSet<PathBuf>,
 }
 
+/// The variables a directory batch compiles its sources with, and the `--vars` file's
+/// duplicate keys, reported once for the batch by the first of its sources that shows
+/// something — its `Recompiled` line, a `Kept` notice it prints, or its failed write's
+/// report — as a file rebuild reports them (#326): never by a batch that shows nothing,
+/// such as one of the batches a single save at `--debounce 0` starts after the first, or
+/// the idle tick's for the same edit, which find the output unchanged.
+struct BatchVars<'a> {
+    /// The variables, given to every compile of the batch.
+    map: &'a Option<HashMap<String, mds::Value>>,
+    /// What the variables were resolved from, while the duplicate keys of its `--vars` file
+    /// are still to be reported for the batch: `None` once they are.
+    unreported: Option<&'a RuntimeVars>,
+}
+
+impl<'a> BatchVars<'a> {
+    /// The variables `resolved` holds, its `--vars` file's duplicate keys still to report.
+    fn of(resolved: &'a RuntimeVars) -> Self {
+        Self {
+            map: &resolved.vars,
+            unreported: Some(resolved),
+        }
+    }
+
+    /// The variables `map` holds, with no duplicate keys to report: a unit test's batch.
+    #[cfg(test)]
+    fn map_only(map: &'a Option<HashMap<String, mds::Value>>) -> Self {
+        Self {
+            map,
+            unreported: None,
+        }
+    }
+
+    /// A source of the batch shows something: report the duplicate keys, unless the batch
+    /// has reported them already. `--quiet` prints none.
+    fn shown(&mut self, quiet: bool) {
+        if let Some(resolved) = self.unreported.take() {
+            crate::build::emit_duplicate_vars_file_warnings(resolved, quiet);
+        }
+    }
+}
+
 /// Compile a single in-root source file, update `state`, and optionally write output.
 ///
 /// This is the shared kernel for both the `vars_changed` full-recompile loop and the
@@ -4163,7 +4204,11 @@ struct LivenessState {
 /// because `src` is gone since the batch found it there retires it as a deleted source
 /// ([`DirWatchState::retire_deleted`], #160). A compile that read a file emptied since the
 /// batch looked — whether it then failed or would write — holds `src` back, unless the
-/// deadline ended the hold in this rebuild ([`EmptyHold::on_late_empty`], #380).
+/// deadline ended the hold in this rebuild ([`EmptyHold::on_late_empty`], #380). A source
+/// whose output is written, kept with a notice, or not written with a report shows
+/// something: the batch's `--vars` duplicate keys are reported with it, before its
+/// `Recompiled` line, after the notice, or before the report, unless an earlier source of
+/// the batch reported them ([`BatchVars`], #326).
 ///
 /// # Invariants preserved
 /// - Freshness rule: dep set recomputed from fresh `compile_to_content` output.
@@ -4174,20 +4219,14 @@ struct LivenessState {
 ///
 /// Compile success/failure is already signalled via `state.errored`; the caller uses
 /// that set for error tracking.
-///
-/// Returns `true` when this call produced an observable, content-changed rebuild
-/// (a real write, not a partial/unchanged/errored compile) — used by
-/// `process_dir_batch`'s callers to gate the `#326` vars-file duplicate-key
-/// warning on an OBSERVABLE rebuild rather than every internal recompute (the
-/// same content-based signal `rebuild_file` uses in single-file mode).
 fn compile_one_source(
     src: &Path,
     watch_root: &WatchedPath,
     output_base: &OutputBase,
-    runtime_vars: &Option<HashMap<String, mds::Value>>,
+    vars: &mut BatchVars<'_>,
     quiet: bool,
     state: &mut DirWatchState,
-) -> bool {
+) {
     let root = watch_root.canonical.as_path();
     let t0 = Instant::now();
     // What the rebuild of `src` before this one kept from being written (#160): told again
@@ -4195,14 +4234,14 @@ fn compile_one_source(
     let kept_before = state.kept.remove(src);
     // A debug build's test pause (#160): the batch found `src` there, and has not read it.
     pause_after_batch_split();
-    let failure = match watch_root.compile_source(src, runtime_vars.clone(), quiet) {
+    let failure = match watch_root.compile_source(src, vars.map.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths = graph_keys(&compiled.dependencies);
 
             // Partials (DD2): refresh graph edges but do NOT write output.
             if is_partial(src) {
                 state.record_success(src, dep_paths, root, None, None);
-                return false;
+                return;
             }
 
             // Derive the output path from the compiled kind (intrinsic extension).
@@ -4256,8 +4295,11 @@ fn compile_one_source(
                         state.kept.insert(source.clone(), kept);
                     }
                     state.held.hold([&source], false);
-                    return false;
+                    return;
                 }
+                // The rebuild of `src` before this one kept the same from being written
+                // (#160): told already.
+                let told = kept_before.as_ref() == Some(&compiled.content);
                 let written = match out_dir {
                     OutDirNow::Elsewhere => {
                         Err(miette::Report::new(crate::write::out_dir_moved(&out)))
@@ -4267,7 +4309,7 @@ fn compile_one_source(
                             &below_checked_out_dir(state.out_dir.as_ref(), &out),
                             state.record(&out.path, src),
                             &compiled.content,
-                            kept_before.as_ref() == Some(&compiled.content),
+                            told,
                             quiet,
                         )
                         .map_err(miette::Report::new)
@@ -4283,13 +4325,18 @@ fn compile_one_source(
                 };
                 match written {
                     // Kept: nothing is written and nothing retired, and the record of the
-                    // old kind's output stays, so a later save tries again.
+                    // old kind's output stays, so a later save tries again. A notice told
+                    // shows something, a kept rebuild that tells nothing does not (#326).
                     Ok(false) => {
+                        if !told {
+                            vars.shown(quiet);
+                        }
                         state.kept.insert(src.to_path_buf(), compiled.content);
                         state.record_success(src, dep_paths, root, None, None);
-                        return false;
+                        return;
                     }
                     Ok(true) => {
+                        vars.shown(quiet);
                         if let Some(anchor) = &mut state.out_dir {
                             anchor.written();
                         }
@@ -4325,21 +4372,23 @@ fn compile_one_source(
                             Some(&out),
                             Some(compiled.content),
                         );
-                        return true;
+                        return;
                     }
                     Err(e) => {
                         // The compile succeeded: the dependencies it reported are the
                         // source's now, as at startup, so an edit to one of them rebuilds
                         // it — one outside the root included (#257). Nothing is recorded
-                        // as written, and the settle below marks the source errored.
+                        // as written, and the settle below marks the source errored and
+                        // reports the failure, which shows something (#326).
                         state.record_success(src, dep_paths, root, None, None);
+                        vars.shown(quiet);
                         Some(e)
                     }
                 }
             } else {
                 // Content unchanged — still refresh graph edges + known_files.
                 state.record_success(src, dep_paths, root, None, None);
-                return false;
+                return;
             }
         }
         // The source went after the batch found it there (#160): whatever the compile
@@ -4349,7 +4398,7 @@ fn compile_one_source(
         // any other compile does.
         Err(CompileFailure::Error(_)) if matches!(src.try_exists(), Ok(false)) => {
             state.retire_deleted(src, watch_root, output_base, quiet);
-            return false;
+            return;
         }
         Err(failure) => {
             // #380: a file the compile read, emptied since the batch looked — a truncation
@@ -4369,14 +4418,13 @@ fn compile_one_source(
                     state.kept.insert(source.clone(), kept);
                 }
                 state.held.hold([&source], false);
-                return false;
+                return;
             }
             failure.unreported()
         }
     };
     // The compile failed, or writing its output did: settled alike.
     settle(SettleInto::Dir(state), failure, Settle::MarkErrored(src));
-    false
 }
 
 /// Compile-time context for directory-mode watch, parallel to `FileCompileCtx`.
@@ -4737,11 +4785,12 @@ fn liveness_probe_dir(
 /// failure to read it is reported and settled: it may be temporarily absent (AC-W7 /
 /// AC-C5). `--set`/`--set-string` are fixed for the session and warned once at startup —
 /// discarded here (via `resolved.vars`). The vars file's duplicate keys are re-reported
-/// only when the batch produced an OBSERVABLE rebuild (#326, test I17): at `--debounce 0`
-/// a single edit can generate more than one raw FS event, each reaching the event handler
-/// separately, and the idle tick can observe the same edit again, so the warning is
-/// emitted after `process_dir_batch` reports whether anything actually changed rather
-/// than unconditionally — one logical edit warns once. A batch the vars file cannot be
+/// once for each batch that shows something, by the first of its sources that does — a
+/// `Recompiled` line, a `Kept` notice, a failed write's report ([`BatchVars`]) — never by
+/// a batch that shows nothing (#326, test I17): at `--debounce 0` a single edit can
+/// generate more than one raw FS event, each reaching the event handler separately, and
+/// the idle tick can observe the same edit again, but only the first batch finds the
+/// output changed — one logical edit warns once. A batch the vars file cannot be
 /// read for is kept ([`HeldBatch`]) and rebuilt with the next one, so a source created
 /// while the file cannot be read is compiled by the batch that reads it again (#380).
 fn rebuild_dir_batch(
@@ -4815,22 +4864,17 @@ fn rebuild_dir_batch(
     // source its compile finds a file emptied for is held alone, the others printing.
     state.clear.clear_if_asked();
 
-    // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
-    // directly rather than cloning it — `resolved` (and its `.vars_file`,
-    // `.duplicate_vars_file_keys`, `.duplicate_vars_file_keys_omitted`) is still
-    // needed below, after this borrow ends, for the warning emission.
-    let any_changed = process_dir_batch(
+    // The batch borrows the variables rather than cloning them, and its first source that
+    // shows something reports the vars file's duplicate keys (#326).
+    process_dir_batch(
         &batch,
         vars_changed,
         &ctx.root,
         &ctx.output_base,
-        &resolved.vars,
+        &mut BatchVars::of(&resolved),
         ctx.quiet,
         state,
     );
-    if any_changed {
-        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
-    }
 }
 
 /// Outcome returned by `handle_fs_event_dir` to tell the loop what to do next.
@@ -5595,26 +5639,25 @@ mod dir_startup {
 /// Called by both the event path and the reconcile path so the same state
 /// transitions apply uniformly.
 ///
-/// Returns `true` when the batch produced at least one observable, content-changed
-/// rebuild (see `compile_one_source`) — callers use this to gate the `#326`
-/// vars-file duplicate-key warning on an OBSERVABLE rebuild, since a single logical
-/// edit can otherwise reach this function more than once (e.g. multiple raw FS
-/// events for one write at `--debounce 0`, or a liveness-probe self-heal tick
-/// racing a real FS event for the same change) and would otherwise double-warn.
+/// `vars` reports the `--vars` file's duplicate keys with the first source that shows
+/// something, and only then (#326): a single logical edit can reach this function more
+/// than once (e.g. multiple raw FS events for one write at `--debounce 0`, or a
+/// liveness-probe self-heal tick racing a real FS event for the same change), and only
+/// the first batch finds an output changed.
 fn process_dir_batch(
     changed: &BTreeSet<PathBuf>,
     vars_changed: bool,
     watch_root: &WatchedPath,
     output_base: &OutputBase,
-    runtime_vars: &Option<HashMap<String, mds::Value>>,
+    vars: &mut BatchVars<'_>,
     quiet: bool,
     state: &mut DirWatchState,
-) -> bool {
-    let any_changed = if vars_changed {
-        process_dir_batch_vars_changed(changed, watch_root, output_base, runtime_vars, quiet, state)
+) {
+    if vars_changed {
+        process_dir_batch_vars_changed(changed, watch_root, output_base, vars, quiet, state);
     } else {
-        process_dir_batch_incremental(changed, watch_root, output_base, runtime_vars, quiet, state)
-    };
+        process_dir_batch_incremental(changed, watch_root, output_base, vars, quiet, state);
+    }
 
     // Re-baseline the content backstop over the post-batch watched set (#321) — the
     // tracked set and the `--vars` file, so a file the batch compiled empty is not taken
@@ -5636,7 +5679,6 @@ fn process_dir_batch(
     // reporting it; one whose compile read it emptied, which held its source, stays
     // emptied; and one saved after the look is found changed again by the idle tick.
     state.rebaseline();
-    any_changed
 }
 
 /// Whether `path`, which a directory batch names, is a source of the watch below `root`: a
@@ -5669,19 +5711,15 @@ fn names_a_source(root: &Path, path: &Path) -> bool {
 /// its compile, during it, or after it — is retired the same way (#160).
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
-///
-/// Returns `true` when at least one source in the batch produced an observable,
-/// content-changed rebuild (see `compile_one_source`).
 fn process_dir_batch_vars_changed(
     changed: &BTreeSet<PathBuf>,
     watch_root: &WatchedPath,
     output_base: &OutputBase,
-    runtime_vars: &Option<HashMap<String, mds::Value>>,
+    vars: &mut BatchVars<'_>,
     quiet: bool,
     state: &mut DirWatchState,
-) -> bool {
+) {
     let root = watch_root.canonical.as_path();
-    let mut any_changed = false;
     let all_sources: BTreeSet<PathBuf> = state
         .known_files
         .iter()
@@ -5719,9 +5757,7 @@ fn process_dir_batch_vars_changed(
         if let Some(deps) = previous.remove(src) {
             state.forward_deps.insert(src.clone(), deps);
         }
-        if compile_one_source(src, watch_root, output_base, runtime_vars, quiet, state) {
-            any_changed = true;
-        }
+        compile_one_source(src, watch_root, output_base, vars, quiet, state);
     }
     state.external_dep_dirs = state.dep_dirs_outside(root);
 
@@ -5733,7 +5769,6 @@ fn process_dir_batch_vars_changed(
         state.retire_deleted(src, watch_root, output_base, quiet);
     }
     state.known_files = present;
-    any_changed
 }
 
 /// Incremental recompile: compile only transitive importers of the changed seeds.
@@ -5750,19 +5785,15 @@ fn process_dir_batch_vars_changed(
 /// 5. Delete outputs for removed sources.
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
-///
-/// Returns `true` when at least one affected source produced an observable,
-/// content-changed rebuild (see `compile_one_source`).
 fn process_dir_batch_incremental(
     changed: &BTreeSet<PathBuf>,
     watch_root: &WatchedPath,
     output_base: &OutputBase,
-    runtime_vars: &Option<HashMap<String, mds::Value>>,
+    vars: &mut BatchVars<'_>,
     quiet: bool,
     state: &mut DirWatchState,
-) -> bool {
+) {
     let root = watch_root.canonical.as_path();
-    let mut any_changed = false;
 
     // 1. Partition.
     let (existing, deleted): (BTreeSet<PathBuf>, BTreeSet<PathBuf>) =
@@ -5776,7 +5807,7 @@ fn process_dir_batch_incremental(
     }
 
     if seeds.is_empty() {
-        return false;
+        return;
     }
 
     // 3. Affected = seeds ∪ transitive importers (uses start-of-batch graph snapshot).
@@ -5828,7 +5859,7 @@ fn process_dir_batch_incremental(
         // hidden dirs) are graph nodes but never emit their own output (DD3 pattern).
         if !is_in_root || is_excluded_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
-            match watch_root.compile_source(src, runtime_vars.clone(), true) {
+            match watch_root.compile_source(src, vars.map.clone(), true) {
                 Ok(compiled) => {
                     state
                         .forward_deps
@@ -5855,9 +5886,7 @@ fn process_dir_batch_incremental(
         }
 
         // In-root source: full compile→dedup→write via shared helper.
-        if compile_one_source(src, watch_root, output_base, runtime_vars, quiet, state) {
-            any_changed = true;
-        }
+        compile_one_source(src, watch_root, output_base, vars, quiet, state);
     }
 
     // 5. Deletions: after importers recompiled, retire the outputs and forget the graph
@@ -5879,7 +5908,6 @@ fn process_dir_batch_incremental(
     // `arm_external_dirs_after_rebuild`, which unwatches the dirs no longer live — under
     // `--poll-interval 0` too, where no liveness tick runs (#257).
     state.external_dep_dirs = state.dep_dirs_outside(root);
-    any_changed
 }
 
 // ── Test-only pause between a directory batch's split and its compile (#160) ──
@@ -7943,7 +7971,7 @@ mod tests {
                 what: Watched::Root,
             },
             &dir_base(out.clone()),
-            &None,
+            &mut BatchVars::map_only(&None),
             true,
             &mut state,
         );
@@ -8005,7 +8033,7 @@ mod tests {
                 what: Watched::Root,
             },
             &dir_base(out.clone()),
-            &None,
+            &mut BatchVars::map_only(&None),
             true,
             &mut state,
         );
@@ -9384,7 +9412,7 @@ mod tests {
                 true,
                 &ctx.root,
                 &ctx.output_base,
-                &runtime_vars,
+                &mut BatchVars::map_only(&runtime_vars),
                 true,
                 &mut state,
             );
@@ -10449,7 +10477,7 @@ mod tests {
             false,
             &ctx.root,
             &ctx.output_base,
-            &None,
+            &mut BatchVars::map_only(&None),
             true,
             &mut state,
         );
@@ -10488,7 +10516,7 @@ mod tests {
             false,
             &ctx.root,
             &ctx.output_base,
-            &None,
+            &mut BatchVars::map_only(&None),
             true,
             &mut state,
         );

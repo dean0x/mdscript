@@ -10066,6 +10066,189 @@ fn watch_file_vars_duplicate_warning_comes_with_a_reported_write_failure() {
     );
 }
 
+/// `notes/` watched as a directory with `vars.json`, its `--vars` file, which holds a
+/// duplicate key: the session, its stderr, and the warning the duplicate prints.
+fn a_dir_session_with_duplicate_vars(base: &Path) -> (ChildGuard, StderrTap, String) {
+    let vars = base.join("vars.json");
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base)
+            .args(["watch", "notes", "--vars"])
+            .arg(&vars)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    (child, tap, dup_vars_file_warning("x", &vars))
+}
+
+/// A directory batch prints the `--vars` file's duplicate-key warning once, however many
+/// outputs it writes, and before its first `Recompiled` line, as a file rebuild does (#326):
+/// the vars file edited, its duplicate kept, rebuilds `a.mds` and `b.mds` in one batch.
+/// Positive control: both are recompiled.
+#[test]
+fn watch_dir_vars_duplicate_warning_comes_once_before_a_batch_s_recompiled_lines() {
+    let base = notes_with(&[("a.mds", "A {{x}}\n"), ("b.mds", "B {{x}}\n")]);
+    let notes = base.path().join("notes");
+    let (mut child, tap, warning) = a_dir_session_with_duplicate_vars(base.path());
+    let written = |name: &str, text: &str| wait_for_file_contains(&notes.join(name), text, TIMEOUT);
+    assert!(
+        written("a.md", "A 2") && written("b.md", "B 2"),
+        "control: the startup writes both outputs; stderr: {}",
+        tap.text()
+    );
+
+    write_atomic(&base.path().join("vars.json"), r#"{"x": 3, "x": 4}"#);
+    assert!(
+        written("a.md", "A 4") && written("b.md", "B 4"),
+        "control: the vars edit rebuilds both sources; stderr: {}",
+        tap.text()
+    );
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        count_occurrences(&stderr, "Recompiled "),
+        2,
+        "control: one batch rebuilds both sources; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, &warning),
+        2,
+        "the warning is printed at startup and once by the batch; stderr: {stderr}"
+    );
+    let first_recompiled = stderr.find("Recompiled ").unwrap();
+    assert_eq!(
+        count_occurrences(&stderr[..first_recompiled], &warning),
+        2,
+        "the batch's warning comes before its first `Recompiled` line; stderr: {stderr}"
+    );
+}
+
+/// Directory mode prints the `--vars` file's duplicate-key warning with a `Kept` notice,
+/// after it, as file mode does (#160): `notes/chat.mds`, edited from messages into Markdown
+/// beside a hand-written `chat.md`, is kept with its notice and the warning — and a rebuild
+/// of the same, which keeps the same again and tells nothing, prints no warning either.
+/// That rebuild is made certain: its batch stops at the pause before its compile
+/// ([`BATCH_PAUSE`]) until the test has seen it there, and nothing writes `chat.mds` again.
+#[cfg(debug_assertions)]
+#[test]
+fn watch_dir_vars_duplicate_warning_skips_a_kept_rebuild_that_tells_nothing() {
+    let base = notes_with(&[("chat.mds", MESSAGES_KIND), ("chat.md", HAND_WRITTEN)]);
+    let notes = base.path().join("notes");
+    let src = notes.join("chat.mds");
+    let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+    let vars = base.path().join("vars.json");
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+    let warning = dup_vars_file_warning("x", &vars);
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(base.path())
+            .args(["watch", "notes", "--vars"])
+            .arg(&vars)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env(BATCH_PAUSE, &go)
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("chat.json"), "What is 3+3?", TIMEOUT),
+        "control: the startup writes chat.json; stderr: {}",
+        tap.text()
+    );
+
+    // The change of kind: kept beside the hand-written chat.md, with its notice and the
+    // warning.
+    write_atomic(&src, "Hello\n");
+    wait_paused(&paused, &mut child, &tap, "the change of kind");
+    std::fs::write(&go, "").unwrap();
+    let kept = format!(
+        "Kept {}: not written by this session; not overwritten",
+        below("notes", "chat.md")
+    );
+    wait_for_tap(&tap, &kept, TIMEOUT);
+    wait_for_tap_count(&tap, &warning, 2, TIMEOUT);
+
+    // The same saved again: its batch stops before the compile, which reads it as saved.
+    std::fs::remove_file(&paused).unwrap();
+    std::fs::remove_file(&go).unwrap();
+    write_atomic(&src, "Hello\n");
+    wait_paused(&paused, &mut child, &tap, "the rebuild of the same");
+    std::fs::write(&go, "").unwrap();
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&notes.join("chat.md")).as_deref(),
+        Some(HAND_WRITTEN),
+        "control: chat.md, which the session did not write, is not overwritten; \
+         stderr: {stderr}"
+    );
+    let notice = stderr.find(&kept).unwrap();
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [kept],
+        "control: the notice is told once; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, &warning),
+        2,
+        "the warning is printed at startup and with the notice — not again by the \
+         rebuild that tells nothing; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr[notice..], &warning),
+        1,
+        "the rebuild's warning comes after its notice; stderr: {stderr}"
+    );
+}
+
+/// Directory mode prints the `--vars` file's duplicate-key warning with a rebuild whose
+/// write fails and is reported, before the report, as file mode does (#160): `notes/t.md`
+/// replaced by a directory, the next edit's write fails with its report, and with the
+/// warning — one for each report, as each batch that rebuilds the source reports again.
+/// Positive control: the report.
+#[test]
+fn watch_dir_vars_duplicate_warning_comes_with_a_reported_write_failure() {
+    let base = notes_with(&[("t.mds", "version 1\n")]);
+    let notes = base.path().join("notes");
+    let (src, out) = (notes.join("t.mds"), notes.join("t.md"));
+    let (mut child, tap, warning) = a_dir_session_with_duplicate_vars(base.path());
+    assert!(
+        wait_for_file_contains(&out, "version 1", TIMEOUT),
+        "control: the startup writes t.md; stderr: {}",
+        tap.text()
+    );
+
+    std::fs::remove_file(&out).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("keep"), "a directory where the output was\n").unwrap();
+    write_atomic(&src, "version 2\n");
+    wait_for_tap(&tap, "mds::io", TIMEOUT);
+    write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    let reports = count_occurrences(&stderr, "mds::io");
+    assert!(
+        reports > 0 && !stderr.contains("Recompiled"),
+        "control: the failed write is reported, and never announced; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, &warning),
+        1 + reports,
+        "the warning is printed at startup and with each failed write's report; \
+         stderr: {stderr}"
+    );
+    let first_report = stderr.find("mds::io").unwrap();
+    assert_eq!(
+        count_occurrences(&stderr[..first_report], &warning),
+        2,
+        "the rebuild's warning comes before its report; stderr: {stderr}"
+    );
+}
+
 /// `--quiet` prints no notice for a file a change of kind keeps (#160), and keeps it all
 /// the same: a hand-written `chat.md` beside `chat.mds`, edited into Markdown. Control:
 /// `talk.mds`, edited into Markdown with it, has nothing at `talk.md`, so `talk.md` is
