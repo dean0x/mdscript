@@ -8060,6 +8060,11 @@ fn watch_exits_0_at_ctrl_c_after_a_rebuild_write_failed() {
         stderr.ends_with("Stopped watching.\n"),
         "the session ends as any Ctrl+C does; stderr: {stderr:?}"
     );
+    assert!(
+        !stderr.contains("Recompiled"),
+        "the failed write is never announced, before the session ends or after the error; \
+         stderr: {stderr:?}"
+    );
 }
 
 /// A rebuild whose output file cannot be written, in a live session, on every OS: it is
