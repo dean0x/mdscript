@@ -1547,7 +1547,8 @@ impl<'a> Record<'a> {
 /// dangling, is something there, and the session's own is refused with a warning.
 ///
 /// Returns whether the file is gone — removed, or not there — so that the record of it
-/// can go too; a file kept, or one whose removal failed, keeps its record.
+/// can go too; a file kept, one whose removal failed, and one that could not be looked at
+/// keep their records.
 #[must_use]
 fn retire_output(
     out: &WriteTarget,
@@ -1558,9 +1559,17 @@ fn retire_output(
     quiet: bool,
 ) -> bool {
     // Looked at without following a symlink: a link at the output, live or dangling, is
-    // something there, and refused below as one.
-    if std::fs::symlink_metadata(&out.path).is_err() {
-        return true;
+    // something there, and refused below as one. Only a name that is not there is gone; a
+    // look that fails otherwise — a directory on its way that may not be searched, say —
+    // leaves the file perhaps there, so its removal is tried as any other's, and a failure
+    // reported, the record kept.
+    if let Err(e) = std::fs::symlink_metadata(&out.path) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            return true;
+        }
     }
     let written = match record {
         Record::Own(written) => written,
@@ -9351,6 +9360,108 @@ mod tests {
                  and the dependency's stays watched"
             );
         }
+    }
+
+    /// #160: a retired output that is not there — its name missing, or a file where a
+    /// directory on its way should be — is gone, and the session's record of it goes too;
+    /// with no record, it is gone with no `Kept` notice, which is told only of a file kept.
+    #[test]
+    fn a_retired_output_that_is_not_there_is_gone_with_its_record() {
+        let (_dir, root) = canonical_tempdir();
+        let src = root.join("page.mds");
+        std::fs::write(root.join("file"), "a file, no directory\n").unwrap();
+        for (label, out) in [
+            ("a missing name", root.join("page.md")),
+            ("a file on its way", root.join("file").join("page.md")),
+        ] {
+            let target = WriteTarget::as_typed(out.clone());
+            assert!(
+                retire_output(
+                    &target,
+                    None,
+                    OutDirNow::Unchanged,
+                    Record::Unwritten,
+                    Retirement::SourceDeleted,
+                    true,
+                ),
+                "{label}: with no record, the output is gone — not kept, with a notice"
+            );
+            let mut state = empty_dir_state();
+            state.wrote(&src, &target, "Page.\n".to_owned());
+            state.retire(
+                &src,
+                &target,
+                OutDirNow::Unchanged,
+                Retirement::SourceDeleted,
+                true,
+            );
+            assert_eq!(
+                state.record(&out, &src),
+                Record::Unwritten,
+                "{label}: the output is gone, and its record with it"
+            );
+        }
+    }
+
+    /// #160: a retired output the session wrote that cannot be looked at — in a directory
+    /// it may no longer search — is no output gone: its removal is reported as failed, and
+    /// the session keeps its record of it, so the file stays the session's. Positive
+    /// control: the directory searchable again, the same retirement removes it and its
+    /// record. `#[cfg(unix)]`: the look is refused through a directory's mode bits, which
+    /// Windows does not use to refuse it; skipped with a reason where the mode does not
+    /// refuse it (running as root).
+    #[cfg(unix)]
+    #[test]
+    fn a_retired_output_that_cannot_be_looked_at_keeps_its_record() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, root) = canonical_tempdir();
+        let (src, sub) = (root.join("page.mds"), root.join("sub"));
+        std::fs::create_dir(&sub).unwrap();
+        let out = sub.join("page.md");
+        std::fs::write(&out, "Page.\n").unwrap();
+        let target = WriteTarget::as_typed(out.clone());
+        let mut state = empty_dir_state();
+        state.wrote(&src, &target, "Page.\n".to_owned());
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(&out).is_ok() {
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::output::ewriteln!("running as root; mode 0o000 does not stop a look");
+            return;
+        }
+        state.retire(
+            &src,
+            &target,
+            OutDirNow::Unchanged,
+            Retirement::SourceDeleted,
+            true,
+        );
+        let kept = state.record(&out, &src) == Record::Own("Page.\n");
+        // Restored before asserting, so the temporary directory can be removed.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            kept,
+            "an output that cannot be looked at keeps the session's record of it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).ok().as_deref(),
+            Some("Page.\n"),
+            "and is left as it is"
+        );
+
+        state.retire(
+            &src,
+            &target,
+            OutDirNow::Unchanged,
+            Retirement::SourceDeleted,
+            true,
+        );
+        assert!(
+            !out.exists() && state.record(&out, &src) == Record::Unwritten,
+            "positive control: the directory searchable again, the output is removed and \
+             its record goes"
+        );
     }
 
     /// A watch that fails, as notify reports one the OS refused.
