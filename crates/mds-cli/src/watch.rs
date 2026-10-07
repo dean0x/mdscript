@@ -58,7 +58,9 @@
 //! - All content output → stdout ONLY when output resolves to stdout.
 //! - All status / warnings / errors → stderr (pipe-safe).
 //! - `--quiet` suppresses status + warnings but NOT compile errors.
-//! - Exit 0 on clean Ctrl+C; non-zero only on startup failure.
+//! - Exit 0 on clean Ctrl+C, or 101 if a compile panicked during the session, which
+//!   keeps watching until it is stopped; a panic anywhere else ends the session with
+//!   101 (#389). Otherwise non-zero only on startup failure.
 //! - Streams (#157): with `-o -`, stdout's reader going away ends the session with
 //!   `Stopped watching (stdout closed).` and verdict 0, since nothing can receive its
 //!   output any more; a closed stderr only loses the status lines. Once live
