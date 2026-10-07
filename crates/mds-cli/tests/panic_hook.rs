@@ -1530,13 +1530,9 @@ fn the_hook_writes_one_constant_and_nothing_about_the_panic() {
         );
     }
     let plant = |sources: &[(String, String)], file: &str, body: &str| {
-        let mut planted = sources.to_vec();
-        let (_, text) = planted
-            .iter_mut()
-            .find(|(name, _)| name == file)
-            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
-        text.push_str(&format!("\nfn planted() {{\n    {body}\n}}\n"));
-        planted
+        plant_in(sources, file, |text| {
+            text.push_str(&format!("\nfn planted() {{\n    {body}\n}}\n"));
+        })
     };
     let missed: Vec<&str> = [
         (
@@ -1941,34 +1937,20 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         found.join("\n")
     );
 
-    let replaced = |file: &str, from: &str, to: &str| -> Vec<(String, String)> {
-        let mut planted = sources.to_vec();
-        let (_, text) = planted
-            .iter_mut()
-            .find(|(name, _)| name == file)
-            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
-        let changed = text.replacen(from, to, 1);
-        assert_ne!(&changed, text, "precondition: {file} holds {from:?}");
-        *text = changed;
-        planted
+    let replaced = |file: &str, from: &str, to: &str| {
+        plant_in(&sources, file, |text| {
+            let changed = text.replacen(from, to, 1);
+            assert_ne!(&changed, text, "precondition: {file} holds {from:?}");
+            *text = changed;
+        })
     };
-    let appended = |file: &str, body: &str| -> Vec<(String, String)> {
-        let mut planted = sources.to_vec();
-        let (_, text) = planted
-            .iter_mut()
-            .find(|(name, _)| name == file)
-            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
-        text.push_str(&format!("\nfn planted(src: &Path) {{\n    {body}\n}}\n"));
-        planted
+    let appended = |file: &str, body: &str| {
+        plant_in(&sources, file, |text| {
+            text.push_str(&format!("\nfn planted(src: &Path) {{\n    {body}\n}}\n"));
+        })
     };
-    let defined = |file: &str, item: &str| -> Vec<(String, String)> {
-        let mut planted = sources.to_vec();
-        let (_, text) = planted
-            .iter_mut()
-            .find(|(name, _)| name == file)
-            .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
-        text.push_str(&format!("\n{item}\n"));
-        planted
+    let defined = |file: &str, item: &str| {
+        plant_in(&sources, file, |text| text.push_str(&format!("\n{item}\n")))
     };
     let plants = [
         (
@@ -2232,6 +2214,22 @@ fn crate_sources() -> Vec<(String, String)> {
 /// `lint/mod.rs`), with its text.
 fn core_sources() -> Vec<(String, String)> {
     rust_sources("../mds-core/src", "lib.rs", 20)
+}
+
+/// A copy of `sources` with the text of `file` changed by `edit`: a control planted into
+/// the real sources, which are left as they are.
+fn plant_in(
+    sources: &[(String, String)],
+    file: &str,
+    edit: impl FnOnce(&mut String),
+) -> Vec<(String, String)> {
+    let mut planted = sources.to_vec();
+    let (_, text) = planted
+        .iter_mut()
+        .find(|(name, _)| name == file)
+        .unwrap_or_else(|| panic!("precondition: the sources hold {file}"));
+    edit(text);
+    planted
 }
 
 /// Every `.rs` file under `relative` (from this package's directory), by its path below
