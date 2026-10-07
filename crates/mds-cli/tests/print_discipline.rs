@@ -277,8 +277,8 @@
 //!   [`no_raw_print_macro_outside_the_writer`], [`process_exit_only_in_the_funnel`],
 //!   [`terminal_streams_are_opened_only_by_the_writers`] and the three path-sink rules
 //!   prove the real sources are clean. The path-sink rules also count what they found:
-//!   each listed helper's exact calls, at least 150 message sinks and 25 causes, and
-//!   exactly [`WATCH_FAILURE_SITES`] watch-failure messages.
+//!   each listed helper's exact calls, at least [`MESSAGE_SINK_FLOOR`] message sinks and
+//!   [`CAUSE_FLOOR`] causes, and exactly [`WATCH_FAILURE_SITES`] watch-failure messages.
 //! - **Non-vacuity:** the same test asserts the scanner actually found the crate's
 //!   modules, its print sites (crate-wide, and per file for the files in
 //!   [`SITE_FLOORS`]), its interpolations, its `let` bindings, the non-`let` binders that
@@ -852,6 +852,14 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
 /// only as one of these, escaped: `safe_inline(io_cause(&e))`. Bare, it reaches only
 /// [`CAUSE_ESCAPING_CALLS`], which escape the cause themselves.
 const CAUSE_PRODUCERS: &[&str] = &["io_cause", "notify_cause"];
+
+/// The fewest message sinks the path-sink rule must find across mds-cli's sources, so it
+/// cannot pass because the scan read nothing.
+const MESSAGE_SINK_FLOOR: usize = 150;
+
+/// The fewest causes the path-sink rule must find shown through [`CAUSE_PRODUCERS`]: 19
+/// since every write failure, and every removal's, is worded once, in one place (#160).
+const CAUSE_FLOOR: usize = 19;
 
 /// Names taken to hold an error wherever they appear. [`error_names`] adds every name a
 /// file binds to one.
@@ -2260,15 +2268,14 @@ fn messages_interpolate_an_error_only_as_its_cause() {
 
     // Non-vacuity: the scan read the crate's messages and recognised the causes in them.
     assert!(
-        sinks >= 150,
-        "non-vacuity: expected at least 150 message sinks across mds-cli/src, found {sinks}"
+        sinks >= MESSAGE_SINK_FLOOR,
+        "non-vacuity: expected at least {MESSAGE_SINK_FLOOR} message sinks across \
+         mds-cli/src, found {sinks}"
     );
-    // 19 since every write failure, and every removal's, is worded once, in one place
-    // (#160).
     assert!(
-        causes >= 19,
-        "non-vacuity: expected at least 19 causes shown through {CAUSE_PRODUCERS:?}, found \
-         {causes}"
+        causes >= CAUSE_FLOOR,
+        "non-vacuity: expected at least {CAUSE_FLOOR} causes shown through \
+         {CAUSE_PRODUCERS:?}, found {causes}"
     );
     assert!(
         violations.is_empty(),
