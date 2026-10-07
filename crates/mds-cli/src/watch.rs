@@ -4323,17 +4323,42 @@ fn arm_external_dep_dirs<'a>(
     }
 }
 
-/// Once a rebuild has run, arm the directories of the dependencies outside the root that
-/// are not armed — one its compile reported first, and one whose earlier watch failed — so
-/// an edit in one rebuilds at once, not only at an idle tick, which `--poll-interval 0`
-/// never runs (#257). A directory that does not exist is left to the liveness tick, which
-/// arms it when it reappears.
+/// Unwatch every directory outside the root that the watcher holds and that no source
+/// imports from any more — not in `imported` — but the `--vars` file's, which it holds for
+/// that file whatever the sources import. Each leaves `armed_dirs`; an `unwatch` that fails
+/// is ignored, the directory perhaps gone and its watch with it.
+fn unwatch_unimported_dirs(
+    ctx: &DirWatchCtx,
+    watcher: &mut dyn Watcher,
+    liveness: &mut LivenessState,
+    imported: &BTreeSet<PathBuf>,
+) {
+    let unimported: Vec<PathBuf> = liveness
+        .armed_dirs
+        .iter()
+        .filter(|dir| !imported.contains(*dir) && ctx.vars_dir_extra.as_ref() != Some(*dir))
+        .cloned()
+        .collect();
+    for dir in &unimported {
+        let _ = watcher.unwatch(dir);
+        liveness.armed_dirs.remove(dir);
+    }
+}
+
+/// Once a rebuild has run, unwatch the directories outside the root that no source imports
+/// from any more ([`unwatch_unimported_dirs`]), and arm the directories of the dependencies
+/// outside the root that are not armed — one its compile reported first, and one whose
+/// earlier watch failed — so an edit in one rebuilds at once and the watches follow the
+/// imports, not only at an idle tick, which `--poll-interval 0` never runs (#257). A
+/// directory that does not exist is left to the liveness tick, which arms it when it
+/// reappears.
 fn arm_external_dirs_after_rebuild(
     ctx: &DirWatchCtx,
     watcher: &mut dyn Watcher,
     liveness: &mut LivenessState,
     state: &DirWatchState,
 ) {
+    unwatch_unimported_dirs(ctx, watcher, liveness, &state.external_dep_dirs);
     arm_external_dep_dirs(
         state.external_dep_dirs.iter().filter(|dir| dir.exists()),
         &mut liveness.armed_dirs,
@@ -4386,25 +4411,12 @@ fn liveness_probe_dir(
         false
     };
 
-    // Unwatch dirs that were pruned from external_dep_dirs by a previous batch
-    // (issue #2 fix: release OS watches when cross-root @imports are edited away to
-    // prevent inotify/FSEvents watch leaks approaching fs.inotify.max_user_watches).
-    // `armed_dirs` tracks which dirs the OS watcher currently holds so we
-    // can call `unwatch()` precisely on the difference — the `--vars` file's directory
-    // excepted, which it holds for that file whatever the sources import.
-    let dropped_external: Vec<PathBuf> = liveness
-        .armed_dirs
-        .iter()
-        .filter(|d| {
-            !state.external_dep_dirs.contains(*d) && ctx.vars_dir_extra.as_ref() != Some(*d)
-        })
-        .cloned()
-        .collect();
-    for d in &dropped_external {
-        // Non-fatal: dir may have already been deleted.
-        let _ = watcher.unwatch(d);
-        liveness.armed_dirs.remove(d);
-    }
+    // Unwatch dirs that were pruned from external_dep_dirs by a previous batch (issue #2
+    // fix: release OS watches when cross-root @imports are edited away, to prevent
+    // inotify/FSEvents watch leaks approaching fs.inotify.max_user_watches) — the step
+    // every rebuild ends with too ([`arm_external_dirs_after_rebuild`]), so on a tick it
+    // asks nothing of the watcher unless the two disagree.
+    unwatch_unimported_dirs(ctx, watcher, liveness, &state.external_dep_dirs);
 
     // Also clean up any stale entries from missing_external_dirs.
     liveness
@@ -5682,9 +5694,9 @@ fn process_dir_batch_incremental(
         .filter_map(|dep| dep.parent().map(Path::to_path_buf))
         .filter(|parent| !parent.starts_with(root))
         .collect();
-    // Unwatch dirs that are no longer live.
-    // (watcher is not in scope here; callers call liveness_probe_dir which re-arms only
-    // live dirs — stale dirs simply drop off the set and stop being visited each tick.)
+    // The watcher is not in scope here: every rebuild is followed by
+    // `arm_external_dirs_after_rebuild`, which unwatches the dirs no longer live — under
+    // `--poll-interval 0` too, where no liveness tick runs (#257).
     state.external_dep_dirs = live_ext_dirs;
     any_changed
 }
@@ -8974,6 +8986,40 @@ mod tests {
              file's is left as it is"
         );
         assert_eq!(liveness.armed_dirs, BTreeSet::from([shared]));
+    }
+
+    /// #257: the rebuild after which no source imports from a directory outside the root
+    /// any more unwatches it at once — the watches follow what the session imports under
+    /// `--poll-interval 0` too, where no idle tick runs — and leaves the `--vars` file's
+    /// directory and a directory still imported as they are.
+    #[test]
+    fn a_rebuild_unwatches_a_directory_no_source_imports_any_more() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_vars_dir, vars_dir) = canonical_tempdir();
+        let (_kept_dir, kept) = canonical_tempdir();
+        let (_gone_dir, gone) = canonical_tempdir();
+        let vars = vars_dir.join("vars.json");
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+        // The rebuild left one directory imported: the import from the other was edited
+        // away.
+        state.external_dep_dirs.insert(kept.clone());
+        let mut liveness = LivenessState {
+            armed_dirs: BTreeSet::from([vars_dir.clone(), kept.clone(), gone.clone()]),
+            ..idle_liveness()
+        };
+        let mut watcher = RecordingWatcher::default();
+
+        arm_external_dirs_after_rebuild(&ctx, &mut watcher, &mut liveness, &state);
+
+        assert_eq!(
+            watcher.calls,
+            [WatchCall::Unwatch(gone.clone())],
+            "the directory no source imports is unwatched — the positive control — and \
+             nothing else is unwatched or watched"
+        );
+        assert_eq!(liveness.armed_dirs, BTreeSet::from([vars_dir, kept]));
     }
 
     /// #380: an idle tick rebuilds with a `--vars` edit whose event was lost — to an inotify
