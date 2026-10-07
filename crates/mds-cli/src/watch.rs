@@ -468,6 +468,32 @@ pub(crate) fn clear_terminal() {
     }
 }
 
+/// `--clear`'s clear of the terminal ([`clear_terminal`]), asked for by the rebuild an event
+/// runs and made by the first rebuild since that is let print (#380).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PendingClear(bool);
+
+impl PendingClear {
+    /// The rebuild an event runs asks for the clear.
+    fn ask(&mut self) {
+        self.0 = true;
+    }
+
+    /// A rebuild is let print: whether it clears the terminal first — once for every clear
+    /// asked for since the last.
+    #[must_use]
+    fn take(&mut self) -> bool {
+        std::mem::take(&mut self.0)
+    }
+
+    /// Clear the terminal if a rebuild asked for it since the last clear ([`Self::take`]).
+    fn clear_if_asked(&mut self) {
+        if self.take() {
+            clear_terminal();
+        }
+    }
+}
+
 /// Update the watcher to reflect a new set of directories.
 ///
 /// Unwatch directories no longer needed, watch newly required ones; a directory that
@@ -2417,6 +2443,8 @@ struct FileWatchState {
     last_mtimes: StampMap,
     /// The rebuild held while a file of interest is empty (#380).
     hold: EmptyHold,
+    /// The `--clear` an event's rebuild asked for, not made yet (#380).
+    clear: PendingClear,
     /// What this session last wrote, by where it wrote it: what a later write may skip as
     /// unchanged, and the bytes a removal or a write after a change of kind asks the file
     /// to still hold (#160). An entry goes with its file, so a file kept — changed, or a
@@ -2538,13 +2566,15 @@ fn liveness_probe_file(
 /// Classify an incoming `Msg` for single-file mode.
 ///
 /// Returns the action the loop should take: skip irrelevant messages, stop on
-/// Ctrl+C, or proceed to rebuild after draining the debounce window.
+/// Ctrl+C, or proceed to rebuild after draining the debounce window — with `--clear`,
+/// that rebuild asks for the terminal to be cleared (`pending`).
 fn handle_fs_event_file(
     msg: Msg,
     foi: &HashSet<PathBuf>,
     rx: &mpsc::Receiver<Msg>,
     debounce_ms: u64,
     clear: bool,
+    pending: &mut PendingClear,
 ) -> FileEventAction {
     let interrupted = match msg {
         Msg::Interrupt => true,
@@ -2579,9 +2609,10 @@ fn handle_fs_event_file(
         return FileEventAction::Stop;
     }
 
-    // Clear terminal if requested (only when stderr is a TTY).
+    // The terminal is cleared, if requested (only when stderr is a TTY), by the rebuild that
+    // is let print (#380).
     if clear {
-        clear_terminal();
+        pending.ask();
     }
 
     FileEventAction::Rebuild
@@ -2615,7 +2646,9 @@ fn handle_fs_event_file(
 /// ([`baseline_over`]), so a file truncated after the compile read it whole is found
 /// emptied by the next rebuild too. `due` is the hold's
 /// deadline when that deadline runs this rebuild, which then ends the hold
-/// ([`not_before`]); `None` for an event or a tick.
+/// ([`not_before`]); `None` for an event or a tick. A held rebuild prints nothing, the
+/// `--clear` its event asked for included: the first rebuild no hold holds back makes it,
+/// before anything it prints ([`PendingClear`]).
 ///
 /// # Invariants preserved
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output, by
@@ -2695,6 +2728,7 @@ fn rebuild_file(
                 settle(SettleInto::File(state), None, Settle::Defer);
                 return ControlFlow::Continue(());
             }
+            state.clear.clear_if_asked();
             settle(SettleInto::File(state), Some(e), Settle::Rebaseline);
             return ControlFlow::Continue(());
         }
@@ -2722,6 +2756,7 @@ fn rebuild_file(
                 settle(SettleInto::File(state), None, Settle::Defer);
                 return ControlFlow::Continue(());
             }
+            state.clear.clear_if_asked();
             settle(
                 SettleInto::File(state),
                 failure.unreported(),
@@ -2743,6 +2778,8 @@ fn rebuild_file(
         settle(SettleInto::File(state), None, Settle::Defer);
         return ControlFlow::Continue(());
     }
+    // No hold holds the rebuild back any more: it may print, so `--clear` clears first.
+    state.clear.clear_if_asked();
 
     // Freshness rule: always recompute dep set from fresh output — before the output's
     // route is admitted, so the files a compile read are watched even when its output is
@@ -3143,8 +3180,8 @@ mod file_startup {
         handle_fs_event_file, live, liveness_probe_file, rebuild_file, settle_startup_error,
         shown_watched_dir, snapshot_state, startup_race_probe, vars_dir_paths, written_path,
         CompileWriteOutcome, EmptyHold, FileCompileCtx, FileEventAction, FileWatchState, Msg,
-        OutDirAnchor, OutputKey, OutputRoute, SessionArgs, StampMap, StartupInto, StopReason,
-        WatchedPath, WorkingDir,
+        OutDirAnchor, OutputKey, OutputRoute, PendingClear, SessionArgs, StampMap, StartupInto,
+        StopReason, WatchedPath, WorkingDir,
     };
 
     /// The session's first watches armed and its first baseline taken, before anything is
@@ -3623,6 +3660,7 @@ mod file_startup {
             foi,
             last_mtimes,
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             last_written,
             written_to,
             kept: None,
@@ -3706,7 +3744,15 @@ mod file_startup {
         }
 
         fn on_message(&mut self, msg: Msg, rx: &mpsc::Receiver<Msg>) -> ControlFlow<StopReason> {
-            match handle_fs_event_file(msg, &self.state.foi, rx, self.debounce_ms, self.clear) {
+            let action = handle_fs_event_file(
+                msg,
+                &self.state.foi,
+                rx,
+                self.debounce_ms,
+                self.clear,
+                &mut self.state.clear,
+            );
+            match action {
                 FileEventAction::Skip => ControlFlow::Continue(()),
                 FileEventAction::Stop => ControlFlow::Break(StopReason::Interrupted),
                 FileEventAction::Rebuild => {
@@ -3772,6 +3818,8 @@ struct DirWatchState {
     last_mtimes: StampMap,
     /// The rebuild held while a watched file is empty (#380).
     hold: EmptyHold,
+    /// The `--clear` an event's batch asked for, not made yet (#380).
+    clear: PendingClear,
     /// What the batches held back carried, rebuilt with the batch that ends the hold — and
     /// what a batch the `--vars` file could not be read for carried, rebuilt with the next
     /// batch (#380).
@@ -4682,7 +4730,9 @@ fn liveness_probe_dir(
 /// stays emptied in the baseline the batch leaves, so the rebuild its own events start is
 /// held; only a file the deadline compiles as it is is taken in empty. `due` is
 /// the hold's deadline when that deadline runs this rebuild, which then ends the hold
-/// ([`not_before`]); `None` for an event or a tick.
+/// ([`not_before`]); `None` for an event or a tick. A held batch prints nothing, the
+/// `--clear` its event asked for included: the first batch no hold holds back makes it,
+/// before anything it prints ([`PendingClear`]).
 /// The vars file is then reloaded (freshness rule), and a
 /// failure to read it is reported and settled: it may be temporarily absent (AC-W7 /
 /// AC-C5). `--set`/`--set-string` are fixed for the session and warned once at startup —
@@ -4754,12 +4804,16 @@ fn rebuild_dir_batch(
             // a source created while the vars file cannot be read is in no other record,
             // so the batch that reads the file again would leave it unbuilt.
             state.held.hold(&batch, vars_changed);
+            state.clear.clear_if_asked();
             // Re-baseline so the idle-tick content backstop does not report the same
             // change again and turn one unreadable vars file into per-tick error spam.
             settle(SettleInto::Dir(state), Some(e), Settle::Rebaseline);
             return;
         }
     };
+    // No hold holds the batch back any more: it may print, so `--clear` clears first. A
+    // source its compile finds a file emptied for is held alone, the others printing.
+    state.clear.clear_if_asked();
 
     // `process_dir_batch` takes the map by reference, so borrow `resolved.vars`
     // directly rather than cloning it — `resolved` (and its `.vars_file`,
@@ -4877,8 +4931,10 @@ fn handle_fs_event_dir(
         return DirEventOutcome::Skip; // Nothing relevant changed.
     }
 
+    // The terminal is cleared, if requested (only when stderr is a TTY), by the rebuild that
+    // is let print (#380).
     if ctx.clear {
-        clear_terminal();
+        state.clear.ask();
     }
 
     rebuild_dir_batch(ctx, &mds_changed, vars_changed, state, None);
@@ -4944,7 +5000,8 @@ mod dir_startup {
         liveness_probe_dir, rebuild_dir_batch, resolve_output_base, settle_startup_error,
         shown_watched_dir, snapshot_state, startup_race_probe, DirEventOutcome, DirWatchCtx,
         DirWatchState, EmptyHold, FileStamp, HeldBatch, LivenessState, Msg, OutDirAnchor,
-        SessionArgs, StampMap, StartupInto, StopReason, WatchedPath, WorkingDir, MAX_COLLECT_DEPTH,
+        PendingClear, SessionArgs, StampMap, StartupInto, StopReason, WatchedPath, WorkingDir,
+        MAX_COLLECT_DEPTH,
     };
 
     /// The root armed recursively, and the `--vars` file's directory outside it, before the
@@ -5245,6 +5302,7 @@ mod dir_startup {
             vars_file: vars_path.clone(),
             last_mtimes: HashMap::new(),
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             held: HeldBatch::default(),
         };
 
@@ -7749,6 +7807,7 @@ mod tests {
             vars_file: None,
             last_mtimes: HashMap::new(),
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             held: HeldBatch::default(),
         };
         state.known_files.insert(importer.clone());
@@ -7792,6 +7851,7 @@ mod tests {
             vars_file: None,
             last_mtimes: HashMap::new(),
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             held: HeldBatch::default(),
         };
         state.record_success(&importer, vec![external.clone()], &root, None, None);
@@ -7858,6 +7918,7 @@ mod tests {
             vars_file: None,
             last_mtimes: HashMap::new(),
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             held: HeldBatch::default(),
         };
         state.known_files.insert(victim.clone());
@@ -8026,6 +8087,7 @@ mod tests {
             vars_file: None,
             last_mtimes: HashMap::new(),
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             held: HeldBatch::default(),
         };
         let src = PathBuf::from("/w/root/broken.mds");
@@ -8425,6 +8487,7 @@ mod tests {
             vars_file: None,
             last_mtimes: HashMap::new(),
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             held: HeldBatch::default(),
         }
     }
@@ -8437,6 +8500,7 @@ mod tests {
             foi,
             last_mtimes: HashMap::new(),
             hold: EmptyHold::Off,
+            clear: PendingClear(false),
             last_written: HashMap::new(),
             written_to: None,
             kept: None,
@@ -9471,6 +9535,213 @@ mod tests {
             "positive control: the directory searchable again, the output is removed and \
              its record goes"
         );
+    }
+
+    /// #380: `--clear`'s clear asked for is made once, by the first rebuild let print since;
+    /// one never asked for is never made.
+    #[test]
+    fn a_clear_asked_for_is_made_once() {
+        let mut pending = PendingClear::default();
+        assert!(!pending.take(), "nothing asked for: nothing is cleared");
+        pending.ask();
+        pending.ask();
+        assert!(pending.take(), "asked for: the terminal is cleared");
+        assert!(!pending.take(), "and once only");
+    }
+
+    /// #380: a file-mode event's rebuild asks for `--clear`'s clear only under `--clear`.
+    #[test]
+    fn a_file_event_s_rebuild_asks_for_the_clear_only_under_clear() {
+        let (_dir, root) = canonical_tempdir();
+        let entry = root.join("page.mds");
+        let foi: HashSet<PathBuf> = std::iter::once(entry.clone()).collect();
+        let (_tx, rx) = mpsc::channel::<Msg>();
+        for clear in [false, true] {
+            let mut pending = PendingClear::default();
+            let action = handle_fs_event_file(
+                modify_event(entry.to_str().unwrap()),
+                &foi,
+                &rx,
+                0,
+                clear,
+                &mut pending,
+            );
+            assert!(
+                matches!(action, FileEventAction::Rebuild),
+                "control: the event rebuilds"
+            );
+            assert_eq!(pending, PendingClear(clear), "--clear: {clear}");
+        }
+    }
+
+    /// #380: a file-mode rebuild held while a file is empty — found so by its look, or by its
+    /// compile after the look — prints nothing, the clear `--clear` asked for included: it
+    /// leaves that clear to the rebuild that ends the hold, which makes it — the hold's
+    /// deadline, or the first rebuild that finds the file written. (The module the compile
+    /// reads emptied is one the look does not stat, so its hold ends when it is written.)
+    #[test]
+    fn a_held_file_rebuild_leaves_the_clear_to_the_rebuild_that_ends_the_hold() {
+        let (_dir, root) = canonical_tempdir();
+        let (entry, module, out) = (
+            root.join("page.mds"),
+            root.join("_inc.mds"),
+            root.join("page.md"),
+        );
+        let mut watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default())
+                .unwrap();
+        for held_by in ["its look", "its compile"] {
+            std::fs::write(
+                &entry,
+                "@import \"./_inc.mds\" as inc\nPage.\n@include inc\n",
+            )
+            .unwrap();
+            std::fs::write(&module, "Inc.\n").unwrap();
+            let mut state = file_state(std::iter::once(entry.clone()).collect());
+            state.output = OutputRoute::Named(Some(WriteTarget::as_typed(out.clone())));
+            state.last_mtimes = snapshot_state(&state.foi);
+            if held_by == "its look" {
+                std::fs::write(&entry, "").unwrap();
+            } else {
+                // The included module, which the look does not stat, read emptied.
+                std::fs::write(&module, "").unwrap();
+                state.last_mtimes.insert(module.clone(), (None, Some(5)));
+            }
+            state.clear.ask();
+            let _ = rebuild_file(&file_ctx(&entry), &mut watcher, &mut state, None);
+            assert!(
+                state.hold.deadline().is_some(),
+                "{held_by}: control: the rebuild is held"
+            );
+            assert_eq!(
+                state.clear,
+                PendingClear(true),
+                "{held_by}: a held rebuild leaves the clear asked for"
+            );
+
+            let due = if held_by == "its look" {
+                state.hold.deadline()
+            } else {
+                std::fs::write(&module, "Inc.\n").unwrap();
+                None
+            };
+            let _ = rebuild_file(&file_ctx(&entry), &mut watcher, &mut state, due);
+            assert_eq!(
+                state.hold.deadline(),
+                None,
+                "{held_by}: control: the hold ends"
+            );
+            assert_eq!(
+                state.clear,
+                PendingClear(false),
+                "{held_by}: the rebuild that ends the hold makes the clear"
+            );
+        }
+    }
+
+    /// #380: a rebuild no hold holds back that reports a failure — a `--vars` file it cannot
+    /// read, in either mode, or a compile that fails — makes the clear `--clear` asked for
+    /// before its report.
+    #[test]
+    fn a_rebuild_that_reports_a_failure_makes_the_clear() {
+        let (_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (entry, vars) = (root.join("page.mds"), root.join("vars.json"));
+        let mut watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default())
+                .unwrap();
+        for failure in ["the --vars file", "the compile"] {
+            std::fs::write(&entry, "Page {{v}}\n").unwrap();
+            let vars_text = if failure == "the --vars file" {
+                r#"{"v": "#
+            } else {
+                r#"{"w": "one"}"#
+            };
+            std::fs::write(&vars, vars_text).unwrap();
+            let ctx = FileCompileCtx {
+                vars_path: Some(vars.clone()),
+                vars_path_typed: Some(vars.clone()),
+                ..file_ctx(&entry)
+            };
+            let mut state = file_state([entry.clone(), vars.clone()].into_iter().collect());
+            state.last_mtimes = snapshot_state(&state.foi);
+            state.clear.ask();
+            let _ = rebuild_file(&ctx, &mut watcher, &mut state, None);
+            assert!(
+                state.hold.deadline().is_none(),
+                "file mode, {failure}: control: nothing is held"
+            );
+            assert_eq!(
+                state.clear,
+                PendingClear(false),
+                "file mode, {failure}: the rebuild that reports it makes the clear"
+            );
+        }
+
+        std::fs::write(&vars, r#"{"v": "#).unwrap();
+        let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+        state.known_files.insert(entry.clone());
+        state.clear.ask();
+        rebuild_dir_batch(&ctx, &BTreeSet::new(), true, &mut state, None);
+        assert!(
+            state.hold.deadline().is_none() && state.held.vars_changed,
+            "directory mode: control: the batch is kept for the next, not held"
+        );
+        assert_eq!(
+            state.clear,
+            PendingClear(false),
+            "directory mode, the --vars file: the batch that reports it makes the clear"
+        );
+    }
+
+    /// #380: a directory batch held while a watched file is empty prints nothing, the clear
+    /// its event asked for under `--clear` included: it leaves that clear to the batch that
+    /// ends the hold, which makes it. Without `--clear`, no event asks for one.
+    #[test]
+    fn a_held_directory_batch_leaves_the_clear_to_the_batch_that_ends_the_hold() {
+        for clear in [false, true] {
+            let (_root_dir, root) = canonical_tempdir();
+            let (_out_dir, out) = canonical_tempdir();
+            let (a, x) = (root.join("a.mds"), root.join("x.mds"));
+            std::fs::write(&a, "A one\n").unwrap();
+            std::fs::write(&x, "X one\n").unwrap();
+            let ctx = DirWatchCtx {
+                clear,
+                ..dir_ctx(&root, &out)
+            };
+            let mut state = empty_dir_state();
+            state.known_files.extend([a.clone(), x.clone()]);
+            state.last_mtimes = snapshot_state(&state.watched_set());
+
+            // x emptied: the batch of a's event is held.
+            std::fs::write(&x, "").unwrap();
+            let (_tx, rx) = mpsc::channel::<Msg>();
+            let outcome =
+                handle_fs_event_dir(modify_event(a.to_str().unwrap()), &ctx, &rx, &mut state);
+            assert!(
+                matches!(outcome, DirEventOutcome::Done) && state.hold.deadline().is_some(),
+                "--clear: {clear}: control: the event's batch is held"
+            );
+            assert_eq!(
+                state.clear,
+                PendingClear(clear),
+                "--clear: {clear}: the held batch leaves the clear its event asked for"
+            );
+
+            // x written: the next batch ends the hold.
+            std::fs::write(&x, "X two\n").unwrap();
+            rebuild_dir_batch(&ctx, &BTreeSet::new(), false, &mut state, None);
+            assert_eq!(
+                state.hold.deadline(),
+                None,
+                "--clear: {clear}: control: the hold ends"
+            );
+            assert_eq!(
+                state.clear,
+                PendingClear(false),
+                "--clear: {clear}: the batch that ends the hold makes the clear"
+            );
+        }
     }
 
     /// A watch that fails, as notify reports one the OS refused.
