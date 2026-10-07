@@ -3815,7 +3815,7 @@ struct DirWatchState {
     /// source is, and the idle tick looks for a change to it as to a source's (#380).
     vars_file: Option<PathBuf>,
     /// `(mtime, size)` baseline over [`DirWatchState::baselined_paths`] — sources,
-    /// dependencies, the `--vars` file and the paths held back. Read by the idle tick's
+    /// dependencies, the `--vars` file and the sources held back. Read by the idle tick's
     /// content backstop over the watched set, and by a batch to tell a file emptied since
     /// (#380); re-written at the end of every batch, so the tick reports only what the
     /// batch did not already handle (#321).
@@ -3843,14 +3843,33 @@ struct DirWatchState {
 struct HeldBatch {
     /// The paths of the batches held back.
     paths: BTreeSet<PathBuf>,
+    /// The sources of the watch among them ([`names_a_source`]): of the paths held back, the
+    /// ones the run reads that the watched files may not hold yet — a source no compile has
+    /// read, or none has succeeded on — and so the ones the look stamps and the baseline keeps
+    /// (#380). A path held back that the run reads otherwise is a watched file already; one
+    /// nothing reads — a `.mds` file beside a dependency outside the root that no source
+    /// imports — is rebuilt with the batch that ends the hold, but never stamped, so its
+    /// emptying holds nothing.
+    sources: BTreeSet<PathBuf>,
     /// Whether one of them changed the `--vars` file.
     vars_changed: bool,
 }
 
 impl HeldBatch {
-    /// Hold `paths` back, with `vars_changed`, beside the batches held before them.
-    fn hold<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>, vars_changed: bool) {
-        self.paths.extend(paths.into_iter().cloned());
+    /// Hold `paths` back, with `vars_changed`, beside the batches held before them; those that
+    /// are sources of the watch below `root` are kept as [`HeldBatch::sources`] too.
+    fn hold<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+        vars_changed: bool,
+        root: &Path,
+    ) {
+        for path in paths {
+            if names_a_source(root, path) {
+                self.sources.insert(path.clone());
+            }
+            self.paths.insert(path.clone());
+        }
         self.vars_changed |= vars_changed;
     }
 
@@ -4013,7 +4032,7 @@ impl DirWatchState {
         self.tracked_paths().cloned().collect()
     }
 
-    /// The watched files: with the paths held back ([`Self::baselined_paths`]), every path
+    /// The watched files: with the sources held back ([`Self::baselined_paths`]), every path
     /// whose emptying holds a batch back and the domain of the `last_mtimes` baseline (#380);
     /// alone, the domain of the idle tick's content backstop. [`Self::tracked_paths`] and the
     /// `--vars` file, which every compile reads — so a change to the vars file whose event
@@ -4030,12 +4049,14 @@ impl DirWatchState {
     }
 
     /// The domain of the `last_mtimes` baseline (#380): [`Self::watched_paths`] and the
-    /// paths of the batches held back ([`HeldBatch`]) — a source a batch named before any
-    /// compile of it succeeded, which its compile held, among them — so a source held keeps
-    /// the stamp the look that named it took, and one emptied before the batch that ends the
-    /// hold is found emptied by that batch's look, as a source the session compiled is.
+    /// sources of the batches held back ([`HeldBatch::sources`]) — a source a batch named
+    /// before any compile of it succeeded, which its compile held, among them — so a source
+    /// held keeps the stamp the look that named it took, and one emptied before the batch that
+    /// ends the hold is found emptied by that batch's look, as a source the session compiled
+    /// is. Every file in it is one the run reads: a path held back that nothing reads is no
+    /// part of it, so its emptying holds nothing.
     fn baselined_paths(&self) -> impl Iterator<Item = &PathBuf> {
-        self.watched_paths().chain(&self.held.paths)
+        self.watched_paths().chain(&self.held.sources)
     }
 
     /// Take the baseline over [`Self::baselined_paths`] again, from the stamps the batch's
@@ -4308,7 +4329,7 @@ fn compile_one_source(
                     if let Some(kept) = kept_before {
                         state.kept.insert(source.clone(), kept);
                     }
-                    state.held.hold([&source], false);
+                    state.held.hold([&source], false, root);
                     return;
                 }
                 // The rebuild of `src` before this one kept the same from being written
@@ -4431,7 +4452,7 @@ fn compile_one_source(
                 if let Some(kept) = kept_before {
                     state.kept.insert(source.clone(), kept);
                 }
-                state.held.hold([&source], false);
+                state.held.hold([&source], false, root);
                 return;
             }
             failure.into_report()
@@ -4785,11 +4806,14 @@ fn liveness_probe_dir(
 /// ([`join_emptied`]), so that batch rebuilds it. A source whose compile read a file
 /// emptied after the look is held the same way, alone, whether the compile then failed or
 /// not ([`compile_one_source`]), and a `--vars` load that failed on the file emptied after
-/// the look holds the whole batch. The look stamps the watched files, the paths the batch
-/// names, those of the batches held back and the sources whose last compile failed, which
-/// a batch with a change compiles again without naming them, so a source no compile has
-/// read yet, or none has succeeded on, is stamped before its compile reads it, and one its
-/// compile holds keeps that stamp ([`DirWatchState::baselined_paths`]). The batch takes the look's stamps as its baseline
+/// the look holds the whole batch. The look stamps the files the run reads: the watched
+/// files, and the sources ([`names_a_source`]) the batch names, those of the batches held
+/// back and those whose last compile failed, which a batch with a change compiles again
+/// without naming them. So a source no compile has read yet, or none has succeeded on, is
+/// stamped before its compile reads it, and one its compile holds keeps that stamp
+/// ([`DirWatchState::baselined_paths`]); a path nothing reads — a `.mds` file beside a
+/// dependency outside the root that no source imports — is not stamped, and its emptying
+/// holds nothing. The batch takes the look's stamps as its baseline
 /// before it reads anything, and keeps them however it ends ([`baseline_over`]) — at its
 /// end, or when its `--vars` load fails ([`Settle::Rebaseline`]): a file emptied while
 /// the batch runs, after its look, that no compile read empty — read whole before, or not
@@ -4821,17 +4845,17 @@ fn rebuild_dir_batch(
     ctx.working_dir.restore_if_recreated();
 
     // #380: a watched file emptied holds the whole batch back, and joins it. The look stamps
-    // each file once — the watched files, the paths held back, the paths the batch names, a
-    // source no compile has read yet included, and the sources a failed compile left
-    // errored, which the batch compiles again without naming them — and its stamps are the
-    // batch's baseline if it runs, so no source the batch compiles is stamped after its
-    // compile read it.
+    // each file the run reads once — the watched files, the sources held back, and the
+    // sources the batch names, a source no compile has read yet included, or a failed
+    // compile left errored, which the batch compiles again without naming them — and its
+    // stamps are the batch's baseline if it runs, so no source the batch compiles is stamped
+    // after its compile read it. A path nothing reads is not stamped, and holds nothing.
     let root = ctx.root.canonical.as_path();
-    let retried = state
-        .errored
+    let sources = batch
         .iter()
+        .chain(&state.errored)
         .filter(|path| names_a_source(root, path));
-    let look = look_at(state.baselined_paths().chain(batch).chain(retried));
+    let look = look_at(state.baselined_paths().chain(sources));
     let emptied: BTreeSet<PathBuf> = emptied_in(&look, &state.last_mtimes).cloned().collect();
     let verdict = state
         .hold
@@ -4843,7 +4867,7 @@ fn rebuild_dir_batch(
     let (batch, vars_changed) =
         join_emptied(batch, vars_changed, &emptied, state.vars_file.as_deref());
     if verdict == HoldVerdict::Hold {
-        state.held.hold(&batch, vars_changed);
+        state.held.hold(&batch, vars_changed, root);
         settle(SettleInto::Dir(state), None, Settle::Defer);
         return;
     }
@@ -4872,14 +4896,16 @@ fn rebuild_dir_batch(
             {
                 let (batch, vars_changed) =
                     join_emptied(&batch, vars_changed, &emptied, state.vars_file.as_deref());
-                state.held.hold(&batch, vars_changed);
+                state.held.hold(&batch, vars_changed, root);
                 settle(SettleInto::Dir(state), None, Settle::Defer);
                 return;
             }
             // Keep the batch, as a held one is kept, for the next batch to rebuild (#380):
             // a source created while the vars file cannot be read is in no other record,
-            // so the batch that reads the file again would leave it unbuilt.
-            state.held.hold(&batch, vars_changed);
+            // so the batch that reads the file again would leave it unbuilt. The look's
+            // stamps of its sources are kept with it; a path it named that nothing reads is
+            // rebuilt but not stamped, so its emptying holds nothing.
+            state.held.hold(&batch, vars_changed, root);
             state.clear.clear_if_asked();
             // Re-baseline so the idle-tick content backstop does not report the same
             // change again and turn one unreadable vars file into per-tick error spam.
@@ -7369,17 +7395,24 @@ mod tests {
 
     /// A directory-mode hold keeps every batch it holds back, and the batch that ends it
     /// rebuilds them all with its own — a vars-file change among them makes it a full
-    /// rebuild — leaving nothing held.
+    /// rebuild — leaving nothing held. Of the paths held, the sources below the root are kept
+    /// as such, the ones the look stamps (#380); a path outside it that no source imports is
+    /// rebuilt all the same, but is none.
     #[test]
     fn held_batches_are_rebuilt_with_the_batch_that_ends_the_hold() {
         let paths =
             |names: &[&str]| -> BTreeSet<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        let root = Path::new("/w");
         let mut held = HeldBatch::default();
-        held.hold(&paths(&["/w/b.mds"]), false);
-        held.hold(&paths(&["/w/a.mds", "/w/b.mds"]), true);
+        held.hold(&paths(&["/w/b.mds", "/x/unread.mds"]), false, root);
+        held.hold(&paths(&["/w/a.mds", "/w/b.mds"]), true, root);
+        assert_eq!(held.sources, paths(&["/w/a.mds", "/w/b.mds"]));
         assert_eq!(
             held.release(&paths(&["/w/a.mds", "/w/c.mds"]), false),
-            (paths(&["/w/a.mds", "/w/b.mds", "/w/c.mds"]), true)
+            (
+                paths(&["/w/a.mds", "/w/b.mds", "/w/c.mds", "/x/unread.mds"]),
+                true
+            )
         );
         assert_eq!(held, HeldBatch::default(), "nothing stays held");
         assert_eq!(
@@ -10388,6 +10421,68 @@ mod tests {
             read()
         );
         assert_eq!(state.hold.deadline(), None, "the hold has ended");
+    }
+
+    /// #380: a directory batch whose `--vars` file cannot be read keeps what it named for the
+    /// next batch, with the stamps its look took of the files the run reads. A `.mds` file in
+    /// the directory of a dependency outside the root that no source imports is read by
+    /// nothing: its event names it, but its emptying holds nothing, and the next batch
+    /// compiles at once. A source the failed batch named, which no compile has read yet, is
+    /// read by the run: emptied, it holds the next batch (the control).
+    #[test]
+    fn a_file_nothing_reads_named_by_a_batch_its_vars_file_failed_holds_nothing_when_emptied() {
+        for (label, read_by_the_run) in [("a new source", true), ("a file nothing reads", false)] {
+            let CrossRootPage {
+                dirs: _dirs,
+                base: _,
+                out,
+                page: _,
+                module: _,
+                shared,
+                vars,
+                ctx,
+                mut state,
+            } = cross_root_page();
+            let named = if read_by_the_run {
+                ctx.root.canonical.join("n.mds")
+            } else {
+                shared.join("unread.mds")
+            };
+            let batch = BTreeSet::from([named.clone()]);
+            std::fs::write(&named, "Named\n").unwrap();
+            std::fs::write(&vars, "{").unwrap();
+            rebuild_dir_batch(&ctx, &batch, false, &mut state, None);
+            assert!(
+                state.held.paths.contains(&named) && state.hold.deadline().is_none(),
+                "{label}: control: the batch the vars file could not be read for keeps what it \
+                 named, and holds nothing; {:?}",
+                state.held
+            );
+
+            // Emptied, and the vars file written again with a new value: one batch of both.
+            std::fs::write(&named, "").unwrap();
+            std::fs::write(&vars, r#"{"v": "two"}"#).unwrap();
+            rebuild_dir_batch(&ctx, &batch, true, &mut state, None);
+            let page_md = std::fs::read_to_string(out.join("page.md")).ok();
+            if read_by_the_run {
+                assert!(
+                    state.hold.deadline().is_some()
+                        && page_md.as_deref().is_some_and(|text| !text.contains("two")),
+                    "{label}: positive control: emptied, it holds the batch; out/page.md: \
+                     {page_md:?}"
+                );
+            } else {
+                assert_eq!(
+                    state.hold.deadline(),
+                    None,
+                    "{label}: emptied, it holds nothing"
+                );
+                assert!(
+                    page_md.as_deref().is_some_and(|text| text.contains("two")),
+                    "{label}: the batch compiles at once; out/page.md: {page_md:?}"
+                );
+            }
+        }
     }
 
     /// #380: a file found emptied after a rebuild looked holds it as the look would have —
