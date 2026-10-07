@@ -997,16 +997,24 @@ mod default_output {
         session.0.try_wait().expect("poll the session").is_none()
     }
 
-    /// Wait until `path` holds `text`, within [`WATCH_STEP`].
-    fn wait_for_file(path: &Path, text: &str) -> bool {
+    /// Wait until `path` holds `text`, within [`WATCH_STEP`]; when it does not, `what`
+    /// fails, said with what the file holds by then and the watcher's `stderr` so far —
+    /// where a write it could not make, or anything else it printed, shows.
+    #[track_caller]
+    fn assert_file_comes_to_hold(path: &Path, text: &str, stderr: &PipeTap, what: &str) {
         let deadline = Instant::now() + WATCH_STEP;
         loop {
-            if std::fs::read_to_string(path).is_ok_and(|now| now == text) {
-                return true;
+            let now = std::fs::read_to_string(path);
+            if now.as_deref().is_ok_and(|now| now == text) {
+                return;
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: {} did not come to hold {text:?} within {WATCH_STEP:?} (it holds \
+                 {now:?}); the watcher's stderr so far:\n{}",
+                path.display(),
+                stderr.text()
+            );
             std::thread::sleep(POLL);
         }
     }
@@ -1041,11 +1049,13 @@ mod default_output {
         std::fs::write(&source, "Hello\n").expect("write x.mds");
         let (mut control, stderr) = watch_live(control_dir.path(), &["x.mds"], None);
         let output = control_dir.path().join("x.md");
-        assert!(wait_for_file(&output, "Hello\n"), "control: the output");
+        assert_file_comes_to_hold(&output, "Hello\n", &stderr, "control: the output");
         write_atomic(&source, "Hello again\n");
-        assert!(
-            wait_for_file(&output, "Hello again\n"),
-            "control: the edit rebuilds"
+        assert_file_comes_to_hold(
+            &output,
+            "Hello again\n",
+            &stderr,
+            "control: the edit rebuilds",
         );
         assert_eq!(stderr.finish_text(&mut control), "", "control: --quiet");
 
@@ -1094,15 +1104,19 @@ mod default_output {
         let d = control_dir.path().join("d");
         let (mut control, stderr) = watch_live(control_dir.path(), &["d"], None);
         for name in ["a", "b"] {
-            assert!(
-                wait_for_file(&d.join(format!("{name}.md")), &format!("Hello {name}\n")),
-                "control: {name}.md"
+            assert_file_comes_to_hold(
+                &d.join(format!("{name}.md")),
+                &format!("Hello {name}\n"),
+                &stderr,
+                &format!("control: {name}.md"),
             );
         }
         write_atomic(&d.join("b.mds"), "Hello again b\n");
-        assert!(
-            wait_for_file(&d.join("b.md"), "Hello again b\n"),
-            "control: the edit rebuilds"
+        assert_file_comes_to_hold(
+            &d.join("b.md"),
+            "Hello again b\n",
+            &stderr,
+            "control: the edit rebuilds",
         );
         assert_eq!(stderr.finish_text(&mut control), "", "control: --quiet");
 
@@ -1110,14 +1124,18 @@ mod default_output {
         let d = dir.path().join("d");
         let (mut session, stderr) = watch_live(dir.path(), &["d"], Some("compile:a"));
         wait_for_tap_count(&stderr, ICE_TEXT, 1, WATCH_STEP);
-        assert!(
-            wait_for_file(&d.join("b.md"), "Hello b\n"),
-            "the startup compiles the other source"
+        assert_file_comes_to_hold(
+            &d.join("b.md"),
+            "Hello b\n",
+            &stderr,
+            "the startup compiles the other source",
         );
         write_atomic(&d.join("b.mds"), "Hello again b\n");
-        assert!(
-            wait_for_file(&d.join("b.md"), "Hello again b\n"),
-            "an edit after the panic rebuilds"
+        assert_file_comes_to_hold(
+            &d.join("b.md"),
+            "Hello again b\n",
+            &stderr,
+            "an edit after the panic rebuilds",
         );
         assert!(
             running(&mut session),
@@ -1273,14 +1291,18 @@ mod default_output {
         for watched in [Watched::File, Watched::Directory] {
             let fixture = WatchFixture::new(watched);
             let (mut control, stderr) = watch_live(fixture.dir(), fixture.args(), None);
-            assert!(
-                wait_for_file(&fixture.output_file(), "Hello\n"),
-                "control ({watched:?})"
+            assert_file_comes_to_hold(
+                &fixture.output_file(),
+                "Hello\n",
+                &stderr,
+                &format!("control ({watched:?})"),
             );
             write_atomic(&fixture.source(), "Hello again\n");
-            assert!(
-                wait_for_file(&fixture.output_file(), "Hello again\n"),
-                "control ({watched:?}): the edit reaches the callback"
+            assert_file_comes_to_hold(
+                &fixture.output_file(),
+                "Hello again\n",
+                &stderr,
+                &format!("control ({watched:?}): the edit reaches the callback"),
             );
             assert_eq!(
                 stderr.finish_text(&mut control),
