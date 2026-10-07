@@ -19,8 +19,9 @@
 //! proven. A raw `std::fs::write` — or a raw `create_dir_all`, `create_dir`, `mkdirat`,
 //! `openat`, `rename`, `renameat`, `renameat_with`, `linkat`, `unlinkat`, path-based
 //! `fs::set_permissions`, `remove_file`, `fs::copy`, `hard_link`, `remove_dir` or
-//! `remove_dir_all`, or tempfile's `tempfile_in`, `persist` or `persist_noclobber` — at
-//! any *one* remaining site
+//! `remove_dir_all`, or tempfile's `tempfile_in`, `persist` or `persist_noclobber`, or a
+//! symlink made with `fs::symlink`, `symlinkat`, `soft_link`, `symlink_file` or
+//! `symlink_dir` — at any *one* remaining site
 //! silently forfeits all of that for the artifact it touches, and "did we remember every
 //! write site?" is an unbounded search that three reviewers can each answer differently.
 //! This test converts it into a machine-checked invariant: a raw write in
@@ -44,9 +45,13 @@
 //!   `.append(true)`, a file that may already exist — and then writes. Needling
 //!   `OpenOptions::new(` was rejected deliberately: it would fire on read-only opens too,
 //!   and an allow-list full of read-only entries is an allow-list nobody reads.
-//! - A symlink made with `symlink(` (`std::os::unix::fs::symlink`), or on Windows with
-//!   `symlink_file(` or `symlink_dir(`: the bare name is part of `is_symlink(`, which the
-//!   crate calls to read a file's type, so a needle on it fires on reads.
+//! - A symlink made by the bare name `symlink(`, imported with
+//!   `use std::os::unix::fs::symlink;`: the bare name is part of `is_symlink(` and
+//!   `check_symlink(`, which the crate calls to read a file's type, so a needle on it
+//!   fires on reads. The qualified `fs::symlink(` is a needle. Product code makes no
+//!   symlink at all: every link the suite makes, it makes in test code — a
+//!   `#[cfg(test)]` item, or a file under `tests/` (such as `common::make_symlink`),
+//!   which this scan does not read.
 //! - Any other call that writes, links or removes a file and is no needle — rustix's
 //!   path-based `open` with `OFlags::CREATE`, `mkdir`, `link`, `unlink` or `chmod`, or
 //!   another of tempfile's constructors (`NamedTempFile::new`, `Builder::tempfile`) or its
@@ -79,12 +84,17 @@ use std::path::{Path, PathBuf};
 /// path, `hard_link(` gives one a second name by path, and `remove_dir(` and
 /// `remove_dir_all(` remove a directory by path, the second with everything below it;
 /// tempfile's `tempfile_in(` creates a temporary file, which `.persist(` moves over a
-/// file by path and `persist_noclobber(` moves to a name no file has. `create_dir(`
-/// is not part of `create_dir_all(`, nor `fs::rename(` of `fs::renameat(`, nor `renameat(`
-/// of `renameat_with(`, nor `fs::linkat(` of `fs::unlinkat(` — which is why the link's
-/// needle is the qualified spelling — nor `remove_dir(` of `remove_dir_all(`, nor
-/// `.persist(` of `.persist_noclobber(`, nor `hard_link(` of the primitive's
-/// `no_hard_links(`, so each call is counted once.
+/// file by path and `persist_noclobber(` moves to a name no file has. `fs::symlink(` —
+/// `std::os::unix::fs::symlink(` and rustix's alike — makes a symbolic link by path,
+/// `symlinkat(` one relative to a descriptor, std's deprecated `soft_link(` one by path,
+/// and on Windows `symlink_file(` and `symlink_dir(` a link to a file or a directory; the
+/// first is qualified because the bare `symlink(` is part of `is_symlink(` and
+/// `check_symlink(`. `create_dir(` is not part of `create_dir_all(`, nor `fs::rename(` of
+/// `fs::renameat(`, nor `renameat(` of `renameat_with(`, nor `fs::linkat(` of
+/// `fs::unlinkat(` — which is why the link's needle is the qualified spelling — nor
+/// `remove_dir(` of `remove_dir_all(`, nor `.persist(` of `.persist_noclobber(`, nor
+/// `hard_link(` of the primitive's `no_hard_links(`, nor `fs::symlink(` of
+/// `fs::symlinkat(`, so each call is counted once.
 const NEEDLES: &[&str] = &[
     "fs::write(",
     "File::create(",
@@ -107,6 +117,11 @@ const NEEDLES: &[&str] = &[
     "tempfile_in(",
     ".persist(",
     "persist_noclobber(",
+    "fs::symlink(",
+    "symlinkat(",
+    "soft_link(",
+    "symlink_file(",
+    "symlink_dir(",
 ];
 
 /// Production sites that may keep a raw write: `(file basename, needle, max hits, why)`.
@@ -461,9 +476,26 @@ fn the_guard_flags_a_planted_raw_write() {
         "fn f(d: &Path) { let _ = tempfile::tempfile_in(d); }",
         "fn f(t: NamedTempFile, p: &Path) { let _ = t.persist(p); }",
         "fn f(t: NamedTempFile, p: &Path) { let _ = t.persist_noclobber(p); }",
+        // A symlink made by path or relative to a descriptor, through std or rustix, on
+        // unix or on Windows — each counted once.
+        "fn f(a: &Path, b: &Path) { let _ = std::os::unix::fs::symlink(a, b); }",
+        "fn f(a: &Path, b: &Path) { let _ = rustix::fs::symlink(a, b); }",
+        "fn f(a: &Path, d: BorrowedFd, b: &OsStr) { let _ = rustix::fs::symlinkat(a, d, b); }",
+        "fn f(a: &Path, b: &Path) { let _ = std::fs::soft_link(a, b); }",
+        "fn f(a: &Path, b: &Path) { let _ = std::os::windows::fs::symlink_file(a, b); }",
+        "fn f(a: &Path, b: &Path) { let _ = std::os::windows::fs::symlink_dir(a, b); }",
     ] {
         assert_eq!(scan_violation_count(planted), 1, "must be flagged: {planted}");
     }
+    // Reading a link, or a name that merely ends in `symlink`, makes none.
+    assert_eq!(
+        scan_violation_count(
+            "fn f(p: &Path) -> bool { p.is_symlink() || std::fs::symlink_metadata(p).is_ok() \
+             || mds::NativeFs::check_symlink(p).is_ok() || make_symlink(p, p) }"
+        ),
+        0,
+        "`is_symlink(`, `symlink_metadata(`, `check_symlink(` and `make_symlink(` make no link"
+    );
     // The primitive's own test for a filesystem without hard links makes none.
     assert_eq!(
         scan_violation_count("fn f(e: Errno) -> bool { no_hard_links(e) }"),
