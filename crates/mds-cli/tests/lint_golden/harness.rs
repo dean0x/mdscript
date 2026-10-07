@@ -29,6 +29,19 @@
 //!    backslash first, then a single one).
 //!
 //! Nothing is sorted, trimmed or line-ending-rewritten.
+//!
+//! The third rule is a waiver: on Windows no golden can see which separator `mds`
+//! printed, so a separator it got wrong there would pass every cell. The separators are
+//! pinned instead by tests that read the output as `mds` printed it, on every OS the CI
+//! runs: in `cli_lint.rs`, a directory entry's `Fixed:` line
+//! (`fix_of_a_partial_in_a_directory_applies_and_reports_no_unused_function`) and its
+//! cap notice (`entry_cap_notice`, in
+//! `a_report_announces_the_cap_first_in_every_input_and_format` and
+//! `the_cap_notice_advises_re_running_fix_under_fix_alone`), each in the platform's
+//! separator; in `lint.rs`, `relative_display`'s unit tests for the JSON `files[].file`
+//! key, which is `/`-separated on every OS; and `dir_fixture_markers_hold` in
+//! `lint_golden.rs`, which reads those keys from [`DirRun::raw_stdout`], never from the
+//! normalized stdout.
 
 #![allow(dead_code)]
 
@@ -971,12 +984,23 @@ pub fn run_dir_cell(cell: &DirCell) -> Result<DirObserved, DirFailure> {
     let id = cell.id();
     let args = cell.args();
     let run = |order| {
-        run_dir(cell.fixture, &id, &args, order, Locking::Applied).map_err(DirFailure::Skipped)
+        run_dir(cell.fixture, &id, &args, order, Locking::Applied)
+            .map(|run| run.observed)
+            .map_err(DirFailure::Skipped)
     };
     let first = run(Order::Forward)?;
     let second = run(Order::Reverse)?;
     compare_runs(&id, &first, &second).map_err(DirFailure::Nondeterministic)?;
     Ok(first)
+}
+
+/// One directory run: what it recorded, and its stdout exactly as `mds` printed it.
+#[derive(Debug)]
+pub struct DirRun {
+    pub observed: DirObserved,
+    /// Stdout before normalization. On Windows it still holds the separators `mds`
+    /// printed, which the normalized stdout rewrites to `/` (the module doc's waiver).
+    pub raw_stdout: String,
 }
 
 /// Run `mds <args>` once in a fresh fixture directory holding `fixture`'s layout.
@@ -987,7 +1011,7 @@ pub fn run_dir(
     args: &[&str],
     order: Order,
     locking: Locking,
-) -> Result<DirObserved, Skip> {
+) -> Result<DirRun, Skip> {
     let dir = fixture_dir();
     let layout = fixture.layout();
     build_layout(dir.path(), &layout, order);
@@ -1000,14 +1024,18 @@ pub fn run_dir(
 
     drop(locks);
     let files = record_files(id, dir.path(), &layout);
+    let raw_stdout = utf8(id, "stdout", stdout.clone());
     let streams = NormalizedStreams::of(id, dir.path(), stdout, stderr);
-    Ok(DirObserved {
-        exit,
-        stdout: streams.stdout,
-        stderr: streams.stderr,
-        files,
-        tmp_paths: streams.tmp_paths,
-        tmp_names: streams.tmp_names,
+    Ok(DirRun {
+        observed: DirObserved {
+            exit,
+            stdout: streams.stdout,
+            stderr: streams.stderr,
+            files,
+            tmp_paths: streams.tmp_paths,
+            tmp_names: streams.tmp_names,
+        },
+        raw_stdout,
     })
 }
 

@@ -24,8 +24,8 @@ mod harness;
 mod single;
 
 use harness::{
-    Cell, Digest, DirFixture, DirGolden, DirObserved, FileAfter, FixMode, Fixture, Format, Golden,
-    Input, Locking, Normalizer, Observed, ObservedFile, Order, Quiet, Stream,
+    Cell, Digest, DirFixture, DirGolden, DirObserved, DirRun, FileAfter, FixMode, Fixture, Format,
+    Golden, Input, Locking, Normalizer, Observed, ObservedFile, Order, Quiet, Stream,
 };
 
 // ── The cells, one test per (input, fixture) group ───────────────────────────
@@ -759,6 +759,17 @@ fn normalizer_rewrites_every_tempdir_spelling() {
     let (text, paths, _) = n.apply("/var/folders/zz/T/.tmpOTHER");
     assert_eq!((text.as_str(), paths), ("/var/folders/zz/T/.tmpOTHER", 0));
 
+    // The separator waiver: on Windows a separator `mds` printed, escaped in JSON or
+    // not, reads as `/` once normalized, so no golden can tell it apart (the directory
+    // markers read the stdout `mds` printed instead); elsewhere a backslash is kept.
+    let printed = r#"{"file":"api\\x.mds"} d\x.mds"#;
+    let (text, _, _) = n.apply(printed);
+    if cfg!(windows) {
+        assert_eq!(text, r#"{"file":"api/x.mds"} d/x.mds"#);
+    } else {
+        assert_eq!(text, printed);
+    }
+
     // Atomic-write temp names: exactly six ASCII alphanumerics between the affixes.
     let (text, count) = harness::replace_tmp_names(
         "x .mds-tmp-Ab3dE9.tmp y .mds-tmp-Ab3dE.tmp z .mds-tmp-Ab3dE9x.tmp w .mds-tmp-Ab_dE9.tmp",
@@ -958,10 +969,10 @@ fn fixture_markers_hold() {
 // ── Directory fixture markers (checked against the tool, not the goldens) ────
 
 /// Run `mds <args>` once on `fixture`'s layout; `None` when a lock does not hold.
-fn dir_run(fixture: DirFixture, args: &[&str], locking: Locking) -> Option<DirObserved> {
+fn dir_run(fixture: DirFixture, args: &[&str], locking: Locking) -> Option<DirRun> {
     let id = format!("{} marker: mds {}", fixture.name(), args.join(" "));
     match harness::run_dir(fixture, &id, args, Order::Forward, locking) {
-        Ok(obs) => Some(obs),
+        Ok(run) => Some(run),
         Err(skip) => {
             harness::announce_skip(&id, skip.reason());
             None
@@ -969,13 +980,16 @@ fn dir_run(fixture: DirFixture, args: &[&str], locking: Locking) -> Option<DirOb
     }
 }
 
-fn unlocked_run(fixture: DirFixture, args: &[&str]) -> DirObserved {
+fn unlocked_run(fixture: DirFixture, args: &[&str]) -> DirRun {
     dir_run(fixture, args, Locking::Unlocked).expect("an unlocked run is never skipped")
 }
 
-fn stdout_json(obs: &DirObserved) -> serde_json::Value {
-    serde_json::from_str(&obs.stdout)
-        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", obs.stdout))
+/// The JSON report a run printed, parsed from its stdout as `mds` printed it: the
+/// normalized stdout rewrites a Windows separator to `/`, and a `files[].file` key must
+/// be `/`-separated on every OS without that help.
+fn stdout_json(run: &DirRun) -> serde_json::Value {
+    serde_json::from_str(&run.raw_stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", run.raw_stdout))
 }
 
 /// The `file` keys of a JSON report, in order.
@@ -1052,24 +1066,33 @@ fn dir_fixture_markers_hold() {
     let layout = DirFixture::Empty.layout();
     assert!(layout.files.is_empty());
     assert_eq!(layout.dirs, [harness::DIR_ARG]);
-    let obs = unlocked_run(DirFixture::Empty, &lint_json("d"));
-    assert!(obs.files.is_empty());
-    assert_eq!(obs.exit, 2, "empty: {}", obs.stderr);
+    let run = unlocked_run(DirFixture::Empty, &lint_json("d"));
+    assert!(run.observed.files.is_empty());
+    assert_eq!(run.observed.exit, 2, "empty: {}", run.observed.stderr);
 
     // all-excluded: the one source has a finding when named directly (positive
     // control), but lies under node_modules, so the tree has nothing to lint.
-    let obs = unlocked_run(DirFixture::AllExcluded, &lint_json("d/node_modules/a.mds"));
-    assert_eq!(obs.exit, 1, "all-excluded: {}", obs.stderr);
+    let run = unlocked_run(DirFixture::AllExcluded, &lint_json("d/node_modules/a.mds"));
     assert_eq!(
-        rules_of(&diagnostics(&stdout_json(&obs))),
+        run.observed.exit, 1,
+        "all-excluded: {}",
+        run.observed.stderr
+    );
+    assert_eq!(
+        rules_of(&diagnostics(&stdout_json(&run))),
         vec!["unused-variable"]
     );
-    let obs = unlocked_run(DirFixture::AllExcluded, &lint_json("d"));
-    assert_eq!(obs.exit, 2, "all-excluded: {}", obs.stderr);
+    let run = unlocked_run(DirFixture::AllExcluded, &lint_json("d"));
+    assert_eq!(
+        run.observed.exit, 2,
+        "all-excluded: {}",
+        run.observed.stderr
+    );
 
-    // mixed: the report lists the files with findings or errors in byte order ...
-    let obs = unlocked_run(DirFixture::Mixed, &lint_json("d"));
-    let json = stdout_json(&obs);
+    // mixed: the report lists the files with findings or errors in byte order, each
+    // key `/`-separated on every OS ...
+    let run = unlocked_run(DirFixture::Mixed, &lint_json("d"));
+    let json = stdout_json(&run);
     let keys = file_keys(&json);
     assert_eq!(
         keys,
@@ -1109,15 +1132,16 @@ fn dir_fixture_markers_hold() {
     );
     // Every summary bucket holds a file.
     assert!(
-        obs.stderr
+        run.observed
+            .stderr
             .contains("1 clean, 1 with warnings, 5 with errors, 1 resource-limited"),
         "mixed: {}",
-        obs.stderr
+        run.observed.stderr
     );
     // The entries the walk skips have findings when named directly (positive controls).
     for path in ["d/.hidden/h.mds", "d/node_modules/n.mds"] {
-        let obs = unlocked_run(DirFixture::Mixed, &lint_json(path));
-        assert_eq!(obs.exit, 1, "{path}: {}", obs.stderr);
+        let run = unlocked_run(DirFixture::Mixed, &lint_json(path));
+        assert_eq!(run.observed.exit, 1, "{path}: {}", run.observed.stderr);
     }
 
     #[cfg(unix)]
@@ -1125,8 +1149,8 @@ fn dir_fixture_markers_hold() {
         // write-fail: unlocked (positive control), all three sources are listed and
         // linted and `--fix` rewrites the fixable one ...
         let fixture = DirFixture::Outcome(Fixture::WriteFail);
-        let obs = unlocked_run(fixture, &lint_json("d"));
-        let json = stdout_json(&obs);
+        let run = unlocked_run(fixture, &lint_json("d"));
+        let json = stdout_json(&run);
         assert_eq!(
             file_keys(&json),
             ["unreadable.mds", "unreadable/y.mds", "x.mds"]
@@ -1138,8 +1162,9 @@ fn dir_fixture_markers_hold() {
             );
         }
         let fix = ["lint", "--fix", "d"];
-        let obs = unlocked_run(fixture, &fix);
-        let x = obs
+        let run = unlocked_run(fixture, &fix);
+        let x = run
+            .observed
             .files
             .iter()
             .find(|(n, _)| n == "d/x.mds")
@@ -1150,21 +1175,21 @@ fn dir_fixture_markers_hold() {
         );
         // ... and locked, the unreadable file is listed but cannot be read, and
         // nothing is rewritten.
-        if let Some(obs) = dir_run(fixture, &lint_json("d"), Locking::Applied) {
-            let json = stdout_json(&obs);
+        if let Some(run) = dir_run(fixture, &lint_json("d"), Locking::Applied) {
+            let json = stdout_json(&run);
             assert!(entry(&json, "unreadable.mds")["error"]["code"].is_string());
             assert_eq!(
                 entry(&json, "x.mds")["diagnostics"][0]["rule"],
                 "unreachable-branch"
             );
         }
-        if let Some(obs) = dir_run(fixture, &fix, Locking::Applied) {
+        if let Some(run) = dir_run(fixture, &fix, Locking::Applied) {
+            let files = &run.observed.files;
             assert!(
-                obs.files.iter().all(|(_, f)| *f == ObservedFile::Unchanged),
-                "write-fail: {:?}",
-                obs.files
+                files.iter().all(|(_, f)| *f == ObservedFile::Unchanged),
+                "write-fail: {files:?}"
             );
-            assert_ne!(obs.exit, 0, "write-fail");
+            assert_ne!(run.observed.exit, 0, "write-fail");
         }
     }
 }
