@@ -1037,6 +1037,142 @@ fn dir_mode_a_source_truncated_after_its_rebuild_looked_is_held() {
     }
 }
 
+// ── A source created and changed after its batch looked ─────────────────────
+
+/// A directory watch of an empty `src/` whose rebuilds stop after their look
+/// (`MDS_TEST_PAUSE_AFTER_LOOK`), with `src/n.mds` just created and the batch its creation
+/// starts stopped there: a batch that names a source no compile has read yet.
+#[cfg(debug_assertions)]
+struct NewSourcePaused {
+    child: ChildGuard,
+    tap: StderrTap,
+    source: std::path::PathBuf,
+    output: std::path::PathBuf,
+    /// The file whose creation ends the pause.
+    go: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+/// Watch an empty `src/`, create `src/n.mds` holding `content`, and return once the batch
+/// that creation starts has looked and stopped. Nothing is below `src/` when the watch
+/// starts, so no event of the startup can start a batch: the one that stops names `n.mds`.
+#[cfg(debug_assertions)]
+fn a_new_source_s_batch_stopped_after_its_look(content: &str) -> NewSourcePaused {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    // Outside the watched directory, so the pause's files raise no event.
+    let (go, paused) = (dir.path().join("go"), dir.path().join("go.paused"));
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &go)
+            .stdout(Stdio::null()),
+    );
+    let source = root.join("n.mds");
+    write_atomic(&source, content);
+    let paused_by = Instant::now() + TIMEOUT;
+    // Bounded by TIMEOUT: at most TIMEOUT / OUTPUT_POLL iterations.
+    while !paused.exists() {
+        assert!(
+            Instant::now() < paused_by,
+            "setup: the new source's batch never paused after its look; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(OUTPUT_POLL);
+    }
+    NewSourcePaused {
+        child,
+        tap,
+        source,
+        output: out.join("n.md"),
+        go,
+        _dir: dir,
+    }
+}
+
+/// In directory mode, a source created and then truncated while the batch its creation
+/// starts is under way — after the batch looked and found it full, before its compile read
+/// it — is held as a source the session compiled before is: the empty read is never
+/// published, and once the source is written one rebuild publishes what was written. The
+/// look stamps every source its batch names, one no compile has read yet included, so the
+/// look that follows the compile finds the source emptied. The debug build's pause after
+/// a batch's look (`MDS_TEST_PAUSE_AFTER_LOOK`) makes the window certain; outside a test, an
+/// editor that creates a file and saves it again by truncating it while the batch of its
+/// creation runs opens it.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_source_created_and_truncated_after_its_batch_looked_is_held() {
+    let NewSourcePaused {
+        mut child,
+        tap,
+        source,
+        output,
+        go,
+        _dir,
+    } = a_new_source_s_batch_stopped_after_its_look("N one\n");
+    let hold = Hold::start(&source);
+    std::fs::write(&go, "").unwrap();
+    let mut log = OutputLog::default();
+    log.poll_for(&output, TRUNCATE_HOLD);
+    let timing = hold.write_and_close("N two\n");
+    log.wait_for(&output, "N two", TIMEOUT);
+
+    let stderr = stderr_through_the_marker(&source, tap, &mut child);
+    let what = "directory mode, a source created and truncated after its batch looked";
+    assert_no_empty_before_the_deadline(&log, timing.started, what);
+    if strict_claims_apply(
+        "dir_mode_a_source_created_and_truncated_after_its_batch_looked_is_held",
+        &timing,
+        what,
+    ) {
+        assert_eq!(
+            log.contents(),
+            ["N two\n"],
+            "{what}: the output is published once, with the content finally written; \
+             stderr:\n{stderr}"
+        );
+        assert_holding_printed_nothing(&stderr, 1, what);
+    }
+}
+
+/// In directory mode, a source created and then saved again while the batch its creation
+/// starts is under way — after the batch looked, before its compile read it — is published
+/// as saved, once: the look stamped the source as it was then, and a change since that
+/// leaves bytes in it holds nothing. The look's stamp, older than the read, is the one the
+/// batch leaves, so the next look would see the save again were its event lost.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_source_created_and_saved_after_its_batch_looked_publishes_the_save() {
+    let NewSourcePaused {
+        mut child,
+        tap,
+        source,
+        output,
+        go,
+        _dir,
+    } = a_new_source_s_batch_stopped_after_its_look("N one\n");
+    write_atomic(&source, "N two, saved after the look\n");
+    std::fs::write(&go, "").unwrap();
+    let mut log = OutputLog::default();
+    log.wait_for(&output, "N two, saved after the look", TIMEOUT);
+
+    let stderr = stderr_through_the_marker(&source, tap, &mut child);
+    let what = "directory mode, a source created and saved after its batch looked";
+    assert_eq!(
+        log.contents(),
+        ["N two, saved after the look\n"],
+        "{what}: the output is published once, with what was saved; stderr:\n{stderr}"
+    );
+    assert_holding_printed_nothing(&stderr, 1, what);
+}
+
 // ── The deadline ────────────────────────────────────────────────────────────
 
 /// Truncate the entry and close it without writing: the empty output IS published —
