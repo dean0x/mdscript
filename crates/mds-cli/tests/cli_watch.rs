@@ -1206,6 +1206,10 @@ fn watch_invalid_path_startup_error() {
 /// it drops the import, the entry `@include`s an empty module: every compile of it
 /// prints the "produced empty output" warning, which makes the rebuild the helper edit
 /// must NOT cause visible.
+///
+/// `--debounce 100` makes the count exact: one save can reach the watcher as several
+/// events, and a quiet period gathers them into one compile, so the edit that drops the
+/// import warns exactly once, however slowly the compiles run.
 #[test]
 fn watch_import_removal_stops_tracking_dep() {
     let dir = tempfile::tempdir().unwrap();
@@ -1237,7 +1241,7 @@ fn watch_import_removal_stops_tracking_dep() {
                 "watch",
                 entry.to_str().unwrap(),
                 "--debounce",
-                "0",
+                "100",
                 // No idle tick: its first-tick recompile would print the warning
                 // counted below on a schedule of its own.
                 "--poll-interval",
@@ -1274,14 +1278,9 @@ fn watch_import_removal_stops_tracking_dep() {
         wait_for_file_contains(&out, "Static content", TIMEOUT),
         "removing @import should rebuild entry with static content"
     );
-    // Positive control: a compile of this entry shows on stderr.
-    wait_for_tap(&stderr_tap, include_warning, TIMEOUT);
-
-    // SETTLE WINDOW, deliberately a fixed sleep: one edit can reach the watcher as
-    // several events, and each recompiles the entry and warns again. No event marks the
-    // last of them, and the baseline below must hold every one.
-    std::thread::sleep(Duration::from_millis(500));
-    let warnings_before = count_occurrences(&stderr_tap.text(), include_warning);
+    // Positive control, and the baseline: the one compile of this save shows on stderr.
+    const STEP_2_COMPILES: usize = 1;
+    wait_for_tap_count(&stderr_tap, include_warning, STEP_2_COMPILES, TIMEOUT);
     let content_before = std::fs::read_to_string(&out).unwrap();
 
     // STEP 3: Edit helper again — the entry must NOT be rebuilt, because the dep was
@@ -1291,7 +1290,7 @@ fn watch_import_removal_stops_tracking_dep() {
         "@define greet(name):\nBye {{name}}!\n@end\n\n@export greet\n",
     );
 
-    // NEGATIVE WINDOW, deliberately a fixed sleep: 500ms is far beyond the debounce-0
+    // NEGATIVE WINDOW, deliberately a fixed sleep: 500ms is far beyond the debounce-100
     // rebuild latency, so a rebuild the helper edit caused has compiled the entry as it
     // is now. The marker below replaces the entry, and a rebuild that read the marker
     // instead would print nothing this test counts.
@@ -1310,7 +1309,7 @@ fn watch_import_removal_stops_tracking_dep() {
     let stderr = stderr_tap.finish_text(&mut child);
     assert_eq!(
         count_occurrences(&stderr, include_warning),
-        warnings_before,
+        STEP_2_COMPILES,
         "after removing @import, editing helper must NOT rebuild the entry; \
          stderr:\n{stderr}"
     );
@@ -2913,8 +2912,30 @@ fn watch_does_not_follow_a_working_directory_recreated_as_a_symlink() {
 
 // ── AC-W6: Delete entry file — at most one error, then recover ───────────────
 
-/// Delete the entry file (parent intact); assert the not-found error appears AT MOST
-/// ONCE across multiple idle ticks, then recreate the file and assert recompile.
+/// How many times one deletion of a watched entry is reported, however long the entry
+/// then stays deleted. The deletion's events — one save can reach the watcher as several —
+/// are gathered by a `--debounce 100` quiet period into one rebuild. One idle tick may
+/// rebuild too: the first tick's recovery, when the deletion came before it, or a tick
+/// that found the entry gone before the deletion's events arrived. Never both, since
+/// such a tick is the first one or the first one came before the deletion. A watcher
+/// that re-fired per tick would report once a tick.
+const DELETION_REPORTS: std::ops::RangeInclusive<usize> = 1..=2;
+
+/// The reports of a deleted entry in `stderr` before its recovery: everything before the
+/// first `Recompiled` line, which only the rebuild of the recreated entry prints. Counted
+/// by the read that fails, "file not found", and the OS's own wording of it.
+#[track_caller]
+fn not_found_before_the_recovery(stderr: &str) -> usize {
+    let at = stderr
+        .find("Recompiled ")
+        .unwrap_or_else(|| panic!("the recovery's `Recompiled` line; stderr:\n{stderr}"));
+    let before = &stderr[..at];
+    count_occurrences(before, "file not found") + count_occurrences(before, "No such file")
+}
+
+/// Delete the entry file (parent intact); assert the not-found error is reported for
+/// the deletion alone — no more often over six idle ticks than [`DELETION_REPORTS`] —
+/// then recreate the file and assert recompile.
 #[test]
 fn watch_file_mode_entry_deleted_settles_then_recovers() {
     let dir = tempfile::tempdir().unwrap();
@@ -2928,7 +2949,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
                 "watch",
                 src.to_str().unwrap(),
                 "--debounce",
-                "0",
+                "100",
                 "--poll-interval",
                 "100",
                 // No -q so we can observe stderr error messages.
@@ -2943,42 +2964,13 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
 
     // Delete the entry file (parent intact).
     std::fs::remove_file(&src).unwrap();
-
-    // The delete is reported: wait for its first error, so the baseline below holds at
-    // least the error the delete itself produced rather than whatever had been sampled.
     wait_for_tap(&stderr_tap, "file not found", TIMEOUT);
 
-    // Scale-invariant error bound (guards against once-per-tick re-firing — the watcher self-trigger pitfall): run two equal idle windows and assert
-    // the error count does NOT grow in the second window.  A per-tick implementation would
-    // accumulate one error per tick across BOTH windows; the fix settles quickly after the
-    // initial native-event errors and is then silent.
-    //
-    // Window 1 — SETTLE WINDOW, deliberately a fixed sleep: ≥5 ticks at 100ms for the
-    // rest of the delete's native events and at most 1 liveness-probe error. How many of
-    // those arrive varies by platform, so no event marks the end of the settling.
-    std::thread::sleep(Duration::from_millis(500));
-    let count_w1 = {
-        let bytes = stderr_tap.bytes();
-        let s = String::from_utf8_lossy(&bytes);
-        s.matches("file not found").count() + s.matches("No such file").count()
-    };
-
-    // Window 2 — NEGATIVE WINDOW, deliberately a fixed sleep: another ≥5 ticks with
-    // nothing changed, so error-settle must keep the count frozen. Any increase proves
-    // the watcher is still firing per-tick. Its positive anchor is the recovery below:
-    // the recreated entry is compiled, so the watcher was running its ticks all along.
-    std::thread::sleep(Duration::from_millis(500));
-    let count_w2 = {
-        let bytes = stderr_tap.bytes();
-        let s = String::from_utf8_lossy(&bytes);
-        s.matches("file not found").count() + s.matches("No such file").count()
-    };
-
-    assert_eq!(
-        count_w1, count_w2,
-        "error count must not grow in a second idle window (not once-per-tick); \
-         w1={count_w1}, w2={count_w2} — the fix must settle after initial native-event errors"
-    );
+    // NEGATIVE WINDOW, deliberately a fixed sleep: six idle ticks at 100ms with nothing
+    // changed. A watcher that re-fired per tick would report six more times. Its positive
+    // anchor is the recovery below: the recreated entry is compiled, so the watcher was
+    // running all along, and its `Recompiled` line follows every earlier report.
+    std::thread::sleep(Duration::from_millis(600));
 
     // Recreate the file with different content.
     write_atomic(&src, "---\nname: Recovered\n---\nHello {{name}}!\n");
@@ -2988,20 +2980,14 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
         wait_for_file_contains(&out, "Hello Recovered!", TIMEOUT),
         "watcher must recompile after recreating deleted entry file"
     );
-
-    // Give the watcher a moment to settle after recovery before killing.
-    std::thread::sleep(Duration::from_millis(200));
-
+    wait_for_tap(&stderr_tap, "Recompiled ", TIMEOUT);
     let stderr_str = stderr_tap.finish_text(&mut child);
 
-    // Sanity: error count across the FULL test run must still be small — rules out a
-    // burst of errors that somehow all arrived in window 1.
-    let error_event_count =
-        stderr_str.matches("file not found").count() + stderr_str.matches("No such file").count();
+    let reports = not_found_before_the_recovery(&stderr_str);
     assert!(
-        error_event_count <= 10,
-        "total error count across full test must be small (not a per-tick flood); \
-         got {error_event_count} file-not-found occurrences; stderr:\n{stderr_str}"
+        DELETION_REPORTS.contains(&reports),
+        "the deletion is reported {DELETION_REPORTS:?} times, not once per idle tick; got \
+         {reports} file-not-found reports before the recovery; stderr:\n{stderr_str}"
     );
 }
 
@@ -3376,9 +3362,16 @@ fn watch_dir_mode_dual_role_node_edit_and_delete() {
 
 // ── AC-R7: Persistent syntax error — bounded error count ─────────────────────
 
-/// A file with a persistent syntax error, idle ≥2 ticks at low --poll-interval.
+/// A file with a persistent syntax error, idle ≥5 ticks at low --poll-interval.
 /// Assert the error line count is bounded (~once per real edit, NOT once per tick)
 /// and the watcher stays alive.
+///
+/// The baseline is read behind an ordered marker, never after a settle: a new source,
+/// `zz.mds`, that compiles. Its batch re-compiles every errored source as any batch with
+/// a real change does, `bad.mds` first by name, so its `Recompiled` line follows
+/// everything any earlier event made the watcher report. Compiling, it is a known source
+/// that no idle tick rebuilds again, and `--debounce 100` gathers its save's events into
+/// one batch, so it reports nothing after that line.
 #[test]
 fn watch_dir_mode_persistent_error_bounded_count() {
     let dir = tempfile::tempdir().unwrap();
@@ -3400,7 +3393,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
                 "--out-dir",
                 out_dir.to_str().unwrap(),
                 "--debounce",
-                "0",
+                "100",
                 "--poll-interval",
                 "100",
                 // No -q so we can count errors.
@@ -3415,35 +3408,24 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     );
 
     // Scale-invariant error bound (applies the reconcile rule — see the `src/watch.rs`
-    // module doc — and guards against once-per-tick re-firing): run two equal idle
-    // windows and assert the "undefined variable" count does NOT grow in the second window.
-    // A per-tick implementation would fire continuously; error-settle means it fires once at
-    // startup and then goes silent.
+    // module doc — and guards against once-per-tick re-firing): with nothing changed
+    // after the marker below, the "undefined variable" count must not grow over an idle
+    // window. A per-tick implementation would fire continuously; error-settle means it
+    // fires once per batch and then goes silent.
     //
-    // The startup compile of bad.mds, which precedes readiness, reported its error: the
-    // baseline below holds at least that one rather than whatever had been sampled.
+    // The startup compile of bad.mds, which precedes readiness, reported its error.
     wait_for_tap(&stderr_tap, "undefined variable", TIMEOUT);
 
-    // Window 1 — SETTLE WINDOW, deliberately a fixed sleep: ≥5 ticks at 100ms (~500ms)
-    // for anything the first ticks report about the startup error. No event marks the
-    // end of that settling.
-    std::thread::sleep(Duration::from_millis(500));
-    let count_w1 = {
-        let bytes = stderr_tap.bytes();
-        let s = String::from_utf8_lossy(&bytes);
-        // Count exactly once per error emission (each miette block contains this phrase once).
-        s.matches("undefined variable").count()
-    };
+    // The ordered marker: its `Recompiled` line closes the baseline.
+    write_atomic(&dir.path().join("zz.mds"), "Marker\n");
+    let marked = wait_for_tap(&stderr_tap, "zz.md (0 deps)", TIMEOUT);
+    let count_w1 = count_occurrences(&marked, "undefined variable");
 
-    // Window 2 — NEGATIVE WINDOW, deliberately a fixed sleep: another ≥5 ticks with
-    // nothing changed; error-settle must keep the count frozen. Any increase here proves
-    // the watcher is still firing per-tick (the bug).
+    // NEGATIVE WINDOW, deliberately a fixed sleep: ≥5 ticks with nothing changed;
+    // error-settle must keep the count frozen. Any increase here proves the watcher is
+    // still firing per-tick (the bug).
     std::thread::sleep(Duration::from_millis(500));
-    let count_w2 = {
-        let bytes = stderr_tap.bytes();
-        let s = String::from_utf8_lossy(&bytes);
-        s.matches("undefined variable").count()
-    };
+    let count_w2 = count_occurrences(&stderr_tap.text(), "undefined variable");
 
     // Positive anchor for the window: a real edit that keeps bad.mds broken is still
     // reported, so an error during the window would have reached stderr too.
@@ -3464,9 +3446,9 @@ fn watch_dir_mode_persistent_error_bounded_count() {
 
     assert_eq!(
         count_w1, count_w2,
-        "error count must not grow in a second idle window (not once-per-tick); \
-         w1={count_w1}, w2={count_w2} (reconcile rule; no once-per-tick re-firing); \
-         stderr:\n{stderr_str}"
+        "error count must not grow over an idle window after the marker (not \
+         once-per-tick); at the marker {count_w1}, after the window {count_w2} (reconcile \
+         rule; no once-per-tick re-firing); stderr:\n{stderr_str}"
     );
 }
 
@@ -3748,9 +3730,10 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
 /// - The moment the parent reappears (vanish→reappear edge), recovery fires and
 ///   recompiles (AC-W1 preserved).
 ///
-/// At 150ms poll-interval over ≥6 ticks (~900ms idle with missing dir) the
-/// not-found error must appear ≤ 3 times (proving "not once-per-tick") — a
-/// per-tick implementation would produce ≥ 6 errors in that window.
+/// At 150ms poll-interval over ≥6 ticks (~900ms idle with missing dir) the not-found
+/// error is reported for the deletion alone ([`DELETION_REPORTS`], read before the
+/// recovery's `Recompiled` line) — a per-tick implementation would report ≥ 6 times in
+/// that window.
 #[test]
 fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     // Place the source in a sub-directory so we can delete the parent without
@@ -3769,7 +3752,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
                 "watch",
                 src.to_str().unwrap(),
                 "--debounce",
-                "0",
+                "100",
                 "--poll-interval",
                 "150",
                 // No -q: we need to observe stderr errors.
@@ -3785,35 +3768,19 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
 
     // Delete the ENTIRE parent directory (not just the file — this is the bug scenario).
     std::fs::remove_dir_all(&src_dir).unwrap();
-
-    // Scale-invariant error bound (reconcile rule; guards against once-per-tick re-firing): run two equal idle
-    // windows and assert the error count does NOT grow in the second window.  A per-tick
-    // implementation would produce ≥1 error per tick continuously; the fix settles after
-    // the initial native-event error(s) and then goes silent.
-    //
-    // Window 1 — ≥6 ticks at 150ms (~900ms): native-event errors may appear here.
-    std::thread::sleep(Duration::from_millis(900));
-    let count_w1 = {
-        let bytes = stderr_tap.bytes();
-        let s = String::from_utf8_lossy(&bytes);
-        s.matches("file not found").count() + s.matches("No such file").count()
-    };
-
-    // Window 2 — another ≥6 ticks: nothing changed, error-settle must keep count frozen.
-    // Any increase here proves the watcher is still firing per-tick (the bug).
-    std::thread::sleep(Duration::from_millis(900));
-    let count_w2 = {
-        let bytes = stderr_tap.bytes();
-        let s = String::from_utf8_lossy(&bytes);
-        s.matches("file not found").count() + s.matches("No such file").count()
-    };
-
-    assert_eq!(
-        count_w1, count_w2,
-        "error count must not grow in a second idle window (not once-per-tick); \
-         w1={count_w1}, w2={count_w2} — the fix must settle after initial native-event errors \
-         (reconcile rule; no once-per-tick re-firing)"
+    let deleted = poll_tap_until(&stderr_tap, TIMEOUT, |text| {
+        text.contains("file not found") || text.contains("No such file")
+    });
+    assert!(
+        deleted.is_ok(),
+        "the deletion is reported; stderr: {deleted:?}"
     );
+
+    // NEGATIVE WINDOW, deliberately a fixed sleep: six idle ticks at 150ms with the
+    // parent missing (reconcile rule; guards against once-per-tick re-firing). Its
+    // positive anchor is the recovery below, whose `Recompiled` line follows every
+    // earlier report.
+    std::thread::sleep(Duration::from_millis(900));
 
     // Recreate the parent directory and write the file with new content.
     std::fs::create_dir(&src_dir).unwrap();
@@ -3826,6 +3793,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
         wait_for_file_contains(&out, "V2-recovered", TICK_TIMEOUT),
         "watcher must self-heal after parent dir delete+recreate and recompile with V2 content"
     );
+    wait_for_tap(&stderr_tap, "Recompiled ", TIMEOUT);
 
     // Watcher must still be alive after recovery.
     let still_alive = child.0.try_wait().unwrap().is_none();
@@ -3837,13 +3805,11 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
         "watcher must remain alive while parent dir is absent; stderr:\n{stderr_str}"
     );
 
-    // Sanity: total error count must remain small — rules out a burst in window 1.
-    let error_count =
-        stderr_str.matches("file not found").count() + stderr_str.matches("No such file").count();
+    let reports = not_found_before_the_recovery(&stderr_str);
     assert!(
-        error_count <= 8,
-        "total error count across both idle windows must be small (not a per-tick flood); \
-         got {error_count} occurrences; stderr:\n{stderr_str}"
+        DELETION_REPORTS.contains(&reports),
+        "the deletion is reported {DELETION_REPORTS:?} times, not once per idle tick; got \
+         {reports} file-not-found reports before the recovery; stderr:\n{stderr_str}"
     );
 }
 
