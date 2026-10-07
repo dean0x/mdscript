@@ -3723,7 +3723,9 @@ struct DirWatchState {
     last_written: HashMap<PathBuf, WrittenOutput>,
     /// The output each source last had written this session, by source: where a deleted
     /// source's outputs are looked for (#160). A source with no entry — a partial, a
-    /// dependency outside the root, one never written — has none to remove.
+    /// dependency outside the root, one never written — has none to remove; what is where
+    /// a source never written would have its outputs is kept, with a notice
+    /// ([`DirWatchState::retire_deleted`]).
     outputs: HashMap<PathBuf, WriteTarget>,
     /// By source: what its last rebuild kept from being written after a change of kind,
     /// the file there not being the session's (#160) — the next rebuild of the same tries
@@ -3998,15 +4000,42 @@ impl DirWatchState {
     /// Retire the outputs of `src`, a deleted source, and forget it (#160): the output it
     /// was last written to and the other kind's beside it, each removed only if this
     /// session wrote it for `src` and it is unchanged, or else kept ([`retire_output`]) —
-    /// one the session last wrote for another source is that source's. A source that is
+    /// one the session last wrote for another source is that source's. A source the
+    /// session never wrote an output for — its compile, or every write, failed for the
+    /// whole session — has its outputs where a write below `watch_root` would put them
+    /// ([`output_path_for`] with `output_base`): nothing the session wrote is there for it,
+    /// so whatever is there is kept, with its notice. A partial has none. A source that is
     /// there again — unlinked and created anew within the batch, as an editor's save, a
     /// branch checkout or `git stash` does — keeps its output and its state: the event that
     /// created it rebuilds it.
-    fn retire_deleted(&mut self, src: &Path, quiet: bool) {
+    fn retire_deleted(
+        &mut self,
+        src: &Path,
+        watch_root: &WatchedPath,
+        output_base: &OutputBase,
+        quiet: bool,
+    ) {
         if src.exists() {
             return;
         }
-        if let Some(out) = self.outputs.get(src).cloned() {
+        // A source still known — walked, or errored — and not forgotten already by an
+        // earlier batch of the same deletion, whose notices were told then.
+        let known = self.known_files.contains(src) || self.errored.contains(src);
+        let out = match self.outputs.get(src) {
+            Some(out) => Some(out.clone()),
+            // Only a source below the root has outputs, so this never takes the flattened
+            // arm of a source outside it, nor reports it (#217).
+            None if known && names_a_source(&watch_root.canonical, src) && !is_partial(src) => {
+                Some(output_path_for(
+                    src,
+                    watch_root.root_paths(),
+                    output_base,
+                    OutputKind::Markdown.extension(),
+                ))
+            }
+            None => None,
+        };
+        if let Some(out) = out {
             let now = check_out_dir(self.out_dir.as_mut(), &mut self.last_written);
             for kind in [OutputKind::Markdown, OutputKind::Messages] {
                 let candidate = out.sibling(|path| path.with_extension(kind.extension()));
@@ -4253,7 +4282,7 @@ fn compile_one_source(
         // error. A source still there, or one whose presence cannot be told, fails as
         // any other compile does.
         Err(CompileFailure::Error(_)) if matches!(src.try_exists(), Ok(false)) => {
-            state.retire_deleted(src, quiet);
+            state.retire_deleted(src, watch_root, output_base, quiet);
             return false;
         }
         Err(failure) => {
@@ -5593,7 +5622,7 @@ fn process_dir_batch_vars_changed(
     // Determine which of them no longer exist — their outputs are retired just as in the
     // incremental deletion step (step 5), by the same rule (#160).
     for del_src in all_sources.iter().filter(|p| !p.exists()) {
-        state.retire_deleted(del_src, quiet);
+        state.retire_deleted(del_src, watch_root, output_base, quiet);
     }
 
     // The graph is built again by the compiles below, so the records of a path that is no
@@ -5607,7 +5636,7 @@ fn process_dir_batch_vars_changed(
     for src in &all_sources {
         // A source gone since the pass above is a deleted source too (#160).
         if !src.exists() {
-            state.retire_deleted(src, quiet);
+            state.retire_deleted(src, watch_root, output_base, quiet);
             continue;
         }
         // A compile that succeeds records the dependencies it reported in their place.
@@ -5625,7 +5654,7 @@ fn process_dir_batch_vars_changed(
     let (present, gone): (BTreeSet<PathBuf>, BTreeSet<PathBuf>) =
         all_sources.into_iter().partition(|p| p.exists());
     for src in &gone {
-        state.retire_deleted(src, quiet);
+        state.retire_deleted(src, watch_root, output_base, quiet);
     }
     state.known_files = present;
     any_changed
@@ -5711,7 +5740,7 @@ fn process_dir_batch_incremental(
             // dependency has no output (#217), and is only forgotten.
             if !deleted.contains(src) {
                 if is_in_root {
-                    state.retire_deleted(src, quiet);
+                    state.retire_deleted(src, watch_root, output_base, quiet);
                 } else {
                     state.forget(src);
                 }
@@ -5758,7 +5787,7 @@ fn process_dir_batch_incremental(
     // 5. Deletions: after importers recompiled, retire the outputs and forget the graph
     //    records of each deleted source (#160).
     for del_src in &deleted {
-        state.retire_deleted(del_src, quiet);
+        state.retire_deleted(del_src, watch_root, output_base, quiet);
     }
 
     // 6. Prune external_dep_dirs to only dirs still referenced by live forward_deps.

@@ -9315,6 +9315,83 @@ fn watch_keeps_an_output_edited_since_the_session_wrote_it() {
     }
 }
 
+/// A deleted source the session never wrote an output for keeps what is at its outputs,
+/// with a notice for each (#160): `draft.mds`, whose compile fails for the whole session,
+/// beside a `draft.md` and a `draft.json` from an earlier build, is deleted — both stay,
+/// each with `Kept … : not written by this session` — in both kinds of batch. Positive
+/// control: `ok.md`, which the session wrote for `ok.mds`, deleted with it, is removed.
+#[test]
+fn watch_keeps_with_a_notice_the_outputs_of_a_deleted_source_it_never_wrote() {
+    for (label, extra, edit_vars) in DELETION_BATCHES {
+        let base = notes_with(&[
+            ("draft.mds", "Draft {{missing}}\n"),
+            ("draft.md", HAND_WRITTEN),
+            ("draft.json", HAND_WRITTEN),
+            ("ok.mds", "Ok\n"),
+        ]);
+        let notes = base.path().join("notes");
+        let (mut child, tap) = spawn_ready(
+            mds_bin()
+                .current_dir(base.path())
+                .args(["watch", "notes", "--poll-interval", "0"])
+                .args(extra)
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&notes.join("ok.md"), "Ok", TIMEOUT),
+            "{label}: control: the startup writes ok.md; stderr: {}",
+            tap.text()
+        );
+
+        // `ok.mds` last: a batch handles its deletions in name order, so once `ok.md` is
+        // gone the draft's deletion has been handled too.
+        for name in ["draft.mds", "ok.mds"] {
+            std::fs::remove_file(notes.join(name)).unwrap();
+        }
+        if edit_vars {
+            write_atomic(&base.path().join("vars.json"), r#"{"name": "two"}"#);
+        }
+        assert!(
+            wait_for_file_gone(&notes.join("ok.md"), TIMEOUT),
+            "{label}: control: the output the session wrote is removed; stderr: {}",
+            tap.text()
+        );
+        write_atomic(&notes.join("zz.mds"), ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+
+        for name in ["draft.md", "draft.json"] {
+            assert_eq!(
+                text_of(&notes.join(name)).as_deref(),
+                Some(HAND_WRITTEN),
+                "{label}: {name}, which the session never wrote, survives; stderr: {stderr}"
+            );
+        }
+        assert_eq!(
+            lines_starting(&stderr, "Kept "),
+            [
+                format!(
+                    "Kept {}: not written by this session",
+                    below("notes", "draft.json")
+                ),
+                format!(
+                    "Kept {}: not written by this session",
+                    below("notes", "draft.md")
+                ),
+            ],
+            "{label}: one notice for each file kept; stderr: {stderr}"
+        );
+        assert_eq!(
+            lines_starting(&stderr, "Removed "),
+            [format!(
+                "Removed {} (source deleted)",
+                below("notes", "ok.md")
+            )],
+            "{label}: stderr: {stderr}"
+        );
+    }
+}
+
 /// A deleted source's outputs are found by the path the session wrote them to, never by
 /// a stem (#160). Deleting `a.b.mds`, written to `out/a.b.md`, removes that file and
 /// leaves `out/a.md`, written for `a.mds`: the stem probe took `.b` for an extension and
