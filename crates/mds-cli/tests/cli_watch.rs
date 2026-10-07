@@ -5277,7 +5277,7 @@ fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
 /// The warning is written to stderr with no ordering relationship to the output file
 /// the test waits on, so every count is read behind a line printed after it: startup
 /// prints its warnings before it compiles and `Compiled to` after it writes, a rebuild
-/// prints them before it writes and `Recompiled` after, and the order marker's
+/// prints them once it has written and `Recompiled` after them, and the order marker's
 /// diagnostic follows everything — a line a rebuild printed after its `Recompiled`
 /// included.
 #[test]
@@ -9942,6 +9942,128 @@ fn watch_never_writes_over_a_file_it_did_not_write_when_the_kind_changes() {
             "{mode}: one rebuild of each kind is written; stderr: {stderr}"
         );
     }
+}
+
+/// The debug build's pause after a file rebuild's reads (#380): the file it names ends the
+/// pause, and the same name with `.paused` appended says the rebuild has stopped.
+#[cfg(debug_assertions)]
+const READ_PAUSE: &str = "MDS_TEST_PAUSE_AFTER_READ";
+
+/// The `--vars` file's duplicate-key warning is printed once for each rebuild that shows
+/// something, after a change of kind too (#160): `chat.mds`, edited from messages into
+/// Markdown beside a hand-written `chat.md`, is kept with its notice and the warning — and
+/// a rebuild of the same, which keeps the same again and tells nothing, prints no warning
+/// either. That rebuild is made certain: the pause after a file rebuild's reads
+/// ([`READ_PAUSE`]) holds it until the test has seen it read the source as saved.
+#[cfg(debug_assertions)]
+#[test]
+fn watch_file_vars_duplicate_warning_skips_a_kept_rebuild_that_tells_nothing() {
+    let base = notes_with(&[("chat.mds", MESSAGES_KIND), ("chat.md", HAND_WRITTEN)]);
+    let notes = base.path().join("notes");
+    let (src, vars) = (notes.join("chat.mds"), base.path().join("vars.json"));
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+    let warning = dup_vars_file_warning("x", &vars);
+    let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .current_dir(&notes)
+            .args(["watch", "chat.mds", "--vars"])
+            .arg(&vars)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env(READ_PAUSE, &go)
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&notes.join("chat.json"), "What is 3+3?", TIMEOUT),
+        "control: the startup writes chat.json; stderr: {}",
+        tap.text()
+    );
+
+    // The change of kind: kept beside the hand-written chat.md, with its notice and the
+    // warning.
+    write_atomic(&src, "Hello\n");
+    wait_paused(&paused, &mut child, &tap, "the change of kind");
+    std::fs::write(&go, "").unwrap();
+    let kept = format!(
+        "Kept {}: not written by this session; not overwritten",
+        below(".", "chat.md")
+    );
+    wait_for_tap(&tap, &kept, TIMEOUT);
+    wait_for_tap_count(&tap, &warning, 2, TIMEOUT);
+
+    // The same saved again: its rebuild stops once it has read it, so it rebuilds the same.
+    std::fs::remove_file(&paused).unwrap();
+    std::fs::remove_file(&go).unwrap();
+    write_atomic(&src, "Hello\n");
+    wait_paused(&paused, &mut child, &tap, "the rebuild of the same");
+    std::fs::write(&go, "").unwrap();
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    assert_eq!(
+        text_of(&notes.join("chat.md")).as_deref(),
+        Some(HAND_WRITTEN),
+        "control: chat.md, which the session did not write, is not overwritten; \
+         stderr: {stderr}"
+    );
+    assert_eq!(
+        lines_starting(&stderr, "Kept "),
+        [kept],
+        "control: the notice is told once; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, &warning),
+        2,
+        "the warning is printed at startup and with the notice — not again by the \
+         rebuild that tells nothing; stderr: {stderr}"
+    );
+}
+
+/// The `--vars` file's duplicate-key warning comes with a rebuild whose write fails and is
+/// reported, as with one that writes (#160): `t.md` replaced by a directory, the next
+/// edit's write fails with its report, and with the warning — one for each report, as each
+/// event of the save rebuilds and reports again. Positive control: the report.
+#[test]
+fn watch_file_vars_duplicate_warning_comes_with_a_reported_write_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, out, vars) = (
+        dir.path().join("t.mds"),
+        dir.path().join("t.md"),
+        dir.path().join("vars.json"),
+    );
+    std::fs::write(&src, "version 1\n").unwrap();
+    std::fs::write(&vars, r#"{"x": 1, "x": 2}"#).unwrap();
+    let warning = dup_vars_file_warning("x", &vars);
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--vars"])
+            .arg(&vars)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+    wait_for_tap(&tap, "Compiled to", TIMEOUT);
+
+    std::fs::remove_file(&out).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("keep"), "a directory where the output was\n").unwrap();
+    write_atomic(&src, "version 2\n");
+    wait_for_tap(&tap, "mds::io", TIMEOUT);
+    write_atomic(&src, ORDER_MARKER_SOURCE);
+    wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+    let stderr = tap.finish_text(&mut child);
+
+    let reports = count_occurrences(&stderr, "mds::io");
+    assert!(
+        reports > 0 && !stderr.contains("Recompiled"),
+        "control: the failed write is reported, and never announced; stderr: {stderr}"
+    );
+    assert_eq!(
+        count_occurrences(&stderr, &warning),
+        1 + reports,
+        "the warning is printed at startup and with each failed write's report; \
+         stderr: {stderr}"
+    );
 }
 
 /// `--quiet` prints no notice for a file a change of kind keeps (#160), and keeps it all

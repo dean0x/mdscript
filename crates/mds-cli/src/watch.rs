@@ -2673,9 +2673,10 @@ fn rebuild_file(
     // that normally dedups to no write, see the comment above this function).
     // Emitting here would double-report the same duplicate once per session on
     // every startup. Instead the resolved vars are held and the warning is
-    // emitted below, gated on `content_changed` — the same signal that gates
-    // the "Recompiled" line — so the vars-file duplicate is re-reported exactly
-    // once per OBSERVABLE rebuild (tests I16, I18, I20).
+    // emitted below, once the write has decided what the rebuild shows — its
+    // "Recompiled" line, a "Kept" notice, or a failed write's report — so the
+    // vars-file duplicate is re-reported exactly once per OBSERVABLE rebuild
+    // (tests I16, I18, I20; a kept change of kind, #160).
     let mut resolved = match build_runtime_vars(RuntimeVarArgs {
         vars: ctx.vars_path_typed.clone(),
         set_vars: ctx.static_set_vars.clone(),
@@ -2809,16 +2810,17 @@ fn rebuild_file(
             .get(&output_key)
             .is_none_or(|prev| *prev != compiled.content);
 
-    // #326: re-report the vars-file duplicate-key warnings exactly when an
-    // observable rebuild happens (same gate as the "Recompiled" line below),
-    // not on the liveness probe's redundant no-op recompile.
-    if content_changed {
-        crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
-    }
-
     if !content_changed {
         return ControlFlow::Continue(());
     }
+    // #326: the vars-file duplicate-key warnings are re-reported once for each rebuild
+    // that shows something — its "Recompiled" line, a "Kept" notice or a failed write's
+    // report, before the report — never by the liveness probe's redundant no-op
+    // recompile, nor by a rebuild after a change of kind that keeps again what the one
+    // before it kept and tells nothing (#160).
+    let warn_duplicates = || crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
+    // The rebuild before this one kept the same from being written (#160): told already.
+    let told = kept_before.as_ref() == Some(&compiled.content);
     let written = match (out_dir, output_path.as_ref()) {
         (OutDirNow::Elsewhere, Some(target)) => OutputWrite::Failed(Some(miette::Report::new(
             crate::write::out_dir_moved(target),
@@ -2827,13 +2829,16 @@ fn rebuild_file(
             &below_checked_out_dir(state.out_dir.as_ref(), target),
             Record::of_entry(state.last_written.get(&output_key)),
             &compiled.content,
-            kept_before.as_ref() == Some(&compiled.content),
+            told,
             ctx.quiet,
         ) {
             Ok(true) => OutputWrite::Written,
             // Kept: nothing is written and nothing retired, and `last_written` is left as
             // it was, so a later save tries again.
             Ok(false) => {
+                if !told {
+                    warn_duplicates();
+                }
                 state.kept = Some(compiled.content);
                 return ControlFlow::Continue(());
             }
@@ -2855,6 +2860,7 @@ fn rebuild_file(
     };
     match written {
         OutputWrite::Written => {
+            warn_duplicates();
             let elapsed = t0.elapsed().as_millis();
             let dep_count = deps.len();
             if !ctx.quiet {
@@ -2906,13 +2912,16 @@ fn rebuild_file(
         }
         // Not written: `last_written` keeps what was last written, so the next rebuild
         // writes again even when its output has not changed.
-        OutputWrite::Failed(Some(e)) => settle(
-            SettleInto::File(state),
-            Some(e),
-            Settle::MarkErrored(&ctx.entry.canonical),
-        ),
+        OutputWrite::Failed(Some(e)) => {
+            warn_duplicates();
+            settle(
+                SettleInto::File(state),
+                Some(e),
+                Settle::MarkErrored(&ctx.entry.canonical),
+            );
+        }
         // A repeat of a stdout failure reported already (#157): neither reported nor
-        // settled again.
+        // settled again, and shown nothing.
         OutputWrite::Failed(None) => {}
         OutputWrite::StdoutClosed => return ControlFlow::Break(StopReason::StdoutClosed),
     }
