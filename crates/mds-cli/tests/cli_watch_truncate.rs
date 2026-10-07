@@ -17,15 +17,18 @@
 //! passed since the truncation is a violation whatever the scheduler did. The stricter
 //! claims — never empty, exactly one rebuild — hold only when the hold measurably ended
 //! before that deadline; a test thread descheduled past it leaves the watcher entitled
-//! to publish, and the test then says so and checks the deadline claim alone.
+//! to publish, and the test then checks the deadline claim alone. Every run of a test
+//! with stricter claims reports which it was in one line (`common::record_run_flag`):
+//! conclusive when they were judged, inconclusive when only the deadline claim was. The
+//! watch soak counts them, so a binary whose runs stop judging is seen, not passed.
 //!
 //! Counts and absences are read behind an ordered anchor (`common::ORDER_MARKER_SOURCE`)
 //! with `finish_text`, never from a snapshot of a live pipe.
 
 mod common;
 use common::{
-    count_occurrences, mds_bin, spawn_watch_ready, wait_for_tap, write_atomic, ChildGuard,
-    StderrTap, ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
+    count_occurrences, mds_bin, record_run_flag, spawn_watch_ready, wait_for_tap, write_atomic,
+    ChildGuard, RunFlag, StderrTap, ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
 };
 
 use std::fs::File;
@@ -210,17 +213,35 @@ fn assert_no_empty_before_the_deadline(log: &OutputLog, started: Instant, what: 
     }
 }
 
-/// Whether the stricter claims apply to this hold. When they do not, the test says so
-/// on stderr — where a failing run shows it — and checks the deadline claim only.
-fn strict_claims_apply(timing: &HoldTiming, what: &str) -> bool {
-    let strict = timing.ended_before_deadline();
-    if !strict {
-        eprintln!(
-            "{what}: the hold lasted {:?}, past the {EMPTY_HOLD_DEADLINE:?} deadline (the \
-             test thread was descheduled); only the deadline claim is checked",
-            timing.held()
-        );
-    }
+/// Whether the stricter claims apply to this hold of `test`: only when it measurably
+/// ended before the deadline. Either way the run is flagged ([`flag_strict_claims`]).
+fn strict_claims_apply(test: &str, timing: &HoldTiming, what: &str) -> bool {
+    flag_strict_claims(
+        test,
+        timing.ended_before_deadline(),
+        &format!("{what}: {}", hold_against_the_deadline(timing)),
+    )
+}
+
+/// How long a hold lasted, against the deadline, for a run's flag.
+fn hold_against_the_deadline(timing: &HoldTiming) -> String {
+    format!(
+        "hold {:?} vs deadline {EMPTY_HOLD_DEADLINE:?}",
+        timing.held()
+    )
+}
+
+/// Flag this run of `test` (`common::record_run_flag`) and return `strict`: conclusive
+/// when the stricter claims are judged, inconclusive when the test thread was descheduled
+/// past what they rest on and only the deadline claim is. `details` says what they rest
+/// on, as measured.
+fn flag_strict_claims(test: &str, strict: bool, details: &str) -> bool {
+    let (flag, judged) = if strict {
+        (RunFlag::Conclusive, "strict claims judged")
+    } else {
+        (RunFlag::Inconclusive, "only the deadline claim judged")
+    };
+    record_run_flag(test, flag, &format!("{details}; {judged}"));
     strict
 }
 
@@ -286,8 +307,9 @@ fn assert_holding_printed_nothing(stderr: &str, rebuilds: usize, what: &str) {
 // ── The entry held truncated ────────────────────────────────────────────────
 
 /// Hold the entry truncated for [`TRUNCATE_HOLD`], then write: the output never goes
-/// empty, and exactly one `Recompiled` line is printed, for the final content.
-fn held_truncate_of_the_entry(extra: &[&str], what: &str) {
+/// empty, and exactly one `Recompiled` line is printed, for the final content. `test`
+/// names the run's flag.
+fn held_truncate_of_the_entry(test: &str, extra: &[&str], what: &str) {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("t.mds");
     std::fs::write(&src, "version 1\n").unwrap();
@@ -317,7 +339,7 @@ fn held_truncate_of_the_entry(extra: &[&str], what: &str) {
         "version 2\n",
         "{what}: the output holds the content finally written"
     );
-    if strict_claims_apply(&timing, what) {
+    if strict_claims_apply(test, &timing, what) {
         assert!(
             log.first_empty.is_none(),
             "{what}: the output must never be empty while the entry is held truncated; \
@@ -330,17 +352,26 @@ fn held_truncate_of_the_entry(extra: &[&str], what: &str) {
 
 #[test]
 fn held_truncate_of_the_entry_at_debounce_0_never_publishes_an_empty_output() {
-    held_truncate_of_the_entry(&["--debounce", "0"], "--debounce 0");
+    held_truncate_of_the_entry(
+        "held_truncate_of_the_entry_at_debounce_0_never_publishes_an_empty_output",
+        &["--debounce", "0"],
+        "--debounce 0",
+    );
 }
 
 #[test]
 fn held_truncate_of_the_entry_at_the_default_debounce_never_publishes_an_empty_output() {
-    held_truncate_of_the_entry(&[], "default debounce");
+    held_truncate_of_the_entry(
+        "held_truncate_of_the_entry_at_the_default_debounce_never_publishes_an_empty_output",
+        &[],
+        "default debounce",
+    );
 }
 
 #[test]
 fn held_truncate_of_the_entry_with_poll_interval_0_never_publishes_an_empty_output() {
     held_truncate_of_the_entry(
+        "held_truncate_of_the_entry_with_poll_interval_0_never_publishes_an_empty_output",
         &["--debounce", "0", "--poll-interval", "0"],
         "--debounce 0 --poll-interval 0",
     );
@@ -350,6 +381,8 @@ fn held_truncate_of_the_entry_with_poll_interval_0_never_publishes_an_empty_outp
 
 /// A dependency of a source to hold truncated.
 struct DependencyCase<'a> {
+    /// The test, by name, for its run's flag.
+    test: &'a str,
     what: &'a str,
     /// The path `mds watch` is given: the source, or the directory it is in.
     watched: &'a Path,
@@ -392,7 +425,7 @@ fn held_truncate_of_a_dependency(case: &DependencyCase<'_>) {
 
     let stderr = stderr_through_the_marker(case.source, tap, &mut child);
     assert_no_empty_before_the_deadline(&log, timing.started, what);
-    if strict_claims_apply(&timing, what) {
+    if strict_claims_apply(case.test, &timing, what) {
         assert_eq!(
             log.states.len(),
             2,
@@ -417,6 +450,7 @@ fn held_truncate_of_an_imported_partial_triggers_nothing_until_written() {
     std::fs::write(&entry, "@import \"./_p.mds\" as p\n{{p.val()}}\n").unwrap();
 
     held_truncate_of_a_dependency(&DependencyCase {
+        test: "held_truncate_of_an_imported_partial_triggers_nothing_until_written",
         what: "an imported partial",
         watched: &entry,
         source: &entry,
@@ -438,6 +472,7 @@ fn held_truncate_of_the_vars_file_triggers_nothing_until_written() {
     std::fs::write(&entry, "Vars {{v}}\n").unwrap();
 
     held_truncate_of_a_dependency(&DependencyCase {
+        test: "held_truncate_of_the_vars_file_triggers_nothing_until_written",
         what: "the vars file",
         watched: &entry,
         source: &entry,
@@ -465,6 +500,7 @@ fn dir_mode_held_truncate_of_the_vars_file_triggers_nothing_until_written() {
     let out = dir.path().join("out");
 
     held_truncate_of_a_dependency(&DependencyCase {
+        test: "dir_mode_held_truncate_of_the_vars_file_triggers_nothing_until_written",
         what: "directory mode, the vars file",
         watched: &root,
         source: &source,
@@ -542,7 +578,7 @@ fn held_truncate_in_a_pause(case: &DependencyCase<'_>, saved: &Path, pause: &str
 
     let stderr = stderr_through_the_marker(case.source, tap, &mut child);
     assert_no_empty_before_the_deadline(&log, timing.started, what);
-    if strict_claims_apply(&timing, what) {
+    if strict_claims_apply(case.test, &timing, what) {
         assert_eq!(
             log.states.len(),
             2,
@@ -568,6 +604,7 @@ fn an_imported_partial_truncated_after_the_look_triggers_nothing_until_written()
     std::fs::write(&entry, "@import \"./_p.mds\" as p\n{{p.val()}}\n").unwrap();
 
     held_truncate_after_the_look(&DependencyCase {
+        test: "an_imported_partial_truncated_after_the_look_triggers_nothing_until_written",
         what: "an imported partial, truncated after the look",
         watched: &entry,
         source: &entry,
@@ -590,6 +627,7 @@ fn the_vars_file_truncated_after_the_look_triggers_nothing_until_written() {
     std::fs::write(&entry, "Vars {{v}}\n").unwrap();
 
     held_truncate_after_the_look(&DependencyCase {
+        test: "the_vars_file_truncated_after_the_look_triggers_nothing_until_written",
         what: "the vars file, truncated after the look",
         watched: &entry,
         source: &entry,
@@ -615,6 +653,7 @@ fn dir_mode_the_vars_file_truncated_after_the_look_triggers_nothing_until_writte
     let out = dir.path().join("out");
 
     held_truncate_after_the_look(&DependencyCase {
+        test: "dir_mode_the_vars_file_truncated_after_the_look_triggers_nothing_until_written",
         what: "directory mode, the vars file, truncated after the look",
         watched: &root,
         source: &source,
@@ -649,6 +688,8 @@ fn dir_mode_an_imported_partial_truncated_after_the_look_triggers_nothing_until_
     let out = dir.path().join("out");
 
     held_truncate_after_the_look(&DependencyCase {
+        test:
+            "dir_mode_an_imported_partial_truncated_after_the_look_triggers_nothing_until_written",
         what: "directory mode, an imported partial, truncated after the look",
         watched: &root,
         source: &source,
@@ -679,6 +720,7 @@ fn the_entry_truncated_after_its_rebuild_read_it_never_publishes_an_empty_output
 
     held_truncate_in_a_pause(
         &DependencyCase {
+            test: "the_entry_truncated_after_its_rebuild_read_it_never_publishes_an_empty_output",
             what: "the entry, truncated after its rebuild read it",
             watched: &entry,
             source: &entry,
@@ -708,6 +750,8 @@ fn the_vars_file_truncated_after_its_rebuild_read_it_triggers_nothing_until_writ
 
     held_truncate_in_a_pause(
         &DependencyCase {
+            test:
+                "the_vars_file_truncated_after_its_rebuild_read_it_triggers_nothing_until_written",
             what: "the vars file, truncated after its rebuild read it",
             watched: &entry,
             source: &entry,
@@ -746,6 +790,7 @@ fn dir_mode_the_vars_file_truncated_after_its_batch_read_it_triggers_nothing_unt
 
     held_truncate_in_a_pause(
         &DependencyCase {
+            test: "dir_mode_the_vars_file_truncated_after_its_batch_read_it_triggers_nothing_until_written",
             what: "directory mode, the vars file, truncated after its batch read it",
             watched: &root,
             source: &source,
@@ -786,6 +831,7 @@ fn dir_mode_a_source_truncated_while_a_batch_rebuilds_another_is_held() {
 
     held_truncate_in_a_pause(
         &DependencyCase {
+            test: "dir_mode_a_source_truncated_while_a_batch_rebuilds_another_is_held",
             what: "directory mode, a source truncated while another's batch runs",
             watched: &root,
             source: &a,
@@ -859,8 +905,16 @@ fn dir_mode_held_truncate_defers_the_whole_batch() {
     assert_no_empty_before_the_deadline(&a_log, timing.started, what);
     // An edit made once the deadline could have passed may be published at once, as an
     // empty output then may: the strict claims need both in time.
-    let edited_in_time = edited_at.duration_since(timing.started) < EMPTY_HOLD_DEADLINE;
-    if strict_claims_apply(&timing, what) && edited_in_time {
+    let edited = edited_at.duration_since(timing.started);
+    let strict = timing.ended_before_deadline() && edited < EMPTY_HOLD_DEADLINE;
+    if flag_strict_claims(
+        "dir_mode_held_truncate_defers_the_whole_batch",
+        strict,
+        &format!(
+            "{what}: {}, the other source edited {edited:?} into it",
+            hold_against_the_deadline(&timing)
+        ),
+    ) {
         assert!(
             a_log.first_empty.is_none(),
             "{what}: a.md must never be empty while a.mds is held truncated; states: {:?}",
@@ -969,7 +1023,11 @@ fn dir_mode_a_source_truncated_after_its_rebuild_looked_is_held() {
     let stderr = stderr_through_the_marker(&a, tap, &mut child);
     let what = "directory mode, truncated after the look";
     assert_no_empty_before_the_deadline(&log, timing.started, what);
-    if strict_claims_apply(&timing, what) {
+    if strict_claims_apply(
+        "dir_mode_a_source_truncated_after_its_rebuild_looked_is_held",
+        &timing,
+        what,
+    ) {
         assert!(
             log.first_empty.is_none(),
             "{what}: a.md must never be empty while a.mds is held truncated; states: {:?}",
