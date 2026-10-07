@@ -3777,7 +3777,8 @@ struct DirWatchState {
     /// [`graph_keys`]; do not re-canonicalize.
     forward_deps: HashMap<PathBuf, Vec<PathBuf>>,
     /// Sources whose last compile attempt failed. Re-seeded into every batch that
-    /// carries a real change, so a fix to whatever broke them is picked up.
+    /// carries a real change, so a fix to whatever broke them is picked up — and stamped by
+    /// every batch's look, so none is stamped after that compile read it (#380).
     errored: HashSet<PathBuf>,
     /// Last-seen collected `.mds` set for reconcile/rename detection.
     known_files: BTreeSet<PathBuf>,
@@ -4785,9 +4786,10 @@ fn liveness_probe_dir(
 /// emptied after the look is held the same way, alone, whether the compile then failed or
 /// not ([`compile_one_source`]), and a `--vars` load that failed on the file emptied after
 /// the look holds the whole batch. The look stamps the watched files, the paths the batch
-/// names and those of the batches held back, so a source no compile has read yet is
-/// stamped before its compile reads it, and one its compile holds keeps that stamp
-/// ([`DirWatchState::baselined_paths`]). The batch takes the look's stamps as its baseline
+/// names, those of the batches held back and the sources whose last compile failed, which
+/// a batch with a change compiles again without naming them, so a source no compile has
+/// read yet, or none has succeeded on, is stamped before its compile reads it, and one its
+/// compile holds keeps that stamp ([`DirWatchState::baselined_paths`]). The batch takes the look's stamps as its baseline
 /// before it reads anything, and keeps them however it ends ([`baseline_over`]) — at its
 /// end, or when its `--vars` load fails ([`Settle::Rebaseline`]): a file emptied while
 /// the batch runs, after its look, that no compile read empty — read whole before, or not
@@ -4819,10 +4821,17 @@ fn rebuild_dir_batch(
     ctx.working_dir.restore_if_recreated();
 
     // #380: a watched file emptied holds the whole batch back, and joins it. The look stamps
-    // each file once — the watched files, the paths held back and the paths the batch names,
-    // a source no compile has read yet included — and its stamps are the batch's baseline if
-    // it runs, so no source the batch names is stamped after its compile read it.
-    let look = look_at(state.baselined_paths().chain(batch));
+    // each file once — the watched files, the paths held back, the paths the batch names, a
+    // source no compile has read yet included, and the sources a failed compile left
+    // errored, which the batch compiles again without naming them — and its stamps are the
+    // batch's baseline if it runs, so no source the batch compiles is stamped after its
+    // compile read it.
+    let root = ctx.root.canonical.as_path();
+    let retried = state
+        .errored
+        .iter()
+        .filter(|path| names_a_source(root, path));
+    let look = look_at(state.baselined_paths().chain(batch).chain(retried));
     let emptied: BTreeSet<PathBuf> = emptied_in(&look, &state.last_mtimes).cloned().collect();
     let verdict = state
         .hold
@@ -5689,9 +5698,9 @@ fn process_dir_batch(
     // batch deleted, which are no longer watched.
     //
     // The stamps are the ones the batch's look took, before anything was read (#380) — a
-    // source the batch named included, one it created too. Only a file no look stamped is
-    // `stat`ed here: a dependency a compile discovered, or a source no compile of which has
-    // succeeded, compiled again for that failure by a batch that does not name it. A file
+    // source the batch named included, one it created too, and one no compile of which had
+    // succeeded, compiled again for that failure by a batch that does not name it. Only a
+    // file no look stamped is `stat`ed here: a dependency a compile discovered. A file
     // changed since the look therefore still differs: one truncated while the batch ran —
     // after the batch read it, or in a batch that does not read it — is found emptied by
     // the next look, where its own events would otherwise rebuild against an empty file

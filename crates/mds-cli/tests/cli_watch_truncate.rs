@@ -1173,6 +1173,109 @@ fn dir_mode_a_source_created_and_saved_after_its_batch_looked_publishes_the_save
     assert_holding_printed_nothing(&stderr, 1, what);
 }
 
+// ── A failing source truncated after a batch for another looked ─────────────
+
+/// Wait until the watcher's pause has written `paused`. PANICS after [`TIMEOUT`], naming
+/// `step`.
+#[cfg(debug_assertions)]
+#[track_caller]
+fn wait_for_the_pause(paused: &Path, tap: &StderrTap, step: &str) {
+    let paused_by = Instant::now() + TIMEOUT;
+    // Bounded by TIMEOUT: at most TIMEOUT / OUTPUT_POLL iterations.
+    while !paused.exists() {
+        assert!(
+            Instant::now() < paused_by,
+            "setup: {step}: the batch never paused after its look; stderr: {}",
+            tap.text()
+        );
+        std::thread::sleep(OUTPUT_POLL);
+    }
+}
+
+/// In directory mode, a source whose every compile has failed is compiled again by each
+/// batch that carries a change, though the batch does not name it. Truncated after such a
+/// batch looked and before its compile read it, it is held as a source the session compiled
+/// is: the empty read is never published, and once the source is written one rebuild
+/// publishes what was written. The batch's look stamps the sources it will compile again
+/// for a failure, so the look that follows the compile finds the source emptied.
+///
+/// The debug build's pause after a batch's look (`MDS_TEST_PAUSE_AFTER_LOOK`) makes the
+/// window certain. It stops every batch until the file that ends it exists, so the test
+/// moves that file aside to stop a later batch: the failing source's own batch is let go,
+/// a second failing source's diagnostic proves every event of the first was handled, and
+/// only then is the pause set again, for the batch of another source's creation. Outside a
+/// test, an editor saving a fix to a broken file by truncating it, while a batch for another
+/// file runs, opens the window.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_failing_source_truncated_after_a_batch_for_another_looked_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    // Outside the watched directory, so the pause's files raise no event.
+    let (go, paused) = (dir.path().join("go"), dir.path().join("go.paused"));
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &go)
+            .stdout(Stdio::null()),
+    );
+    let (failing, flush, other) = (root.join("e.mds"), root.join("f.mds"), root.join("a.mds"));
+    let output = out.join("e.md");
+
+    // e.mds is created failing: its batch stops after its look, and is let go.
+    write_atomic(&failing, "E {{e_undefined}}\n");
+    wait_for_the_pause(&paused, &tap, "the failing source's batch");
+    std::fs::write(&go, "").unwrap();
+    wait_for_tap(&tap, "undefined variable 'e_undefined'", TIMEOUT);
+    // f.mds is created failing too, after every event of e.mds: once its diagnostic is
+    // printed, no batch is left that names e.mds.
+    write_atomic(&flush, "F {{f_undefined}}\n");
+    wait_for_tap(&tap, "undefined variable 'f_undefined'", TIMEOUT);
+
+    // The pause is set again: the batch a.mds's creation starts stops after its look.
+    std::fs::rename(&go, dir.path().join("go.spent")).unwrap();
+    std::fs::rename(&paused, dir.path().join("go.paused.spent")).unwrap();
+    write_atomic(&other, "A one\n");
+    wait_for_the_pause(&paused, &tap, "the batch of a.mds");
+    let hold = Hold::start(&failing);
+    std::fs::write(&go, "").unwrap();
+    let mut log = OutputLog::default();
+    log.poll_for(&output, TRUNCATE_HOLD);
+    let timing = hold.write_and_close("E fixed\n");
+    log.wait_for(&output, "E fixed", TIMEOUT);
+
+    let stderr = stderr_through_the_marker(&failing, tap, &mut child);
+    let what = "directory mode, a failing source truncated after a batch for another looked";
+    assert_no_empty_before_the_deadline(&log, timing.started, what);
+    if strict_claims_apply(
+        "dir_mode_a_failing_source_truncated_after_a_batch_for_another_looked_is_held",
+        &timing,
+        what,
+    ) {
+        assert_eq!(
+            log.contents(),
+            ["E fixed\n"],
+            "{what}: the output is published once, with the content finally written; \
+             stderr:\n{stderr}"
+        );
+        let rebuilds = before_the_marker(&stderr)
+            .lines()
+            .filter(|line| line.starts_with("Recompiled ") && line.contains("e.md"))
+            .count();
+        assert_eq!(
+            rebuilds, 1,
+            "{what}: exactly one rebuild of e.md; stderr:\n{stderr}"
+        );
+    }
+}
+
 // ── The deadline ────────────────────────────────────────────────────────────
 
 /// Truncate the entry and close it without writing: the empty output IS published —
