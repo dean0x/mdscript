@@ -4037,6 +4037,10 @@ struct LivenessState {
     /// the process lifetime (avoids approaching `fs.inotify.max_user_watches`). Mirrors the
     /// `resync_watches` discipline from file mode.
     armed_dirs: BTreeSet<PathBuf>,
+    /// The dependencies' directories outside the root whose last watch failed and was
+    /// reported ([`arm_dir`]): each is reported once for as long as its watch keeps failing
+    /// — until a watch of it succeeds, or no source imports from it any more (#257).
+    failing_dirs: BTreeSet<PathBuf>,
 }
 
 /// Compile a single in-root source file, update `state`, and optionally write output.
@@ -4294,31 +4298,69 @@ struct DirWatchCtx {
     quiet: bool,
 }
 
+/// What [`arm_dir`] came to for one directory — a failure is reported once for as long as
+/// it lasts, as [`StdoutOutcome`] reports stdout's (#257).
+#[derive(Debug)]
+enum DirArm {
+    /// The watcher held it already: nothing was asked of it.
+    Held,
+    /// Its watch is in place now.
+    Armed,
+    /// Its watch failed, the first failure since a watch of it last succeeded, or since it
+    /// was imported: the caller reports it.
+    Failed(notify::Error),
+    /// Its watch failed again, with no watch of it succeeding in between: it was reported,
+    /// and is not reported a second time.
+    FailedAgain,
+}
+
+/// Watch `dir` unless `armed` holds it, and hold it there once its watch is in place
+/// (#257). A failure is noted in `failing`, and only the first of a run of them is
+/// [`DirArm::Failed`], for the caller to report; a watch that succeeds ends the run. So a
+/// directory that exists but cannot be watched — EACCES, inotify's `max_user_watches`
+/// spent — is tried again by every rebuild and warned about once, not after each one.
+fn arm_dir(
+    dir: &Path,
+    armed: &mut BTreeSet<PathBuf>,
+    failing: &mut BTreeSet<PathBuf>,
+    watch: impl FnOnce(&Path) -> notify::Result<()>,
+) -> DirArm {
+    if armed.contains(dir) {
+        return DirArm::Held;
+    }
+    match watch(dir) {
+        Ok(()) => {
+            armed.insert(dir.to_path_buf());
+            failing.remove(dir);
+            DirArm::Armed
+        }
+        Err(e) if failing.insert(dir.to_path_buf()) => DirArm::Failed(e),
+        Err(_) => DirArm::FailedAgain,
+    }
+}
+
 /// Arm each of `dirs` — directories of dependencies outside the root — that `armed` does
 /// not hold yet, with `watch`, and add it to `armed` once its watch is in place (#257).
-/// One whose watch fails is reported, named through [`shown_watched_dir`] with `root` and
-/// `vars`, and is left out of `armed`, so the next rebuild and the liveness tick arm it
-/// again: `armed` holds only directories the watcher holds.
+/// One whose watch fails is left out of `armed`, so the next rebuild and the liveness tick
+/// arm it again — `armed` holds only directories the watcher holds — and is reported,
+/// named through [`shown_watched_dir`] with `root` and `vars`, once for as long as its
+/// watch keeps failing ([`arm_dir`], `failing`).
 fn arm_external_dep_dirs<'a>(
     dirs: impl IntoIterator<Item = &'a PathBuf>,
     armed: &mut BTreeSet<PathBuf>,
+    failing: &mut BTreeSet<PathBuf>,
     mut watch: impl FnMut(&Path) -> notify::Result<()>,
     root: RootPaths<'_>,
     vars: Option<RootPaths<'_>>,
 ) {
     for dir in dirs {
-        if armed.contains(dir) {
-            continue;
-        }
-        match watch(dir) {
-            Ok(()) => {
-                armed.insert(dir.clone());
-            }
-            Err(e) => eprint_warning(&format!(
+        match arm_dir(dir, armed, failing, &mut watch) {
+            DirArm::Failed(e) => eprint_warning(&format!(
                 "warning: failed to watch external dep dir {}: {}",
                 safe_path(&shown_watched_dir(dir, root, vars)),
                 safe_inline(notify_cause(&e))
             )),
+            DirArm::Held | DirArm::Armed | DirArm::FailedAgain => {}
         }
     }
 }
@@ -4326,7 +4368,9 @@ fn arm_external_dep_dirs<'a>(
 /// Unwatch every directory outside the root that the watcher holds and that no source
 /// imports from any more — not in `imported` — but the `--vars` file's, which it holds for
 /// that file whatever the sources import. Each leaves `armed_dirs`; an `unwatch` that fails
-/// is ignored, the directory perhaps gone and its watch with it.
+/// is ignored, the directory perhaps gone and its watch with it. A directory no source
+/// imports leaves `failing_dirs` too, so an import that brings it back reports its first
+/// failed watch again ([`arm_dir`]).
 fn unwatch_unimported_dirs(
     ctx: &DirWatchCtx,
     watcher: &mut dyn Watcher,
@@ -4343,6 +4387,7 @@ fn unwatch_unimported_dirs(
         let _ = watcher.unwatch(dir);
         liveness.armed_dirs.remove(dir);
     }
+    liveness.failing_dirs.retain(|dir| imported.contains(dir));
 }
 
 /// Once a rebuild has run, unwatch the directories outside the root that no source imports
@@ -4359,9 +4404,17 @@ fn arm_external_dirs_after_rebuild(
     state: &DirWatchState,
 ) {
     unwatch_unimported_dirs(ctx, watcher, liveness, &state.external_dep_dirs);
+    // A directory the watcher holds is passed over before it is looked at: a rebuild costs
+    // no `stat` per armed directory.
+    let unarmed: Vec<&PathBuf> = state
+        .external_dep_dirs
+        .iter()
+        .filter(|dir| !liveness.armed_dirs.contains(*dir) && dir.exists())
+        .collect();
     arm_external_dep_dirs(
-        state.external_dep_dirs.iter().filter(|dir| dir.exists()),
+        unarmed,
         &mut liveness.armed_dirs,
+        &mut liveness.failing_dirs,
         |dir| watcher.watch(dir, RecursiveMode::NonRecursive),
         ctx.root.root_paths(),
         extra_vars_dir(
@@ -4438,7 +4491,9 @@ fn liveness_probe_dir(
                 } else {
                     let ok = watcher.watch(ext_dir, RecursiveMode::NonRecursive).is_ok();
                     if ok {
+                        // A watch that succeeds ends a run of failed ones (`arm_dir`).
                         liveness.armed_dirs.insert(ext_dir.clone());
+                        liveness.failing_dirs.remove(ext_dir);
                     }
                     ok
                 }
@@ -5252,10 +5307,13 @@ mod dir_startup {
         // Only a directory whose watch is in place is held as armed: one whose watch
         // failed is tried again by the next rebuild and the liveness tick (#257). The
         // `--vars` file's directory, when a dependency shares it, is held already and is
-        // not watched a second time.
+        // not watched a second time. A failed one is warned about here, and not again until
+        // a watch of it has succeeded.
+        let mut failing_dirs = BTreeSet::new();
         arm_external_dep_dirs(
             &state.external_dep_dirs,
             &mut armed_dirs,
+            &mut failing_dirs,
             |dir| watcher.watch(dir, RecursiveMode::NonRecursive),
             watch_root.root_paths(),
             extra_vars_dir(vars_dir_extra.as_deref(), vars_path_typed.as_deref()),
@@ -5310,6 +5368,8 @@ mod dir_startup {
                 .collect(),
             // The directories whose startup watch is in place, and only those.
             armed_dirs,
+            // The dependencies' directories whose startup watch failed, warned about.
+            failing_dirs,
         };
 
         let ctx = DirWatchCtx {
@@ -6018,7 +6078,7 @@ mod tests {
             walked: Path::new("/project/src"),
         };
 
-        let mut armed = BTreeSet::new();
+        let (mut armed, mut failing) = (BTreeSet::new(), BTreeSet::new());
         let mut watched = Vec::new();
         let first = |dir: &Path| {
             watched.push(dir.to_path_buf());
@@ -6028,7 +6088,7 @@ mod tests {
                 Ok(())
             }
         };
-        arm_external_dep_dirs(&dirs, &mut armed, first, root, None);
+        arm_external_dep_dirs(&dirs, &mut armed, &mut failing, first, root, None);
         // Control: both directories exist, so existence cannot tell them apart.
         assert!(ok.is_dir() && refused.is_dir());
         assert_eq!(watched, [ok.clone(), refused.clone()]);
@@ -6043,7 +6103,7 @@ mod tests {
             again.push(dir.to_path_buf());
             Ok(())
         };
-        arm_external_dep_dirs(&dirs, &mut armed, second, root, None);
+        arm_external_dep_dirs(&dirs, &mut armed, &mut failing, second, root, None);
         assert_eq!(
             again,
             [refused],
@@ -8811,6 +8871,7 @@ mod tests {
             root_armed: true,
             missing_external_dirs: BTreeSet::new(),
             armed_dirs: BTreeSet::new(),
+            failing_dirs: BTreeSet::new(),
         }
     }
 
@@ -9020,6 +9081,139 @@ mod tests {
              nothing else is unwatched or watched"
         );
         assert_eq!(liveness.armed_dirs, BTreeSet::from([vars_dir, kept]));
+    }
+
+    /// A watch that fails, as notify reports one the OS refused.
+    fn refuse(_: &Path) -> notify::Result<()> {
+        Err(notify::Error::generic("refused"))
+    }
+
+    /// #257: a directory whose watch keeps failing is reported once for as long as the
+    /// failures last — the first is [`DirArm::Failed`], each after it with no watch of it
+    /// succeeding in between [`DirArm::FailedAgain`] — and a watch that succeeds ends the
+    /// run, so a failure after it is reported again. A directory held is not watched.
+    #[test]
+    fn a_directory_whose_watch_keeps_failing_is_reported_once_until_a_watch_succeeds() {
+        let dir = Path::new("/elsewhere/lib");
+        let (mut armed, mut failing) = (BTreeSet::new(), BTreeSet::new());
+
+        let outcomes: Vec<DirArm> = (0..3)
+            .map(|_| arm_dir(dir, &mut armed, &mut failing, refuse))
+            .collect();
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [DirArm::Failed(_), DirArm::FailedAgain, DirArm::FailedAgain]
+            ),
+            "the first failure is reported, the two after it are not: {outcomes:?}"
+        );
+
+        let armed_now = arm_dir(dir, &mut armed, &mut failing, |_| Ok(()));
+        assert!(
+            matches!(armed_now, DirArm::Armed),
+            "control: a watch that succeeds: {armed_now:?}"
+        );
+        let mut asked = false;
+        let held = arm_dir(dir, &mut armed, &mut failing, |_| {
+            asked = true;
+            Ok(())
+        });
+        assert!(
+            matches!(held, DirArm::Held) && !asked,
+            "a directory held is not watched: {held:?}"
+        );
+
+        // It vanished — the tick holds it no more — and its watch fails once more.
+        armed.remove(dir);
+        let again = arm_dir(dir, &mut armed, &mut failing, refuse);
+        assert!(
+            matches!(again, DirArm::Failed(_)),
+            "a failure after a watch that succeeded is reported again: {again:?}"
+        );
+    }
+
+    /// #257: a directory no source imports any more leaves its run of failed watches with
+    /// it, so the import that brings it back reports its first failed watch again; while it
+    /// stays imported, another failure is not reported.
+    #[test]
+    fn a_directory_imported_again_reports_its_failed_watch_again() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let ctx = dir_ctx(&root, &out);
+        let dir = Path::new("/elsewhere/lib");
+        let imported = BTreeSet::from([dir.to_path_buf()]);
+        let mut liveness = idle_liveness();
+        let mut watcher = RecordingWatcher::default();
+        let arm = |liveness: &mut LivenessState| {
+            arm_dir(
+                dir,
+                &mut liveness.armed_dirs,
+                &mut liveness.failing_dirs,
+                refuse,
+            )
+        };
+
+        let first = arm(&mut liveness);
+        unwatch_unimported_dirs(&ctx, &mut watcher, &mut liveness, &imported);
+        let still = arm(&mut liveness);
+        assert!(
+            matches!((&first, &still), (DirArm::Failed(_), DirArm::FailedAgain)),
+            "control: while it is imported, only the first failure is reported: \
+             {first:?}, {still:?}"
+        );
+
+        // Its import edited away, then back.
+        unwatch_unimported_dirs(&ctx, &mut watcher, &mut liveness, &BTreeSet::new());
+        let back = arm(&mut liveness);
+        assert!(
+            matches!(back, DirArm::Failed(_)),
+            "the directory imported again reports its failed watch again: {back:?}"
+        );
+    }
+
+    /// #257: the idle tick's watch of a directory whose watch kept failing, once it
+    /// succeeds, ends that run of failures as a rebuild's does: the next failed watch of
+    /// it is reported.
+    #[test]
+    fn a_tick_that_arms_a_failing_directory_ends_its_run_of_failures() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_ext_dir, ext) = canonical_tempdir();
+        let ctx = dir_ctx(&root, &out);
+        let mut state = empty_dir_state();
+        state.external_dep_dirs.insert(ext.clone());
+        let mut liveness = idle_liveness();
+        let first = arm_dir(
+            &ext,
+            &mut liveness.armed_dirs,
+            &mut liveness.failing_dirs,
+            refuse,
+        );
+        assert!(
+            matches!(first, DirArm::Failed(_)),
+            "control: a rebuild's watch failed: {first:?}"
+        );
+
+        let mut watcher = RecordingWatcher::default();
+        liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
+        assert_eq!(
+            watcher.calls,
+            [WatchCall::Watch(ext.clone())],
+            "control: the tick watches it, and the watch succeeds"
+        );
+
+        // It vanished — the tick holds it no more — and a rebuild's watch of it fails.
+        liveness.armed_dirs.remove(&ext);
+        let again = arm_dir(
+            &ext,
+            &mut liveness.armed_dirs,
+            &mut liveness.failing_dirs,
+            refuse,
+        );
+        assert!(
+            matches!(again, DirArm::Failed(_)),
+            "a failure after the tick's watch succeeded is reported: {again:?}"
+        );
     }
 
     /// #380: an idle tick rebuilds with a `--vars` edit whose event was lost — to an inotify
