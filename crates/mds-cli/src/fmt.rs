@@ -19,10 +19,17 @@
 //! - 1: `--check` found something that would change (after printing the
 //!   summary), OR a format/parse error (`MdsError` non-io, including
 //!   `FormatterInvariant`) via `Err` -> `exit_code`
-//! - 2: file not found / not `.mds` / I/O / bad UTF-8
-//! - 3: oversized source
+//! - 2: file not found / not `.mds` / I/O / bad UTF-8 — a rewrite or a stdout write
+//!   that fails included, in directory mode too, where one such file makes the run
+//!   exit 2 (#157); a closed stdout is not a failure. So is a rewrite that lands in a
+//!   directory it cannot then sync (#160): given the file, `Formatted:` names it and the
+//!   failed sync is reported after it; a directory run — which syncs each directory once,
+//!   after the last of its files, and shows their `Formatted:` lines only then — reports
+//!   the failed sync in place of each such file's `Formatted:` line, and counts it
+//!   formatted
+//! - 3: oversized source (in directory mode, a failed file that leaves the run at 1)
 
-use std::io::Write as _;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use mds::effective_parent;
@@ -30,7 +37,12 @@ use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, render_unified_diff, Durability,
+    catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path, stdout_failure,
+    write_stdout, Panicked, RootPaths, StdoutOutcome, WriteTarget,
+};
+use crate::write::{
+    read_stamped, replace_if_unchanged, replace_owing_sync, DirectorySyncs, Durability, Renamed,
+    Rewritten, Synced,
 };
 
 pub(crate) struct FmtArgs {
@@ -59,7 +71,7 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
 
     let (input, auto_detected) = resolve_input(input, "fmt")?;
     if auto_detected && !quiet {
-        eprintln!("Formatting {}", crate::output::safe_path(&input));
+        crate::output::ewriteln!("Formatting {}", crate::output::safe_path(&input));
     }
 
     let flags = FmtFlags { check, diff, quiet };
@@ -124,22 +136,21 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
     // `None` is the working directory, shown as "." (see `read_stdin`).
     let result = format_source_named(&source, None, STDIN_DISPLAY_LABEL)?;
 
+    // A closed stdout is not an error here: the reader is gone, and the verdict below
+    // still stands (#157).
     if diff {
-        print_diff(&render_unified_diff(
-            &source,
-            &result.formatted,
-            STDIN_DISPLAY_LABEL,
-        ))?;
+        let rendered = render_unified_diff(&source, &result.formatted, STDIN_DISPLAY_LABEL);
+        write_stdout(rendered.as_bytes()).into_batch_result()?;
     } else if !check {
         // Plain filter mode: formatted content is the output.
-        write_stdout(&result.formatted)?;
+        write_stdout(result.formatted.as_bytes()).into_batch_result()?;
     }
 
     if check && result.changed {
         if !quiet {
-            eprintln!("Would reformat: {STDIN_DISPLAY_LABEL}");
+            crate::output::ewriteln!("Would reformat: {STDIN_DISPLAY_LABEL}");
         }
-        std::process::exit(1);
+        crate::output::exit(1);
     }
     Ok(())
 }
@@ -154,26 +165,35 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     // path and does not silently fall through to the structural_equivalent fallback
     // that would swallow a genuine mds::syntax error. avoids PF-006, applies ADR-001.
     let base_dir = Some(effective_parent(path));
-    let file_name = path.display().to_string();
+    // The label of its error frames and of its `--diff` header (#390).
+    let file_name = safe_path(path);
     let result = format_source_named(&source, base_dir, &file_name)?;
 
     if diff && result.changed {
-        let label = crate::output::safe_path(path);
-        print_diff(&render_unified_diff(&source, &result.formatted, &label))?;
+        let rendered = render_unified_diff(&source, &result.formatted, &file_name);
+        write_stdout(rendered.as_bytes()).into_batch_result()?;
     }
 
     let read_only = check || diff;
     if !read_only {
         if result.changed {
-            // Atomic write preserves file permissions and avoids truncate-then-write
-            // data loss on crash or full disk (avoids the issue fixed for lint by
-            // commit c5aa086 — both write paths now share the same helper).
-            atomic_write_file(path, &result.formatted, Durability::Fsync)?;
+            // Replace-by-rename preserves file permissions and avoids truncate-then-write
+            // data loss on crash or full disk — the same helpers as lint --fix. A file
+            // argument is anchored at its typed parent, read again there and replaced only
+            // if it still holds the bytes formatted, in the directory it was read in
+            // (#160).
+            let read = read_stamped(&WriteTarget::as_typed(path.to_path_buf()), &source)?;
+            let rewritten = replace_if_unchanged(read, &result.formatted, Durability::Fsync)?;
             if !quiet {
-                eprintln!("Formatted: {}", crate::output::safe_path(path));
+                crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
+            }
+            // The file holds the rewrite; a directory that could not then be synced is the
+            // run's failure, reported after it (exit 2).
+            if let Rewritten::NotSynced(e) = rewritten {
+                return Err(e.into());
             }
         } else if !quiet {
-            eprintln!("Unchanged: {}", crate::output::safe_path(path));
+            crate::output::ewriteln!("Unchanged: {}", crate::output::safe_path(path));
         }
         return Ok(());
     }
@@ -181,12 +201,12 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     if check {
         if result.changed {
             if !quiet {
-                eprintln!("Would reformat: {}", crate::output::safe_path(path));
+                crate::output::ewriteln!("Would reformat: {}", crate::output::safe_path(path));
             }
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         if !quiet {
-            eprintln!("Unchanged: {}", crate::output::safe_path(path));
+            crate::output::ewriteln!("Unchanged: {}", crate::output::safe_path(path));
         }
     }
     Ok(())
@@ -196,55 +216,81 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
 
 /// Outcome of formatting a single file in directory mode; tallied by the caller.
 enum FileOutcome {
-    /// Normal mode: the file was reformatted and written.
-    Formatted,
+    /// Normal mode: the file was reformatted and written; the sync of its directory, and
+    /// its `Formatted:` line, are owed (#160).
+    Formatted(Renamed),
     /// Normal mode: the file was already formatted (no write needed).
     Unchanged,
     /// `--check` / `--diff` mode: the file would change.
     WouldChange,
     /// `--check` / `--diff` mode: the file is already formatted.
     NoChange,
-    /// Any per-file error (read, format, diff-output, or write).
+    /// Any per-file error (read, format, diff-output, or write), or a panic in the
+    /// formatter, which the panic hook reported (#389).
     Failed,
 }
 
 /// Format one file in directory mode: read → format → (optional) diff → (optional) write.
 ///
-/// All per-file error and status lines are printed as side effects so the
-/// directory loop only needs to tally the returned [`FileOutcome`].
+/// Every per-file error line is printed here as a side effect, so the directory loop
+/// only needs to tally the returned [`FileOutcome`] — and show the `Formatted:` line of
+/// a rewrite once its directory is synced.
 ///
-/// A diff-output failure (non-broken-pipe stdout error) is returned as
-/// [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
-/// read and format errors are treated in the surrounding loop.
-fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
-    let FmtFlags { check, diff, quiet } = flags;
-    let file_name = file.display().to_string();
+/// A diff-output failure other than a closed stdout, and a rewrite that fails, are
+/// returned as [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
+/// read and format errors are treated in the surrounding loop — and recorded as I/O
+/// failures, so the run exits at least 2; so is a read or format error in the I/O and
+/// file-system class. A failing stdout is reported once per failure episode — the first
+/// failed write since the run began or since a write last landed; every file whose diff
+/// it lost counts as failed. A closed stdout is not a failure: the diff has no reader,
+/// and the file's outcome stands (#157). A rewrite that lands is
+/// [`FileOutcome::Formatted`], whose directory's sync — and with it the file's
+/// `Formatted:` line — the run makes later ([`run_fmt_directory`], #160).
+///
+/// `file` is the walk's path, below the directory argument as typed: the label of its
+/// error frames and of its `--diff` header, as a file argument typed that way is named
+/// (#390). Its rewrite is anchored at `root`, the directory argument, so a directory
+/// between the two that turned into a symlink after the walk is refused (#160).
+fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
+    let FmtFlags { check, diff, .. } = flags;
+    let file_name = safe_path(file);
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
             // File path is embedded in the miette report; sanitize for ESC injection safety
             // (avoids PF-004 parallel-path gap — uses the shared render helper).
-            crate::output::eprint_error(e);
+            crate::output::eprint_file_failure(e);
             return FileOutcome::Failed;
         }
     };
     // effective_parent maps "" (bare filename) to "." — avoids PF-006, applies ADR-001.
     let base_dir = Some(effective_parent(file));
-    let result = match format_source_named(&source, base_dir, &file_name) {
-        Ok(r) => r,
-        Err(e) => {
+    // A panic in the formatter fails this file alone, and the batch goes on (#389).
+    let formatted = catch_compile(
+        file,
+        AssertUnwindSafe(|| format_source_named(&source, base_dir, &file_name)),
+    );
+    let result = match formatted {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             // MdsError::Syntax embeds user-controlled source fragments that may contain
             // raw ESC bytes; file_name is threaded into the report by format_source_named.
-            crate::output::eprint_error(e);
+            crate::output::eprint_file_failure(e);
             return FileOutcome::Failed;
         }
+        // The panic hook reported it, and the run will exit 101.
+        Err(Panicked) => return FileOutcome::Failed,
     };
 
     if diff && result.changed {
-        let label = file_name.clone();
-        if let Err(e) = print_diff(&render_unified_diff(&source, &result.formatted, &label)) {
-            crate::output::eprint_error(e);
-            return FileOutcome::Failed;
+        let rendered = render_unified_diff(&source, &result.formatted, &file_name);
+        match write_stdout(rendered.as_bytes()) {
+            StdoutOutcome::Written | StdoutOutcome::Closed => {}
+            StdoutOutcome::Failed(e) => {
+                crate::output::eprint_io_failure(stdout_failure(&e));
+                return FileOutcome::Failed;
+            }
+            StdoutOutcome::FailedAgain => return FileOutcome::Failed,
         }
     }
 
@@ -258,18 +304,16 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     } else if !result.changed {
         FileOutcome::Unchanged
     } else {
-        // Atomic write preserves file permissions and avoids truncate-then-write
-        // data loss on crash or full disk — same guarantee as lint --fix (avoids
-        // the divergence introduced after commit c5aa086 hardened the lint path).
-        match atomic_write_file(file, &result.formatted, Durability::Fsync) {
-            Ok(()) => {
-                if !quiet {
-                    eprintln!("Formatted: {}", crate::output::safe_path(file));
-                }
-                FileOutcome::Formatted
-            }
+        // Replace-by-rename preserves file permissions and avoids truncate-then-write
+        // data loss on crash or full disk — the same helpers as lint --fix — and writes
+        // only over the bytes formatted, in the directory they were read in (#160).
+        let target = WriteTarget::walked_below(RootPaths::as_typed(root), file);
+        match read_stamped(&target, &source)
+            .and_then(|read| replace_owing_sync(read, &result.formatted))
+        {
+            Ok(renamed) => FileOutcome::Formatted(renamed),
             Err(e) => {
-                crate::output::eprint_error(e);
+                crate::output::eprint_io_failure(e);
                 FileOutcome::Failed
             }
         }
@@ -284,7 +328,8 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
 /// just as much a candidate for reformatting as any other file.
 ///
 /// Continue-on-error: a per-file failure does not abort the run. Non-zero
-/// exit when any file failed, or (under `--check`) when any file would change.
+/// exit when any file failed, or (under `--check`) when any file would change; 2 when an
+/// I/O or file-system failure was recorded (#157).
 fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     // Directory recursion depth cap, matching `run_build_directory` /
     // `run_check_directory` which also declare MAX_DEPTH as a function-local
@@ -302,21 +347,21 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
-            eprintln!(
+            crate::output::ewriteln!(
                 "{} .mds file(s) found but all are under default-excluded directories \
                  (hidden dirs, node_modules); nothing was formatted",
                 walk.excluded_by_default
             );
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         // #204: an empty tree is "nothing to format", not success (mirrors build.rs).
         // Emitted even under --quiet and exit 1.  This arm sits BEFORE the `read_only`
         // split below, so `--check` and `--diff` behave identically on an empty tree.
-        eprintln!(
+        crate::output::ewriteln!(
             "no .mds files found in {}; nothing was formatted",
             crate::output::safe_path(dir)
         );
-        std::process::exit(1);
+        crate::output::exit(1);
     }
 
     let read_only = flags.check || flags.diff;
@@ -324,11 +369,33 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     let mut unchanged_count: usize = 0;
     let mut fail_count: usize = 0;
 
-    for file in &files {
-        match format_one_file(file, flags) {
-            FileOutcome::Formatted | FileOutcome::WouldChange => changed_count += 1,
-            FileOutcome::Unchanged | FileOutcome::NoChange => unchanged_count += 1,
-            FileOutcome::Failed => fail_count += 1,
+    // Each directory a rewrite lands in is synced once, after the last file of the walk
+    // in it, and only then are its rewrites' `Formatted:` lines shown (#160).
+    let mut syncs = DirectorySyncs::new(files.iter().map(PathBuf::as_path));
+    for (place, file) in files.iter().enumerate() {
+        let landed = match format_one_file(dir, file, flags) {
+            FileOutcome::Formatted(renamed) => {
+                changed_count += 1;
+                syncs.landed(place, renamed, file.as_path())
+            }
+            FileOutcome::WouldChange => {
+                changed_count += 1;
+                None
+            }
+            FileOutcome::Unchanged | FileOutcome::NoChange => {
+                unchanged_count += 1;
+                None
+            }
+            FileOutcome::Failed => {
+                fail_count += 1;
+                None
+            }
+        };
+        for synced in landed.into_iter().flatten() {
+            show_synced(synced, flags.quiet);
+        }
+        for synced in syncs.past(place).into_iter().flatten() {
+            show_synced(synced, flags.quiet);
         }
     }
 
@@ -340,46 +407,35 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
         // the single-file --check path (which is fully silent under --quiet,
         // exiting 1 with no message when a file would change).
         if !flags.quiet || fail_count > 0 {
-            eprintln!(
+            crate::output::ewriteln!(
                 "{changed_count} would reformat, {unchanged_count} unchanged, {fail_count} failed"
             );
         }
     } else if !flags.quiet || fail_count > 0 {
-        eprintln!("{changed_count} formatted, {unchanged_count} unchanged, {fail_count} failed");
+        crate::output::ewriteln!(
+            "{changed_count} formatted, {unchanged_count} unchanged, {fail_count} failed"
+        );
     }
 
     if fail_count > 0 || (flags.check && changed_count > 0) {
-        std::process::exit(1);
+        crate::output::exit(1);
     }
     Ok(())
 }
 
-// ── stdout writing (broken-pipe-safe) ────────────────────────────────────────
-
-/// Write `s` to stdout, treating a broken pipe as a clean early exit rather
-/// than an error — matches Unix filter conventions (e.g. `mds fmt - | head
-/// -n1` closing the pipe early must not surface as a crash or failure).
-fn write_stdout(s: &str) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    if let Err(e) = stdout.write_all(s.as_bytes()) {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
+/// Show a directory run's rewrite of `file` once its directory's sync is made (#160):
+/// `Formatted:` when it was synced, not under `--quiet`; otherwise, in its place, the
+/// failed sync, recorded as an I/O failure (exit 2). Either way the file holds the
+/// rewrite, and counts as formatted.
+fn show_synced(synced: Synced<&Path>, quiet: bool) {
+    match synced {
+        Synced::Durable(file) => {
+            if !quiet {
+                crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(file));
+            }
         }
-        return Err(miette::miette!("cannot write to stdout: {e}"));
+        Synced::NotSynced(_, e) => crate::output::eprint_io_failure(e),
     }
-    if let Err(e) = stdout.flush() {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(miette::miette!("cannot flush stdout: {e}"));
-        }
-    }
-    Ok(())
-}
-
-fn print_diff(rendered: &str) -> Result<()> {
-    if rendered.is_empty() {
-        return Ok(());
-    }
-    write_stdout(rendered)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -451,5 +507,59 @@ mod tests {
             format_source_named("Hello!\r\n\r\n\r\n\r\nBye.\r\n", None, "<source>").unwrap();
         assert!(result.changed);
         assert!(!result.formatted.contains('\r'));
+    }
+
+    /// A directory run syncs each directory its rewrites landed in once, after the run is
+    /// past its last file there, not once for each rewrite (#160): three files reformatted
+    /// in `src` are one sync, and `src/sub`, with a rewrite of its own, one more — four
+    /// rewrites, two syncs — and each file holds its rewrite. Control: the same four files
+    /// given one at a time are a sync each.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_run_syncs_each_directory_once() {
+        use crate::write::sync_probe::directory_syncs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let files = ["a.mds", "b.mds", "sub/c.mds", "z.mds"].map(|file| src.join(file));
+        let unformatted = || {
+            for file in &files {
+                std::fs::write(file, "Alpha\r\n").unwrap();
+            }
+        };
+        let flags = FmtFlags {
+            check: false,
+            diff: false,
+            quiet: true,
+        };
+
+        unformatted();
+        let before = directory_syncs();
+        run_fmt_directory(&src, flags).unwrap();
+        assert_eq!(
+            directory_syncs() - before,
+            2,
+            "one sync for src and one for src/sub"
+        );
+        for file in &files {
+            assert_eq!(
+                std::fs::read_to_string(file).unwrap(),
+                "Alpha\n",
+                "{file:?}"
+            );
+        }
+
+        unformatted();
+        let before = directory_syncs();
+        for file in &files {
+            run_fmt_file(file, flags).unwrap();
+        }
+        assert_eq!(
+            directory_syncs() - before,
+            files.len(),
+            "control: a file argument's rewrite syncs its directory itself"
+        );
     }
 }

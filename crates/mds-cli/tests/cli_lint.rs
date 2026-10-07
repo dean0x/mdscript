@@ -569,20 +569,16 @@ fn directory_mode_lints_all_files_including_partials() {
 
 // ── L-CLI-USAGE-ERR: --fix --format json stdin → exit 2 ─────────────────────
 
+/// Refused with the error document on stdout, the run's one report (#309).
 #[test]
 fn fix_json_stdin_is_usage_error_exit_2() {
     let out = lint_stdin("Hello {{name}}!", &["--fix", "--format", "json"]);
     assert_eq!(
-        out.status.code(),
-        Some(2),
-        "--fix --format json stdin must exit 2 (usage error)"
+        json_exit(&out),
+        JsonExit::error(2, "mds::io"),
+        "--fix --format json stdin must exit 2 with the error document"
     );
-    // Error message must go to stderr
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.is_empty(),
-        "usage error message must appear on stderr"
-    );
+    assert_eq!(error_message(&out).as_deref(), Some(STDIN_FIX_JSON_REFUSAL));
 }
 
 // ── L-CLI-JSON4: nonexistent path → JSON error envelope ─────────────────────
@@ -1178,7 +1174,7 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
 // Pins that after --fix in SINGLE-FILE mode, residual diagnostics in the JSON
 // output are keyed by the file's basename, NOT by "input.mds".
 //
-// The plan_and_apply_fixes reverify closure calls lint_str_with, which sets
+// The reverify gate used to lint each candidate with lint_str_with, which sets
 // diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").  Without set_diag_display_path
 // in the single-file Fixed/PartiallyFixed arms, `mds lint --fix --format json <file>`
 // emitted "input.mds" instead of the real basename.  Directory mode already had the
@@ -1233,8 +1229,8 @@ fn file_fix_json_residuals_keyed_by_filename_not_input_mds() {
 
 // ── Test (c): --fix --check on overlap-fix fixture → "Would fix" after coalescing ──
 //
-// Pins bug-5 / PF-004 fix for the check path: preview_fixes returns a
-// PreviewOutcome::WouldFix so --fix --check reports what would change.
+// Pins the bug-5 fix for the check path: the preview (`preview_fix`) returns a
+// pending fix, so --fix --check reports what would change.
 //
 // Fixture: lint_overlap_fix.mds — @if "x" == "x": with "hello" then-body and an
 // empty @else body. Two rules fire simultaneously:
@@ -1720,7 +1716,7 @@ fn frame_source_identity(rendered: &str) -> Option<String> {
 fn stdin_analysis_failure_labels_source_as_stdin() {
     // A source that fails the check gate: `@if` without a condition is a hard
     // syntax error, so lint_str_with returns Err and takes the
-    // emit_analysis_failure_json_or_stderr path.
+    // analysis-failure path (`analysis_failed`).
     let source = "@if\nbroken\n";
 
     // Human channel: the miette frame header must name <stdin>.
@@ -2609,14 +2605,14 @@ fn dir_fix_check_json_emits_parseable_json_before_exit_1() {
 // ── resolve-b2a: single-file --fix --check --format json emits JSON before exit ─
 //
 // Regression: `lint_one_file` called `std::process::exit(1)` inside the
-// `PreviewOutcome::WouldFix` + `check` arm WITHOUT first calling `emit_result`,
-// making the `emit_result` at the end of the preview block unreachable.  On exit,
+// would-fix + `check` preview arm WITHOUT first emitting the result, making the
+// emit at the end of the preview block unreachable.  On exit,
 // stdout was zero bytes — `JSON.parse("")` throws.  AC-F-14 was satisfied in
 // directory mode (the `any_would_fix` exit emits the envelope first at
 // run_lint_directory) but broken in single-file mode.
 //
-// Fix: call `emit_result(format, &result, quiet, named_source)` immediately before
-// `std::process::exit(1)` in the single-file WouldFix+check arm (mirroring dir mode).
+// Fix: emit the result immediately before `std::process::exit(1)` in the
+// single-file would-fix + check arm (mirroring dir mode).
 
 #[test]
 fn file_fix_check_json_emits_parseable_json_before_exit_1() {
@@ -2684,7 +2680,7 @@ fn stdin_fix_check_exits_1_and_writes_nothing_to_stdout() {
 
 // ── resolve-w2 #43: dir-mode and single-file-mode agree on --quiet for PartiallyFixed
 //
-// Regression: `lint_one_file_accumulating` destructured `LintFlags` without binding
+// Regression: the directory JSON path destructured `LintFlags` without binding
 // `quiet`, so `mds lint dir/ --fix --format json --quiet` emitted "partial fix:"
 // lines to stderr that the single-file equivalent suppressed. Three different message
 // texts across four call sites was the root cause. Refs: issue #173.
@@ -2816,7 +2812,7 @@ fn lint_fix_bare_filename_applies_fix() {
 /// Background: `MdsError::Syntax` embeds user-controlled source fragments via
 /// miette's NamedSource.  Before the fix, those fragments printed with raw ESC
 /// bytes intact, enabling terminal escape injection when linting untrusted repos.
-/// The fix sanitizes at the CLI render boundary in `emit_analysis_failure_json_or_stderr`.
+/// The fix sanitizes at the CLI render boundary, where an analysis failure is shown.
 #[test]
 fn lint_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
@@ -3323,8 +3319,8 @@ fn lint_write_failure_includes_filename_in_stderr() {
     )
     .unwrap();
 
-    // Make the parent directory read-only so temp-file creation fails.
-    // This triggers the "cannot create temp file for {path}" error path.
+    // Make the parent directory read-only so temp-file creation fails: the
+    // "cannot write {path}" error path.
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
     let out = lint_path(&target, &["--fix"]);
@@ -3400,7 +3396,7 @@ fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
 
 /// Regression gate (directory mode): when `atomic_write_file` fails,
 /// stderr must NOT contain "Fixed: <file>" — mirrors the single-file check
-/// above for the `lint_one_file_human` code path (lint.rs:1227).
+/// above for each directory entry (`lint_dir_entry`).
 ///
 /// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
 /// read-only attribute does not block creating files in a directory (#147).
@@ -3423,7 +3419,7 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
     // Make the inner directory read-only so temp-file creation fails on write.
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Run lint --fix on the directory (directory mode routes through lint_one_file_human).
+    // Run lint --fix on the directory (each entry goes through lint_dir_entry).
     let out = lint_path(&inner, &["--fix"]);
 
     let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
@@ -3438,13 +3434,13 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
     );
 }
 
-/// Regression gate (directory JSON mode): when `atomic_write_file` fails in
-/// `lint_one_file_accumulating`, stderr must NOT contain "Fixed: <file>" — mirrors
-/// the human-mode check above for the `lint_one_file_human` code path.
+/// Regression gate (directory JSON mode): when `atomic_write_file` fails for an
+/// entry, stderr must NOT contain "Fixed: <file>" — mirrors the human-mode check
+/// above.
 ///
-/// Code ordering is correct: `lint_one_file_accumulating` returns `FileTally::Error`
-/// at lint.rs:1537 before reaching the `eprintln!("Fixed: …")` at lint.rs:1541.
-/// This test provides the coverage that the code ordering is verified.
+/// Code ordering: a failed write is `Rewrite::WriteFailed`, decided before anything
+/// is shown, and the result sink announces `Fixed:` only for a written file.
+/// This test covers that ordering end to end.
 ///
 /// Positive control (PF-013/ADR-009): a writable directory run confirms "Fixed:"
 /// DOES appear so the absence assertion below cannot be vacuous.
@@ -3489,7 +3485,7 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
     // Make the inner directory read-only so temp-file creation fails on write.
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Run lint --fix --format json on the directory (routes through lint_one_file_accumulating).
+    // Run lint --fix --format json on the directory (each entry goes through lint_dir_entry).
     let out = lint_path(&inner, &["--fix", "--format", "json"]);
 
     let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
@@ -3506,8 +3502,8 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
 
 // ── resolve-b2a (F-14): dir JSON write failure must emit structured error, not stale result ─
 //
-// Regression: `lint_one_file_accumulating` called `accumulate_result_json(&residual, …)`
-// BEFORE `atomic_write_file`.  On write failure the residual (post-fix, zero-diagnostic)
+// Regression: the directory JSON path added the residual to the document BEFORE
+// `atomic_write_file`.  On write failure the residual (post-fix, zero-diagnostic)
 // result was already pushed to the envelope, so consumers parsed clean-looking JSON
 // while the process exited 2 and stderr said "Permission denied".  AC-F-14 requires the
 // JSON envelope to truthfully reflect what happened.
@@ -3524,8 +3520,8 @@ fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
 
     // ── Positive control (PF-013/ADR-009): writable dir → clean JSON, no error entry ──
     //
-    // After a successful fix the residual has zero diagnostics, so accumulate_result_json
-    // adds no file entry and files[] is empty — that is the correct/clean shape.
+    // After a successful fix the residual has zero diagnostics, so the document gets
+    // no file entry and files[] is empty — that is the correct/clean shape.
     // The critical positive-control signal is: exit 0 + "Fixed:" on stderr + no "error" key.
     {
         let dir = tempfile::tempdir().unwrap();
@@ -3621,7 +3617,7 @@ fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
 /// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
 /// `MdsError::Syntax`.
 ///
-/// Directory mode routes through `lint_one_file_human`, which previously called
+/// Directory mode's per-entry human path previously called
 /// `eprintln!("{:?}", miette::Report::from(e.clone()))` directly without sanitization.
 /// That path is now guarded by `crate::output::eprint_error` (avoids PF-004 parallel-path
 /// gap — the sibling that slipped past rounds 1 and 2).
@@ -4830,7 +4826,7 @@ fn unknown_rule_does_not_change_fix_behaviour() {
 ///
 /// The JSON arm is pinned by `unknown_rule_json_stdout_is_byte_identical_to_run_without_it`.
 /// Human format routes diagnostics through a completely different renderer
-/// (`render_result_human` → `eprint_error` → miette, on stderr) and writes nothing to
+/// (the human result sink → miette, on stderr) and writes nothing to
 /// stdout, so a JSON-only assertion proves nothing here — this arm has to be asserted
 /// separately (PF-007 reasoning applied within one surface: two output formats are two
 /// renderers).
@@ -5541,24 +5537,18 @@ fn lint_stdin_prints_no_directory_summary() {
 // ── D4 cross-mode parity: status messages honour --quiet in ALL four input modes ──
 //
 // PF-004 — an alternate output path can silently bypass a guard. Directory mode
-// has TWO separate emitters (lint_one_file_human for --format human, and
-// lint_one_file_accumulating for --format json), plus single-file mode and stdin mode.
-// That is eight `fix rejected:` call sites in lint.rs (cited by function + match arm
-// so the reference survives future line-number shifts):
-//   run_lint_stdin             apply  — FixFileOutcome::Rejected arm
-//   run_lint_stdin             preview — PreviewOutcome::Rejected arm
-//   run_lint_file              apply  — FixFileOutcome::Rejected arm
-//   run_lint_file              preview — PreviewOutcome::Rejected arm
-//   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm
-//   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm
-//   lint_one_file_human        apply  — FixFileOutcome::Rejected arm
-//   lint_one_file_human        preview — PreviewOutcome::Rejected arm
+// once had two separate emitters, one per format, plus single-file mode and stdin
+// mode: eight `fix rejected:` call sites. Every mode now reaches `fix rejected:` the
+// same way — `lint_input` turns a refused fix into `Rewrite::Refused` (a file's
+// `--fix`), `FilterFix::Refused` (stdin's) or `PreviewFix::Refused` (a preview), and
+// the format's result sink (`lint_sink.rs`) prints it — but the four modes still load
+// and name their input differently.
 // This test covers all four modes, each with its own paired positive control, so no
 // assertion can pass because the fix was never attempted rather than suppressed.
 
 /// Source with a single Tier A fix that the reverify gate rejects whole-file:
-/// removing the empty `@define` would orphan the `@export`, so `FixFileOutcome`
-/// is `Rejected` (not `PartiallyFixed`) and `fix rejected:` is emitted.
+/// removing the empty `@define` would orphan the `@export`, so the fix pipeline's
+/// outcome is `Rejected` (not `PartiallyFixed`) and `fix rejected:` is emitted.
 const FIX_REJECTED_SOURCE: &str = "\
 @define empty_fn():
 
@@ -5638,14 +5628,13 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
         "directory: --quiet must not move the exit code"
     );
 
-    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
-    // PF-004: --format json routes directory files through lint_one_file_accumulating,
-    // a separate emitter from lint_one_file_human (Mode 3).  This covers the two
-    // gated sites in that emitter:
-    //   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm  (--fix)
-    //   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm (--fix --check)
+    // ── Mode 4: directory, --format json (JSON result sink) ─────────────────────
+    // --format json shows directory files through the JSON result sink, not the human
+    // one (Mode 3).  This covers its two refusals:
+    //   apply   — Rewrite::Refused     (--fix)
+    //   preview — PreviewFix::Refused  (--fix --check)
 
-    // Apply path (lint_one_file_accumulating, FixFileOutcome::Rejected): --fix --format json.
+    // Apply path (Rewrite::Refused): --fix --format json.
     let loud_json = lint_path(dir.path(), &["--fix", "--format", "json"]);
     let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
     assert!(
@@ -5668,7 +5657,7 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
         "dir --format json --fix: --quiet must not move the exit code"
     );
 
-    // Preview path (lint_one_file_accumulating, PreviewOutcome::Rejected): --fix --check --format json.
+    // Preview path (PreviewFix::Refused): --fix --check --format json.
     let loud_json_check = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
     let loud_json_check_stderr = String::from_utf8_lossy(&loud_json_check.stderr);
     assert!(
@@ -5704,11 +5693,12 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
 
 // ── D4 cross-mode parity: diagnostic-cap notice honours --quiet in all four modes ──
 //
-// PF-004: the cap notice is emitted from four separate call sites:
+// The cap notice once came from four separate call sites; every mode now reaches it
+// through `render`, from its own entry point:
 //   run_lint_stdin          (stdin mode)
 //   run_lint_file           (single-file mode)
-//   lint_one_file_human     (directory --format human, the default)
-//   lint_one_file_accumulating (directory --format json)
+//   run_lint_directory      (directory --format human, the default)
+//   run_lint_directory      (directory --format json)
 // Each mode must gate on !quiet independently — PF-004 (avoids #43/#173 divergence class).
 // PF-013 / ADR-009: each mode carries a paired positive control so the quiet
 // assertion cannot pass vacuously on an uncovered path.
@@ -5808,10 +5798,10 @@ fn cap_notice_honours_quiet_in_all_four_modes() {
         "directory: --quiet must not move the exit code"
     );
 
-    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
-    // PF-004: --format json routes directory files through lint_one_file_accumulating,
-    // a SEPARATE emitter from lint_one_file_human (Mode 3).  The cap-notice gate
-    // (`if fix && !quiet`) inside lint_one_file_accumulating must also be tested;
+    // ── Mode 4: directory, --format json (JSON result sink) ─────────────────────
+    // --format json shows directory files through the JSON result sink, not the
+    // human one (Mode 3).  Its cap-notice gate (shown unless --quiet) must also be
+    // tested;
     // a regression that leaves it unguarded would pass Modes 1–3 and escape CI.
     // The same temp `dir` / `cap.mds` file is reused (not modified by --fix --check).
 
@@ -5990,39 +5980,26 @@ fn lint_directory_empty_exits_two_prints_no_summary() {
     );
 }
 
-/// #204: `--format json` on an empty tree exits 2 with the stderr diagnostic and
-/// emits NO JSON envelope on stdout — the empty-tree arm returns before any emitter
-/// runs, exactly as lint's all-excluded arm does (it emits no envelope either).
-/// Relax the stdout-empty half if a JSON envelope for "nothing to lint" is ever added.
+/// #204: `--format json` on an empty tree exits 2 with the error document on stdout,
+/// the run's one document, in the words of the human report's diagnostic, and nothing
+/// on stderr (#309) — as lint's all-excluded arm does.
 #[test]
-fn lint_directory_empty_format_json_exits_two_no_envelope() {
+fn lint_directory_empty_format_json_exits_two_with_the_error_document() {
     let dir = tempfile::tempdir().unwrap();
 
     let out = lint_path(dir.path(), &["--format", "json"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-
     assert_eq!(
-        out.status.code(),
-        Some(2),
-        "empty directory lint --format json must exit 2; stderr: {stderr}"
+        json_exit(&out),
+        JsonExit::error(2, "mds::io"),
+        "empty directory lint --format json"
     );
+    let message = error_message(&out).unwrap_or_default();
     assert!(
-        stderr.contains("no .mds files found in"),
-        "the empty-tree diagnostic must appear on stderr in JSON mode; got: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("nothing was linted"),
-        "JSON mode must still say nothing was linted; got: {stderr:?}"
-    );
-    assert!(
-        stdout.is_empty(),
-        "empty directory lint --format json must emit no envelope on stdout; \
-         got: {stdout:?}"
+        message.starts_with("no .mds files found in ") && message.ends_with("; nothing was linted"),
+        "the error says nothing was linted; got: {message:?}"
     );
 
-    // Positive control: a directory with one .mds file DOES emit a
-    // JSON envelope on stdout, so the emptiness assertion above is not vacuous.
+    // Positive control: a directory with one .mds file emits the findings document.
     let control_dir = tempfile::tempdir().unwrap();
     fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
     let control = lint_path(control_dir.path(), &["--format", "json"]);
@@ -6470,8 +6447,8 @@ fn lint_directory_unreadable_file_forces_summary_under_quiet() {
 
 // ── D4 (PF-004): Fixed: and Would fix: honour --quiet in dir-mode JSON emitter ─
 //
-// Finding: lint_one_file_accumulating (JSON) was missing Fixed: and Would fix:
-// messages, creating a divergence from lint_one_file_human (PF-004 class).
+// Finding: the directory JSON path was missing Fixed: and Would fix: messages,
+// creating a divergence from the directory human path.
 // These tests verify: (a) the messages appear without --quiet (positive control per
 // PF-013/ADR-009), and (b) --quiet suppresses them.
 
@@ -6567,16 +6544,16 @@ fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
 //
 // PF-007: per-surface assertions cannot prove cross-surface parity.
 // The JSON-side test (dir_json_fix_emits_fixed_and_quiet_suppresses_it) cannot
-// substitute for this test — lint_one_file_human is a separate emitter from
-// lint_one_file_accumulating.
+// substitute for this test — the human result sink is a separate emitter from
+// the JSON one.
 // Mutation-verified: without this test, changing the human-mode gate at
 // lint.rs:1723 from `!quiet` to `true` leaves all prior tests passing.
 
 /// D4/PF-004: dir-mode `--fix` (human format, the default) emits `Fixed:` to stderr
 /// (positive), and `--quiet` suppresses it (negative).  Both arms per PF-013/ADR-009.
 ///
-/// PF-007: this is a separate emitter (`lint_one_file_human`) from the JSON-mode
-/// equivalent (`lint_one_file_accumulating`); a gate on one is not inherited by the
+/// This is a separate emitter (the human result sink) from the JSON-mode
+/// equivalent (the JSON result sink); a gate on one is not inherited by the
 /// other.  The JSON-mode equivalent is `dir_json_fix_emits_fixed_and_quiet_suppresses_it`.
 #[test]
 fn dir_human_fix_emits_fixed_and_quiet_suppresses_it() {
@@ -6862,8 +6839,8 @@ fn d1_dir_fix_diff_residual_error_exits_2() {
 #[test]
 fn d1_fix_diff_residual_clean_info_only_exits_1() {
     // The floor: a file whose only findings are info-severity but FIXABLE
-    // previously previewed as exit 0 under --fix --diff (exit_by_severity on the
-    // pre-fix result ignores Info).  R1 floors the preview at 1 whenever a fix
+    // previously previewed as exit 0 under --fix --diff (the exit by severity of
+    // the pre-fix result ignores Info).  R1 floors the preview at 1 whenever a fix
     // is pending, matching --check's "would change" contract.
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -7027,5 +7004,1752 @@ fn lint_single_file_non_utf8_path_exits_2() {
     assert!(
         stderr.contains("not valid UTF-8"),
         "the diagnostic must say why; got: {stderr}"
+    );
+}
+
+// ── #309: --fix re-verifies a fixed partial as a partial ──────────────────────
+//
+// A file whose name starts with `_` is a partial: `unused-function`, `unused-import`
+// and `unused-variable` stay quiet for it. `--fix` lints every candidate source again
+// before it accepts it, and must lint it under the file's own name. Under any other
+// name the candidate is no partial, a define the module neither exports nor calls
+// turns into an `unused-function` finding the original did not have, and the fix is
+// refused as one that adds a finding.
+//
+// Fixture: `_p.mds` holds an always-false `@if` block (a fixable `unreachable-branch`
+// error) and one `@define` nothing exports or calls; its wildcard `@export`, from a
+// sibling that defines nothing, makes the module's exports explicit, which
+// `unused-function` needs. `full.mds`, the same text under a name that is not a
+// partial, is the positive control.
+
+/// A partial's text: a dead `@if` block, a define nothing exports or calls, and the
+/// export that makes the module's exports explicit. One `@define` block only.
+const PARTIAL_WITH_AN_UNUSED_DEFINE: &str = "---\ngreeting: hello\n---\n\
+     @if \"x\" == \"y\":\ndead\n@end\n\
+     @define helper():\nhelp text\n@end\n\
+     @export * from \"./_lib.mds\"\n{{greeting}}\n";
+
+/// [`PARTIAL_WITH_AN_UNUSED_DEFINE`] with its unreachable branch fixed: the dead block
+/// is gone, and the define stays.
+const PARTIAL_WITH_AN_UNUSED_DEFINE_FIXED: &str = "---\ngreeting: hello\n---\n\
+     @define helper():\nhelp text\n@end\n\
+     @export * from \"./_lib.mds\"\n{{greeting}}\n";
+
+/// Run `mds lint [extra_args] <dir>` from the working directory `cwd`.
+fn lint_dir_in(cwd: &Path, dir: &str, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(extra_args)
+        .arg(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// Each finding of a directory's JSON report, as `"<files[].file> <rule>"`.
+fn findings_of(report: &std::process::Output) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be the JSON report: {e}; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&report.stdout),
+            String::from_utf8_lossy(&report.stderr)
+        )
+    });
+    let mut findings = Vec::new();
+    for entry in json["files"].as_array().expect("the report has files[]") {
+        let file = entry["file"].as_str().expect("each entry names its file");
+        for diag in entry["diagnostics"]
+            .as_array()
+            .expect("each entry has diagnostics[]")
+        {
+            let rule = diag["rule"].as_str().expect("each finding names its rule");
+            findings.push(format!("{file} {rule}"));
+        }
+    }
+    findings
+}
+
+#[test]
+fn fix_of_a_partial_in_a_directory_applies_and_reports_no_unused_function() {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["d", "c"] {
+        fs::create_dir(tmp.path().join(dir)).unwrap();
+        fs::write(tmp.path().join(dir).join("_lib.mds"), "Shared text.\n").unwrap();
+    }
+    let partial = tmp.path().join("d").join("_p.mds");
+    fs::write(&partial, PARTIAL_WITH_AN_UNUSED_DEFINE).unwrap();
+    let full = tmp.path().join("c").join("full.mds");
+    fs::write(&full, PARTIAL_WITH_AN_UNUSED_DEFINE).unwrap();
+
+    // Positive control: under a name that is not a partial, the same text reports the
+    // unused define, in JSON and in the human report — so the absence checks below
+    // cannot pass on nothing.
+    let control = lint_dir_in(tmp.path(), "c", &["--format", "json"]);
+    assert_eq!(
+        findings_of(&control),
+        ["full.mds unreachable-branch", "full.mds unused-function"],
+        "control: a file that is not a partial reports the unused define"
+    );
+    let control = lint_dir_in(tmp.path(), "c", &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("unused-function"),
+        "control: the human report names the unused define; stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // Before the fix the partial reports its dead block, and no unused define.
+    let before = lint_dir_in(tmp.path(), "d", &["--format", "json"]);
+    assert_eq!(
+        findings_of(&before),
+        ["_p.mds unreachable-branch"],
+        "the partial reports only its dead block before the fix"
+    );
+
+    let out = lint_dir_in(tmp.path(), "d", &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("fix rejected"),
+        "the fix of a partial must not be refused; stderr: {stderr}"
+    );
+    let fixed_line = format!(
+        "Fixed: {}",
+        "d/_p.mds".replace('/', std::path::MAIN_SEPARATOR_STR)
+    );
+    assert!(
+        stderr.contains(&fixed_line),
+        "the partial must be fixed ({fixed_line:?}); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unused-"),
+        "no unused-* finding may be reported for a partial; stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nothing is left to report once the dead block is gone; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        PARTIAL_WITH_AN_UNUSED_DEFINE_FIXED,
+        "the dead block is removed and the define kept"
+    );
+
+    // After the fix a report of the directory finds nothing at all.
+    let after = lint_dir_in(tmp.path(), "d", &["--format", "json"]);
+    assert_eq!(
+        findings_of(&after),
+        Vec::<String>::new(),
+        "the fixed partial reports nothing"
+    );
+    assert_eq!(after.status.code(), Some(0));
+}
+
+// ── The findings a fix leaves point into the fixed source (#309) ─────────────
+//
+// The findings `--fix` leaves come from linting the fixed source, so their spans index
+// that text: a human frame must show them over it, and a JSON span must index it. Shown
+// over the source as it was read, a finding below a removed block lands lines too low,
+// on unrelated text — or past the end of the text, where the frame cannot be read.
+//
+// Fixture: a dead `@if` block (a fixable `unreachable-branch` error) above two padding
+// lines and a `redundant-else` warning no fix removes. Removing the block moves the
+// warning's `@if` from line 9 up to line 6. The same warning ABOVE the dead block does
+// not move, and is the positive control.
+
+/// A dead `@if` block above a `redundant-else` warning the fix leaves.
+const A_WARNING_BELOW_A_DEAD_BLOCK: &str = "---\nflag: true\n---\n\
+     @if \"x\" == \"y\":\nhidden\n@end\n\
+     first padding line\nsecond padding line\n\
+     @if flag:\nsame\n@else:\nsame\n@end\n";
+
+/// [`A_WARNING_BELOW_A_DEAD_BLOCK`] fixed: the dead block is gone, and the warning's
+/// `@if` is on line 6.
+const A_WARNING_BELOW_A_DEAD_BLOCK_FIXED: &str = "---\nflag: true\n---\n\
+     first padding line\nsecond padding line\n\
+     @if flag:\nsame\n@else:\nsame\n@end\n";
+
+/// The warning above the dead block: its `@if` is on line 4 before and after the fix.
+const A_WARNING_ABOVE_A_DEAD_BLOCK: &str = "---\nflag: true\n---\n\
+     @if flag:\nsame\n@else:\nsame\n@end\n\
+     padding line\n\
+     @if \"x\" == \"y\":\nhidden\n@end\n";
+
+/// The `redundant-else` warning's frame in a human report: the line and column its
+/// header names (`╭─[<label>:<line>:<col>]`), and the text the frame shows on that line.
+fn redundant_else_frame(stderr: &str, label: &str) -> (usize, usize, String) {
+    let finding = stderr
+        .find("[redundant-else]")
+        .unwrap_or_else(|| panic!("no redundant-else finding; stderr: {stderr}"));
+    let header = format!("╭─[{label}:");
+    let start = finding
+        + stderr[finding..]
+            .find(&header)
+            .unwrap_or_else(|| panic!("no frame for {label:?}; stderr: {stderr}"))
+        + header.len();
+    let (position, _) = stderr[start..]
+        .split_once(']')
+        .expect("the frame header closes");
+    let (line, col) = position.split_once(':').expect("<line>:<col>");
+    let line: usize = line.parse().expect("a line number");
+    let col: usize = col.parse().expect("a column number");
+    let gutter = format!("{line} │");
+    let shown = stderr[start..]
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix(gutter.as_str()))
+        .unwrap_or_else(|| panic!("the frame shows no line {line}; stderr: {stderr}"));
+    (
+        line,
+        col,
+        shown.strip_prefix(' ').unwrap_or(shown).to_string(),
+    )
+}
+
+/// Assert that the human report in `stderr` frames the `redundant-else` warning of
+/// `label` over `text`, the source its spans index: the line its header names shows that
+/// line of `text`, and it is the warning's `@if`, at `line`, column 1.
+fn assert_framed_over(stderr: &str, label: &str, text: &str, line: usize, what: &str) {
+    let (at, col, shown) = redundant_else_frame(stderr, label);
+    let line_of_text = at
+        .checked_sub(1)
+        .and_then(|index| text.lines().nth(index))
+        .unwrap_or("<past the end of the text>");
+    assert_eq!(
+        shown, line_of_text,
+        "{what}: the frame's line {at} must show line {at} of the text its spans index; \
+         stderr: {stderr}"
+    );
+    assert_eq!(
+        (at, col, shown.as_str()),
+        (line, 1, "@if flag:"),
+        "{what}: the frame must point at the warning's @if; stderr: {stderr}"
+    );
+}
+
+/// The line the `redundant-else` span of `file`'s entry in a JSON report starts on, in
+/// `text`, the source the span indexes; it must start a line, at the warning's `@if`.
+fn redundant_else_json_line(report: &std::process::Output, file: &str, text: &str) -> usize {
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be the JSON report: {e}; stdout: {}",
+            String::from_utf8_lossy(&report.stdout)
+        )
+    });
+    let entry = json["files"]
+        .as_array()
+        .expect("the report has files[]")
+        .iter()
+        .find(|entry| entry["file"] == file)
+        .unwrap_or_else(|| panic!("no entry for {file:?}: {json}"));
+    let diag = entry["diagnostics"]
+        .as_array()
+        .expect("the entry has diagnostics[]")
+        .iter()
+        .find(|diag| diag["rule"] == "redundant-else")
+        .unwrap_or_else(|| panic!("no redundant-else finding: {entry}"));
+    let offset = diag["span"]["offset"]
+        .as_u64()
+        .and_then(|o| usize::try_from(o).ok())
+        .expect("the finding has a span offset");
+    let (before, after) = text.split_at_checked(offset).unwrap_or_else(|| {
+        panic!(
+            "the span offset {offset} lies past the {}-byte text",
+            text.len()
+        )
+    });
+    assert!(
+        before.ends_with('\n') && after.starts_with("@if flag:"),
+        "the span offset {offset} must index the warning's @if; text after it: {after:?}"
+    );
+    before.matches('\n').count() + 1
+}
+
+#[test]
+fn a_finding_left_by_a_fix_of_a_file_points_into_the_written_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let above = tmp.path().join("y.mds");
+    let below = tmp.path().join("x.mds");
+
+    // Positive control: a warning above the removed block keeps its line, so the frame
+    // reads the same over either text.
+    fs::write(&above, A_WARNING_ABOVE_A_DEAD_BLOCK).unwrap();
+    let out = lint_path(&above, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let written = fs::read_to_string(&above).unwrap();
+    assert_ne!(
+        written, A_WARNING_ABOVE_A_DEAD_BLOCK,
+        "control: the fix is written"
+    );
+    assert_framed_over(&stderr, "y.mds", &written, 4, "control");
+
+    // JSON: the span indexes the written file.
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    let out = lint_path(&below, &["--fix", "--format", "json"]);
+    let written = fs::read_to_string(&below).unwrap();
+    assert_eq!(written, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_eq!(redundant_else_json_line(&out, "x.mds", &written), 6);
+    assert_eq!(out.status.code(), Some(1), "the warning is left");
+
+    // Human: the frame shows the written file's line 6, not the pre-fix line 9 or the
+    // padding that took its place.
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    let out = lint_path(&below, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let written = fs::read_to_string(&below).unwrap();
+    assert_eq!(written, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_framed_over(&stderr, "x.mds", &written, 6, "a file argument");
+    assert_eq!(out.status.code(), Some(1), "the warning is left");
+}
+
+#[test]
+fn a_finding_left_by_a_fix_of_a_directory_entry_points_into_the_written_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let write_both = || {
+        fs::write(d.join("x.mds"), A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+        fs::write(d.join("y.mds"), A_WARNING_ABOVE_A_DEAD_BLOCK).unwrap();
+    };
+
+    // JSON: each span indexes its written file.
+    write_both();
+    let out = lint_dir_in(tmp.path(), "d", &["--fix", "--format", "json"]);
+    let x = fs::read_to_string(d.join("x.mds")).unwrap();
+    let y = fs::read_to_string(d.join("y.mds")).unwrap();
+    assert_eq!(x, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_eq!(redundant_else_json_line(&out, "y.mds", &y), 4, "control");
+    assert_eq!(redundant_else_json_line(&out, "x.mds", &x), 6);
+
+    // Human: `y.mds` (its warning above the block) is the positive control.
+    write_both();
+    let out = lint_dir_in(tmp.path(), "d", &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let x = fs::read_to_string(d.join("x.mds")).unwrap();
+    let y = fs::read_to_string(d.join("y.mds")).unwrap();
+    assert_framed_over(&stderr, "y.mds", &y, 4, "control");
+    assert_eq!(x, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_framed_over(&stderr, "x.mds", &x, 6, "a directory entry");
+    assert_eq!(out.status.code(), Some(1), "the warnings are left");
+}
+
+#[test]
+fn a_finding_left_by_a_fix_of_stdin_points_into_the_source_it_emits() {
+    let out = lint_stdin(A_WARNING_BELOW_A_DEAD_BLOCK, &["--fix"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED);
+    assert_framed_over(&stderr, "<stdin>", &stdout, 6, "stdin");
+}
+
+#[test]
+fn a_fix_preview_frames_the_findings_over_the_file_as_read() {
+    // A preview shows the file's own findings — what is wrong now — over the file it
+    // leaves unchanged, so the warning stays on line 9.
+    let tmp = tempfile::tempdir().unwrap();
+    let below = tmp.path().join("x.mds");
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    for mode in [&["--fix", "--check"][..], &["--fix", "--diff"]] {
+        let out = lint_path(&below, mode);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let file = fs::read_to_string(&below).unwrap();
+        assert_eq!(
+            file, A_WARNING_BELOW_A_DEAD_BLOCK,
+            "{mode:?} writes nothing"
+        );
+        assert_framed_over(&stderr, "x.mds", &file, 9, &format!("{mode:?}"));
+    }
+}
+
+/// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
+/// read-only attribute does not block creating files in a directory (#147).
+#[cfg(unix)]
+#[test]
+fn a_finding_left_by_a_fix_that_cannot_be_written_points_into_the_fixed_source() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let below = dir.path().join("x.mds");
+    fs::write(&below, A_WARNING_BELOW_A_DEAD_BLOCK).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let out = lint_path(&below, &["--fix"]);
+    let _ = fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        fs::read_to_string(&below).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "the write failed; stderr: {stderr}"
+    );
+    // The finding the fix would have left is a span into the fixed source.
+    assert_framed_over(
+        &stderr,
+        "x.mds",
+        A_WARNING_BELOW_A_DEAD_BLOCK_FIXED,
+        6,
+        "a failed write",
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+}
+
+// ── `truncated` and the diagnostic-cap notice (#309) ─────────────────────────
+//
+// A JSON document's `truncated` says whether the findings an input is left with stopped
+// at the diagnostic cap — its own findings in a report, the findings `--fix` leaves, or
+// those a preview's fix would leave — in every mode, for a file and a directory alike.
+// The cap notice says an input's own findings stopped at the cap: it prints in every
+// mode, a report included, before anything else about the input, and `--quiet`
+// suppresses it. Only under `--fix`, which writes its fix, does it advise re-running
+// `--fix`; a report and a preview write nothing a re-run would build on.
+//
+// Fixtures: one more unused frontmatter key than the cap — no fix removes one — and one
+// more empty `@if` block than the cap: `--fix` removes the 1,000 it is shown and leaves
+// the last.
+
+/// A report, and each `--fix` mode.
+const LINT_MODES: [&[&str]; 5] = [
+    &[],
+    &["--fix"],
+    &["--fix", "--check"],
+    &["--fix", "--diff"],
+    &["--fix", "--check", "--diff"],
+];
+
+/// One unused frontmatter key: one finding, under the cap.
+const UNDER_THE_CAP: &str = "---\nv0: 1\n---\nHello\n";
+
+/// One more unused frontmatter key than the diagnostic cap: an unfixable warning each.
+fn over_the_cap_unfixable() -> String {
+    use std::fmt::Write as _;
+    let mut source = String::from("---\n");
+    for i in 0..=mds::MAX_DIAGNOSTICS {
+        let _ = writeln!(source, "v{i}: 1");
+    }
+    source.push_str("---\nHello\n");
+    source
+}
+
+/// One more empty `@if` block than the diagnostic cap: a fixable warning each.
+fn over_the_cap_fixable() -> String {
+    let mut source = String::from("---\nflag: true\n---\n");
+    for _ in 0..=mds::MAX_DIAGNOSTICS {
+        source.push_str("@if flag:\n@end\n");
+    }
+    source
+}
+
+/// [`over_the_cap_fixable`] after `--fix`: the block the cap hid from the fix.
+const OVER_THE_CAP_FIXED: &str = "---\nflag: true\n---\n@if flag:\n@end\n";
+
+/// The diagnostic-cap notice for stdin or a file argument in a report or a preview.
+fn cap_notice() -> String {
+    format!(
+        "diagnostic cap ({}) reached; further findings were suppressed",
+        mds::MAX_DIAGNOSTICS
+    )
+}
+
+/// The cap notice under `--fix`: [`cap_notice`] and its advice to re-run `--fix`.
+fn cap_notice_under_fix() -> String {
+    format!("{} — re-run --fix to continue", cap_notice())
+}
+
+/// `notice` for the entry `d/x.mds` of a directory run, named with the platform's
+/// separator.
+fn entry_cap_notice(notice: &str) -> String {
+    format!(
+        "{}: {notice}",
+        "d/x.mds".replace('/', std::path::MAIN_SEPARATOR_STR)
+    )
+}
+
+/// The cap notice a run in `mode` gives stdin or a file argument: the advice to re-run
+/// `--fix` under `--fix` alone.
+fn cap_notice_in(mode: &[&str]) -> String {
+    if mode == ["--fix"] {
+        cap_notice_under_fix()
+    } else {
+        cap_notice()
+    }
+}
+
+/// The first lines of `stderr`, for a failure message: a capped human report runs to
+/// hundreds of kilobytes.
+fn head_of(stderr: &str) -> Vec<&str> {
+    stderr.lines().take(3).collect()
+}
+
+/// The `truncated` flag of the JSON document a run printed last on stdout — after its
+/// diffs, under `--fix --diff`.
+fn truncated_of(out: &std::process::Output) -> bool {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document = stdout.lines().last().unwrap_or_else(|| {
+        panic!(
+            "no JSON document on stdout; stderr starts {:?}",
+            head_of(&String::from_utf8_lossy(&out.stderr))
+        )
+    });
+    let json: serde_json::Value = serde_json::from_str(document)
+        .unwrap_or_else(|e| panic!("stdout must end with the JSON document: {e}"));
+    json["truncated"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("the document has no `truncated` flag"))
+}
+
+/// No fix removes an unused key, so the findings each input is left with are its own,
+/// capped: `truncated` is true in every mode.
+///
+/// Control: one unused key is not truncated.
+#[test]
+fn truncated_is_true_for_a_capped_residual_in_every_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+
+    fs::write(&file, UNDER_THE_CAP).unwrap();
+    assert!(
+        !truncated_of(&lint_path(&file, &["--format", "json"])),
+        "control: one finding is not truncated"
+    );
+
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+    assert!(
+        truncated_of(&lint_stdin(&source, &["--format", "json"])),
+        "stdin, a report"
+    );
+    for mode in LINT_MODES {
+        let args = [mode, &["--format", "json"][..]].concat();
+        assert!(truncated_of(&lint_path(&file, &args)), "a file, {mode:?}");
+        assert!(
+            truncated_of(&lint_dir_in(tmp.path(), "d", &args)),
+            "a directory, {mode:?}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&file).unwrap(), source, "nothing to fix");
+}
+
+/// Once `--fix` clears a capped set of fixable findings — or a preview's fix would — the
+/// findings left are under the cap, so `truncated` is false, for a file and a directory
+/// alike, though a preview's document lists the input's own capped findings.
+///
+/// Control: the report fixes nothing, and is truncated.
+#[test]
+fn truncated_is_false_once_a_fix_clears_a_capped_fixable_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+    let source = over_the_cap_fixable();
+
+    let mut seen = Vec::new();
+    for mode in LINT_MODES {
+        let args = [mode, &["--format", "json"][..]].concat();
+        fs::write(&file, &source).unwrap();
+        seen.push(("a file", mode, truncated_of(&lint_path(&file, &args))));
+        fs::write(&file, &source).unwrap();
+        let dir = lint_dir_in(tmp.path(), "d", &args);
+        seen.push(("a directory", mode, truncated_of(&dir)));
+        if mode == ["--fix"] {
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                OVER_THE_CAP_FIXED,
+                "--fix removes the blocks it is shown"
+            );
+        }
+    }
+    let expected: Vec<_> = seen
+        .iter()
+        .map(|&(input, mode, _)| (input, mode, mode.is_empty()))
+        .collect();
+    assert_eq!(seen, expected, "truncated: the report's alone");
+}
+
+/// A report announces the cap of a capped input, as `--fix` does: once, first, before its
+/// findings, in either format, for stdin, a file and a directory's entry.
+///
+/// Control: an input under the cap announces none.
+#[test]
+fn a_report_announces_the_cap_first_in_every_input_and_format() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+
+    fs::write(&file, UNDER_THE_CAP).unwrap();
+    let control = lint_path(&file, &[]);
+    let stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        stderr.contains("[unused-variable]") && !stderr.contains("diagnostic cap"),
+        "control: the finding shows, and no cap; stderr: {stderr}"
+    );
+
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+    for format in ["human", "json"] {
+        let args = ["--format", format];
+        let runs = [
+            ("stdin", lint_stdin(&source, &args), cap_notice()),
+            ("a file", lint_path(&file, &args), cap_notice()),
+            (
+                "a directory",
+                lint_dir_in(tmp.path(), "d", &args),
+                entry_cap_notice(&cap_notice()),
+            ),
+        ];
+        for (input, out, notice) in runs {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.lines().next(),
+                Some(notice.as_str()),
+                "{input}, {format}: the cap comes first; stderr starts {:?}",
+                head_of(&stderr)
+            );
+            assert_eq!(
+                stderr.matches("diagnostic cap").count(),
+                1,
+                "{input}, {format}: one notice"
+            );
+            assert_eq!(out.status.code(), Some(1), "{input}, {format}: warnings");
+        }
+    }
+}
+
+/// `--quiet` suppresses the cap notice in a report, as it does under `--fix`, and leaves
+/// the exit code alone.
+///
+/// Positive control: the same run without `--quiet` prints it.
+#[test]
+fn quiet_suppresses_the_cap_notice_in_a_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+
+    for format in ["human", "json"] {
+        let run = |input: &str, quiet: bool| {
+            let mut args = vec!["--format", format];
+            if quiet {
+                args.push("--quiet");
+            }
+            match input {
+                "stdin" => lint_stdin(&source, &args),
+                "a file" => lint_path(&file, &args),
+                _ => lint_dir_in(tmp.path(), "d", &args),
+            }
+        };
+        for input in ["stdin", "a file", "a directory"] {
+            let loud = run(input, false);
+            let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+            assert!(
+                loud_stderr.contains("diagnostic cap"),
+                "positive control ({input}, {format}): without --quiet the notice prints; \
+                 stderr starts {:?}",
+                head_of(&loud_stderr)
+            );
+            let quiet = run(input, true);
+            let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+            assert!(
+                !quiet_stderr.contains("diagnostic cap"),
+                "{input}, {format}: --quiet suppresses the notice; stderr starts {:?}",
+                head_of(&quiet_stderr)
+            );
+            assert_eq!(
+                quiet.status.code(),
+                loud.status.code(),
+                "{input}, {format}: --quiet leaves the exit code"
+            );
+        }
+    }
+}
+
+/// The cap notice advises re-running `--fix` under `--fix` alone, which writes its fix: a
+/// report and every preview write nothing, so their notice ends at the suppressed
+/// findings — for stdin, a file and a directory's entry, in either format.
+///
+/// Positive control: `--fix` gives the advice, so a notice without it is no absent line.
+#[test]
+fn the_cap_notice_advises_re_running_fix_under_fix_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    let file = d.join("x.mds");
+    let source = over_the_cap_unfixable();
+    fs::write(&file, &source).unwrap();
+
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for mode in LINT_MODES {
+        let notice = cap_notice_in(mode);
+        for format in ["human", "json"] {
+            let args = [mode, &["--format", format][..]].concat();
+            let file_run = lint_path(&file, &args);
+            let dir_run = lint_dir_in(tmp.path(), "d", &args);
+            for (input, out, notice) in [
+                ("a file", file_run, notice.clone()),
+                ("a directory", dir_run, entry_cap_notice(&notice)),
+            ] {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let first = stderr.lines().next().unwrap_or_default().to_string();
+                seen.push((input, mode, format, first));
+                expected.push((input, mode, format, notice));
+            }
+        }
+        // Stdin's `--fix --format json` is refused before it is linted; its human run
+        // fixes through the filter.
+        let stdin_run = lint_stdin(&source, mode);
+        let stderr = String::from_utf8_lossy(&stdin_run.stderr);
+        let first = stderr.lines().next().unwrap_or_default().to_string();
+        seen.push(("stdin", mode, "human", first));
+        expected.push(("stdin", mode, "human", notice));
+    }
+    assert!(
+        expected
+            .iter()
+            .any(|(_, _, _, notice)| notice.ends_with("re-run --fix to continue")),
+        "non-vacuity: the advice is expected somewhere"
+    );
+    assert_eq!(seen, expected, "the first stderr line of each run");
+    assert_eq!(fs::read_to_string(&file).unwrap(), source, "nothing to fix");
+}
+
+// ── A fix that cannot be written (#309) ───────────────────────────────────────
+//
+// `--fix` reports a rewrite that fails in one wording in every mode — `cannot write
+// <file>: <cause>`, naming the file once, as typed, and then the cause, which names no
+// path — and never a result for the fix it could not write: under `--format json` the
+// failure is the input's one record, a file argument's error document or a directory
+// entry's error entry.
+//
+// Fixture: `ro/x.mds` in a read-only directory, beside `rw/x.mds` in a writable one, each
+// holding `A_WARNING_BELOW_A_DEAD_BLOCK`: its fix leaves a warning, so findings recorded
+// for the fix that failed would show.
+
+/// A directory made read-only (`0o555`) while this lives, so no file can be created in
+/// it; writable again on drop, so its tempdir can be removed.
+#[cfg(unix)]
+struct ReadOnlyDir(std::path::PathBuf);
+
+#[cfg(unix)]
+impl ReadOnlyDir {
+    /// `None`, after printing why the caller skips, when a file can still be created in
+    /// `dir` at mode `0o555`: running as euid 0, which the mode does not stop.
+    fn new(dir: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let guard = Self(dir.to_path_buf());
+        let probe = dir.join(".write-probe");
+        if fs::write(&probe, "").is_ok() {
+            let _ = fs::remove_file(&probe);
+            eprintln!(
+                "skipped: a file can be created in {} at mode 0o555 (running as euid 0?)",
+                dir.display()
+            );
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A tempdir holding `ro/x.mds` and `rw/x.mds`, each [`A_WARNING_BELOW_A_DEAD_BLOCK`],
+/// with `ro` read-only while the guard lives; `None` where that does not stop a write.
+#[cfg(unix)]
+fn a_fix_that_cannot_be_written() -> Option<(tempfile::TempDir, ReadOnlyDir)> {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["ro", "rw"] {
+        fs::create_dir(tmp.path().join(dir)).unwrap();
+        fs::write(
+            tmp.path().join(dir).join("x.mds"),
+            A_WARNING_BELOW_A_DEAD_BLOCK,
+        )
+        .unwrap();
+    }
+    let ro = ReadOnlyDir::new(&tmp.path().join("ro"))?;
+    Some((tmp, ro))
+}
+
+/// Run `mds lint [extra_args] <input>` from the working directory `cwd`.
+#[cfg(unix)]
+fn lint_in(cwd: &Path, input: &Path, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(extra_args)
+        .arg(input)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// The one wording of a fix `--fix` cannot write: the file as typed, then the cause — the
+/// operating system's refusal to create the temporary file, which names no file (#160).
+#[cfg(unix)]
+fn write_failure(typed: &Path) -> String {
+    format!(
+        "cannot write {}: {}",
+        typed.display(),
+        std::io::Error::from_raw_os_error(libc::EACCES)
+    )
+}
+
+/// The failure a run reports for `typed`: under `--format json` the message of the error
+/// document or of the error entry on stdout; in a human report the first stderr line that
+/// names `typed`, without miette's `×` marker — `Fixed: <typed>` where the fix was
+/// written.
+#[cfg(unix)]
+fn failure_reported(out: &std::process::Output, typed: &Path) -> Option<String> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if let Ok(document) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        let entry_error = document["files"]
+            .as_array()
+            .and_then(|files| files.iter().find_map(|entry| entry.get("error")));
+        let error = document.get("error").or(entry_error)?;
+        return error["message"].as_str().map(str::to_string);
+    }
+    let typed = typed.display().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr.lines().find(|line| line.contains(&typed))?.trim();
+    Some(line.strip_prefix("× ").unwrap_or(line).to_string())
+}
+
+/// Under `--format json` a file argument whose fix cannot be written gets the error
+/// document, `{"error": …, "version": 1}` with the `mds::io` error, as the run's one
+/// document, and exits 2 — never the findings document of a fix that did not land.
+///
+/// Control: the same file in a writable directory is fixed, and its document lists the
+/// warning the fix left.
+#[cfg(unix)]
+#[test]
+fn a_file_fix_that_cannot_be_written_prints_the_io_error_document() {
+    let Some((tmp, _ro)) = a_fix_that_cannot_be_written() else {
+        return;
+    };
+    let typed = Path::new("ro").join("x.mds");
+    let out = lint_in(tmp.path(), &typed, &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout.lines().count(), 1, "one document; stdout: {stdout}");
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be a JSON document: {e}; stdout: {stdout}"));
+    let expected = serde_json::json!({
+        "version": 1,
+        "error": {
+            "code": "mds::io",
+            "message": write_failure(&typed),
+            "help": null,
+            "span": null,
+        },
+    });
+    assert_eq!(document, expected, "stderr: {stderr}");
+    assert_eq!(stderr, "", "the document is the one report of the failure");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(&typed)).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "nothing was written"
+    );
+
+    let typed = Path::new("rw").join("x.mds");
+    let out = lint_in(tmp.path(), &typed, &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("control: a JSON document: {e}; stdout: {stdout}"));
+    assert_eq!(
+        document["files"][0]["diagnostics"][0]["rule"], "redundant-else",
+        "control: the warning the fix left; stdout: {stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "control");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(&typed)).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK_FIXED,
+        "control: the fix was written"
+    );
+}
+
+/// Under `--format json` a directory's entry whose fix cannot be written is recorded as
+/// that failure alone — `{"file": …, "error": …}`, with no findings — though its fix
+/// leaves a warning a record made before the write would list.
+///
+/// Control: in a writable directory the entry lists the warning the fix left.
+#[cfg(unix)]
+#[test]
+fn a_directory_entry_whose_fix_cannot_be_written_is_recorded_as_that_failure_alone() {
+    let Some((tmp, _ro)) = a_fix_that_cannot_be_written() else {
+        return;
+    };
+    let typed = Path::new("ro").join("x.mds");
+    let out = lint_in(tmp.path(), Path::new("ro"), &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be a JSON document: {e}; stdout: {stdout}"));
+    let expected = serde_json::json!([{
+        "file": "x.mds",
+        "error": {
+            "code": "mds::io",
+            "message": write_failure(&typed),
+            "help": null,
+            "span": null,
+        },
+    }]);
+    assert_eq!(document["files"], expected, "stdout: {stdout}");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(&typed)).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "nothing was written"
+    );
+
+    let out = lint_in(tmp.path(), Path::new("rw"), &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("control: a JSON document: {e}; stdout: {stdout}"));
+    assert_eq!(
+        document["files"][0]["diagnostics"][0]["rule"], "redundant-else",
+        "control: the warning the fix left; stdout: {stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "control");
+}
+
+/// A fix that cannot be written is reported as `cannot write <file>: <cause>` for a file
+/// argument and for a directory's entry, in either format, naming the file once, as
+/// typed.
+///
+/// Control: in a writable directory every mode fixes the file and reports no failure; a
+/// human report's line naming the file is its `Fixed:` line.
+#[cfg(unix)]
+#[test]
+fn a_fix_that_cannot_be_written_is_reported_in_one_wording_in_every_mode() {
+    let Some((tmp, _ro)) = a_fix_that_cannot_be_written() else {
+        return;
+    };
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    let mut controls = Vec::new();
+    for dir in ["ro", "rw"] {
+        let typed = Path::new(dir).join("x.mds");
+        for (input, arg) in [("a file", typed.clone()), ("a directory", dir.into())] {
+            for format in ["human", "json"] {
+                fs::write(
+                    tmp.path().join("rw").join("x.mds"),
+                    A_WARNING_BELOW_A_DEAD_BLOCK,
+                )
+                .unwrap();
+                let out = lint_in(tmp.path(), &arg, &["--fix", "--format", format]);
+                let reported = failure_reported(&out, &typed);
+                let both = [out.stdout.as_slice(), out.stderr.as_slice()].concat();
+                let named = String::from_utf8_lossy(&both)
+                    .matches(typed.display().to_string().as_str())
+                    .count();
+                if dir == "ro" {
+                    seen.push((input, format, reported, named));
+                    expected.push((input, format, Some(write_failure(&typed)), 1));
+                } else {
+                    let fixed = fs::read_to_string(tmp.path().join(&typed)).unwrap();
+                    let status = (format == "human").then(|| format!("Fixed: {}", typed.display()));
+                    controls.push((input, format, reported, status, out.status.code(), fixed));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "(input, format, failure, times the file is named)"
+    );
+    for (input, format, reported, status, code, fixed) in controls {
+        assert_eq!(reported, status, "control, {input}, {format}: no failure");
+        assert_eq!(
+            code,
+            Some(1),
+            "control, {input}, {format}: the warning stays"
+        );
+        assert_eq!(
+            fixed, A_WARNING_BELOW_A_DEAD_BLOCK_FIXED,
+            "control, {input}, {format}: the fix was written"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("ro").join("x.mds")).unwrap(),
+        A_WARNING_BELOW_A_DEAD_BLOCK,
+        "nothing was written"
+    );
+}
+
+// ── A source file over the size cap (#309) ────────────────────────────────────
+//
+// A file over the 10 MiB cap is `mds::resource_limit`, exit 3, in every lint mode: a file
+// argument or a directory's entry, `--format human` or `--format json`, a report, `--fix`
+// or a preview. A directory reports it as that entry's failure, still lints its other
+// files, counts it under "resource-limited" — never "with errors" — and exits with its
+// worst file's code, 3.
+//
+// Fixture: `d/big.mds`, `a`s ending in a newline, beside `d/warn.mds`, whose one warning
+// no fix removes.
+
+/// A tempdir holding `d/warn.mds` and `d/big.mds`, `len` bytes long.
+fn a_tree_with_a_file_of(len: u64) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    fs::create_dir(&dir).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.join("warn.mds")).unwrap();
+    let len = usize::try_from(len).unwrap();
+    fs::write(dir.join("big.mds"), "a".repeat(len - 1) + "\n").unwrap();
+    tmp
+}
+
+/// What a run over [`a_tree_with_a_file_of`] reported.
+#[derive(Debug, PartialEq)]
+struct SizeReport {
+    exit: Option<i32>,
+    /// The code of the error reported for `big.mds`: under `--format json` the error
+    /// document's or the entry's; in a human report the code line of the first error that
+    /// is not a lint finding.
+    error: Option<String>,
+    /// A directory's summary line.
+    summary: Option<String>,
+    /// `warn.mds`'s warning is reported.
+    rest_linted: bool,
+}
+
+/// Run `mds lint <mode> --format <format> <input>` in `cwd`, and read what it reported.
+fn size_report(cwd: &Path, input: &Path, format: &str, mode: &[&str]) -> SizeReport {
+    let out = mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(mode)
+        .args(["--format", format])
+        .arg(input)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let summary = stderr
+        .lines()
+        .find(|line| line.ends_with(" resource-limited"))
+        .map(str::to_string);
+    let (error, rest_linted) = if format == "json" {
+        // A preview's diff would come first: the document is the last line.
+        let document: serde_json::Value = stdout
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .unwrap_or_else(|| panic!("a JSON document on stdout; got {stdout:?}"));
+        let entry = |name: &str| {
+            document["files"]
+                .as_array()
+                .and_then(|files| files.iter().find(|entry| entry["file"] == name))
+                .cloned()
+        };
+        let error = document
+            .get("error")
+            .cloned()
+            .or_else(|| entry("big.mds").map(|entry| entry["error"].clone()));
+        let rest_linted = entry("warn.mds")
+            .is_some_and(|entry| entry["diagnostics"][0]["rule"] == "unused-variable");
+        let code = error.and_then(|error| error["code"].as_str().map(str::to_string));
+        (code, rest_linted)
+    } else {
+        let code = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("mds::") && !line.starts_with("mds::lint::"))
+            .map(str::to_string);
+        (code, stderr.contains("[unused-variable]"))
+    };
+    SizeReport {
+        exit: out.status.code(),
+        error,
+        summary,
+        rest_linted,
+    }
+}
+
+/// A file over the size cap is `mds::resource_limit`, exit 3, in every lint mode, as a
+/// file argument and as a directory's entry, in either format. A directory still lints
+/// its other files and counts the file under "resource-limited" — where its human report
+/// used to count it under "with errors" and exit 2 (#309).
+///
+/// Control: a file of exactly the cap passes the size gate in a report and under `--fix`,
+/// as a file argument and as a directory's entry, in either format.
+#[test]
+fn a_file_over_the_size_cap_is_resource_limited_in_every_lint_mode() {
+    let file = Path::new("d").join("big.mds");
+    let inputs = [("a file", file.as_path()), ("a directory", Path::new("d"))];
+
+    let over = a_tree_with_a_file_of(mds::MAX_FILE_SIZE + 1);
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (input, arg) in inputs {
+        let in_dir = input == "a directory";
+        for format in ["human", "json"] {
+            for mode in LINT_MODES {
+                let report = size_report(over.path(), arg, format, mode);
+                seen.push((input, format, mode, report));
+                let report = SizeReport {
+                    exit: Some(3),
+                    error: Some("mds::resource_limit".to_string()),
+                    summary: in_dir.then(|| {
+                        "0 clean, 1 with warnings, 0 with errors, 1 resource-limited".into()
+                    }),
+                    rest_linted: in_dir,
+                };
+                expected.push((input, format, mode, report));
+            }
+        }
+    }
+    assert_eq!(seen, expected, "(input, format, mode, what it reported)");
+    assert_eq!(
+        fs::metadata(over.path().join(&file)).unwrap().len(),
+        mds::MAX_FILE_SIZE + 1,
+        "nothing was written"
+    );
+
+    let at = a_tree_with_a_file_of(mds::MAX_FILE_SIZE);
+    let mut controls = Vec::new();
+    let mut expected = Vec::new();
+    for (input, arg) in inputs {
+        let in_dir = input == "a directory";
+        for format in ["human", "json"] {
+            for mode in [&[][..], &["--fix"]] {
+                let report = size_report(at.path(), arg, format, mode);
+                controls.push((input, format, mode, report));
+                let report = SizeReport {
+                    exit: Some(i32::from(in_dir)),
+                    error: None,
+                    summary: in_dir.then(|| {
+                        "1 clean, 1 with warnings, 0 with errors, 0 resource-limited".into()
+                    }),
+                    rest_linted: in_dir,
+                };
+                expected.push((input, format, mode, report));
+            }
+        }
+    }
+    assert_eq!(
+        controls, expected,
+        "control, (input, format, mode, what it reported)"
+    );
+}
+
+/// A file over the size cap under an `mds.json` that cannot load reports the
+/// configuration's failure, `mds::io`, exit 2, in every arm: the file's configuration
+/// loads before the file is read, for a file argument and a directory's entry in either
+/// format — where a directory's human report used to read the file first and report
+/// `mds::resource_limit`, exit 3 (#309).
+///
+/// Control: under a valid `mds.json` the same file is `mds::resource_limit`, exit 3.
+#[test]
+fn a_config_that_cannot_load_is_reported_before_a_file_over_the_size_cap() {
+    let file = Path::new("d").join("big.mds");
+    let inputs = [("a file", file.as_path()), ("a directory", Path::new("d"))];
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (config, valid) in [("{", false), ("{}", true)] {
+        let tree = a_tree_with_a_file_of(mds::MAX_FILE_SIZE + 1);
+        fs::write(tree.path().join("d").join("mds.json"), config).unwrap();
+        for (input, arg) in inputs {
+            let in_dir = input == "a directory";
+            for format in ["human", "json"] {
+                for mode in [&[][..], &["--fix"]] {
+                    let report = size_report(tree.path(), arg, format, mode);
+                    seen.push((config, input, format, mode, report));
+                    let report = if valid {
+                        SizeReport {
+                            exit: Some(3),
+                            error: Some("mds::resource_limit".to_string()),
+                            summary: in_dir.then(|| {
+                                "0 clean, 1 with warnings, 0 with errors, 1 resource-limited".into()
+                            }),
+                            rest_linted: in_dir,
+                        }
+                    } else {
+                        SizeReport {
+                            exit: Some(2),
+                            error: Some("mds::io".to_string()),
+                            summary: in_dir.then(|| {
+                                "0 clean, 0 with warnings, 2 with errors, 0 resource-limited".into()
+                            }),
+                            rest_linted: false,
+                        }
+                    };
+                    expected.push((config, input, format, mode, report));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "(mds.json, input, format, mode, what it reported)"
+    );
+}
+
+/// A `--vars` file over the size cap is `mds::resource_limit`, exit 3, as a source over it
+/// is and as `mds build --vars` exits — under `--format human`, and under `--format json`
+/// as the run's one document, the error document (#309).
+///
+/// Control: a `--vars` file of exactly the cap loads, and the file is linted clean.
+#[test]
+fn a_vars_file_over_the_size_cap_exits_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("x.mds"), "Hello!\n").unwrap();
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (len, exit, code) in [
+        (mds::MAX_FILE_SIZE, 0, None),
+        (mds::MAX_FILE_SIZE + 1, 3, Some("mds::resource_limit")),
+    ] {
+        // `{"pad":"aa…a"}`, `len` bytes long.
+        let (head, tail) = ("{\"pad\":\"", "\"}");
+        let pad = usize::try_from(len).unwrap() - head.len() - tail.len();
+        fs::write(
+            tmp.path().join("vars.json"),
+            format!("{head}{}{tail}", "a".repeat(pad)),
+        )
+        .unwrap();
+
+        let human = lint_with_stdin(tmp.path(), &["--vars", "vars.json", "x.mds"], b"");
+        let human_code = String::from_utf8_lossy(&human.stderr)
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("mds::"))
+            .map(str::to_string);
+        seen.push((len, "human", human.status.code(), human_code, None));
+        expected.push((len, "human", Some(exit), code.map(str::to_string), None));
+
+        let json = lint_with_stdin(
+            tmp.path(),
+            &["--format", "json", "--vars", "vars.json", "x.mds"],
+            b"",
+        );
+        let json = json_exit(&json);
+        let rest = (json.documents, json.stderr);
+        seen.push((len, "json", json.exit, json.code, Some(rest)));
+        expected.push((
+            len,
+            "json",
+            Some(exit),
+            code.map(str::to_string),
+            Some((Some(1), String::new())),
+        ));
+    }
+    assert_eq!(
+        seen, expected,
+        "(vars file length, format, exit, error code, (documents, stderr))"
+    );
+}
+
+// ── One JSON document on every exit (#309) ────────────────────────────────────
+//
+// Under `--format json`, every exit of `mds lint` but a usage error clap reports prints
+// exactly one JSON document on stdout: the findings document, or the error document
+// `{"error": …, "version": 1}` for a failure that stops the run before it lints anything —
+// runtime variables that cannot load, no file to auto-detect, an `mds.json` that cannot
+// load, stdin that is over the size cap or not UTF-8, a working directory that is gone, a
+// directory with nothing to lint, and stdin under `--fix`, which `--format json` refuses.
+// Nothing about that failure goes to stderr. The one exception is `--fix --diff`, whose
+// diffs come first.
+
+/// The top-level JSON documents `stdout` holds, in order; `None` when it holds anything
+/// else.
+fn json_documents(stdout: &[u8]) -> Option<Vec<serde_json::Value>> {
+    serde_json::Deserializer::from_slice(stdout)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
+/// What one `--format json` run printed.
+#[derive(Debug, PartialEq)]
+struct JsonExit {
+    exit: Option<i32>,
+    /// How many JSON documents stdout holds; `None` when it holds anything else.
+    documents: Option<usize>,
+    /// The code of the one document's error, when it is the error document.
+    code: Option<String>,
+    stderr: String,
+}
+
+impl JsonExit {
+    /// A run stopped by a failure: exit `exit`, the one error document with `code`, and
+    /// nothing on stderr.
+    fn error(exit: i32, code: &str) -> Self {
+        Self {
+            exit: Some(exit),
+            documents: Some(1),
+            code: Some(code.to_string()),
+            stderr: String::new(),
+        }
+    }
+}
+
+/// Read what `out`, a `--format json` run, printed.
+fn json_exit(out: &std::process::Output) -> JsonExit {
+    let documents = json_documents(&out.stdout);
+    let code = match documents.as_deref() {
+        Some([document]) => document["error"]["code"].as_str().map(str::to_string),
+        _ => None,
+    };
+    JsonExit {
+        exit: out.status.code(),
+        documents: documents.map(|documents| documents.len()),
+        code,
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// The message of the error document `out` printed, when stdout is exactly that document.
+fn error_message(out: &std::process::Output) -> Option<String> {
+    match json_documents(&out.stdout).as_deref() {
+        Some([document]) => document["error"]["message"].as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Run `mds lint <args>` in `cwd` with `stdin` as its input.
+fn lint_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = mds_bin()
+        .current_dir(cwd)
+        .arg("lint")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A run that stops before it reads stdin closes it; that write failing is not what a
+    // test here is about.
+    let _ = child.stdin.take().unwrap().write_all(stdin);
+    child.wait_with_output().unwrap()
+}
+
+/// A failure that stops a `--format json` run before it lints anything prints the error
+/// document, the run's one document, and nothing on stderr — in every fix mode where the
+/// failure comes before the mode matters, and under `--quiet` too: runtime variables that
+/// cannot load, no file to auto-detect or more than one, an `mds.json` that cannot load,
+/// stdin over the size cap or not UTF-8, and a directory with nothing to lint — none at
+/// all, or every one under a default-excluded directory — in the words its human report
+/// gives it.
+///
+/// Controls: a run that lints prints its one findings document; the human report of a
+/// directory with nothing to lint is those words on stderr, with nothing on stdout.
+#[test]
+fn every_failure_that_stops_a_json_run_prints_one_error_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("x.mds"), "Hello!\n").unwrap();
+    for dir in ["none", "empty", "several", "cfg"] {
+        fs::create_dir(root.join(dir)).unwrap();
+    }
+    fs::write(root.join("several").join("a.mds"), "A\n").unwrap();
+    fs::write(root.join("several").join("b.mds"), "B\n").unwrap();
+    fs::write(root.join("cfg").join("mds.json"), "{").unwrap();
+    fs::write(root.join("cfg").join("x.mds"), "Hello!\n").unwrap();
+    let excluded = root.join("excluded").join("node_modules");
+    fs::create_dir_all(&excluded).unwrap();
+    fs::write(excluded.join("a.mds"), "A\n").unwrap();
+    let configured = Path::new("cfg").join("x.mds");
+    let configured = configured.to_str().unwrap();
+    let over_the_cap = vec![b'a'; usize::try_from(mds::MAX_FILE_SIZE).unwrap() + 1];
+    let (none, several, cfg) = (root.join("none"), root.join("several"), root.join("cfg"));
+
+    // (what stops the run, working directory, arguments, stdin, in every fix mode,
+    //  exit, error code, words its message holds)
+    #[allow(clippy::type_complexity)]
+    let rows: [(&str, &Path, &[&str], &[u8], bool, i32, &str, &str); 9] = [
+        (
+            "--vars that cannot load",
+            root,
+            &["--vars", "missing.json", "x.mds"],
+            b"",
+            true,
+            2,
+            "mds::file_not_found",
+            "missing.json",
+        ),
+        (
+            "no file to auto-detect",
+            &none,
+            &[],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "no .mds files found in current directory",
+        ),
+        (
+            "more than one file to auto-detect",
+            &several,
+            &[],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "multiple .mds files found",
+        ),
+        (
+            "an mds.json that cannot load, a file argument",
+            root,
+            &[configured],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "invalid mds.json",
+        ),
+        (
+            "an mds.json that cannot load, stdin",
+            &cfg,
+            &["-"],
+            b"Hello!\n",
+            false,
+            2,
+            "mds::io",
+            "invalid mds.json",
+        ),
+        (
+            "stdin over the size cap",
+            root,
+            &["-"],
+            &over_the_cap,
+            false,
+            3,
+            "mds::resource_limit",
+            "maximum size",
+        ),
+        (
+            "stdin that is not UTF-8",
+            root,
+            &["-"],
+            b"Hello \xff\n",
+            false,
+            2,
+            "mds::io",
+            "valid UTF-8",
+        ),
+        (
+            "a directory with no .mds file",
+            root,
+            &["empty"],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "no .mds files found in empty; nothing was linted",
+        ),
+        (
+            "a directory whose every .mds file is excluded",
+            root,
+            &["excluded"],
+            b"",
+            true,
+            2,
+            "mds::io",
+            "1 .mds file(s) found but all are under default-excluded directories \
+             (hidden dirs, node_modules); nothing was linted",
+        ),
+    ];
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    let mut messages = Vec::new();
+    for (what, cwd, args, stdin, every_mode, exit, code, words) in rows {
+        let modes: &[&[&str]] = if every_mode { &LINT_MODES } else { &[&[]] };
+        for mode in modes {
+            for quiet in [&[][..], &["--quiet"]] {
+                let mut all = vec!["--format", "json"];
+                all.extend_from_slice(mode);
+                all.extend_from_slice(quiet);
+                all.extend_from_slice(args);
+                let out = lint_with_stdin(cwd, &all, stdin);
+                let run = all.join(" ");
+                messages.push((what, run.clone(), error_message(&out), words));
+                seen.push((what, run.clone(), json_exit(&out)));
+                expected.push((what, run, JsonExit::error(exit, code)));
+            }
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "(what stops the run, arguments, what it printed)"
+    );
+    for (what, run, message, words) in messages {
+        assert!(
+            message.as_deref().is_some_and(|m| m.contains(words)),
+            "{what} (`mds lint {run}`): the message holds {words:?}; got {message:?}"
+        );
+    }
+
+    // The words of a directory with nothing to lint are its human report's.
+    for (dir, words) in [("empty", rows[7].7), ("excluded", rows[8].7)] {
+        let human = lint_with_stdin(root, &[dir], b"");
+        assert_eq!(
+            (
+                human.status.code(),
+                String::from_utf8_lossy(&human.stdout).into_owned(),
+                String::from_utf8_lossy(&human.stderr).into_owned()
+            ),
+            (Some(2), String::new(), format!("{words}\n")),
+            "control: the human report of {dir}"
+        );
+        let json = lint_with_stdin(root, &["--format", "json", dir], b"");
+        assert_eq!(
+            error_message(&json).as_deref(),
+            Some(words),
+            "the error document of {dir} words it as the human report does"
+        );
+    }
+
+    // Control: a run that lints prints its one findings document.
+    let linted = lint_with_stdin(root, &["--format", "json", "x.mds"], b"");
+    assert_eq!(
+        json_exit(&linted),
+        JsonExit {
+            exit: Some(0),
+            documents: Some(1),
+            code: None,
+            stderr: String::new(),
+        },
+        "control: a clean file"
+    );
+    let document = &json_documents(&linted.stdout).unwrap()[0];
+    let mut keys: Vec<&String> = document.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["files", "truncated", "version"],
+        "control: {document}"
+    );
+}
+
+/// The text `mds lint --fix --format json -` is refused with.
+const STDIN_FIX_JSON_REFUSAL: &str = "--fix --format json with stdin input is not supported; \
+     use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output";
+
+/// `mds lint --fix --format json -` is refused — stdin under `--fix` is a filter, whose
+/// product is the source on stdout — with the error document, exit 2, nothing on stderr, in
+/// every `--fix` mode and under `--quiet` too.
+///
+/// Controls: the filter without `--format json` prints the source; a report of the same
+/// stdin under `--format json` prints its findings document.
+#[test]
+fn stdin_under_fix_in_json_is_refused_with_one_error_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for mode in &LINT_MODES[1..] {
+        for quiet in [&[][..], &["--quiet"]] {
+            let mut args = vec!["--format", "json"];
+            args.extend_from_slice(mode);
+            args.extend_from_slice(quiet);
+            args.push("-");
+            let out = lint_with_stdin(tmp.path(), &args, b"Hello!\n");
+            seen.push((args.join(" "), json_exit(&out), error_message(&out)));
+            expected.push((
+                args.join(" "),
+                JsonExit::error(2, "mds::io"),
+                Some(STDIN_FIX_JSON_REFUSAL.to_string()),
+            ));
+        }
+    }
+    assert_eq!(seen, expected, "(arguments, what it printed, its message)");
+
+    let filter = lint_with_stdin(tmp.path(), &["--fix", "-"], b"Hello!\n");
+    assert_eq!(
+        (
+            filter.status.code(),
+            String::from_utf8_lossy(&filter.stdout).into_owned()
+        ),
+        (Some(0), "Hello!\n".to_string()),
+        "control: the filter; stderr: {}",
+        String::from_utf8_lossy(&filter.stderr)
+    );
+    let report = lint_with_stdin(tmp.path(), &["--format", "json", "-"], b"Hello!\n");
+    assert_eq!(
+        json_exit(&report),
+        JsonExit {
+            exit: Some(0),
+            documents: Some(1),
+            code: None,
+            stderr: String::new(),
+        },
+        "control: a report of stdin"
+    );
+}
+
+/// `--fix --diff --format json` is the one exception to the one document: stdout holds the
+/// diffs first, one per file with a pending fix, then exactly one document — for a file
+/// argument and for a directory.
+///
+/// Control: `--fix --check --format json`, which prints no diff, prints exactly the one
+/// document.
+#[test]
+fn fix_diff_in_json_prints_its_diffs_then_exactly_one_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    fs::create_dir(&dir).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.join("a.mds")).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.join("b.mds")).unwrap();
+    let file = Path::new("d").join("a.mds");
+    let file = file.to_str().unwrap();
+    for (input, files) in [(file, 1), ("d", 2)] {
+        let out = lint_with_stdin(
+            tmp.path(),
+            &["--fix", "--diff", "--format", "json", input],
+            b"",
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with('{'))
+            .unwrap_or_else(|| panic!("{input}: a document on stdout; got {stdout:?}"));
+        let headers = lines[..start]
+            .iter()
+            .filter(|line| line.starts_with("--- "))
+            .count();
+        assert_eq!(
+            headers, files,
+            "{input}: a diff per file comes first; stdout: {stdout:?}"
+        );
+        let rest = lines[start..].join("\n");
+        let documents = json_documents(rest.as_bytes())
+            .unwrap_or_else(|| panic!("{input}: only JSON after the diffs; got {rest:?}"));
+        assert_eq!(documents.len(), 1, "{input}: then one document: {rest}");
+        assert!(
+            documents[0]["files"].is_array() && documents[0]["version"] == 1,
+            "{input}: the findings document: {rest}"
+        );
+
+        let check = lint_with_stdin(
+            tmp.path(),
+            &["--fix", "--check", "--format", "json", input],
+            b"",
+        );
+        assert_eq!(
+            json_documents(&check.stdout).map(|documents| documents.len()),
+            Some(1),
+            "control: {input} under --fix --check; stdout: {:?}",
+            String::from_utf8_lossy(&check.stdout)
+        );
+    }
+}
+
+/// Run `mds <args>` with `stdin` in `gone`, a directory the child removes right before
+/// `mds` starts, so that the run's working directory no longer exists. std changes into
+/// `gone` before it runs the closure below; were that order reversed, the spawn would fail
+/// rather than run somewhere else.
+#[cfg(unix)]
+fn run_where_the_working_directory_is_gone(
+    gone: &Path,
+    args: &[&str],
+    stdin: &[u8],
+) -> std::process::Output {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::process::CommandExt as _;
+
+    fs::create_dir(gone).unwrap();
+    let target =
+        std::ffi::CString::new(gone.as_os_str().as_bytes()).expect("a temporary path holds no NUL");
+    let mut cmd = mds_bin();
+    cmd.current_dir(gone)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `rmdir` is a thin wrapper around its system call
+    // that takes no lock and allocates nothing, and the path it reads was allocated before
+    // the fork. The closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::rmdir(target.as_ptr()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let _ = child.stdin.take().unwrap().write_all(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        !gone.exists(),
+        "control: the run's working directory was gone; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// `mds lint -` in a working directory that is gone fails closed in the words
+/// `mds build -` meets it in — `cannot determine current directory: <reason>`, `mds::io`,
+/// exit 2 — not as a base directory `.` that cannot be resolved (#390), with or without
+/// `--fix`; under `--format json` that failure is the one error document.
+///
+/// Controls: `mds build -` where the working directory is gone; the same stdin linted where
+/// it exists.
+///
+/// Unix-only: Windows cannot remove a directory that is a process's working directory.
+#[cfg(unix)]
+#[test]
+fn stdin_where_the_working_directory_is_gone_fails_in_the_words_build_uses() {
+    const CANNOT_DETERMINE: &str = "cannot determine current directory: ";
+    let tmp = tempfile::tempdir().unwrap();
+    let gone = |name: &str, args: &[&str]| {
+        run_where_the_working_directory_is_gone(&tmp.path().join(name), args, b"Hello!\n")
+    };
+    let build = gone("build", &["build", "-"]);
+    let build_stderr = String::from_utf8_lossy(&build.stderr).into_owned();
+    assert_eq!(
+        build.status.code(),
+        Some(2),
+        "control: build: {build_stderr}"
+    );
+    assert!(
+        build_stderr.contains("mds::io") && build_stderr.contains(CANNOT_DETERMINE),
+        "control: build fails in mds-core's words; stderr: {build_stderr}"
+    );
+    for args in [&["lint", "-"][..], &["lint", "--fix", "-"]] {
+        let human = gone(&args.join("-"), args);
+        assert_eq!(
+            (
+                human.status.code(),
+                String::from_utf8_lossy(&human.stdout).into_owned(),
+                String::from_utf8_lossy(&human.stderr).into_owned()
+            ),
+            (build.status.code(), String::new(), build_stderr.clone()),
+            "`mds {}` fails as `mds build -` does",
+            args.join(" ")
+        );
+    }
+    let json = gone("json", &["lint", "--format", "json", "-"]);
+    assert_eq!(json_exit(&json), JsonExit::error(2, "mds::io"), "json");
+    assert!(
+        error_message(&json).is_some_and(|m| m.starts_with(CANNOT_DETERMINE)),
+        "json: in the same words; got {:?}",
+        error_message(&json)
+    );
+
+    let here = lint_with_stdin(tmp.path(), &["--format", "json", "-"], b"Hello!\n");
+    assert_eq!(
+        json_exit(&here),
+        JsonExit {
+            exit: Some(0),
+            documents: Some(1),
+            code: None,
+            stderr: String::new(),
+        },
+        "control: where the working directory exists"
     );
 }
