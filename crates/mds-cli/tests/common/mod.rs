@@ -241,8 +241,13 @@ static WRITE_ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Deliberate non-user: `watch_single_status_line_per_rebuild`, whose subject IS the
 /// coalescing of the truncate+write pair.
 ///
-/// The Windows sharing-violation caveat (a rename over a file another process holds
-/// open can fail) is developer-machine only; CI runs this suite on ubuntu.
+/// On Windows, a rename over a file another process holds open succeeds when that
+/// process opened it as std does, sharing deletion (`FILE_SHARE_DELETE`): std's `rename`
+/// falls back to a POSIX-semantics replace. A handle opened without that share flag — a
+/// virus scanner's, say — makes it fail with a sharing violation. The Windows CI job
+/// (`Rust — clippy, test (windows-latest)`) runs `cli_watch`, `cli_watch_cap` (hundreds of
+/// rename-overs in a run) and `cli_watch_truncate` through this helper, so a
+/// `cannot rename` panic there is a failure to triage, not one that cannot happen.
 ///
 /// # Panics
 /// Panics if `path` has no parent or no file name, or if either filesystem step
