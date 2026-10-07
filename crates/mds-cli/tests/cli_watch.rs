@@ -446,34 +446,29 @@ fn watch_rebuild_names_the_entry_as_typed() {
 /// and nothing is written — rather than compiling the new target while watching the
 /// old one. Control: through the link as it was, an edit rebuilds.
 ///
-/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
-#[cfg(unix)]
+/// Runs on every OS; the entry is typed in the platform's separator, as the refusal names
+/// it as typed.
 #[test]
 fn watch_entry_through_a_retargeted_directory_is_refused() {
-    use std::os::unix::fs::symlink;
-
     let dir = tempfile::tempdir().unwrap();
     for (name, text) in [("a", "Hello A\n"), ("b", "Hello B\n")] {
         std::fs::create_dir(dir.path().join(name)).unwrap();
         std::fs::write(dir.path().join(name).join("page.mds"), text).unwrap();
     }
     let link = dir.path().join("link");
-    symlink("a", &link).unwrap();
+    if !make_symlink(Path::new("a"), &link) {
+        return;
+    }
     let watched = dir.path().join("a").join("page.mds");
     let out = dir.path().join("out.md");
+    let typed = Path::new("link").join("page.mds");
 
     let (child, stderr_tap) = spawn_ready(
         mds_bin()
             .current_dir(dir.path())
-            .args([
-                "watch",
-                "link/page.mds",
-                "-o",
-                "out.md",
-                "--debounce",
-                "0",
-                "-q",
-            ])
+            .arg("watch")
+            .arg(&typed)
+            .args(["-o", "out.md", "--debounce", "0", "-q"])
             .stdout(Stdio::null()),
     );
     assert!(wait_for_file_contains(&out, "Hello A", TIMEOUT), "startup");
@@ -483,15 +478,19 @@ fn watch_entry_through_a_retargeted_directory_is_refused() {
         "control: an edit rebuilds through the link"
     );
 
-    std::fs::remove_file(&link).unwrap();
-    symlink("b", &link).unwrap();
+    remove_symlink(&link);
+    assert!(
+        make_symlink(Path::new("b"), &link),
+        "retarget the link to b"
+    );
     write_atomic(&watched, "Hello A2\n");
     let stderr = wait_for_tap(&stderr_tap, "watched entry now resolves", TIMEOUT);
     assert!(
-        squash(&stderr).contains(
-            "mds::io×watchedentrynowresolvestoadifferentfile:\"link/page.mds\";\
-             restartmdswatchtofollowit"
-        ),
+        squash(&stderr).contains(&squash(&format!(
+            "mds::io × watched entry now resolves to a different file: \"{}\"; \
+             restart mds watch to follow it",
+            typed.display()
+        ))),
         "the rebuild is refused, naming the entry as typed; stderr: {stderr}"
     );
     assert_eq!(
@@ -2887,8 +2886,6 @@ fn watch_dot_recovers_after_the_working_directory_is_recreated() {
 #[cfg(unix)]
 #[test]
 fn watch_does_not_follow_a_working_directory_recreated_as_a_symlink() {
-    use std::os::unix::fs::symlink;
-
     let base = tempfile::tempdir().unwrap();
     let entry = base.path().join("entry.mds");
     std::fs::write(&entry, "Entry\n").unwrap();
@@ -2912,7 +2909,10 @@ fn watch_does_not_follow_a_working_directory_recreated_as_a_symlink() {
     );
 
     std::fs::remove_dir_all(&proj).unwrap();
-    symlink("other", &proj).unwrap();
+    assert!(
+        make_symlink(Path::new("other"), &proj),
+        "recreate the working directory as a link"
+    );
     write_atomic(&entry, "Edited\n");
 
     // The rebuild cannot write out.md in the dead working directory.
@@ -6082,66 +6082,76 @@ fn watch_dot_forms_watch_the_canonical_directory() {
 
 /// Directory mode compiles each source by its walked path — the directory argument as
 /// typed, joined with the source's path below it — but watches the canonical directory
-/// (#413). `link/..` is accepted as the directory above the link's target; once the
-/// link is retargeted, the walked path leads into another directory: the rebuild is
-/// refused (`mds::io`), naming the directory as typed, and nothing is written from the
-/// other directory — rather than compiling its file into the watched one's output.
-/// Control: before the retarget, an edit rebuilds.
+/// (#413). A directory reached through a link, `link/a`, is accepted, and on unix so is
+/// `link/..`, the directory above the link's target; once the link is retargeted, the
+/// walked path leads into another directory: the rebuild is refused (`mds::io`), naming
+/// the directory as typed, and nothing is written from the other directory — rather than
+/// compiling its file into the watched one's output. Control: before the retarget, an
+/// edit rebuilds.
 ///
-/// Unix-only: it retargets a directory symlink; the rule itself is platform-independent.
-#[cfg(unix)]
+/// Runs on every OS with `link/a`, typed in the platform's separator. `link/..` is typed
+/// on unix alone: Windows takes `link\..` back to the directory the link is in before it
+/// looks at the link, so there it never leads through the link.
 #[test]
 fn watch_dir_through_a_retargeted_link_is_refused() {
-    use std::os::unix::fs::symlink;
+    // (the directory as typed, where the link leads, where it is retargeted to); each
+    // leads to `one/a` first and to `two/a` once retargeted.
+    let rows = std::iter::once((Path::new("link").join("a"), "one", "two"))
+        .chain(cfg!(unix).then(|| (Path::new("link").join(".."), "one/a/x", "two/a/y")));
+    for (typed, first, then) in rows {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, below, text) in [("one", "x", "Hello A\n"), ("two", "y", "Hello B\n")] {
+            let root = dir.path().join(name).join("a");
+            std::fs::create_dir_all(root.join(below)).unwrap();
+            std::fs::write(root.join("p.mds"), text).unwrap();
+        }
+        let link = dir.path().join("link");
+        if !make_symlink(Path::new(first), &link) {
+            return;
+        }
+        let watched = dir.path().join("one").join("a").join("p.mds");
+        let out = dir.path().join("out").join("p.md");
+        let shown = typed.display();
 
-    let dir = tempfile::tempdir().unwrap();
-    for (name, below, text) in [("a", "x", "Hello A\n"), ("b", "y", "Hello B\n")] {
-        std::fs::create_dir_all(dir.path().join(name).join(below)).unwrap();
-        std::fs::write(dir.path().join(name).join("p.mds"), text).unwrap();
+        let (child, stderr_tap) = spawn_ready(
+            mds_bin()
+                .current_dir(dir.path())
+                .arg("watch")
+                .arg(&typed)
+                .args(["--out-dir", "out", "--debounce", "0", "-q"])
+                .stdout(Stdio::null()),
+        );
+        assert!(
+            wait_for_file_contains(&out, "Hello A", TIMEOUT),
+            "{shown}: startup"
+        );
+        write_atomic(&watched, "Hello A1\n");
+        assert!(
+            wait_for_file_contains(&out, "Hello A1", TIMEOUT),
+            "{shown}: control: an edit rebuilds through the link"
+        );
+
+        remove_symlink(&link);
+        assert!(
+            make_symlink(Path::new(then), &link),
+            "{shown}: retarget the link to {then}"
+        );
+        write_atomic(&watched, "Hello A2\n");
+        let stderr = wait_for_tap(&stderr_tap, "watched directory now resolves", TIMEOUT);
+        assert!(
+            squash(&stderr).contains(&squash(&format!(
+                "mds::io × watched directory now resolves to a different directory: \
+                 \"{shown}\"; restart mds watch to follow it"
+            ))),
+            "{shown}: the rebuild is refused, naming the directory as typed; stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "Hello A1\n",
+            "{shown}: nothing is written from the retargeted directory"
+        );
+        drop(child);
     }
-    let link = dir.path().join("link");
-    symlink("a/x", &link).unwrap();
-    let watched = dir.path().join("a").join("p.mds");
-    let out = dir.path().join("out").join("p.md");
-
-    let (child, stderr_tap) = spawn_ready(
-        mds_bin()
-            .current_dir(dir.path())
-            .args([
-                "watch",
-                "link/..",
-                "--out-dir",
-                "out",
-                "--debounce",
-                "0",
-                "-q",
-            ])
-            .stdout(Stdio::null()),
-    );
-    assert!(wait_for_file_contains(&out, "Hello A", TIMEOUT), "startup");
-    write_atomic(&watched, "Hello A1\n");
-    assert!(
-        wait_for_file_contains(&out, "Hello A1", TIMEOUT),
-        "control: an edit rebuilds through the link"
-    );
-
-    std::fs::remove_file(&link).unwrap();
-    symlink("b/y", &link).unwrap();
-    write_atomic(&watched, "Hello A2\n");
-    let stderr = wait_for_tap(&stderr_tap, "watched directory now resolves", TIMEOUT);
-    assert!(
-        squash(&stderr).contains(
-            "mds::io×watcheddirectorynowresolvestoadifferentdirectory:\"link/..\";\
-             restartmdswatchtofollowit"
-        ),
-        "the rebuild is refused, naming the directory as typed; stderr: {stderr}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&out).unwrap(),
-        "Hello A1\n",
-        "nothing is written from the retargeted directory"
-    );
-    drop(child);
 }
 
 /// Directory mode checks before every compile that the source's own walked path still
@@ -6155,12 +6165,9 @@ fn watch_dir_through_a_retargeted_link_is_refused() {
 /// every known source; `top.mds` rebuilding is its positive control, and before the swap
 /// an edit under the unchanged subdirectory rebuilds.
 ///
-/// Unix-only: it replaces a directory with a symlink; the rule itself is platform-independent.
-#[cfg(unix)]
+/// Runs on every OS; the walked path is named in the platform's separator.
 #[test]
 fn watch_dir_source_under_a_subdirectory_swapped_for_a_link_is_refused() {
-    use std::os::unix::fs::symlink;
-
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
     std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -6194,7 +6201,9 @@ fn watch_dir_source_under_a_subdirectory_swapped_for_a_link_is_refused() {
     );
 
     std::fs::rename(root.join("sub"), dir.path().join("sub.old")).unwrap();
-    symlink(&outside, root.join("sub")).unwrap();
+    if !make_symlink(&outside, &root.join("sub")) {
+        return;
+    }
     write_atomic(&vars, r#"{"v": "2"}"#);
     assert!(
         wait_for_file_contains(&out.join("top.md"), "Top 2", TIMEOUT),
@@ -6202,11 +6211,13 @@ fn watch_dir_source_under_a_subdirectory_swapped_for_a_link_is_refused() {
         tap.text()
     );
     let stderr = wait_for_tap(&tap, "watched file now resolves", TIMEOUT);
+    let walked = Path::new("root").join("sub").join("x.mds");
     assert!(
-        squash(&stderr).contains(
-            "mds::io×watchedfilenowresolvestoadifferentfile:\"root/sub/x.mds\";\
-             restartmdswatchtofollowit"
-        ),
+        squash(&stderr).contains(&squash(&format!(
+            "mds::io × watched file now resolves to a different file: \"{}\"; \
+             restart mds watch to follow it",
+            walked.display()
+        ))),
         "the rebuild is refused, naming the source as walked; stderr: {stderr}"
     );
     assert_eq!(

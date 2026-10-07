@@ -107,9 +107,8 @@ fn refused(component: &str) -> String {
 /// through the link by hand does show up in the directory it points at, so the check
 /// that nothing did can see one.
 ///
-/// Unix-only: it makes its link with `std::os::unix::fs::symlink`; its Windows twin is
-/// [`a_directory_symlink_or_junction_below_the_out_dir_is_refused`].
-#[cfg(unix)]
+/// Runs on every OS. A junction, the other link Windows makes to a directory, is refused
+/// there too: [`a_directory_symlink_or_junction_below_the_out_dir_is_refused`].
 #[test]
 fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
     let dir = scratch();
@@ -118,7 +117,10 @@ fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
     put(root, "src/top.mds", "Top\n");
     std::fs::create_dir(root.join("victim")).unwrap();
     std::fs::create_dir(root.join("out")).unwrap();
-    std::os::unix::fs::symlink("../victim", root.join("out/sub")).unwrap();
+    let link = root.join(native("out/sub"));
+    if !common::make_symlink(&Path::new("..").join("victim"), &link) {
+        return;
+    }
 
     let out = run(
         root,
@@ -135,9 +137,13 @@ fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
         stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refused("out/sub"))),
         "the refusal names the link as typed; stderr: {stderr}"
     );
-    assert_eq!(read(&root.join("out/top.md")), "Top\n", "stderr: {stderr}");
+    assert_eq!(
+        read(&root.join(native("out/top.md"))),
+        "Top\n",
+        "stderr: {stderr}"
+    );
     assert!(
-        std::fs::symlink_metadata(root.join("out/sub"))
+        std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
             .is_symlink(),
@@ -145,7 +151,7 @@ fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
     );
 
     // Control: the check above sees a file that does arrive through the link.
-    std::fs::write(root.join("out/sub/by-hand"), "x").unwrap();
+    std::fs::write(link.join("by-hand"), "x").unwrap();
     assert_eq!(entries(&root.join("victim")), vec!["by-hand".to_owned()]);
 }
 
@@ -154,15 +160,17 @@ fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
 /// and written through. (`mds.json`'s `build.output_dir` is no path the user typed: a
 /// symlink there is refused, below.)
 ///
-/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
-#[cfg(unix)]
+/// Runs on every OS; each path is typed in the platform's separator, as the output is
+/// named as typed.
 #[test]
 fn a_symlinked_anchor_the_user_named_is_still_followed() {
     let dir = scratch();
     let root = dir.path();
     put(root, "src/sub/a.mds", "A\n");
     std::fs::create_dir(root.join("real")).unwrap();
-    std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+    if !common::make_symlink(Path::new("real"), &root.join("link")) {
+        return;
+    }
 
     // (arguments, the line naming the output, where the bytes land)
     for (args, line, landed) in [
@@ -182,7 +190,8 @@ fn a_symlinked_anchor_the_user_named_is_still_followed() {
             "real/a.md",
         ),
     ] {
-        let out = run(root, args);
+        let args: Vec<String> = args.iter().map(|arg| native(arg)).collect();
+        let out = run(root, &args);
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{args:?}: stderr: {stderr}");
         assert!(
@@ -324,8 +333,7 @@ fn a_fifo_at_the_output_path_is_refused_and_left_in_place() {
 /// `mds watch` of a directory — and the directory it points at is left alone. The
 /// refusal names the link below the directory `mds.json` was reached by, as an output is.
 ///
-/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
-#[cfg(unix)]
+/// Runs on every OS; each path is typed in the platform's separator.
 #[test]
 fn a_symlink_committed_as_build_output_dir_is_refused() {
     let dir = scratch();
@@ -333,10 +341,13 @@ fn a_symlink_committed_as_build_output_dir_is_refused() {
     put(root, "mds.json", r#"{"build":{"output_dir":"dist"}}"#);
     put(root, "src/a.mds", "A\n");
     std::fs::create_dir(root.join("victim")).unwrap();
-    std::os::unix::fs::symlink("victim", root.join("dist")).unwrap();
+    let link = root.join("dist");
+    if !common::make_symlink(Path::new("victim"), &link) {
+        return;
+    }
 
-    for args in [&["build", "src/a.mds"][..], &["build", "src"]] {
-        let out = run(root, args);
+    for args in [["build", "src/a.mds"], ["build", "src"]].map(|args| args.map(native)) {
+        let out = run(root, &args);
         let stderr = text(&out.stderr);
         assert_eq!(
             entries(&root.join("victim")),
@@ -369,7 +380,7 @@ fn a_symlink_committed_as_build_output_dir_is_refused() {
         "watch: the refusal names the link; stderr: {stderr}"
     );
     assert!(
-        std::fs::symlink_metadata(root.join("dist"))
+        std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
             .is_symlink(),
@@ -432,13 +443,12 @@ fn a_build_output_dir_must_be_relative() {
 /// `mds watch` refuses a symlink that replaced a directory below `--out-dir` when it
 /// rebuilds into it. Control: the startup write landed in that directory before the swap.
 ///
-/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
-#[cfg(unix)]
+/// Runs on every OS.
 #[test]
 fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
     let dir = scratch();
     let root = dir.path();
-    put(root, "src/sub/a.mds", "First\n");
+    let source = put(root, "src/sub/a.mds", "First\n");
     std::fs::create_dir(root.join("victim")).unwrap();
 
     let (child, tap, _) = common::spawn_watch_ready(
@@ -448,11 +458,14 @@ fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
             .stdout(Stdio::null()),
     );
     let mut child = common::ChildGuard(child);
-    assert_eq!(read(&root.join("out/sub/a.md")), "First\n");
+    assert_eq!(read(&root.join(native("out/sub/a.md"))), "First\n");
 
-    std::fs::remove_dir_all(root.join("out/sub")).unwrap();
-    std::os::unix::fs::symlink("../victim", root.join("out/sub")).unwrap();
-    common::write_atomic(&root.join("src/sub/a.mds"), "Second\n");
+    let link = root.join(native("out/sub"));
+    std::fs::remove_dir_all(&link).unwrap();
+    if !common::make_symlink(&Path::new("..").join("victim"), &link) {
+        return;
+    }
+    common::write_atomic(&source, "Second\n");
     let reported = common::poll_tap_until(&tap, TIMEOUT, |seen| {
         seen.contains("Recompiled") || seen.contains("symlink")
     });
@@ -483,15 +496,14 @@ fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
 /// deleted source's output below a real directory is removed; and the link is left in
 /// place.
 ///
-/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
-#[cfg(unix)]
+/// Runs on every OS.
 #[test]
 fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
     const HAND: &str = "X\n";
     let dir = scratch();
     let root = dir.path();
-    put(root, "src/top.mds", "Top\n");
-    put(root, "src/sub/x.mds", "X\n");
+    let top = put(root, "src/top.mds", "Top\n");
+    let source = put(root, "src/sub/x.mds", "X\n");
     let victim = put(root, "victim/x.md", HAND);
 
     let (child, tap, _) = common::spawn_watch_ready(
@@ -501,19 +513,22 @@ fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
             .stdout(Stdio::null()),
     );
     let mut child = common::ChildGuard(child);
-    assert_eq!(read(&root.join("out/sub/x.md")), "X\n");
+    assert_eq!(read(&root.join(native("out/sub/x.md"))), "X\n");
 
     // Control: the output of a source deleted below a real directory is removed.
-    std::fs::remove_file(root.join("src/top.mds")).unwrap();
+    std::fs::remove_file(&top).unwrap();
     common::wait_for_tap(&tap, "top.md (source deleted)", TIMEOUT);
     assert!(
-        !root.join("out/top.md").exists(),
+        !root.join(native("out/top.md")).exists(),
         "control: the deleted source's output is removed"
     );
 
-    std::fs::remove_dir_all(root.join("out/sub")).unwrap();
-    std::os::unix::fs::symlink("../victim", root.join("out/sub")).unwrap();
-    std::fs::remove_file(root.join("src/sub/x.mds")).unwrap();
+    let link = root.join(native("out/sub"));
+    std::fs::remove_dir_all(&link).unwrap();
+    if !common::make_symlink(&Path::new("..").join("victim"), &link) {
+        return;
+    }
+    std::fs::remove_file(&source).unwrap();
     common::wait_for_tap(&tap, "could not remove", TIMEOUT);
     let stderr = tap.finish_text(&mut child);
 
@@ -531,7 +546,7 @@ fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
         "the refusal names the output and the link as typed; stderr: {stderr}"
     );
     assert!(
-        std::fs::symlink_metadata(root.join("out/sub"))
+        std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
             .is_symlink(),
@@ -545,15 +560,15 @@ fn watch_never_removes_an_output_through_a_symlink_below_the_out_dir() {
 /// where the link leads is left as it was. Control: earlier in the same session, a
 /// deleted source's output in the out-dir as it started is removed.
 ///
-/// Unix-only: it makes its link with `std::os::unix::fs::symlink`.
-#[cfg(unix)]
+/// Runs on every OS: the out-dir is refused by where `--out-dir`, as typed, resolves now,
+/// canonical with canonical, on Windows as on unix.
 #[test]
 fn watch_never_removes_an_output_through_an_out_dir_replaced_by_a_symlink() {
     const HAND: &str = "Hand-written, not an mds output\n";
     let dir = scratch();
     let root = dir.path();
-    put(root, "src/top.mds", "Top\n");
-    put(root, "src/x.mds", "X\n");
+    let top = put(root, "src/top.mds", "Top\n");
+    let source = put(root, "src/x.mds", "X\n");
     let victim = put(root, "victim/x.md", HAND);
 
     let (child, tap, _) = common::spawn_watch_ready(
@@ -563,19 +578,22 @@ fn watch_never_removes_an_output_through_an_out_dir_replaced_by_a_symlink() {
             .stdout(Stdio::null()),
     );
     let mut child = common::ChildGuard(child);
-    assert_eq!(read(&root.join("out/x.md")), "X\n");
+    assert_eq!(read(&root.join(native("out/x.md"))), "X\n");
 
     // Control: the output of a source deleted while the out-dir is as it started is removed.
-    std::fs::remove_file(root.join("src/top.mds")).unwrap();
+    std::fs::remove_file(&top).unwrap();
     common::wait_for_tap(&tap, "top.md (source deleted)", TIMEOUT);
     assert!(
-        !root.join("out/top.md").exists(),
+        !root.join(native("out/top.md")).exists(),
         "control: the deleted source's output is removed"
     );
 
-    std::fs::remove_dir_all(root.join("out")).unwrap();
-    std::os::unix::fs::symlink("victim", root.join("out")).unwrap();
-    std::fs::remove_file(root.join("src/x.mds")).unwrap();
+    let out = root.join("out");
+    std::fs::remove_dir_all(&out).unwrap();
+    if !common::make_symlink(Path::new("victim"), &out) {
+        return;
+    }
+    std::fs::remove_file(&source).unwrap();
     let reported = common::poll_tap_until(&tap, TIMEOUT, |seen| {
         seen.contains("x.md (source deleted)") || seen.contains("could not remove")
     });

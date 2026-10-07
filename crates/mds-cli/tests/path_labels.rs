@@ -235,18 +235,18 @@ fn compiled_to_under_a_relative_out_dir_names_the_out_dir_as_typed() {
 /// An out-dir reached through a symlink is named by the link, as typed — relative or
 /// absolute — never by the directory the link resolves to.
 ///
-/// Unix-only: it creates a directory symlink; the rule itself is platform-independent.
-#[cfg(unix)]
+/// Runs on every OS; each name is written in the platform's separator.
 #[test]
 fn compiled_to_under_a_symlinked_out_dir_names_the_link_not_its_target() {
     let dir = scratch();
     put(dir.path(), "src/sub/page.mds", "Page\n");
     std::fs::create_dir(dir.path().join("real-target")).unwrap();
-    std::os::unix::fs::symlink(
-        dir.path().join("real-target"),
-        dir.path().join("alias-link"),
-    )
-    .unwrap();
+    if !common::make_symlink(
+        &dir.path().join("real-target"),
+        &dir.path().join("alias-link"),
+    ) {
+        return;
+    }
 
     // Relative, as typed.
     let out = run(dir.path(), &["build", "src", "--out-dir", "alias-link"]);
@@ -261,7 +261,7 @@ fn compiled_to_under_a_symlinked_out_dir_names_the_link_not_its_target() {
         "the output is named below the link as typed"
     );
     assert!(
-        dir.path().join("real-target/sub/page.md").is_file(),
+        dir.path().join(native("real-target/sub/page.md")).is_file(),
         "the output was written through the link"
     );
     assert!(
@@ -1231,15 +1231,17 @@ fn watching_names_the_entry_and_the_directory_as_typed() {
 /// `Recompiled` — never by the directory the link resolves to, which is what the session
 /// watches.
 ///
-/// Unix-only: it creates a directory symlink; the rule itself is platform-independent.
-#[cfg(unix)]
+/// Runs on every OS; each path is typed, and each name expected, in the platform's
+/// separator.
 #[test]
 fn watching_names_a_path_reached_through_a_symlink_by_the_link() {
     let dir = scratch();
     let root = dir.path();
     put(root, "real-target/page.mds", "Page\n");
     put(root, "real-target/sub/b.mds", "B\n");
-    std::os::unix::fs::symlink(root.join("real-target"), root.join("alias-link")).unwrap();
+    if !common::make_symlink(&root.join("real-target"), &root.join("alias-link")) {
+        return;
+    }
 
     // (arguments, the banner, the output's name, the source edited, the output written)
     let cases: [(&[&str], &str, &str, &str, &str); 2] = [
@@ -1259,14 +1261,16 @@ fn watching_names_a_path_reached_through_a_symlink_by_the_link() {
         ),
     ];
     for (args, banner, output, edit, written) in cases {
-        let (mut child, tap, _) = watch_live(root, args, false);
-        write_atomic(&root.join(edit), "Edited\n");
+        let args = typed_args(args);
+        let (banner, output) = (native(banner), native(output));
+        let (mut child, tap, _) = watch_live(root, &args, false);
+        write_atomic(&root.join(native(edit)), "Edited\n");
         common::wait_for_tap(&tap, "Recompiled ", WATCH_STEP);
         let stderr = tap.finish_text(&mut child);
 
         assert_eq!(
             stderr.lines().next(),
-            Some(banner),
+            Some(banner.as_str()),
             "{args:?}: stderr: {stderr}"
         );
         assert_eq!(
@@ -1283,7 +1287,7 @@ fn watching_names_a_path_reached_through_a_symlink_by_the_link() {
             "{args:?}: every rebuild names the output by the link; stderr: {stderr}"
         );
         assert_eq!(
-            std::fs::read_to_string(root.join(written)).unwrap(),
+            std::fs::read_to_string(root.join(native(written))).unwrap(),
             "Edited\n",
             "{args:?}: the rebuild was written through the link"
         );
