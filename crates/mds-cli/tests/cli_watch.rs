@@ -43,7 +43,7 @@ use common::{
     StdoutTap, WriteCadence, ORDER_MARKER_LINE, ORDER_MARKER_SOURCE,
 };
 #[cfg(unix)]
-use common::{full_file, limit_file_growth};
+use common::{default_sigint, full_file, limit_file_growth};
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -4694,6 +4694,11 @@ fn watch_dir_mode_idle_tick_fires_under_event_flood() {
 // keeps writing outputs, ignores every further press, and finally exits 0. The
 // user-visible defect is that Ctrl+C does nothing and the tool writes files the user
 // was trying to stop it writing.
+//
+// Every test here that signals before the handler is installed asserts SIGINT's default
+// action, so it spawns its watcher through `common::default_sigint`: a test run started
+// in the background of a non-interactive shell has SIGINT ignored, and its children
+// would inherit that and never die of the signal.
 
 /// Directory mode: SIGINT delivered while the startup compile is still running must
 /// terminate the process, not be queued until the compile finishes.
@@ -4731,19 +4736,19 @@ fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
             .unwrap_or(0)
     };
 
-    let (mut guard, _tap) = spawn_unsynchronized(
-        mds_bin()
-            .args([
-                "watch",
-                root.to_str().unwrap(),
-                "--out-dir",
-                out_dir.to_str().unwrap(),
-                "--debounce",
-                "0",
-                "-q",
-            ])
-            .stdout(Stdio::null()),
-    );
+    let mut cmd = mds_bin();
+    cmd.args([
+        "watch",
+        root.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--debounce",
+        "0",
+        "-q",
+    ])
+    .stdout(Stdio::null());
+    default_sigint(&mut cmd);
+    let (mut guard, _tap) = spawn_unsynchronized(&mut cmd);
     let pid = guard.id();
 
     // Gate on the artifact rather than on a guessed sleep: wait until the startup
@@ -4839,12 +4844,12 @@ fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
     let src = dir.path().join("entry.mds");
     std::fs::write(&src, &entry).unwrap();
 
-    let (mut guard, tap) = spawn_unsynchronized(
-        // No -q: the `Watching …` line is the startup gate.
-        mds_bin()
-            .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
-            .stdout(Stdio::null()),
-    );
+    let mut cmd = mds_bin();
+    // No -q: the `Watching …` line is the startup gate.
+    cmd.args(["watch", src.to_str().unwrap(), "--debounce", "0"])
+        .stdout(Stdio::null());
+    default_sigint(&mut cmd);
+    let (mut guard, tap) = spawn_unsynchronized(&mut cmd);
     let pid = guard.id();
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -4922,7 +4927,8 @@ fn wait_bounded(guard: &mut ChildGuard, timeout: Duration, what: &str) -> std::p
 ///   line. `file_startup::arm_pre_read` prints that line before it even creates the
 ///   watcher, and therefore long before `live::go_live` calls `ctrlc::set_handler`, so
 ///   the signal lands in the pre-handler window where the default disposition still
-///   applies: death by SIGINT.
+///   applies: death by SIGINT. Its watcher is spawned through `common::default_sigint`,
+///   so that disposition is the default whatever this run inherited.
 ///   If this arm ever exits cleanly, the window is no longer being hit and the
 ///   treatment arm below proves nothing.
 /// - **TREATMENT.** [`spawn_ready`], with SIGINT sent the instant the handshake
@@ -4967,12 +4973,12 @@ fn watch_readiness_handshake_makes_ctrl_c_exit_deterministic() {
 
     for iteration in 0..N {
         // ── CONTROL arm: signal delivered before the handler is installed ───────
-        let (mut guard, tap) = spawn_unsynchronized(
-            // No -q: the `Watching …` line is the gate.
-            mds_bin()
-                .args(["watch", slow_src.to_str().unwrap(), "--debounce", "0"])
-                .stdout(Stdio::null()),
-        );
+        let mut cmd = mds_bin();
+        // No -q: the `Watching …` line is the gate.
+        cmd.args(["watch", slow_src.to_str().unwrap(), "--debounce", "0"])
+            .stdout(Stdio::null());
+        default_sigint(&mut cmd);
+        let (mut guard, tap) = spawn_unsynchronized(&mut cmd);
         let pid = guard.id();
 
         let deadline = Instant::now() + STARTUP_WINDOW_TIMEOUT;
@@ -5044,6 +5050,69 @@ fn watch_readiness_handshake_makes_ctrl_c_exit_deterministic() {
              `Stopped watching.`; stderr:\n{stderr}"
         );
     }
+}
+
+/// `common::default_sigint` gives a child SIGINT's default action though it would
+/// inherit SIGINT ignored, as every child of a test run started in the background of a
+/// non-interactive shell does. The inherited disposition is planted by a `pre_exec` of
+/// the test's own, registered first, so no shell is needed.
+///
+/// The child is `mds fmt -` reading a stdin the test holds open: alive, and with no
+/// handler of its own, when the signal comes. Control: with SIGINT ignored the signal is
+/// discarded, and the child exits by itself once its stdin closes. With `default_sigint`
+/// as well, it dies of the signal.
+///
+/// Unix-only: it plants and resets a signal disposition and sends SIGINT with
+/// `libc::kill`; Windows has neither.
+#[test]
+#[cfg(unix)]
+fn default_sigint_gives_a_child_sigint_s_default_action_though_it_would_inherit_it_ignored() {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+    let interrupted = |reset: bool| -> std::process::ExitStatus {
+        let mut cmd = mds_bin();
+        cmd.args(["fmt", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: as `default_sigint`'s: the closure runs in the forked child before
+        // `exec`, calls only the async-signal-safe `signal`, and touches none of the
+        // parent's state.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        if reset {
+            default_sigint(&mut cmd);
+        }
+        // `spawn` returns once the child has exec'd, its disposition set.
+        let mut child = ChildGuard(cmd.spawn().expect("spawn mds fmt -"));
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid fits pid_t");
+        // SAFETY: `kill` only sends a signal, to the child this test spawned and has not
+        // reaped, so the pid names no other process.
+        let sent = unsafe { libc::kill(pid, libc::SIGINT) };
+        assert_eq!(sent, 0, "send SIGINT to mds fmt -");
+        // A child that survived the signal finishes once its stdin closes.
+        drop(child.0.stdin.take());
+        wait_bounded(&mut child, Duration::from_secs(5), "mds fmt -")
+    };
+
+    let ignored = interrupted(false);
+    assert_eq!(
+        ignored.signal(),
+        None,
+        "control: a child that inherits SIGINT ignored survives it; got {ignored:?}"
+    );
+    let reset = interrupted(true);
+    assert_eq!(
+        reset.signal(),
+        Some(libc::SIGINT),
+        "default_sigint gives the child SIGINT's default action; got {reset:?}"
+    );
 }
 
 // ── I8: file-watch mode warns exactly ONCE across two edits (#200) ──────────

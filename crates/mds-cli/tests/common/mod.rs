@@ -1000,6 +1000,37 @@ pub fn full_file(path: &Path, len: usize) -> std::fs::File {
     file
 }
 
+// ── SIGINT's default action in a child (#381) ────────────────────────────────
+
+/// Give the child `cmd` spawns SIGINT's default action, terminate, whatever this
+/// process's own disposition is.
+///
+/// A child inherits an ignored signal across `exec`, and `std::process::Command` resets
+/// SIGPIPE alone: a test run started as a background job of a non-interactive shell has
+/// SIGINT ignored, and so would every child it spawns. A test that sends SIGINT to `mds
+/// watch` before its Ctrl+C handler is installed asserts the default action, so without
+/// this the signal is discarded and the test waits for an exit that never comes.
+///
+/// Unix-only: a signal disposition is a unix notion, and Windows has no SIGINT a test can
+/// send one child.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn default_sigint(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `signal` is on POSIX's async-signal-safe list. The
+    // closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Assert that `s` contains no raw C0 (excluding `\t` and `\n`), DEL, C1, bidi
 /// control, line/paragraph separator, or BOM codepoint.
 ///
