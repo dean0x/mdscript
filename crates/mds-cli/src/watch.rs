@@ -4023,14 +4023,20 @@ struct LivenessState {
     /// missing. A permanently-missing external dir must NOT force an O(tree) walk
     /// on every idle tick (reconcile rule / AC-P1).
     missing_external_dirs: BTreeSet<PathBuf>,
-    /// External dep dirs that are currently armed with the OS watcher.
+    /// The directories outside the root that the OS watcher holds, non-recursively: the
+    /// dependencies' and the `--vars` file's — one entry for a directory both share, as
+    /// file mode's `armed_dirs` holds them.
     ///
-    /// Used to call `watcher.unwatch()` when an external dir is pruned from
-    /// `state.external_dep_dirs` (e.g. because a cross-root @import was edited away).
-    /// Prevents inotify/FSEvents watch leaks for the process lifetime (avoids
-    /// approaching `fs.inotify.max_user_watches`). Mirrors the `resync_watches`
-    /// discipline from file mode.
-    armed_external_dirs: BTreeSet<PathBuf>,
+    /// A directory is watched only while it is not held here (#257): a repeat watch of a
+    /// held path is no no-op — macOS restarts its event stream, dropping the events that
+    /// land meanwhile, and Windows opens another handle, which delivers every event once
+    /// more. One that vanishes leaves the set with no `unwatch` — its watch went with it —
+    /// so it is watched once more when it comes back. Used to call `watcher.unwatch()` when a
+    /// dependency's directory is pruned from `state.external_dep_dirs` (e.g. because a
+    /// cross-root @import was edited away), which prevents inotify/FSEvents watch leaks for
+    /// the process lifetime (avoids approaching `fs.inotify.max_user_watches`). Mirrors the
+    /// `resync_watches` discipline from file mode.
+    armed_dirs: BTreeSet<PathBuf>,
 }
 
 /// Compile a single in-root source file, update `state`, and optionally write output.
@@ -4324,13 +4330,13 @@ fn arm_external_dep_dirs<'a>(
 /// arms it when it reappears.
 fn arm_external_dirs_after_rebuild(
     ctx: &DirWatchCtx,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut dyn Watcher,
     liveness: &mut LivenessState,
     state: &DirWatchState,
 ) {
     arm_external_dep_dirs(
         state.external_dep_dirs.iter().filter(|dir| dir.exists()),
-        &mut liveness.armed_external_dirs,
+        &mut liveness.armed_dirs,
         |dir| watcher.watch(dir, RecursiveMode::NonRecursive),
         ctx.root.root_paths(),
         extra_vars_dir(
@@ -4342,12 +4348,13 @@ fn arm_external_dirs_after_rebuild(
 
 /// Run the idle-tick liveness probe for directory mode (reconcile rule, DD1).
 ///
-/// Re-arms root + external dirs + vars dir. Applies edge-triggered recovery
-/// to decide whether a full reconcile (collect_mds_files diff) is needed.
-/// Mutates `liveness` state for next tick.
+/// Re-arms the root, the external dirs and the vars dir that the watcher does not hold —
+/// a tick that finds every watch in place asks nothing of the watcher (#257). Applies
+/// edge-triggered recovery to decide whether a full reconcile (collect_mds_files diff) is
+/// needed. Mutates `liveness` state for next tick.
 fn liveness_probe_dir(
     ctx: &DirWatchCtx,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut dyn Watcher,
     liveness: &mut LivenessState,
     state: &mut DirWatchState,
 ) {
@@ -4356,14 +4363,14 @@ fn liveness_probe_dir(
     // Skip the `watcher.watch()` syscall on healthy ticks when root is already armed:
     // on Linux `notify` re-WalkDirs the entire subtree + calls `inotify_add_watch` per
     // subdirectory on every `watch()` call regardless of mode; on macOS it tears down
-    // and recreates the FSEvents stream.  Only re-arm when:
-    //   (a) first_tick — not yet armed
-    //   (b) root was missing last tick but now exists (vanish→reappear edge)
-    //   (c) root_armed is false — a previous arm attempt failed; retry
+    // and recreates the FSEvents stream, and on Windows it opens a second handle that
+    // delivers every event again (#257).  Only re-arm when:
+    //   (a) root was missing last tick but now exists (vanish→reappear edge)
+    //   (b) root_armed is false — a previous arm attempt failed; retry
+    // The first tick is no reason: the startup armed the root before anything was read,
+    // and the first tick's reconcile walk (`recovery` below) does not need it armed again.
     let root_now_exists = ctx.root.canonical.exists();
-    let need_root_rearm = liveness.first_tick
-        || (liveness.root_was_missing && root_now_exists)
-        || !liveness.root_armed;
+    let need_root_rearm = (liveness.root_was_missing && root_now_exists) || !liveness.root_armed;
     let root_ok = if root_now_exists && need_root_rearm {
         let ok = watcher
             .watch(&ctx.root.canonical, RecursiveMode::Recursive)
@@ -4382,18 +4389,21 @@ fn liveness_probe_dir(
     // Unwatch dirs that were pruned from external_dep_dirs by a previous batch
     // (issue #2 fix: release OS watches when cross-root @imports are edited away to
     // prevent inotify/FSEvents watch leaks approaching fs.inotify.max_user_watches).
-    // `armed_external_dirs` tracks which dirs the OS watcher currently holds so we
-    // can call `unwatch()` precisely on the difference.
+    // `armed_dirs` tracks which dirs the OS watcher currently holds so we
+    // can call `unwatch()` precisely on the difference — the `--vars` file's directory
+    // excepted, which it holds for that file whatever the sources import.
     let dropped_external: Vec<PathBuf> = liveness
-        .armed_external_dirs
+        .armed_dirs
         .iter()
-        .filter(|d| !state.external_dep_dirs.contains(*d))
+        .filter(|d| {
+            !state.external_dep_dirs.contains(*d) && ctx.vars_dir_extra.as_ref() != Some(*d)
+        })
         .cloned()
         .collect();
     for d in &dropped_external {
         // Non-fatal: dir may have already been deleted.
         let _ = watcher.unwatch(d);
-        liveness.armed_external_dirs.remove(d);
+        liveness.armed_dirs.remove(d);
     }
 
     // Also clean up any stale entries from missing_external_dirs.
@@ -4408,7 +4418,7 @@ fn liveness_probe_dir(
         .iter()
         .map(|ext_dir| {
             let exists = ext_dir.exists();
-            let already_armed = liveness.armed_external_dirs.contains(ext_dir);
+            let already_armed = liveness.armed_dirs.contains(ext_dir);
             let rearm_ok = if exists {
                 if already_armed {
                     // Already armed and healthy — skip the syscall.
@@ -4416,13 +4426,13 @@ fn liveness_probe_dir(
                 } else {
                     let ok = watcher.watch(ext_dir, RecursiveMode::NonRecursive).is_ok();
                     if ok {
-                        liveness.armed_external_dirs.insert(ext_dir.clone());
+                        liveness.armed_dirs.insert(ext_dir.clone());
                     }
                     ok
                 }
             } else {
                 // Dir does not exist — ensure it is not marked as armed.
-                liveness.armed_external_dirs.remove(ext_dir);
+                liveness.armed_dirs.remove(ext_dir);
                 false
             };
             (ext_dir.clone(), exists, rearm_ok)
@@ -4430,9 +4440,16 @@ fn liveness_probe_dir(
         .collect();
     let (external_recovery, now_missing_external) =
         external_recovery_decision(&liveness.missing_external_dirs, &ext_statuses);
-    if let Some(ref vd) = ctx.vars_dir_extra {
-        if vd.exists() {
-            let _ = watcher.watch(vd, RecursiveMode::NonRecursive);
+    // The `--vars` file's directory outside the root, gated like the external dirs (#257):
+    // watched only while the watcher does not hold it — its startup watch failed, or it
+    // vanished and came back — never again on every tick.
+    if let Some(vd) = ctx.vars_dir_extra.as_deref() {
+        if !vd.exists() {
+            liveness.armed_dirs.remove(vd);
+        } else if !liveness.armed_dirs.contains(vd)
+            && watcher.watch(vd, RecursiveMode::NonRecursive).is_ok()
+        {
+            liveness.armed_dirs.insert(vd.to_path_buf());
         }
     }
 
@@ -4814,6 +4831,10 @@ mod dir_startup {
         exclude_prefix: Option<PathBuf>,
         /// The `--vars` file's directory when it is outside the root, armed on its own.
         vars_dir_extra: Option<PathBuf>,
+        /// The directories outside the root whose watch is in place: the `--vars` file's,
+        /// when its watch succeeded. The dependencies' join them once the compile reports
+        /// them, and a directory held here is never watched a second time (#257).
+        armed_dirs: BTreeSet<PathBuf>,
         quiet: bool,
         clear: bool,
         debounce_ms: u64,
@@ -4973,14 +4994,19 @@ mod dir_startup {
         // Watch the vars dir if it is outside root — soft warning on failure (mirrors the
         // external-dep-dir convention and the liveness probe's best-effort re-arm
         // semantics; a transient failure must not abort the session, applies the reconcile
-        // rule / consistency fix).
+        // rule / consistency fix). Held as armed only once its watch is in place, so the
+        // liveness tick tries a failed one again and leaves a held one alone (#257).
+        let mut armed_dirs = BTreeSet::new();
         if let Some(ref vd) = vars_dir_extra {
-            if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
-                eprint_warning(&format!(
+            match watcher.watch(vd, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    armed_dirs.insert(vd.clone());
+                }
+                Err(e) => eprint_warning(&format!(
                     "warning: failed to watch vars directory {}: {}",
                     safe_path(&shown_watched_dir(vd, watch_root.root_paths(), vars_dir)),
                     safe_inline(notify_cause(&e))
-                ));
+                )),
             }
         }
 
@@ -4996,6 +5022,7 @@ mod dir_startup {
             output_base,
             exclude_prefix,
             vars_dir_extra,
+            armed_dirs,
             quiet,
             clear,
             debounce_ms,
@@ -5177,6 +5204,7 @@ mod dir_startup {
             output_base,
             exclude_prefix,
             vars_dir_extra,
+            mut armed_dirs,
             quiet,
             clear,
             debounce_ms,
@@ -5198,11 +5226,12 @@ mod dir_startup {
         // recompiles (#321). `MDS_WATCH_READY` still marks the instant both detectors
         // cover every path, so tests can synchronise on arming rather than on a tick.
         // Only a directory whose watch is in place is held as armed: one whose watch
-        // failed is tried again by the next rebuild and the liveness tick (#257).
-        let mut armed_external_dirs = BTreeSet::new();
+        // failed is tried again by the next rebuild and the liveness tick (#257). The
+        // `--vars` file's directory, when a dependency shares it, is held already and is
+        // not watched a second time.
         arm_external_dep_dirs(
             &state.external_dep_dirs,
-            &mut armed_external_dirs,
+            &mut armed_dirs,
             |dir| watcher.watch(dir, RecursiveMode::NonRecursive),
             watch_root.root_paths(),
             extra_vars_dir(vars_dir_extra.as_deref(), vars_path_typed.as_deref()),
@@ -5256,7 +5285,7 @@ mod dir_startup {
                 .cloned()
                 .collect(),
             // The directories whose startup watch is in place, and only those.
-            armed_external_dirs,
+            armed_dirs,
         };
 
         let ctx = DirWatchCtx {
@@ -8757,8 +8786,158 @@ mod tests {
             root_was_missing: false,
             root_armed: true,
             missing_external_dirs: BTreeSet::new(),
-            armed_external_dirs: BTreeSet::new(),
+            armed_dirs: BTreeSet::new(),
         }
+    }
+
+    /// What a liveness tick or a rebuild asked of the watcher.
+    #[derive(Debug, PartialEq, Eq)]
+    enum WatchCall {
+        Watch(PathBuf),
+        Unwatch(PathBuf),
+    }
+
+    /// A watcher that holds nothing and records every call made of it ([`WatchCall`]).
+    #[derive(Default)]
+    struct RecordingWatcher {
+        calls: Vec<WatchCall>,
+    }
+
+    impl Watcher for RecordingWatcher {
+        fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+            Ok(Self::default())
+        }
+
+        fn watch(&mut self, path: &Path, _: RecursiveMode) -> notify::Result<()> {
+            self.calls.push(WatchCall::Watch(path.to_path_buf()));
+            Ok(())
+        }
+
+        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+            self.calls.push(WatchCall::Unwatch(path.to_path_buf()));
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    /// Directory mode with a `--vars` file whose directory is outside the root: the
+    /// context, and a state whose baseline is taken over that file.
+    fn dir_ctx_with_vars(root: &Path, out: &Path, vars: &Path) -> (DirWatchCtx, DirWatchState) {
+        let ctx = DirWatchCtx {
+            vars_path: Some(vars.to_path_buf()),
+            vars_path_typed: Some(vars.to_path_buf()),
+            vars_dir_extra: vars.parent().map(Path::to_path_buf),
+            ..dir_ctx(root, out)
+        };
+        let mut state = empty_dir_state();
+        state.vars_file = Some(vars.to_path_buf());
+        state.last_mtimes = snapshot_state(&state.watched_set());
+        (ctx, state)
+    }
+
+    /// #257: a directory watch's idle tick watches a directory only when the watcher does
+    /// not hold it — not the root again on the first tick, which the startup armed, and not
+    /// the `--vars` file's directory on every tick. A repeat watch of a held path is no
+    /// no-op: macOS restarts its event stream, dropping the events that land meanwhile, and
+    /// Windows opens another handle, which delivers every event once more. A directory the
+    /// watcher does not hold is watched once, and again only once it has vanished and
+    /// come back.
+    #[test]
+    fn a_tick_watches_a_directory_only_when_the_watcher_does_not_hold_it() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_vars_parent, vars_parent) = canonical_tempdir();
+        let (_ext_dir, ext) = canonical_tempdir();
+        let vars_dir = vars_parent.join("cfg");
+        let vars = vars_dir.join("vars.json");
+        std::fs::create_dir(&vars_dir).unwrap();
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+        state.external_dep_dirs.insert(ext.clone());
+        // The first tick of a session whose startup armed the root, and neither directory
+        // outside it: their watches failed.
+        let mut liveness = LivenessState {
+            first_tick: true,
+            ..idle_liveness()
+        };
+        let mut watcher = RecordingWatcher::default();
+
+        for _ in 0..6 {
+            liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
+        }
+        assert_eq!(
+            watcher.calls,
+            [
+                WatchCall::Watch(ext.clone()),
+                WatchCall::Watch(vars_dir.clone())
+            ],
+            "six ticks watch each directory the watcher did not hold once — the positive \
+             control — and nothing else"
+        );
+
+        // The `--vars` file's directory vanishes, then comes back.
+        watcher.calls.clear();
+        std::fs::remove_dir_all(&vars_dir).unwrap();
+        liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
+        assert_eq!(watcher.calls, [], "a directory that is gone is not watched");
+        std::fs::create_dir(&vars_dir).unwrap();
+        std::fs::write(&vars, r#"{"v": "two"}"#).unwrap();
+        for _ in 0..3 {
+            liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
+        }
+        assert_eq!(
+            watcher.calls,
+            [WatchCall::Watch(vars_dir.clone())],
+            "the directory back is watched once, by the first tick that finds it"
+        );
+    }
+
+    /// #257: the `--vars` file's directory outside the root that a dependency shares is
+    /// one watch, held once: the tick watches it no more than any directory the watcher
+    /// holds, and when no source imports from it any more it stays watched — only a
+    /// directory nothing needs is unwatched.
+    #[test]
+    fn a_vars_directory_a_dependency_shares_stays_watched_once_the_import_goes() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (_shared_dir, shared) = canonical_tempdir();
+        let (_other_dir, other) = canonical_tempdir();
+        let vars = shared.join("vars.json");
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+        let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+        state
+            .external_dep_dirs
+            .extend([shared.clone(), other.clone()]);
+        // The startup armed the shared directory as the vars file's, and the dependency's
+        // arm found it held.
+        let mut liveness = LivenessState {
+            armed_dirs: BTreeSet::from([shared.clone(), other.clone()]),
+            ..idle_liveness()
+        };
+        let mut watcher = RecordingWatcher::default();
+
+        liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
+        assert_eq!(
+            watcher.calls,
+            [],
+            "every directory is held: nothing is watched"
+        );
+
+        // The imports from both directories edited away.
+        state.external_dep_dirs.clear();
+        for _ in 0..3 {
+            liveness_probe_dir(&ctx, &mut watcher, &mut liveness, &mut state);
+        }
+        assert_eq!(
+            watcher.calls,
+            [WatchCall::Unwatch(other.clone())],
+            "the directory nothing needs is unwatched — the positive control — and the vars \
+             file's is left as it is"
+        );
+        assert_eq!(liveness.armed_dirs, BTreeSet::from([shared]));
     }
 
     /// #380: a dependency below the root that is no source — a `type: mds` `.md` module a
