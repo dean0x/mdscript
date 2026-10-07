@@ -9,9 +9,13 @@
 //! falsify:
 //!
 //! 1. A rebuild is published while the writes go on. The writer reads the output before
-//!    each write, so a rebuilt output read before its last write is the proof, and no
-//!    timing enters it. A slow runner cannot fail it: a pause can close a window early,
-//!    never hold one open.
+//!    each write, so a rebuilt output read before a write shows one. A slow runner
+//!    cannot fail the claim — a pause can close a window early, never hold one open — but
+//!    it can satisfy it without the cap: a window closes quietly once the writer pauses
+//!    for half a window, the watcher seeing each write up to half a window late. So the
+//!    claim is proven only when no measured gap of the writes up to the one the rebuilt
+//!    output was read before reached half a window. Otherwise a quiet close may have
+//!    published it, and the run's flag says the claim went unjudged.
 //! 2. The stream's final state is published once the stream ends.
 //! 3. The rebuilds number no more than the stream's MEASURED cadence allows
 //!    (`common::most_debounce_windows`) — a bound a window that never extends, or a cap
@@ -143,6 +147,45 @@ fn write_stream(src: &Path, out: &Path, startup: &str) -> Stream {
     }
 }
 
+/// Claim 1's verdict, for the run's flag: whether it is proven, and how it was judged.
+///
+/// It is proven when the first rebuilt output was read before write `k` and no gap of
+/// writes 1 to `k` — the last of them spans the read — reached half a window: no window
+/// can have closed quietly by then, so the cap published it. Otherwise a quiet close may
+/// have, and the claim went unjudged.
+fn claim_1(stream: &Stream) -> (bool, String) {
+    let writes = stream.cadence.writes();
+    let Some((version, line)) = &stream.rebuilt_before else {
+        return (
+            false,
+            format!("no rebuilt output read before any of the {writes} writes"),
+        );
+    };
+    let before = stream
+        .cadence
+        .first(usize::try_from(*version).expect("a write number fits usize"));
+    let quiet = before.pauses(WINDOW / 2);
+    let read = format!("{line:?} read before write {version} of {writes}");
+    if quiet == 0 {
+        (
+            true,
+            format!(
+                "claim 1 proven: {read}, no gap of {:?} or more by then ({before})",
+                WINDOW / 2
+            ),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "claim 1 not judged: {read}, after {quiet} gap(s) of {:?} or more in which a \
+                 window could close quietly ({before})",
+                WINDOW / 2
+            ),
+        )
+    }
+}
+
 // ── The cap ─────────────────────────────────────────────────────────────────
 
 /// A source written to without pause is still rebuilt while the writing goes on, and
@@ -210,10 +253,13 @@ fn watch_debounce_cap_rebuilds_while_writes_never_stop() {
             WINDOW / 2
         ),
     };
-    let seen = match &stream.rebuilt_before {
-        Some((version, line)) => format!("{line:?} read before write {version} of {writes}"),
-        None => format!("no rebuilt output read before any of the {writes} writes"),
-    };
+    // A run with no pause at all has none before its first rebuilt output either, so a
+    // conclusive run has always proven claim 1.
+    let (proven, seen) = claim_1(&stream);
+    assert!(
+        flag == RunFlag::Inconclusive || proven || stream.rebuilt_before.is_none(),
+        "a run without a pause proves claim 1 whenever it saw a rebuild: {seen}"
+    );
     record_run_flag(
         TEST,
         flag,
@@ -302,6 +348,58 @@ fn a_gap_runs_from_the_start_of_one_write_to_the_end_of_the_next() {
     assert_eq!(cadence.pauses(Duration::from_millis(116)), 0);
     assert_eq!(cadence.pauses(Duration::from_millis(7)), 2);
     assert_eq!(WriteCadence::of(Vec::new()).span(), Duration::ZERO);
+}
+
+/// The first writes of a stream are a cadence of their own, so a claim can be judged on
+/// what the writer had done by a given write.
+#[test]
+fn the_first_writes_are_a_cadence_of_their_own() {
+    let t0 = Instant::now();
+    let cadence = WriteCadence::of(vec![
+        (at(t0, 0), at(t0, 1)),
+        (at(t0, 6), at(t0, 7)),
+        (at(t0, 120), at(t0, 121)),
+    ]);
+    let first_two = cadence.first(2);
+    assert_eq!(first_two.writes(), 2);
+    assert_eq!(first_two.gaps(), [Duration::from_millis(7)]);
+    assert_eq!(
+        first_two.pauses(WINDOW / 2),
+        0,
+        "the pause comes after the second write"
+    );
+    assert_eq!(cadence.first(3).pauses(WINDOW / 2), 1);
+    assert_eq!(
+        cadence.first(10).writes(),
+        3,
+        "all of them when fewer were recorded"
+    );
+    assert_eq!(cadence.first(0).span(), Duration::ZERO);
+}
+
+/// Claim 1 is proven only when no pause of half a window came by the write the rebuilt
+/// output was read before; the gap that ends at that write spans the read.
+#[test]
+fn claim_1_is_proven_only_when_no_pause_came_before_the_read() {
+    let t0 = Instant::now();
+    // Ten writes 5ms apart, a pause, then ten more: write 11 is the first after it.
+    let stream = |read_before: Option<u32>| {
+        let mut writes = writes_every(t0, 0, 5, 10);
+        writes.extend(writes_every(t0, 300, 5, 10));
+        Stream {
+            cadence: WriteCadence::of(writes),
+            rebuilt_before: read_before.map(|version| (version, "Hot v1!".to_owned())),
+        }
+    };
+    for (read_before, proven) in [(Some(5), true), (Some(10), true), (Some(11), false)] {
+        let (verdict, text) = claim_1(&stream(read_before));
+        assert_eq!(verdict, proven, "read before write {read_before:?}: {text}");
+    }
+    let (verdict, text) = claim_1(&stream(None));
+    assert!(
+        !verdict && text.starts_with("no rebuilt output"),
+        "no rebuild read: {text}"
+    );
 }
 
 /// The bound counts the windows the cap can close over the measured span, one window

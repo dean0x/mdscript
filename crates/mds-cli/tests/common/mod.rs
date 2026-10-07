@@ -603,6 +603,14 @@ impl WriteCadence {
         self.writes.len()
     }
 
+    /// The first `n` writes as a record of their own — all of them when fewer were
+    /// recorded — to judge what the writer had done by a given write.
+    pub fn first(&self, n: usize) -> Self {
+        Self {
+            writes: self.writes.iter().take(n).copied().collect(),
+        }
+    }
+
     /// From the start of the first write to the end of the last: the longest the
     /// writes' events can have been spread over. Zero with no write.
     pub fn span(&self) -> Duration {
