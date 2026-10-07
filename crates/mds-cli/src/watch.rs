@@ -1915,7 +1915,7 @@ enum CompileFailure {
 
 impl CompileFailure {
     /// The error to report: none for a panic, which the panic hook reported.
-    fn unreported(self) -> Option<miette::Report> {
+    fn into_report(self) -> Option<miette::Report> {
         match self {
             Self::Error(e) => Some(e),
             Self::Panicked => None,
@@ -2298,7 +2298,7 @@ fn compile_and_write(
 ) -> Result<CompileWriteOutcome> {
     let compiled = match entry.compile(runtime_vars, quiet) {
         Ok(compiled) => compiled,
-        Err(failure) => return Ok(CompileWriteOutcome::CompileFailed(failure.unreported())),
+        Err(failure) => return Ok(CompileWriteOutcome::CompileFailed(failure.into_report())),
     };
     let output_path =
         resolve_output_path_for_kind(Some(entry.paths()), output, out_dir, config, compiled.kind)?;
@@ -2759,7 +2759,7 @@ fn rebuild_file(
             state.clear.clear_if_asked();
             settle(
                 SettleInto::File(state),
-                failure.unreported(),
+                failure.into_report(),
                 Settle::MarkErrored(&entry.canonical),
             );
             return ControlFlow::Continue(());
@@ -4420,7 +4420,7 @@ fn compile_one_source(
                 state.held.hold([&source], false);
                 return;
             }
-            failure.unreported()
+            failure.into_report()
         }
     };
     // The compile failed, or writing its output did: settled alike.
@@ -5408,7 +5408,7 @@ mod dir_startup {
                 Err(failure) => {
                     // `key` is new to the graph — each source is compiled once here — so the
                     // errored source's dependency set is the empty one.
-                    settle_startup_error(StartupInto::Dir(&mut state), failure.unreported(), &key);
+                    settle_startup_error(StartupInto::Dir(&mut state), failure.into_report(), &key);
                     state.known_files.insert(key);
                 }
             }
@@ -5869,7 +5869,7 @@ fn process_dir_batch_incremental(
                 Err(failure) => {
                     settle(
                         SettleInto::Dir(state),
-                        failure.unreported(),
+                        failure.into_report(),
                         Settle::MarkErrored(src),
                     );
                 }
@@ -8353,7 +8353,7 @@ mod tests {
             .map(|compiled| compiled.content)
             .map_err(|failure| {
                 failure
-                    .unreported()
+                    .into_report()
                     .map_or_else(|| "a panic".to_string(), |e| e.to_string())
             })
         };
@@ -10656,7 +10656,7 @@ mod tests {
             state.forward_deps.insert(src.clone(), vec![dep.clone()]);
             settle_reporting(
                 SettleInto::Dir(&mut state),
-                failure.unreported(),
+                failure.into_report(),
                 Settle::MarkErrored(&src),
                 |e| reported.push(e.to_string()),
             );
@@ -10674,7 +10674,7 @@ mod tests {
             let mut state = file_state(foi.clone());
             settle_reporting(
                 SettleInto::File(&mut state),
-                failure.unreported(),
+                failure.into_report(),
                 Settle::MarkErrored(&src),
                 |e| reported.push(e.to_string()),
             );
@@ -10690,7 +10690,7 @@ mod tests {
         let mut reported = Vec::new();
         settle_startup_error_reporting(
             StartupInto::File,
-            CompileFailure::from(miette::miette!("broken")).unreported(),
+            CompileFailure::from(miette::miette!("broken")).into_report(),
             &src,
             |e| reported.push(e.to_string()),
         );
