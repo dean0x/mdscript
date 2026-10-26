@@ -697,8 +697,16 @@ pub fn display_native_path(path: &Path) -> std::borrow::Cow<'_, Path> {
 /// `\uXXXX` literals. HUMAN mode — this is terminal output, so `\n` stays raw
 /// (the wire counterpart is `CompileResult::to_canonical_json`, which escapes it).
 fn emit_warnings(warnings: &[String]) {
+    use std::io::Write;
+
     for w in warnings {
-        eprintln!("{}", crate::lint::sanitize_control_chars(w));
+        // Warnings are advisory diagnostics. A closed stderr pipe must not turn a
+        // successful compile into a panic in this library entry point.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            crate::lint::sanitize_control_chars(w)
+        );
     }
 }
 
