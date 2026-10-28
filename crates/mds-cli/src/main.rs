@@ -1,5 +1,6 @@
+use std::ffi::OsString;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::process;
 
 use clap::{Parser, Subcommand};
 use miette::Result;
@@ -8,8 +9,10 @@ mod build;
 mod fmt;
 mod input;
 mod lint;
+mod lint_sink;
 mod output;
 mod watch;
+mod write;
 
 use build::{
     build_runtime_vars, emit_duplicate_var_warnings, exit_code, parse_key_value, resolve_input,
@@ -49,8 +52,10 @@ enum Commands {
         /// Output destination: a file path, or "-" for stdout.
         /// Defaults to `<name>.md` or `<name>.json` next to the source file, based on output kind.
         /// Mutually exclusive with --out-dir.
+        // Taken as given, like `--out-dir`: a value that is not valid UTF-8 is refused
+        // as `mds::io` by `build::reject_forbidden_output_flags`, not by the parser (#390).
         #[arg(short = 'o', long = "output", conflicts_with = "out_dir")]
-        output: Option<String>,
+        output: Option<OsString>,
         /// Output directory. The output file is named `<input-stem>.md` or `<input-stem>.json`
         /// inside this directory, based on output kind.
         /// Directory is created if it does not exist.
@@ -202,8 +207,10 @@ enum Commands {
         input: Option<PathBuf>,
         /// Output destination: a file path, or "-" for stdout.
         /// Mutually exclusive with --out-dir. Not allowed in directory mode.
+        // Taken as given, like `--out-dir`: a value that is not valid UTF-8 is refused
+        // as `mds::io` by `build::reject_forbidden_output_flags`, not by the parser (#390).
         #[arg(short = 'o', long = "output", conflicts_with = "out_dir")]
-        output: Option<String>,
+        output: Option<OsString>,
         /// Output directory for compiled files (directory mode).
         /// Output mirrors the source subtree: src/a/b/foo.mds → out/a/b/foo.md.
         /// Mutually exclusive with -o/--output.
@@ -225,7 +232,11 @@ enum Commands {
         /// Each file change restarts the window, so a save burst longer than MS still
         /// coalesces into one rebuild; the window is capped at max(10 x MS, 1000) ms so
         /// continuous writes still rebuild. Use 0 to disable coalescing.
-        /// Values above 60000 are clamped.
+        /// Values above 60000 are clamped. At any value, a rebuild waits while a watched
+        /// file is empty after having had content, as during a truncate-then-write save,
+        /// until it is written or for about 1000 ms, after which the empty file is
+        /// compiled; longer only while a debounce window opened before then is still
+        /// collecting events, by at most that window's cap.
         #[arg(long = "debounce", value_name = "MS", default_value = "100")]
         debounce: u64,
         /// Self-heal poll interval in milliseconds (default 1000).
@@ -238,18 +249,59 @@ enum Commands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // #389: first, so that any panic after it — clap's parsing included — prints the
+    // fixed internal-compiler-error text, never the panic's message.
+    output::install_panic_hook();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => exit_after_clap_output(&err),
+    };
 
-    let result = run(cli);
-    if let Err(e) = result {
-        // Route through the single render choke point (avoids PF-004 /
-        // architecture-6: hand-rolled sanitize_control_chars bypass). Every subcommand's
-        // error propagates here; guarding here makes the protection hold by construction
-        // for any future error path, not just the ones we remember to sanitize individually.
-        let code = exit_code(&e);
-        output::eprint_error(e);
-        process::exit(code);
+    // A panic in the command unwinds to here, running the destructors on its way (a
+    // temporary file removes itself), and the run exits 101 through the funnel. The hook
+    // has reported it.
+    let verdict = match output::catch_panic(move || verdict_of(run(cli))) {
+        Ok(verdict) => verdict,
+        Err(output::Panicked) => output::PANIC_EXIT,
+    };
+    output::exit(verdict)
+}
+
+/// The exit code of a command's result, its error reported first when it has one.
+fn verdict_of(result: Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            // Route through the single render choke point, never a hand-rolled
+            // sanitize_control_chars. Every subcommand's error propagates here; guarding
+            // here makes the protection hold by construction for any future error path,
+            // not just the ones we remember to sanitize individually.
+            let code = exit_code(&e);
+            output::eprint_error(e);
+            code
+        }
     }
+}
+
+/// Print clap's help, version or usage error and end the run with clap's exit code — 0
+/// for help and version, 2 for a usage error — under the rule every other output
+/// follows (#157): a closed pipe changes nothing; any other failed write exits at least
+/// 2, a failed stdout write reported on stderr as `mds::io`.
+fn exit_after_clap_output(err: &clap::Error) -> ! {
+    let printed = err
+        .print()
+        .and_then(|()| std::io::Write::flush(&mut std::io::stdout()));
+    if let Err(e) = printed {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            if err.use_stderr() {
+                // stderr itself failed, so there is nowhere to report it.
+                output::note_io_failure();
+            } else {
+                output::eprint_io_failure(output::stdout_failure(&e));
+            }
+        }
+    }
+    output::exit(err.exit_code())
 }
 
 fn run_check(
@@ -295,7 +347,7 @@ fn run_check(
                 output::eprint_warning(w);
             }
             // AD-211-3: one definition of the sentinel, shared with lint/build/fmt.
-            eprintln!("OK: {STDIN_DISPLAY_LABEL}");
+            output::ewriteln!("OK: {STDIN_DISPLAY_LABEL}");
         }
     } else {
         let ((), warnings) =
@@ -304,7 +356,7 @@ fn run_check(
             for w in &warnings {
                 output::eprint_warning(w);
             }
-            eprintln!("OK: {}", output::safe_path(&input));
+            output::ewriteln!("OK: {}", output::safe_path(&input));
         }
     }
     Ok(())
@@ -313,7 +365,8 @@ fn run_check(
 /// Validate every non-partial `.mds` file under `dir`.
 ///
 /// Continue-on-error: a per-file error does not abort the run. Prints a summary and
-/// returns non-zero if any file fails (AC-FUNC-26).
+/// returns non-zero if any file fails (AC-FUNC-26): 2 when an I/O or file-system
+/// failure is among them, as for `mds build <dir>` (#157), else 1.
 fn run_check_directory(
     dir: &std::path::Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
@@ -329,21 +382,21 @@ fn run_check_directory(
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
-            eprintln!(
+            output::ewriteln!(
                 "{} .mds file(s) found but all are under default-excluded directories \
                  (hidden dirs, node_modules); nothing was checked",
                 walk.excluded_by_default
             );
-            std::process::exit(1);
+            output::exit(1);
         }
         // #204: an empty tree is "nothing to check", not success (mirrors build.rs).
         // Emitted even under --quiet and exit 1, the same "nothing was done" code
         // build and fmt use.
-        eprintln!(
+        output::ewriteln!(
             "no .mds files found in {}; nothing was checked",
             output::safe_path(dir)
         );
-        std::process::exit(1);
+        output::exit(1);
     }
 
     // #387: a tree whose only .mds files are partials is "nothing to check" too. The
@@ -353,12 +406,12 @@ fn run_check_directory(
     // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
     // behaviour; `mds watch <dir>` still starts.
     if let Some(partials_only_count) = output::partials_only(&files) {
-        eprintln!(
+        output::ewriteln!(
             "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
              nothing was checked",
             output::safe_path(dir)
         );
-        std::process::exit(1);
+        output::exit(1);
     }
 
     let mut ok_count: usize = 0;
@@ -368,10 +421,13 @@ fn run_check_directory(
         if is_partial(file) {
             continue;
         }
-        match mds::check_collecting_warnings(file, runtime_vars.clone())
-            .map_err(miette::Error::from)
-        {
-            Ok(((), warnings)) => {
+        // A panic in the check fails this file alone, and the batch goes on (#389).
+        let checked = output::catch_compile(
+            file,
+            AssertUnwindSafe(|| mds::check_collecting_warnings(file, runtime_vars.clone())),
+        );
+        match checked {
+            Ok(Ok(((), warnings))) => {
                 if !quiet {
                     for w in &warnings {
                         output::eprint_warning(w);
@@ -379,21 +435,24 @@ fn run_check_directory(
                 }
                 ok_count += 1;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // Route through the single render choke point (avoids PF-004 /
-                // architecture-6: hand-rolled sanitize_control_chars bypass).
-                output::eprint_error(e);
+                // architecture-6: hand-rolled sanitize_control_chars bypass); a source
+                // that cannot be read lifts the exit code to 2 (#157).
+                output::eprint_file_failure(miette::Error::from(e));
                 fail_count += 1;
             }
+            // The panic hook reported it, and the run will exit 101.
+            Err(output::Panicked) => fail_count += 1,
         }
     }
 
     if !quiet || fail_count > 0 {
-        eprintln!("{ok_count} passed, {fail_count} failed");
+        output::ewriteln!("{ok_count} passed, {fail_count} failed");
     }
 
     if fail_count > 0 {
-        std::process::exit(1);
+        output::exit(1);
     }
     Ok(())
 }
@@ -411,11 +470,10 @@ fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
             "init filename must not contain '..' components"
         ));
     }
+    // An early answer only: a file that appears after this look is refused by the commit
+    // itself (`write::create_new`, #160), in the same way.
     if filename.exists() && !force {
-        return Err(miette::miette!(
-            "{} already exists (use --force to overwrite)",
-            filename.display()
-        ));
+        return Err(init_target_exists(&filename));
     }
     let starter = "\
 ---
@@ -431,14 +489,27 @@ Your items:
 - {{item}}
 @end
 ";
-    // #386: the same replace-by-rename primitive as every other CLI write — a symlink
-    // at `filename` (live under `--force`, dangling without it) is refused instead of
-    // written through; `--force` replaces a regular file by rename with its mode
-    // preserved. `RenameOnly` because the starter is a fixed public template a re-run
-    // reproduces.
-    output::atomic_write_file(&filename, starter, output::Durability::RenameOnly)?;
+    // #386: the same primitive as every other CLI write — a symlink at `filename` (live
+    // under `--force`, dangling without it) is refused instead of written through;
+    // `--force` replaces a regular file by rename with its permission bits kept, and
+    // without it the starter is committed only where nothing is, so a file that appeared
+    // after the check above is refused, not replaced (#160). `RenameOnly` because the starter is a
+    // fixed public template a re-run reproduces. Anchored at the typed parent, which must
+    // exist: init creates no directory (#160).
+    let target = output::WriteTarget::as_typed(filename.clone());
+    let (durability, parents) = (write::Durability::RenameOnly, write::Parents::Existing);
+    if force {
+        write::atomic_write_file(&target, starter, durability, parents)?;
+    } else {
+        write::create_new(&target, starter, durability, parents).map_err(|not_created| {
+            match not_created {
+                write::NotCreated::Exists => init_target_exists(&filename),
+                write::NotCreated::Failed(e) => miette::Report::new(e),
+            }
+        })?;
+    }
     if !quiet {
-        eprintln!(
+        output::ewriteln!(
             "Created {}\n  Try: mds build {}",
             output::safe_path(&filename),
             output::safe_path(&filename)
@@ -447,7 +518,15 @@ Your items:
     Ok(())
 }
 
+/// `mds init`'s refusal of a file at its target (#160): `<file> already exists (use
+/// --force to overwrite)`, exit 1, no error code — one answer whether its look found the
+/// file there or the commit met one that appeared after that look.
+fn init_target_exists(filename: &std::path::Path) -> miette::Report {
+    miette::miette!("{} {}", output::safe_path(filename), write::ALREADY_EXISTS)
+}
+
 fn run(cli: Cli) -> Result<()> {
+    output::panic_on_request();
     let quiet = cli.quiet;
     match cli.command {
         Commands::Build {
@@ -500,14 +579,14 @@ fn run(cli: Cli) -> Result<()> {
                 "human" => lint::LintFormat::Human,
                 "json" => lint::LintFormat::Json,
                 other => {
-                    eprintln!(
+                    output::ewriteln!(
                         "error: unknown --format value '{}'; expected 'human' or 'json'",
                         output::safe_inline(other)
                     );
-                    std::process::exit(2);
+                    output::exit(2);
                 }
             };
-            lint::run_lint(lint::LintArgs {
+            output::exit(lint::run_lint(lint::LintArgs {
                 input,
                 fix,
                 check,
@@ -517,7 +596,7 @@ fn run(cli: Cli) -> Result<()> {
                 vars,
                 set_vars,
                 set_string_vars,
-            })
+            }))
         }
         Commands::Init { filename, force } => run_init(filename, force, quiet),
         Commands::Watch {

@@ -3,15 +3,24 @@
 //! # What lives here
 //!
 //! - [`OutputBase`] / [`resolve_output_base`] / [`output_path_for`]: directory-mode
-//!   path resolution used by watch and build-directory.
+//!   path resolution used by watch and build-directory. Each output is a
+//!   [`WriteTarget`]: the path written, the path a message shows (#390), and the anchor
+//!   [`crate::write::write_compiled`] writes it below (#160).
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
-//! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
-//! - [`eprint_error`]: the single CLI stderr choke-point — escapes every report's
-//!   message, help, and label text before miette renders it (CWE-150 / PF-014).
-//! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`,
-//!   and — since #227 — by every `build` / `watch` output and `.map` sidecar. The
-//!   [`Durability`] argument says whether the bytes are fsynced before the rename;
-//!   atomicity does not depend on it.
+//! - [`probe_and_remove_stale`]: a directory build's stale-output cleanup after a change of
+//!   kind, which removes only a `.json` mds provably wrote (#160).
+//! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr choke point,
+//!   which never panics — a closed pipe or a failed write becomes sticky [`OutputState`]
+//!   instead (#157). [`write_stdout`] writes a command's product and reports a
+//!   [`StdoutOutcome`], writing nothing once stdout's reader is gone; [`exit`] ends the
+//!   process through [`final_exit_code`].
+//! - [`install_panic_hook`] / [`catch_panic`]: a panic prints one fixed
+//!   internal-compiler-error text — never the panic's message or location — and the run
+//!   exits 101 (#389). [`catch_compile`] catches a panic in one file's compile, so a
+//!   directory run or a watch session goes on without that file.
+//! - [`eprint_error`]: the CLI's error-report choke point — escapes every report's
+//!   message, help, and label text before miette renders it (CWE-150), then writes the
+//!   frame through `ewriteln!`.
 //! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
 //!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
@@ -23,10 +32,706 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use miette::Result;
 
-use crate::build::{MdsConfig, OutputKind};
+use crate::build::{OutputKind, ProjectConfig};
+use crate::write::{DirIdentity, NotRemoved, Removal};
+
+// ── Streams and the exit funnel (#157) ───────────────────────────────────────
+
+/// `eprint!` for the CLI: write to stderr through [`write_stderr_fmt`], which never
+/// panics.
+///
+/// `tests/print_discipline.rs` lists this macro and `ewriteln!` beside the std print
+/// macros and scans their arguments the same way. A stderr writer the guard does not
+/// list would take every site that uses it out of the guard.
+macro_rules! ewrite {
+    ($($arg:tt)*) => {
+        $crate::output::write_stderr_fmt(::std::format_args!($($arg)*))
+    };
+}
+
+/// `eprintln!` for the CLI: `ewrite!` plus a trailing newline.
+macro_rules! ewriteln {
+    () => {
+        $crate::output::write_stderr_fmt(::std::format_args!("\n"))
+    };
+    ($($arg:tt)+) => {
+        $crate::output::write_stderr_fmt(::std::format_args!(
+            "{}\n",
+            ::std::format_args!($($arg)+)
+        ))
+    };
+}
+
+pub(crate) use ewrite;
+pub(crate) use ewriteln;
+
+/// Sticky facts about the CLI's output streams, read when the process exits.
+///
+/// Each fact is one bit, set with `fetch_or`, so a fact recorded on any thread is still
+/// there at exit. Only `STDOUT_FAILED` is ever cleared: it marks stdout's current
+/// failure, which a write that lands ends. No fact the exit code reads is cleared.
+/// Functions that decide something from these facts take `&OutputState`, so a unit test
+/// builds its own instead of sharing the process's [`OUTPUT_STATE`] with every other
+/// test in the binary.
+///
+/// Adding a fact is adding one bit and its accessors.
+pub(crate) struct OutputState {
+    bits: AtomicU8,
+}
+
+impl OutputState {
+    /// A stderr write hit a closed pipe: the reader is gone.
+    const STDERR_CLOSED: u8 = 1 << 0;
+    /// An output operation — a write, a flush, a directory creation, a delete — failed
+    /// for any reason other than a closed pipe.
+    const IO_FAILED: u8 = 1 << 1;
+    /// A stdout write hit a closed pipe: the reader is gone.
+    const STDOUT_CLOSED: u8 = 1 << 2;
+    /// A stdout write failed for a reason other than a closed pipe, and no write has
+    /// landed since. Cleared by a write that lands, so a later failure is a new one.
+    const STDOUT_FAILED: u8 = 1 << 3;
+    /// A `mds watch` session went live: from then on its output failures do not change
+    /// the exit code ([`ExitPolicy::WatchSession`]).
+    const WATCH_LIVE: u8 = 1 << 4;
+    /// A panic happened (#389): the run exits 101, whatever else it recorded.
+    const PANICKED: u8 = 1 << 5;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            bits: AtomicU8::new(0),
+        }
+    }
+
+    /// Set `bit`; `true` when this call is the one that set it.
+    fn set(&self, bit: u8) -> bool {
+        self.bits.fetch_or(bit, Ordering::AcqRel) & bit == 0
+    }
+
+    fn clear(&self, bit: u8) {
+        self.bits.fetch_and(!bit, Ordering::AcqRel);
+    }
+
+    fn has(&self, bit: u8) -> bool {
+        self.bits.load(Ordering::Acquire) & bit != 0
+    }
+
+    /// Record that stderr's reader is gone. Later stderr writes are dropped.
+    pub(crate) fn note_stderr_closed(&self) {
+        self.set(Self::STDERR_CLOSED);
+    }
+
+    /// Record an output operation that failed for a reason other than a closed pipe.
+    pub(crate) fn note_io_failure(&self) {
+        self.set(Self::IO_FAILED);
+    }
+
+    /// Record that stdout's reader is gone. Later stdout writes are dropped.
+    pub(crate) fn note_stdout_closed(&self) {
+        self.set(Self::STDOUT_CLOSED);
+    }
+
+    /// Record a stdout write that failed for a reason other than a closed pipe; `true`
+    /// for the first failed write since the run began or since a write last landed —
+    /// the one that is reported.
+    pub(crate) fn note_stdout_failure(&self) -> bool {
+        self.set(Self::STDOUT_FAILED)
+    }
+
+    /// Record a stdout write that landed: stdout's current failure, if any, is over, so
+    /// the next failure is reported again. The I/O failure recorded for the exit code
+    /// stays recorded.
+    pub(crate) fn note_stdout_written(&self) {
+        self.clear(Self::STDOUT_FAILED);
+    }
+
+    pub(crate) fn stderr_closed(&self) -> bool {
+        self.has(Self::STDERR_CLOSED)
+    }
+
+    pub(crate) fn io_failed(&self) -> bool {
+        self.has(Self::IO_FAILED)
+    }
+
+    pub(crate) fn stdout_closed(&self) -> bool {
+        self.has(Self::STDOUT_CLOSED)
+    }
+
+    /// Record that a `mds watch` session went live.
+    pub(crate) fn note_watch_live(&self) {
+        self.set(Self::WATCH_LIVE);
+    }
+
+    /// Record that a panic happened (#389).
+    pub(crate) fn note_panicked(&self) {
+        self.set(Self::PANICKED);
+    }
+
+    pub(crate) fn panicked(&self) -> bool {
+        self.has(Self::PANICKED)
+    }
+
+    /// The rule [`final_exit_code`] applies when the process exits:
+    /// [`ExitPolicy::WatchSession`] once a watch session went live,
+    /// [`ExitPolicy::Batch`] for every other run.
+    pub(crate) fn exit_policy(&self) -> ExitPolicy {
+        if self.has(Self::WATCH_LIVE) {
+            ExitPolicy::WatchSession
+        } else {
+            ExitPolicy::Batch
+        }
+    }
+}
+
+/// The process's own [`OutputState`], used by the process-boundary functions
+/// [`write_stderr_fmt`], [`write_stdout`], [`note_io_failure`],
+/// [`note_watch_session_live`], [`exit`] and the panic hook, [`on_panic`].
+static OUTPUT_STATE: OutputState = OutputState::new();
+
+/// Record, for the exit code, that an output operation of this run failed for a reason
+/// other than a closed pipe: [`exit`] then ends the run with at least 2 (#157).
+///
+/// For a run that reports a failure and carries on — a directory build or
+/// `mds fmt <dir>` counting the file as failed — and so never returns the error to
+/// `main`. A run that returns the `mds::io` error reaches the same exit code through
+/// `exit_code` instead. `mds watch` never calls it: a rebuild's failure is reported as
+/// it happens and does not change how the session exits ([`note_watch_session_live`]).
+pub(crate) fn note_io_failure() {
+    OUTPUT_STATE.note_io_failure();
+}
+
+/// Record that this `mds watch` session is live — every watch armed, every baseline
+/// captured (#157). From here on [`exit`] applies [`ExitPolicy::WatchSession`]: a
+/// rebuild's output failure, reported as it happened, and a stderr that fails other
+/// than by a closed pipe no longer change the exit code. Until then — a session that
+/// ends at startup — the batch rule applies.
+pub(crate) fn note_watch_session_live() {
+    OUTPUT_STATE.note_watch_live();
+}
+
+/// Report an I/O failure of a run that carries on past it — a directory build,
+/// `mds fmt <dir>` — as one `mds::io` error, and record it for the exit code (#157).
+pub(crate) fn eprint_io_failure(e: mds::MdsError) {
+    note_io_failure();
+    eprint_error(miette::Report::new(e));
+}
+
+/// Report why one file of a directory build, check or fmt failed, and carry on.
+///
+/// A failure in the I/O and file-system class — exit 2 for the same file given alone:
+/// `mds::io` (a source that cannot be read, a forbidden path character),
+/// `mds::file_not_found`, `mds::not_mds` — is recorded for the exit code, so the run
+/// exits 2 as that file alone would (#157). Any other failure, a template error or a
+/// resource limit, leaves the exit code to the caller's count of failed files (1).
+pub(crate) fn eprint_file_failure(report: miette::Report) {
+    if crate::build::exit_code(&report) == IO_FAILURE_EXIT {
+        note_io_failure();
+    }
+    eprint_error(report);
+}
+
+/// The body of `ewrite!` / `ewriteln!`: write `args` to stderr, never panicking.
+///
+/// std's `eprintln!` panics when the write fails, which ends the run with exit 101.
+/// Here instead:
+///
+/// - A closed pipe (the reader is gone) records [`OutputState::note_stderr_closed`];
+///   this write and every later stderr write are dropped, and the exit code does not
+///   change.
+/// - Any other write error records [`OutputState::note_io_failure`], which
+///   [`final_exit_code`] turns into an exit of at least 2. Later writes are still
+///   attempted.
+pub(crate) fn write_stderr_fmt(args: std::fmt::Arguments<'_>) {
+    write_stderr_to(&OUTPUT_STATE, &mut std::io::stderr().lock(), args);
+}
+
+/// [`write_stderr_fmt`] against any sink and state.
+///
+/// The text is rendered first and written with one `write_all`, then flushed. A
+/// `Display` that fails ends the text where it failed: that is a bug in the impl, not an
+/// output failure, so it records nothing.
+fn write_stderr_to<W: std::io::Write + ?Sized>(
+    state: &OutputState,
+    sink: &mut W,
+    args: std::fmt::Arguments<'_>,
+) {
+    if state.stderr_closed() {
+        return;
+    }
+    let mut text = String::new();
+    let _ = std::fmt::Write::write_fmt(&mut text, args);
+    match sink.write_all(text.as_bytes()).and_then(|()| sink.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => state.note_stderr_closed(),
+        Err(_) => state.note_io_failure(),
+    }
+}
+
+/// What happened to one [`write_stdout`] call.
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum StdoutOutcome {
+    /// Every byte was written and flushed.
+    Written,
+    /// The reader is gone — a closed pipe, on this write or an earlier one. Nothing more
+    /// is written to stdout, and the verdict is kept.
+    Closed,
+    /// A new stdout failure for any other reason — the first of the run, or the first
+    /// since a write last landed: the caller reports it as `mds::io`.
+    Failed(std::io::Error),
+    /// Another failure after [`StdoutOutcome::Failed`] was returned, with no write
+    /// landing in between: nothing was written, and the failure is not reported a
+    /// second time.
+    FailedAgain,
+}
+
+impl StdoutOutcome {
+    /// What a run that ends on its own — build, fmt — makes of the outcome.
+    ///
+    /// A closed pipe is not an error: the reader is gone, so stdout gets nothing more
+    /// and the run keeps its verdict. A new failure for another reason is `mds::io`,
+    /// naming stdout; a repeat of it was already reported (#157). Nothing is recorded
+    /// here; an `Err` reaches the exit code through the caller.
+    ///
+    /// `mds watch -o -` reads the outcome itself instead: a closed pipe ends its session,
+    /// and neither it nor a repeated failure is a write it may remember as done.
+    pub(crate) fn into_batch_result(self) -> std::result::Result<(), mds::MdsError> {
+        match self {
+            Self::Written | Self::Closed | Self::FailedAgain => Ok(()),
+            Self::Failed(e) => Err(stdout_failure(&e)),
+        }
+    }
+}
+
+/// The `mds::io` error for a stdout write that failed for a reason other than a closed
+/// pipe (#157).
+pub(crate) fn stdout_failure(e: &std::io::Error) -> mds::MdsError {
+    mds::MdsError::Io {
+        message: format!("cannot write to stdout: {}", safe_inline(io_cause(e))),
+    }
+}
+
+/// Write a command's product — compiled output, a diff, a JSON report — to stdout and
+/// flush it. [`StdoutOutcome::Written`] only when both the write and the flush succeed.
+///
+/// Once stdout's reader is gone, every later call returns [`StdoutOutcome::Closed`]
+/// without writing. After a failure for another reason, later calls still write, and a
+/// repeat of the failure is [`StdoutOutcome::FailedAgain`], so it is reported once for
+/// as long as it lasts. A write that lands ends it: a failure after that is new, and
+/// [`StdoutOutcome::Failed`] again — a `mds watch -o -` session whose stdout recovers
+/// and fails again reports both (#157). A write of no bytes shows nothing about stdout
+/// and ends nothing.
+pub(crate) fn write_stdout(bytes: &[u8]) -> StdoutOutcome {
+    write_stdout_to(&OUTPUT_STATE, &mut std::io::stdout().lock(), bytes)
+}
+
+/// [`write_stdout`] against any sink and state.
+fn write_stdout_to<W: std::io::Write + ?Sized>(
+    state: &OutputState,
+    sink: &mut W,
+    bytes: &[u8],
+) -> StdoutOutcome {
+    if state.stdout_closed() {
+        return StdoutOutcome::Closed;
+    }
+    match sink.write_all(bytes).and_then(|()| sink.flush()) {
+        Ok(()) => {
+            if !bytes.is_empty() {
+                state.note_stdout_written();
+            }
+            StdoutOutcome::Written
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            state.note_stdout_closed();
+            StdoutOutcome::Closed
+        }
+        Err(e) => {
+            if state.note_stdout_failure() {
+                StdoutOutcome::Failed(e)
+            } else {
+                StdoutOutcome::FailedAgain
+            }
+        }
+    }
+}
+
+/// Which rule [`final_exit_code`] applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitPolicy {
+    /// A run that ends on its own — build, check, fmt, lint, init, and a watch session
+    /// that never went live: an output failure lifts the exit code to at least 2.
+    Batch,
+    /// A watch session after it went live ([`note_watch_session_live`]): its per-rebuild
+    /// failures were reported as they happened, and they do not change the exit code.
+    WatchSession,
+}
+
+/// The lowest exit code a batch run with an output failure ends with.
+const IO_FAILURE_EXIT: i32 = 2;
+
+/// The code a run whose verdict is `verdict` exits with, given what happened to its
+/// output.
+///
+/// A panic comes first: a run that panicked exits 101 ([`PANIC_EXIT`]) under either
+/// policy, whatever its verdict (#389). Otherwise a closed stdout or stderr pipe never
+/// changes the code. Under [`ExitPolicy::Batch`], any other output failure lifts it to
+/// `max(verdict, 2)` — a resource limit keeps its 3. [`ExitPolicy::WatchSession`]
+/// returns `verdict` unchanged.
+#[must_use]
+pub(crate) fn final_exit_code(verdict: i32, state: &OutputState, policy: ExitPolicy) -> i32 {
+    if state.panicked() {
+        return PANIC_EXIT;
+    }
+    match policy {
+        ExitPolicy::Batch if state.io_failed() => verdict.max(IO_FAILURE_EXIT),
+        ExitPolicy::Batch | ExitPolicy::WatchSession => verdict,
+    }
+}
+
+/// End the process: the CLI's exit funnel.
+///
+/// Exits with [`final_exit_code`] of `verdict` under the policy the run's state records
+/// ([`OutputState::exit_policy`]): [`ExitPolicy::Batch`], so an output failure recorded
+/// anywhere in the run is honoured on the way out — unless a watch session went live.
+pub(crate) fn exit(verdict: i32) -> ! {
+    std::process::exit(final_exit_code(
+        verdict,
+        &OUTPUT_STATE,
+        OUTPUT_STATE.exit_policy(),
+    ))
+}
+
+// ── Panics: one internal-compiler-error text (#389) ──────────────────────────
+//
+// A panic anywhere in the process runs `on_panic`, which prints `ICE_TEXT` and never
+// the panic's message or location: a panic message can carry a user's text or a build
+// machine's absolute paths. The run then exits 101. `main` runs the whole command
+// inside `catch_panic`, so a panic on its thread unwinds — running the destructors that
+// remove temporary files — to the exit funnel; a panic nothing catches, on a helper
+// thread for one, ends the process at once through `exit_after_panic`. A batch runs
+// each file's compile inside `catch_compile`, so a panic there fails that file alone.
+
+/// What the CLI prints when it panics: that it failed, and where to report it. Nothing
+/// about the panic itself.
+const ICE_TEXT: &str = concat!(
+    "mds: internal compiler error\n",
+    "note: this is a bug in mds; please report it at ",
+    env!("CARGO_PKG_REPOSITORY"),
+    "/issues\n",
+);
+
+/// The exit code of a run that panicked, whatever else happened (#389) — Rust's own code
+/// for a panic that ends `main`.
+pub(crate) const PANIC_EXIT: i32 = 101;
+
+/// The backtrace a panic prints after [`ICE_TEXT`], as `RUST_BACKTRACE` asks for it. Both
+/// print the same frames, from the capture itself on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BacktraceStyle {
+    /// Each frame's function and source line.
+    Short,
+    /// The same, with each frame's address (`RUST_BACKTRACE=full`).
+    Full,
+}
+
+impl BacktraceStyle {
+    /// The backtrace `RUST_BACKTRACE`'s `value` asks for, read as std reads it: none when
+    /// it is unset or `0`, the frames with their addresses for `full`, the frames alone
+    /// for any other value.
+    fn from_env(value: Option<&OsStr>) -> Option<Self> {
+        match value {
+            None => None,
+            Some(value) if value == OsStr::new("0") => None,
+            Some(value) if value == OsStr::new("full") => Some(Self::Full),
+            Some(_) => Some(Self::Short),
+        }
+    }
+}
+
+thread_local! {
+    /// Whether this thread is running a [`catch_panic`] closure, which catches a panic
+    /// that unwinds out of it.
+    static CATCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread is unwinding from a panic the hook let unwind, and no
+    /// [`catch_panic`] has caught yet.
+    static UNWINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install the CLI's panic hook, [`on_panic`] (#389). `main` calls it before anything
+/// else. `RUST_BACKTRACE` is read here, once: the hook itself reads no environment.
+pub(crate) fn install_panic_hook() {
+    let backtrace = BacktraceStyle::from_env(std::env::var_os("RUST_BACKTRACE").as_deref());
+    std::panic::set_hook(Box::new(move |info| on_panic(backtrace, info)));
+}
+
+/// The panic hook: what a panic on any thread does (#389).
+///
+/// 1. Record the panic: from here on [`final_exit_code`] is 101. This comes before
+///    anything that can wait, so a run that ends while this thread is still in step 2 —
+///    a helper thread's panic, say — still exits 101.
+/// 2. One `write_all` of [`ICE_TEXT`] to stderr, its error ignored — a closed or failing
+///    stderr loses the text and nothing else. Nothing the panic carries is formatted, so
+///    no `Display` of the payload can run here, and std's stderr is a reentrant lock, so a
+///    thread that panicked while writing to stderr takes it again. If another thread is
+///    stuck inside a stderr write, this one waits with it.
+/// 3. With `RUST_BACKTRACE` asking, [`write_backtrace`]. With the never-shipped
+///    `debug-panics` feature, the panic's message and location.
+/// 4. Let the panic unwind only to a [`catch_panic`] on this thread that is not already
+///    unwinding from an earlier one. Otherwise end the process now, exit 101
+///    ([`exit_after_panic`]): a panic on a thread that nothing catches — a watch helper
+///    thread — would end that thread alone and leave the command running without it; and
+///    a second panic while the thread unwinds from the first — a destructor that panics,
+///    or the panic Rust raises where an unwind reaches a function that cannot unwind —
+///    would make std abort the process after a message of its own.
+///
+/// It must not panic: std aborts a process whose panic hook panics, after printing the
+/// second panic's location. `std::panic::always_abort`, with which a panic aborts without
+/// calling any hook, is unstable, and the CLI never calls it; std sets it only in a child
+/// between `fork` and `exec`, before the child is `mds` at all. A panic that cannot
+/// unwind and follows no other — a check of undefined behaviour that a debug build
+/// compiles in — looks to the hook like one that can: stable Rust does not say which it
+/// is. Inside a [`catch_panic`] it prints the text, and then std aborts.
+fn on_panic(backtrace: Option<BacktraceStyle>, info: &std::panic::PanicHookInfo<'_>) {
+    OUTPUT_STATE.note_panicked();
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(ICE_TEXT.as_bytes());
+    if let Some(style) = backtrace {
+        write_backtrace(&mut stderr, style);
+    }
+    #[cfg(feature = "debug-panics")]
+    write_panic_detail(&mut stderr, info);
+    #[cfg(not(feature = "debug-panics"))]
+    let _ = info;
+    if !unwinds_to_a_catch() {
+        exit_after_panic();
+    }
+}
+
+/// Whether the panic being reported will unwind to a [`catch_panic`] on this thread:
+/// the thread is inside one, and not already unwinding from an earlier panic. Marks the
+/// thread as unwinding.
+fn unwinds_to_a_catch() -> bool {
+    let catching = CATCHING.with(std::cell::Cell::get);
+    let already_unwinding = UNWINDING.with(|unwinding| unwinding.replace(true));
+    catching && !already_unwinding
+}
+
+/// End the process after a panic that nothing will catch: exit 101 at once (#389). The
+/// panicking thread cannot return to [`exit`], so the panic path has this way out of its
+/// own.
+fn exit_after_panic() -> ! {
+    std::process::exit(PANIC_EXIT)
+}
+
+/// A panic that unwound out of a [`catch_panic`] closure. The hook has reported it.
+#[derive(Debug)]
+pub(crate) struct Panicked;
+
+/// Run `f`, catching a panic that unwinds out of it — the one place the CLI catches a
+/// panic (#389). The hook has already printed the text and recorded the panic, so the
+/// run exits 101 whatever it does next; nothing here reports the panic again.
+///
+/// The panic's payload goes to [`dispose_payload`].
+pub(crate) fn catch_panic<T>(
+    f: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> std::result::Result<T, Panicked> {
+    let outer = CATCHING.with(|catching| catching.replace(true));
+    let caught = std::panic::catch_unwind(f);
+    CATCHING.with(|catching| catching.set(outer));
+    caught.map_err(|payload| {
+        dispose_payload(payload);
+        UNWINDING.with(|unwinding| unwinding.set(false));
+        Panicked
+    })
+}
+
+/// Run one file's compile — `compile` — catching a panic in it, so a batch goes on
+/// without that file: a directory run of `mds build`, `check`, `fmt` or `lint`, and every
+/// compile of an `mds watch` session (#389).
+///
+/// The panic hook has printed the text and recorded the panic, so the run exits 101
+/// whatever it does next. On `Err`, the caller counts the file as failed and prints
+/// nothing more about it.
+///
+/// `compile` is the compile call alone. A panic abandons it part-way, so nothing in it
+/// may write or delete a file or change state the batch goes on to use: what it
+/// abandons is then only its own. The caller wraps it in `AssertUnwindSafe`, which says
+/// just that; `tests/panic_hook.rs` pins every call site's closure to one compile call.
+///
+/// `label` is the file being compiled. A debug build's test trigger panics here when
+/// `MDS_TEST_PANIC` is `compile:` followed by the label's file stem.
+pub(crate) fn catch_compile<T>(
+    label: &Path,
+    compile: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> std::result::Result<T, Panicked> {
+    catch_panic(move || {
+        panic_on_compile(label);
+        compile()
+    })
+}
+
+/// What [`dispose_payload`] did with a caught panic's payload.
+#[derive(Debug, PartialEq, Eq)]
+enum Disposal {
+    /// Dropped: a panic message, whose destructor only frees its memory.
+    Dropped,
+    /// Forgotten: its destructor never runs, and the memory it holds is not freed.
+    Forgotten,
+}
+
+/// Get rid of a caught panic's payload. The `String` or `&'static str` message a
+/// `panic!` makes is dropped, which runs no code of the panic's own, so a watch session
+/// that catches panics again and again does not hold on to their messages. Any other
+/// payload is forgotten (`mem::forget`): its destructor is arbitrary code, and a panic
+/// in it would be a panic outside any catch.
+fn dispose_payload(payload: Box<dyn std::any::Any + Send>) -> Disposal {
+    if payload.is::<String>() || payload.is::<&'static str>() {
+        drop(payload);
+        Disposal::Dropped
+    } else {
+        std::mem::forget(payload);
+        Disposal::Forgotten
+    }
+}
+
+/// Write the panicking thread's backtrace to `sink`, as `RUST_BACKTRACE` asked: a
+/// `stack backtrace:` line, then the frames, each line WIRE-escaped with its line break
+/// kept. A write that fails is ignored — stderr is where it would be reported.
+fn write_backtrace<W: std::io::Write + ?Sized>(sink: &mut W, style: BacktraceStyle) {
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    let mut text = String::from("stack backtrace:\n");
+    // A frame that fails to render ends the text where it failed.
+    let _ = match style {
+        BacktraceStyle::Short => std::fmt::Write::write_fmt(&mut text, format_args!("{backtrace}")),
+        BacktraceStyle::Full => {
+            std::fmt::Write::write_fmt(&mut text, format_args!("{backtrace:#}"))
+        }
+    };
+    let _ = sink.write_all(escape_each_line(&text).as_bytes());
+}
+
+/// `text` with each line WIRE-escaped on its own and ended by a line break, so a line
+/// keeps its break and gains no raw control character.
+fn escape_each_line(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for line in text.split_terminator('\n') {
+        escaped.push_str(&mds::sanitize_control_chars_wire(line));
+        escaped.push('\n');
+    }
+    escaped
+}
+
+/// The panic's message and location, escaped as a backtrace line is — only in a build
+/// with the never-shipped `debug-panics` feature (#389).
+#[cfg(feature = "debug-panics")]
+fn write_panic_detail<W: std::io::Write + ?Sized>(
+    sink: &mut W,
+    info: &std::panic::PanicHookInfo<'_>,
+) {
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(a panic payload that is not text)");
+    let mut text = String::new();
+    let _ = std::fmt::Write::write_fmt(&mut text, format_args!("panic: {message}\n"));
+    if let Some(location) = info.location() {
+        let _ = std::fmt::Write::write_fmt(&mut text, format_args!("  at {location}\n"));
+    }
+    let _ = sink.write_all(escape_each_line(&text).as_bytes());
+}
+
+// ── Test-only panic trigger (#389) ───────────────────────────────────────────
+
+/// `MDS_TEST_PANIC`: how a debug build is made to panic on purpose, for the tests of the
+/// panic hook (`tests/panic_hook.rs`). A release build has none of it.
+#[cfg(debug_assertions)]
+mod panic_trigger {
+    use std::path::Path;
+
+    /// The variable that asks for a panic, and where:
+    /// - `main`: in the command's dispatch;
+    /// - `thread`: in a thread the dispatch starts and waits for;
+    /// - `compile:<stem>`: in [`catch_compile`](super::catch_compile), compiling a file
+    ///   whose file stem is `<stem>`;
+    /// - `notify` / `ctrlc`: in `mds watch`'s file-event callback / Ctrl-C handler, each
+    ///   on a thread of its own.
+    const VARIABLE: &str = "MDS_TEST_PANIC";
+
+    /// A word the payload carries, for a test to look for.
+    pub(super) const SENTINEL: &str = "mds-test-panic-payload";
+
+    /// What `MDS_TEST_PANIC` asks for, when it is set to text.
+    fn requested() -> Option<String> {
+        std::env::var_os(VARIABLE).and_then(|value| value.into_string().ok())
+    }
+
+    /// Panic as `MDS_TEST_PANIC` asks, if it asks for `main` or `thread`. The dispatch
+    /// calls it first.
+    pub(crate) fn panic_on_request() {
+        match requested().as_deref() {
+            Some("main") => std::panic::panic_any(payload()),
+            Some("thread") => {
+                // A thread's panic that does not end the process leaves the dispatch to
+                // carry on as if nothing had happened — what a test must be able to see.
+                let _ = std::thread::spawn(|| std::panic::panic_any(payload())).join();
+            }
+            _ => {}
+        }
+    }
+
+    /// Panic when `MDS_TEST_PANIC` is `compile:` followed by `label`'s file stem.
+    /// [`catch_compile`](super::catch_compile) calls it inside its catch.
+    pub(crate) fn panic_on_compile(label: &Path) {
+        let Some(stem) = label.file_stem().and_then(std::ffi::OsStr::to_str) else {
+            return;
+        };
+        if requested()
+            .as_deref()
+            .and_then(|value| value.strip_prefix("compile:"))
+            == Some(stem)
+        {
+            std::panic::panic_any(payload());
+        }
+    }
+
+    /// Panic when `MDS_TEST_PANIC` is `handler`, the name of the handler that calls it:
+    /// `notify` or `ctrlc`.
+    pub(crate) fn panic_in_handler(handler: &str) {
+        if requested().as_deref() == Some(handler) {
+            std::panic::panic_any(payload());
+        }
+    }
+
+    /// A payload no panic output may show: the sentinel, a raw ESC and the absolute path
+    /// of the working directory.
+    pub(super) fn payload() -> String {
+        let esc = char::from(0x1b);
+        let here = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        format!("{SENTINEL} {esc}[2J {}", here.display())
+    }
+}
+
+#[cfg(debug_assertions)]
+use panic_trigger::panic_on_compile;
+#[cfg(debug_assertions)]
+pub(crate) use panic_trigger::{panic_in_handler, panic_on_request};
+
+/// A release build's `MDS_TEST_PANIC` trigger in the dispatch: nothing (#389).
+#[cfg(not(debug_assertions))]
+pub(crate) fn panic_on_request() {}
+
+/// A release build's `MDS_TEST_PANIC` trigger in [`catch_compile`]: nothing (#389).
+#[cfg(not(debug_assertions))]
+fn panic_on_compile(_label: &Path) {}
+
+/// A release build's `MDS_TEST_PANIC` trigger in a watch handler: nothing (#389).
+#[cfg(not(debug_assertions))]
+pub(crate) fn panic_in_handler(_handler: &str) {}
 
 // ── Stdin display sentinel ────────────────────────────────────────────────────
 
@@ -161,8 +866,8 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// - `mds check -`: `run_check` in `crates/mds-cli/src/main.rs`
 /// - `mds build -` (single-file path): `compile_to_content` in `crates/mds-cli/src/build.rs`
 /// - `mds build -` (directory stdin path): `run_build` in `crates/mds-cli/src/build.rs`
-/// - `mds lint -`: `run_lint_stdin` in `crates/mds-cli/src/lint.rs` (direct call)
-///   and `run_lint_file` via `emit_analysis_failure_json_or_stderr` (indirect)
+/// - `mds lint -`: the human result sink's `analysis_failure` in
+///   `crates/mds-cli/src/lint_sink.rs`, for every failure of a stdin run
 ///
 /// Any new CLI boundary that renders a stdin analysis failure must call this
 /// function; skipping it renders `<source>` and breaks the uniform-sentinel rule.
@@ -180,6 +885,26 @@ pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Re
             None
         },
         inner: e.clone(),
+    })
+}
+
+// ── Working directory (#390) ──────────────────────────────────────────────────
+
+/// The working directory, which a path typed relative to it resolves against (#390).
+///
+/// Fails closed: a working directory that cannot be determined — deleted while the
+/// process is in it, say — is `mds::io` (exit 2), `cannot determine current directory:
+/// <reason>`, never a fallback to `"."`, which would name whatever directory the process
+/// is left in rather than the one the path was typed against. The words are mds-core's
+/// for a string compile that needs the working directory (its private
+/// `current_dir_base`), so a relative output location and a stdin source that meet the
+/// same failure read the same.
+pub(crate) fn current_dir() -> std::result::Result<PathBuf, mds::MdsError> {
+    std::env::current_dir().map_err(|e| mds::MdsError::Io {
+        message: format!(
+            "cannot determine current directory: {}",
+            safe_inline(io_cause(&e))
+        ),
     })
 }
 
@@ -207,6 +932,26 @@ pub(crate) fn reject_forbidden_output_path(
     mds::reject_forbidden_path(what, Path::new(value), &value.to_string_lossy())
 }
 
+/// Refuse an output location that is not valid UTF-8 (#390): `mds::io`, exit 2,
+/// `<what> is not valid UTF-8: "<value>"`, the value shown with U+FFFD for each invalid
+/// sequence and escaped by [`mds::escape_path_for_message`]. Otherwise the value, as
+/// text.
+///
+/// Every status line and comparison would name such a location by its lossy form, which
+/// is a different path. Callers run it up front, after
+/// [`reject_forbidden_output_path`], so it is never created or written.
+pub(crate) fn reject_non_utf8_output_path<'a>(
+    what: &str,
+    value: &'a OsStr,
+) -> std::result::Result<&'a str, mds::MdsError> {
+    value.to_str().ok_or_else(|| mds::MdsError::Io {
+        message: format!(
+            "{what} is not valid UTF-8: \"{}\"",
+            mds::escape_path_for_message(&value.to_string_lossy())
+        ),
+    })
+}
+
 /// Refuse an output location whose RESOLVED form carries a forbidden path character
 /// (#265): `mds::io`, exit 2.
 ///
@@ -223,12 +968,16 @@ pub(crate) fn reject_forbidden_output_path(
 /// names `typed`, the value as typed, escaped by [`mds::escape_path_for_message`] —
 /// never the absolute resolved path. The scan and the message are
 /// [`mds::reject_forbidden_path`]'s.
+///
+/// A relative value is resolved against the working directory, so one that cannot be
+/// determined refuses it too, in [`current_dir`]'s words (#390): there is no directory
+/// the value names.
 pub(crate) fn reject_forbidden_resolved_output_path(
     what: &str,
     path: &Path,
     typed: &OsStr,
 ) -> std::result::Result<(), mds::MdsError> {
-    let Some(resolved) = resolve_existing_prefix(path) else {
+    let Some(resolved) = resolve_existing_prefix(path)? else {
         return Ok(());
     };
     mds::reject_forbidden_path(
@@ -239,33 +988,47 @@ pub(crate) fn reject_forbidden_resolved_output_path(
 }
 
 /// The canonical form of the deepest existing ancestor of `path` (`path` itself when
-/// it exists); a relative `path` is taken against the working directory.
+/// it exists); a relative `path` is taken against the working directory, which must
+/// exist ([`current_dir`]).
 ///
-/// `None` when nothing resolves — the working directory is gone, so there is nothing
-/// on disk the value could lead through, and the typed check stands alone.
-fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
+/// `None` when no ancestor resolves, so there is nothing on disk the value could lead
+/// through and the typed check stands alone.
+fn resolve_existing_prefix(path: &Path) -> std::result::Result<Option<PathBuf>, mds::MdsError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().ok()?.join(path)
+        current_dir()?.join(path)
     };
     // Bounded: one step per component of `absolute`.
-    absolute.ancestors().find_map(|a| a.canonicalize().ok())
+    Ok(absolute.ancestors().find_map(|a| a.canonicalize().ok()))
 }
 
-/// Refuse an `mds.json` `build.output_dir` with a `..` component: `mds::io`, exit 2.
+/// Refuse an `mds.json` `build.output_dir` that leaves the directory `mds.json` is in: an
+/// absolute one — a root or a drive prefix — or one with a `..` component. `mds::io`,
+/// exit 2, naming the value as written.
 ///
-/// The raw components are checked rather than a canonical form because the
-/// directory may not exist yet (it is created on the first write). Shared by the
-/// single-file (`resolve_output_path_for_kind`) and directory
-/// ([`resolve_output_base`]) resolvers so both refuse it identically.
-pub(crate) fn reject_output_dir_traversal(
-    output_dir: &str,
-) -> std::result::Result<(), mds::MdsError> {
-    let traversal = Path::new(output_dir)
-        .components()
-        .any(|c| c == std::path::Component::ParentDir);
-    if traversal {
+/// The value is the repository's, not a path the user typed, so it may only name a
+/// directory below `mds.json`'s own, which is where its writes are anchored (#160). The
+/// raw components are checked rather than a canonical form because the directory may not
+/// exist yet (it is created on the first write). Shared by the single-file
+/// (`resolve_output_path_for_kind`) and directory ([`resolve_output_base`]) resolvers so
+/// both refuse it identically.
+pub(crate) fn reject_output_dir_escape(output_dir: &str) -> std::result::Result<(), mds::MdsError> {
+    use std::path::Component;
+
+    let mut components = Path::new(output_dir).components();
+    if components
+        .clone()
+        .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+    {
+        return Err(mds::MdsError::Io {
+            message: format!(
+                "mds.json output_dir '{}' must be a relative path",
+                mds::escape_path_for_message(output_dir)
+            ),
+        });
+    }
+    if components.any(|c| c == Component::ParentDir) {
         return Err(mds::MdsError::Io {
             message: format!(
                 "mds.json output_dir '{}' must not contain '..' components",
@@ -280,60 +1043,279 @@ pub(crate) fn reject_output_dir_traversal(
 
 /// Describes where directory-mode output files are written.
 ///
-/// `Dir(base)` mirrors the source subtree under `base`:
-///   `source.strip_prefix(root)` → `base/rel/stem.<ext>`
+/// `Dir` mirrors the source subtree under a directory:
+///   `source.strip_prefix(root)` → `<dir>/rel/stem.<ext>`
 /// `NextToSource` places the output next to the source file.
 #[derive(Debug, Clone)]
 pub(crate) enum OutputBase {
-    Dir(PathBuf),
+    /// The directory, in the two forms [`resolve_output_base`] fixes once (#390).
+    Dir {
+        /// Absolute, canonical where it exists: where outputs are written, and what every
+        /// containment check (`starts_with`) compares.
+        canonical: PathBuf,
+        /// The same directory as the user named it: `--out-dir` as typed, or `mds.json`
+        /// `build.output_dir` below the directory `mds.json` was reached by. The form a
+        /// status line names an output by.
+        shown: PathBuf,
+        /// How many of the directory's own last components lie below the anchor its
+        /// writes are made below (#160): none for `--out-dir`, which is its own anchor,
+        /// resolved when the run starts; `build.output_dir`'s, below the directory
+        /// `mds.json` is in, so a symlink there is refused like any other below an anchor.
+        below_anchor: usize,
+    },
     NextToSource,
+}
+
+/// One file the CLI writes, in the two forms fixed where its location is resolved —
+/// [`output_path_for`] in directory mode, `resolve_output_path_for_kind` for a single
+/// file (#390) — and the anchor its write resolves by path (#160).
+///
+/// `path` is where the bytes go. `shown` is the same file as the user named it: the path
+/// as typed, or the part below a directory they named — the directory argument,
+/// `--out-dir`, or the directory `mds.json` was reached by — joined to that directory as
+/// typed. A status line, a message the caller writes itself, and the error
+/// [`crate::write::write_compiled`] raises writing it name the file by `shown` alone,
+/// so display never resolves a path again.
+///
+/// The last `below_anchor` components of `path` — and of `shown`, which ends in the same
+/// names — lie below the write's anchor: the parent of a file argument or of `-o`,
+/// `--out-dir`, a directory argument's root, or, for `mds.json`'s `build.output_dir`, the
+/// directory `mds.json` is in, with `build.output_dir`'s own directories below it. The
+/// write resolves the anchor by path, in the form `path` holds it — as typed, or as
+/// resolved once when the run started: a directory-mode `--out-dir` ([`OutputBase::Dir`]'s
+/// `canonical`) and the entry's directory or directory argument of `mds watch` — and
+/// refuses a symlink at any of the components below it instead of writing through it.
+/// A write `mds watch` makes below its out-dir also names the directory its anchor must
+/// be ([`WriteTarget::below_checked_anchor`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteTarget {
+    pub(crate) path: PathBuf,
+    pub(crate) shown: PathBuf,
+    below_anchor: usize,
+    /// The directory the write must find its anchor to be, when its caller has just
+    /// checked which one that is; `None`: whatever directory the anchor's path leads to.
+    checked_anchor: Option<DirIdentity>,
+}
+
+impl WriteTarget {
+    /// A file named exactly as it is written: a path the user typed, or one built from a
+    /// typed path alone, so its two forms are one. Its anchor is its own directory.
+    pub(crate) fn as_typed(path: PathBuf) -> Self {
+        Self::new(path.clone(), path)
+    }
+
+    /// A file written at `path` and named as `shown`, anchored at the directory it is in:
+    /// the typed parent of a file argument, of `-o`, or of a file-mode output's directory.
+    pub(crate) fn new(path: PathBuf, shown: PathBuf) -> Self {
+        Self {
+            path,
+            shown,
+            below_anchor: 1,
+            checked_anchor: None,
+        }
+    }
+
+    /// The file `rel` below the anchor `anchor`, named below `shown_anchor`, the same
+    /// directory as the user named it: a directory-mode output below `--out-dir` or the
+    /// directory argument, or a directory's entry its walk found. `rel` is relative; the
+    /// write refuses a `..` in it.
+    pub(crate) fn below(anchor: &Path, shown_anchor: &Path, rel: &Path) -> Self {
+        Self {
+            path: anchor.join(rel),
+            shown: shown_anchor.join(rel),
+            // `components` keeps a `.` only at the start, which a join drops.
+            below_anchor: rel
+                .components()
+                .filter(|c| *c != std::path::Component::CurDir)
+                .count(),
+            checked_anchor: None,
+        }
+    }
+
+    /// The file `rel` below a directory-mode out-dir, `dir` in its two forms, whose own last
+    /// `dir_below_anchor` components lie below the anchor too — none for `--out-dir`,
+    /// `build.output_dir`'s below the directory `mds.json` is in ([`OutputBase::Dir`]).
+    pub(crate) fn below_out_dir(
+        dir: &Path,
+        shown_dir: &Path,
+        dir_below_anchor: usize,
+        rel: &Path,
+    ) -> Self {
+        let mut target = Self::below(dir, shown_dir, rel);
+        target.below_anchor += dir_below_anchor;
+        target
+    }
+
+    /// `file`, a path the walk of `root.walked` found, below that root as its anchor and
+    /// named below `root.typed`. A file not below the walked root has no typed form and is
+    /// anchored at its own directory.
+    pub(crate) fn walked_below(root: RootPaths<'_>, file: &Path) -> Self {
+        match file.strip_prefix(root.walked) {
+            Ok(rel) => Self::below(root.walked, root.typed, rel),
+            Err(_) => Self::as_typed(file.to_path_buf()),
+        }
+    }
+
+    /// How many of the last components of `path` lie below the anchor.
+    pub(crate) fn below_anchor(&self) -> usize {
+        self.below_anchor
+    }
+
+    /// The same file below `dir`, the directory its anchor is as its caller resolved and
+    /// checked it — `mds watch`'s out-dir, or the directory `mds.json` is in — written only
+    /// if the directory the write opens as its anchor is `identity` (#160). The last
+    /// `missing` components of `dir`, which were not there when it was checked, lie below
+    /// the anchor too: the write opens the directory above them, the one checked, and
+    /// creates them below it without following a symlink. Named as before.
+    pub(crate) fn below_checked_anchor(
+        &self,
+        dir: &Path,
+        missing: usize,
+        identity: DirIdentity,
+    ) -> Self {
+        let above = self
+            .path
+            .components()
+            .count()
+            .saturating_sub(self.below_anchor);
+        Self {
+            path: dir.join(self.path.components().skip(above).collect::<PathBuf>()),
+            shown: self.shown.clone(),
+            below_anchor: self.below_anchor + missing,
+            checked_anchor: Some(identity),
+        }
+    }
+
+    /// The directory the write must find its anchor to be, if its caller checked it.
+    pub(crate) fn checked_anchor(&self) -> Option<DirIdentity> {
+        self.checked_anchor
+    }
+
+    /// The file `edit` derives from this one, in both forms and below the same anchor —
+    /// the sidecar map beside an output, say. `edit` changes the file name alone.
+    pub(crate) fn sibling(&self, edit: impl Fn(&Path) -> PathBuf) -> Self {
+        Self {
+            path: edit(&self.path),
+            shown: edit(&self.shown),
+            below_anchor: self.below_anchor,
+            checked_anchor: self.checked_anchor,
+        }
+    }
+}
+
+/// A directory-mode root in the two forms its sources are walked in and named by, always
+/// in `(typed, walked)` order, so the two cannot be passed swapped (#390).
+///
+/// `walked` is the form the sources below it are walked in — what [`output_path_for`]
+/// strips a source against. `typed` is the directory argument as typed: an output next to
+/// its source is named below it. `mds build` walks the directory as typed and passes it as
+/// both; `mds watch` walks its canonical form, which matches the event paths notify
+/// reports, and holds the entry's directory and the `--vars` file's in the same two forms
+/// to name a directory it watches.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RootPaths<'a> {
+    pub(crate) typed: &'a Path,
+    pub(crate) walked: &'a Path,
+}
+
+impl<'a> RootPaths<'a> {
+    /// A root walked as typed: its two forms are one.
+    pub(crate) fn as_typed(dir: &'a Path) -> Self {
+        Self {
+            typed: dir,
+            walked: dir,
+        }
+    }
+
+    /// `source`, a path the walk of `walked` produced, named below `typed`. A source not
+    /// below `walked` has no typed form and keeps its own.
+    pub(crate) fn shown_below(self, source: &Path) -> PathBuf {
+        self.typed_below(source)
+            .unwrap_or_else(|| source.to_path_buf())
+    }
+
+    /// `path` named below `typed` — `walked` itself as `typed`, with no separator added —
+    /// or `None` when `path` is not `walked` or below it.
+    pub(crate) fn typed_below(self, path: &Path) -> Option<PathBuf> {
+        let below = path.strip_prefix(self.walked).ok()?;
+        Some(if below.as_os_str().is_empty() {
+            self.typed.to_path_buf()
+        } else {
+            self.typed.join(below)
+        })
+    }
 }
 
 /// Resolve `out_dir` to an absolute, canonicalized path for reliable `starts_with` checks.
 ///
-/// Used by both `run_build_directory` and `dir_watch_startup` before calling
-/// [`resolve_output_base`]. Relative paths are resolved against `current_dir`; the result
-/// is then canonicalized (falls back to the absolute form when the directory does not yet exist).
-pub(crate) fn canonicalize_out_dir(out_dir: Option<&PathBuf>) -> Option<PathBuf> {
-    out_dir.map(|d| {
-        let abs = if d.is_absolute() {
-            d.clone()
-        } else {
-            // Fail-OPEN, deliberately left alone here (#217): when `current_dir()` fails
-            // — the cwd was deleted, or is unreadable — the relative `--out-dir` is
-            // anchored at `"."` instead, which resolves against whatever the process's
-            // cwd actually is. The subsequent `canonicalize()` then usually fails too and
-            // the non-absolute form is returned, so `starts_with` containment checks
-            // downstream compare against a path that is not the one they assume.
-            // Turning this into a hard error changes the signature of an infallible
-            // helper and every caller with it; tracked as a follow-up rather than folded
-            // into this change.
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(d)
-        };
-        abs.canonicalize().unwrap_or(abs)
-    })
+/// [`resolve_output_base`] calls it for the `--out-dir` of `run_build_directory` and of
+/// a directory watch's startup (`dir_startup::arm_pre_read`). A relative path is resolved
+/// against the working directory; the result is then canonicalized (falls back to the
+/// absolute form when the directory does not yet exist).
+///
+/// # Errors
+///
+/// A relative `out_dir` when the working directory cannot be determined: `mds::io`, in
+/// [`current_dir`]'s words (#390). It is never anchored at `"."` instead, which would
+/// leave a relative base that every `starts_with` check downstream misreads.
+pub(crate) fn canonicalize_out_dir(
+    out_dir: Option<&PathBuf>,
+) -> std::result::Result<Option<PathBuf>, mds::MdsError> {
+    let Some(d) = out_dir else {
+        return Ok(None);
+    };
+    let abs = if d.is_absolute() {
+        d.clone()
+    } else {
+        current_dir()?.join(d)
+    };
+    Ok(Some(abs.canonicalize().unwrap_or(abs)))
 }
 
-/// Compute the `OutputBase` for directory mode.
+/// Compute the `OutputBase` for directory mode, fixing both forms of its directory here,
+/// once (#390).
 ///
-/// Precedence (mirrors `resolve_output_path` for file mode):
-/// 1. `--out-dir` → `Dir(abs_out_dir)`
-/// 2. `mds.json build.output_dir` → `Dir(config_dir.join(output_dir))`
-///    — rejects `..` components at startup (`mds::io`, exit 2).
+/// Precedence (mirrors `resolve_output_path_for_kind` for file mode):
+/// 1. `--out-dir` → `Dir`: canonical per [`canonicalize_out_dir`], shown as typed; the
+///    anchor of its writes.
+/// 2. `mds.json build.output_dir` → `Dir`: below the config directory, the anchor of its
+///    writes, shown below the directory `mds.json` was reached by — refuses an absolute
+///    value and `..` components at startup (`mds::io`, exit 2).
 /// 3. Default → `NextToSource`
+///
+/// # Errors
+///
+/// A relative `--out-dir` when the working directory cannot be determined
+/// ([`canonicalize_out_dir`]), and a `build.output_dir` that is absolute or has a `..`
+/// component ([`reject_output_dir_escape`]).
 pub(crate) fn resolve_output_base(
-    abs_out_dir: Option<&Path>,
-    config: &Option<(MdsConfig, PathBuf)>,
+    out_dir: Option<&PathBuf>,
+    config: &Option<ProjectConfig>,
 ) -> Result<OutputBase> {
-    if let Some(d) = abs_out_dir {
-        return Ok(OutputBase::Dir(d.to_path_buf()));
+    if let (Some(typed), Some(canonical)) = (out_dir, canonicalize_out_dir(out_dir)?) {
+        return Ok(OutputBase::Dir {
+            canonical,
+            shown: typed.clone(),
+            below_anchor: 0,
+        });
     }
-    if let Some((cfg, config_dir)) = config {
-        if let Some(ref output_dir) = cfg.build.output_dir {
-            reject_output_dir_traversal(output_dir)?;
-            return Ok(OutputBase::Dir(config_dir.join(output_dir)));
+    if let Some(ProjectConfig {
+        config,
+        dir,
+        shown_dir,
+    }) = config
+    {
+        if let Some(ref output_dir) = config.build.output_dir {
+            reject_output_dir_escape(output_dir)?;
+            return Ok(OutputBase::Dir {
+                canonical: dir.join(output_dir),
+                shown: shown_dir.join(output_dir),
+                // Names alone, once the refusal above has run; a `.` adds none.
+                below_anchor: Path::new(output_dir)
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .count(),
+            });
         }
     }
     Ok(OutputBase::NextToSource)
@@ -347,11 +1329,13 @@ pub(crate) fn resolve_output_base(
 /// kept in one place (issue 5 — single source of truth), shared with
 /// [`output_base_no_ext`].
 ///
-/// - `Dir(base)`: mirrors `source` relative to `root` under `base`.
+/// - `Dir`: mirrors `source` relative to `root.walked` under the directory — its
+///   canonical form for the write, its shown form for the message (#390).
 ///   If `strip_prefix` fails (source not under root after canonicalization),
-///   falls back to `base/stem.<ext>` — **never** joins an absolute path that
+///   falls back to `<dir>/stem.<ext>` — **never** joins an absolute path that
 ///   could escape the output directory (AC-M7 path-escape guard).
-/// - `NextToSource`: `source.with_extension(ext)`.
+/// - `NextToSource`: `source.with_extension(ext)` beside the source as walked, named
+///   below the directory argument as typed ([`output_stem_for`], #390).
 ///
 /// The `ext` parameter is the output extension without leading `.` (`"md"` or `"json"`).
 ///
@@ -359,57 +1343,29 @@ pub(crate) fn resolve_output_base(
 ///
 /// It is called once per output path actually computed for a write, so it is where the
 /// [`MirroredStem::Flattened`] arm is reported — a warning naming the source, the root
-/// and the flat output. [`output_base_no_ext`] computes the same stem for bookkeeping
-/// probes and stays silent; moving the report there would fire it on paths that are
-/// never written, several times per watch batch (#217).
+/// and the flat output. [`output_base_no_ext`] computes the same stem for bookkeeping —
+/// a directory build's source-map base — and stays silent; moving the report there would
+/// fire it for a stem no write is made at (#217).
 ///
 /// No live caller can reach the flattened arm: `build` walks `root` and hands the walk's
 /// own prefix back here; `watch` gates event paths on `starts_with(&ctx.root)` and its
 /// startup/baseline loops use canonical keys under a canonical root whose walker skips
 /// symlinks. The warning is therefore an invariant report, not a user-facing condition —
 /// if it is ever seen, one of those gates has moved.
-pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext: &str) -> PathBuf {
+pub(crate) fn output_path_for(
+    source: &Path,
+    root: RootPaths<'_>,
+    base: &OutputBase,
+    ext: &str,
+) -> WriteTarget {
     match base {
-        OutputBase::Dir(d) => {
-            let mirrored = mirror_stem(source, root, d);
-            let flattened = matches!(mirrored, MirroredStem::Flattened(_));
-            let no_ext = mirrored.into_path();
-            // Invariant: `no_ext` was built by `mirror_stem` as `<something>/<stem>`, so
-            // `file_name()` is `Some`. The literal fallback exists because the previous
-            // one — `source.as_os_str()` — could be absolute, and an absolute name makes
-            // the `join` below re-root out of the out-dir.
-            let mut name = no_ext
-                .file_name()
-                .unwrap_or_else(|| OsStr::new("output"))
-                .to_os_string();
-            name.push(".");
-            name.push(ext);
-            let out = no_ext.parent().unwrap_or(d.as_path()).join(&name);
-            // AC-M7 containment invariant: the output path must remain inside the out-dir.
-            // `mirror_stem` already guards the strip_prefix escape case by returning
-            // `d/<stem>` for out-of-root sources; the with-extension step cannot escape.
-            // The check here is a defence-in-depth belt-and-suspenders assertion, and it
-            // stays DEBUG-ONLY on purpose: the release fallback below is contained, so
-            // there is nothing for a release-time check to prevent.
-            let out = if out.starts_with(d) {
-                out
-            } else {
-                debug_assert!(
-                    false,
-                    "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
-                );
-                let flat_name = {
-                    // Invariant: same as above — the join argument must be relative.
-                    let mut n = source
-                        .file_stem()
-                        .unwrap_or_else(|| OsStr::new("output"))
-                        .to_os_string();
-                    n.push(".");
-                    n.push(ext);
-                    n
-                };
-                d.join(flat_name)
-            };
+        OutputBase::Dir {
+            canonical,
+            shown,
+            below_anchor,
+        } => {
+            let (rel, flattened) = mirrored_output(source, root.walked, ext);
+            let target = WriteTarget::below_out_dir(canonical, shown, *below_anchor, &rel);
             if flattened {
                 // Invariant report, not gated on --quiet (like the depth-limit and
                 // stale-unlink warnings above). Emitted once per output-path computation:
@@ -420,14 +1376,60 @@ pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext
                      as {} (another source outside the root with the same file name would \
                      overwrite it)",
                     safe_path(source),
-                    safe_path(root),
-                    safe_path(&out)
+                    safe_path(root.walked),
+                    safe_path(&target.shown)
                 ));
             }
-            out
+            target
         }
-        OutputBase::NextToSource => output_base_no_ext(source, root, base).with_extension(ext),
+        OutputBase::NextToSource => {
+            output_stem_for(source, root, base).sibling(|stem| stem.with_extension(ext))
+        }
     }
+}
+
+/// `source`'s output below the out-dir — the part below it, mirrored as [`mirror_stem`]
+/// mirrors it — and whether the mirror was flattened. [`output_path_for`] joins it to both
+/// forms of the out-dir, so both name the same file below it.
+fn mirrored_output(source: &Path, root: &Path, ext: &str) -> (PathBuf, bool) {
+    let mirrored = mirror_stem(source, root);
+    let flattened = matches!(mirrored, MirroredStem::Flattened(_));
+    let no_ext = mirrored.into_path();
+    // Invariant: `no_ext` was built by `mirror_stem` as `[<dirs>/]<stem>`, so
+    // `file_name()` is `Some`. The literal fallback exists because the previous
+    // one — `source.as_os_str()` — could be absolute, and an absolute name makes
+    // a join re-root out of the out-dir.
+    let mut name = no_ext
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("output"))
+        .to_os_string();
+    name.push(".");
+    name.push(ext);
+    let out = no_ext.parent().unwrap_or(Path::new("")).join(&name);
+    // AC-M7 containment invariant: the output path must remain inside the out-dir, so
+    // the part below it is names alone. `mirror_stem` already guards the strip_prefix
+    // escape case by returning a bare `<stem>` for out-of-root sources; the
+    // with-extension step cannot escape. The check here is a defence-in-depth assertion,
+    // and it stays DEBUG-ONLY on purpose: the release fallback below is contained, and the
+    // write refuses a `..` below its anchor whatever reaches it (#160).
+    if out
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return (out, flattened);
+    }
+    debug_assert!(
+        false,
+        "output_path_for: AC-M7 violated — output {out:?} is not below the out-dir"
+    );
+    // Invariant: same as above — the name must be relative.
+    let mut flat_name = source
+        .file_stem()
+        .unwrap_or_else(|| OsStr::new("output"))
+        .to_os_string();
+    flat_name.push(".");
+    flat_name.push(ext);
+    (PathBuf::from(flat_name), flattened)
 }
 
 // ── Directory traversal ───────────────────────────────────────────────────────
@@ -676,60 +1678,159 @@ pub(crate) fn partials_only(files: &[PathBuf]) -> Option<usize> {
 
 // ── Stale-output cleanup ──────────────────────────────────────────────────────
 
-/// Probe for BOTH possible output siblings and unlink the one that does NOT match `kind`.
+/// The stale output beside `written`, the output of a source that compiled to `kind`: the
+/// other kind's output of the same name (#160), which [`probe_and_remove_stale`] deals
+/// with — `out/a.b.md`'s is `out/a.b.json`.
+pub(crate) fn stale_output(written: &WriteTarget, kind: OutputKind) -> WriteTarget {
+    written.sibling(|path| path.with_extension(kind.stale_extension()))
+}
+
+/// After a directory build wrote `written`, the output of a source that compiled to
+/// `kind`, deal with the other kind's output of the same name that an earlier build left
+/// when the source compiled to that kind (#160). It is named from the output written —
+/// `out/a.b.md`'s is `out/a.b.json` — never from the source's name, which for `a.b.mds`
+/// would name `a.mds`'s output.
 ///
-/// Called after writing a compiled output to clean up a stale sibling from a previous
-/// format flip (e.g. a file that used to emit `x.md` but now emits `x.json`).
+/// - A stale `.json` is removed only while it holds exactly what mds writes for a
+///   messages output ([`holds_messages_output`]), and only as every removal is made
+///   ([`crate::write::remove_proven`]): below the output's anchor, through no symlink
+///   there, and only as a regular file. Anything else at its name — another file, a
+///   symlink, a directory, a FIFO — is kept, with one warning.
+/// - A stale `.md` is never removed — nothing in Markdown shows that mds wrote it — and
+///   is kept, as is anything else at its name, with one warning.
 ///
-/// If neither sibling exists the function is a no-op. If the wrong-extension file
-/// exists it is deleted; errors are soft-warned (non-fatal: the stale file stays,
-/// which is an annoyance, not a correctness issue).
+/// A removal is silent, as is a name nothing has; `quiet` silences the warnings, which
+/// name the file by its `shown` form (#390).
 ///
-/// `base_path` must be the path WITHOUT extension (e.g. `/out/foo` for a source
-/// `foo.mds`). The function constructs `base_path.with_extension("md")` and
-/// `base_path.with_extension("json")` and removes the one that contradicts `kind`.
+/// # Errors
 ///
-/// AC-FUNC-23 (watch format-flip) and the equivalent dir-build stale-cleanup both
-/// call this function so the probe-and-unlink logic is shared.
-pub(crate) fn probe_and_remove_stale(base_no_ext: &Path, kind: OutputKind) {
-    let stale_ext = kind.stale_extension();
-    let stale_path = base_no_ext.with_extension(stale_ext);
-    if stale_path.exists() {
-        match std::fs::remove_file(&stale_path) {
-            Ok(()) => {
-                // non-loud: stale cleanup is a housekeeping detail, not an action the
-                // user normally needs to know about (mirrors watch "Removed …" style).
-            }
-            Err(e) => {
-                // Same shape as the depth-limit warning above: the path is walker-derived
-                // and the `io::Error` Display embeds a path of its own, so both are WIRE.
+/// `mds::io`, for the caller to report (#157), naming the stale `.json` as shown: one
+/// that cannot be looked at or read, so nothing is known of it, and a proven one that is
+/// not removed — refused (a symlink below the anchor, say) or the removal failed.
+pub(crate) fn probe_and_remove_stale(
+    written: &WriteTarget,
+    kind: OutputKind,
+    quiet: bool,
+) -> std::result::Result<(), mds::MdsError> {
+    let stale = stale_output(written, kind);
+    match kind {
+        OutputKind::Markdown => remove_stale_messages(&stale, quiet),
+        OutputKind::Messages => {
+            if !quiet && std::fs::symlink_metadata(&stale.path).is_ok() {
                 eprint_warning(&format!(
-                    "warning: could not remove stale output {}: {}",
-                    safe_path(&stale_path),
-                    safe_inline(&e)
+                    "warning: kept stale output {}: mds never removes a Markdown file",
+                    safe_path(&stale.shown)
                 ));
             }
+            Ok(())
         }
     }
 }
 
-/// Where a `Dir(_)`-mode source landed.
+/// Remove `stale`, the `.json` of a source that now compiles to Markdown, only while it
+/// holds exactly what mds writes for a messages output; keep anything else with one
+/// warning (none under `quiet`). See [`probe_and_remove_stale`].
+fn remove_stale_messages(
+    stale: &WriteTarget,
+    quiet: bool,
+) -> std::result::Result<(), mds::MdsError> {
+    let proof = |file: &mut std::fs::File| {
+        let size = file.metadata()?.len();
+        holds_messages_output(file, size, mds::MAX_FILE_SIZE)
+    };
+    let not_removed = match crate::write::remove_proven(stale, proof) {
+        Ok(Removal::Removed | Removal::Missing) => return Ok(()),
+        Ok(Removal::Kept) | Err(NotRemoved::NotAFile | NotRemoved::Link) => {
+            if !quiet {
+                eprint_warning(&format!(
+                    "warning: kept stale output {}: not proven to be written by mds",
+                    safe_path(&stale.shown)
+                ));
+            }
+            return Ok(());
+        }
+        Err(not_removed) => not_removed,
+    };
+    Err(stale_removal_error(
+        "stale output",
+        &stale.shown,
+        &not_removed,
+    ))
+}
+
+/// Word `not_removed`, a [`crate::write::remove_proven`] refusal already decided to be an
+/// error rather than a kept file, as `mds::io`: "cannot read `<noun>` …" when nothing is
+/// known of the file, "could not remove `<noun>` …" otherwise. Shared by the stale-output
+/// removal above and `build::verify_then_delete_map`'s stale map, so the two wordings
+/// cannot drift apart (#160).
+pub(crate) fn stale_removal_error(
+    noun: &str,
+    shown: &Path,
+    not_removed: &NotRemoved,
+) -> mds::MdsError {
+    let what = match not_removed {
+        NotRemoved::Unreadable(_) => "cannot read",
+        _ => "could not remove",
+    };
+    mds::MdsError::Io {
+        message: format!(
+            "{what} {noun} {}: {}",
+            safe_path(shown),
+            not_removed.cause()
+        ),
+    }
+}
+
+/// One message as a messages output holds it: the fields of [`mds::Message`], in the
+/// order they are written, and no other.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WrittenMessage {
+    role: String,
+    content: String,
+}
+
+/// Whether `reader` holds exactly what mds writes for a messages output (#160): a JSON
+/// array of messages that, written back as a messages output is written
+/// ([`crate::build::messages_json`]), gives the same bytes — so neither its shape nor its
+/// text differs from a file mds wrote. `size` is the reader's length, which sizes the
+/// read; no more than `cap` bytes are read, and a reader that holds more holds no
+/// messages output.
+fn holds_messages_output(
+    reader: &mut impl std::io::Read,
+    size: u64,
+    cap: u64,
+) -> std::io::Result<bool> {
+    if size > cap {
+        return Ok(false);
+    }
+    let bytes = mds::read_at_most(reader, cap.saturating_add(1), size)?;
+    if bytes.len() as u64 > cap {
+        return Ok(false);
+    }
+    let Ok(messages) = serde_json::from_slice::<Vec<WrittenMessage>>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(crate::build::messages_json(&messages).is_ok_and(|written| written.as_bytes() == bytes))
+}
+
+/// Where a `Dir`-mode source lands below the out-dir, without its extension.
 ///
-/// `Flattened` is the `strip_prefix` failure arm: contained by construction (the join
-/// argument is always a relative `OsStr`) but it abandons the subtree mirror, so two
-/// out-of-root sources with the same file name map to the same path. Unreachable from
-/// every live caller — see [`output_path_for`] — and the variant exists so the write
-/// oracle can *say* so instead of silently degrading (#217).
+/// `Flattened` is the `strip_prefix` failure arm: contained by construction (the stem is
+/// always a relative `OsStr`) but it abandons the subtree mirror, so two out-of-root
+/// sources with the same file name map to the same path. Unreachable from every live
+/// caller — see [`output_path_for`] — and the variant exists so the write oracle can
+/// *say* so instead of silently degrading (#217).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MirroredStem {
-    /// `source` was below `root`: its relative subtree is preserved under the out-dir.
+    /// `source` was below `root`: its relative subtree is preserved below the out-dir.
     Mirrored(PathBuf),
-    /// `source` was not below `root`: only its stem survives, joined to the out-dir.
+    /// `source` was not below `root`: only its stem survives, directly below the out-dir.
     Flattened(PathBuf),
 }
 
 impl MirroredStem {
-    /// The extension-less output path, whichever arm produced it.
+    /// The extension-less output path below the out-dir, whichever arm produced it.
     pub(crate) fn into_path(self) -> PathBuf {
         match self {
             Self::Mirrored(p) | Self::Flattened(p) => p,
@@ -737,44 +1838,45 @@ impl MirroredStem {
     }
 }
 
-/// Compute the `Dir(_)`-mode extension-less output stem for `source`, classified by
-/// whether the subtree mirror survived.
+/// Compute the `Dir`-mode extension-less output stem for `source`, relative to the
+/// out-dir, classified by whether the subtree mirror survived.
 ///
 /// Single source of truth for both [`output_base_no_ext`] (the silent probe oracle) and
 /// [`output_path_for`] (the write oracle that reports the flatten).
-fn mirror_stem(source: &Path, root: &Path, d: &Path) -> MirroredStem {
+fn mirror_stem(source: &Path, root: &Path) -> MirroredStem {
     match source.strip_prefix(root) {
         Ok(rel) => {
             // Invariant: `rel` is a non-empty RELATIVE path — `source` is a regular
             // `.mds` file strictly below `root` — so `file_stem()` is `Some`. For a
             // single-component `rel` (a bare file name) `parent()` is `Some("")`, not
-            // `None`, and `d.join("")` is `d`, so bare names land directly in the
-            // out-dir rather than re-rooting.
+            // `None`, so a bare name lands directly in the out-dir.
             let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
-            MirroredStem::Mirrored(d.join(rel.parent().unwrap_or(Path::new(""))).join(stem))
+            MirroredStem::Mirrored(rel.parent().unwrap_or(Path::new("")).join(stem))
         }
         Err(_) => {
-            // Invariant: the join argument must be relative, or `d.join` re-roots and
-            // the result leaves the out-dir entirely (`d.join("/") == "/"`).
-            // `file_stem()` is `None` only for `/`, `..` and a bare drive prefix —
-            // never a `.mds` file — and the fallback that used to stand here,
-            // `source.as_os_str()`, was exactly the absolute value that escapes. A
-            // literal is the only value guaranteed relative for every input.
+            // Invariant: the stem must be relative, or joining it re-roots and the result
+            // leaves the out-dir entirely (`d.join("/") == "/"`). `file_stem()` is `None`
+            // only for `/`, `..` and a bare drive prefix — never a `.mds` file — and the
+            // fallback that used to stand here, `source.as_os_str()`, was exactly the
+            // absolute value that escapes. A literal is the only value guaranteed relative
+            // for every input.
             let stem = source.file_stem().unwrap_or_else(|| OsStr::new("output"));
-            MirroredStem::Flattened(d.join(stem))
+            MirroredStem::Flattened(PathBuf::from(stem))
         }
     }
 }
 
 /// Return the path stem (path without extension) for a compiled source.
 ///
-/// Used to construct the `base_no_ext` argument to [`probe_and_remove_stale`].
+/// The `path` of [`output_stem_for`]: a directory build takes the directory its output
+/// lands in — a source map's base — from it.
 ///
-/// For `Dir(base)` mode this defers to [`mirror_stem`] so the stem is always computed
-/// consistently with [`output_path_for`].
+/// For `Dir` mode this defers to [`mirror_stem`] so the stem is always computed
+/// consistently with [`output_path_for`], below the directory's canonical form: the stem
+/// is for probing the filesystem, not for a message.
 pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) -> PathBuf {
     match base {
-        OutputBase::Dir(d) => mirror_stem(source, root, d).into_path(),
+        OutputBase::Dir { canonical, .. } => canonical.join(mirror_stem(source, root).into_path()),
         OutputBase::NextToSource => {
             // source.with_extension("") removes the existing extension.
             source.with_extension("")
@@ -782,165 +1884,34 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
     }
 }
 
-// ── Atomic file write ─────────────────────────────────────────────────────────
-
-/// How hard [`atomic_write_file`] works to make the new bytes survive a crash.
+/// [`output_base_no_ext`] in both forms, fixed here as [`output_path_for`] fixes an
+/// output's (#390), below the same anchor (#160): `path` is the extension-less stem the
+/// filesystem is probed at; `shown` is the same stem below the out-dir's shown form, or —
+/// next to the source — below the directory argument as typed. [`output_path_for`]
+/// names an output next to its source from it.
 ///
-/// Atomicity — a reader sees either the whole old file or the whole new one, never a
-/// truncated mix — is unconditional: it comes from the rename, not from the fsync. This
-/// knob only chooses whether the data is forced to stable storage *before* that rename.
-///
-/// The split exists because the two families of file MDS writes have different recovery
-/// costs, and on macOS `sync_all()` is `F_FULLFSYNC` — a full drive cache flush, ~7 ms
-/// per file. Measured on a 500-template `mds watch` startup (#227): 1.44 s → 4.69 s, and
-/// the `cli_watch` suite 4.2 s → 8.3 s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Durability {
-    /// `sync_all()` before the rename. For files whose content exists nowhere else:
-    /// `mds fmt` and `mds lint --fix` rewrite the user's hand-authored `.mds` source in
-    /// place, so bytes lost to a power failure are lost for good.
-    Fsync,
-    /// Rename only. For **derived** artifacts — compiled outputs and `.map` sidecars —
-    /// which are reproducible by re-running `mds build`. A crash can leave the previous
-    /// artifact or an unflushed new one; either way the fix is one rebuild, and paying
-    /// `F_FULLFSYNC` per file to avoid it costs more than it saves.
-    RenameOnly,
-}
-
-/// Write `content` to `path` atomically via a temp-file-then-rename cycle.
-///
-/// Centralising this helper in `output.rs` ensures both `fmt` and `lint --fix`
-/// route through the same write path (avoids PF-004 — a check enforced on the
-/// primary path silently absent on a sibling path).
-///
-/// This is the single write primitive for every file the CLI produces: `fmt` and
-/// `lint --fix` rewrites, and — since #227 — every `mds build` / `mds watch`
-/// artifact and `.map` sidecar. The parent directory must already exist; callers
-/// that need directories create them first.
-///
-/// Behaviour: the target is probed with `lstat`. A regular file is replaced
-/// (final-component symlink re-check, Unix mode preserved with `& 0o7777`). A
-/// symlink at the target — live or dangling — is refused rather than written
-/// through. An absent target is created with mode `0666 & !umask`, i.e. what
-/// `std::fs::write` produced. Any other stat failure is an error, never a silent
-/// mode guess (#225).
-///
-/// Safety properties:
-/// - Re-checks for symlink immediately before the write (TOCTOU guard, AC-F-21).
-/// - Temp file lives in the SAME directory as the target so the rename is
-///   always intra-filesystem (atomic on POSIX, near-atomic on Windows).
-/// - Calls `sync_all()` (not `flush()` — `flush()` is a no-op on unbuffered
-///   `File`) for crash durability before the rename, when `durability` is
-///   [`Durability::Fsync`]. Under [`Durability::RenameOnly`] the fsync is skipped;
-///   the rename — and therefore the atomicity — is unchanged. See [`Durability`]
-///   for which callers pick which and why.
-/// - Directory-level symlinks in the path are resolved, not rejected (the same
-///   rule `NativeFs::check_symlink` applies).
-///
-/// # Contract (#226)
-///
-/// This is replace-by-rename, not an in-place rewrite. The target path receives a
-/// NEW inode, so the write does NOT preserve hard links (other links keep the old
-/// content), ACLs, extended attributes (xattrs), or owner/group of the original
-/// file; only the permission bits are carried over (Unix). This applies to every
-/// path routed through this helper: `mds fmt` and `mds lint --fix` source
-/// rewrites and, under #227, `mds build` / `mds watch` compiled outputs and
-/// `.map` sidecars. Hard-link preservation is out of scope by construction (it
-/// would require truncate-in-place and forfeit crash safety); ACL/xattr/
-/// owner-group preservation is not planned — MDS only rewrites its own outputs
-/// and `.mds` sources.
-pub(crate) fn atomic_write_file(path: &Path, content: &str, durability: Durability) -> Result<()> {
-    use mds::{effective_parent, NativeFs};
-
-    // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
-    let parent = effective_parent(path);
-
-    // #409: this primitive writes every `mds build`/`watch` output (under a
-    // possibly-canonicalized `--out-dir`) and every `fmt`/`lint --fix` source
-    // rewrite, so its own error text must show the conventional form too, not a
-    // Windows verbatim prefix. Computed once and reused below.
-    let shown = mds::display_native_path(path);
-
-    // #227: `mds build` targets may not exist yet. Probe with lstat, which never
-    // follows a symlink: `Ok` means something is there (a regular file, or a
-    // symlink — live or dangling — which is refused below); `Err(NotFound)` means
-    // create a new file. Any other lstat failure is a hard error (#225: silently
-    // writing with a guessed mode was the defect, and a warning is not a decision).
-    let existing = match path.symlink_metadata() {
-        Ok(m) => Some(m),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(miette::miette!("cannot stat {}: {e}", shown.display())),
-    };
-
-    if let Some(m) = &existing {
-        if m.file_type().is_symlink() {
-            return Err(miette::miette!(
-                "cannot write {}: refusing to replace a symlink",
-                shown.display()
-            ));
+/// Like [`output_base_no_ext`] it is a probe: it reports nothing, the flattened arm
+/// included.
+pub(crate) fn output_stem_for(
+    source: &Path,
+    root: RootPaths<'_>,
+    base: &OutputBase,
+) -> WriteTarget {
+    match base {
+        OutputBase::Dir {
+            canonical,
+            shown,
+            below_anchor,
+        } => WriteTarget::below_out_dir(
+            canonical,
+            shown,
+            *below_anchor,
+            &mirror_stem(source, root.walked).into_path(),
+        ),
+        OutputBase::NextToSource => {
+            WriteTarget::walked_below(root, source).sibling(|source| source.with_extension(""))
         }
-        // Re-check for symlink right before writing (TOCTOU guard).
-        NativeFs::check_symlink(path)
-            .map_err(|e| miette::miette!("cannot write {}: {e}", shown.display()))?;
     }
-
-    // Mode to restore on Unix. The lstat result of a non-symlink IS the file's
-    // metadata, so there is no second stat call and no site left for the spurious
-    // metadata warning that fired on every first build (#225, #227).
-    // `None` = new file.
-    #[cfg(unix)]
-    let original_mode: Option<u32> = {
-        use std::os::unix::fs::PermissionsExt as _;
-        existing.as_ref().map(|m| m.permissions().mode())
-    };
-
-    // Temp file in same directory so rename is always intra-filesystem.
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".mds-tmp-").suffix(".tmp");
-    // New file: request 0666 and let the kernel apply the umask, so a first
-    // `mds build` creates the same mode `std::fs::write` did (typically 0644).
-    // `tempfile`'s default is 0600, which would make every fresh artifact
-    // owner-only.
-    #[cfg(unix)]
-    if original_mode.is_none() {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
-    }
-    let mut tmp = builder
-        .tempfile_in(parent)
-        .map_err(|e| miette::miette!("cannot create temp file for {}: {e}", shown.display()))?;
-
-    // Restore original permissions before writing; mask off file-type bits
-    // (high bits of st_mode) so only the permission bits reach from_mode.
-    #[cfg(unix)]
-    if let Some(mode) = original_mode {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode & 0o7777))
-            .map_err(|e| {
-                miette::miette!(
-                    "cannot set permissions on temp file for {}: {e}",
-                    shown.display()
-                )
-            })?;
-    }
-
-    tmp.write_all(content.as_bytes())
-        .map_err(|e| miette::miette!("cannot write {}: {e}", shown.display()))?;
-
-    // sync_all() flushes data + metadata to storage (flush() is a no-op on
-    // unbuffered File and provides no crash durability guarantee). Skipped for
-    // derived artifacts, which a rebuild reproduces — see `Durability`.
-    if durability == Durability::Fsync {
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| miette::miette!("cannot fsync {}: {e}", shown.display()))?;
-    }
-
-    // persist() atomically renames the temp file to the target path.
-    tmp.persist(path)
-        .map_err(|e| miette::miette!("cannot rename temp file to {}: {e}", shown.display()))?;
-
-    Ok(())
 }
 
 // ── Sanitized stderr render ───────────────────────────────────────────────────
@@ -954,15 +1925,21 @@ pub(crate) use mds::neutralize_source_for_render;
 
 /// A terminal-safe view of a [`miette::Report`], built **before** rendering.
 ///
-/// Overrides every prose surface the frame can render — the `Display` message, the
-/// `help` text, each [`miette::LabeledSpan`]'s label, and the whole auxiliary
-/// diagnostic graph (`source` cause chain, `related`, `diagnostic_source`) — with
-/// [`mds::sanitize_control_chars`]-escaped copies (HUMAN mode, so `\n` and `\t` survive
-/// and multi-line frames stay readable).  Everything the frame's geometry depends on —
-/// `code`, `severity`, `url`, `source_code`, and each label's byte span — is delegated
-/// to the inner report untouched, so the byte-length-preserving neutralization already
-/// applied to source excerpts (via `mds::named_source_for_render`) keeps every span
-/// offset and caret column exact.
+/// Overrides every text surface the frame can render — the `Display` message, the
+/// `code`, the `help` and `url` text, each [`miette::LabeledSpan`]'s label, and the
+/// whole auxiliary diagnostic graph (`source` cause chain, `related`,
+/// `diagnostic_source`) — with [`mds::sanitize_control_chars`]-escaped copies (HUMAN
+/// mode, so `\n` and `\t` survive and multi-line frames stay readable).  Everything the
+/// frame's geometry depends on — `severity`, `source_code`, and each label's byte span —
+/// is delegated to the inner report untouched, so the byte-length-preserving
+/// neutralization already applied to source excerpts (via `mds::named_source_for_render`)
+/// keeps every span offset and caret column exact.
+///
+/// Every copy is rendered at construction without panicking (#157): a surface whose
+/// `Display` fails is dropped, or — for a message, which is never optional — replaced
+/// by a fixed placeholder. miette then formats owned strings for all of those surfaces;
+/// what it still reads through the inner report is the source excerpt, and a read that
+/// fails there is handled by [`render_error_sanitized`].
 ///
 /// # Why this is the PF-014-correct boundary
 ///
@@ -1004,7 +1981,9 @@ pub(crate) use mds::neutralize_source_for_render;
 struct SanitizedReport {
     inner: miette::Report,
     message: String,
+    code: Option<String>,
     help: Option<String>,
+    url: Option<String>,
     source: Option<SanitizedNode>,
     related: Vec<SanitizedNode>,
     diagnostic_source: Option<SanitizedNode>,
@@ -1042,9 +2021,35 @@ struct SanitizedNode {
     diagnostic_source: Option<Box<SanitizedNode>>,
 }
 
+/// Placeholder for a message whose own `Display` failed (#157).
+const UNFORMATTABLE: &str = "(this text could not be formatted)";
+
+/// Render `d` into a `String` without panicking: `None` when its `Display` fails.
+///
+/// `to_string()` and `format!` panic when an impl returns `fmt::Error`, and a report's
+/// text comes from `Display` impls this crate does not control.
+fn display_text<T: std::fmt::Display + ?Sized>(d: &T) -> Option<String> {
+    let mut text = String::new();
+    std::fmt::Write::write_fmt(&mut text, format_args!("{d}")).ok()?;
+    Some(text)
+}
+
 /// Escape one optional `Display` surface to an owned `String`.
+///
+/// A surface whose `Display` fails is dropped: code, help and url are optional, so the
+/// frame renders without it.
 fn escape_display(d: Option<Box<dyn std::fmt::Display + '_>>) -> Option<String> {
-    d.map(|v| mds::sanitize_control_chars(&v.to_string()).into_owned())
+    d.and_then(|v| display_text(&*v))
+        .map(|text| mds::sanitize_control_chars(&text).into_owned())
+}
+
+/// Escape a message, or [`UNFORMATTABLE`] when its `Display` fails — a message is never
+/// optional, so its place says why it is empty.
+fn escape_message<T: std::fmt::Display + ?Sized>(d: &T) -> String {
+    display_text(d).map_or_else(
+        || UNFORMATTABLE.to_owned(),
+        |text| mds::sanitize_control_chars(&text).into_owned(),
+    )
 }
 
 /// Escape a `Diagnostic`'s label text, keeping each byte span verbatim.
@@ -1074,7 +2079,7 @@ impl SanitizedNode {
     /// Build from a `Diagnostic` node (used for `related` / `diagnostic_source`).
     fn from_diagnostic(d: &dyn miette::Diagnostic, depth: usize) -> Self {
         Self {
-            message: mds::sanitize_control_chars(&d.to_string()).into_owned(),
+            message: escape_message(d),
             help: escape_display(d.help()),
             code: escape_display(d.code()),
             url: escape_display(d.url()),
@@ -1090,7 +2095,7 @@ impl SanitizedNode {
     /// expose no `Diagnostic` data — only a `Display` message and a further `source()`).
     fn from_error(e: &(dyn std::error::Error + 'static), depth: usize) -> Self {
         Self {
-            message: mds::sanitize_control_chars(&e.to_string()).into_owned(),
+            message: escape_message(e),
             help: None,
             code: None,
             url: None,
@@ -1209,8 +2214,10 @@ fn related_iter(
 
 impl SanitizedReport {
     fn new(inner: miette::Report) -> Self {
-        let message = mds::sanitize_control_chars(&inner.to_string()).into_owned();
+        let message = escape_message(&inner);
+        let code = escape_display(inner.code());
         let help = escape_display(inner.help());
+        let url = escape_display(inner.url());
         let source = SanitizedNode::chain_from_error(std::error::Error::source(&*inner), 0)
             .map(|boxed| *boxed);
         let related = SanitizedNode::related_from(inner.as_ref(), 0);
@@ -1220,7 +2227,9 @@ impl SanitizedReport {
         Self {
             inner,
             message,
+            code,
             help,
+            url,
             source,
             related,
             diagnostic_source,
@@ -1257,7 +2266,7 @@ impl std::error::Error for SanitizedReport {
 
 impl miette::Diagnostic for SanitizedReport {
     fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.inner.code()
+        boxed_str(self.code.as_deref())
     }
 
     fn severity(&self) -> Option<miette::Severity> {
@@ -1269,7 +2278,7 @@ impl miette::Diagnostic for SanitizedReport {
     }
 
     fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.inner.url()
+        boxed_str(self.url.as_deref())
     }
 
     fn source_code(&self) -> Option<&dyn miette::SourceCode> {
@@ -1311,6 +2320,11 @@ fn sanitize_report(report: miette::Report) -> miette::Report {
 /// The rendered frame itself is never post-processed (PF-014); all escaping happens
 /// in [`sanitize_report`], before miette sees the values.
 ///
+/// Never panics (#157). The frame is rendered through `fmt::Write`, which reports a
+/// formatting failure as `fmt::Error` where `format!` would panic; when miette's render
+/// fails part-way — a source excerpt that cannot be read, say — the partial frame is
+/// discarded and [`plain_text_fallback`] renders the report instead.
+///
 /// Note: idempotency is a property of [`mds::sanitize_control_chars`] (calling it
 /// twice on already-sanitized input is a no-op), not of this function (each call
 /// re-renders the `Report` from scratch).  That idempotency is what lets
@@ -1318,7 +2332,35 @@ fn sanitize_report(report: miette::Report) -> miette::Report {
 /// neutralizes the source excerpt and filename, which this boundary cannot do.
 fn render_error_sanitized(report: miette::Report) -> String {
     let report = sanitize_report(report);
-    format!("{report:?}")
+    let mut rendered = String::new();
+    match std::fmt::Write::write_fmt(&mut rendered, format_args!("{report:?}")) {
+        Ok(()) => rendered,
+        Err(std::fmt::Error) => plain_text_fallback(report.as_ref()),
+    }
+}
+
+/// The plain-text form of a report whose frame miette could not render: its code, its
+/// message and its help, each escaped, laid out like miette's frame without the source
+/// excerpt. A surface whose `Display` fails is left out, as in [`SanitizedReport`].
+fn plain_text_fallback(d: &dyn miette::Diagnostic) -> String {
+    let mut out = String::new();
+    if let Some(code) = d.code().and_then(|c| display_text(&*c)) {
+        out.push_str(&mds::sanitize_control_chars_wire(&code));
+        out.push_str("\n\n");
+    }
+    push_frame_block(&mut out, "  \u{00d7} ", &escape_message(d));
+    if let Some(help) = escape_display(d.help()) {
+        push_frame_block(&mut out, "  help: ", &help);
+    }
+    out
+}
+
+/// Push `lead` and `text`, continuing each further line of `text` under miette's
+/// U+2502 rule, then end the line.
+fn push_frame_block(out: &mut String, lead: &str, text: &str) {
+    out.push_str(lead);
+    out.push_str(&text.replace('\n', "\n  \u{2502} "));
+    out.push('\n');
 }
 
 /// Render a miette `Report` to stderr — the single choke-point for all CLI error
@@ -1344,10 +2386,12 @@ fn render_error_sanitized(report: miette::Report) -> String {
 /// miette's own ANSI SGR styling is passed through untouched — carets and box-drawing
 /// survive intact.
 ///
+/// Writes through `ewriteln!`, so a closed or failing stderr never panics (#157).
+///
 /// Note: status-line path display (`Clean:`, `Fixed:`, etc.) is handled by the
 /// separate [`safe_path`] helper, not by this function.
 pub(crate) fn eprint_error(report: miette::Report) {
-    eprintln!("{}", render_error_sanitized(report));
+    ewriteln!("{}", render_error_sanitized(report));
 }
 
 /// Print a CLI warning to stderr with HUMAN-mode escaping applied to the whole line
@@ -1392,8 +2436,10 @@ pub(crate) fn eprint_error(report: miette::Report) {
 /// escape helpers, and which applies the same rule to `format!` invocations nested
 /// inside `eprint_warning` calls. `watch.rs`'s lifecycle status lines — previously
 /// carved out as a pre-existing gap — are in scope and now routed like everything else.
+///
+/// Writes through `ewriteln!`, so a closed or failing stderr never panics (#157).
 pub(crate) fn eprint_warning(w: &str) {
-    eprintln!("{}", mds::sanitize_control_chars(w));
+    ewriteln!("{}", mds::sanitize_control_chars(w));
 }
 
 /// Neutralize hostile control bytes in source text for `--diff` preview output.
@@ -1569,9 +2615,9 @@ pub(crate) fn safe_file_display(name: &str) -> String {
 ///
 /// This is the general form of [`safe_path`] / [`safe_file_display`]: the same WIRE
 /// escape (those two also escape `\t`, which a path may not carry), for values that are
-/// neither a `Path` nor a filename — an `io::Error`
-/// `Display` (which embeds a filesystem path), an `mds.json` rule name or config value,
-/// a `--format` argument, a fix-rejection reason.
+/// neither a `Path` nor a filename — the cause of an I/O or file-watcher error, with its
+/// paths dropped first ([`io_cause`], [`notify_cause`]), an `mds.json` rule name or config
+/// value, a `--format` argument, a fix-rejection reason.
 ///
 /// # Why WIRE, on human surfaces too
 ///
@@ -1600,6 +2646,49 @@ pub(crate) fn safe_inline(value: impl std::fmt::Display) -> String {
     mds::sanitize_control_chars_wire(&value.to_string()).into_owned()
 }
 
+/// The text [`notify_cause`] shows for a file watcher's own message that names a path.
+const WATCHER_ERROR: &str = "file watcher error";
+
+/// The cause an [`std::io::Error`] gives, with any path it carries dropped (#390): what
+/// every message `mds` builds around an I/O error interpolates — through [`safe_inline`],
+/// like any other value a line interpolates.
+///
+/// An error the operating system raised displays as the system's description and code
+/// (`Permission denied (os error 13)`), and one made from a kind alone, or from a message
+/// of std's own, as that kind or message: none of them names a path, so each is shown as
+/// it displays. An error that carries a payload — text or an error a library attached —
+/// is shown by its kind alone (`permission denied`): the payload may quote a path, as
+/// tempfile's does (`… at path "<the temporary file>"`), and its cause chain need not lead
+/// back to the error it wraps (tempfile's skips it).
+pub(crate) fn io_cause(e: &std::io::Error) -> String {
+    match e.get_ref() {
+        None => e.to_string(),
+        Some(_) => e.kind().to_string(),
+    }
+}
+
+/// The cause a [`notify::Error`] gives, without the paths it lists (#390) — through
+/// [`safe_inline`] in a message, as [`io_cause`]'s is.
+///
+/// notify displays an error as its kind's text followed by ` about [<paths>]`, the paths
+/// it was handed — for `mds watch`, a directory's canonical path. Only the kind's text is
+/// shown: an I/O error's through [`io_cause`], notify's own fixed texts in notify's words,
+/// and a backend's own message as given (`Input watch path is neither a file nor a
+/// directory.` on Windows) unless it carries a path separator, when [`WATCHER_ERROR`]
+/// stands for it.
+pub(crate) fn notify_cause(e: &notify::Error) -> String {
+    use notify::ErrorKind;
+    match &e.kind {
+        ErrorKind::Io(io) => io_cause(io),
+        ErrorKind::Generic(text) if !text.contains(['/', '\\']) => text.clone(),
+        ErrorKind::Generic(_) => WATCHER_ERROR.to_owned(),
+        ErrorKind::PathNotFound => notify::Error::path_not_found().to_string(),
+        ErrorKind::WatchNotFound => notify::Error::watch_not_found().to_string(),
+        ErrorKind::InvalidConfig(config) => notify::Error::invalid_config(config).to_string(),
+        ErrorKind::MaxFilesWatch => notify::Error::new(ErrorKind::MaxFilesWatch).to_string(),
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1607,23 +2696,474 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// An out-dir written at `/out` and typed as `out`, so every assertion tells the two
+    /// forms apart.
+    fn out_base() -> OutputBase {
+        OutputBase::Dir {
+            canonical: PathBuf::from("/out"),
+            shown: PathBuf::from("out"),
+            below_anchor: 0,
+        }
+    }
+
+    /// The file `rel` below the anchor `anchor`, named below `shown_anchor` (#160).
+    fn target(anchor: &str, shown_anchor: &str, rel: &str) -> WriteTarget {
+        WriteTarget::below(Path::new(anchor), Path::new(shown_anchor), Path::new(rel))
+    }
+
+    /// #390: a directory-mode output is written below the out-dir's canonical form and
+    /// named below its shown form — the same file below each; a map sidecar derives from
+    /// both forms alike; and an output next to its source is named as the walk found it.
+    /// #160: each is anchored at the out-dir, or at the directory argument next to its
+    /// source, with the directories the mirror keeps below that anchor.
+    #[test]
+    fn an_output_is_written_below_the_canonical_out_dir_and_named_below_the_typed_one() {
+        let source = Path::new("/root/sub/page.mds");
+        let root = Path::new("/root");
+        let out = output_path_for(source, RootPaths::as_typed(root), &out_base(), "md");
+        assert_eq!(out, target("/out", "out", "sub/page.md"));
+        assert_eq!(
+            out.sibling(crate::build::map_path_for),
+            target("/out", "out", "sub/page.md.map")
+        );
+        assert_eq!(
+            output_path_for(
+                Path::new("src/sub/page.mds"),
+                RootPaths::as_typed(Path::new("src")),
+                &OutputBase::NextToSource,
+                "md"
+            ),
+            target("src", "src", "sub/page.md")
+        );
+    }
+
+    /// What mds writes for the messages template `@message user:` / `Hi` / `@end`.
+    const HI: &str = "[\n  {\n    \"role\": \"user\",\n    \"content\": \"Hi\"\n  }\n]\n";
+
+    /// What a build writes for the messages template `source` — compiled as a build
+    /// compiles it — in `dir`.
+    fn compiled_messages(dir: &Path, source: &str) -> String {
+        let path = dir.join("chat.mds");
+        std::fs::write(&path, source).unwrap();
+        let compiled =
+            crate::build::compile_to_content(&path, None, true, mds::CompileOptions::default())
+                .unwrap();
+        assert_eq!(compiled.kind, OutputKind::Messages, "{source:?}");
+        compiled.content
+    }
+
+    /// Whether `bytes` is proven a messages output mds wrote, read no further than `cap`.
+    fn proven(bytes: &[u8], cap: u64) -> bool {
+        holds_messages_output(&mut &bytes[..], bytes.len() as u64, cap).unwrap()
+    }
+
+    /// #160: a messages output is proven one mds wrote by its exact bytes, and by nothing
+    /// less: the same messages formatted or escaped another way, a field more, fewer or in
+    /// another order, another shape, bytes that are not UTF-8, and one byte over the cap
+    /// are not. Control: what a build writes — a message's quotes, tab and non-ASCII
+    /// characters as it escapes them, and the empty array of a template whose messages are
+    /// all empty — is.
+    #[test]
+    fn a_messages_output_is_proven_only_by_the_bytes_mds_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            compiled_messages(dir.path(), "@message user:\nHi\n@end\n"),
+            HI
+        );
+        let escaped = compiled_messages(
+            dir.path(),
+            "@message system:\nSay \"hi\"\tthen go\n@end\n@message user:\nCaf\u{e9} \u{2014} 1 < 2\n@end\n",
+        );
+        // A messages template whose only message has an empty body has none to write.
+        let none = compiled_messages(dir.path(), "@message user:\n  \n@end\n");
+        assert_eq!(none, "[]\n", "mds writes an empty messages output");
+        for (name, output) in [
+            ("HI", HI),
+            ("escaped", escaped.as_str()),
+            ("none", none.as_str()),
+        ] {
+            assert!(
+                proven(output.as_bytes(), mds::MAX_FILE_SIZE),
+                "control: {name} {output:?}"
+            );
+        }
+
+        let backslash = '\\';
+        let not_written_by_mds: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "compact",
+                b"[{\"role\":\"user\",\"content\":\"Hi\"}]\n".to_vec(),
+            ),
+            ("no final newline", HI.trim_end_matches('\n').into()),
+            ("CRLF", HI.replace('\n', "\r\n").into()),
+            (
+                "a byte-order mark",
+                [&b"\xEF\xBB\xBF"[..], HI.as_bytes()].concat(),
+            ),
+            (
+                "another escape",
+                HI.replace("\"Hi\"", &format!("\"H{backslash}u0069\""))
+                    .into(),
+            ),
+            (
+                "a field more",
+                HI.replace("\"Hi\"\n", "\"Hi\",\n    \"name\": \"x\"\n")
+                    .into(),
+            ),
+            (
+                "a field fewer",
+                HI.replace(",\n    \"content\": \"Hi\"", "").into(),
+            ),
+            (
+                "fields in another order",
+                b"[\n  {\n    \"content\": \"Hi\",\n    \"role\": \"user\"\n  }\n]\n".to_vec(),
+            ),
+            ("content not a string", HI.replace("\"Hi\"", "1").into()),
+            (
+                "an object",
+                b"{\n  \"role\": \"user\",\n  \"content\": \"Hi\"\n}\n".to_vec(),
+            ),
+            ("strings", b"[\n  \"Hi\"\n]\n".to_vec()),
+            ("null", b"null\n".to_vec()),
+            ("empty", Vec::new()),
+            ("a raw control character", HI.replace("Hi", "H\u{1}").into()),
+        ];
+        for (name, bytes) in not_written_by_mds {
+            assert!(!proven(&bytes, mds::MAX_FILE_SIZE), "{name}: {bytes:?}");
+        }
+        let mut not_utf8 = HI.as_bytes().to_vec();
+        let at = HI.find("Hi").unwrap() + 1;
+        not_utf8[at] = 0xFF;
+        assert!(!proven(&not_utf8, mds::MAX_FILE_SIZE), "not UTF-8");
+
+        let size = HI.len() as u64;
+        assert!(
+            proven(HI.as_bytes(), size),
+            "control: a file of exactly the cap"
+        );
+        assert!(!proven(HI.as_bytes(), size - 1), "one byte over the cap");
+        assert!(
+            !holds_messages_output(&mut HI.as_bytes(), size + 1, size).unwrap(),
+            "a size over the cap"
+        );
+        assert!(
+            !holds_messages_output(&mut HI.as_bytes(), 1, size - 1).unwrap(),
+            "a reader holding more than the cap whatever its size said"
+        );
+    }
+
+    /// #160: a stale output whose directory below the anchor is a symlink is not removed
+    /// through it, though it holds exactly what mds writes: the removal is refused
+    /// (`mds::io`), naming the stale output and the link as shown, and the file of that
+    /// name where the link leads is left. Control: the same stale output below a real
+    /// directory is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_output_is_never_removed_through_a_symlink_below_its_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir_all(anchor.join("real")).unwrap();
+        std::fs::create_dir(dir.path().join("victim")).unwrap();
+        std::os::unix::fs::symlink("../victim", anchor.join("sub")).unwrap();
+        let victim = dir.path().join("victim/x.json");
+        std::fs::write(&victim, HI).unwrap();
+
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("sub/x.md"));
+        let result = probe_and_remove_stale(&written, OutputKind::Markdown, true);
+        assert_eq!(
+            std::fs::read_to_string(&victim).ok().as_deref(),
+            Some(HI),
+            "nothing is removed through the symlink"
+        );
+        match result {
+            Err(mds::MdsError::Io { message }) => assert_eq!(
+                message,
+                "could not remove stale output out/sub/x.json: \
+                 refusing to follow a symlink at out/sub"
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+
+        // Control: below a real directory, the stale output is removed.
+        let real = anchor.join("real/x.json");
+        std::fs::write(&real, HI).unwrap();
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("real/x.md"));
+        assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
+        assert!(!real.exists(), "control: the stale output is removed");
+    }
+
+    /// #160, #157: a stale output proven mds's whose removal fails is an `mds::io` error
+    /// naming it as shown, and the file is left; a build reports it and exits 2. Control:
+    /// once its directory is writable again, it is removed.
+    ///
+    /// Unix-only: a mode makes the directory read-only; skipped where it does not (as
+    /// root).
+    #[cfg(unix)]
+    #[test]
+    fn a_proven_stale_output_that_cannot_be_removed_is_an_io_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir(&anchor).unwrap();
+        let stale = anchor.join("x.json");
+        std::fs::write(&stale, HI).unwrap();
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("x.md"));
+        let mode = |mode| std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(mode));
+        mode(0o555).unwrap();
+        if std::fs::write(anchor.join(".probe"), "").is_ok() {
+            mode(0o755).unwrap();
+            ewriteln!("skipped: out is writable at mode 0o555 (running as root?)");
+            return;
+        }
+        let result = probe_and_remove_stale(&written, OutputKind::Markdown, true);
+        mode(0o755).unwrap();
+
+        match result {
+            Err(mds::MdsError::Io { message }) => assert_eq!(
+                message,
+                format!(
+                    "could not remove stale output out/x.json: {}",
+                    std::io::Error::from(rustix::io::Errno::ACCESS)
+                )
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&stale).ok().as_deref(), Some(HI));
+        assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
+        assert!(!stale.exists(), "control: the stale output is removed");
+    }
+
+    /// #160, #157: the same on Windows — a stale output proven mds's whose removal fails is
+    /// an `mds::io` error naming it as shown, and the file is left. Control: once nothing
+    /// holds it, it is removed.
+    ///
+    /// Windows-only — it runs in the Windows CI leg, never on a unix machine. There, a file
+    /// held open by a handle that does not share deletion cannot be removed while it is
+    /// held; a read-only file is no such case, since std removes one on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn a_proven_stale_output_held_open_on_windows_is_an_io_error() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        /// `FILE_SHARE_READ`: another handle may read the file, never delete it.
+        const FILE_SHARE_READ: u32 = 0x1;
+        /// `ERROR_SHARING_VIOLATION`: what removing a file another handle denies that gives.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir(&anchor).unwrap();
+        let stale = anchor.join("x.json");
+        std::fs::write(&stale, HI).unwrap();
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("x.md"));
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&stale)
+            .unwrap();
+        let result = probe_and_remove_stale(&written, OutputKind::Markdown, true);
+        drop(held);
+
+        match result {
+            Err(mds::MdsError::Io { message }) => assert_eq!(
+                message,
+                format!(
+                    "could not remove stale output {}: {}",
+                    Path::new("out").join("x.json").display(),
+                    std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION)
+                )
+            ),
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&stale).ok().as_deref(), Some(HI));
+        assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
+        assert!(!stale.exists(), "control: the stale output is removed");
+    }
+
+    /// #160: a stale `.json` whose bytes are not UTF-8, or that is larger than the read
+    /// cap (10 MiB), is not proven mds's and is kept by a directory build's cleanup, though
+    /// it holds what mds writes for a messages output but for one byte, or would hold
+    /// exactly that but for its size. Control: the same messages output of exactly the
+    /// cap, and the output with its byte restored, are each removed. Built at run time.
+    #[test]
+    fn a_stale_json_that_is_not_utf8_or_over_the_read_cap_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("out");
+        std::fs::create_dir(&anchor).unwrap();
+        let stale = anchor.join("x.json");
+        let written = WriteTarget::below(&anchor, Path::new("out"), Path::new("x.md"));
+        let kept_or_removed = |bytes: &[u8]| {
+            std::fs::write(&stale, bytes).unwrap();
+            assert!(probe_and_remove_stale(&written, OutputKind::Markdown, true).is_ok());
+            if stale.exists() {
+                "kept"
+            } else {
+                "removed"
+            }
+        };
+
+        let mut not_utf8 = HI.as_bytes().to_vec();
+        not_utf8[HI.find("Hi").unwrap() + 1] = 0xFF;
+        assert_eq!(kept_or_removed(&not_utf8), "kept", "not UTF-8");
+        assert_eq!(kept_or_removed(HI.as_bytes()), "removed", "control: {HI:?}");
+
+        // What mds writes for one message whose content is `len` bytes of `a`.
+        let output = |len: usize| {
+            let message = WrittenMessage {
+                role: "user".to_owned(),
+                content: "a".repeat(len),
+            };
+            crate::build::messages_json(&[message]).unwrap()
+        };
+        let cap = usize::try_from(mds::MAX_FILE_SIZE).unwrap();
+        let frame = output(0).len();
+        let over = output(cap + 1 - frame);
+        assert_eq!(over.len(), cap + 1, "one byte over the cap");
+        assert_eq!(kept_or_removed(over.as_bytes()), "kept", "over the cap");
+        let at_cap = output(cap - frame);
+        assert_eq!(at_cap.len(), cap, "exactly the cap");
+        assert_eq!(
+            kept_or_removed(at_cap.as_bytes()),
+            "removed",
+            "control: exactly the cap"
+        );
+    }
+
+    /// #390: a root walked in another form than it was typed in — `mds watch` walks the
+    /// canonical directory — names an output next to its source, and the stem it is named
+    /// from, below the directory as typed, while both are written and probed below the
+    /// walked form; under an out-dir the typed root changes nothing. A source outside the
+    /// walked root has no typed form and keeps its own.
+    #[test]
+    fn an_output_next_to_its_source_is_named_below_the_root_as_typed() {
+        let root = RootPaths {
+            typed: Path::new("src"),
+            walked: Path::new("/root"),
+        };
+        let source = Path::new("/root/sub/page.mds");
+        let next_to = OutputBase::NextToSource;
+
+        assert_eq!(
+            output_path_for(source, root, &next_to, "md"),
+            target("/root", "src", "sub/page.md")
+        );
+        assert_eq!(
+            output_stem_for(source, root, &next_to),
+            target("/root", "src", "sub/page")
+        );
+        assert_eq!(
+            output_path_for(source, root, &out_base(), "json"),
+            target("/out", "out", "sub/page.json")
+        );
+        assert_eq!(
+            output_stem_for(source, root, &out_base()),
+            target("/out", "out", "sub/page")
+        );
+        assert_eq!(
+            output_stem_for(Path::new("/other/page.mds"), root, &next_to),
+            WriteTarget::as_typed(PathBuf::from("/other/page"))
+        );
+    }
+
+    /// #390: `resolve_output_base` fixes both forms of the out-dir: the canonical form is
+    /// absolute, the shown form is the out-dir exactly as typed; `mds.json`'s
+    /// `build.output_dir` is resolved below the config directory and shown below the
+    /// directory `mds.json` was reached by. #160: `--out-dir` is its writes' anchor, and
+    /// `build.output_dir`'s own directories lie below the config directory, theirs.
+    #[test]
+    fn the_out_dir_is_shown_as_typed_and_resolved_absolute() {
+        let typed = PathBuf::from("out");
+        match resolve_output_base(Some(&typed), &None).expect("a relative out-dir resolves") {
+            OutputBase::Dir {
+                canonical,
+                shown,
+                below_anchor,
+            } => {
+                assert!(canonical.is_absolute(), "canonical: {canonical:?}");
+                assert!(canonical.ends_with("out"), "canonical: {canonical:?}");
+                assert_eq!(shown, typed);
+                assert_eq!(below_anchor, 0);
+            }
+            other => panic!("want Dir; got {other:?}"),
+        }
+
+        let config = Some(ProjectConfig {
+            config: crate::build::MdsConfig {
+                build: crate::build::BuildConfig {
+                    output_dir: Some("dist".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            dir: PathBuf::from("/project"),
+            shown_dir: PathBuf::from("src/.."),
+        });
+        match resolve_output_base(None, &config).expect("a config output_dir resolves") {
+            OutputBase::Dir {
+                canonical,
+                shown,
+                below_anchor,
+            } => {
+                assert_eq!(canonical, Path::new("/project").join("dist"));
+                assert_eq!(shown, Path::new("src/..").join("dist"));
+                assert_eq!(below_anchor, 1);
+            }
+            other => panic!("want Dir; got {other:?}"),
+        }
+    }
+
+    /// #160: a directory-mode output below `mds.json`'s `build.output_dir` is anchored at
+    /// the directory `mds.json` is in, `build.output_dir`'s own directories below it — a
+    /// `.` adds none — and an absolute value is refused before it can name an anchor.
+    #[test]
+    fn a_build_output_dir_lies_below_the_config_directory() {
+        let config = |output_dir: &str| {
+            Some(ProjectConfig {
+                config: crate::build::MdsConfig {
+                    build: crate::build::BuildConfig {
+                        output_dir: Some(output_dir.to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                dir: PathBuf::from("/project"),
+                shown_dir: PathBuf::from("."),
+            })
+        };
+        let root = PathBuf::from("/project/src");
+        let source = root.join("sub").join("a.mds");
+        for (output_dir, rel) in [("dist", "dist/sub/a.md"), ("./a/b", "a/b/sub/a.md")] {
+            let base = resolve_output_base(None, &config(output_dir)).expect("relative");
+            assert_eq!(
+                output_path_for(&source, RootPaths::as_typed(&root), &base, "md"),
+                target("/project", ".", rel),
+                "{output_dir:?}"
+            );
+        }
+        let absolute = std::env::temp_dir().join("dist");
+        let refused = resolve_output_base(None, &config(absolute.to_str().unwrap()))
+            .expect_err("an absolute output_dir is refused")
+            .to_string();
+        assert!(refused.contains("must be a relative path"), "{refused}");
+    }
+
     // T-CLI-21 (unit): output_path_for with "json" / "md" extensions.
     #[test]
     fn output_path_for_json_extension_dir_mode() {
         let source = PathBuf::from("/root/src/chat.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base, "json");
-        assert_eq!(result, PathBuf::from("/out/src/chat.json"));
+        let base = out_base();
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "json");
+        assert_eq!(result, target("/out", "out", "src/chat.json"));
     }
 
     #[test]
     fn output_path_for_md_extension_dir_mode() {
         let source = PathBuf::from("/root/src/page.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base, "md");
-        assert_eq!(result, PathBuf::from("/out/src/page.md"));
+        let base = out_base();
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
+        assert_eq!(result, target("/out", "out", "src/page.md"));
     }
 
     #[test]
@@ -1631,8 +3171,8 @@ mod tests {
         let source = PathBuf::from("/root/src/page.mds");
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
-        let result = output_path_for(&source, &root, &base, "md");
-        assert_eq!(result, PathBuf::from("/root/src/page.md"));
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
+        assert_eq!(result, target("/root", "/root", "src/page.md"));
     }
 
     #[test]
@@ -1640,8 +3180,8 @@ mod tests {
         let source = PathBuf::from("/root/src/chat.mds");
         let root = PathBuf::from("/root");
         let base = OutputBase::NextToSource;
-        let result = output_path_for(&source, &root, &base, "json");
-        assert_eq!(result, PathBuf::from("/root/src/chat.json"));
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "json");
+        assert_eq!(result, target("/root", "/root", "src/chat.json"));
     }
 
     // T-CLI-21 (unit): ..‑containment guard (AC-M7) still holds.
@@ -1650,14 +3190,14 @@ mod tests {
     fn output_path_for_outside_root_falls_back_to_flat() {
         let source = PathBuf::from("/other/page.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base, "md");
+        let base = out_base();
+        let result = output_path_for(&source, RootPaths::as_typed(&root), &base, "md");
         // Must be inside /out, not escape to /other.
         assert!(
-            result.starts_with("/out"),
+            result.path.starts_with("/out"),
             "output must be inside /out; got {result:?}"
         );
-        assert_eq!(result, PathBuf::from("/out/page.md"));
+        assert_eq!(result, target("/out", "out", "page.md"));
     }
 
     /// Body of the first `fn` whose header starts with `header`, brace-matched from the
@@ -1682,7 +3222,7 @@ mod tests {
         None
     }
 
-    /// #217: the `Dir(_)` oracles must be able to say WHICH arm produced a stem — the
+    /// #217: the `Dir`-mode oracles must be able to say WHICH arm produced a stem — the
     /// subtree mirror, or the out-of-root flatten that drops the subtree and lets two
     /// sources with the same file name collide.
     ///
@@ -1691,21 +3231,13 @@ mod tests {
     #[test]
     fn mirror_stem_classifies_out_of_root_as_flattened() {
         assert_eq!(
-            mirror_stem(
-                Path::new("/other/page.mds"),
-                Path::new("/root"),
-                Path::new("/out"),
-            ),
-            MirroredStem::Flattened(PathBuf::from("/out/page")),
+            mirror_stem(Path::new("/other/page.mds"), Path::new("/root")),
+            MirroredStem::Flattened(PathBuf::from("page")),
             "a source outside the root loses its subtree and must say so"
         );
         assert_eq!(
-            mirror_stem(
-                Path::new("/root/a/page.mds"),
-                Path::new("/root"),
-                Path::new("/out"),
-            ),
-            MirroredStem::Mirrored(PathBuf::from("/out/a/page")),
+            mirror_stem(Path::new("/root/a/page.mds"), Path::new("/root")),
+            MirroredStem::Mirrored(PathBuf::from("a/page")),
             "a source below the root keeps its subtree and must NOT be reported"
         );
     }
@@ -1723,7 +3255,7 @@ mod tests {
     fn stemless_source_never_escapes_out_dir() {
         let source = Path::new("/");
         let root = Path::new("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = out_base();
 
         assert_eq!(
             output_base_no_ext(source, root, &base),
@@ -1731,17 +3263,17 @@ mod tests {
             "the probe oracle must keep a stem-less source inside the out-dir"
         );
         assert_eq!(
-            output_path_for(source, root, &base, "md"),
-            PathBuf::from("/out/output.md"),
+            output_path_for(source, RootPaths::as_typed(root), &base, "md"),
+            target("/out", "out", "output.md"),
             "the write oracle must not join an absolute stem"
         );
     }
 
     /// #217: the out-of-root flatten is reported from the WRITE oracle only.
     ///
-    /// `output_base_no_ext` is a probe: watch calls it to guess the output siblings of a
-    /// source it is about to forget, repeatedly per batch and for sources that are never
-    /// written. A warning there would fire on bookkeeping rather than on a write.
+    /// `output_base_no_ext` is a probe: a directory build takes a source map's base from
+    /// it, for a stem no output is written at. A warning there would fire on bookkeeping
+    /// rather than on a write.
     /// `output_path_for` is called once per output path actually computed for a write,
     /// so that is where the report belongs.
     ///
@@ -1755,8 +3287,6 @@ mod tests {
 
         let oracle = fn_body(SRC, "fn output_path_for(")
             .expect("non-vacuity: fn output_path_for must be present in this file");
-        let probe = fn_body(SRC, "fn output_base_no_ext(")
-            .expect("non-vacuity: fn output_base_no_ext must be present in this file");
 
         assert!(
             oracle.contains("eprint_warning("),
@@ -1766,15 +3296,21 @@ mod tests {
             oracle.contains(NEEDLE),
             "the write oracle's report must name the out-of-root condition; body: {oracle}"
         );
-        assert!(
-            !probe.contains("eprint_warning("),
-            "the probe oracle must stay silent — it runs on bookkeeping, not on writes; \
-             body: {probe}"
-        );
-        assert!(
-            !probe.contains(NEEDLE),
-            "the probe oracle must not carry the report text either; body: {probe}"
-        );
+        // Both probes: the stem, and the stem in both forms that an output beside its
+        // source is named from (#390).
+        for header in ["fn output_base_no_ext(", "fn output_stem_for("] {
+            let probe = fn_body(SRC, header)
+                .unwrap_or_else(|| panic!("non-vacuity: {header} must be present in this file"));
+            assert!(
+                !probe.contains("eprint_warning("),
+                "the probe oracle must stay silent — it runs on bookkeeping, not on writes; \
+                 body: {probe}"
+            );
+            assert!(
+                !probe.contains(NEEDLE),
+                "the probe oracle must not carry the report text either; body: {probe}"
+            );
+        }
     }
 
     /// The `.<name>.tmp-<pid>-<n>` temp files an atomic write leaves in flight must
@@ -2022,7 +3558,7 @@ mod tests {
     fn output_base_no_ext_dir_mode() {
         let source = PathBuf::from("/root/src/chat.mds");
         let root = PathBuf::from("/root");
-        let base = OutputBase::Dir(PathBuf::from("/out"));
+        let base = out_base();
         let result = output_base_no_ext(&source, &root, &base);
         assert_eq!(result, PathBuf::from("/out/src/chat"));
     }
@@ -2608,7 +4144,7 @@ mod tests {
 
     // ── eprint_warning: the CLI warning sanitization boundary (CWE-150 / PF-004 / #176) ──
     //
-    // eprint_warning is a thin wrapper around mds::sanitize_control_chars + eprintln!.
+    // eprint_warning is a thin wrapper around mds::sanitize_control_chars + ewriteln!.
     // The tests below exercise the transformation directly (the pure function that the
     // wrapper applies) to keep assertions deterministic without capturing stderr.
     //
@@ -2663,7 +4199,7 @@ mod tests {
             "MAX_SOURCEMAP_SEGMENTS exceeded in imported module 'lib{}[2Jbar.mds'",
             '\u{1b}'
         );
-        // This is exactly what eprint_warning applies before calling eprintln!.
+        // This is exactly what eprint_warning applies before calling ewriteln!.
         let result = mds::sanitize_control_chars(&hostile);
 
         // Non-vacuity: the plain-text content is preserved.
@@ -2766,379 +4302,1282 @@ mod tests {
         assert!(colorized.contains("\x1b[36m+++ b\x1b[0m"));
     }
 
-    // ── atomic_write_file ─────────────────────────────────────────────────────
+    // ── io_cause / notify_cause: a cause with no path in it (#390) ─────────────
 
-    /// Names of leftover `.mds-tmp-*` entries directly inside `dir`.
-    fn temp_residue(dir: &Path) -> Vec<String> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(".mds-tmp-"))
-            .collect()
+    /// The name of a directory no cause text could carry by chance. The tests look for
+    /// this name, not for the whole path: tempfile and notify quote a path in its `Debug`
+    /// spelling, which doubles each `\`, so on Windows a path as it displays never
+    /// appears in their text.
+    const SENTINEL_DIR: &str = "sentinel-cause-dir";
+
+    /// An absolute path below [`SENTINEL_DIR`], a directory that does not exist — so an
+    /// error about it is a real one, raised for that path.
+    fn sentinel(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join(SENTINEL_DIR).join("leaf")
     }
 
-    /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
-    ///
-    /// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
-    /// name and contract (#147): Unix needs no privilege; Windows needs Developer
-    /// Mode or an elevated process (GitHub's `windows-latest` runners have
-    /// Developer Mode enabled, so a failure there is a genuine regression and
-    /// must panic), and only the unprivileged local case — `CI` unset plus raw
-    /// OS error 1314 (`ERROR_PRIVILEGE_NOT_HELD`) — is a skip. Duplicated rather
-    /// than shared because this crate has no unit-test-scope helper module.
-    fn make_symlink(target: &Path, link: &Path) -> bool {
-        #[cfg(unix)]
-        let result = std::os::unix::fs::symlink(target, link);
-        #[cfg(windows)]
-        let result = if target.is_dir() {
-            std::os::windows::fs::symlink_dir(target, link)
-        } else {
-            std::os::windows::fs::symlink_file(target, link)
-        };
+    /// A library error that carries a path in its own text is shown by its kind alone:
+    /// tempfile's `at path "…"`, and any other payload. An error of the operating system's
+    /// keeps its text, which names no path. Controls: each error's own text carries the
+    /// sentinel, so its absence below means the helper dropped it.
+    #[test]
+    fn io_cause_drops_the_path_an_error_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = sentinel(&dir);
+        let needle = SENTINEL_DIR;
 
-        match result {
-            Ok(()) => true,
-            Err(err) => {
-                #[cfg(windows)]
-                {
-                    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
-                    if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
-                        && std::env::var_os("CI").is_none()
-                    {
-                        eprintln!(
-                            "skipping: symlink creation needs Developer Mode or an elevated process on Windows"
-                        );
-                        return false;
-                    }
+        // tempfile wraps the error creating its file in one that names the file.
+        let tempfile = tempfile::Builder::new()
+            .tempfile_in(sentinel.parent().unwrap())
+            .expect_err("no temporary file below a directory that does not exist");
+        assert!(
+            tempfile.to_string().contains(needle),
+            "control: tempfile's text names the path: {tempfile}"
+        );
+        let cause = io_cause(&tempfile);
+        assert!(!cause.contains(needle), "{cause}");
+        assert!(!cause.contains("at path"), "{cause}");
+        assert_eq!(cause, tempfile.kind().to_string(), "its kind's text");
+
+        let custom = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("denied: {}", sentinel.display()),
+        );
+        assert!(custom.to_string().contains(needle), "control: {custom}");
+        assert_eq!(io_cause(&custom), "permission denied");
+
+        // The operating system's own error keeps its words and code.
+        let os = std::fs::File::open(&sentinel).expect_err("the sentinel does not exist");
+        assert!(os.raw_os_error().is_some(), "control: an OS error: {os:?}");
+        assert_eq!(io_cause(&os), os.to_string());
+        assert!(io_cause(&os).contains("(os error "), "{}", io_cause(&os));
+
+        // An error made from a kind alone is that kind's text.
+        let kind = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(io_cause(&kind), std::io::ErrorKind::NotFound.to_string());
+    }
+
+    /// A file watcher's error is shown by its kind's text, without the paths notify lists
+    /// after it (` about ["…"]`): notify's own fixed texts as notify words them, an I/O
+    /// error through [`io_cause`], and a backend's message as it gives it unless it names
+    /// a path. Every kind notify has is listed. Controls: notify's own text of each carries
+    /// the sentinel.
+    #[test]
+    fn notify_cause_drops_the_paths_a_watcher_error_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = sentinel(&dir);
+        let needle = SENTINEL_DIR;
+        let listing = |e: notify::Error| e.add_path(sentinel.clone());
+        let os = std::fs::File::open(&sentinel).expect_err("the sentinel does not exist");
+        let os_text = os.to_string();
+        let config = notify::Config::default();
+
+        // (the error, its cause)
+        let cases = [
+            (
+                listing(notify::Error::path_not_found()),
+                "No path was found.".to_owned(),
+            ),
+            (
+                listing(notify::Error::watch_not_found()),
+                "No watch was found.".to_owned(),
+            ),
+            (
+                listing(notify::Error::invalid_config(&config)),
+                format!("Invalid configuration: {config:?}"),
+            ),
+            (
+                listing(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+                "OS file watch limit reached.".to_owned(),
+            ),
+            (listing(notify::Error::io(os)), os_text),
+            (
+                listing(notify::Error::generic(
+                    "Input watch path is neither a file nor a directory.",
+                )),
+                "Input watch path is neither a file nor a directory.".to_owned(),
+            ),
+            (
+                listing(notify::Error::generic(&format!(
+                    "Expected ack for {sentinel:?}"
+                ))),
+                WATCHER_ERROR.to_owned(),
+            ),
+            (
+                listing(notify::Error::io(std::io::Error::other(format!(
+                    "IO error for operation on {}",
+                    sentinel.display()
+                )))),
+                std::io::ErrorKind::Other.to_string(),
+            ),
+        ];
+        for (error, expected) in cases {
+            let shown = error.to_string();
+            assert!(shown.contains(needle), "control: {shown}");
+            let cause = notify_cause(&error);
+            assert!(!cause.contains(needle), "{cause}");
+            assert!(!cause.contains(" about "), "{cause}");
+            assert_eq!(cause, expected, "the cause of {shown:?}");
+        }
+
+        // A backend's message is kept as given; a line escapes it through `safe_inline`,
+        // as it does every value it interpolates.
+        let raw = format!("bad{}word", '\x1b');
+        let cause = notify_cause(&notify::Error::generic(&raw));
+        assert_eq!(cause, raw, "the cause is the backend's text");
+        let shown = safe_inline(&cause);
+        assert!(!shown.contains('\x1b'), "{shown:?}");
+        assert!(
+            shown.starts_with("bad") && shown.ends_with("word"),
+            "{shown:?}"
+        );
+    }
+
+    // ── render_error_sanitized never panics on a failing Display (#157) ─────────
+
+    /// The six-character escape `sanitize_control_chars` writes for ESC, built at runtime
+    /// so no escape sequence is written into this source.
+    fn escaped_esc() -> String {
+        format!("{}u001B", '\\')
+    }
+
+    /// A `Display` that always fails, standing in for a buggy third-party impl.
+    struct Unformattable;
+
+    impl std::fmt::Display for Unformattable {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+
+    /// Source text that serves a label's surrounding context but fails the exact-span
+    /// read miette makes next, so miette's own render returns `fmt::Error` part-way
+    /// through the frame.
+    #[derive(Debug)]
+    struct FailsNarrowReads(String);
+
+    impl miette::SourceCode for FailsNarrowReads {
+        fn read_span<'a>(
+            &'a self,
+            span: &miette::SourceSpan,
+            context_lines_before: usize,
+            context_lines_after: usize,
+        ) -> std::result::Result<Box<dyn miette::SpanContents<'a> + 'a>, miette::MietteError>
+        {
+            if context_lines_before == 0 && context_lines_after == 0 {
+                return Err(miette::MietteError::OutOfBounds);
+            }
+            miette::SourceCode::read_span(&self.0, span, context_lines_before, context_lines_after)
+        }
+    }
+
+    /// A cause whose message cannot be formatted.
+    #[derive(Debug)]
+    struct UnformattableCause;
+
+    impl std::fmt::Display for UnformattableCause {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+
+    impl std::error::Error for UnformattableCause {}
+
+    /// A diagnostic whose surfaces fail to format one at a time, as each test asks.
+    #[derive(Debug, Default)]
+    struct Probe {
+        message: String,
+        message_fails: bool,
+        code_fails: bool,
+        help_fails: bool,
+        cause: Option<UnformattableCause>,
+        source: Option<FailsNarrowReads>,
+    }
+
+    impl std::fmt::Display for Probe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if self.message_fails {
+                return Err(std::fmt::Error);
+            }
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Probe {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause
+                .as_ref()
+                .map(|c| c as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    impl miette::Diagnostic for Probe {
+        fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+            if self.code_fails {
+                Some(Box::new(Unformattable))
+            } else {
+                Some(Box::new("mds::probe"))
+            }
+        }
+
+        fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+            if self.help_fails {
+                Some(Box::new(Unformattable))
+            } else {
+                Some(Box::new("probe help"))
+            }
+        }
+
+        fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+            self.source.as_ref().map(|s| s as &dyn miette::SourceCode)
+        }
+
+        fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+            self.source.as_ref()?;
+            Some(Box::new(std::iter::once(
+                miette::LabeledSpan::new_primary_with_span(Some("here".to_string()), (0, 5)),
+            )))
+        }
+    }
+
+    /// A report whose own message cannot be formatted still renders — its code and help
+    /// in the usual frame, a fixed placeholder where the message would be.
+    #[test]
+    fn a_report_whose_message_cannot_be_formatted_renders_a_placeholder() {
+        let rendered = render_error_sanitized(miette::Report::new(Probe {
+            message_fails: true,
+            ..Probe::default()
+        }));
+
+        assert!(
+            rendered.contains("mds::probe") && rendered.contains("probe help"),
+            "the rest of the frame must render; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("could not be formatted"),
+            "the message's place must say it could not be formatted; got {rendered:?}"
+        );
+    }
+
+    /// A code, help or cause whose `Display` fails costs only that surface: the message
+    /// still renders, escaped, in the usual frame.
+    #[test]
+    fn a_report_whose_code_help_or_cause_cannot_be_formatted_keeps_its_message() {
+        let rendered = render_error_sanitized(miette::Report::new(Probe {
+            message: format!("cannot write fo{}[2Jo.mds", '\x1b'),
+            code_fails: true,
+            help_fails: true,
+            cause: Some(UnformattableCause),
+            ..Probe::default()
+        }));
+
+        assert!(
+            rendered.contains("cannot write fo") && rendered.contains(&escaped_esc()),
+            "the message must render, with ESC escaped; got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\x1b'),
+            "no raw ESC may reach the rendered text; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("could not be formatted"),
+            "the unformattable cause must leave a placeholder, not vanish; got {rendered:?}"
+        );
+    }
+
+    /// When miette's own render fails part-way (here: a source read fails after the
+    /// frame has started), the whole frame is replaced by escaped plain text — never a
+    /// panic, never half a frame.
+    #[test]
+    fn a_render_failure_falls_back_to_escaped_plain_text() {
+        let rendered = render_error_sanitized(miette::Report::new(Probe {
+            message: format!("cannot write fo{}[2Jo.mds\nsecond line", '\x1b'),
+            source: Some(FailsNarrowReads("Hello world\n".to_string())),
+            ..Probe::default()
+        }));
+
+        let esc = escaped_esc();
+        let want = format!(
+            "mds::probe\n\n  \u{00d7} cannot write fo{esc}[2Jo.mds\n  \u{2502} second line\n  help: probe help\n"
+        );
+        assert_eq!(
+            rendered, want,
+            "a failed render must fall back to the plain-text form, escaped"
+        );
+    }
+
+    // ── The stderr writer, the stdout outcome and the exit code (#157) ──────────
+
+    /// What a [`Sink`]'s `write` does.
+    #[derive(Clone, Copy)]
+    enum OnWrite {
+        Accept,
+        Fail(std::io::ErrorKind),
+        /// Accept nothing: `write` returns `Ok(0)`, which `write_all` reports as
+        /// `WriteZero`.
+        Zero,
+    }
+
+    /// An in-memory stream whose `write` and `flush` fail as a test asks, counting the
+    /// `write` calls so a dropped write can be told apart from a failed one.
+    struct Sink {
+        on_write: OnWrite,
+        flush_fails: Option<std::io::ErrorKind>,
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Sink {
+        fn new(on_write: OnWrite) -> Self {
+            Self {
+                on_write,
+                flush_fails: None,
+                writes: 0,
+                bytes: Vec::new(),
+            }
+        }
+
+        fn failing_flush(kind: std::io::ErrorKind) -> Self {
+            Self {
+                flush_fails: Some(kind),
+                ..Self::new(OnWrite::Accept)
+            }
+        }
+    }
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            match self.on_write {
+                OnWrite::Accept => {
+                    self.bytes.extend_from_slice(buf);
+                    Ok(buf.len())
                 }
-                panic!(
-                    "failed to create symlink {} -> {}: {err}",
-                    target.display(),
-                    link.display()
+                OnWrite::Fail(kind) => Err(std::io::Error::from(kind)),
+                OnWrite::Zero => Ok(0),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self.flush_fails {
+                Some(kind) => Err(std::io::Error::from(kind)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn stderr_writer_writes_the_whole_text_and_records_nothing() {
+        let state = OutputState::new();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_stderr_to(&state, &mut sink, format_args!("OK: {}\n", "x.mds"));
+
+        assert_eq!(sink.bytes, b"OK: x.mds\n");
+        assert_eq!(sink.writes, 1, "the rendered text goes out in one write");
+        assert!(!state.stderr_closed() && !state.io_failed());
+    }
+
+    #[test]
+    fn stderr_writer_treats_a_closed_pipe_as_sticky_and_drops_later_writes() {
+        let state = OutputState::new();
+        let mut closed = Sink::new(OnWrite::Fail(std::io::ErrorKind::BrokenPipe));
+        write_stderr_to(&state, &mut closed, format_args!("first\n"));
+        assert!(state.stderr_closed(), "a closed pipe must be recorded");
+        assert!(!state.io_failed(), "a closed pipe is not an I/O failure");
+
+        let mut later = Sink::new(OnWrite::Accept);
+        write_stderr_to(&state, &mut later, format_args!("second\n"));
+        assert_eq!(
+            later.writes, 0,
+            "every write after the pipe closed must be dropped"
+        );
+    }
+
+    #[test]
+    fn stderr_writer_records_any_other_failure_and_keeps_writing() {
+        let state = OutputState::new();
+        let mut full = Sink::new(OnWrite::Fail(std::io::ErrorKind::StorageFull));
+        write_stderr_to(&state, &mut full, format_args!("first\n"));
+        assert!(state.io_failed(), "a non-pipe failure must be recorded");
+        assert!(!state.stderr_closed(), "a full disk is not a closed pipe");
+
+        let mut later = Sink::new(OnWrite::Accept);
+        write_stderr_to(&state, &mut later, format_args!("second\n"));
+        assert_eq!(
+            later.bytes, b"second\n",
+            "an I/O failure must not stop later writes"
+        );
+        assert!(state.io_failed(), "the failure stays recorded");
+    }
+
+    #[test]
+    fn stderr_writer_counts_a_short_write_and_a_failed_flush() {
+        let short = OutputState::new();
+        write_stderr_to(&short, &mut Sink::new(OnWrite::Zero), format_args!("x\n"));
+        assert!(short.io_failed() && !short.stderr_closed());
+
+        let flush_full = OutputState::new();
+        let mut sink = Sink::failing_flush(std::io::ErrorKind::StorageFull);
+        write_stderr_to(&flush_full, &mut sink, format_args!("x\n"));
+        assert!(flush_full.io_failed() && !flush_full.stderr_closed());
+
+        let flush_closed = OutputState::new();
+        let mut sink = Sink::failing_flush(std::io::ErrorKind::BrokenPipe);
+        write_stderr_to(&flush_closed, &mut sink, format_args!("x\n"));
+        assert!(flush_closed.stderr_closed() && !flush_closed.io_failed());
+    }
+
+    #[test]
+    fn stderr_writer_survives_a_display_that_fails() {
+        let state = OutputState::new();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_stderr_to(
+            &state,
+            &mut sink,
+            format_args!("before {} after\n", Unformattable),
+        );
+
+        assert_eq!(
+            sink.bytes, b"before ",
+            "the text ends where the Display failed"
+        );
+        assert!(
+            !state.stderr_closed() && !state.io_failed(),
+            "a formatting bug is not an output failure"
+        );
+    }
+
+    #[test]
+    fn write_stdout_is_written_only_when_the_write_and_the_flush_succeed() {
+        let state = OutputState::new();
+        let mut ok = Sink::new(OnWrite::Accept);
+        assert!(matches!(
+            write_stdout_to(&state, &mut ok, b"compiled\n"),
+            StdoutOutcome::Written
+        ));
+        assert_eq!(ok.bytes, b"compiled\n");
+        assert!(
+            !state.stdout_closed() && !state.io_failed(),
+            "a write that succeeds records nothing"
+        );
+
+        let cases = [
+            (
+                "write hits a closed pipe",
+                Sink::new(OnWrite::Fail(std::io::ErrorKind::BrokenPipe)),
+                None,
+            ),
+            (
+                "flush hits a closed pipe",
+                Sink::failing_flush(std::io::ErrorKind::BrokenPipe),
+                None,
+            ),
+            (
+                "write fails",
+                Sink::new(OnWrite::Fail(std::io::ErrorKind::StorageFull)),
+                Some(std::io::ErrorKind::StorageFull),
+            ),
+            (
+                "write is short",
+                Sink::new(OnWrite::Zero),
+                Some(std::io::ErrorKind::WriteZero),
+            ),
+            (
+                "flush fails",
+                Sink::failing_flush(std::io::ErrorKind::StorageFull),
+                Some(std::io::ErrorKind::StorageFull),
+            ),
+        ];
+        for (what, mut sink, failed_kind) in cases {
+            let outcome = write_stdout_to(&OutputState::new(), &mut sink, b"compiled\n");
+            match (failed_kind, &outcome) {
+                (None, StdoutOutcome::Closed) => {}
+                (Some(want), StdoutOutcome::Failed(e)) if e.kind() == want => {}
+                _ => panic!("{what}: want Closed or Failed({failed_kind:?}); got {outcome:?}"),
+            }
+        }
+    }
+
+    /// Once stdout's reader is gone, nothing more is written to it: a later write, to
+    /// the same stream or to one that would accept it, is `Closed` without a byte
+    /// reaching the stream (#157).
+    #[test]
+    fn write_stdout_writes_nothing_once_stdout_is_closed() {
+        let state = OutputState::new();
+        let mut closed = Sink::new(OnWrite::Fail(std::io::ErrorKind::BrokenPipe));
+        let first = write_stdout_to(&state, &mut closed, b"first\n");
+        assert!(state.stdout_closed(), "a closed stdout must be recorded");
+        assert!(!state.io_failed(), "a closed pipe is not an I/O failure");
+        let second = write_stdout_to(&state, &mut closed, b"second\n");
+        let mut later = Sink::new(OnWrite::Accept);
+        let third = write_stdout_to(&state, &mut later, b"third\n");
+        assert_eq!(
+            (closed.writes, later.writes),
+            (1, 0),
+            "no write may follow a closed pipe; outcomes {first:?}, {second:?}, {third:?}"
+        );
+        assert!(
+            matches!(
+                (&first, &second, &third),
+                (
+                    StdoutOutcome::Closed,
+                    StdoutOutcome::Closed,
+                    StdoutOutcome::Closed
+                )
+            ),
+            "got {first:?}, {second:?}, {third:?}"
+        );
+    }
+
+    /// A stdout that fails for another reason is reported once while it keeps failing:
+    /// the first failed write is `Failed`, and a later one that fails again is not, so a
+    /// batch run reports the failure once. Every write is still attempted (#157).
+    #[test]
+    fn write_stdout_reports_only_the_first_other_failure() {
+        let state = OutputState::new();
+        // A success first: it must not use up the one report.
+        let _ = write_stdout_to(&state, &mut Sink::new(OnWrite::Accept), b"ok\n");
+        let mut full = Sink::new(OnWrite::Fail(std::io::ErrorKind::StorageFull));
+        let first = write_stdout_to(&state, &mut full, b"first\n");
+        let second = write_stdout_to(&state, &mut full, b"second\n");
+        assert!(
+            matches!(&first, StdoutOutcome::Failed(e) if e.kind() == std::io::ErrorKind::StorageFull),
+            "the first failure is reported; got {first:?}"
+        );
+        assert!(
+            !matches!(second, StdoutOutcome::Failed(_)),
+            "a second failure must not be reported again; got {second:?}"
+        );
+        assert_eq!(full.writes, 2, "a write after a failure is still attempted");
+        assert!(
+            second.into_batch_result().is_ok(),
+            "a batch run does not report a repeated failure"
+        );
+
+        let mut ok = Sink::new(OnWrite::Accept);
+        let third = write_stdout_to(&state, &mut ok, b"third\n");
+        assert!(
+            matches!(third, StdoutOutcome::Written) && ok.bytes == b"third\n",
+            "a write that succeeds after a failure is written; got {third:?}"
+        );
+        assert!(
+            !state.stdout_closed() && !state.io_failed(),
+            "the writer records only the stdout failure; the caller's report records the \
+             I/O failure for the exit code"
+        );
+    }
+
+    /// A stdout failure is reported once per failure episode: a write that lands ends
+    /// the episode, so the next failure is new and reported again — a `mds watch -o -`
+    /// session must not go silent on a stdout that failed, recovered and failed again.
+    /// A write of no bytes proves nothing and ends nothing. The recorded I/O failure
+    /// that lifts a batch run's exit code outlives the recovery (#157).
+    #[test]
+    fn write_stdout_reports_a_new_failure_after_stdout_recovers() {
+        let state = OutputState::new();
+        let mut full = Sink::new(OnWrite::Fail(std::io::ErrorKind::StorageFull));
+        let first = write_stdout_to(&state, &mut full, b"one\n");
+        assert!(
+            matches!(&first, StdoutOutcome::Failed(e) if e.kind() == std::io::ErrorKind::StorageFull),
+            "the first failure is reported; got {first:?}"
+        );
+        // What fmt and lint do with a reported failure: record it for the exit code.
+        state.note_io_failure();
+        let repeat = write_stdout_to(&state, &mut full, b"two\n");
+        assert!(
+            matches!(repeat, StdoutOutcome::FailedAgain),
+            "a repeat before stdout recovers is not reported; got {repeat:?}"
+        );
+
+        let mut empty = Sink::new(OnWrite::Accept);
+        let nothing = write_stdout_to(&state, &mut empty, b"");
+        assert!(matches!(nothing, StdoutOutcome::Written), "got {nothing:?}");
+        let still = write_stdout_to(&state, &mut full, b"three\n");
+        assert!(
+            matches!(still, StdoutOutcome::FailedAgain),
+            "a write of no bytes does not show that stdout recovered; got {still:?}"
+        );
+
+        let mut ok = Sink::new(OnWrite::Accept);
+        let recovered = write_stdout_to(&state, &mut ok, b"four\n");
+        assert!(
+            matches!(recovered, StdoutOutcome::Written) && ok.bytes == b"four\n",
+            "stdout recovers; got {recovered:?}"
+        );
+
+        let again = write_stdout_to(&state, &mut full, b"five\n");
+        assert!(
+            matches!(&again, StdoutOutcome::Failed(e) if e.kind() == std::io::ErrorKind::StorageFull),
+            "a failure after stdout recovered is a new one, reported again; got {again:?}"
+        );
+        let repeat_again = write_stdout_to(&state, &mut full, b"six\n");
+        assert!(
+            matches!(repeat_again, StdoutOutcome::FailedAgain),
+            "the new failure's repeat is not reported; got {repeat_again:?}"
+        );
+        assert_eq!(full.writes, 5, "every write is attempted");
+
+        assert!(
+            state.io_failed() && !state.stdout_closed(),
+            "the recovery clears neither the recorded I/O failure nor anything else"
+        );
+        assert_eq!(
+            final_exit_code(0, &state, ExitPolicy::Batch),
+            IO_FAILURE_EXIT,
+            "a batch run that lost a stdout write still exits 2 after stdout recovered"
+        );
+    }
+
+    /// A batch run keeps going past a closed stdout, and reports any other stdout
+    /// failure as one `mds::io` error naming stdout (#157).
+    #[test]
+    fn a_batch_run_ignores_a_closed_stdout_and_reports_any_other_failure() {
+        assert!(StdoutOutcome::Written.into_batch_result().is_ok());
+        assert!(StdoutOutcome::Closed.into_batch_result().is_ok());
+        assert!(
+            StdoutOutcome::FailedAgain.into_batch_result().is_ok(),
+            "a repeated failure was already reported"
+        );
+
+        let failed = StdoutOutcome::Failed(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left",
+        ))
+        .into_batch_result();
+        match failed {
+            Err(mds::MdsError::Io { message }) => {
+                assert_eq!(
+                    message,
+                    format!(
+                        "cannot write to stdout: {}",
+                        std::io::ErrorKind::StorageFull
+                    ),
+                    "the error's kind, not the text it carries (#390)"
+                );
+            }
+            other => panic!("want Err(MdsError::Io {{ .. }}); got {other:?}"),
+        }
+    }
+
+    /// Every combination of verdict, recorded facts and policy that matters, with the
+    /// code each one must exit with — written out, not recomputed.
+    #[test]
+    fn final_exit_code_table() {
+        struct Case {
+            verdict: i32,
+            closed: bool,
+            failed: bool,
+            policy: ExitPolicy,
+            want: i32,
+        }
+        const fn case(
+            verdict: i32,
+            closed: bool,
+            failed: bool,
+            policy: ExitPolicy,
+            want: i32,
+        ) -> Case {
+            Case {
+                verdict,
+                closed,
+                failed,
+                policy,
+                want,
+            }
+        }
+        use ExitPolicy::{Batch, WatchSession};
+        let cases = [
+            // Nothing recorded: the verdict stands.
+            case(0, false, false, Batch, 0),
+            case(1, false, false, Batch, 1),
+            case(2, false, false, Batch, 2),
+            case(3, false, false, Batch, 3),
+            case(101, false, false, Batch, 101),
+            // A closed pipe never changes the code.
+            case(0, true, false, Batch, 0),
+            case(1, true, false, Batch, 1),
+            case(3, true, false, Batch, 3),
+            // Any other failure lifts a batch run to at least 2.
+            case(0, false, true, Batch, 2),
+            case(1, false, true, Batch, 2),
+            case(2, false, true, Batch, 2),
+            case(3, false, true, Batch, 3),
+            case(101, false, true, Batch, 101),
+            case(0, true, true, Batch, 2),
+            case(1, true, true, Batch, 2),
+            // A live watch session keeps its verdict whatever was recorded.
+            case(0, false, false, WatchSession, 0),
+            case(1, false, false, WatchSession, 1),
+            case(0, true, false, WatchSession, 0),
+            case(0, false, true, WatchSession, 0),
+            case(1, false, true, WatchSession, 1),
+            case(3, false, true, WatchSession, 3),
+            case(0, true, true, WatchSession, 0),
+        ];
+        for c in cases {
+            let state = OutputState::new();
+            if c.closed {
+                state.note_stderr_closed();
+            }
+            if c.failed {
+                state.note_io_failure();
+            }
+            assert_eq!(
+                final_exit_code(c.verdict, &state, c.policy),
+                c.want,
+                "verdict {} closed={} failed={} {:?}",
+                c.verdict,
+                c.closed,
+                c.failed,
+                c.policy
+            );
+        }
+    }
+
+    /// A run exits under the batch rule until a watch session goes live, and under the
+    /// session rule from then on — whenever its output failure was recorded (#157).
+    #[test]
+    fn the_session_rule_applies_only_once_a_watch_session_is_live() {
+        let state = OutputState::new();
+        assert_eq!(
+            state.exit_policy(),
+            ExitPolicy::Batch,
+            "a fresh run is a batch"
+        );
+        state.note_io_failure();
+        assert_eq!(
+            final_exit_code(0, &state, state.exit_policy()),
+            2,
+            "before a session goes live, an output failure lifts the exit code"
+        );
+
+        state.note_watch_live();
+        assert_eq!(state.exit_policy(), ExitPolicy::WatchSession);
+        assert_eq!(
+            final_exit_code(0, &state, state.exit_policy()),
+            0,
+            "a live session keeps its verdict, the failure recorded before it included"
+        );
+        state.note_io_failure();
+        state.note_watch_live();
+        assert_eq!(
+            final_exit_code(1, &state, state.exit_policy()),
+            1,
+            "going live is sticky, and a failure recorded after it changes nothing"
+        );
+    }
+
+    // ── Panics (#389) ─────────────────────────────────────────────────────────
+
+    /// A panic makes the run exit 101, whatever its verdict, whatever else it recorded,
+    /// and under either policy — a live watch session's included.
+    #[test]
+    fn a_panic_exits_101_whatever_else_was_recorded() {
+        use ExitPolicy::{Batch, WatchSession};
+        // (verdict, stderr closed, I/O failed, policy)
+        let cases = [
+            (0, false, false, Batch),
+            (1, false, false, Batch),
+            (2, false, true, Batch),
+            (3, false, true, Batch),
+            (0, true, false, Batch),
+            (0, false, false, WatchSession),
+            (1, true, true, WatchSession),
+            (3, false, true, WatchSession),
+        ];
+        for (verdict, closed, failed, policy) in cases {
+            let state = OutputState::new();
+            if closed {
+                state.note_stderr_closed();
+            }
+            if failed {
+                state.note_io_failure();
+            }
+            assert!(
+                final_exit_code(verdict, &state, policy) < 101,
+                "control: verdict {verdict} closed={closed} failed={failed} {policy:?} \
+                 exits below 101 until a panic is recorded"
+            );
+            state.note_panicked();
+            assert!(state.panicked());
+            assert_eq!(
+                final_exit_code(verdict, &state, policy),
+                101,
+                "verdict {verdict} closed={closed} failed={failed} {policy:?}"
+            );
+        }
+    }
+
+    /// `RUST_BACKTRACE` asks for a backtrace when it is set to anything but `0`, and for
+    /// each frame's address as well when it is `full` — as std reads it.
+    #[test]
+    fn rust_backtrace_picks_the_backtrace_a_panic_prints() {
+        let cases = [
+            (None, None),
+            (Some("0"), None),
+            (Some("1"), Some(BacktraceStyle::Short)),
+            (Some("full"), Some(BacktraceStyle::Full)),
+            (Some(""), Some(BacktraceStyle::Short)),
+            (Some("short"), Some(BacktraceStyle::Short)),
+        ];
+        for (value, want) in cases {
+            assert_eq!(
+                BacktraceStyle::from_env(value.map(OsStr::new)),
+                want,
+                "RUST_BACKTRACE={value:?}"
+            );
+        }
+    }
+
+    /// The text is two fixed lines: that the CLI failed, and the issue tracker of the
+    /// repository its manifest names.
+    #[test]
+    fn the_internal_compiler_error_text_names_the_issue_tracker() {
+        let lines: Vec<&str> = ICE_TEXT.lines().collect();
+        assert_eq!(lines.len(), 2, "{ICE_TEXT:?}");
+        assert!(ICE_TEXT.ends_with('\n'), "{ICE_TEXT:?}");
+        assert_eq!(lines[0], "mds: internal compiler error");
+        let tracker = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
+        assert!(
+            tracker.starts_with("https://github.com/") && tracker.len() > 26,
+            "the manifest names a GitHub repository: {tracker}"
+        );
+        assert!(lines[1].ends_with(tracker), "{ICE_TEXT:?}");
+        assert!(
+            ICE_TEXT.chars().all(|c| c == '\n' || !c.is_control()),
+            "{ICE_TEXT:?}"
+        );
+    }
+
+    /// Each line of a backtrace is WIRE-escaped on its own and keeps its line break: an
+    /// ESC, a CR or a bidi override inside a line becomes its escape; a tab stays.
+    #[test]
+    fn a_backtrace_is_escaped_line_by_line() {
+        let esc = char::from(0x1b);
+        let cr = char::from(0x0d);
+        let rlo = char::from_u32(0x202E).expect("U+202E");
+        let code = |c: char| format!("{}u{:04X}", '\\', u32::from(c));
+        let text = format!("frame {esc}[2J\n\tat {rlo}file.rs{cr}\nlast");
+        assert_eq!(
+            escape_each_line(&text),
+            format!(
+                "frame {}[2J\n\tat {}file.rs{}\nlast\n",
+                code(esc),
+                code(rlo),
+                code(cr)
+            )
+        );
+        // Control: clean text comes back as it is, each line ended by its line break.
+        assert_eq!(escape_each_line("a\nb\n"), "a\nb\n");
+    }
+
+    /// `write_backtrace` writes a header and this thread's frames — the writer's own among
+    /// them — every line escaped, in one write; a write that fails is not retried and does
+    /// not panic.
+    #[test]
+    fn write_backtrace_writes_escaped_frames_and_ignores_a_failed_write() {
+        for style in [BacktraceStyle::Short, BacktraceStyle::Full] {
+            let mut sink = Sink::new(OnWrite::Accept);
+            write_backtrace(&mut sink, style);
+            let text = String::from_utf8(sink.bytes).expect("a backtrace is UTF-8");
+            assert!(text.starts_with("stack backtrace:\n"), "{style:?}: {text}");
+            assert!(
+                text.contains("write_backtrace"),
+                "{style:?}: the frames include the writer's own; {text}"
+            );
+            assert!(
+                text.split_terminator('\n')
+                    .all(|line| mds::sanitize_control_chars_wire(line) == line),
+                "{style:?}: every line is escaped; {text}"
+            );
+            assert_eq!(sink.writes, 1, "{style:?}: one write");
+            for kind in [
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::StorageFull,
+            ] {
+                let mut failing = Sink::new(OnWrite::Fail(kind));
+                write_backtrace(&mut failing, style);
+                assert_eq!(
+                    failing.writes, 1,
+                    "{style:?}: a failed write is not retried"
                 );
             }
         }
     }
 
-    /// T-U1: `mds build` writes artifacts that do not exist yet (#227). The
-    /// primitive must create the target instead of failing the existence probe.
+    /// The trigger's payload is one no panic output may show: the sentinel, a raw ESC and
+    /// the absolute path of the working directory.
+    #[cfg(debug_assertions)]
     #[test]
-    fn atomic_write_file_creates_missing_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("fresh.md");
-        assert!(!target.exists(), "precondition: target must be absent");
-
-        atomic_write_file(&target, "CREATED", Durability::Fsync)
-            .expect("writing an absent target must succeed");
-
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "CREATED");
-        let residue = temp_residue(dir.path());
-        assert!(
-            residue.is_empty(),
-            "no .mds-tmp- residue may survive a successful write; got {residue:?}"
-        );
+    fn the_trigger_s_payload_carries_a_sentinel_an_esc_and_an_absolute_path() {
+        let payload = panic_trigger::payload();
+        let here = std::env::current_dir().expect("the working directory");
+        assert!(here.is_absolute(), "{here:?}");
+        assert!(payload.contains(panic_trigger::SENTINEL), "{payload:?}");
+        assert!(payload.contains(char::from(0x1b)), "{payload:?}");
+        assert!(payload.contains(&here.display().to_string()), "{payload:?}");
     }
 
-    /// T-U9: `Durability::RenameOnly` changes ONLY whether the temp file is fsynced.
-    /// Everything the callers rely on — the content, the mode of a freshly created
-    /// artifact, the symlink refusal, and leaving no temp residue — must be identical
-    /// to `Fsync` (#227). The fsync itself is not observable from a passing process;
-    /// what this pins is that skipping it did not quietly relax anything else.
+    /// The variable that makes a test run as the child [`panic_in_a_child`] starts.
+    const PANIC_CHILD: &str = "MDS_OUTPUT_PANIC_CHILD";
+
+    /// Run the test `name` again as a child — this test binary, that one test — with
+    /// [`PANIC_CHILD`] set, so that it installs the panic hook in a process of its own.
+    /// The child's `RUST_BACKTRACE` is removed: CI sets it for every job.
+    fn panic_in_a_child(name: &str) -> std::process::Output {
+        let binary = std::env::current_exe().expect("the test binary's path");
+        std::process::Command::new(binary)
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(PANIC_CHILD, name)
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .expect("the child runs")
+    }
+
+    fn in_the_child(name: &str) -> bool {
+        std::env::var_os(PANIC_CHILD).is_some_and(|value| value == name)
+    }
+
+    /// The child's streams: what the harness and the test wrote to stdout, and stderr.
+    fn streams(child: &std::process::Output) -> (String, String) {
+        (
+            String::from_utf8_lossy(&child.stdout).into_owned(),
+            String::from_utf8_lossy(&child.stderr).into_owned(),
+        )
+    }
+
+    /// A panic that unwinds to [`catch_panic`] is reported once and caught, and the run
+    /// goes on: the thread is not left unwinding, so a second panic is caught as well,
+    /// and the run then ends through [`exit`] with 101 (#389).
+    ///
+    /// Control: the child really ran the test (the harness announced it), and ended at the
+    /// funnel, not in the harness.
     #[test]
-    fn atomic_write_file_rename_only_matches_fsync_contract() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Fresh target: created, with the same content and mode as the Fsync sibling.
-        let quick = dir.path().join("quick.md");
-        let synced = dir.path().join("synced.md");
-        atomic_write_file(&quick, "DERIVED", Durability::RenameOnly).unwrap();
-        atomic_write_file(&synced, "DERIVED", Durability::Fsync).unwrap();
-        assert_eq!(std::fs::read_to_string(&quick).unwrap(), "DERIVED");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                std::fs::metadata(&quick).unwrap().permissions().mode() & 0o777,
-                std::fs::metadata(&synced).unwrap().permissions().mode() & 0o777,
-                "RenameOnly must not change the mode a fresh artifact is created with"
-            );
-        }
-
-        // Existing target: replaced, previous content gone.
-        atomic_write_file(&quick, "REBUILT", Durability::RenameOnly).unwrap();
-        assert_eq!(std::fs::read_to_string(&quick).unwrap(), "REBUILT");
-
-        // Symlink target: still refused (the fsync is not what enforces this).
-        {
-            let real = dir.path().join("real.md");
-            std::fs::write(&real, "REAL").unwrap();
-            let link = dir.path().join("link.md");
-            if !make_symlink(&real, &link) {
-                return;
+    fn a_caught_panic_is_reported_once_and_the_run_goes_on() {
+        const NAME: &str = "output::tests::a_caught_panic_is_reported_once_and_the_run_goes_on";
+        if in_the_child(NAME) {
+            install_panic_hook();
+            let first = catch_panic(|| {
+                panic!("first");
+            });
+            let second = catch_panic(|| {
+                panic!("second");
+            });
+            if first.is_err() && second.is_err() {
+                let _ = write_stdout(b"after both catches\n");
             }
-            let err = atomic_write_file(&link, "NEW", Durability::RenameOnly)
-                .expect_err("RenameOnly must still refuse a symlink target");
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "a run that caught a panic exits 101; stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            report.contains("after both catches") && !report.contains("test result"),
+            "both panics were caught and the run went on to the exit; stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
+    }
+
+    /// A panic that nothing catches ends the process at once with 101, after the text —
+    /// before the test harness, which would catch it, sees it.
+    #[test]
+    fn a_panic_nothing_catches_ends_the_run_at_once_with_101() {
+        const NAME: &str = "output::tests::a_panic_nothing_catches_ends_the_run_at_once_with_101";
+        if in_the_child(NAME) {
+            install_panic_hook();
+            panic!("uncaught");
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            !report.contains("test result"),
+            "the process ended at the panic, before the harness could report it; \
+             stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT, "the text, once");
+    }
+
+    /// A panic while the thread is unwinding from another — a value that panics when it
+    /// is dropped — ends the process at once with 101 instead of the abort std would make
+    /// of it; each panic prints the text.
+    #[test]
+    fn a_panic_while_unwinding_ends_the_run_with_101_not_an_abort() {
+        const NAME: &str =
+            "output::tests::a_panic_while_unwinding_ends_the_run_with_101_not_an_abort";
+        struct PanicsWhenDropped;
+        impl Drop for PanicsWhenDropped {
+            fn drop(&mut self) {
+                panic!("second");
+            }
+        }
+        if in_the_child(NAME) {
+            install_panic_hook();
+            let _ = catch_panic(|| {
+                let _armed = PanicsWhenDropped;
+                panic!("first");
+            });
+            let _ = write_stdout(b"the run went on\n");
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "exit 101, not an abort (a signal: None); stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            !report.contains("the run went on") && !report.contains("test result"),
+            "the process ended at the second panic; stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
+    }
+
+    /// A panic is recorded before the hook writes anything, so the run exits 101 even
+    /// when the hook cannot write: here the test holds stderr's lock, and a helper
+    /// thread's hook waits on it while the test ends the run through [`exit`].
+    ///
+    /// Controls: the child really ran the test and ended at the funnel; the hook's write
+    /// never landed, so it really was waiting.
+    #[test]
+    fn a_panic_is_recorded_before_the_hook_writes() {
+        const NAME: &str = "output::tests::a_panic_is_recorded_before_the_hook_writes";
+        /// How long the test waits for the helper's panic to be recorded: 500 polls,
+        /// 10 ms apart.
+        const POLLS: u32 = 500;
+        const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+        if in_the_child(NAME) {
+            install_panic_hook();
+            // Held until the process ends, so the helper's hook blocks in its write.
+            let _held = std::io::stderr().lock();
+            let _helper = std::thread::spawn(|| panic!("helper"));
+            for _ in 0..POLLS {
+                if OUTPUT_STATE.panicked() {
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+            let _ = write_stdout(b"at the funnel\n");
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert!(
+            report.contains("at the funnel") && !report.contains("test result"),
+            "control: the child ended at the funnel; stdout:\n{report}"
+        );
+        assert_eq!(
+            shown, "",
+            "control: the hook's write waited on the held lock until the process ended"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "a panic whose hook cannot write still makes the run exit 101; stdout:\n{report}"
+        );
+    }
+
+    /// A panic that unwinds into a function that cannot unwind — an `extern "C"`
+    /// function — makes Rust raise a second panic there, one that cannot unwind at all.
+    /// The thread is already unwinding from the first, so the hook ends the run with 101
+    /// before std can abort.
+    #[test]
+    fn a_panic_into_a_function_that_cannot_unwind_ends_the_run_with_101_not_an_abort() {
+        const NAME: &str = "output::tests::\
+            a_panic_into_a_function_that_cannot_unwind_ends_the_run_with_101_not_an_abort";
+        extern "C" fn cannot_unwind() {
+            panic!("first");
+        }
+        if in_the_child(NAME) {
+            install_panic_hook();
+            let _ = catch_panic(|| cannot_unwind());
+            let _ = write_stdout(b"the run went on\n");
+            exit(0);
+        }
+        let child = panic_in_a_child(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "exit 101, not an abort (a signal: None); stdout:\n{report}\nstderr:\n{shown}"
+        );
+        assert!(
+            !report.contains("the run went on") && !report.contains("test result"),
+            "the process ended at the second panic; stdout:\n{report}"
+        );
+        assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
+    }
+
+    /// A caught panic's payload is dropped when dropping it runs no code of the panic's
+    /// own — a `String` or `&'static str` message, which is what `panic!` makes — and is
+    /// forgotten otherwise: any other payload's destructor is arbitrary code, and a panic
+    /// in it would be a panic outside any catch.
+    ///
+    /// Control: the counting payload's destructor does run when it is dropped.
+    #[test]
+    fn a_caught_payload_is_dropped_only_when_that_runs_no_code_of_its_own() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        struct CountsDrops(Arc<AtomicUsize>);
+        impl Drop for CountsDrops {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        assert_eq!(
+            dispose_payload(Box::new(String::from("a formatted message"))),
+            Disposal::Dropped,
+            "a `String` message is dropped"
+        );
+        assert_eq!(
+            dispose_payload(Box::new("a literal message")),
+            Disposal::Dropped,
+            "a `&'static str` message is dropped"
+        );
+        let drops = Arc::new(AtomicUsize::new(0));
+        drop(CountsDrops(Arc::clone(&drops)));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "control: the counting payload's destructor runs when it is dropped"
+        );
+        assert_eq!(
+            dispose_payload(Box::new(CountsDrops(Arc::clone(&drops)))),
+            Disposal::Forgotten,
+            "any other payload is forgotten"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "a forgotten payload's destructor never runs"
+        );
+    }
+
+    /// The variable that makes [`a_working_directory_that_is_gone_fails_closed_in_core_s_words`]
+    /// run as its own child.
+    #[cfg(unix)]
+    const GONE_CWD_CHILD: &str = "MDS_OUTPUT_GONE_CWD_CHILD";
+
+    /// Where the working directory is gone, [`current_dir`] fails in exactly the words,
+    /// and with the code, mds-core gives a string compile that needs it (#390) — core's
+    /// function is private, so its words are taken from `mds::check_str_with` with no
+    /// base directory — and [`canonicalize_out_dir`], and [`resolve_output_base`] through
+    /// it, refuse a relative out-dir with that error instead of anchoring it at `"."`.
+    ///
+    /// The test removes its own working directory, which is the whole process's, so it
+    /// runs as a child: this test binary, this one test. Controls: the child really ran
+    /// it (the harness reports it passed); an absolute out-dir needs no working
+    /// directory, in either function; and where it exists, [`current_dir`] is it.
+    ///
+    /// Unix-only: Windows cannot remove a directory that is a process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_that_is_gone_fails_closed_in_core_s_words() {
+        const NAME: &str =
+            "output::tests::a_working_directory_that_is_gone_fails_closed_in_core_s_words";
+        if std::env::var_os(GONE_CWD_CHILD).is_some_and(|value| value == NAME) {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let gone = dir.path().join("gone");
+            std::fs::create_dir(&gone).expect("create the working directory");
+            std::env::set_current_dir(&gone).expect("move into it");
+            std::fs::remove_dir(&gone).expect("remove it");
+
+            let ours = current_dir().expect_err("no working directory to determine");
+            let core = mds::check_str_with("Hello!\n", None, None)
+                .expect_err("core needs the working directory as the base");
             assert!(
-                err.to_string().contains("symlink"),
-                "the refusal must say why; got: {err}"
+                matches!(
+                    (&ours, &core),
+                    (mds::MdsError::Io { .. }, mds::MdsError::Io { .. })
+                ),
+                "both mds::io: {ours:?} / {core:?}"
             );
-            assert_eq!(std::fs::read_to_string(&real).unwrap(), "REAL");
-        }
+            assert_eq!(ours.to_string(), core.to_string(), "core's words exactly");
+            assert!(
+                ours.to_string()
+                    .starts_with("cannot determine current directory: "),
+                "{ours}"
+            );
+            let refused = canonicalize_out_dir(Some(&PathBuf::from("out")))
+                .expect_err("a relative out-dir has no directory to resolve against");
+            assert_eq!(refused.to_string(), ours.to_string());
+            let absolute = dir.path().join("out");
+            assert_eq!(
+                canonicalize_out_dir(Some(&absolute)).expect("an absolute out-dir resolves"),
+                Some(absolute.clone()),
+                "control: an absolute out-dir needs no working directory"
+            );
+            assert_eq!(canonicalize_out_dir(None).expect("no out-dir"), None);
 
-        let residue = temp_residue(dir.path());
-        assert!(
-            residue.is_empty(),
-            "RenameOnly must leave no .mds-tmp- residue; got {residue:?}"
-        );
-    }
-
-    /// T-U2: a freshly created artifact must carry the same mode `std::fs::write`
-    /// would have produced (`0666 & !umask`), not `tempfile`'s owner-only 0600.
-    /// The sibling control makes the assertion umask-independent.
-    ///
-    /// `#[cfg(unix)]`: Unix permission mode bits (`PermissionsExt::mode`) have no
-    /// Windows equivalent — the permission model differs (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_new_file_mode_matches_std_fs_write() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.md");
-        let ctl = dir.path().join("ctl.md");
-
-        atomic_write_file(&out, "X", Durability::Fsync).unwrap();
-        std::fs::write(&ctl, "X").unwrap();
-
-        let mode_out = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
-        let mode_ctl = std::fs::metadata(&ctl).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode_out, mode_ctl,
-            "new-file mode must match std::fs::write; got 0{mode_out:o} vs control 0{mode_ctl:o}"
-        );
-    }
-
-    /// T-U3: an existing file keeps its mode across the replace-by-rename cycle.
-    ///
-    /// `#[cfg(unix)]`: Unix permission mode bits have no Windows equivalent (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_existing_mode_0640_preserved() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("src.mds");
-        std::fs::write(&target, "OLD").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
-
-        atomic_write_file(&target, "NEW", Durability::Fsync).unwrap();
-
-        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(
-            mode, 0o640,
-            "existing mode must be preserved; got 0{mode:o}"
-        );
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
-    }
-
-    /// T-U4: a symlink at the target is refused, never written through. The
-    /// control writes the symlink's own target directly and must succeed, so the
-    /// refusal is not passing on an unrelated failure.
-    #[test]
-    fn atomic_write_file_refuses_live_symlink_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real.md");
-        let link = dir.path().join("link.md");
-        std::fs::write(&real, "REAL").unwrap();
-        if !make_symlink(&real, &link) {
+            // `resolve_output_base` is where a directory run resolves its out-dir: it
+            // refuses a relative one in the same words, and never falls back to a
+            // default route or to a base anchored at `"."`.
+            let refused = resolve_output_base(Some(&PathBuf::from("out")), &None)
+                .expect_err("a relative out-dir is refused, not resolved");
+            assert_eq!(refused.to_string(), ours.to_string());
+            assert!(
+                matches!(
+                    refused.downcast_ref::<mds::MdsError>(),
+                    Some(mds::MdsError::Io { .. })
+                ),
+                "mds::io: {refused:?}"
+            );
+            match resolve_output_base(Some(&absolute), &None).expect("an absolute out-dir") {
+                OutputBase::Dir {
+                    canonical, shown, ..
+                } => {
+                    assert_eq!(canonical, absolute, "control: resolved without one");
+                    assert_eq!(shown, absolute, "control: shown as typed");
+                }
+                other => panic!("control: want Dir; got {other:?}"),
+            }
             return;
         }
-
-        let err = atomic_write_file(&link, "NEW", Durability::Fsync)
-            .expect_err("writing through a symlink must be refused")
-            .to_string();
-        assert!(
-            err.contains("symlink"),
-            "expected a symlink refusal; got {err}"
-        );
         assert_eq!(
-            std::fs::read_to_string(&real).unwrap(),
-            "REAL",
-            "the symlink's target must not be written through"
+            current_dir().expect("the working directory exists"),
+            std::env::current_dir().expect("the working directory exists"),
+            "control: where it exists, it is the working directory"
         );
+        let binary = std::env::current_exe().expect("the test binary's path");
+        let child = std::process::Command::new(binary)
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(GONE_CWD_CHILD, NAME)
+            .output()
+            .expect("the child runs");
+        let report = String::from_utf8_lossy(&child.stdout);
         assert!(
-            std::fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "the symlink itself must survive the refusal"
-        );
-
-        // CONTROL: the same directory and content, addressed at the real file.
-        atomic_write_file(&real, "NEW", Durability::Fsync)
-            .expect("writing the real file must succeed");
-        assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW");
-    }
-
-    /// T-U5: a dangling symlink is still a symlink — refuse it rather than
-    /// materialising the missing file it points at.
-    #[test]
-    fn atomic_write_file_refuses_dangling_symlink_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing.md");
-        let link = dir.path().join("link.md");
-        if !make_symlink(&missing, &link) {
-            return;
-        }
-
-        let err = atomic_write_file(&link, "NEW", Durability::Fsync)
-            .expect_err("writing through a dangling symlink must be refused")
-            .to_string();
-        assert!(
-            err.contains("symlink"),
-            "expected a symlink refusal; got {err}"
-        );
-        assert!(
-            !missing.exists(),
-            "the dangling link's target must not be created"
-        );
-        assert!(
-            std::fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "the symlink itself must survive the refusal"
-        );
-    }
-
-    /// T-U6: a failed write leaves the original inode, bytes and mtime untouched
-    /// and drops the temp file. The control proves the same call succeeds once
-    /// the directory is writable again, and that success DOES replace the inode.
-    ///
-    /// `#[cfg(unix)]`: provokes the failure via chmod (Unix permission bits) and
-    /// asserts on `MetadataExt::ino()`, neither of which exists on Windows —
-    /// the read-only attribute there does not block creating files in a
-    /// directory, so the same setup would not provoke a write failure (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_failure_preserves_original_and_leaves_no_temp() {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let target = sub.join("locked.mds");
-        std::fs::write(&target, "OLD").unwrap();
-
-        let before = std::fs::metadata(&target).unwrap();
-        let (ino, mtime) = (before.ino(), before.modified().unwrap());
-
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let result = atomic_write_file(&target, "NEW", Durability::Fsync);
-        // Restore before asserting so a failed assertion cannot leave an
-        // undeletable tempdir behind.
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let err = result
-            .expect_err("a read-only parent directory must fail the write")
-            .to_string();
-        assert!(
-            err.contains("locked.mds"),
-            "error must name the target; got {err}"
-        );
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD");
-        let after = std::fs::metadata(&target).unwrap();
-        assert_eq!(
-            after.ino(),
-            ino,
-            "a failed write must not replace the inode"
-        );
-        assert_eq!(
-            after.modified().unwrap(),
-            mtime,
-            "a failed write must not touch the mtime"
-        );
-        let residue = temp_residue(&sub);
-        assert!(
-            residue.is_empty(),
-            "failed write left temp residue: {residue:?}"
-        );
-
-        // CONTROL: writable again — the same call succeeds and swaps the inode.
-        atomic_write_file(&target, "NEW", Durability::Fsync)
-            .expect("write must succeed once the dir is writable");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
-        assert_ne!(
-            std::fs::metadata(&target).unwrap().ino(),
-            ino,
-            "replace-by-rename must produce a new inode"
-        );
-    }
-
-    /// T-U7: a directory at the target is an error, not a clobber, and leaves no
-    /// temp file behind in the parent.
-    #[test]
-    fn atomic_write_file_directory_target_refused_without_residue() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("adir");
-        std::fs::create_dir(&target).unwrap();
-
-        let err = atomic_write_file(&target, "X", Durability::Fsync)
-            .expect_err("a directory target must not be written")
-            .to_string();
-        assert!(
-            err.contains("adir"),
-            "error must name the target; got {err}"
-        );
-        assert!(target.is_dir(), "the directory must survive the refusal");
-        let residue = temp_residue(dir.path());
-        assert!(
-            residue.is_empty(),
-            "refused write left temp residue: {residue:?}"
-        );
-    }
-
-    /// T-U8: a stat failure that is NOT `NotFound` is a hard error — never a
-    /// warning followed by a write with a guessed mode (#225).
-    ///
-    /// `#[cfg(unix)]`: provokes the stat failure with a `0o000`-mode parent
-    /// directory; Windows' permission model does not block traversal the same
-    /// way, so this setup would not provoke the failure there (#147).
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_file_unreadable_parent_is_hard_error() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("nosearch");
-        std::fs::create_dir(&p).unwrap();
-        // Planted before the chmod so the root probe below has something to stat.
-        let probe = p.join("probe");
-        std::fs::write(&probe, "").unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        if std::fs::metadata(&probe).is_ok() {
-            // Root bypasses the mode bits; EACCES cannot be provoked here.
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-            eprintln!("running as root; cannot exercise EACCES");
-            return;
-        }
-
-        let result = atomic_write_file(&p.join("x.md"), "X", Durability::Fsync);
-        // Restore before asserting so tempdir cleanup always succeeds.
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let err = result
-            .expect_err("an unstattable target must be a hard error")
-            .to_string();
-        assert!(
-            err.contains("cannot stat"),
-            "expected a stat error; got {err}"
-        );
-        assert!(
-            err.contains("x.md"),
-            "error must name the target; got {err}"
+            child.status.success() && report.contains("1 passed"),
+            "the child ran the test and it passed; stdout:\n{report}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
         );
     }
 }

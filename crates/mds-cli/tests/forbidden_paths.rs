@@ -17,6 +17,7 @@
 mod common;
 use common::{assert_no_control_chars, mds_bin};
 
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
@@ -34,7 +35,7 @@ fn escaped(ch: char) -> String {
 /// Bounded: a command still running after 20 s — a `watch` expected to refuse at
 /// startup that started watching instead — is killed and fails the test rather than
 /// hanging the suite.
-fn run(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+fn run<S: AsRef<OsStr> + std::fmt::Debug>(dir: &Path, args: &[S]) -> (Option<i32>, String) {
     let mut child = mds_bin()
         .current_dir(dir)
         .args(args)
@@ -106,8 +107,7 @@ type Frame<'a> = (&'a str, &'a str);
 const QUOTED: Frame<'static> = ("\"", "\"");
 
 /// `text` names the path exactly as `shown`, framed by `frame`, and never frames the
-/// canonical absolute form of `resolved` — status lines may name that, an error may
-/// not.
+/// canonical absolute form of `resolved`, which an error may not name.
 fn assert_names_as_typed(text: &str, frame: Frame<'_>, shown: &str, resolved: &Path, label: &str) {
     let (open, close) = frame;
     let text = squash(text);
@@ -126,6 +126,9 @@ fn assert_names_as_typed(text: &str, frame: Frame<'_>, shown: &str, resolved: &P
 //
 // Unix-only: a Windows file name cannot hold a C0 control, so the hostile file the
 // matrix needs cannot be created there.
+//
+// The refusal is `mds::io`, an I/O or file-system failure, so a directory build, check
+// or fmt that meets it exits 2 while its siblings are still processed (#157).
 
 #[cfg(unix)]
 mod walker {
@@ -149,7 +152,11 @@ mod walker {
     fn build_refuses_the_hostile_file_and_builds_its_sibling() {
         let (dir, shown) = tree();
         let (code, text) = run(dir.path(), &["build", ".", "--out-dir", "out"]);
-        assert_eq!(code, Some(1), "per-file failure exits 1; got: {text}");
+        assert_eq!(
+            code,
+            Some(2),
+            "an mds::io per-file failure exits 2; got: {text}"
+        );
         assert_refusal(&text, ESC, &shown, "build");
         assert!(is_line(&text, "1 built, 1 failed"), "got: {text}");
         let out = dir.path().join("out");
@@ -170,7 +177,7 @@ mod walker {
         std::fs::create_dir(&hostile).unwrap();
         std::fs::write(hostile.join("a.mds"), "A\n").unwrap();
         let (code, text) = run(dir.path(), &["build", ".", "--out-dir", "out"]);
-        assert_eq!(code, Some(1), "got: {text}");
+        assert_eq!(code, Some(2), "got: {text}");
         assert_refusal(
             &text,
             ESC,
@@ -185,7 +192,7 @@ mod walker {
     fn check_refuses_the_hostile_file_and_checks_its_sibling() {
         let (dir, shown) = tree();
         let (code, text) = run(dir.path(), &["check", "."]);
-        assert_eq!(code, Some(1), "got: {text}");
+        assert_eq!(code, Some(2), "got: {text}");
         assert_refusal(&text, ESC, &shown, "check");
         assert!(is_line(&text, "1 passed, 1 failed"), "got: {text}");
     }
@@ -196,7 +203,7 @@ mod walker {
         // The sibling needs a rewrite, so "formatted" proves it was processed.
         std::fs::write(dir.path().join("ok.mds"), "Hello!").unwrap();
         let (code, text) = run(dir.path(), &["fmt", "."]);
-        assert_eq!(code, Some(1), "got: {text}");
+        assert_eq!(code, Some(2), "got: {text}");
         assert_refusal(&text, ESC, &shown, "fmt");
         assert!(
             is_line(&text, "1 formatted, 0 unchanged, 1 failed"),
@@ -334,6 +341,48 @@ mod walker {
             "control: a symlink keeps the symlink message; got: {text}"
         );
     }
+}
+
+// ── A symlinked --vars file is an I/O failure on every command (#157) ───────
+
+/// A `--vars` file that is a symlink is refused by every command that takes the flag as
+/// `mds watch` refuses it: `mds::io`, exit 2, `--vars file must not be a symlink: <path
+/// as typed>` (#157). `mds build` and `mds check` passed the library's own refusal through
+/// (`mds::import`, `symlinks are not allowed in vars file path: …`, exit 1), and
+/// `mds lint` showed it under that code. Control: the file the link leads to, named by its
+/// own path, is read.
+#[test]
+fn a_symlinked_vars_file_is_an_io_error_on_every_command() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.mds"), "Hello {{name}}!\n").unwrap();
+    std::fs::write(dir.path().join("real.json"), r#"{"name": "vars"}"#).unwrap();
+    if !common::make_symlink(&dir.path().join("real.json"), &dir.path().join("link.json")) {
+        // No symlink privilege (Windows without Developer Mode): nothing to refuse.
+        return;
+    }
+    for command in ["build", "check", "lint", "watch"] {
+        let (code, text) = run(dir.path(), &[command, "in.mds", "--vars", "link.json"]);
+        assert_eq!(code, Some(2), "{command}: exit 2; got: {text}");
+        assert!(text.contains("mds::io"), "{command}: mds::io; got: {text}");
+        assert!(
+            squash(&text).contains(&squash("--vars file must not be a symlink: link.json")),
+            "{command}: names the file as typed, in the words mds watch uses; got: {text}"
+        );
+        assert!(
+            !text.contains("mds::import") && !text.contains("symlinks are not allowed"),
+            "{command}: not the library's own refusal; got: {text}"
+        );
+    }
+
+    let (code, text) = run(
+        dir.path(),
+        &["build", "in.mds", "--vars", "real.json", "-o", "-"],
+    );
+    assert_eq!(code, Some(0), "control: the real file is read; got: {text}");
+    assert!(
+        text.contains("Hello vars!"),
+        "control: its variables are used; got: {text}"
+    );
 }
 
 // ── Stdin: the working directory is shown as "." ────────────────────────────
@@ -634,6 +683,134 @@ fn clean_output_locations_are_accepted() {
     assert!(dir.path().join("out").join("in.md").is_file());
 }
 
+/// Every path below `dir`, sorted: equal listings mean a run created nothing.
+#[cfg(unix)]
+fn paths_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+        assert!(depth < 8, "fixture trees are shallow");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                walk(&path, depth + 1, out);
+            }
+            out.push(path);
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 0, &mut out);
+    out.sort();
+    out
+}
+
+/// An output location that is not valid UTF-8 — an `--out-dir` or a `-o` — is refused
+/// up front — `mds::io`, exit 2, `<flag> is not valid UTF-8: "<value>"`, each invalid
+/// sequence shown as U+FFFD — before anything is created, by `mds build` and
+/// `mds watch` in file and directory mode (#390). Every status line and comparison
+/// would have used a lossy form of it, which names another path. The two flags are
+/// refused alike: the same check, code and words, and — for a value that also carries
+/// a forbidden character — the same order, the forbidden character first.
+///
+/// Controls: an `--out-dir` and a `-o` spelled in valid non-ASCII UTF-8 are created and
+/// written, and `-o -` still writes to stdout.
+///
+/// Unix-only: the value is built from raw bytes with `OsStrExt`. No file of that name is
+/// ever created, so the run needs a filesystem that could hold one on neither platform.
+#[cfg(unix)]
+#[test]
+fn an_output_location_that_is_not_utf8_is_refused_before_anything_is_created() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.mds"), "Hi\n").unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("a.mds"), "A\n").unwrap();
+    let before = paths_under(dir.path());
+    let replaced = char::REPLACEMENT_CHARACTER;
+
+    for (flag, value, expected) in [
+        (
+            "--out-dir",
+            OsStr::from_bytes(b"o\x80ut"),
+            format!("--out-dir is not valid UTF-8: \"o{replaced}ut\""),
+        ),
+        (
+            "-o",
+            OsStr::from_bytes(b"o\x80ut.md"),
+            format!("-o/--output is not valid UTF-8: \"o{replaced}ut.md\""),
+        ),
+    ] {
+        for (sub, input) in [
+            ("build", "in.mds"),
+            ("build", "src"),
+            ("watch", "in.mds"),
+            ("watch", "src"),
+        ] {
+            let args = [OsStr::new(sub), OsStr::new(input), OsStr::new(flag), value];
+            let label = format!("{sub} {input} {flag}");
+            let (code, text) = run(dir.path(), &args);
+            assert_eq!(code, Some(2), "{label}: got: {text}");
+            assert!(text.contains("mds::io"), "{label}: mds::io; got: {text}");
+            assert!(
+                squash(&text).contains(&squash(&expected)),
+                "{label}: expected {expected:?}; got: {text}"
+            );
+            assert_eq!(
+                paths_under(dir.path()),
+                before,
+                "{label}: nothing is created"
+            );
+        }
+    }
+
+    // A value both hostile and not valid UTF-8 is refused for its forbidden character
+    // first, under either flag: that check runs before any other whose message quotes
+    // the value (#265).
+    for (flag, value) in [
+        ("--out-dir", OsStr::from_bytes(b"o\x1b\x80")),
+        ("-o", OsStr::from_bytes(b"o\x1b\x80.md")),
+    ] {
+        let args = [
+            OsStr::new("build"),
+            OsStr::new("in.mds"),
+            OsStr::new(flag),
+            value,
+        ];
+        let label = format!("build in.mds {flag} with U+001B and 0x80");
+        let (code, text) = run(dir.path(), &args);
+        assert_eq!(code, Some(2), "{label}: got: {text}");
+        assert_refusal(&text, ESC, &format!("o{}{replaced}", escaped(ESC)), &label);
+        assert_eq!(
+            paths_under(dir.path()),
+            before,
+            "{label}: nothing is created"
+        );
+    }
+
+    let (code, text) = run(dir.path(), &["build", "in.mds", "-o", "-"]);
+    assert_eq!(code, Some(0), "control -o -: got: {text}");
+    assert!(text.contains("Hi"), "control -o -: to stdout; got: {text}");
+    assert_eq!(
+        paths_under(dir.path()),
+        before,
+        "control -o -: stdout, no file"
+    );
+
+    let clean = "o\u{e9}ut";
+    let (code, text) = run(dir.path(), &["build", "in.mds", "--out-dir", clean]);
+    assert_eq!(code, Some(0), "control --out-dir: got: {text}");
+    assert!(
+        dir.path().join(clean).join("in.md").is_file(),
+        "control: a UTF-8 --out-dir is created and written"
+    );
+    let clean = "o\u{e9}ut.md";
+    let (code, text) = run(dir.path(), &["build", "in.mds", "-o", clean]);
+    assert_eq!(code, Some(0), "control -o: got: {text}");
+    assert!(
+        dir.path().join(clean).is_file(),
+        "control: a UTF-8 -o is written"
+    );
+}
+
 fn write_mds_json(dir: &Path, output_dir: &str) {
     let json = serde_json::json!({ "build": { "output_dir": output_dir } });
     std::fs::write(dir.join("mds.json"), json.to_string()).unwrap();
@@ -681,7 +858,7 @@ mod resolved_output {
         );
         assert_no_control_chars(text, label);
         assert!(!text.contains('\t'), "{label}: raw TAB; got: {text:?}");
-        // The refusal itself: `watch` announces its (canonical) entry before it.
+        // The refusal itself: `watch` announces its entry before it.
         let refusal = &text[text
             .find("mds::io")
             .unwrap_or_else(|| panic!("{label}: mds::io; got: {text:?}"))..];
@@ -784,8 +961,17 @@ mod resolved_output {
             "nothing is written into the hostile directory"
         );
 
-        // Control: a symlink to a clean directory works.
+        // Control: the refusal above is the hostile name's. A symlink to a clean directory
+        // passes the load, and the write refuses it as it refuses any symlink below the
+        // directory `mds.json` is in (#160); the clean directory itself is written.
         write_mds_json(dir.path(), "clean_link");
+        let (code, text) = run(dir.path(), &["build", "in.mds"]);
+        assert_eq!(code, Some(2), "got: {text}");
+        assert!(
+            text.contains("refusing to follow a symlink") && !text.contains("forbidden character"),
+            "got: {text}"
+        );
+        write_mds_json(dir.path(), "clean");
         let (code, text) = run(dir.path(), &["build", "in.mds"]);
         assert_eq!(code, Some(0), "got: {text}");
         assert!(dir.path().join("clean").join("in.md").is_file());
@@ -874,7 +1060,7 @@ mod config_errors {
     /// run in a clean working directory: in the hostile one `watch` refuses its input
     /// before it loads the config. There the absence of the temp directory's name is
     /// what proves no absolute path is shown, and `-q` keeps `watch`'s `Watching …`
-    /// status line — which names the canonical path, as status lines may — out of it.
+    /// status line out of it, so the text checked is the config error's alone.
     #[test]
     fn config_load_errors_name_the_file_as_reached_from_the_input() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1,9 +1,10 @@
 use std::io::Read;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
 pub fn fixture(name: &str) -> PathBuf {
@@ -24,6 +25,19 @@ pub fn mds_bin() -> std::process::Command {
     cmd
 }
 
+/// The write end of a pipe whose read end has already been dropped.
+///
+/// Handing this to a child as one of its standard streams makes every write the child
+/// makes to that stream fail with a broken pipe from the first byte on. The reader is
+/// dropped BEFORE the child is spawned: dropping `child.stdout` / `child.stderr` after
+/// the spawn instead races the child, since a short run can finish writing first.
+#[allow(dead_code)]
+pub fn closed_pipe() -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().expect("create a pipe");
+    drop(reader);
+    writer
+}
+
 /// Creates a symlink for a test, tolerating Windows' unprivileged restriction.
 ///
 /// Unix symlink creation needs no special privilege. On Windows it needs either
@@ -35,6 +49,11 @@ pub fn mds_bin() -> std::process::Command {
 /// `CI` env var is unset, printing a one-line reason. Returns `false` when the
 /// caller should skip the rest of the test.
 ///
+/// Windows makes a link to a directory and a link to a file differently, so the
+/// target is looked at first — a relative one from the link's directory, where the
+/// link will resolve it, not from the working directory. A target that is not there
+/// gets a file link.
+///
 /// Mirrors `crates/mds-core/src/lib.rs`'s crate-internal helper of the same
 /// name and contract (#147); duplicated rather than shared because
 /// `mds-core`'s helper is `pub(crate)` to that crate and each `mds-cli`
@@ -44,10 +63,15 @@ pub fn make_symlink(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
-    let result = if target.is_dir() {
-        std::os::windows::fs::symlink_dir(target, link)
-    } else {
-        std::os::windows::fs::symlink_file(target, link)
+    let result = {
+        let resolved = link
+            .parent()
+            .map_or_else(|| target.to_path_buf(), |dir| dir.join(target));
+        if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
     };
 
     match result {
@@ -72,6 +96,29 @@ pub fn make_symlink(target: &Path, link: &Path) -> bool {
             );
         }
     }
+}
+
+/// Removes the symlink at `link` — the link, never what it points to.
+///
+/// Windows keeps a link to a directory as a directory entry, which `remove_dir` removes,
+/// not `remove_file`; every other link, and every link on unix, is removed with
+/// `remove_file`.
+#[allow(dead_code)]
+pub fn remove_symlink(link: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+
+        let linked = std::fs::symlink_metadata(link)
+            .unwrap_or_else(|e| panic!("look at the link {}: {e}", link.display()));
+        if linked.file_type().is_symlink_dir() {
+            std::fs::remove_dir(link)
+                .unwrap_or_else(|e| panic!("remove the link {}: {e}", link.display()));
+            return;
+        }
+    }
+    std::fs::remove_file(link)
+        .unwrap_or_else(|e| panic!("remove the link {}: {e}", link.display()));
 }
 
 // ── Frontmatter YAML bounds builders (#162) ──────────────────────────────────
@@ -154,9 +201,9 @@ pub fn dup_vars_file_omitted(n: usize, path: &Path) -> String {
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
 ///
-/// Same body as the private `count_occurrences` in `warnings.rs` / `cli_watch.rs` —
-/// those files import only the two render helpers above (E0255 otherwise) and keep
-/// their own private copy of this one.
+/// Same body as the private `count_occurrences` in `warnings.rs` — that file imports
+/// only the two render helpers above (E0255 otherwise) and keeps its own private copy
+/// of this one.
 #[allow(dead_code)]
 pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     let mut count = 0;
@@ -194,8 +241,13 @@ static WRITE_ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Deliberate non-user: `watch_single_status_line_per_rebuild`, whose subject IS the
 /// coalescing of the truncate+write pair.
 ///
-/// The Windows sharing-violation caveat (a rename over a file another process holds
-/// open can fail) is developer-machine only; CI runs this suite on ubuntu.
+/// On Windows, a rename over a file another process holds open succeeds when that
+/// process opened it as std does, sharing deletion (`FILE_SHARE_DELETE`): std's `rename`
+/// falls back to a POSIX-semantics replace. A handle opened without that share flag — a
+/// virus scanner's, say — makes it fail with a sharing violation. The Windows CI job
+/// (`Rust — clippy, test (windows-latest)`) runs `cli_watch`, `cli_watch_cap` (hundreds of
+/// rename-overs in a run) and `cli_watch_truncate` through this helper, so a
+/// `cannot rename` panic there is a failure to triage, not one that cannot happen.
 ///
 /// # Panics
 /// Panics if `path` has no parent or no file name, or if either filesystem step
@@ -282,6 +334,7 @@ impl ChildGuard {
 
     /// Reap an already-exiting child. `Child::wait` caches its status, so calling this
     /// and then letting `Drop` run is safe.
+    #[track_caller]
     pub fn wait_status(&mut self) -> std::process::ExitStatus {
         self.0.wait().expect("wait failed")
     }
@@ -367,7 +420,12 @@ impl PipeTap {
 }
 
 /// Spawn a background thread that drains `reader` into a fresh [`PipeTap`].
-fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
+///
+/// The spawn helpers below call it with a child's pipe; the wait self-tests in
+/// `cli_watch.rs` call it with an in-memory reader, so they exercise the waits without
+/// a process.
+#[allow(dead_code)]
+pub fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = buf.clone();
     let handle = std::thread::spawn(move || {
@@ -387,6 +445,339 @@ fn tap_reader<R: Read + Send + 'static>(reader: R) -> PipeTap {
     PipeTap {
         buf,
         drain: Arc::new(Mutex::new(Some(handle))),
+    }
+}
+
+// ── Pipe-tap waits ───────────────────────────────────────────────────────────
+
+/// How often the pipe-tap waits sample their tap.
+const TAP_POLL: Duration = Duration::from_millis(20);
+
+/// Poll `tap` until `done` holds for its text, or `timeout` elapses. Never panics.
+///
+/// `Ok` carries the text that satisfied `done`; `Err` carries the last text seen when
+/// the time ran out. This is for a caller that treats an unmet condition as data
+/// rather than as a failure; a wait whose timeout is a failure goes through
+/// [`wait_for_tap`] or [`wait_for_tap_count`], which fail at the caller.
+#[allow(dead_code)]
+pub fn poll_tap_until(
+    tap: &PipeTap,
+    timeout: Duration,
+    done: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    // Bounded by `timeout`: at most timeout / TAP_POLL iterations, and the text is
+    // tested once more after the deadline passes, so a condition met on the last
+    // sample still counts.
+    loop {
+        let text = tap.text();
+        if done(&text) {
+            return Ok(text);
+        }
+        if Instant::now() >= deadline {
+            return Err(text);
+        }
+        std::thread::sleep(TAP_POLL);
+    }
+}
+
+/// Wait until `tap` holds `needle`, and return everything it holds at that moment.
+///
+/// PANICS on timeout. The message opens with the CALLER's `file:line:column` and ends
+/// with what the tap actually held, so a missing line is reported where the test waited
+/// for it, as the precondition that never happened — never as a later assertion about
+/// text that was simply incomplete. A wait that returned the text on timeout let the
+/// caller's own assertion report the shortfall as if it were a final answer.
+///
+/// A tap samples a live pipe: text returned here is complete only up to `needle`.
+/// A count over it needs an ordered anchor — a line the child writes AFTER everything
+/// being counted — or [`PipeTap::finish_text`] once such an anchor has been seen.
+#[track_caller]
+#[allow(dead_code)]
+pub fn wait_for_tap(tap: &PipeTap, needle: &str, timeout: Duration) -> String {
+    match poll_tap_until(tap, timeout, |text| text.contains(needle)) {
+        Ok(text) => text,
+        Err(seen) => panic!(
+            "wait_for_tap at {}: {needle:?} did not appear within {timeout:?}; \
+             the tap held:\n{seen}",
+            Location::caller()
+        ),
+    }
+}
+
+/// Wait until `tap` holds at least `n` occurrences of `needle`, and return everything
+/// it holds at that moment.
+///
+/// PANICS on timeout, naming the caller's `file:line:column` and the count it saw.
+///
+/// Why a count and not "contains": a stderr line the watcher emits AFTER the output
+/// write has no ordering relationship with the output file the test waited on.
+/// Dir-mode emits the duplicate-vars-key warning after the write (watch.rs
+/// `handle_fs_event_dir`), so a snapshot taken the instant `wait_for_file_contains`
+/// returns can legitimately be one warning short — or, if the previous rebuild's
+/// warning has not been sampled yet, one long. Waiting for the expected count first
+/// turns the assertion that follows into a genuine over-count check instead of a race.
+#[track_caller]
+#[allow(dead_code)]
+pub fn wait_for_tap_count(tap: &PipeTap, needle: &str, n: usize, timeout: Duration) -> String {
+    match poll_tap_until(tap, timeout, |text| count_occurrences(text, needle) >= n) {
+        Ok(text) => text,
+        Err(seen) => panic!(
+            "wait_for_tap_count at {}: expected at least {n} occurrences of {needle:?} \
+             within {timeout:?}; saw {}; the tap held:\n{seen}",
+            Location::caller(),
+            count_occurrences(&seen, needle)
+        ),
+    }
+}
+
+/// A source whose compile always fails with one `mds::undefined_var` diagnostic
+/// carrying [`ORDER_MARKER_LINE`]. Diagnostics survive `--quiet`.
+///
+/// Writing it to a watched source makes an ORDERED ANCHOR on stderr. The watch loop
+/// handles one event at a time and finishes a rebuild — its `Recompiled` line, its
+/// post-write warnings — before it takes the next event, so once the marker's
+/// diagnostic is on the tap, everything earlier rebuilds wrote is on it too. A count
+/// or an absence taken at that point is exact rather than a sample of a live pipe.
+/// The failed compile writes no output, so the output file keeps what it held.
+#[allow(dead_code)]
+pub const ORDER_MARKER_SOURCE: &str = "Order marker {{__order_marker__}}\n";
+
+/// The line of the diagnostic [`ORDER_MARKER_SOURCE`] produces, once per compile.
+///
+/// One edit can reach the watcher as several events, and each failed compile reports
+/// again, so this line can print several times for a single edit: wait for it, never
+/// count it.
+#[allow(dead_code)]
+pub const ORDER_MARKER_LINE: &str = "undefined variable '__order_marker__'";
+
+// ── Write cadence and run flags (#397) ───────────────────────────────────────
+
+/// When each write of a test's writer began and when it completed.
+///
+/// A watcher sees a write's events at some instant between the two, so the longest
+/// pause it can have seen between two successive writes runs from the START of the one
+/// to the END of the next ([`WriteCadence::gaps`]). A claim that depends on how often a
+/// test managed to write is judged on these MEASURED gaps, never on the cadence the
+/// test asked for: a loaded runner can deschedule a writer for longer than any window
+/// under test.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct WriteCadence {
+    /// `(began, completed)` for each write, in order.
+    writes: Vec<(Instant, Instant)>,
+}
+
+#[allow(dead_code)]
+impl WriteCadence {
+    /// An empty record with room for `writes` writes.
+    pub fn with_capacity(writes: usize) -> Self {
+        Self {
+            writes: Vec::with_capacity(writes),
+        }
+    }
+
+    /// A record of writes timed elsewhere, as `(began, completed)` in order.
+    ///
+    /// # Panics
+    /// Panics if a write completes before it begins, or begins before the one before it
+    /// completed: one writer writes one file at a time.
+    pub fn of(writes: Vec<(Instant, Instant)>) -> Self {
+        for (i, &(began, completed)) in writes.iter().enumerate() {
+            assert!(began <= completed, "write {i} completes before it begins");
+            if let Some(&(_, previous)) = i.checked_sub(1).and_then(|p| writes.get(p)) {
+                assert!(
+                    previous <= began,
+                    "write {i} begins before the write before it completed"
+                );
+            }
+        }
+        Self { writes }
+    }
+
+    /// Run `write`, recording when it began and when it completed.
+    pub fn time<T>(&mut self, write: impl FnOnce() -> T) -> T {
+        let began = Instant::now();
+        let done = write();
+        self.writes.push((began, Instant::now()));
+        done
+    }
+
+    /// How many writes were recorded.
+    pub fn writes(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// The first `n` writes as a record of their own — all of them when fewer were
+    /// recorded — to judge what the writer had done by a given write.
+    pub fn first(&self, n: usize) -> Self {
+        Self {
+            writes: self.writes.iter().take(n).copied().collect(),
+        }
+    }
+
+    /// From the start of the first write to the end of the last: the longest the
+    /// writes' events can have been spread over. Zero with no write.
+    pub fn span(&self) -> Duration {
+        match (self.writes.first(), self.writes.last()) {
+            (Some(&(began, _)), Some(&(_, completed))) => completed.duration_since(began),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// For each two successive writes, the longest pause a watcher can have seen
+    /// between their events: from the start of the first to the end of the second.
+    pub fn gaps(&self) -> Vec<Duration> {
+        self.writes
+            .windows(2)
+            .map(|pair| pair[1].1.duration_since(pair[0].0))
+            .collect()
+    }
+
+    /// How many [`Self::gaps`] are `at_least` long.
+    pub fn pauses(&self, at_least: Duration) -> usize {
+        self.gaps()
+            .into_iter()
+            .filter(|&gap| gap >= at_least)
+            .count()
+    }
+}
+
+impl std::fmt::Display for WriteCadence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut gaps = self.gaps();
+        gaps.sort_unstable();
+        let rank = |per_mille: usize| -> Duration {
+            gaps.get(gaps.len().saturating_sub(1) * per_mille / 1000)
+                .copied()
+                .unwrap_or_default()
+        };
+        write!(
+            f,
+            "{} writes over {:?}; gaps: max {:?}, median {:?}, p99 {:?}",
+            self.writes.len(),
+            self.span(),
+            rank(1000),
+            rank(500),
+            rank(990)
+        )
+    }
+}
+
+/// The most debounce windows that can have closed over a stream with this `cadence`,
+/// under a quiet period of `window` that a cap ends at most `cap` after it opened.
+///
+/// It holds while the watcher drains each write's events within half a window of the
+/// write:
+/// - A window the cap closed lasted the whole cap, and its last event came no earlier
+///   than one window before the cap's end. Such windows do not overlap, and they lie
+///   between the first write and one and a half windows after the last, so at most
+///   `(span + window + window / 2) / cap` of them close at the cap.
+/// - A window closes quietly only after a whole window without a drained event. With
+///   each drain at most half a window late, that takes a measured gap of at least half
+///   a window ([`WriteCadence::pauses`]) — or the end of the stream: one more.
+///
+/// A window can also close at the watcher's message limit, which no cadence measures; a
+/// caller that cannot rule that out adds an allowance of its own.
+///
+/// # Panics
+/// Panics unless `window` is nonzero and `cap` is at least `window`.
+#[allow(dead_code)]
+pub fn most_debounce_windows(cadence: &WriteCadence, window: Duration, cap: Duration) -> usize {
+    assert!(
+        !window.is_zero() && cap >= window,
+        "a debounce cap is at least its nonzero window"
+    );
+    let reach = cadence.span() + window + window / 2;
+    let cap_closes = usize::try_from(reach.as_nanos() / cap.as_nanos()).unwrap_or(usize::MAX);
+    cap_closes
+        .saturating_add(cadence.pauses(window / 2))
+        .saturating_add(1)
+}
+
+/// Env var naming a file that a test judging its own run appends one line to.
+///
+/// A claim that depends on the runner's cadence is judged only on a run whose measured
+/// cadence can decide it; any other run passes INCONCLUSIVE — it neither fails on the
+/// runner's speed nor skips. The watch soak workflow sets this per iteration and counts
+/// conclusive and inconclusive iterations apart from passed, failed and skipped ones.
+#[allow(dead_code)]
+pub const RUN_FLAG_LOG_ENV: &str = "MDS_TEST_FLAG_LOG";
+
+/// Whether a run could decide the claim it flags.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFlag {
+    /// The measured cadence let the run judge the claim, and it did.
+    Conclusive,
+    /// The measured cadence left the claim undecided; the run passed without judging it.
+    Inconclusive,
+}
+
+impl std::fmt::Display for RunFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RunFlag::Conclusive => "conclusive",
+            RunFlag::Inconclusive => "inconclusive",
+        })
+    }
+}
+
+/// The one line that flags a run of `test`: `<test>: <flag>: <details>`. The watch
+/// soak counts the lines holding `: conclusive: ` and those holding `: inconclusive: `.
+///
+/// # Panics
+/// Panics if `test` or `details` holds a line break: a flag is one line.
+#[allow(dead_code)]
+pub fn run_flag_line(test: &str, flag: RunFlag, details: &str) -> String {
+    assert!(
+        !test.contains(['\n', '\r']) && !details.contains(['\n', '\r']),
+        "a run flag is one line"
+    );
+    format!("{test}: {flag}: {details}")
+}
+
+/// Append `line` and a newline to the file at `path`, creating it if it is missing.
+///
+/// Line and newline go out in ONE write: the tests of a binary run at once and append to
+/// the same log, and an appending write lands whole at the end, while two writes per line
+/// let another writer's line fall between a line and its newline.
+#[allow(dead_code)]
+pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    file.write_all(format!("{line}\n").as_bytes())
+}
+
+/// Report whether this run of `test` was conclusive, where a passing run cannot hide
+/// it: on stderr, and as one line appended to the file [`RUN_FLAG_LOG_ENV`] names.
+/// Without that file under GitHub Actions — a CI run, not a soak that counts the lines
+/// itself — an inconclusive run also adds its line to the job summary.
+///
+/// # Panics
+/// Panics if [`RUN_FLAG_LOG_ENV`] is set and the line cannot be appended: whoever set
+/// it is counting flags, and a flag it cannot see would read as a run that never
+/// reported one.
+#[allow(dead_code)]
+pub fn record_run_flag(test: &str, flag: RunFlag, details: &str) {
+    let line = run_flag_line(test, flag, details);
+    eprintln!("{line}");
+    if let Some(path) = std::env::var_os(RUN_FLAG_LOG_ENV) {
+        let path = PathBuf::from(path);
+        if let Err(e) = append_line(&path, &line) {
+            panic!(
+                "{RUN_FLAG_LOG_ENV}={}: cannot record the run's flag: {e}",
+                path.display()
+            );
+        }
+    } else if flag == RunFlag::Inconclusive {
+        // Best effort: the job summary is a convenience; a soak's flag log is the record.
+        if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+            let _ = append_line(Path::new(&summary), &format!(":information_source: {line}"));
+        }
     }
 }
 
@@ -450,36 +841,103 @@ pub fn spawn_watch_unsynchronized(cmd: &mut Command) -> (Child, StderrTap, Optio
 /// slow machine.
 #[allow(dead_code)]
 pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutTap>) {
-    // A private directory per spawn: the suite runs at full parallelism, so a shared
-    // path would let one watcher's marker satisfy another's wait. Dropped — and so
-    // deleted — when this function returns, by which point the marker has been read.
-    let ready_dir = tempfile::tempdir().expect("failed to create readiness tempdir");
-    let ready_path = ready_dir.path().join("watch-ready");
+    let ready = ReadyFile::new();
+    let (mut child, tap, stdout_tap) =
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", ready.path()));
+    ready.wait(&mut child, || tap.text());
+    (child, tap, stdout_tap)
+}
+
+/// [`spawn_watch_ready`] for a command whose stderr the caller has set to something
+/// that needs no draining — a closed pipe, a file — which is left alone here.
+///
+/// A piped stdout is still drained, and its tap returned, as [`spawn_watch_ready`]
+/// does. With nothing tapping stderr, a watcher that ends at startup is reported by its
+/// exit status alone.
+#[allow(dead_code)]
+pub fn spawn_watch_ready_stderr_untapped(cmd: &mut Command) -> (Child, Option<StdoutTap>) {
+    let ready = ReadyFile::new();
+    let mut child = cmd
+        .env("MDS_TEST_READY", ready.path())
+        .spawn()
+        .expect("failed to spawn mds watch");
+    let stdout_tap = child.stdout.take().map(tap_reader);
+    ready.wait(&mut child, || "(stderr is not tapped)".to_string());
+    (child, stdout_tap)
+}
+
+/// [`spawn_watch_ready`] with the readiness file at `marker`, a path the caller chose —
+/// so it can plant something at it, or at the temporary path beside it, first. `marker`
+/// must be absolute and in a directory that test owns.
+#[allow(dead_code)]
+pub fn spawn_watch_ready_at(
+    cmd: &mut Command,
+    marker: &Path,
+) -> (Child, StderrTap, Option<StdoutTap>) {
     assert!(
-        ready_path.is_absolute(),
+        marker.is_absolute(),
         "MDS_TEST_READY must be absolute; mds watch ignores relative values"
     );
-
     let (mut child, tap, stdout_tap) =
-        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", &ready_path));
+        spawn_watch_unsynchronized(cmd.env("MDS_TEST_READY", marker));
+    wait_for_ready(marker, &mut child, || tap.text());
+    (child, tap, stdout_tap)
+}
 
+/// The file one spawned watcher creates when it is live (`MDS_TEST_READY`).
+struct ReadyFile {
+    /// A private directory per spawn: the suite runs at full parallelism, so a shared
+    /// path would let one watcher's marker satisfy another's wait. Dropped — and so
+    /// deleted — with this value, by which point the marker has been read.
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl ReadyFile {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("failed to create readiness tempdir");
+        let path = dir.path().join("watch-ready");
+        assert!(
+            path.is_absolute(),
+            "MDS_TEST_READY must be absolute; mds watch ignores relative values"
+        );
+        Self { _dir: dir, path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Block until `child` has created the marker; see [`wait_for_ready`].
+    fn wait(&self, child: &mut Child, stderr: impl Fn() -> String) {
+        wait_for_ready(&self.path, child, stderr);
+    }
+}
+
+/// Block until `child` has created the readiness file at `marker`. `stderr` reports what
+/// the child has printed so far, for the panic messages.
+///
+/// # Panics
+/// Panics if the child exits first, or if [`READY_TIMEOUT`] passes (the child is killed
+/// and reaped first).
+fn wait_for_ready(marker: &Path, child: &mut Child, stderr: impl Fn() -> String) {
     // Bounded by READY_TIMEOUT: at most READY_TIMEOUT / READY_POLL iterations.
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
-        if std::fs::read(&ready_path).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
-            return (child, tap, stdout_tap);
+        if std::fs::read(marker).is_ok_and(|b| b == READY_MARKER.as_bytes()) {
+            return;
         }
         // Check liveness before the deadline so a watcher that failed at startup is
         // reported as "exited", not as "timed out".
         if let Ok(Some(status)) = child.try_wait() {
-            let seen = tap.text();
+            let seen = stderr();
             panic!(
                 "mds watch exited with {status:?} before signalling readiness; \
                  stderr was:\n{seen}"
             );
         }
         if std::time::Instant::now() >= deadline {
-            let seen = tap.text();
+            let seen = stderr();
             let _ = child.kill();
             let _ = child.wait();
             panic!(
@@ -488,6 +946,97 @@ pub fn spawn_watch_ready(cmd: &mut Command) -> (Child, StderrTap, Option<StdoutT
             );
         }
         std::thread::sleep(READY_POLL);
+    }
+}
+
+// ── A stream that fails other than by a closed pipe (#157) ───────────────────
+
+/// Make the child `cmd` spawns unable to grow a file past `limit` bytes: its file-size
+/// limit is `limit` and it ignores SIGXFSZ, so a write past the limit fails with "file
+/// too large" (EFBIG) instead of killing the child.
+///
+/// A stream on a regular file the child may not grow then fails every write for a
+/// reason other than a closed pipe — on every unix, where `/dev/full` is Linux only.
+/// Pipes are not files, so the limit leaves a piped stream alone; every file the child
+/// writes itself (outputs, the readiness marker) is limited too.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn limit_file_growth(cmd: &mut Command, limit: libc::rlim_t) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `signal` is on POSIX's async-signal-safe list, and
+    // `setrlimit` is a thin wrapper around its system call that takes no lock and
+    // allocates nothing. The closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            let growth = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &growth) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// A regular file of exactly `len` bytes, open for writing at its end, to hand to a
+/// child as a stream: under [`limit_file_growth`] with `len` as the limit, every write
+/// the child makes to it fails with "file too large".
+///
+/// Not opened for appending: macOS checks the limit against the descriptor's offset,
+/// and an appending descriptor sits at 0 until its first write, so a write shorter than
+/// the limit would get through. The offset is shared with every copy of the descriptor
+/// — the child's stream and a `try_clone` the test keeps — so the test makes room again
+/// by shortening the file and moving that clone's offset back (#157).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn full_file(path: &Path, len: usize) -> std::fs::File {
+    use std::io::{Seek as _, SeekFrom};
+
+    std::fs::write(path, vec![b'#'; len]).expect("fill the stream file");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open the stream file");
+    file.seek(SeekFrom::End(0))
+        .expect("move to the end of the stream file");
+    file
+}
+
+// ── SIGINT's default action in a child (#381) ────────────────────────────────
+
+/// Give the child `cmd` spawns SIGINT's default action, terminate, whatever this
+/// process's own disposition is.
+///
+/// A child inherits an ignored signal across `exec`, and `std::process::Command` resets
+/// SIGPIPE alone: a test run started as a background job of a non-interactive shell has
+/// SIGINT ignored, and so would every child it spawns. A test that sends SIGINT to `mds
+/// watch` before its Ctrl+C handler is installed asserts the default action, so without
+/// this the signal is discarded and the test waits for an exit that never comes.
+///
+/// Unix-only: a signal disposition is a unix notion, and Windows has no SIGINT a test can
+/// send one child.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn default_sigint(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure runs in the forked child just before `exec`, where only
+    // async-signal-safe work is sound: `signal` is on POSIX's async-signal-safe list. The
+    // closure touches none of the parent's state.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 

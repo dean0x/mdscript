@@ -84,16 +84,143 @@ input. The compiler enforces several defense-in-depth controls:
   derived from a lossy string. A root that is empty or not valid UTF-8 is treated
   as "no root" — entries degrade to basenames — so it can never make the
   containment check vacuous.
-- **Replace-by-rename writes**: `mds fmt`, `mds lint --fix`, `mds init`, and `mds
-  build`/`mds watch` outputs and `.map` sidecars are written to a same-directory
-  temp file and renamed over the target after a final symlink re-check (`mds-cli/src/output.rs`,
-  `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so a
-  crash never leaves a truncated target and a symlinked output path is refused.
+- **Replace-by-rename writes, below an anchor**: `mds fmt`, `mds lint --fix`, `mds init`,
+  and `mds build`/`mds watch` outputs and `.map` sidecars are written to a
+  same-directory temp file and renamed over the target (`mds-cli/src/write.rs`,
+  `atomic_write_file`; enforced by `crates/mds-cli/tests/write_funnel.rs`), so on a
+  local filesystem a crash or kill of the run never leaves a truncated target (a
+  network or FUSE filesystem can report a full disk only when the file is closed, which
+  the write does not check). Every write is made below an anchor —
+  the parent of a file argument or of `-o`, `--out-dir`, a directory argument's root,
+  or, for `build.output_dir`, the directory that contains `mds.json` — which is
+  resolved by path, so a symlinked anchor the user named is followed: as typed, or,
+  for a directory-mode `--out-dir` and the anchors `mds watch` derives from its
+  entry or directory argument, as resolved once when the run starts. `mds watch`
+  checks its out-dir before each write below it: a write whose out-dir, as the user
+  named it, now leads to a different directory than at startup — a symlink
+  retargeted, the out-dir replaced by a link — is refused (`mds::io`, restart to
+  follow it) rather than followed, while a deleted out-dir is created again at the
+  same path. The check goes by path, and so does the write's open of its anchor, so
+  the check also finds the directory the write is anchored at — the out-dir, the
+  nearest directory above it once it has been deleted (the out-dir is then created
+  below that one without following a symlink), or, for `build.output_dir`, the
+  directory that contains `mds.json` — and the write refuses an anchor it opens that
+  is another directory, and one gone by then, which it does not make again: on Unix
+  compared on the descriptor it opened, so a link swapped onto the path between the
+  check and the write is refused rather than followed. Nothing below the anchor is
+  followed (#160): on Unix each directory below the anchor is opened from the one above
+  without following a symlink (`openat` with `O_NOFOLLOW`) — for search alone
+  (`O_PATH`) on Linux, and to read on other Unix systems, so there a directory the user
+  may write to but not list refuses the write — and the temp file is
+  created (`O_CREAT | O_EXCL | O_NOFOLLOW`), given a replaced file's mode on its own
+  descriptor, and renamed (`renameat`) in the last one, so a symlink below the anchor
+  — planted before the run or swapped in while a write runs — and a symlink at the
+  target are refused (`mds::io`, exit 2) and never written through; one that appears
+  at the target during the write is replaced by the rename, not followed. On Unix a
+  FIFO, a socket or a device at the target is refused (`not a regular file`) without
+  being opened. `build.output_dir` comes from the repository, not from the user: it must be
+  a relative path (an absolute one is refused before anything is written), and its own
+  directories lie below the anchor, so a symlink committed there, such as
+  `dist -> ~/elsewhere`, is refused rather than followed.
+  `mds fmt` and `mds lint --fix` write only over the bytes they read (#160): before a
+  rewrite the file is read again below its anchor, without following a symlink, and
+  must hold the bytes formatted or fixed; on Unix the directory it is in stays open and
+  the rewrite is renamed into that directory, whatever its path leads to by then, so a
+  directory swapped after the read never receives another file's content. That
+  directory is then synced, which makes the rename durable — at once for a file
+  argument, and in a directory run once for all its rewrites there, when the run is past
+  the last of its files, the directory held open until then — so the sync is always made
+  on the directory the renames went into, never on one swapped in at its path, and a
+  rewrite's `Formatted:` or `Fixed:` line is shown only after it. Just before
+  the rename the file is looked at again in that directory and compared with a stamp
+  taken when it was read — on Unix device and inode, size, and modification and
+  status-change times; on Windows size, and modification and creation times — and a
+  file edited in between is left as edited and the rewrite refused
+  (`mds::io`, `"<path>" changed since it was read; not written`). Residuals: an edit
+  that lands between that comparison and the rename is replaced; on a filesystem whose
+  clock is coarser than the time between two writes (one-second timestamps, say), an
+  edit that keeps the file's size within the same tick is not seen; and on Windows the
+  second read, the comparison and the rename all go by path, and an edit that keeps the
+  file's size and sets its modification time back is not seen.
+  `mds init` without `--force` never replaces a file (#160): the starter is given its
+  name only where nothing has it at that moment — by a rename that never replaces on
+  Linux, Android and Apple platforms, else by a hard link, and on Windows by a move
+  without replace — so a file that appears after its existence check is left as it is
+  and refused as one already there is; on a filesystem without hard links the starter
+  is written in place into a file created exclusively, which keeps that guarantee but
+  not atomicity: a write that fails part-way removes the file again while its name is
+  still the file it created, but a crash or kill while it is written can leave it
+  partly written. `mds watch`'s write of a source's output after a change of kind
+  (below) uses the same commit, with the same residual.
+  A stale output, a stale `.map` sidecar and, in `mds watch`, a deleted source's output
+  are removed below their anchor in the same way (#160), only as a regular file, never
+  through a symlink nor one at the file, and, in `mds watch`, only below the out-dir it
+  checked: on Unix the file is opened in the directory the walk reached without
+  following a symlink, proven, and unlinked (`unlinkat`) from that directory only while
+  its name is still the file opened, unchanged — the same device and inode, size, and
+  modification and status-change times, so the same file written over after the proof
+  read it is kept; the residuals are a rewrite's: a change in the instant between that
+  last look and the removal, and on a filesystem whose clock is coarser than the time
+  between the read and an edit (one-second timestamps, say), an edit that keeps the
+  file's size. `mds watch` removes an output — of a
+  deleted source, or of the old kind after a change of kind — only when the session
+  last wrote that file for that source and it still holds exactly the bytes written
+  (#160): a file it did not write, hand-written or left by another run, one it wrote for
+  another source of the same output name, and one changed since are kept with a
+  notice. The proof is the content, so a file holding exactly those bytes is removed as
+  the session's own. After a change of kind, `mds watch` writes the new kind's output
+  only where nothing has that name at the commit — the same never-replacing commit as
+  `mds init` — or over the file the session wrote there for that source while it still
+  holds exactly those bytes, by the same stamped replace as `mds fmt` (#160): anything
+  else there, hand-written, left by another run, written for another source or changed
+  since, is kept with a notice.
+  `mds build <dir>` removes the stale `.json` of a source whose kind
+  changed below an out-dir only — beside its sources, where another source's output
+  can have that name, it looks at none — and only when it holds exactly what mds
+  writes for a messages output — read
+  no further than 10 MiB, parsed and written back to the same bytes — and never a stale
+  `.md`: anything else at that name, a symlink, a FIFO or a directory included, is kept
+  with a warning (#160). The proof is the content here too: a file holding exactly a
+  messages output, copied there by hand, is removed as mds's own.
+  **Windows residual**: the standard library has no descriptor-relative walk on
+  Windows. Each directory below the anchor is checked and refused when it is a
+  symlink or a junction, and the write — or the removal — then goes by path, so a
+  directory that another process replaces with a link between that check and the
+  write is followed; a link
+  in place before the write is refused. A file to be removed is proven, closed again,
+  looked at by path — the same size, and modification and creation times, or it is
+  kept — and then removed by its name, so a file another process puts at that name
+  after that look, or one with the same size and times, is removed in its place. The
+  anchor `mds watch` checked is compared by
+  path there, just before that walk, so a link swapped onto the out-dir's path after
+  the comparison is followed too. Other reparse points, such as a cloud-sync
+  placeholder, are written to.
   `mds build` and `mds watch` refuse an output that is the entry file itself —
   however `-o`, `--out-dir`, `build.output_dir` or the default output name it —
   before anything is written or any directory created (`mds::io`, exit 2, #425).
+  Nor do they write an output over an MDS module — a `.mds` file, or a `.md` file
+  whose frontmatter declares `type: mds`, which a template can import — or over a
+  file the run reads: the entry, an imported module, the `--vars` file, the
+  `mds.json` in force — in directory mode also the `mds.json` nearest each source,
+  which a file-mode build of it would hold in force. Just before the rename the
+  file at the output path is looked at in the directory the write walked to: a
+  `.mds` file is a module by its name, never read, and a `.md` file is read as
+  opened there (on Windows, by path); it is compared with each file the run reads,
+  looked up by its path then — on Unix by device and inode, on Windows by canonical
+  path, so a hard link to an input is written over there. A module, a `.md` file that cannot be read to tell, and a
+  file the run reads are refused and left as they are (`mds::io`, #425). One put
+  there in the instant between that look and the rename is replaced. An output that
+  itself declares `type: mds` — a module a template generates — replaces a module,
+  its own or one written by hand, though never a file the run reads. On Windows a
+  name holding a `:` — NTFS stream syntax, `lib.mds::$DATA` being `lib.mds` itself —
+  is refused before anything is written (`invalid filename`), so no write reaches a
+  module by a name the check does not take for one.
   Consequence: hard links, ACLs, xattrs, and owner/group of a pre-existing target
-  are not preserved (permission bits are, on Unix) — see spec §7.2 "Output writing".
+  are not preserved (permission bits are, on Unix — read, write and execute alone,
+  never a setuid, setgid or sticky bit, and only from a file the user running mds owns:
+  one another user owns lends none, so a file another user plants at an output path in
+  a shared directory cannot choose the mode of the output that replaces it) — see spec
+  §7.2 "Output writing".
 
 The symlink, containment, NUL-byte, forbidden-character, path-encoding and
 segment-count rules above are specified normatively — with their error codes, the
@@ -127,23 +254,99 @@ growth, or non-termination.
 
 ## ⚠️ The `debug-panics` feature must never ship enabled
 
-The three binding crates — `mds-napi`, `mds-wasm` and `mds-python` — declare an
-off-by-default `debug-panics` Cargo feature (`crates/mds-napi/Cargo.toml`,
-`crates/mds-wasm/Cargo.toml`, `crates/mds-python/Cargo.toml`). `mds-core` and
-`mds-cli` have no such feature: the CLI installs no panic hook, so a panic there is
-a plain Rust panic (exit code 101) with no error object to attach a payload to. When
-enabled, the feature surfaces the raw Rust panic payload as `err.detail` on
-`mds::internal` errors thrown at the binding boundary, to help diagnose unexpected
-panics during local development.
+The three binding crates — `mds-napi`, `mds-wasm` and `mds-python` — and `mds-cli`
+declare an off-by-default `debug-panics` Cargo feature (`crates/mds-napi/Cargo.toml`,
+`crates/mds-wasm/Cargo.toml`, `crates/mds-python/Cargo.toml`,
+`crates/mds-cli/Cargo.toml`). `mds-core` has none. In a binding the feature surfaces
+the raw Rust panic payload as `err.detail` on `mds::internal` errors thrown at the
+binding boundary; in the CLI it prints the panic's message and location after the
+internal-compiler-error text below. Both exist to help diagnose unexpected panics
+during local development.
+
+**The CLI's panic output (#389).** A panic in `mds` is reported with these two lines on
+stderr, and the run exits 101:
+
+```
+mds: internal compiler error
+note: this is a bug in mds; please report it at https://github.com/dean0x/mdscript/issues
+```
+
+The panic's message and its source location are never shown: a message can carry a
+template author's text or the build machine's absolute paths. The two lines are one
+fixed text, printed once per panic and written with its write error ignored, so a closed
+or failing stderr loses the text and the run still exits 101, not by a signal.
+
+A panic compiling one file of a batch — a file of `mds build`, `mds check`, `mds fmt` or
+`mds lint` given a directory, or any compile of an `mds watch` session — is caught, and
+the batch goes on without that file. Only the file's compile, format or analysis runs
+inside the catch, not the write or delete of an output, so what the panic abandons is
+the compile's own work. The file counts as failed in the run's summary (`mds lint`:
+under "with errors"), and the run exits 101 once it has finished; `mds watch` keeps
+watching, rebuilds on the next edit, and exits 101 when it is stopped. A compile that
+panics again prints the two lines again. No error line names the file.
+`mds lint --format json` records it as a directory entry whose error is
+`{"code": "mds::internal", "message": "internal compiler error", "help": null, "span": null}`;
+for a panic in the `--fix` pipeline of a file argument, the run's one error document
+carries that error. Neither holds anything of the panic itself.
+
+A panic anywhere else on the thread running the command ends the run: it unwinds to the
+end, which removes an output's temporary file on the way, and exits 101. A panic on
+another thread — `mds watch`'s file-event callback or its Ctrl-C handler, each on a
+thread of its own — ends the process at once with the same text and exit 101, and so
+does a second panic while the first is still unwinding, which Rust would otherwise turn
+into an abort. Ending the process at once runs no destructors, so an output being
+written at that moment can be left part-way: its temporary file (`.mds-tmp-….tmp`) can
+stay beside it, and stdout's reader can get part of the product. Exit 101 wins over
+every other exit code, `mds watch`'s included.
+
+With `RUST_BACKTRACE` set to anything but `0`, a backtrace of the panicking thread
+follows the two lines — the same frames for every value, from where the hook captured
+them, with each frame's address added for `full` — each line escaped as a status line
+is. It still shows no message, but its frames name the functions and source files the
+binary was built from, with the build machine's paths and the Rust toolchain's; leave
+`RUST_BACKTRACE` unset where that matters. A panic that Rust cannot unwind at all and
+that follows no other — one of the undefined-behaviour checks a build with debug
+assertions compiles in — can print the text and then abort.
+`crates/mds-cli/tests/panic_hook.rs` pins this output, and pins the panic hook's code to
+one write of the fixed text. It also pins where each per-file catch sits, and that each
+wraps one compile call which, through the functions of `mds-cli` it calls, changes no
+file or directory, writes nothing to stdout and does not end the process. That check is
+lexical: it follows calls by name, and does not see into a macro, `mds-core`, or a call
+through a function pointer or a trait object.
+
+A build with debug assertions — `cargo install --debug`, or a profile that turns them
+on — also compiles in a test-only trigger: with the environment variable
+`MDS_TEST_PANIC` set to one of these values, `mds` panics on purpose, to exercise the
+output above:
+
+- `main`: in the command's dispatch;
+- `thread`: in a thread the dispatch starts and waits for;
+- `compile:<file stem>`: in the per-file catch, compiling a file with that stem;
+- `notify`: in `mds watch`'s file-event callback;
+- `ctrlc`: in `mds watch`'s Ctrl-C handler.
+
+The trigger is compiled only under `cfg(debug_assertions)`, which `panic_hook.rs` pins.
+A release build therefore does not contain it — the variable is never read — unless its
+profile turns debug assertions on. Build with debug assertions for development, not for
+anything you ship.
+
+So is `MDS_TEST_READY`, with which the test suite has `mds watch` create a file once it
+is watching — by path, outside the write primitive's checks: a release build never reads
+the variable, which `panic_hook.rs` pins as well.
 
 **Never enable `debug-panics` in a published or production build.** Panic messages
 can contain absolute filesystem paths and other internal details that should not be
 exposed to template authors or end users. The feature is off unless opted into
-explicitly: none of the three crates lists it in a `default` feature set
+explicitly: none of the four crates lists it in a `default` feature set
 (`mds-python`'s default is `extension-module` only), and the commands that build the
 published artifacts — `napi build --release` in `release.yml` for the addon, the
 `@mdscript/mds-wasm` build script (`wasm-pack build ../../crates/mds-wasm --target
 nodejs …` and `--target web …`) for the WASM package, and `maturin` with
 `pyproject.toml`'s `features = ["pyo3/abi3-py311"]` for the wheels — pass no
-`--features debug-panics`. No automated gate asserts this; it is checked by reading
-those three build sites.
+`--features debug-panics`. For `mds-cli` alone, `crates/mds-cli/tests/panic_hook.rs`
+fails when a line of its manifest names the feature in quotes outside a comment — how a
+`default` feature or any other feature turns it on, on one line or several — or when the
+manifest declares it as anything but `debug-panics = []`; the build sites are checked by
+reading them. `mds-cli` is published to crates.io, so
+`cargo install mds-cli --features debug-panics` builds a CLI that prints panic
+messages: build one only for your own debugging.

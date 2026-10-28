@@ -118,7 +118,13 @@ Watch-only options:
                               than MS still coalesces into a single rebuild. The window is
                               capped at max(10 × MS, 1000) ms, so a file written to
                               continuously still rebuilds. 0 disables coalescing (every
-                              event rebuilds). Values above 60000 are clamped.
+                              event rebuilds). Values above 60000 are clamped. At any
+                              value, a rebuild waits while a watched file is empty after
+                              having had content (as during a truncate-then-write save)
+                              until it is written, or for about 1000 ms, after which the
+                              empty file is compiled — longer only while a debounce window
+                              opened before then is still collecting events, by at most
+                              that window's cap.
   --poll-interval <MS>        Liveness-probe interval in milliseconds (default: 1000).
                               0 disables self-heal (native events only). Clamped to ≥50ms.
                               The watcher self-heals after a watched dir/root is deleted and
@@ -134,11 +140,51 @@ Exit codes:
   0   Success (or clean Ctrl+C in watch mode; or a clean `fmt --check` / `fmt --diff` preview)
   1   Template error (syntax, undefined variable, arity mismatch), or `fmt --check` found a
       file that would change
-  2   I/O error (file not found, not an MDS file), or invalid CLI argument (clap parse error)
-  3   Resource limit exceeded
+  2   I/O error (file not found, not an MDS file, a source that cannot be read, an output
+      that cannot be written, an output directory that cannot be created, a stale `.json`
+      that cannot be read or removed, stdin that cannot be read or is not UTF-8), or invalid CLI
+      argument (clap parse error)
+  3   Resource limit exceeded (stdin over 10 MiB included)
 ```
 
-**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary (`N built, N failed`; `N passed, N failed` for `check`) is printed on a successful run or when any file fails; the exit code is non-zero if any file fails. Under `--quiet`, the summary is suppressed on a fully-successful run but is always emitted when any file fails, so the non-zero exit is never unexplained. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) also exits non-zero (`1`) with `no .mds files found in <dir>; nothing was built` (`…checked` for `check`), likewise even under `--quiet` — an empty tree is treated as a misconfiguration, not a success. (Changed in v0.4.3; previously exited 0.) A directory whose `.mds` files are all `_`-prefixed partials is treated the same way — `build`/`check` exit `1` with `<n> .mds file(s) found in <dir> but all are _-prefixed partials; nothing was built` (`…checked`), even under `--quiet`, while `mds fmt` and `mds lint` are unaffected since they format and lint partials. (Changed in v0.4.3; previously `0 built, 0 failed`, exit 0.) `mds watch <dir>` is the exception: it starts on an empty tree and compiles files created later. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
+A closed pipe never changes the exit code of `mds build`, `mds check`, `mds fmt`, `mds init` or
+`mds lint`: `mds build page.mds -o - | head -n 1` exits 0 once `head` has read its line, and a
+closed stderr leaves every output written. The failures listed under exit code 2 exit at least 2
+— the CLI's own write, delete and stdin failures as `mds::io` errors — also in directory mode,
+where the other files are still processed; a directory run whose failures are only template
+errors or resource limits exits 1.
+`mds lint` exits at least 2 for an I/O failure: a failed `--fix` rewrite, stdin that cannot be
+read, and a stdout write that fails other than by a closed pipe. The stdout failure is reported
+once, as `mds::io`, and lifts even a clean run (changed in v0.5.0; previously a clean
+`mds lint --format json` into such a stdout exited 0). In directory mode each file whose
+`--fix --diff` diff it lost counts under `with errors`, as `mds fmt --diff <dir>` counts it
+failed. A failed `--fix` rewrite — of a file argument or of a file in a directory — and a stdin
+read failure are `mds::io` too. A source over 10 MiB — stdin, a file argument or a file in a
+directory — is `mds::resource_limit`, exit 3, in every mode and format, except that
+`mds lint --fix --format json -` refuses stdin before reading it; a directory still lints its
+other files. A `--vars` file over 10 MiB is `mds::resource_limit`, exit 3, too. A file
+argument's `mds.json`, and in directory mode each file's, loads before the file is read, so a
+malformed one is that file's `mds::io` error even when the file is also unreadable or over the
+cap. Under `--format json`, every exit except a usage error or a panic that ends the run prints
+exactly one JSON document on stdout — the error document for a failure that stops the run,
+such as a `--vars` file that cannot load or a directory with nothing to lint — and
+`--fix --diff` prints its diffs before it (changed in v0.5.0; these failures printed only on
+stderr).
+
+**Never over an MDS module or an input** (#425): `mds build` and `mds watch` never write an
+output over an MDS module a template can import — a `.mds` file, or a `.md` file whose
+frontmatter declares `type: mds` — nor over a file the run reads: the entry, a module it imports, the `--vars` file or the
+`mds.json` in force (`mds build chat.mds --vars chat.json`, a messages template whose output is
+`chat.json`) — in directory mode also the `mds.json` nearest each source, which `mds build
+<source>` would hold in force. It is refused (`mds::io`, `cannot write <file>: refusing to replace an MDS module`
+or `… refusing to replace a file this run reads`) and left as it is: `mds build <file>` exits 2,
+`mds build <dir>` goes on with the other files and exits 2, and `mds watch` reports it and
+keeps watching. Any other file there is written over as before. An output whose own
+frontmatter declares `type: mds` — a template that generates a module — is a module itself, so
+it rewrites its output on every build and rebuild, and replaces a module written by hand at
+that path the same way; it is never written over a file the run reads either.
+
+**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary (`N built, N failed`; `N passed, N failed` for `check`) is printed on a successful run or when any file fails; the exit code is non-zero if any file fails. Under `--quiet`, the summary is suppressed on a fully-successful run but is always emitted when any file fails, so the non-zero exit is never unexplained. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) also exits non-zero (`1`) with `no .mds files found in <dir>; nothing was built` (`…checked` for `check`), likewise even under `--quiet` — an empty tree is treated as a misconfiguration, not a success. (Changed in v0.4.3; previously exited 0.) A directory whose `.mds` files are all `_`-prefixed partials is treated the same way — `build`/`check` exit `1` with `<n> .mds file(s) found in <dir> but all are _-prefixed partials; nothing was built` (`…checked`), even under `--quiet`, while `mds fmt` and `mds lint` are unaffected since they format and lint partials. (Changed in v0.4.3; previously `0 built, 0 failed`, exit 0.) `mds watch <dir>` is the exception: it starts on an empty tree and compiles files created later. When a file's kind changes, `mds build <dir>` with `--out-dir` (or `build.output_dir`) removes the old `.json` only while it holds exactly the messages output mds writes, and never removes the old `.md`; anything else at that name is kept, with a warning. `mds watch <dir>` removes the output of a deleted source, and the old output of a file whose kind changed, only when that session wrote the file and it is unchanged; any other file is kept, with a notice. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
 
 `mds fmt <dir>` follows the same directory-mode conventions (recursive, symlinks rejected, continue-on-error, non-zero exit summary) with one deliberate difference: it formats `_`-prefixed **partials too** — formatting rewrites source, not compiled output, and a partial's source is just as much a candidate for reformatting as any other file.
 
@@ -178,10 +224,49 @@ shared partial rebuilds **all transitive importers** automatically.
 - **Cross-root imports**: if a file imports a partial located outside the watched root
   (e.g. `../shared/_x.mds`), editing that external partial rebuilds its in-root importers.
   The external file is never compiled to its own output.
+- **Removals**: `mds watch` removes only an output it wrote in this session, and only while
+  it still holds exactly what was written — when its source is deleted (directory mode), or
+  when an edit changes the template's kind and the output moves to `<name>.json` or
+  `<name>.md` (both modes; an explicit `-o` keeps its path). A hand-written `todo.json`
+  beside `todo.mds`, or an output you edited, is kept, with
+  `Kept <file>: not written by this session` or `Kept <file>: changed since it was written`.
+  Each file is the output of the source it was last written for: beside their sources
+  `a.b.mds` and `a.mds` both write `a.md`, and deleting one keeps the `a.md` written for
+  the other, with `Kept <file>: not written by this source`.
+  A partial has no output, so a `_p.md` beside a deleted `_p.mds` is left as it is, and
+  nothing is printed for it.
+  A save that unlinks the source and creates it again within one batch — some editors,
+  `git checkout`, `git stash` — is an edit and removes nothing.
+- **Change of kind**: when an edit changes the template's kind mid-session, the new kind's
+  output is written only where nothing is, or over the file this session wrote there for
+  that template while it is unchanged (both modes). A hand-written `chat.md` beside
+  `chat.mds` is never overwritten: it is kept with `Kept <file>: not written by this
+  session; not overwritten`, the old output stays as it was, and the next save tries
+  again. The startup write, and `-o`, write over whatever is there but an MDS module or a
+  file the session reads, as `mds build` does.
+- **Truncating saves**: an editor that saves by truncating the file and then writing it
+  leaves it empty for a moment. While a watched file — the entry, an import, the `--vars`
+  file, any source of a watched directory — is empty after having content, rebuilds wait
+  (in directory mode, the whole batch waits), at every `--debounce`: nothing is compiled
+  or printed until the file is written, so no empty output is published in between. A
+  file still empty one second after the watcher first saw it emptied is compiled as it
+  is, however many events arrive meanwhile and under `--poll-interval 0` too — later only
+  while a debounce window opened before that second ended is still collecting events, by
+  at most the window's cap of max(10 × `--debounce`, 1000) ms. A rebuild
+  that empties an output it had written with content prints
+  `Wrote an empty output: <file>` (not under `--quiet`).
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
 - Ctrl+C exits with code 0 and prints `Stopped watching.`
+- With `-o -`, a reader that goes away ends the session: `mds watch page.mds -o - | head -n 1`
+  prints `Stopped watching (stdout closed).` (not under `--quiet`) and exits 0 at the next write —
+  unless that is the startup write and stderr has also failed for another reason than a closed
+  pipe: the session was not watching yet, so it exits 2, as the other commands do.
+  A stdout write that fails for another reason is reported as `mds::io` — once however many writes
+  in a row it fails, and again if stdout fails anew after a write has landed — and watching
+  continues; the next rebuild writes again, even when its output has not changed. A closed stderr
+  does not stop the watcher, and once it is watching, no output failure changes its exit code.
 - `--vars` file is reloaded from disk on every rebuild; edits to it trigger a recompile.
 
 ### Formatting with `mds fmt`
@@ -243,8 +328,8 @@ Directory mode (`mds lint <dir>`) lints every `.mds` file recursively (partials 
 prints one summary line to stderr after processing all files:
 `N clean, N with warnings, N with errors, N resource-limited`.
 A directory with no `.mds` files exits 2 (lint's usage-error code) with
-`no .mds files found in <dir>; nothing was linted` on stderr, even under `--quiet`, and prints
-no summary.
+`no .mds files found in <dir>; nothing was linted` on stderr — under `--format json`, the error
+document on stdout instead — even under `--quiet`, and prints no summary.
 Under `--quiet`, the summary is suppressed when the worst outcome is warnings or clean; it is
 always printed when any file has errors or hits a resource limit, so the non-zero exit is never
 unexplained in those cases. Two exits are deliberately left unexplained under `--quiet`, because
