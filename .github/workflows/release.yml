@@ -1174,7 +1174,7 @@ jobs:
       - name: Publish to TestPyPI
         # IMPORTANT: Do NOT change this pin back to a commit SHA — see the
         # extended comment in the publish-python step below (PF-040).
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           packages-dir: python-dist/
           repository-url: https://test.pypi.org/legacy/
@@ -1467,7 +1467,7 @@ jobs:
         # if they drift.
         # `rehearse-publish-python` enforces this as a gate on every PR, dry run
         # and tag push (#350, PF-040).
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           packages-dir: python-dist/
           skip-existing: true
