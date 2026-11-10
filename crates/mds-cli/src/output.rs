@@ -1502,7 +1502,8 @@ pub(crate) fn output_path_for(
 
 /// `source`'s output below the out-dir — the part below it, mirrored as [`mirror_stem`]
 /// mirrors it — and whether the mirror was flattened. [`output_path_for`] joins it to both
-/// forms of the out-dir, so both name the same file below it.
+/// forms of the out-dir, so both name the same file below it. A mirror that is not below
+/// the out-dir is replaced by its flat name ([`flat_output`]), flagged flattened.
 fn mirrored_output(source: &Path, root: &Path, ext: &str) -> (PathBuf, bool) {
     let mirrored = mirror_stem(source, root);
     let flattened = matches!(mirrored, MirroredStem::Flattened(_));
@@ -1518,12 +1519,13 @@ fn mirrored_output(source: &Path, root: &Path, ext: &str) -> (PathBuf, bool) {
     name.push(".");
     name.push(ext);
     let out = no_ext.parent().unwrap_or(Path::new("")).join(&name);
-    // AC-M7 containment invariant: the output path must remain inside the out-dir, so
-    // the part below it is names alone. `mirror_stem` already guards the strip_prefix
-    // escape case by returning a bare `<stem>` for out-of-root sources; the
-    // with-extension step cannot escape. The check here is a defence-in-depth assertion,
-    // and it stays DEBUG-ONLY on purpose: the release fallback below is contained, and the
-    // write refuses a `..` below its anchor whatever reaches it (#160).
+    // Containment invariant: the output path must remain inside the out-dir, so the part
+    // below it is names alone. `mirror_stem` already guards the strip_prefix escape case
+    // by returning a bare `<stem>` for out-of-root sources; the with-extension step cannot
+    // escape. The check here is a defence-in-depth assertion, and the assertion stays
+    // DEBUG-ONLY on purpose: a release build does not stop. It falls back to the flat
+    // name, which is contained, and reports it as flattened, so `output_path_for` warns;
+    // the write also refuses a `..` below its anchor whatever reaches it (#160).
     if out
         .components()
         .all(|c| matches!(c, std::path::Component::Normal(_)))
@@ -1532,16 +1534,23 @@ fn mirrored_output(source: &Path, root: &Path, ext: &str) -> (PathBuf, bool) {
     }
     debug_assert!(
         false,
-        "output_path_for: AC-M7 violated — output {out:?} is not below the out-dir"
+        "output_path_for: output {out:?} is not below the out-dir"
     );
-    // Invariant: same as above — the name must be relative.
+    flat_output(source, ext)
+}
+
+/// The flat output name for `source`, `<stem>.<ext>`, and the flag that it is flattened:
+/// the fallback of [`mirrored_output`] for a mirror that is not below the out-dir. The
+/// caller reports it, as it reports a source outside the root (#217).
+fn flat_output(source: &Path, ext: &str) -> (PathBuf, bool) {
+    // Invariant: same as in `mirror_stem` — the name must be relative.
     let mut flat_name = source
         .file_stem()
         .unwrap_or_else(|| OsStr::new("output"))
         .to_os_string();
     flat_name.push(".");
     flat_name.push(ext);
-    (PathBuf::from(flat_name), flattened)
+    (PathBuf::from(flat_name), true)
 }
 
 // ── Directory traversal ───────────────────────────────────────────────────────
@@ -3430,6 +3439,35 @@ mod tests {
             output_path_for(source, RootPaths::as_typed(root), &base, "md"),
             target("/out", "out", "output.md"),
             "the write oracle must not join an absolute stem"
+        );
+    }
+
+    /// The flat name a mirror that leaves the out-dir falls back to is flagged flattened,
+    /// so the write oracle warns for it as it warns for a source outside the root (#217).
+    #[test]
+    fn the_flat_fallback_of_a_mirror_is_flagged_flattened() {
+        assert_eq!(
+            flat_output(Path::new("/root/../x/a.mds"), "md"),
+            (PathBuf::from("a.md"), true)
+        );
+        assert_eq!(
+            flat_output(Path::new("/"), "json"),
+            (PathBuf::from("output.json"), true),
+            "a stem-less source keeps a relative name"
+        );
+    }
+
+    /// A source whose path climbs out of the root by `..` mirrors to a name that is not
+    /// below the out-dir. A release build then writes it flat and flags it flattened (#160).
+    /// A debug build stops on the assertion before that, so the test runs in a release
+    /// build only.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_mirror_that_leaves_the_out_dir_is_written_flat_and_reported() {
+        assert_eq!(
+            mirrored_output(Path::new("/root/../x/a.mds"), Path::new("/root"), "md"),
+            (PathBuf::from("a.md"), true),
+            "the flat name is returned with the flag that makes the caller warn"
         );
     }
 
