@@ -1422,7 +1422,7 @@ fn lint_output_goes_through_the_sink() {
     );
 }
 
-// ── Scanner self-tests (PF-013 positive / negative / robustness) ──────────────
+// ── Scanner self-tests (positive / negative / robustness controls) ────────────
 
 #[test]
 fn the_guard_flags_a_bare_interpolating_print() {
@@ -1502,9 +1502,10 @@ fn the_guard_accepts_sanitized_and_literal_prints() {
 
 #[test]
 fn the_guard_follows_a_hoisted_format_binding() {
-    // B1: hoisting the message into a local is completely idiomatic, and it used to make
+    // Hoisting the message into a local is completely idiomatic, and it used to make
     // the whole interpolation invisible — `collect_sites` only looked for `format!`
-    // lexically INSIDE the `eprint_warning(…)` parens. This is M2 reintroduced verbatim.
+    // lexically INSIDE the `eprint_warning(…)` parens. This is the earlier blind spot
+    // reintroduced verbatim.
     let src = r#"
         fn f(name: &str) {
             let msg = format!("warning: unknown lint rule '{name}'; ignoring");
@@ -1540,7 +1541,7 @@ fn the_guard_follows_a_hoisted_format_binding() {
 
 #[test]
 fn the_guard_reports_an_untraceable_helper_argument() {
-    // B2: `eprint_warning(<bare identifier>)` used to produce zero sites, so the argument
+    // `eprint_warning(<bare identifier>)` used to produce zero sites, so the argument
     // was trusted without anything checking it. It must fail closed instead.
     let src = r#"
         fn f(warnings: &[String]) {
@@ -2047,7 +2048,7 @@ fn the_module_walk_finds_every_module_a_crate_declares() {
 
 #[test]
 fn the_guard_scans_writes_to_a_stream_but_not_to_a_buffer() {
-    // B4: `writeln!(std::io::stderr(), …)` reaches a terminal exactly like `eprintln!`.
+    // `writeln!(std::io::stderr(), …)` reaches a terminal exactly like `eprintln!`.
     // There are none in the crate today; this pins the rule before the first one lands.
     let sites = collect_sites(
         r#"fn f(p: &Path) { writeln!(std::io::stderr(), "warning: {}", p.display()); }"#,

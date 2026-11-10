@@ -1,18 +1,18 @@
 //! Integration tests for `mds build <dir>` and `mds check <dir>`.
 //!
 //! Coverage:
-//! - T-CLI-12 (FUNC-16): subtree mirror + intrinsic ext per file with --out-dir
-//! - T-CLI-13 (FUNC-17): `_`-prefixed partials produce no output
-//! - T-CLI-14 (FUNC-18): continue-on-error: per-file error, summary, non-zero exit
-//! - T-CLI-15 (FUNC-19): bare build without --out-dir writes next-to-source
-//! - T-CLI-16 (FUNC-20): in-tree symlinked file/dir skipped; symlinked entry root rejected
-//! - T-CLI-17 (FUNC-21): one oversized (>10 MiB) file fails while others succeed
-//! - T-CLI-20 (FUNC-26): `check <dir>` validates tree, continues on error, non-zero exit on failure
-//! - T-CLI-21 (FUNC-16, unit): `output_path_for("json"/"md")` + `..`-containment (AC-M7)
-//!   (covered in output.rs unit tests; here we test via CLI)
-//! - AC-Q01 (#216): `mds build --quiet <dir>` on all-success tree produces no stderr
-//! - AC-Q02 (#216): `mds build --quiet <dir>` with a failing file still prints summary
-//! - AC-Q30 (#216): `--quiet` before subcommand and after produce identical results
+//! - subtree mirror and the intrinsic extension per file with `--out-dir`
+//! - `_`-prefixed partials produce no output
+//! - continue-on-error: a per-file error, a summary and a non-zero exit
+//! - a bare build without `--out-dir` writes next to the source
+//! - an in-tree symlinked file or directory is skipped; a symlinked entry root is rejected
+//! - one oversized (>10 MiB) file fails while the others succeed
+//! - `check <dir>` validates the tree, continues on error and exits non-zero on failure
+//! - `output_path_for("json"/"md")` and `..` containment (unit-tested in output.rs; tested
+//!   here through the CLI)
+//! - `mds build --quiet <dir>` on an all-success tree prints no stderr (#216)
+//! - `mds build --quiet <dir>` with a failing file still prints the summary (#216)
+//! - `--quiet` before the subcommand and after it give identical results (#216)
 
 mod common;
 use common::{make_symlink, mds_bin};
@@ -1883,9 +1883,9 @@ fn dir_build_quiet_still_prints_summary_on_failure() {
     );
 }
 
-// ── AC-Q30 (build half): --quiet in both argument positions (global flag) ─────
+// ── --quiet in both argument positions (build half; global flag) ──────────────
 //
-// --quiet is declared `global = true` (main.rs:31), so `mds --quiet build <dir>`
+// --quiet is declared `global = true` (`Cli::quiet` in main.rs), so `mds --quiet build <dir>`
 // and `mds build <dir> --quiet` must behave identically.
 
 #[test]

@@ -3350,8 +3350,8 @@ fn lint_write_failure_includes_filename_in_stderr() {
 /// Previously `lint.rs` emitted `eprintln!("Fixed: ...")` BEFORE calling
 /// `atomic_write_file`, so a failed write printed "Fixed: …/e1.mds" followed
 /// immediately by "error writing …/e1.mds" — actively lying about the
-/// outcome.  `fmt.rs:284` already does this correctly (write first, label on
-/// `Ok(())`); this test locks in parity for both lint modes.
+/// outcome.  `mds fmt` already does this correctly (write first, label on
+/// success); this test locks in parity for both lint modes.
 ///
 /// `#[cfg(unix)]`: provokes the write failure with a `0o555`-mode directory; Windows'
 /// read-only attribute does not block creating files in a directory (#147).
@@ -3492,11 +3492,12 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // "Fixed:" must NOT appear — the early return at lint.rs:1535 must prevent it.
+    // "Fixed:" must NOT appear — a failed write is `Rewrite::WriteFailed`, decided before
+    // anything is shown, and `ResultSink::fixed` runs only for a written file.
     assert!(
         !stderr.contains("Fixed:"),
         "stderr must not contain 'Fixed:' when the JSON-dir write failed \
-         (lint_one_file_accumulating, lint.rs:1535 guard); got: {stderr:?}"
+         (`Rewrite::WriteFailed` is shown without `ResultSink::fixed`); got: {stderr:?}"
     );
 }
 
@@ -5407,8 +5408,9 @@ fn lint_directory_check_exit_still_prints_summary() {
 
 // ── AC-Q14: D1-a contract: warn-only and --fix --check --quiet are silent ────
 //
-// D1-a decision (mirrors fmt.rs precedent): warnings are status output (main.rs:30)
-// and are suppressed under --quiet.  Exit codes are unaffected (AD-216-2).
+// Decision (mirrors the `mds fmt` precedent): warnings are status output (`Cli::quiet`
+// in main.rs documents `--quiet` as suppressing it) and are suppressed under --quiet.
+// Exit codes are unaffected.
 // This test pins the chosen behaviour so a future plan change is visible as a test failure.
 
 #[test]
@@ -5728,7 +5730,7 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
     assert!(
         !quiet_json_stderr.contains(needle),
         "dir --fix --format json --quiet must suppress 'fix rejected:' \
-         (D4/PF-004 lint_one_file_accumulating FixFileOutcome::Rejected); \
+         (the quiet gate of `ResultSink::fix_rejected`); \
          got: {quiet_json_stderr:?}"
     );
     assert_eq!(
@@ -5754,7 +5756,7 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
     assert!(
         !quiet_json_check_stderr.contains(needle),
         "dir --fix --check --format json --quiet must suppress 'fix rejected:' \
-         (D4/PF-004 lint_one_file_accumulating PreviewOutcome::Rejected); \
+         (the quiet gate of `ResultSink::fix_rejected`); \
          got: {quiet_json_check_stderr:?}"
     );
     assert_eq!(
@@ -5902,7 +5904,7 @@ fn cap_notice_honours_quiet_in_all_four_modes() {
     assert!(
         !quiet_json_stderr.contains(needle),
         "directory --fix --check --format json --quiet must suppress the cap notice \
-         (D4/PF-004 lint_one_file_accumulating cap-notice gate); got: {quiet_json_stderr:?}"
+         (the quiet gate of `ResultSink::cap_reached`); got: {quiet_json_stderr:?}"
     );
     assert_eq!(
         quiet_json.status.code(),
@@ -6265,9 +6267,9 @@ fn help_documents_quiet_summary_contract() {
     );
 }
 
-// ── AC-Q30 (lint half): --quiet in both argument positions ────────────────────
+// ── --quiet in both argument positions (lint half) ────────────────────────────
 //
-// --quiet is `global = true` (main.rs:31); both orderings must be identical.
+// --quiet is `global = true` (`Cli::quiet` in main.rs); both orderings must be identical.
 
 #[test]
 fn lint_directory_quiet_works_in_pre_subcommand_position() {
@@ -6320,15 +6322,15 @@ fn lint_directory_quiet_works_in_pre_subcommand_position() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// D3-a: per-file analysis failures are counted in the "with errors" bucket
+// Per-file analysis failures are counted in the "with errors" bucket
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// spec.md §7.5 "With errors" bullet (lines 964-966): "error-severity lint findings
+// spec.md §7.5 "With errors" bullet: "error-severity lint findings
 // OR a per-file analysis failure (source read, config load, or lint call failure)".
 // Every prior #216 test populates the error bucket via lint findings (lint_error.mds).
 // The tests below exercise the analysis-failure half, which has separate code paths
 // in lint.rs (config-discovery error arms, source-read IO error arms) and must be
-// covered independently (D3-a bucket-membership claim).
+// covered independently (the bucket-membership claim).
 
 // ── D3-a: config-load failure counted in "with errors" (not "clean") ──────────
 
@@ -6425,7 +6427,7 @@ fn lint_directory_config_failure_forces_summary_under_quiet() {
 //
 // A chmod-000 file causes a source-read IO error in the lint engine, which must be
 // counted as FileTally::Error (not FileTally::Clean).  This is the source-read
-// population of the "with errors" disjunction (spec.md §7.5 lines 964-966).
+// population of the "with errors" disjunction (spec.md §7.5 "With errors" bullet).
 //
 // Not run on Windows where permission enforcement uses ACLs, not Unix mode bits.
 // Running as root bypasses Unix permission checks: the chmod-000 file is readable,
@@ -6536,7 +6538,7 @@ fn lint_directory_unreadable_file_forces_summary_under_quiet() {
 /// and `--quiet` suppresses it (negative).  Both arms per PF-013.
 #[test]
 fn dir_json_fix_emits_fixed_and_quiet_suppresses_it() {
-    // Case A (positive control — ADR-009/PF-013): Fixed: must appear without --quiet.
+    // Case A (positive control): Fixed: must appear without --quiet.
     {
         let dir = tempfile::tempdir().unwrap();
         fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
@@ -6620,24 +6622,22 @@ fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
     }
 }
 
-// ── D4 (PF-004): Fixed: honours --quiet in dir-mode HUMAN emitter ─────────────
+// ── Fixed: honours --quiet in the dir-mode HUMAN format ───────────────────────
 //
-// PF-007: per-surface assertions cannot prove cross-surface parity.
-// The JSON-side test (dir_json_fix_emits_fixed_and_quiet_suppresses_it) cannot
-// substitute for this test — the human result sink is a separate emitter from
-// the JSON one.
-// Mutation-verified: without this test, changing the human-mode gate at
-// lint.rs:1723 from `!quiet` to `true` leaves all prior tests passing.
+// Per-surface assertions cannot prove cross-surface parity: the JSON-side test
+// (dir_json_fix_emits_fixed_and_quiet_suppresses_it) cannot substitute for this
+// one, which runs the human format.
 
-/// D4/PF-004: dir-mode `--fix` (human format, the default) emits `Fixed:` to stderr
-/// (positive), and `--quiet` suppresses it (negative).  Both arms per PF-013/ADR-009.
+/// Dir-mode `--fix` (human format, the default) emits `Fixed:` to stderr
+/// (positive), and `--quiet` suppresses it (negative).  Both arms run, so the
+/// absence cannot pass on a run that printed nothing.
 ///
-/// This is a separate emitter (the human result sink) from the JSON-mode
-/// equivalent (the JSON result sink); a gate on one is not inherited by the
-/// other.  The JSON-mode equivalent is `dir_json_fix_emits_fixed_and_quiet_suppresses_it`.
+/// Both result sinks announce `Fixed:` through `ResultSink::fixed`, whose quiet gate this
+/// pins for the human format.  The JSON-mode equivalent is
+/// `dir_json_fix_emits_fixed_and_quiet_suppresses_it`.
 #[test]
 fn dir_human_fix_emits_fixed_and_quiet_suppresses_it() {
-    // Case A (positive control — ADR-009/PF-013): Fixed: must appear without --quiet.
+    // Case A (positive control): Fixed: must appear without --quiet.
     {
         let dir = tempfile::tempdir().unwrap();
         fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
@@ -6646,14 +6646,14 @@ fn dir_human_fix_emits_fixed_and_quiet_suppresses_it() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("Fixed:"),
-            "D4/PF-004: dir --fix (human format) must emit 'Fixed:' when a file is \
-             successfully fixed (lint_one_file_human gate, lint.rs:1723); got stderr: {stderr}"
+            "dir --fix (human format) must emit 'Fixed:' when a file is \
+             successfully fixed (`ResultSink::fixed`); got stderr: {stderr}"
         );
         // Stdout must remain empty in human format mode.
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             stdout.is_empty(),
-            "D4: dir --fix human format must not write to stdout; got: {stdout:?}"
+            "dir --fix human format must not write to stdout; got: {stdout:?}"
         );
     }
 
@@ -6666,25 +6666,26 @@ fn dir_human_fix_emits_fixed_and_quiet_suppresses_it() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !stderr.contains("Fixed:"),
-            "D4/PF-004: dir --fix --quiet (human format) must suppress 'Fixed:' \
-             (lint_one_file_human gate, lint.rs:1723); got stderr: {stderr}"
+            "dir --fix --quiet (human format) must suppress 'Fixed:' \
+             (the quiet gate of `ResultSink::fixed`); got stderr: {stderr}"
         );
     }
 }
 
-// ── D1-a exception: --fix --diff --format json writes diff then JSON envelope ──
+// ── Exception: --fix --diff --format json writes diff then JSON envelope ──────
 //
-// spec.md:938 and lint.rs:1231-1233 document that `--fix --diff --format json`
+// The spec's §7.5 output-channel bullet for the directory summary and the JSON-envelope
+// paragraph of `run_lint_directory`'s doc say that `--fix --diff --format json`
 // writes the unified diff to stdout before the JSON envelope, making stdout
 // non-JSON-parseable as a whole by design.  This test pins the wire contract so
 // rerouting the diff to stderr (silently 'fixing' the exception) is caught.
 
-/// D1-a: `mds lint --fix --diff --format json <dir>` writes the unified diff to
+/// `mds lint --fix --diff --format json <dir>` writes the unified diff to
 /// stdout before the JSON envelope.  The final stdout line must parse as JSON;
 /// stdout as a whole must NOT parse as JSON (the diff header breaks it).
 ///
-/// Pins spec.md:938 and the D2-decision comment at lint.rs:1231-1233.  Without
-/// this test, rerouting the diff to stderr would silently remove the documented
+/// Pins that spec bullet and the JSON-envelope paragraph of `run_lint_directory`'s doc.
+/// Without this test, rerouting the diff to stderr would silently remove the documented
 /// exception with no test failure.
 #[test]
 fn lint_fix_diff_format_json_diff_precedes_json_envelope() {
@@ -6706,7 +6707,7 @@ fn lint_fix_diff_format_json_diff_precedes_json_envelope() {
     let last = lines[lines.len() - 1];
     let _: serde_json::Value = serde_json::from_str(last).unwrap_or_else(|e| {
         panic!(
-            "D1-a: final stdout line must parse as JSON (the envelope follows the diff); \
+            "final stdout line must parse as JSON (the envelope follows the diff); \
              err: {e}; last line: {last:?}; full stdout: {stdout:?}"
         )
     });
@@ -6717,19 +6718,19 @@ fn lint_fix_diff_format_json_diff_precedes_json_envelope() {
         .any(|l| l.starts_with("@@") || l.starts_with("--- ") || l.starts_with("+++ "));
     assert!(
         diff_present,
-        "D1-a: unified diff must precede the JSON envelope on stdout (spec.md:938, \
-         lint.rs:1231-1233); full stdout: {stdout:?}"
+        "unified diff must precede the JSON envelope on stdout (spec §7.5, \
+         `run_lint_directory`'s doc); full stdout: {stdout:?}"
     );
 
     // Stdout as a whole must NOT parse as JSON — the diff header breaks the shape.
     assert!(
         serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
-        "D1-a: stdout as a whole must not parse as JSON under --fix --diff --format json; \
-         this is the documented exception (spec.md:938); stdout: {stdout:?}"
+        "stdout as a whole must not parse as JSON under --fix --diff --format json; \
+         this is the documented exception (spec §7.5); stdout: {stdout:?}"
     );
 }
 
-// ── R1 (v0.4.0 dogfood): preview exit = max(1 if fixes pending, residual severity) ──
+// ── Preview exit = max(1 if fixes pending, residual severity) (v0.4.0 dogfood) ──
 //
 // `--fix --check` / `--fix --diff` previously discarded the residual (post-fix)
 // `LintResult`: `--check` hardcoded exit 1 and `--diff` exited by PRE-fix severity,
@@ -6737,7 +6738,7 @@ fn lint_fix_diff_format_json_diff_precedes_json_envelope() {
 // reported exit 1 while the real `--fix` run exits 2 — and a file with only
 // info-severity fixable findings previewed as exit 0 under `--diff`.
 //
-// Binding rule (R1): preview exit = `result_exit_code(residual)` floored at 1 when
+// Binding rule: preview exit = `result_exit_code(residual)` floored at 1 when
 // any fix is pending.  The emitted body stays PRE-fix — the preview reports what is
 // wrong NOW; only the exit code looks through to the post-fix residual.  The
 // residual can never exceed the pre-fix severity (the reverify gate refuses edits
@@ -6795,12 +6796,12 @@ fn d1_file_fix_check_residual_error_exits_2() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("Would fix:"),
-        "R1: --fix --check must still report the pending fix; stderr: {stderr}"
+        "preview exit: --fix --check must still report the pending fix; stderr: {stderr}"
     );
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: --fix --check must exit 2 when the residual carries an error-severity \
+        "preview exit: --fix --check must exit 2 when the residual carries an error-severity \
          finding (was hardcoded 1); stderr: {stderr}"
     );
     assert_eq!(
@@ -6824,7 +6825,7 @@ fn d1_file_fix_diff_residual_error_exits_2() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: --fix --diff must exit 2 when the residual carries an error-severity \
+        "preview exit: --fix --diff must exit 2 when the residual carries an error-severity \
          finding; stdout: {stdout}"
     );
     assert_eq!(
@@ -6845,12 +6846,12 @@ fn d1_stdin_fix_check_residual_error_exits_2() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("Would fix: <stdin>"),
-        "R1: stdin --fix --check must still report the pending fix; stderr: {stderr}"
+        "preview exit: stdin --fix --check must still report the pending fix; stderr: {stderr}"
     );
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: stdin --fix --check must exit 2 when the residual carries an \
+        "preview exit: stdin --fix --check must exit 2 when the residual carries an \
          error-severity finding (was hardcoded 1); stderr: {stderr}"
     );
     assert!(
@@ -6874,7 +6875,7 @@ fn d1_stdin_fix_diff_residual_error_exits_2() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: stdin --fix --diff must exit 2 when the residual carries an \
+        "preview exit: stdin --fix --diff must exit 2 when the residual carries an \
          error-severity finding; stdout: {stdout}"
     );
 }
@@ -6887,12 +6888,12 @@ fn d1_dir_fix_check_residual_error_exits_2() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("Would fix:"),
-        "R1: dir --fix --check must still report the pending fix; stderr: {stderr}"
+        "preview exit: dir --fix --check must still report the pending fix; stderr: {stderr}"
     );
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: dir --fix --check must exit 2 when any residual carries an \
+        "preview exit: dir --fix --check must exit 2 when any residual carries an \
          error-severity finding (the old early exit(1) shadowed max_tally); \
          stderr: {stderr}"
     );
@@ -6911,7 +6912,7 @@ fn d1_dir_fix_diff_residual_error_exits_2() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: dir --fix --diff must exit 2 when any residual carries an \
+        "preview exit: dir --fix --diff must exit 2 when any residual carries an \
          error-severity finding; stdout: {stdout}"
     );
 }
@@ -6920,7 +6921,7 @@ fn d1_dir_fix_diff_residual_error_exits_2() {
 fn d1_fix_diff_residual_clean_info_only_exits_1() {
     // The floor: a file whose only findings are info-severity but FIXABLE
     // previously previewed as exit 0 under --fix --diff (the exit by severity of
-    // the pre-fix result ignores Info).  R1 floors the preview at 1 whenever a fix
+    // the pre-fix result ignores Info).  The rule floors the preview at 1 whenever a fix
     // is pending, matching --check's "would change" contract.
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -6941,7 +6942,7 @@ fn d1_fix_diff_residual_clean_info_only_exits_1() {
     assert_eq!(
         out.status.code(),
         Some(1),
-        "R1: --fix --diff must exit at least 1 when a fix is pending, even when \
+        "preview exit: --fix --diff must exit at least 1 when a fix is pending, even when \
          every finding is info-severity (was 0); stderr: {stderr}"
     );
 }
@@ -6949,7 +6950,7 @@ fn d1_fix_diff_residual_clean_info_only_exits_1() {
 #[test]
 fn d1_fix_check_nothing_fixable_error_exits_2() {
     // No fixable finding at all + an error-severity finding: the NothingToFix
-    // path must keep exiting by severity (2), unchanged by R1.
+    // path must keep exiting by severity (2), unchanged by the preview rule.
     let target = fixture("lint_preview_exit/lint_nothing_fixable_error.mds");
 
     let out = lint_path(&target, &["--fix", "--check"]);
@@ -6983,12 +6984,12 @@ fn d1_file_fix_check_json_body_pre_fix_and_exit_2() {
     let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
     assert!(
         rules.contains(&"unused-variable") && rules.contains(&"empty-block"),
-        "R1: JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"
+        "preview exit: JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"
     );
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: exit must reflect the residual error while the body stays pre-fix; \
+        "preview exit: exit must reflect the residual error while the body stays pre-fix; \
          stdout: {stdout}"
     );
 }
@@ -7007,12 +7008,12 @@ fn d1_dir_fix_check_json_body_pre_fix_and_exit_2() {
     let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
     assert!(
         rules.contains(&"unused-variable") && rules.contains(&"empty-block"),
-        "R1: dir JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"
+        "preview exit: dir JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"
     );
     assert_eq!(
         out.status.code(),
         Some(2),
-        "R1: dir --fix --check --format json must emit the envelope AND exit 2 \
+        "preview exit: dir --fix --check --format json must emit the envelope AND exit 2 \
          (residual error); stdout: {stdout}"
     );
 }

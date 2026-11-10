@@ -1884,7 +1884,7 @@ fn watch_debounce_single_rebuild_from_burst() {
     );
 }
 
-// ── AC-F10: Watch no-arg auto-detect ─────────────────────────────────────
+// ── Watch no-arg auto-detect ─────────────────────────────────────────────
 
 /// `mds watch` with no argument and cwd containing exactly ONE .mds file
 /// should auto-detect and compile that file.
@@ -5738,7 +5738,7 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
     );
 }
 
-// ── R1-R3: rename-into-place (atomic write) is a first-class edit (#320) ─────
+// ── Rename-into-place (atomic write) is a first-class edit (#320) ────────────
 //
 // Editors and `write_atomic` replace a file by writing a sibling temp file and
 // renaming it over the target. That is ONE filesystem event on the destination
@@ -5747,7 +5747,7 @@ fn i20_watch_quiet_suppresses_vars_file_duplicate_warning_on_every_rebuild() {
 // watcher treats it as a content edit and that the in-flight temp file is invisible
 // to both watch modes.
 
-/// R1: file mode must rebuild when the watched source is replaced by a rename.
+/// File mode must rebuild when the watched source is replaced by a rename.
 #[test]
 fn watch_file_mode_rename_into_place_triggers_rebuild() {
     let dir = tempfile::tempdir().unwrap();
@@ -5763,22 +5763,22 @@ fn watch_file_mode_rename_into_place_triggers_rebuild() {
 
     assert!(
         wait_for_file_contains(&out, "version 1", TIMEOUT),
-        "R1: startup compile must complete"
+        "file mode: startup compile must complete"
     );
 
     write_atomic(&src, "version 2");
 
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
-        "R1: a rename-into-place edit must trigger a rebuild"
+        "file mode: a rename-into-place edit must trigger a rebuild"
     );
-    // R1: the rebuild must announce itself.
+    // The rebuild must announce itself.
     wait_for_tap(&stderr_tap, "Recompiled", TIMEOUT);
 
     drop(child);
 }
 
-/// R2: dir mode must rebuild when a watched source is replaced by a rename.
+/// Dir mode must rebuild when a watched source is replaced by a rename.
 #[test]
 fn watch_dir_mode_rename_into_place_triggers_rebuild() {
     let base = tempfile::tempdir().unwrap();
@@ -5806,22 +5806,22 @@ fn watch_dir_mode_rename_into_place_triggers_rebuild() {
 
     assert!(
         wait_for_file_contains(&out, "version 1", TIMEOUT),
-        "R2: startup compile must complete"
+        "dir mode: startup compile must complete"
     );
 
     write_atomic(&src, "version 2");
 
     assert!(
         wait_for_file_contains(&out, "version 2", TIMEOUT),
-        "R2: a rename-into-place edit must trigger a rebuild"
+        "dir mode: a rename-into-place edit must trigger a rebuild"
     );
-    // R2: the rebuild must announce itself.
+    // The rebuild must announce itself.
     wait_for_tap(&stderr_tap, "Recompiled", TIMEOUT);
 
     drop(child);
 }
 
-/// R3: the temp file an atomic write leaves in flight is never compiled.
+/// The temp file an atomic write leaves in flight is never compiled.
 ///
 /// The `.<name>.tmp-<pid>-<n>` shape puts the suffix AFTER the `.mds`, so
 /// `Path::extension()` is not `mds` and both the dir-mode event filter and
@@ -5854,14 +5854,14 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
 
     assert!(
         wait_for_file_contains(&out_dir.join("t.md"), "version 1", TIMEOUT),
-        "R3: startup compile must complete"
+        "temp file: startup compile must complete"
     );
 
     // Atomic edit of the existing source, then a brand-new source — also atomic.
     write_atomic(&src, "version 2");
     assert!(
         wait_for_file_contains(&out_dir.join("t.md"), "version 2", TIMEOUT),
-        "R3: the atomic edit must rebuild t.md"
+        "temp file: the atomic edit must rebuild t.md"
     );
 
     // Positive control: a genuine new source written the same way IS compiled, so the
@@ -5886,7 +5886,7 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
             assert!(
                 !name.contains(".tmp-"),
-                "R3: no file derived from a write_atomic temp name may survive in {}; \
+                "temp file: no file derived from a write_atomic temp name may survive in {}; \
                  found {name}",
                 dir.display()
             );
@@ -5896,7 +5896,7 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
     // And nothing announced compiling one.
     assert!(
         !stderr.contains(".tmp-"),
-        "R3: no status line may mention a write_atomic temp file; stderr:\n{stderr}"
+        "temp file: no status line may mention a write_atomic temp file; stderr:\n{stderr}"
     );
 }
 
@@ -5916,8 +5916,7 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
 /// a count of 0 would mean the watcher compiled nothing, not that the tap is sound.
 ///
 /// macOS has not been observed to lose the tail; the field signature is Linux
-/// (`cli_watch.rs:520` in CI runs 32954883014 and 32954876042). The Linux soak is the
-/// instrument for this one.
+/// (CI runs 32954883014 and 32954876042). The Linux soak is the instrument for this one.
 #[test]
 fn stderr_tap_finish_captures_every_line_the_child_wrote() {
     const FILE_COUNT: usize = 500;
