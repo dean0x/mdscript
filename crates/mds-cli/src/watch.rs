@@ -3829,8 +3829,8 @@ struct HeldBatch {
     /// read, or none has succeeded on — and so the ones the look stamps and the baseline keeps
     /// (#380). A path held back that the run reads otherwise is a watched file already; one
     /// nothing reads — a `.mds` file beside a dependency outside the root that no source
-    /// imports — is rebuilt with the batch that ends the hold, but never stamped, so its
-    /// emptying holds nothing.
+    /// imports — is rebuilt with the batch that ends the hold, but kept out of the baseline,
+    /// so its emptying holds nothing.
     sources: BTreeSet<PathBuf>,
     /// Whether one of them changed the `--vars` file.
     vars_changed: bool,
@@ -4787,15 +4787,17 @@ fn liveness_probe_dir(
 /// ([`join_emptied`]), so that batch rebuilds it. A source whose compile read a file
 /// emptied after the look is held the same way, alone, whether the compile then failed or
 /// not ([`compile_one_source`]), and a `--vars` load that failed on the file emptied after
-/// the look holds the whole batch. The look stamps the files the run reads: the watched
-/// files, and the sources ([`names_a_source`]) the batch names, those of the batches held
-/// back and those whose last compile failed, which a batch with a change compiles again
-/// without naming them. So a source no compile has read yet, or none has succeeded on, is
-/// stamped before its compile reads it, and one its compile holds keeps that stamp
+/// the look holds the whole batch. The look stamps the watched files, every path the batch
+/// names, and the sources ([`names_a_source`]) of the batches held back and those whose last
+/// compile failed, which a batch with a change compiles again without naming them. So a
+/// source no compile has read yet, or none has succeeded on, and a dependency outside the
+/// root that a source of the batch imports for the first time, is stamped before its compile
+/// reads it, and a source its compile holds keeps that stamp
 /// ([`DirWatchState::baselined_paths`]); a path nothing reads — a `.mds` file beside a
-/// dependency outside the root that no source imports — is not stamped, and its emptying
-/// holds nothing. The batch takes the look's stamps as its baseline
-/// before it reads anything, and keeps them however it ends ([`baseline_over`]) — at its
+/// dependency outside the root that no source imports — is stamped at the look and dropped
+/// from the baseline when the batch ends, so its emptying holds nothing. The batch takes
+/// the look's stamps as its baseline before it reads anything, and keeps the ones in the
+/// baseline's domain however it ends ([`baseline_over`]) — at its
 /// end, or when its `--vars` load fails ([`Settle::Rebaseline`]): a file emptied while
 /// the batch runs, after its look, that no compile read empty — read whole before, or not
 /// read — stays emptied in the baseline the batch leaves, so the rebuild its own events
@@ -4841,17 +4843,19 @@ fn run_dir_batch(
     ctx.working_dir.restore_if_recreated();
 
     // #380: a watched file emptied holds the whole batch back, and joins it. The look stamps
-    // each file the run reads once — the watched files, the sources held back, and the
-    // sources the batch names, a source no compile has read yet included, or a failed
-    // compile left errored, which the batch compiles again without naming them — and its
-    // stamps are the batch's baseline if it runs, so no source the batch compiles is stamped
-    // after its compile read it. A path nothing reads is not stamped, and holds nothing.
+    // each file the run may read once — the watched files, the sources held back, every path
+    // the batch names (a dependency outside the root that a source of the batch imports for
+    // the first time among them, which no record of the session names yet) and the sources
+    // a failed compile left errored, which the batch compiles again without naming them —
+    // and its stamps are the batch's baseline if it runs, so no file a compile of the batch
+    // reads is stamped after the read. A path nothing reads is stamped too, and the batch's
+    // end drops it from the baseline ([`DirWatchState::baselined_paths`]), so it holds nothing.
     let root = ctx.root.canonical.as_path();
-    let sources = batch
+    let errored_sources = state
+        .errored
         .iter()
-        .chain(&state.errored)
         .filter(|path| names_a_source(root, path));
-    let look = look_at(state.baselined_paths().chain(sources));
+    let look = look_at(state.baselined_paths().chain(batch).chain(errored_sources));
     let emptied: BTreeSet<PathBuf> = emptied_in(&look, &state.last_mtimes).cloned().collect();
     let verdict = state
         .hold
@@ -5983,8 +5987,9 @@ mod batch_pause_trigger {
     const VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_BATCH_SPLIT";
 
     /// The variable naming the file that ends the pause after a rebuild's look, which says
-    /// it has stopped in the same way.
-    const LOOK_VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_LOOK";
+    /// it has stopped in the same way. A unit test that stops a batch there sets it in a
+    /// child process of its own.
+    pub(super) const LOOK_VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_LOOK";
 
     /// The variable naming the file that ends the pause after a file rebuild's reads, which
     /// says it has stopped in the same way.
@@ -10804,6 +10809,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #380: a dependency outside the root that a batch names, and a source of the same
+    /// batch imports for the first time, is stamped by the batch's look — whatever the run
+    /// reads, a named path included — so a truncation that begins between the look and the
+    /// source's read holds the source back as the look would have: the empty read is not
+    /// written, and the source is kept for the batch that ends the hold. The debug build's
+    /// pause after a batch's look (`MDS_TEST_PAUSE_AFTER_LOOK`) makes the window certain;
+    /// the variable is the process's, so the test runs in a child of its own.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_dependency_outside_the_root_a_batch_names_is_held_when_truncated_after_the_look() {
+        const NAME: &str = "watch::tests::\
+            a_dependency_outside_the_root_a_batch_names_is_held_when_truncated_after_the_look";
+        if child_process::is_child(NAME) {
+            let CrossRootPage {
+                dirs: _dirs,
+                out,
+                page,
+                shared,
+                ctx,
+                mut state,
+                ..
+            } = cross_root_page();
+            let output = out.join("page.md");
+            let before = std::fs::read_to_string(&output).unwrap();
+
+            // The source imports a file beside the root it has never imported: both are
+            // named by the batch, and the file is full when the batch looks.
+            let dependency = shared.join("_y.mds");
+            std::fs::write(&page, "@import \"../shared/_y.mds\" as y\n@include y\n").unwrap();
+            std::fs::write(&dependency, "Y one\n").unwrap();
+            let batch = BTreeSet::from([page.clone(), dependency.clone()]);
+
+            // Outside every watched directory. The batch stops after its look; the file is
+            // truncated while it is stopped, and the batch goes on.
+            let (_gate_dir, gate) = canonical_tempdir();
+            let (go, paused) = (gate.join("go"), gate.join("go.paused"));
+            std::env::set_var(batch_pause_trigger::LOOK_VARIABLE, &go);
+            let truncating = std::thread::spawn({
+                let (dependency, go) = (dependency.clone(), go.clone());
+                move || {
+                    // Bounded: at most 2000 looks, ten seconds.
+                    let stopped = (0..2_000).any(|_| {
+                        std::thread::sleep(Duration::from_millis(5));
+                        paused.exists()
+                    });
+                    std::fs::File::create(&dependency).unwrap();
+                    std::fs::write(&go, "").unwrap();
+                    stopped
+                }
+            });
+            rebuild_dir_batch(&ctx, &batch, false, &mut state, None);
+            assert!(
+                truncating.join().unwrap(),
+                "control: the batch stopped after its look"
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                before,
+                "a dependency truncated after the batch's look: the empty read is not written"
+            );
+            assert!(
+                state.held.paths.contains(&page) && state.hold.deadline().is_some(),
+                "the source is held for the batch that ends the hold; {:?}",
+                state.held
+            );
+
+            // The file written again: the next batch compiles what was written.
+            std::fs::write(&dependency, "Y two\n").unwrap();
+            rebuild_dir_batch(&ctx, &BTreeSet::from([dependency]), false, &mut state, None);
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                "Y two\n",
+                "positive control: the batch after the write publishes it"
+            );
+            assert!(
+                state.held.paths.is_empty(),
+                "the hold has ended; {:?}",
+                state.held
+            );
+            return;
+        }
+        let child = child_process::run(NAME);
+        let report = String::from_utf8_lossy(&child.stdout).into_owned();
+        let printed = String::from_utf8_lossy(&child.stderr).into_owned();
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert!(
+            child.status.success(),
+            "the child's test passes; stdout:\n{report}\nstderr:\n{printed}"
+        );
     }
 
     /// #380: a file found emptied after a rebuild looked holds it as the look would have —
