@@ -691,6 +691,7 @@ fn stamp_now(path: &Path) -> FileStamp {
 
 /// Whether any of `paths` went from non-empty to empty since `baseline` was taken
 /// ([`went_empty`]): one `stat` per path, stopping at the first that did.
+#[cfg(test)]
 fn any_went_empty<'a>(paths: impl IntoIterator<Item = &'a PathBuf>, baseline: &StampMap) -> bool {
     paths
         .into_iter()
@@ -844,6 +845,30 @@ impl EmptyHold {
             Self::Until(until) => Some(until),
         }
     }
+}
+
+/// The late look (#380): the files of `read` — those a `--vars` load or a compile read —
+/// that went from non-empty to empty since `baseline` was taken, a truncation that began
+/// between the rebuild's look and the read. When there are any, the rebuild is held as the
+/// look would have held it ([`EmptyHold::on_late_empty`], at the instant read here, once)
+/// and the files are returned. `None` lets the rebuild run: no file went empty, or the
+/// deadline ended the hold in this rebuild, which compiles the files as they are.
+///
+/// A rebuild held reports nothing and records nothing, and the baseline is left as it is —
+/// as it was before a rebuild its look held, the look's stamps for one held by a file found
+/// emptied after the look — so the next event or tick finds the emptied file again, and the
+/// rebuild is held again or run ([`Settle::Defer`]).
+#[must_use]
+fn held_after_look<'a>(
+    hold: &mut EmptyHold,
+    read: impl IntoIterator<Item = &'a PathBuf>,
+    baseline: &StampMap,
+) -> Option<BTreeSet<PathBuf>> {
+    let emptied = emptied_paths(read, baseline);
+    if emptied.is_empty() {
+        return None;
+    }
+    (hold.on_late_empty(Instant::now()) == HoldVerdict::Hold).then_some(emptied)
 }
 
 // ── Idle tick ─────────────────────────────────────────────────────────────────
@@ -2708,72 +2733,36 @@ fn run_file_rebuild(
     // "Recompiled" line, a "Kept" notice, or a failed write's report — so the
     // vars-file duplicate is re-reported exactly once per OBSERVABLE rebuild
     // (tests I16, I18, I20; a kept change of kind, #160).
-    let mut resolved = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_typed.clone(),
-        set_vars: ctx.static_set_vars.clone(),
-        set_string_vars: ctx.static_set_string_vars.clone(),
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            // #380: the vars file emptied since the look above — a truncation that began
-            // between the two, so the load read it empty — holds the rebuild back as the
-            // look would have, with nothing reported or recorded, unless the deadline ended
-            // the hold in this rebuild.
-            if any_went_empty(&state.foi, &state.last_mtimes)
-                && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
-            {
-                state.kept = kept_before;
-                settle(SettleInto::File(state), None, Settle::Defer);
-                return ControlFlow::Continue(());
-            }
-            settle(SettleInto::File(state), Some(e), Settle::Rebaseline);
-            return ControlFlow::Continue(());
-        }
+    let loaded = load_and_compile(ctx);
+    // #380: a file of interest emptied since the look above — a truncation that began
+    // between the two, so the `--vars` load or the compile read it empty — holds the
+    // rebuild back as the look would have, with nothing reported or recorded, unless the
+    // deadline ended the hold in this rebuild. A compile that succeeded read the files of
+    // interest it reports. A load or a compile that failed reports none, so the files of
+    // interest are those of the compile before.
+    let read = match &loaded {
+        Ok(done) => &done.foi,
+        Err(_) => &state.foi,
     };
-    // Move the map out instead of cloning it: `compile_to_content` takes
-    // `runtime_vars` by value, and the emitter below only ever reads
-    // `resolved.vars_file` / `duplicate_vars_file_keys` /
-    // `duplicate_vars_file_keys_omitted` — none of which need `.vars`.
-    let runtime_vars = resolved.vars.take();
-
-    let t0 = Instant::now();
-    let entry = &ctx.entry;
-    let compiled = match entry.compile(runtime_vars, ctx.quiet) {
-        Ok(compiled) => compiled,
-        Err(failure) => {
-            // #380: a file of interest emptied since the look above — one the compile read
-            // empty and failed on, a truncation that began between the two — holds the
-            // rebuild back as the look would have, with nothing reported or recorded,
-            // unless the deadline ended the hold in this rebuild. A failed compile reports
-            // no dependencies, so the files of interest are those of the compile before.
-            if any_went_empty(&state.foi, &state.last_mtimes)
-                && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
-            {
-                state.kept = kept_before;
-                settle(SettleInto::File(state), None, Settle::Defer);
-                return ControlFlow::Continue(());
-            }
-            settle(
-                SettleInto::File(state),
-                failure.into_report(),
-                Settle::MarkErrored(&entry.canonical),
-            );
-            return ControlFlow::Continue(());
-        }
-    };
-
-    let deps = graph_keys(&compiled.dependencies);
-    let foi = files_of_interest(&entry.canonical, &deps, ctx.vars_path.as_deref());
-    // #380: a file the compile read, emptied since the look above — a truncation that began
-    // between the two — holds the rebuild back as the look would have, with nothing
-    // recorded, unless the deadline ended the hold in this rebuild.
-    if any_went_empty(&foi, &state.last_mtimes)
-        && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
-    {
+    if held_after_look(&mut state.hold, read, &state.last_mtimes).is_some() {
         state.kept = kept_before;
         settle(SettleInto::File(state), None, Settle::Defer);
         return ControlFlow::Continue(());
     }
+    let FileCompiled {
+        resolved,
+        started: t0,
+        compiled,
+        deps,
+        foi,
+    } = match loaded {
+        Ok(done) => done,
+        Err((failure, how)) => {
+            settle(SettleInto::File(state), failure, how);
+            return ControlFlow::Continue(());
+        }
+    };
+    let entry = &ctx.entry;
     // Freshness rule: always recompute dep set from fresh output — before the output's
     // route is admitted, so the files a compile read are watched even when its output is
     // refused, a dependency in a directory no earlier compile reported included (#257).
@@ -2956,6 +2945,56 @@ fn run_file_rebuild(
         OutputWrite::StdoutClosed => return ControlFlow::Break(StopReason::StdoutClosed),
     }
     ControlFlow::Continue(())
+}
+
+/// What a file-mode rebuild's `--vars` load and compile gave ([`load_and_compile`]).
+struct FileCompiled {
+    /// The variables the load resolved, less the map the compile took: the duplicate keys
+    /// of the `--vars` file are still to be reported (#326).
+    resolved: RuntimeVars,
+    /// When the compile began.
+    started: Instant,
+    compiled: CompileOutput,
+    /// The dependencies the compile reported, as graph keys.
+    deps: Vec<PathBuf>,
+    /// The files of interest the compile gave: the entry, `deps` and the `--vars` file.
+    foi: HashSet<PathBuf>,
+}
+
+/// A file-mode rebuild's `--vars` load and, when it succeeded, its compile of the entry: a
+/// load that failed compiles nothing. A failure is returned as what to report — `None` for
+/// a compile that panicked, which the panic hook reported (#389) — and how to settle it:
+/// [`Settle::Rebaseline`] for the load, [`Settle::MarkErrored`] for the compile. Nothing is
+/// reported or settled here: the caller's late look decides first ([`held_after_look`]).
+fn load_and_compile(
+    ctx: &FileCompileCtx,
+) -> std::result::Result<FileCompiled, (Option<miette::Report>, Settle<'_>)> {
+    let mut resolved = build_runtime_vars(RuntimeVarArgs {
+        vars: ctx.vars_path_typed.clone(),
+        set_vars: ctx.static_set_vars.clone(),
+        set_string_vars: ctx.static_set_string_vars.clone(),
+    })
+    .map_err(|e| (Some(e), Settle::Rebaseline))?;
+    // Move the map out instead of cloning it: `compile_to_content` takes
+    // `runtime_vars` by value, and the emitter in `run_file_rebuild` only ever reads
+    // `resolved.vars_file` / `duplicate_vars_file_keys` /
+    // `duplicate_vars_file_keys_omitted` — none of which need `.vars`.
+    let runtime_vars = resolved.vars.take();
+
+    let started = Instant::now();
+    let entry = &ctx.entry;
+    let compiled = entry
+        .compile(runtime_vars, ctx.quiet)
+        .map_err(|failure| (failure.into_report(), Settle::MarkErrored(&entry.canonical)))?;
+    let deps = graph_keys(&compiled.dependencies);
+    let foi = files_of_interest(&entry.canonical, &deps, ctx.vars_path.as_deref());
+    Ok(FileCompiled {
+        resolved,
+        started,
+        compiled,
+        deps,
+        foi,
+    })
 }
 
 // ── Settling a failure ────────────────────────────────────────────────────────
@@ -4065,6 +4104,28 @@ impl DirWatchState {
             .chain(&self.held.read_empty)
     }
 
+    /// A batch whose `--vars` load failed (#380): a watched file emptied since the batch's
+    /// look — the vars file the load read empty, a truncation that began between the two —
+    /// holds the whole batch back as the look would have ([`held_after_look`]), every file
+    /// found emptied joined to it, its own event lost or not ([`join_emptied`]). Returns
+    /// whether the batch was held; nothing else is recorded, and nothing is held when the
+    /// deadline ended the hold in this rebuild.
+    fn hold_after_vars_load_failed(
+        &mut self,
+        batch: &BTreeSet<PathBuf>,
+        vars_changed: bool,
+        root: &Path,
+    ) -> bool {
+        let watched = self.watched_set();
+        let Some(emptied) = held_after_look(&mut self.hold, &watched, &self.last_mtimes) else {
+            return false;
+        };
+        let (batch, vars_changed) =
+            join_emptied(batch, vars_changed, &emptied, self.vars_file.as_deref());
+        self.held.hold(&batch, vars_changed, root);
+        true
+    }
+
     /// Take the baseline over [`Self::baselined_paths`] again, from the stamps the batch's
     /// look took ([`baseline_over`], #380): only a file no look stamped is stamped now.
     fn rebaseline(&mut self) {
@@ -4332,9 +4393,8 @@ fn compile_one_source(
                 let reads = std::iter::once(&source)
                     .chain(&dep_paths)
                     .chain(state.vars_file.as_ref());
-                let read_empty = emptied_paths(reads, &state.last_mtimes);
-                if !read_empty.is_empty()
-                    && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
+                if let Some(read_empty) =
+                    held_after_look(&mut state.hold, reads, &state.last_mtimes)
                 {
                     if let Some(kept) = kept_before {
                         state.kept.insert(source.clone(), kept);
@@ -4456,9 +4516,7 @@ fn compile_one_source(
             let reads = std::iter::once(&source)
                 .chain(state.forward_deps.get(src).into_iter().flatten())
                 .chain(state.vars_file.as_ref());
-            if any_went_empty(reads, &state.last_mtimes)
-                && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
-            {
+            if held_after_look(&mut state.hold, reads, &state.last_mtimes).is_some() {
                 if let Some(kept) = kept_before {
                     state.kept.insert(source.clone(), kept);
                 }
@@ -4917,15 +4975,10 @@ fn run_dir_batch(
         Ok(v) => v,
         Err(e) => {
             // #380: a watched file emptied since the look above — the vars file the load read
-            // empty, a truncation that began between the two — holds the whole batch back as
-            // the look would have, every file found emptied joined to it, with nothing
-            // reported or recorded, unless the deadline ended the hold in this rebuild.
-            let emptied = emptied_paths(&state.watched_set(), &state.last_mtimes);
-            if !emptied.is_empty() && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
-            {
-                let (batch, vars_changed) =
-                    join_emptied(&batch, vars_changed, &emptied, state.vars_file.as_deref());
-                state.held.hold(&batch, vars_changed, root);
+            // empty, a truncation that began between the two — holds the whole batch back,
+            // with nothing reported or recorded, unless the deadline ended the hold in this
+            // rebuild.
+            if state.hold_after_vars_load_failed(&batch, vars_changed, root) {
                 settle(SettleInto::Dir(state), None, Settle::Defer);
                 return;
             }
