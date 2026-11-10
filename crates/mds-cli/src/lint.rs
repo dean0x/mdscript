@@ -297,7 +297,7 @@ fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
             // Every OTHER setup error exits through `lint_through`: 3 for a
             // resource limit, 2 for any other.
             if let Some(mds_err @ MdsError::VarConflict { .. }) = e.downcast_ref::<MdsError>() {
-                sink.analysis_failure(mds_err, None);
+                sink.analysis_failed(mds_err, None);
                 return Ok(1);
             }
             return Err(e);
@@ -331,7 +331,7 @@ fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
         return Ok(match crate::input::resolve_directory_argument(&input) {
             Ok(_) => run_lint_directory(&input, flags, runtime_vars, sink),
             Err(mds_err) => {
-                sink.analysis_failure(&mds_err, None);
+                sink.analysis_failed(&mds_err, None);
                 2
             }
         });
@@ -930,13 +930,13 @@ impl DirSummary {
 
 /// Show `error`, which stops a run over stdin or a file argument before its input is
 /// linted, and return the run's exit code. `stdin_source` relabels a stdin source, as
-/// [`ResultSink::analysis_failure`] describes.
+/// [`ResultSink::analysis_failed`] describes.
 fn analysis_failed(
     sink: &mut impl ResultSink,
     error: &MdsError,
     stdin_source: Option<&str>,
 ) -> i32 {
-    sink.analysis_failure(error, stdin_source);
+    sink.analysis_failed(error, stdin_source);
     mds_error_exit_code(error)
 }
 
@@ -2811,7 +2811,7 @@ mod tests {
             self.record("clean", input);
         }
 
-        fn analysis_failure(&mut self, _: &MdsError, _: Option<&str>) {
+        fn analysis_failed(&mut self, _: &MdsError, _: Option<&str>) {
             self.calls.push("analysis failure".to_string());
         }
 

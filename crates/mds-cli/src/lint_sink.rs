@@ -103,7 +103,7 @@ pub(crate) trait ResultSink {
     /// `message` / `help` / `span`, and no `MdsError` message interpolates the source's
     /// name (`cli_lint.rs::stdin_analysis_failure_labels_source_as_stdin` pins both). A file
     /// source passes `None`: its error already names the file.
-    fn analysis_failure(&mut self, error: &MdsError, stdin_source: Option<&str>);
+    fn analysis_failed(&mut self, error: &MdsError, stdin_source: Option<&str>);
 
     /// A directory run starts linting its entries.
     fn start_document(&mut self);
@@ -310,7 +310,7 @@ impl ResultSink for HumanSink {
         }
     }
 
-    fn analysis_failure(&mut self, error: &MdsError, stdin_source: Option<&str>) {
+    fn analysis_failed(&mut self, error: &MdsError, stdin_source: Option<&str>) {
         let report = match stdin_source {
             Some(source) => relabel_stdin_error(error, source),
             None => miette::Report::from(error.clone()),
@@ -416,7 +416,7 @@ impl ResultSink for JsonSink {
             document.push(error_entry(input, &error));
             return;
         }
-        self.analysis_failure(&error, None);
+        self.analysis_failed(&error, None);
     }
 
     /// A directory's entry: `{"file": …, "error": …}` with the internal error
@@ -441,7 +441,7 @@ impl ResultSink for JsonSink {
     fn clean(&mut self, _input: &LintSource<'_>, _findings: &mds::LintResult) {}
 
     /// The error document `{"error": …, "version": 1}` on stdout.
-    fn analysis_failure(&mut self, error: &MdsError, _stdin_source: Option<&str>) {
+    fn analysis_failed(&mut self, error: &MdsError, _stdin_source: Option<&str>) {
         emit_stdout(&json_line(&error_envelope(error.serialize())));
     }
 
@@ -461,7 +461,7 @@ impl ResultSink for JsonSink {
         let error = MdsError::Io {
             message: nothing_to_lint_message(dir, walk),
         };
-        self.analysis_failure(&error, None);
+        self.analysis_failed(&error, None);
     }
 
     /// The error document (#309). A failure that is not an `MdsError` — auto-detection

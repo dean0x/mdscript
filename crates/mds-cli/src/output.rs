@@ -979,7 +979,7 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// - `mds check -`: `run_check` in `crates/mds-cli/src/main.rs`
 /// - `mds build -` (single-file path): `compile_to_content` in `crates/mds-cli/src/build.rs`
 /// - `mds build -` (directory stdin path): `run_build` in `crates/mds-cli/src/build.rs`
-/// - `mds lint -`: the human result sink's `analysis_failure` in
+/// - `mds lint -`: the human result sink's `analysis_failed` in
 ///   `crates/mds-cli/src/lint_sink.rs`, for every failure of a stdin run
 ///
 /// Any new CLI boundary that renders a stdin analysis failure must call this
