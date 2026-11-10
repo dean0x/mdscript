@@ -272,12 +272,13 @@ impl DirIdentity {
 /// Every failure is `mds::io` (exit 2, #157), worded `cannot write <file>: <cause>`
 /// whichever step failed (#309): the file named by `target.shown`, the form the caller's
 /// status line names it by, never by `target.path` (#390), and the cause naming no path
-/// ([`io_cause`]). A symlink refused below the anchor is named instead, below the anchor's
-/// shown form — `cannot write out/sub: refusing to follow a symlink` — and one at the
-/// target says `refusing to replace a symlink`; a FIFO, a socket or a device there says
-/// `not a regular file`; an anchor that is not the directory the caller checked
-/// ([`WriteTarget::below_checked_anchor`]), or that is gone — it is not made again — is
-/// refused as [`out_dir_moved`] words it, before anything below it is opened.
+/// ([`io_cause`]). A symlink refused below the anchor is named in the cause, below the
+/// anchor's shown form — `cannot write out/sub/x.md: refusing to follow a symlink at
+/// out/sub` — and one at the target says `refusing to replace a symlink`; a FIFO, a
+/// socket or a device there says `not a regular file`; an anchor that is not the directory
+/// the caller checked ([`WriteTarget::below_checked_anchor`]), or that is gone — it is not
+/// made again — is refused as [`out_dir_moved`] words it, before anything below it is
+/// opened.
 ///
 /// In the [`Durability::Fsync`] tier a directory that cannot be synced after the rename is
 /// an error too, though the file holds `content`: `<file> written, but its directory could
@@ -613,8 +614,8 @@ pub(crate) struct ReadForRewrite {
 ///
 /// `mds::io`, worded as [`atomic_write_file`] words a failure — a symlink below the
 /// anchor or at the file is refused as it refuses one — and, for a file whose bytes are
-/// not `read` any more, or that is gone, `"<file>" changed since it was read; not
-/// written`, the file named by `target.shown`.
+/// not `read` any more, or that is gone, `cannot write <file>: changed since it was read;
+/// not written`, the file named by `target.shown`.
 pub(crate) fn read_stamped(
     target: &WriteTarget,
     read: &str,
@@ -640,8 +641,8 @@ pub(crate) fn read_stamped(
 ///
 /// # Errors
 ///
-/// `mds::io`, the file left as it was: `"<file>" changed since it was read; not written`
-/// for a file that changed, else as [`atomic_write_file`] words a failure.
+/// `mds::io`, the file left as it was: `cannot write <file>: changed since it was read; not
+/// written` for a file that changed, else as [`atomic_write_file`] words a failure.
 pub(crate) fn replace_if_unchanged(
     read: ReadForRewrite,
     content: &str,
@@ -932,21 +933,20 @@ fn not_removed(target: &WriteTarget, failure: Failure) -> NotRemoved {
 fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
     match failure {
         Failure::AnchorMoved => out_dir_moved(target),
-        Failure::Changed => mds::MdsError::Io {
-            message: format!(
-                "\"{}\" changed since it was read; not written",
-                safe_path(&target.shown)
-            ),
-        },
+        Failure::Changed => io_error(&target.shown, CHANGED_SINCE_READ.to_owned()),
         // Only a new file's commit meets a file at its target, and [`create_new`] hands that
         // to its caller to word; any other write that did would have failed like any other.
         Failure::Exists => io_error(
             &target.shown,
             io_cause(&std::io::ErrorKind::AlreadyExists.into()),
         ),
-        Failure::LinkBelowAnchor { depth } => {
-            io_error(&shown_directory(target, depth), FOLLOW_REFUSAL.to_owned())
-        }
+        Failure::LinkBelowAnchor { depth } => io_error(
+            &target.shown,
+            format!(
+                "{FOLLOW_REFUSAL} at {}",
+                safe_path(&shown_directory(target, depth))
+            ),
+        ),
         Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
         Failure::Module => io_error(&target.shown, MODULE_REFUSAL.to_owned()),
         Failure::Input => io_error(&target.shown, INPUT_REFUSAL.to_owned()),
@@ -983,6 +983,9 @@ const INPUT_REFUSAL: &str = "refusing to replace a file this run reads";
 /// read's cause: nothing tells it is no MDS module (#425).
 const MODULE_UNKNOWN: &str = "cannot tell whether it is an MDS module";
 
+/// Why [`replace_if_unchanged`] leaves a file that is not as it was read.
+const CHANGED_SINCE_READ: &str = "changed since it was read; not written";
+
 /// Why [`remove_proven`] leaves a file whose name, by the time it was to be removed, was
 /// another file's than the one its proof read.
 const CHANGED_WHILE_CHECKED: &str = "changed while it was checked";
@@ -1006,8 +1009,8 @@ pub(crate) fn out_dir_moved(target: &WriteTarget) -> mds::MdsError {
     io_error(&target.shown, OUT_DIR_MOVED.to_owned())
 }
 
-/// The `mds::io` error for a write that failed: `shown` — the file, or the directory below
-/// the anchor that was a symlink — escaped (#390), then the cause, escaped too.
+/// The `mds::io` error for a write that failed: `shown`, the file, escaped (#390), then
+/// the cause, escaped too.
 fn io_error(shown: &Path, cause: String) -> mds::MdsError {
     mds::MdsError::Io {
         message: format!("cannot write {}: {}", safe_path(shown), safe_inline(cause)),
@@ -2957,7 +2960,10 @@ mod tests {
             let err = atomic_write_file(&target, "X", Durability::Fsync, parents)
                 .expect_err("a symlink below the anchor is refused")
                 .to_string();
-            assert_eq!(err, "cannot write out/a/b: refusing to follow a symlink");
+            assert_eq!(
+                err,
+                "cannot write out/a/b/x.md: refusing to follow a symlink at out/a/b"
+            );
         }
         assert_eq!(entries(&victim), Vec::<String>::new());
         assert!(std::fs::symlink_metadata(anchor.join("a/b"))
@@ -3541,7 +3547,7 @@ mod tests {
         let err = write(&base)
             .expect_err("a link where the out-dir goes")
             .to_string();
-        assert_eq!(err, format!("cannot write o: {FOLLOW_REFUSAL}"));
+        assert_eq!(err, format!("cannot write o/x.md: {FOLLOW_REFUSAL} at o"));
         assert_eq!(
             entries(&victim),
             Vec::<String>::new(),
@@ -3739,7 +3745,7 @@ mod tests {
         let file = dir.path().join("a.mds");
         let target = WriteTarget::new(file.clone(), PathBuf::from("a.mds"));
         let changed = format!(
-            "\"{}\" changed since it was read; not written",
+            "cannot write {}: changed since it was read; not written",
             safe_path(&target.shown)
         );
         let refused = |read: &str| {

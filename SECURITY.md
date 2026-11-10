@@ -136,7 +136,7 @@ input. The compiler enforces several defense-in-depth controls:
   taken when it was read — on Unix device and inode, size, and modification and
   status-change times; on Windows size, and modification and creation times — and a
   file edited in between is left as edited and the rewrite refused
-  (`mds::io`, `"<path>" changed since it was read; not written`). Residuals: an edit
+  (`mds::io`, `cannot write <path>: changed since it was read; not written`). Residuals: an edit
   that lands between that comparison and the rename is replaced; on a filesystem whose
   clock is coarser than the time between two writes (one-second timestamps, say), an
   edit that keeps the file's size within the same tick is not seen; and on Windows the

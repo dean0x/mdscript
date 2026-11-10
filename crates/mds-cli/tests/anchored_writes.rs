@@ -91,10 +91,13 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The refusal of a symlink at `component`, a directory below the anchor, as typed.
-fn refused(component: &str) -> String {
+/// The refusal to write `file`, as typed, because `component`, a directory below the
+/// anchor on its way, is a symlink: `cannot write <file>: refusing to follow a symlink at
+/// <component>`, the file as every failed write names it and the link in the cause.
+fn refused(file: &str, component: &str) -> String {
     format!(
-        "cannot write {}: refusing to follow a symlink",
+        "cannot write {}: refusing to follow a symlink at {}",
+        native(file),
         native(component)
     )
 }
@@ -134,8 +137,9 @@ fn a_symlink_below_the_out_dir_is_refused_and_its_target_left_alone() {
     );
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(
-        stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refused("out/sub"))),
-        "the refusal names the link as typed; stderr: {stderr}"
+        stderr.contains("mds::io")
+            && squash(&stderr).contains(&squash(&refused("out/sub/a.md", "out/sub"))),
+        "the refusal names the output and the link as typed; stderr: {stderr}"
     );
     assert_eq!(
         read(&root.join(native("out/top.md"))),
@@ -357,8 +361,8 @@ fn a_symlink_committed_as_build_output_dir_is_refused() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
         assert!(
             stderr.contains("mds::io")
-                && squash(&stderr).contains(&squash(&refused("src/../dist"))),
-            "{args:?}: the refusal names the link; stderr: {stderr}"
+                && squash(&stderr).contains(&squash(&refused("src/../dist/a.md", "src/../dist"))),
+            "{args:?}: the refusal names the output and the link; stderr: {stderr}"
         );
     }
 
@@ -376,8 +380,8 @@ fn a_symlink_committed_as_build_output_dir_is_refused() {
         "watch: nothing is written through the symlink; stderr: {stderr}"
     );
     assert!(
-        squash(&stderr).contains(&squash(&refused("src/../dist"))),
-        "watch: the refusal names the link; stderr: {stderr}"
+        squash(&stderr).contains(&squash(&refused("src/../dist/a.md", "src/../dist"))),
+        "watch: the refusal names the output and the link; stderr: {stderr}"
     );
     assert!(
         std::fs::symlink_metadata(&link)
@@ -481,8 +485,8 @@ fn watch_refuses_a_symlink_below_the_out_dir_on_a_rebuild() {
         "nothing is written through the symlink; stderr: {stderr}"
     );
     assert!(
-        squash(&stderr).contains(&squash(&refused("out/sub"))),
-        "the refusal names the link as typed; stderr: {stderr}"
+        squash(&stderr).contains(&squash(&refused("out/sub/a.md", "out/sub"))),
+        "the refusal names the output and the link as typed; stderr: {stderr}"
     );
 }
 
@@ -757,8 +761,9 @@ fn assert_refused_after_the_swap(dir: &Path, code: Option<i32>, stderr: &str, fi
     );
     assert_eq!(code, Some(2), "stderr: {stderr}");
     assert!(
-        stderr.contains("mds::io") && squash(stderr).contains(&squash(&refused("src/sub"))),
-        "the refusal names the link as typed; stderr: {stderr}"
+        stderr.contains("mds::io")
+            && squash(stderr).contains(&squash(&refused("src/sub/b.mds", "src/sub"))),
+        "the refusal names the file and the link as typed; stderr: {stderr}"
     );
     assert_eq!(
         read(&dir.join("src/sub.moved/b.mds")),
@@ -884,10 +889,11 @@ fn rewrite_paused(root: &Path, args: &[&str], meanwhile: impl FnOnce()) -> (Opti
     (code, tap.finish_text(&mut child))
 }
 
-/// The refusal of a rewrite whose file changed after it was read, the file as typed.
+/// The refusal of a rewrite whose file changed after it was read, the file as typed:
+/// `cannot write <file>: changed since it was read; not written`.
 fn changed(file: &str) -> String {
     format!(
-        "\"{}\" changed since it was read; not written",
+        "cannot write {}: changed since it was read; not written",
         native(file)
     )
 }
@@ -1408,8 +1414,10 @@ fn a_directory_symlink_or_junction_below_the_out_dir_is_refused() {
             "junction {junction}: stderr: {stderr}"
         );
         assert!(
-            stderr.contains("mds::io") && squash(&stderr).contains(&squash(&refused("out/sub"))),
-            "junction {junction}: the refusal names the link as typed; stderr: {stderr}"
+            stderr.contains("mds::io")
+                && squash(&stderr).contains(&squash(&refused("out/sub/a.md", "out/sub"))),
+            "junction {junction}: the refusal names the output and the link as typed; stderr: \
+             {stderr}"
         );
         assert_eq!(read(&root.join("out").join("top.md")), "Top\n");
     }

@@ -9112,9 +9112,11 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
         }
         write_atomic(&source, "A two\n");
         let refusal = if config {
+            let link = Path::new("src").join("..").join("out");
             squash(&format!(
-                "mds::io × cannot write {}: refusing to follow a symlink",
-                Path::new("src").join("..").join("out").display()
+                "mds::io × cannot write {}: refusing to follow a symlink at {}",
+                link.join("a.md").display(),
+                link.display()
             ))
         } else {
             out_dir_moved_refusal(&Path::new("out").join("a.md"))
