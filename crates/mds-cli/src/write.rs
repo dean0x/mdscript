@@ -545,7 +545,7 @@ fn write_below_anchor(
     content: &str,
     durability: Durability,
     parents: Parents,
-    commit: Commit<'_, &imp::Stamp>,
+    commit: Commit<'_>,
 ) -> std::result::Result<Landed, Failure> {
     let below = Below::of(target)?;
     let anchor = target.checked_anchor();
@@ -581,10 +581,10 @@ impl Landed {
 
 /// How the temporary file a write has filled takes the target's name.
 #[derive(Debug, Clone, Copy)]
-enum Commit<'i, S> {
+enum Commit<'i> {
     /// Renamed over whatever file is there — for a rewrite, only while that file still
-    /// holds the stamp `S` it was read with.
-    Replace(Option<S>),
+    /// holds the stamp it was read with.
+    Replace(Option<&'i imp::Stamp>),
     /// Renamed over whatever file is there, unless it is one of the files the run reads, or
     /// an MDS module while the output itself is none (`module`) ([`write_compiled`], #425).
     Output { inputs: &'i Inputs, module: bool },
@@ -1383,7 +1383,7 @@ mod unix {
         content: &[u8],
         durability: Durability,
         parents: Parents,
-        commit: Commit<'_, &Stamp>,
+        commit: Commit<'_>,
     ) -> Result<Landed, Failure> {
         let dir = walk(below, anchor, parents)?;
         replace(dir, below.name, content, durability, commit)
@@ -1728,7 +1728,7 @@ mod unix {
         name: &OsStr,
         content: &[u8],
         durability: Durability,
-        commit: Commit<'_, &Stamp>,
+        commit: Commit<'_>,
     ) -> Result<Landed, Failure> {
         let dir = put(dir, name, content, durability, commit)?;
         let not_synced = match durability {
@@ -1745,7 +1745,7 @@ mod unix {
         name: &OsStr,
         content: &[u8],
         durability: Durability,
-        commit: Commit<'_, &Stamp>,
+        commit: Commit<'_>,
     ) -> Result<OwnedFd, Failure> {
         // The target is looked at, never opened: a FIFO would block the open.
         let replaced = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -1823,7 +1823,7 @@ mod unix {
     fn ready_to_replace(
         dir: BorrowedFd<'_>,
         name: &OsStr,
-        commit: Commit<'_, &Stamp>,
+        commit: Commit<'_>,
     ) -> Result<(), Failure> {
         match commit {
             Commit::Replace(Some(stamp)) if !stamp.holds(dir, name) => Err(Failure::Changed),
@@ -2220,7 +2220,7 @@ mod windows {
         content: &[u8],
         durability: Durability,
         parents: Parents,
-        commit: Commit<'_, &Stamp>,
+        commit: Commit<'_>,
     ) -> Result<Landed, Failure> {
         let dir = walk(below, anchor, parents)?;
         let target = dir.join(below.name);
@@ -2443,7 +2443,7 @@ mod windows {
         target: &Path,
         content: &[u8],
         durability: Durability,
-        commit: Commit<'_, &Stamp>,
+        commit: Commit<'_>,
     ) -> Result<(), Failure> {
         let mut temp = tempfile::Builder::new()
             .prefix(TEMP_PREFIX)
@@ -2486,7 +2486,7 @@ mod windows {
     /// before it: a rewrite's file must still hold the stamp it was read with, and an
     /// output's target must be no file the run reads, nor an MDS module unless the output
     /// is one (#425).
-    fn ready_to_replace(target: &Path, commit: Commit<'_, &Stamp>) -> Result<(), Failure> {
+    fn ready_to_replace(target: &Path, commit: Commit<'_>) -> Result<(), Failure> {
         match commit {
             Commit::Replace(Some(stamp)) if !stamp.holds(target) => Err(Failure::Changed),
             Commit::Output { inputs, module } => never_over_an_input(target, inputs, module),
