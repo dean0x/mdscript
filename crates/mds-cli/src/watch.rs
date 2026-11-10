@@ -3921,15 +3921,24 @@ struct DirWatchState {
     held: HeldBatch,
 }
 
+/// The paths a directory-mode rebuild covers, and whether one of them changed the `--vars`
+/// file (#380): what a batch is from its look to its compiles, and what is kept
+/// ([`HeldBatch`]) to be rebuilt with the next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Batch {
+    paths: BTreeSet<PathBuf>,
+    vars_changed: bool,
+}
+
 /// What the batches held back while a watched file is empty carried (#380): every path
 /// they named, and whether one changed the `--vars` file. A directory-mode hold holds the
 /// whole batch back — a source that imports the emptied file, or reads the emptied vars
 /// file, would compile against nothing — and the batch that ends the hold rebuilds what
 /// they named with its own, so no change made during the hold waits for a later one.
 ///
-/// A batch the `--vars` file cannot be read for is kept here too, with no hold running,
-/// and the next batch rebuilds what it named — the one that fixes the file compiles a
-/// source created meanwhile, which no other record names.
+/// A batch the `--vars` file cannot be read for is kept here too ([`HeldBatch::carry`]),
+/// with no hold running, and the next batch rebuilds what it named — the one that fixes
+/// the file compiles a source created meanwhile, which no other record names.
 ///
 /// A source whose compile read a file emptied after the batch looked is held alone
 /// ([`HeldBatch::hold_read_empty`]), and the file stays in the baseline's domain until the
@@ -3958,27 +3967,33 @@ struct HeldBatch {
 }
 
 impl HeldBatch {
-    /// Hold `paths` back, with `vars_changed`, beside the batches held before them; those that
-    /// are sources of the watch below `root` are kept as [`HeldBatch::sources`] too.
-    fn hold<'a>(
-        &mut self,
-        paths: impl IntoIterator<Item = &'a PathBuf>,
-        vars_changed: bool,
-        root: &Path,
-    ) {
-        for path in paths {
+    /// Hold `batch` back beside the batches held before it, a hold running; those of its
+    /// paths that are sources of the watch below `root` are kept as [`HeldBatch::sources`]
+    /// too.
+    fn hold(&mut self, batch: &Batch, root: &Path) {
+        for path in &batch.paths {
             if names_a_source(root, path) {
                 self.sources.insert(path.clone());
             }
             self.paths.insert(path.clone());
         }
-        self.vars_changed |= vars_changed;
+        self.vars_changed |= batch.vars_changed;
+    }
+
+    /// Carry `batch` to the next one, no hold running: a batch the `--vars` file could not
+    /// be read for. It is kept as [`HeldBatch::hold`] keeps one, and released with it.
+    fn carry(&mut self, batch: &Batch, root: &Path) {
+        self.hold(batch, root);
     }
 
     /// Hold `source` back as [`HeldBatch::hold`] does, for a compile that read the files in
     /// `emptied` empty, and keep them in the baseline until the hold ends.
-    fn hold_read_empty(&mut self, source: &PathBuf, emptied: BTreeSet<PathBuf>, root: &Path) {
-        self.hold([source], false, root);
+    fn hold_read_empty(&mut self, source: &Path, emptied: BTreeSet<PathBuf>, root: &Path) {
+        let batch = Batch {
+            paths: BTreeSet::from([source.to_path_buf()]),
+            vars_changed: false,
+        };
+        self.hold(&batch, root);
         self.read_empty.extend(emptied);
     }
 
@@ -3986,33 +4001,27 @@ impl HeldBatch {
     /// read for: `batch` and every batch kept, with whether any of them changed the vars
     /// file. Nothing stays held, the files read empty included: they leave the baseline's
     /// domain with the hold.
-    fn release(
-        &mut self,
-        batch: &BTreeSet<PathBuf>,
-        vars_changed: bool,
-    ) -> (BTreeSet<PathBuf>, bool) {
+    fn release(&mut self, batch: Batch) -> Batch {
         let held = std::mem::take(self);
         let mut paths = held.paths;
-        paths.extend(batch.iter().cloned());
-        (paths, vars_changed || held.vars_changed)
+        paths.extend(batch.paths);
+        Batch {
+            paths,
+            vars_changed: batch.vars_changed || held.vars_changed,
+        }
     }
 }
 
-/// `batch` and `vars_changed` with the watched files a look found `emptied` joined to them
-/// (#380): the `--vars` file as a change to it, every other file as a path of the batch —
-/// whether or not its own event came — so the batch that ends a hold rebuilds it.
-fn join_emptied(
-    batch: &BTreeSet<PathBuf>,
-    vars_changed: bool,
-    emptied: &BTreeSet<PathBuf>,
-    vars_file: Option<&Path>,
-) -> (BTreeSet<PathBuf>, bool) {
+/// `batch` with the watched files a look found `emptied` joined to it (#380): the `--vars`
+/// file as a change to it, every other file as a path of the batch — whether or not its own
+/// event came — so the batch that ends a hold rebuilds it.
+fn join_emptied(mut batch: Batch, emptied: &BTreeSet<PathBuf>, vars_file: Option<&Path>) -> Batch {
     let (vars, paths): (Vec<&PathBuf>, Vec<&PathBuf>) = emptied
         .iter()
         .partition(|path| Some(path.as_path()) == vars_file);
-    let mut joined = batch.clone();
-    joined.extend(paths.into_iter().cloned());
-    (joined, vars_changed || !vars.is_empty())
+    batch.paths.extend(paths.into_iter().cloned());
+    batch.vars_changed |= !vars.is_empty();
+    batch
 }
 
 impl DirWatchState {
@@ -4180,19 +4189,13 @@ impl DirWatchState {
     /// found emptied joined to it, its own event lost or not ([`join_emptied`]). Returns
     /// whether the batch was held; nothing else is recorded, and nothing is held when the
     /// deadline ended the hold in this rebuild.
-    fn hold_after_vars_load_failed(
-        &mut self,
-        batch: &BTreeSet<PathBuf>,
-        vars_changed: bool,
-        root: &Path,
-    ) -> bool {
+    fn hold_after_vars_load_failed(&mut self, batch: &Batch, root: &Path) -> bool {
         let watched = self.watched_set();
         let Some(emptied) = held_after_look(&mut self.hold, &watched, &self.last_mtimes) else {
             return false;
         };
-        let (batch, vars_changed) =
-            join_emptied(batch, vars_changed, &emptied, self.vars_file.as_deref());
-        self.held.hold(&batch, vars_changed, root);
+        let batch = join_emptied(batch.clone(), &emptied, self.vars_file.as_deref());
+        self.held.hold(&batch, root);
         true
     }
 
@@ -4969,19 +4972,17 @@ fn rebuild_dir_batch(
     state: &mut DirWatchState,
     due: Option<Instant>,
 ) {
-    run_dir_batch(ctx, batch, vars_changed, state, due);
+    let batch = Batch {
+        paths: batch.clone(),
+        vars_changed,
+    };
+    run_dir_batch(ctx, batch, state, due);
     end_rebuild_clear(&state.hold);
 }
 
 /// The batch [`rebuild_dir_batch`] runs and ends: every return of it is one the clear is
 /// dropped after (unless held).
-fn run_dir_batch(
-    ctx: &DirWatchCtx,
-    batch: &BTreeSet<PathBuf>,
-    vars_changed: bool,
-    state: &mut DirWatchState,
-    due: Option<Instant>,
-) {
+fn run_dir_batch(ctx: &DirWatchCtx, batch: Batch, state: &mut DirWatchState, due: Option<Instant>) {
     ctx.working_dir.restore_if_recreated();
 
     // #380: a watched file emptied holds the whole batch back, and joins it. The look stamps
@@ -4997,7 +4998,12 @@ fn run_dir_batch(
         .errored
         .iter()
         .filter(|path| names_a_source(root, path));
-    let look = look_at(state.baselined_paths().chain(batch).chain(errored_sources));
+    let look = look_at(
+        state
+            .baselined_paths()
+            .chain(&batch.paths)
+            .chain(errored_sources),
+    );
     let emptied: BTreeSet<PathBuf> = emptied_in(&look, &state.last_mtimes).cloned().collect();
     let verdict = state
         .hold
@@ -5006,10 +5012,9 @@ fn run_dir_batch(
         due.is_none() || verdict == HoldVerdict::Compile,
         "a held rebuild's deadline ends its hold"
     );
-    let (batch, vars_changed) =
-        join_emptied(batch, vars_changed, &emptied, state.vars_file.as_deref());
+    let batch = join_emptied(batch, &emptied, state.vars_file.as_deref());
     if verdict == HoldVerdict::Hold {
-        state.held.hold(&batch, vars_changed, root);
+        state.held.hold(&batch, root);
         settle(SettleInto::Dir(state), None, Settle::Defer);
         return;
     }
@@ -5018,7 +5023,7 @@ fn run_dir_batch(
     // end both keep them (#380). A file the look found emptied — the hold's deadline runs
     // this batch — is in it empty: the batch compiles it as it is, and it is not held again.
     state.last_mtimes.extend(look);
-    let (batch, vars_changed) = state.held.release(&batch, vars_changed);
+    let batch = state.held.release(batch);
     // A debug build's test pause (#380): the batch found no file emptied, and has read none.
     pause_after_look();
 
@@ -5033,7 +5038,7 @@ fn run_dir_batch(
             // empty, a truncation that began between the two — holds the whole batch back,
             // with nothing reported or recorded, unless the deadline ended the hold in this
             // rebuild.
-            if state.hold_after_vars_load_failed(&batch, vars_changed, root) {
+            if state.hold_after_vars_load_failed(&batch, root) {
                 settle(SettleInto::Dir(state), None, Settle::Defer);
                 return;
             }
@@ -5042,7 +5047,7 @@ fn run_dir_batch(
             // so the batch that reads the file again would leave it unbuilt. The look's
             // stamps of its sources are kept with it; a path it named that nothing reads is
             // rebuilt but not stamped, so its emptying holds nothing.
-            state.held.hold(&batch, vars_changed, root);
+            state.held.carry(&batch, root);
             // Re-baseline so the idle-tick content backstop does not report the same
             // change again and turn one unreadable vars file into per-tick error spam.
             settle(SettleInto::Dir(state), Some(e), Settle::Rebaseline);
@@ -5053,8 +5058,8 @@ fn run_dir_batch(
     // batch borrows the variables rather than cloning them, and its first source that
     // shows something reports the vars file's duplicate keys (#326).
     process_dir_batch(
-        &batch,
-        vars_changed,
+        &batch.paths,
+        batch.vars_changed,
         &ctx.root,
         &ctx.output_base,
         &mut BatchVars::of(&resolved),
@@ -7536,21 +7541,22 @@ mod tests {
         let paths =
             |names: &[&str]| -> BTreeSet<PathBuf> { names.iter().map(PathBuf::from).collect() };
         let root = Path::new("/w");
+        let batch = |names: &[&str], vars_changed: bool| Batch {
+            paths: paths(names),
+            vars_changed,
+        };
         let mut held = HeldBatch::default();
-        held.hold(&paths(&["/w/b.mds", "/x/unread.mds"]), false, root);
-        held.hold(&paths(&["/w/a.mds", "/w/b.mds"]), true, root);
+        held.hold(&batch(&["/w/b.mds", "/x/unread.mds"], false), root);
+        held.hold(&batch(&["/w/a.mds", "/w/b.mds"], true), root);
         assert_eq!(held.sources, paths(&["/w/a.mds", "/w/b.mds"]));
         assert_eq!(
-            held.release(&paths(&["/w/a.mds", "/w/c.mds"]), false),
-            (
-                paths(&["/w/a.mds", "/w/b.mds", "/w/c.mds", "/x/unread.mds"]),
-                true
-            )
+            held.release(batch(&["/w/a.mds", "/w/c.mds"], false)),
+            batch(&["/w/a.mds", "/w/b.mds", "/w/c.mds", "/x/unread.mds"], true)
         );
         assert_eq!(held, HeldBatch::default(), "nothing stays held");
         assert_eq!(
-            held.release(&paths(&["/w/c.mds"]), false),
-            (paths(&["/w/c.mds"]), false),
+            held.release(batch(&["/w/c.mds"], false)),
+            batch(&["/w/c.mds"], false),
             "positive control: with nothing held, a batch is its own"
         );
     }
@@ -7583,8 +7589,14 @@ mod tests {
         assert!(in_domain(&state), "the file is in the baseline's domain");
 
         assert_eq!(
-            state.held.release(&BTreeSet::new(), false),
-            (BTreeSet::from([page]), false),
+            state.held.release(Batch {
+                paths: BTreeSet::new(),
+                vars_changed: false
+            }),
+            Batch {
+                paths: BTreeSet::from([page]),
+                vars_changed: false
+            },
             "the batch that ends the hold rebuilds the source"
         );
         assert!(
@@ -11170,22 +11182,31 @@ mod tests {
     #[test]
     fn files_found_emptied_join_the_batch() {
         let path = |name: &str| PathBuf::from("/w").join(name);
-        let batch: BTreeSet<PathBuf> = BTreeSet::from([path("a.mds")]);
+        let batch = |vars_changed: bool| Batch {
+            paths: BTreeSet::from([path("a.mds")]),
+            vars_changed,
+        };
         let vars = path("vars.json");
         let emptied: BTreeSet<PathBuf> = BTreeSet::from([path("x.mds"), vars.clone()]);
 
         assert_eq!(
-            join_emptied(&batch, false, &emptied, Some(&vars)),
-            (BTreeSet::from([path("a.mds"), path("x.mds")]), true),
+            join_emptied(batch(false), &emptied, Some(&vars)),
+            Batch {
+                paths: BTreeSet::from([path("a.mds"), path("x.mds")]),
+                vars_changed: true
+            },
             "the vars file is a change to it, not a path of the batch"
         );
         assert_eq!(
-            join_emptied(&batch, false, &BTreeSet::from([path("x.mds")]), Some(&vars)),
-            (BTreeSet::from([path("a.mds"), path("x.mds")]), false)
+            join_emptied(batch(false), &BTreeSet::from([path("x.mds")]), Some(&vars)),
+            Batch {
+                paths: BTreeSet::from([path("a.mds"), path("x.mds")]),
+                vars_changed: false
+            }
         );
         assert_eq!(
-            join_emptied(&batch, true, &BTreeSet::new(), Some(&vars)),
-            (batch.clone(), true),
+            join_emptied(batch(true), &BTreeSet::new(), Some(&vars)),
+            batch(true),
             "nothing emptied: the batch as it came"
         );
     }
@@ -11215,11 +11236,14 @@ mod tests {
     fn a_batch_whose_vars_load_failed_on_an_emptied_dependency_is_held_with_it() {
         let (_dir, root) = canonical_tempdir();
         let (mut state, [page, dep, _vars]) = state_with_a_vars_file(&root);
-        let batch = BTreeSet::from([page.clone()]);
+        let batch = Batch {
+            paths: BTreeSet::from([page.clone()]),
+            vars_changed: false,
+        };
 
         std::fs::write(&dep, "").unwrap();
         assert!(
-            state.hold_after_vars_load_failed(&batch, false, &root),
+            state.hold_after_vars_load_failed(&batch, &root),
             "the batch is held"
         );
 
@@ -11241,11 +11265,14 @@ mod tests {
     fn a_batch_whose_vars_load_failed_on_an_emptied_vars_file_is_held_as_a_change_to_it() {
         let (_dir, root) = canonical_tempdir();
         let (mut state, [page, _dep, vars]) = state_with_a_vars_file(&root);
-        let batch = BTreeSet::from([page.clone()]);
+        let batch = Batch {
+            paths: BTreeSet::from([page.clone()]),
+            vars_changed: false,
+        };
 
         std::fs::write(&vars, "").unwrap();
         assert!(
-            state.hold_after_vars_load_failed(&batch, false, &root),
+            state.hold_after_vars_load_failed(&batch, &root),
             "the batch is held"
         );
 
@@ -11264,10 +11291,13 @@ mod tests {
     fn a_batch_whose_vars_load_failed_is_held_only_for_a_file_emptied_before_the_deadline() {
         let (_dir, root) = canonical_tempdir();
         let (mut state, [page, dep, _vars]) = state_with_a_vars_file(&root);
-        let batch = BTreeSet::from([page]);
+        let batch = Batch {
+            paths: BTreeSet::from([page]),
+            vars_changed: false,
+        };
 
         assert!(
-            !state.hold_after_vars_load_failed(&batch, false, &root),
+            !state.hold_after_vars_load_failed(&batch, &root),
             "no file went empty"
         );
         assert_eq!(state.held, HeldBatch::default(), "nothing is held");
@@ -11276,14 +11306,14 @@ mod tests {
         std::fs::write(&dep, "").unwrap();
         state.hold = EmptyHold::Expired;
         assert!(
-            !state.hold_after_vars_load_failed(&batch, false, &root),
+            !state.hold_after_vars_load_failed(&batch, &root),
             "the deadline ended the hold in this rebuild"
         );
         assert_eq!(state.held, HeldBatch::default(), "nothing is held");
 
         state.hold = EmptyHold::Off;
         assert!(
-            state.hold_after_vars_load_failed(&batch, false, &root),
+            state.hold_after_vars_load_failed(&batch, &root),
             "positive control: the same file, with the deadline still ahead, holds the batch"
         );
     }
