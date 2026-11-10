@@ -82,14 +82,14 @@ impl LintCliConfig {
     ///
     /// Uses [`mds::LintConfig::from_rules_checked`] so the caller receives both
     /// the config and the unknowns report in one step, rather than building the
-    /// config and optionally invoking a separate check. This closes the gap
-    /// identified in the review finding for config.rs:104 — a consumer could
-    /// previously skip detection silently by not invoking the separate check.
+    /// config and optionally invoking a separate check. This closes a gap: a
+    /// consumer could previously skip detection silently by not invoking the
+    /// separate check.
     /// Note: `#[must_use]` on `from_rules_checked` fires only when the entire
     /// return value is dropped; `let (config, _) = …` silently discards the
-    /// `Option<mds::UnknownRuleNames>` and is the caller's own choice (as
-    /// config.rs:249 states: the `#[must_use]` only warns "if the return value
-    /// is discarded entirely").
+    /// `Option<mds::UnknownRuleNames>` and is the caller's own choice (as the
+    /// doc of `from_rules_checked` states: the `#[must_use]` only warns "if the
+    /// return value is discarded entirely").
     pub(crate) fn into_core_config(self) -> (mds::LintConfig, Option<mds::UnknownRuleNames>) {
         mds::LintConfig::from_rules_checked(self.rules)
     }
@@ -831,12 +831,13 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
 /// every depth, plus one tail line when the duplicate count exceeds
 /// [`mds::VarsLoad`]'s cap.
 ///
-/// AD-224-3: every untrusted value interpolated into `eprint_warning` must be wrapped
-/// in `safe_inline(…)` / `safe_path(…)` **at the interpolation site** — not hoisted
-/// into a `let` binding first. `key` is raw, untrusted text straight from the JSON
-/// (D4); `Path` is not `Display`, so it goes through `safe_path`, not `safe_inline`.
+/// Every untrusted value interpolated into `eprint_warning` must be wrapped in
+/// `safe_inline(…)` / `safe_path(…)` **at the interpolation site** — not hoisted into a
+/// `let` binding first — so the print-discipline guard can see it. `key` is raw,
+/// untrusted text straight from the JSON; `Path` is not `Display`, so it goes through
+/// `safe_path`, not `safe_inline`.
 ///
-/// AD-224-5: no-op when `quiet` is true.
+/// No-op when `quiet` is true.
 pub(crate) fn emit_duplicate_vars_file_warnings(resolved: &RuntimeVars, quiet: bool) {
     if quiet {
         return;
@@ -861,15 +862,16 @@ pub(crate) fn emit_duplicate_vars_file_warnings(resolved: &RuntimeVars, quiet: b
 }
 
 /// Emit `warning: variable '…' is set more than once by --set/--set-string` lines
-/// for any duplicate keys found by [`build_runtime_vars`], plus (D8 order: file →
-/// `--set` → `--set-string`) the `--vars` file duplicate-key warnings (#326).
+/// for any duplicate keys found by [`build_runtime_vars`], plus the `--vars` file
+/// duplicate-key warnings (#326), in that order: the file's, then `--set`'s, then
+/// `--set-string`'s.
 ///
-/// AD-224-3: every untrusted value interpolated into `eprint_warning` must be wrapped
-/// in `safe_inline(…)` **at the interpolation site** — not hoisted into a `let` binding
+/// Every untrusted value interpolated into `eprint_warning` must be wrapped in
+/// `safe_inline(…)` **at the interpolation site** — not hoisted into a `let` binding
 /// first.  The call is repeated rather than bound so the print-discipline guard can see
-/// it.  See `build.rs:318-320` for the same pattern.
+/// it, as in [`emit_duplicate_vars_file_warnings`].
 ///
-/// AD-224-5: no-op when `quiet` is true.
+/// No-op when `quiet` is true.
 pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
     if quiet {
         return;
@@ -2300,10 +2302,9 @@ fn run_build_directory(
                 }
             }
             Ok(Err(e)) => {
-                // Route through the single render choke point (avoids PF-004 /
-                // architecture-6: hand-rolled sanitize_control_chars bypass); a source
-                // that cannot be read lifts the exit code to 2, one over a resource
-                // limit to 3 (#157).
+                // Route through the single render choke point, so no path renders a
+                // report without its escaping; a source that cannot be read lifts the
+                // exit code to 2, one over a resource limit to 3 (#157).
                 crate::output::eprint_file_failure(e);
                 fail_count += 1;
             }

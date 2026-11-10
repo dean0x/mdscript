@@ -5201,7 +5201,7 @@ mod dir_startup {
         let output_base = resolve_output_base(out_dir.as_ref(), &config)?;
 
         // When the out-dir is inside root, exclude it from collection so the watcher
-        // doesn't self-pollute (AC-M7 / edge case 6).
+        // doesn't self-pollute: its own outputs would trigger rebuilds.
         let exclude_prefix: Option<PathBuf> = match &output_base {
             OutputBase::Dir { canonical: d, .. } if d.starts_with(root) => Some(d.clone()),
             _ => None,
@@ -6518,7 +6518,7 @@ mod tests {
         assert_eq!(result.path, PathBuf::from("/out/foo.bar.md"));
     }
 
-    // Path-escape guard (AC-M7): source outside root stays inside out-dir.
+    // Path-escape guard: a source outside the root stays inside the out-dir.
     #[test]
     fn output_path_for_source_outside_root_stays_contained() {
         let root = PathBuf::from("/root");

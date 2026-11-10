@@ -336,7 +336,7 @@ fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
 fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     // Directory recursion depth cap, matching `run_build_directory` /
     // `run_check_directory` which also declare MAX_DEPTH as a function-local
-    // constant (build.rs line ~744).
+    // constant.
     const MAX_DEPTH: usize = 64;
 
     // Validate mds.json even though `fmt` doesn't act on its `fmt` section's

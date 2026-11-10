@@ -352,19 +352,18 @@ fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
 
 /// Load mds.json and extract the core `LintConfig`, warning about unknown rule names.
 ///
-/// AD-224-1 (2026-08-12 ruling): an unknown rule name WARNS and lint CONTINUES.
+/// An unknown rule name WARNS and lint CONTINUES (the 2026-08-12 ruling).
 /// The domain is asymmetric — severities are a closed set but rule names grow
 /// every release — so hard-failing would break configs naming rules from a newer
 /// mds when run with an older binary.
 ///
-/// AD-224-5 (AC-224-21, AC-224-22): the warning goes to STDERR only (never
-/// stdout — `--format json` stdout must remain valid parseable JSON), and is
-/// SUPPRESSED under `--quiet` (AC-224-22, coordination point with PR4 D4): the
+/// The warning goes to STDERR only (never stdout — `--format json` stdout must
+/// remain valid parseable JSON), and is SUPPRESSED under `--quiet`: the
 /// unknown-rule warning is never the causal reason for a non-zero exit — an
 /// unknown rule has no enforcement and does not affect `result_exit_code`, which
 /// counts actual lint findings, not config anomalies. A `--quiet` consumer who
 /// receives a non-zero exit will always have a visible, causal lint finding.
-/// `crates/mds-cli/src/main.rs:30` documents `--quiet` as suppressing
+/// The `--quiet` flag (`Cli::quiet` in `main.rs`) is documented as suppressing
 /// *"status and diagnostic output"*; this warning is status, not an error.
 fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     let config_opt = load_config(dir)?;
@@ -374,9 +373,9 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             let shown_file = project.shown_file();
             // into_core_config returns (config, Option<UnknownRuleNames>) in one step —
             // structurally forcing the caller to handle the unknowns report so detection
-            // cannot be accidentally skipped (review finding at config.rs:104).
-            // The safe_inline / print-discipline contract (AD-224-3, AC-224-6) and the
-            // --quiet gate (AD-224-5, AC-224-22) are documented at `emit_unknown_rule_warning`.
+            // cannot be accidentally skipped.
+            // The safe_inline / print-discipline contract and the --quiet gate are
+            // documented at `emit_unknown_rule_warning`.
             let (lint_config, unknown) = project.config.lint.into_core_config();
             if let Some(unknown) = unknown {
                 emit_unknown_rule_warning(&unknown, &shown_file, quiet);
@@ -390,21 +389,20 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
 ///
 /// Both `load_lint_config` (stdin/single-file path) and `LintDirCtx::config_for`
 /// (directory path) call this function. One definition prevents the duplication
-/// that already drifted once inside this PR on the CWE-117 escape path (PF-009:
-/// the same work set represented twice drifts; ADR-008: the escape contract is
-/// per-file, so every call site is equally security-relevant).
+/// that already drifted once on the CWE-117 escape path: the same work represented
+/// twice drifts, and the escape contract is per-file, so every call site is equally
+/// security-relevant.
 ///
-/// AC-224-3 (amended criterion, repo-owner ruling 2026-08-16): the criterion requires
-/// a shared message body, a shared recognised-rules list, and a shared sort order
-/// across all five surfaces. The CLI prefix `"warning: in <mds.json>: "` is permitted
-/// by the amended criterion; it carries source-file provenance that the bindings
+/// All five surfaces share one message body, one recognised-rules list and one sort
+/// order. The CLI prefix `"warning: in <mds.json>: "` is permitted (repo-owner ruling,
+/// 2026-08-16); it carries source-file provenance that the bindings
 /// cannot provide because their rules arrive in the caller's options object, not a
 /// config file. `<mds.json>` is the config as the run reached it (`shown_file`:
 /// `./mds.json`, `sub/../mds.json`), as a config error names it (#390). One formatter
 /// ([`mds::format_unknown_rule_names_warning`]) produces the shared body; the CLI adds
 /// the provenance prefix before emitting on stderr.
 ///
-/// AD-224-3 (AC-224-6): every value interpolated inside `eprint_warning`'s
+/// Every value interpolated inside `eprint_warning`'s
 /// `format!` must be a WHOLE-EXPRESSION `safe_inline` call — the one shape that
 /// `print_discipline.rs`'s trace accepts without an allowlist entry. Keeping the
 /// `eprint_warning` call here (in a named function inside `crates/mds-cli/src/`)
@@ -413,12 +411,12 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
 /// `safe_inline(&core_msg)` satisfies that constraint; the call is idempotent
 /// because names are already wire-escaped inside `format_unknown_rule_names_warning`.
 ///
-/// AD-224-5 (AC-224-22): no-op when `quiet` is true.
+/// No-op when `quiet` is true.
 fn emit_unknown_rule_warning(unknown: &mds::UnknownRuleNames, shown_file: &Path, quiet: bool) {
     if quiet {
         return;
     }
-    // AC-224-3: shared message body; the "in <mds.json>:" prefix carries source provenance.
+    // The shared message body; the "in <mds.json>:" prefix carries source provenance.
     let core_msg = mds::format_unknown_rule_names_warning(unknown);
     eprint_warning(&format!(
         "warning: in {}: {}",
@@ -1607,7 +1605,7 @@ fn run_lint_file(
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     sink: &mut impl ResultSink,
 ) -> i32 {
-    // effective_parent maps "" (bare filename) to "." — avoids PF-006.
+    // effective_parent maps "" (a bare filename's parent) to ".", the working directory.
     let base_dir = effective_parent(path);
     // mds.json load/parse failure → the JSON envelope in --format json mode.
     let config = match load_lint_config(base_dir, flags.quiet) {
@@ -1781,36 +1779,36 @@ impl<'a> LintDirCtx<'a> {
 /// Lint every `.mds` file under `dir`, INCLUDING `_`-prefixed partials.
 ///
 /// Accumulate-and-continue past per-file failures. Exit = max severity across files.
-/// Output is path-sorted (F1 — `collect_mds_files` does NOT sort).
+/// Output is path-sorted (`collect_mds_files` does NOT sort).
 ///
-/// **Directory summary (AD-216-3):** after processing all files, emits one summary
+/// **Directory summary:** after processing all files, emits one summary
 /// line to stderr in the form
 /// `{clean} clean, {warn} with warnings, {error} with errors, {limit} resource-limited`.
 /// "With errors" covers both error-severity lint findings AND per-file analysis failures
 /// (read error, config error, lint call failure) — the same conflation `mds build`'s
-/// "failed" bucket makes (D3-a).  "Resource-limited" counts files where `mds::lint`
+/// "failed" bucket makes.  "Resource-limited" counts files where `mds::lint`
 /// returned `MdsError::ResourceLimit`, as the read of a source over the size cap does
 /// (#309) — distinct from lint findings.  A file whose own
 /// output failed also counts "with errors": a `--fix` rewrite that fails, or a diff a
 /// failing stdout lost (#157) — as `mds fmt <dir>` counts either one failed.
 ///
-/// **Summary / quiet contract (AD-216-6):** the summary is suppressed under `--quiet`
+/// **Summary / quiet contract:** the summary is suppressed under `--quiet`
 /// unless at least one file is in the `error` or `resource-limited` bucket.  Warn-only
 /// runs are silent under `--quiet` (mirrors `mds fmt`, which does not force its summary
-/// on a `changed_count`-only run).  Exit codes are unaffected (AD-216-2).
+/// on a `changed_count`-only run).  Exit codes are unaffected.
 ///
-/// **D1 decision (AC-Q14):** `mds lint --quiet <dir>` on a warn-only tree exits 1 with
+/// **Quiet runs:** `mds lint --quiet <dir>` on a warn-only tree exits 1 with
 /// no output.  `mds lint --fix --check --quiet <dir>` with pending fixes exits 1 with
-/// no output.  Both are intentional: warnings are status output, which `main.rs:30`
-/// says `--quiet` suppresses.
+/// no output.  Both are intentional: warnings are status output, which the `--quiet`
+/// flag (`Cli::quiet` in `main.rs`) suppresses.
 ///
-/// **D2 decision (AC-Q16):** the JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`)
+/// **JSON envelope:** the JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`)
 /// is unchanged — no `"summary"` key is added.  The summary is emitted to stderr only,
 /// keeping stdout a single clean JSON document in all non-`--diff` modes.  (`--fix --diff`
 /// is a legal invocation that writes the unified diff to stdout ahead of the envelope,
 /// so `--fix --diff --format json` produces non-JSON-parseable stdout by design.)
 ///
-/// **Channel discipline (AD-216-8):** the summary is emitted in BOTH human and JSON
+/// **Channel discipline:** the summary is emitted in BOTH human and JSON
 /// format modes — format governs where machine-readable output goes (stdout), not
 /// whether status output (stderr) appears.  JSON consumers using `--format json`
 /// (without `--fix --diff`) continue to receive valid parseable JSON on stdout

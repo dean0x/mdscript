@@ -1438,15 +1438,14 @@ pub(crate) fn resolve_output_base(
 ///
 /// Infallible — no directory creation.
 ///
-/// Defined in terms of [`mirror_stem`] so the strip_prefix / AC-M7 path-escape logic is
-/// kept in one place (issue 5 — single source of truth), shared with
-/// [`output_base_no_ext`].
+/// Defined in terms of [`mirror_stem`] so the strip_prefix path-escape logic is kept in
+/// one place, shared with [`output_base_no_ext`].
 ///
 /// - `Dir`: mirrors `source` relative to `root.walked` under the directory — its
 ///   canonical form for the write, its shown form for the message (#390).
 ///   If `strip_prefix` fails (source not under root after canonicalization),
 ///   falls back to `<dir>/stem.<ext>` — **never** joins an absolute path that
-///   could escape the output directory (AC-M7 path-escape guard).
+///   could escape the output directory (the path-escape guard).
 /// - `NextToSource`: `source.with_extension(ext)` beside the source as walked, named
 ///   below the directory argument as typed ([`output_stem_for`], #390).
 ///
@@ -1480,8 +1479,8 @@ pub(crate) fn output_path_for(
             let (rel, flattened) = mirrored_output(source, root.walked, ext);
             let target = WriteTarget::below_out_dir(canonical, shown, *below_anchor, &rel);
             if flattened {
-                // Invariant report, not gated on --quiet (like the depth-limit and
-                // stale-unlink warnings above). Emitted once per output-path computation:
+                // Invariant report, not gated on --quiet (like the walker's depth-limit
+                // warning). Emitted once per output-path computation:
                 // build — once per file, since its `output_base_no_ext` probes are silent;
                 // watch — once per rebuild (#217).
                 eprint_warning(&format!(
@@ -2490,8 +2489,8 @@ fn push_frame_block(out: &mut String, lead: &str, text: &str) {
 ///
 /// All per-file error handlers in `main`, `build`, `fmt`, `lint`, and `watch` route
 /// error rendering through this helper, so there is exactly one site to audit for
-/// escape-injection safety (architecture-6 / avoids PF-004: a check enforced on the
-/// primary path silently absent on a sibling path).
+/// escape-injection safety: a check enforced on the primary path and silently absent on
+/// a sibling path is the failure this one site prevents.
 ///
 /// **This function escapes the report's message, help, label text, and auxiliary
 /// diagnostic graph itself**, via [`sanitize_report`], for every report it is given —
@@ -3321,7 +3320,7 @@ mod tests {
         assert!(refused.contains("must be a relative path"), "{refused}");
     }
 
-    // T-CLI-21 (unit): output_path_for with "json" / "md" extensions.
+    // output_path_for with "json" and "md" extensions.
     #[test]
     fn output_path_for_json_extension_dir_mode() {
         let source = PathBuf::from("/root/src/chat.mds");
@@ -3358,8 +3357,8 @@ mod tests {
         assert_eq!(result, target("/root", "/root", "src/chat.json"));
     }
 
-    // T-CLI-21 (unit): ..‑containment guard (AC-M7) still holds.
-    // When source is outside root, output must be `base/stem.ext`, not escaped.
+    // The `..` containment guard still holds: when the source is outside the root, the
+    // output must be `base/stem.ext`, not escaped.
     #[test]
     fn output_path_for_outside_root_falls_back_to_flat() {
         let source = PathBuf::from("/other/page.mds");

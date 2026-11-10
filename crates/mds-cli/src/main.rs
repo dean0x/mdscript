@@ -365,8 +365,9 @@ fn run_check(
 /// Validate every non-partial `.mds` file under `dir`.
 ///
 /// Continue-on-error: a per-file error does not abort the run. Prints a summary and
-/// returns non-zero if any file fails (AC-FUNC-26): 2 when an I/O or file-system
-/// failure is among them, as for `mds build <dir>` (#157), else 1.
+/// returns non-zero if any file fails: 1 for a template error, 2 when an I/O or
+/// file-system failure is among them, as for `mds build <dir>` (#157), and 3 when a file
+/// failed with a resource limit.
 fn run_check_directory(
     dir: &std::path::Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
@@ -436,10 +437,9 @@ fn run_check_directory(
                 ok_count += 1;
             }
             Ok(Err(e)) => {
-                // Route through the single render choke point (avoids PF-004 /
-                // architecture-6: hand-rolled sanitize_control_chars bypass); a source
-                // that cannot be read lifts the exit code to 2, one over a resource
-                // limit to 3 (#157).
+                // Route through the single render choke point, so no path renders a
+                // report without its escaping; a source that cannot be read lifts the
+                // exit code to 2, one over a resource limit to 3 (#157).
                 output::eprint_file_failure(miette::Error::from(e));
                 fail_count += 1;
             }
