@@ -2269,6 +2269,90 @@ fn write_session_output(
     }
 }
 
+/// A rebuilt output whose route is not the one the session last wrote to: the compiled
+/// kind changed (#160). It is written over only a file the session wrote.
+#[derive(Debug, Clone, Copy)]
+struct ChangeOfKind<'a> {
+    /// What the session's record says of the file at the new route, for the source.
+    record: Record<'a>,
+    /// The rebuild before this one kept the same content from being written: the notice
+    /// for the same keep is not shown again.
+    told: bool,
+}
+
+/// What the write of a rebuilt output came to, when it did not fail ([`write_rebuilt`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rewritten {
+    /// Written in full.
+    Written,
+    /// Not written: after a change of kind, the file there is not the session's own, or was
+    /// changed since the session wrote it, and is kept as it is (#160). Nothing is written
+    /// or retired, so a later save tries again.
+    Kept,
+}
+
+/// Write `content`, a rebuilt output, to the file `target` (#160): the one write file mode
+/// and directory mode both make. `anchor` is the out-dir the session writes below and
+/// `now` what the check of it just before this found.
+///
+/// - An out-dir the typed path now leads elsewhere from refuses the write
+///   ([`crate::write::out_dir_moved`]).
+/// - After a change of kind (`change_of_kind` is `Some`), the file at `target` is written
+///   over only if it is the session's own ([`write_after_change_of_kind`]); else
+///   [`Rewritten::Kept`].
+/// - Any other write is [`write_output`], never over one of the files `inputs` names, the
+///   files the compile read (#425). `inputs` is made only when this write needs it.
+///
+/// The late look (#380) is not taken here: each mode takes it where its own state allows,
+/// before this write. The record of what was written, the retirement of the other kind's
+/// output and what the rebuild shows are each mode's own.
+fn write_rebuilt(
+    target: &WriteTarget,
+    anchor: Option<&OutDirAnchor>,
+    now: OutDirNow,
+    change_of_kind: Option<ChangeOfKind<'_>>,
+    content: &str,
+    inputs: impl FnOnce() -> Inputs,
+    quiet: bool,
+) -> std::result::Result<Rewritten, miette::Report> {
+    if now == OutDirNow::Elsewhere {
+        return Err(miette::Report::new(crate::write::out_dir_moved(target)));
+    }
+    let below = below_checked_out_dir(anchor, target);
+    match change_of_kind {
+        Some(ChangeOfKind { record, told }) => {
+            write_after_change_of_kind(&below, record, content, told, quiet)
+                .map(|written| {
+                    if written {
+                        Rewritten::Written
+                    } else {
+                        Rewritten::Kept
+                    }
+                })
+                .map_err(miette::Report::new)
+        }
+        None => write_output(Some(&below), content, &inputs(), quiet, false)
+            .map(|()| Rewritten::Written),
+    }
+}
+
+/// Announce a rebuilt output that was written: its `Recompiled` line, naming `shown`, the
+/// number of dependencies the compile reported and the time since `since`, when the
+/// compile began; then the notice for an output the write `emptied` ([`empties_output`],
+/// #380). Nothing under `--quiet`, as for every watch status line.
+fn announce_recompiled(shown: &Path, dep_count: usize, since: Instant, emptied: bool, quiet: bool) {
+    if !quiet {
+        let elapsed = since.elapsed().as_millis();
+        crate::output::ewriteln!(
+            "Recompiled {} ({} deps) in {}ms",
+            safe_path(shown),
+            dep_count,
+            elapsed
+        );
+    }
+    announce_emptied_output(shown, emptied, quiet);
+}
+
 /// Compile `entry` ([`WatchedPath::compile`]), derive the output path from the compiled
 /// kind and the entry's two forms — written beside `entry.canonical`, named beside
 /// `entry.typed` (#390) — and write: file mode's startup compile.
@@ -2840,58 +2924,46 @@ fn run_file_rebuild(
     let warn_duplicates = || crate::build::emit_duplicate_vars_file_warnings(&resolved, ctx.quiet);
     // The rebuild before this one kept the same from being written (#160): told already.
     let told = kept_before.as_ref() == Some(&compiled.content);
-    let written = match (out_dir, output_path.as_ref()) {
-        (OutDirNow::Elsewhere, Some(target)) => OutputWrite::Failed(Some(miette::Report::new(
-            crate::write::out_dir_moved(target),
-        ))),
-        (_, Some(target)) if kind_changed => match write_after_change_of_kind(
-            &below_checked_out_dir(state.out_dir.as_ref(), target),
-            Record::of_entry(state.last_written.get(&output_key)),
+    let written = match output_path.as_ref() {
+        Some(target) => match write_rebuilt(
+            target,
+            state.out_dir.as_ref(),
+            out_dir,
+            kind_changed.then(|| ChangeOfKind {
+                record: Record::of_entry(state.last_written.get(&output_key)),
+                told,
+            }),
             &compiled.content,
-            told,
+            || {
+                compile_inputs(
+                    Some(&ctx.entry.canonical),
+                    &compiled.dependencies,
+                    &ctx.reads,
+                )
+            },
             ctx.quiet,
         ) {
-            Ok(true) => OutputWrite::Written,
+            Ok(Rewritten::Written) => OutputWrite::Written,
             // Kept: nothing is written and nothing retired, and `last_written` is left as
             // it was, so a later save tries again.
-            Ok(false) => {
+            Ok(Rewritten::Kept) => {
                 if !told {
                     warn_duplicates();
                 }
                 state.kept = Some(compiled.content);
                 return ControlFlow::Continue(());
             }
-            Err(e) => OutputWrite::Failed(Some(miette::Report::new(e))),
+            Err(e) => OutputWrite::Failed(Some(e)),
         },
-        (_, target) => write_session_output(
-            target
-                .map(|target| below_checked_out_dir(state.out_dir.as_ref(), target))
-                .as_ref(),
-            &compiled.content,
-            &compile_inputs(
-                Some(&ctx.entry.canonical),
-                &compiled.dependencies,
-                &ctx.reads,
-            ),
-            ctx.quiet,
-            false,
-        ),
+        None => OutputWrite::from_stdout(write_stdout(compiled.content.as_bytes())),
     };
     match written {
         OutputWrite::Written => {
             warn_duplicates();
-            let elapsed = t0.elapsed().as_millis();
-            let dep_count = deps.len();
-            if !ctx.quiet {
-                crate::output::ewriteln!(
-                    "Recompiled {} ({} deps) in {}ms",
-                    safe_path(shown_output(&output_path)),
-                    dep_count,
-                    elapsed
-                );
-            }
-            announce_emptied_output(
+            announce_recompiled(
                 shown_output(&output_path),
+                deps.len(),
+                t0,
                 empties_output(
                     state.last_written.get(&output_key).map(String::as_str),
                     &compiled.content,
@@ -4456,30 +4528,23 @@ fn compile_one_source(
     // The rebuild of `src` before this one kept the same from being written
     // (#160): told already.
     let told = kept_before.as_ref() == Some(&compiled.content);
-    let written = match out_dir {
-        OutDirNow::Elsewhere => Err(miette::Report::new(crate::write::out_dir_moved(&out))),
-        OutDirNow::Unchanged | OutDirNow::New if previous.is_some() => write_after_change_of_kind(
-            &below_checked_out_dir(state.out_dir.as_ref(), &out),
-            state.record(&out.path, src),
-            &compiled.content,
+    let written = write_rebuilt(
+        &out,
+        state.out_dir.as_ref(),
+        out_dir,
+        previous.is_some().then(|| ChangeOfKind {
+            record: state.record(&out.path, src),
             told,
-            quiet,
-        )
-        .map_err(miette::Report::new),
-        OutDirNow::Unchanged | OutDirNow::New => write_output(
-            Some(&below_checked_out_dir(state.out_dir.as_ref(), &out)),
-            &compiled.content,
-            &source_inputs(src, &compiled.dependencies, &state.reads),
-            quiet,
-            false,
-        )
-        .map(|()| true),
-    };
+        }),
+        &compiled.content,
+        || source_inputs(src, &compiled.dependencies, &state.reads),
+        quiet,
+    );
     match written {
         // Kept: nothing is written and nothing retired, and the record of the
         // old kind's output stays, so a later save tries again. A notice told
         // shows something, a kept rebuild that tells nothing does not (#326).
-        Ok(false) => {
+        Ok(Rewritten::Kept) => {
             if !told {
                 vars.shown(quiet);
             }
@@ -4498,23 +4563,13 @@ fn compile_one_source(
             settle(SettleInto::Dir(state), Some(e), Settle::MarkErrored(src));
             return;
         }
-        Ok(true) => {}
+        Ok(Rewritten::Written) => {}
     }
     vars.shown(quiet);
     if let Some(anchor) = &mut state.out_dir {
         anchor.written();
     }
-    let elapsed = t0.elapsed().as_millis();
-    let dep_count = compiled.dependencies.len();
-    if !quiet {
-        crate::output::ewriteln!(
-            "Recompiled {} ({} deps) in {}ms",
-            safe_path(&out.shown),
-            dep_count,
-            elapsed
-        );
-    }
-    announce_emptied_output(&out.shown, emptied, quiet);
+    announce_recompiled(&out.shown, compiled.dependencies.len(), t0, emptied, quiet);
     // A change of kind (#160): the output the session last wrote for
     // `src`, the other kind's, is retired — removed only if the
     // session's record says it wrote it for `src` and it still holds
