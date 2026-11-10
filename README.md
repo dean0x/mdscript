@@ -177,7 +177,7 @@ such as a `--vars` file that cannot load or a directory with nothing to lint —
 `--fix --diff` prints its diffs before it (changed in v0.5.0; these failures printed only on
 stderr).
 
-**Never over an MDS module or an input** (#425): `mds build` and `mds watch` never write an
+**Never over an MDS module or an input** (changed in v0.5.0; previously such an output replaced the file and exited 0): `mds build` and `mds watch` never write an
 output over an MDS module a template can import — a `.mds` file, or a `.md` file whose
 frontmatter declares `type: mds` — nor over a file the run reads: the entry, a module it imports, the `--vars` file or the
 `mds.json` in force (`mds build chat.mds --vars chat.json`, a messages template whose output is
