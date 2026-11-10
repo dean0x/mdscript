@@ -263,6 +263,79 @@ fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
     assert_eq!(read(&root.join(native("newdir/page.md"))), "Hello\n");
 }
 
+/// A write refused at its output path — an MDS module there, or a file the run reads — is
+/// refused after the directories it needs have been made, and leaves them (#160): `-o
+/// nd/../<file>` reaches such a file by way of a directory that does not exist yet, and
+/// the run exits 2 with the refusal, the file keeps its content, no temporary file is left,
+/// and `nd` stays, empty. Spec §7.2 says so: a cleanup that removed the directory would
+/// change that sentence. Each row first shows there is no `nd`, so the directory is the
+/// run's own; the refusal itself shows the write was attempted.
+///
+/// Runs on every OS.
+#[test]
+fn a_refused_write_leaves_the_directories_it_created() {
+    const MODULE: &str = "---\ntype: mds\n---\nA module\n";
+    const VARS: &str = "{\"n\":\"x\"}\n";
+    const ROWS: [(&str, &[&str], &str); 2] = [
+        ("lib.md", &[], "refusing to replace an MDS module"),
+        (
+            "vars.json",
+            &["--vars", "vars.json"],
+            "refusing to replace a file this run reads",
+        ),
+    ];
+    let dir = scratch();
+    let root = dir.path();
+    put(root, "a.mds", "Hello\n");
+    put(root, "lib.md", MODULE);
+    put(root, "vars.json", VARS);
+    let before = entries(root);
+    let mut after = before.clone();
+    after.push("nd".to_owned());
+    after.sort();
+
+    for (file, extra, cause) in ROWS {
+        let typed = native(&format!("nd/../{file}"));
+        let mut args = vec!["build", "a.mds"];
+        args.extend_from_slice(extra);
+        args.extend(["-o", typed.as_str()]);
+
+        assert!(!root.join("nd").exists(), "{file}: no `nd` before the run");
+        let out = run(root, &args);
+        let diagnostics = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{file}: stderr: {diagnostics}");
+        let refusal = format!("cannot write {typed}: {cause}");
+        assert!(
+            diagnostics.contains("mds::io") && squash(&diagnostics).contains(&squash(&refusal)),
+            "{file}: refused as `{cause}`; stderr: {diagnostics}"
+        );
+        assert!(
+            root.join("nd").is_dir(),
+            "{file}: the directory the write made is left"
+        );
+        assert!(
+            entries(&root.join("nd")).is_empty(),
+            "{file}: the directory is empty"
+        );
+        assert_eq!(
+            entries(root),
+            after,
+            "{file}: nothing else is created, no temporary file included"
+        );
+        std::fs::remove_dir(root.join("nd")).expect("remove the directory for the next row");
+    }
+    assert_eq!(
+        read(&root.join("lib.md")),
+        MODULE,
+        "the module was left alone"
+    );
+    assert_eq!(
+        read(&root.join("vars.json")),
+        VARS,
+        "the vars file was left alone"
+    );
+}
+
 /// A FIFO at the output path is no file a write replaces: it is refused (`mds::io`, exit
 /// 2) without being opened — the run does not block on it — and left in place. Control:
 /// a regular file at the same path is replaced.
