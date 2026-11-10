@@ -233,7 +233,8 @@ shared partial rebuilds **all transitive importers** automatically.
 - **`.md` modules**: a `.md` file whose frontmatter says `type: mds`, which a source
   imports, is a dependency like a partial, below the directory or outside it. Editing it
   rebuilds its importers at once, under `--poll-interval 0` too, and it never gets an
-  output of its own.
+  output of its own. An edit that makes it a plain `.md` is reported through the sources
+  that import it, and never again under its own path.
 - **Removals**: `mds watch` removes only an output it wrote in this session, and only while
   it still holds exactly what was written — when its source is deleted (directory mode), or
   when an edit changes the template's kind and the output moves to `<name>.json` or

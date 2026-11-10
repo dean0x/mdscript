@@ -6153,11 +6153,15 @@ fn process_dir_batch_incremental(
             // The same limit as the initial walker's, which never recurses into those
             // dirs, applied here on the parallel event-processing path so the two paths
             // stay consistent.
-            Node::ExternalDep | Node::ExcludedDep => refresh_dependency(src, ctx, state),
-            // An in-root dependency that is no source — a `type: mds` `.md` module — is
-            // rebuilt through its importers, which `affected` holds, and never compiled as
-            // a source (#380).
-            Node::InRootModule | Node::Unrelated => {}
+            Node::ExternalDep | Node::ExcludedDep if has_mds_extension(src) => {
+                refresh_dependency(src, ctx, state)
+            }
+            // A dependency that is no `.mds` file — a `type: mds` `.md` module, in the root
+            // or not — is rebuilt through its importers, which `affected` holds, and never
+            // compiled as an entry (#380). Its edges from them stay. Compiled as an entry,
+            // a module edited into a plain `.md` was refused under its own path, beside
+            // its importers' refusal, in every batch with a change that followed.
+            Node::InRootModule | Node::ExternalDep | Node::ExcludedDep | Node::Unrelated => {}
         }
     }
 

@@ -1707,6 +1707,90 @@ fn watch_dir_mode_event_rebuilds_the_importer_of_an_md_module_below_or_outside_t
     drop(child);
 }
 
+/// #380: a `type: mds` `.md` module outside the root that is edited into a plain `.md` is
+/// refused through the source that imports it, whose import now fails — and never compiled
+/// as an entry of its own, which reported a second error for it, under its canonical path,
+/// in every rebuild with a change that followed. The source's edge to it stays, so the edit
+/// that makes it a module again rebuilds the source.
+#[test]
+fn watch_dir_mode_never_compiles_an_md_dependency_outside_the_root_as_an_entry() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("src");
+    let shared = base.path().join("shared");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    // The project root is `base`, so the import below reaches `../shared/`.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    std::fs::write(
+        root.join("a.mds"),
+        "@import \"../shared/m.md\" as m\nA.\n@include m\n",
+    )
+    .unwrap();
+    let other = root.join("b.mds");
+    std::fs::write(&other, "B one\n").unwrap();
+    let module = shared.join("m.md");
+    std::fs::write(&module, "---\ntype: mds\n---\nModule one\n").unwrap();
+    let out = base.path().join("out");
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "0", "--poll-interval", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "Module one", TIMEOUT),
+        "a.md is written at startup; stderr: {}",
+        tap.text()
+    );
+    settle_queued_events(&tap, &root.join("barrier.mds"), "settle");
+
+    // The module loses its frontmatter. Two rebuilds with a change follow, each of which
+    // seeds the sources that failed, and a dependency that failed with them.
+    write_atomic(&module, "No frontmatter now\n");
+    settle_queued_events(&tap, &root.join("barrier.mds"), "broken");
+    write_atomic(&other, "B two\n");
+    assert!(
+        wait_for_file_contains(&out.join("b.md"), "B two", TIMEOUT),
+        "control: a rebuild with a change runs; stderr: {}",
+        tap.text()
+    );
+    settle_queued_events(&tap, &root.join("barrier.mds"), "after_b_two");
+    write_atomic(&other, "B three\n");
+    assert!(
+        wait_for_file_contains(&out.join("b.md"), "B three", TIMEOUT),
+        "control: a second rebuild with a change runs; stderr: {}",
+        tap.text()
+    );
+
+    // The module is a module again: the edge from the source to it stayed.
+    write_atomic(&module, "---\ntype: mds\n---\nModule two\n");
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "Module two", TIMEOUT),
+        "the edit that makes the module one again rebuilds the source; stderr: {}",
+        tap.text()
+    );
+    settle_queued_events(&tap, &root.join("barrier.mds"), "end");
+
+    let stderr_text = tap.finish_text(&mut child);
+    let squashed = squash(&stderr_text);
+    let refusals = count_occurrences(&squashed, &squash("not an MDS file:"));
+    let through_import = count_occurrences(&squashed, &squash("not an MDS file: ../shared/m.md"));
+    assert!(
+        through_import >= 1,
+        "control: the import of the plain `.md` is refused; stderr: {stderr_text}"
+    );
+    assert_eq!(
+        refusals - through_import,
+        0,
+        "the module is refused through its importer only, never compiled as an entry; \
+         stderr: {stderr_text}"
+    );
+}
+
 // ── AC-A5: Quiet mode keeps compile errors visible ────────────────────────
 
 /// Under `-q`, compile errors must still appear on stderr; the watcher stays alive.
