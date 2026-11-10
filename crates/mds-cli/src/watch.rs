@@ -4126,6 +4126,25 @@ impl DirWatchState {
         true
     }
 
+    /// Hold `src` back, a compile of it having read a file emptied since the batch looked
+    /// (#380): nothing is written or recorded, and what the rebuild before kept from being
+    /// written (`kept_before`) stays kept, to be told again as it would have been. The files
+    /// in `read_empty` stay in the baseline until the hold ends
+    /// ([`HeldBatch::hold_read_empty`]).
+    fn hold_back(
+        &mut self,
+        src: &Path,
+        kept_before: Option<String>,
+        read_empty: BTreeSet<PathBuf>,
+        root: &Path,
+    ) {
+        let source = src.to_path_buf();
+        if let Some(kept) = kept_before {
+            self.kept.insert(source.clone(), kept);
+        }
+        self.held.hold_read_empty(&source, read_empty, root);
+    }
+
     /// Take the baseline over [`Self::baselined_paths`] again, from the stamps the batch's
     /// look took ([`baseline_over`], #380): only a file no look stamped is stamped now.
     fn rebaseline(&mut self) {
@@ -4306,7 +4325,7 @@ impl<'a> BatchVars<'a> {
 /// because `src` is gone since the batch found it there retires it as a deleted source
 /// ([`DirWatchState::retire_deleted`], #160). A compile that read a file emptied since the
 /// batch looked — whether it then failed or would write — holds `src` back, unless the
-/// deadline ended the hold in this rebuild ([`EmptyHold::on_late_empty`], #380). A compile
+/// deadline ended the hold in this rebuild ([`held_after_look`], #380). A compile
 /// that succeeded keeps the files it read empty in the baseline until the hold ends
 /// ([`HeldBatch::hold_read_empty`]); one that failed read the files its last compile
 /// reported, which the baseline holds already. A source
@@ -4339,163 +4358,8 @@ fn compile_one_source(
     let kept_before = state.kept.remove(src);
     // A debug build's test pause (#160): the batch found `src` there, and has not read it.
     pause_after_batch_split();
-    let failure = match watch_root.compile_source(src, vars.map.clone(), quiet) {
-        Ok(compiled) => {
-            let dep_paths = graph_keys(&compiled.dependencies);
-
-            // Partials (DD2): refresh graph edges but do NOT write output.
-            if is_partial(src) {
-                state.record_success(src, dep_paths, root, None, None);
-                return;
-            }
-
-            // Derive the output path from the compiled kind (intrinsic extension).
-            // AC-FUNC-23: a @message template writes .json; a plain template writes .md.
-            //
-            // Invariant: `src` is strictly below `root`, so this never takes the
-            // out-of-root flatten arm and never emits its report (#217). Every path that
-            // reaches here is a source: one `names_a_source` admits, in both passes, or a
-            // known one in `process_dir_batch_vars_changed`; out-of-root deps take the
-            // dep-refresh-only branch and in-root ones that are no source are left to their
-            // importers, so neither calls this function (#380).
-            let ext = compiled.kind.extension();
-            let out = output_path_for(src, watch_root.root_paths(), output_base, ext);
-
-            let out_dir = check_out_dir(state.out_dir.as_mut(), &mut state.last_written);
-
-            // A change of kind (#160): the output this session last wrote for `src` is
-            // the other kind's, so the file at `out` is written over only if it is the
-            // session's own, written for `src`.
-            let previous = state
-                .outputs
-                .get(src)
-                .filter(|last| last.path != out.path)
-                .cloned();
-            // Content-based dedup: skip the write when the session last wrote the same
-            // there for `src` — never after a change of kind, whose write is decided by the
-            // file there whatever the record of it holds.
-            let content_changed = previous.is_some()
-                || state.record(&out.path, src) != Record::Own(&compiled.content);
-            // Whether the write empties the output the session wrote there for `src`,
-            // decided before the write replaces the record (#380).
-            let emptied = match state.record(&out.path, src) {
-                Record::Own(before) => empties_output(Some(before), &compiled.content),
-                Record::Unwritten | Record::OtherSource => false,
-            };
-
-            if content_changed {
-                // #380: a file the compile read, emptied since the batch looked — a
-                // truncation that began between the two — holds `src` back as the look
-                // would have, unless the deadline ended the hold in this rebuild: nothing
-                // written or recorded, `src` kept to be rebuilt with the batch that ends
-                // the hold.
-                let source = src.to_path_buf();
-                let reads = std::iter::once(&source)
-                    .chain(&dep_paths)
-                    .chain(state.vars_file.as_ref());
-                if let Some(read_empty) =
-                    held_after_look(&mut state.hold, reads, &state.last_mtimes)
-                {
-                    if let Some(kept) = kept_before {
-                        state.kept.insert(source.clone(), kept);
-                    }
-                    state.held.hold_read_empty(&source, read_empty, root);
-                    return;
-                }
-                // The rebuild of `src` before this one kept the same from being written
-                // (#160): told already.
-                let told = kept_before.as_ref() == Some(&compiled.content);
-                let written = match out_dir {
-                    OutDirNow::Elsewhere => {
-                        Err(miette::Report::new(crate::write::out_dir_moved(&out)))
-                    }
-                    OutDirNow::Unchanged | OutDirNow::New if previous.is_some() => {
-                        write_after_change_of_kind(
-                            &below_checked_out_dir(state.out_dir.as_ref(), &out),
-                            state.record(&out.path, src),
-                            &compiled.content,
-                            told,
-                            quiet,
-                        )
-                        .map_err(miette::Report::new)
-                    }
-                    OutDirNow::Unchanged | OutDirNow::New => write_output(
-                        Some(&below_checked_out_dir(state.out_dir.as_ref(), &out)),
-                        &compiled.content,
-                        &source_inputs(src, &compiled.dependencies, &state.reads),
-                        quiet,
-                        false,
-                    )
-                    .map(|()| true),
-                };
-                match written {
-                    // Kept: nothing is written and nothing retired, and the record of the
-                    // old kind's output stays, so a later save tries again. A notice told
-                    // shows something, a kept rebuild that tells nothing does not (#326).
-                    Ok(false) => {
-                        if !told {
-                            vars.shown(quiet);
-                        }
-                        state.kept.insert(src.to_path_buf(), compiled.content);
-                        state.record_success(src, dep_paths, root, None, None);
-                        return;
-                    }
-                    Ok(true) => {
-                        vars.shown(quiet);
-                        if let Some(anchor) = &mut state.out_dir {
-                            anchor.written();
-                        }
-                        let elapsed = t0.elapsed().as_millis();
-                        let dep_count = compiled.dependencies.len();
-                        if !quiet {
-                            crate::output::ewriteln!(
-                                "Recompiled {} ({} deps) in {}ms",
-                                safe_path(&out.shown),
-                                dep_count,
-                                elapsed
-                            );
-                        }
-                        announce_emptied_output(&out.shown, emptied, quiet);
-                        // A change of kind (#160): the output the session last wrote for
-                        // `src`, the other kind's, is retired — removed only if the
-                        // session's record says it wrote it for `src` and it still holds
-                        // what was written, else kept with a notice: one the session wrote
-                        // for another source (beside its sources `a.b.mds` and `a.mds` both
-                        // name theirs `a.md`), or one in an out-dir made since, is not
-                        // `src`'s. The removal, below the directory the write's check
-                        // found, triggers no rebuild: it is no `.mds` file. A rebuild's
-                        // failure never changes how the session exits, so one to remove
-                        // it stays a warning (#157).
-                        if let Some(previous) = &previous {
-                            state.retire(src, previous, out_dir, Retirement::KindChanged, quiet);
-                        }
-
-                        state.record_success(
-                            src,
-                            dep_paths,
-                            root,
-                            Some(&out),
-                            Some(compiled.content),
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        // The compile succeeded: the dependencies it reported are the
-                        // source's now, as at startup, so an edit to one of them rebuilds
-                        // it — one outside the root included (#257). Nothing is recorded
-                        // as written, and the settle below marks the source errored and
-                        // reports the failure, which shows something (#326).
-                        state.record_success(src, dep_paths, root, None, None);
-                        vars.shown(quiet);
-                        Some(e)
-                    }
-                }
-            } else {
-                // Content unchanged — still refresh graph edges + known_files.
-                state.record_success(src, dep_paths, root, None, None);
-                return;
-            }
-        }
+    let compiled = match watch_root.compile_source(src, vars.map.clone(), quiet) {
+        Ok(compiled) => compiled,
         // The source went after the batch found it there (#160): whatever the compile
         // said of a file that is no longer there — `file not found`, or a read that
         // failed — it is a deleted source, retired by the same rule, never a compile
@@ -4511,23 +4375,161 @@ fn compile_one_source(
             // the look would have, unless the deadline ended the hold in this rebuild:
             // nothing reported or recorded, `src` kept to be rebuilt with the batch that
             // ends the hold. A failed compile reports no dependencies, so the files it read
-            // are taken to be those its last compile reported.
+            // are taken to be those its last compile reported, which the baseline holds
+            // already: none stays in it for the hold.
             let source = src.to_path_buf();
             let reads = std::iter::once(&source)
                 .chain(state.forward_deps.get(src).into_iter().flatten())
                 .chain(state.vars_file.as_ref());
             if held_after_look(&mut state.hold, reads, &state.last_mtimes).is_some() {
-                if let Some(kept) = kept_before {
-                    state.kept.insert(source.clone(), kept);
-                }
-                state.held.hold([&source], false, root);
+                state.hold_back(src, kept_before, BTreeSet::new(), root);
                 return;
             }
-            failure.into_report()
+            settle(
+                SettleInto::Dir(state),
+                failure.into_report(),
+                Settle::MarkErrored(src),
+            );
+            return;
         }
     };
-    // The compile failed, or writing its output did: settled alike.
-    settle(SettleInto::Dir(state), failure, Settle::MarkErrored(src));
+    let dep_paths = graph_keys(&compiled.dependencies);
+
+    // Partials (DD2): refresh graph edges but do NOT write output.
+    if is_partial(src) {
+        state.record_success(src, dep_paths, root, None, None);
+        return;
+    }
+
+    // Derive the output path from the compiled kind (intrinsic extension).
+    // AC-FUNC-23: a @message template writes .json; a plain template writes .md.
+    //
+    // Invariant: `src` is strictly below `root`, so this never takes the
+    // out-of-root flatten arm and never emits its report (#217). Every path that
+    // reaches here is a source: one `names_a_source` admits, in both passes, or a
+    // known one in `process_dir_batch_vars_changed`; out-of-root deps take the
+    // dep-refresh-only branch and in-root ones that are no source are left to their
+    // importers, so neither calls this function (#380).
+    let ext = compiled.kind.extension();
+    let out = output_path_for(src, watch_root.root_paths(), output_base, ext);
+
+    let out_dir = check_out_dir(state.out_dir.as_mut(), &mut state.last_written);
+
+    // A change of kind (#160): the output this session last wrote for `src` is
+    // the other kind's, so the file at `out` is written over only if it is the
+    // session's own, written for `src`.
+    let previous = state
+        .outputs
+        .get(src)
+        .filter(|last| last.path != out.path)
+        .cloned();
+    // Content-based dedup: skip the write when the session last wrote the same
+    // there for `src` — never after a change of kind, whose write is decided by the
+    // file there whatever the record of it holds.
+    let content_changed =
+        previous.is_some() || state.record(&out.path, src) != Record::Own(&compiled.content);
+    // Whether the write empties the output the session wrote there for `src`,
+    // decided before the write replaces the record (#380).
+    let emptied = match state.record(&out.path, src) {
+        Record::Own(before) => empties_output(Some(before), &compiled.content),
+        Record::Unwritten | Record::OtherSource => false,
+    };
+
+    if !content_changed {
+        // Content unchanged — still refresh graph edges + known_files.
+        state.record_success(src, dep_paths, root, None, None);
+        return;
+    }
+    // #380: a file the compile read, emptied since the batch looked — a truncation that
+    // began between the two — holds `src` back as the look would have, unless the
+    // deadline ended the hold in this rebuild: nothing written or recorded, `src` kept to
+    // be rebuilt with the batch that ends the hold, and the files it read empty kept in
+    // the baseline until then. The look is taken only when the output would be written.
+    let source = src.to_path_buf();
+    let reads = std::iter::once(&source)
+        .chain(&dep_paths)
+        .chain(state.vars_file.as_ref());
+    if let Some(read_empty) = held_after_look(&mut state.hold, reads, &state.last_mtimes) {
+        state.hold_back(src, kept_before, read_empty, root);
+        return;
+    }
+    // The rebuild of `src` before this one kept the same from being written
+    // (#160): told already.
+    let told = kept_before.as_ref() == Some(&compiled.content);
+    let written = match out_dir {
+        OutDirNow::Elsewhere => Err(miette::Report::new(crate::write::out_dir_moved(&out))),
+        OutDirNow::Unchanged | OutDirNow::New if previous.is_some() => write_after_change_of_kind(
+            &below_checked_out_dir(state.out_dir.as_ref(), &out),
+            state.record(&out.path, src),
+            &compiled.content,
+            told,
+            quiet,
+        )
+        .map_err(miette::Report::new),
+        OutDirNow::Unchanged | OutDirNow::New => write_output(
+            Some(&below_checked_out_dir(state.out_dir.as_ref(), &out)),
+            &compiled.content,
+            &source_inputs(src, &compiled.dependencies, &state.reads),
+            quiet,
+            false,
+        )
+        .map(|()| true),
+    };
+    match written {
+        // Kept: nothing is written and nothing retired, and the record of the
+        // old kind's output stays, so a later save tries again. A notice told
+        // shows something, a kept rebuild that tells nothing does not (#326).
+        Ok(false) => {
+            if !told {
+                vars.shown(quiet);
+            }
+            state.kept.insert(src.to_path_buf(), compiled.content);
+            state.record_success(src, dep_paths, root, None, None);
+            return;
+        }
+        // The compile succeeded: the dependencies it reported are the
+        // source's now, as at startup, so an edit to one of them rebuilds
+        // it — one outside the root included (#257). Nothing is recorded
+        // as written, and the source is marked errored and the failure
+        // reported, which shows something (#326).
+        Err(e) => {
+            state.record_success(src, dep_paths, root, None, None);
+            vars.shown(quiet);
+            settle(SettleInto::Dir(state), Some(e), Settle::MarkErrored(src));
+            return;
+        }
+        Ok(true) => {}
+    }
+    vars.shown(quiet);
+    if let Some(anchor) = &mut state.out_dir {
+        anchor.written();
+    }
+    let elapsed = t0.elapsed().as_millis();
+    let dep_count = compiled.dependencies.len();
+    if !quiet {
+        crate::output::ewriteln!(
+            "Recompiled {} ({} deps) in {}ms",
+            safe_path(&out.shown),
+            dep_count,
+            elapsed
+        );
+    }
+    announce_emptied_output(&out.shown, emptied, quiet);
+    // A change of kind (#160): the output the session last wrote for
+    // `src`, the other kind's, is retired — removed only if the
+    // session's record says it wrote it for `src` and it still holds
+    // what was written, else kept with a notice: one the session wrote
+    // for another source (beside its sources `a.b.mds` and `a.mds` both
+    // name theirs `a.md`), or one in an out-dir made since, is not
+    // `src`'s. The removal, below the directory the write's check
+    // found, triggers no rebuild: it is no `.mds` file. A rebuild's
+    // failure never changes how the session exits, so one to remove
+    // it stays a warning (#157).
+    if let Some(previous) = &previous {
+        state.retire(src, previous, out_dir, Retirement::KindChanged, quiet);
+    }
+
+    state.record_success(src, dep_paths, root, Some(&out), Some(compiled.content));
 }
 
 /// Compile-time context for directory-mode watch, parallel to `FileCompileCtx`.
