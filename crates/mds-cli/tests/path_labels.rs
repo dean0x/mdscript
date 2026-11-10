@@ -2242,6 +2242,7 @@ const LABEL_TABLE: &[&[&str]] = &[
         "lint_names_a_file_argument_as_typed_and_its_findings_by_its_file_name",
         SWEEP,
     ],
+    &["unknown_rule_warning_names_the_mds_json_as_the_input_reached_it"],
     &[
         "watching_names_the_entry_and_the_directory_as_typed",
         "watching_names_a_path_reached_through_a_symlink_by_the_link",
