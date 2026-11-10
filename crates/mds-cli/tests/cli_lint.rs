@@ -4113,8 +4113,9 @@ fn unknown_rule_cli_exact_golden() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_singular = format!(
-            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
-             recognised rules are: {recognised}; ignoring"
+            "{}unknown lint rule 'no-such-rule-xyzzy'; \
+             recognised rules are: {recognised}; ignoring",
+            unknown_rule_warning_prefix(dir.path())
         );
         let warning_line = stderr
             .lines()
@@ -4150,8 +4151,9 @@ fn unknown_rule_cli_exact_golden() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_plural = format!(
-            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
-             recognised rules are: {recognised}; ignoring"
+            "{}unknown lint rules: 'aaa-bad', 'zzz-bad'; \
+             recognised rules are: {recognised}; ignoring",
+            unknown_rule_warning_prefix(dir.path())
         );
         let warning_line = stderr
             .lines()
@@ -4204,8 +4206,9 @@ fn unknown_rule_cli_exact_golden_single_file() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_singular = format!(
-            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
-             recognised rules are: {recognised}; ignoring"
+            "{}unknown lint rule 'no-such-rule-xyzzy'; \
+             recognised rules are: {recognised}; ignoring",
+            unknown_rule_warning_prefix(dir.path())
         );
         let warning_line = stderr
             .lines()
@@ -4243,8 +4246,9 @@ fn unknown_rule_cli_exact_golden_single_file() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_plural = format!(
-            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
-             recognised rules are: {recognised}; ignoring"
+            "{}unknown lint rules: 'aaa-bad', 'zzz-bad'; \
+             recognised rules are: {recognised}; ignoring",
+            unknown_rule_warning_prefix(dir.path())
         );
         let warning_line = stderr
             .lines()
@@ -4288,6 +4292,82 @@ fn write_rules_config(dir: &std::path::Path, rules: serde_json::Value) {
         serde_json::to_string(&config).unwrap(),
     )
     .unwrap();
+}
+
+/// What the unknown-rule warning starts with when the run reaches the `mds.json` in
+/// `config_dir` as the path `config_dir` itself.
+fn unknown_rule_warning_prefix(config_dir: &std::path::Path) -> String {
+    format!("warning: in {}: ", config_dir.join("mds.json").display())
+}
+
+/// The warning names the `mds.json` as the run reached it — `./mds.json`,
+/// `sub/../mds.json`, `./sub/mds.json` — as a config error and `mds build`'s own
+/// `mds.json` warning do, and not by the bare name, which fits every `mds.json` of a
+/// tree (#390).
+#[test]
+fn unknown_rule_warning_names_the_mds_json_as_the_input_reached_it() {
+    let lint_from = |cwd: &std::path::Path, args: &[&str]| {
+        let out = mds_bin()
+            .current_dir(cwd)
+            .arg("lint")
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let shown = |parts: &[&str]| -> String {
+        let path: std::path::PathBuf = parts.iter().collect();
+        format!("warning: in {}: unknown lint rule", path.display())
+    };
+
+    // A file in the directory with the `mds.json`: a directory run reaches it in place.
+    let top = tempfile::tempdir().unwrap();
+    std::fs::write(top.path().join("top.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(top.path());
+    let stderr = lint_from(top.path(), &["."]);
+    let want = shown(&[".", "mds.json"]);
+    assert!(
+        stderr.lines().any(|l| l.starts_with(&want)),
+        "`mds lint .` must name the config as {want:?}; stderr: {stderr}"
+    );
+
+    // A file one directory below it: reached by one step up from that file's directory,
+    // however the run names the file or its directory.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("sub")).unwrap();
+    std::fs::write(root.path().join("sub").join("a.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(root.path());
+    let sub_file = std::path::Path::new("sub").join("a.mds");
+    for (args, parts) in [
+        (&["sub"][..], &["sub", "..", "mds.json"][..]),
+        (
+            &[sub_file.to_str().unwrap()][..],
+            &["sub", "..", "mds.json"][..],
+        ),
+        (&["."][..], &[".", "sub", "..", "mds.json"][..]),
+    ] {
+        let stderr = lint_from(root.path(), args);
+        let want = shown(parts);
+        assert!(
+            stderr.lines().any(|l| l.starts_with(&want)),
+            "`mds lint {args:?}` must name the config as {want:?}; stderr: {stderr}"
+        );
+    }
+
+    // A nested `mds.json` of a directory run is named below the directory as typed.
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tree.path().join("sub")).unwrap();
+    std::fs::write(tree.path().join("sub").join("a.mds"), "Hello!\n").unwrap();
+    std::fs::write(tree.path().join("mds.json"), "{}").unwrap();
+    write_unknown_rule_config(&tree.path().join("sub"));
+    let stderr = lint_from(tree.path(), &["."]);
+    let want = shown(&[".", "sub", "mds.json"]);
+    assert!(
+        stderr.lines().any(|l| l.starts_with(&want)),
+        "a nested config must be named as {want:?}; stderr: {stderr}"
+    );
 }
 
 /// AC-224-10 (NEGATIVE, envelope frozen): an unknown rule name changes the `--format json`

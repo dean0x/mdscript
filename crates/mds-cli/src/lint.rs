@@ -370,17 +370,16 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     let config_opt = load_config(dir)?;
     match config_opt {
         None => Ok(mds::LintConfig::default()),
-        Some(ProjectConfig {
-            config: mds_config, ..
-        }) => {
+        Some(project) => {
+            let shown_file = project.shown_file();
             // into_core_config returns (config, Option<UnknownRuleNames>) in one step —
             // structurally forcing the caller to handle the unknowns report so detection
             // cannot be accidentally skipped (review finding at config.rs:104).
             // The safe_inline / print-discipline contract (AD-224-3, AC-224-6) and the
             // --quiet gate (AD-224-5, AC-224-22) are documented at `emit_unknown_rule_warning`.
-            let (lint_config, unknown) = mds_config.lint.into_core_config();
+            let (lint_config, unknown) = project.config.lint.into_core_config();
             if let Some(unknown) = unknown {
-                emit_unknown_rule_warning(&unknown, quiet);
+                emit_unknown_rule_warning(&unknown, &shown_file, quiet);
             }
             Ok(lint_config)
         }
@@ -397,11 +396,13 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
 ///
 /// AC-224-3 (amended criterion, repo-owner ruling 2026-08-16): the criterion requires
 /// a shared message body, a shared recognised-rules list, and a shared sort order
-/// across all five surfaces. The CLI prefix `"warning: in mds.json: "` is permitted
+/// across all five surfaces. The CLI prefix `"warning: in <mds.json>: "` is permitted
 /// by the amended criterion; it carries source-file provenance that the bindings
 /// cannot provide because their rules arrive in the caller's options object, not a
-/// config file. One formatter ([`mds::format_unknown_rule_names_warning`]) produces
-/// the shared body; the CLI adds the provenance prefix before emitting on stderr.
+/// config file. `<mds.json>` is the config as the run reached it (`shown_file`:
+/// `./mds.json`, `sub/../mds.json`), as a config error names it (#390). One formatter
+/// ([`mds::format_unknown_rule_names_warning`]) produces the shared body; the CLI adds
+/// the provenance prefix before emitting on stderr.
 ///
 /// AD-224-3 (AC-224-6): every value interpolated inside `eprint_warning`'s
 /// `format!` must be a WHOLE-EXPRESSION `safe_inline` call — the one shape that
@@ -413,13 +414,17 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
 /// because names are already wire-escaped inside `format_unknown_rule_names_warning`.
 ///
 /// AD-224-5 (AC-224-22): no-op when `quiet` is true.
-fn emit_unknown_rule_warning(unknown: &mds::UnknownRuleNames, quiet: bool) {
+fn emit_unknown_rule_warning(unknown: &mds::UnknownRuleNames, shown_file: &Path, quiet: bool) {
     if quiet {
         return;
     }
-    // AC-224-3: shared message body; "in mds.json:" prefix carries source provenance.
+    // AC-224-3: shared message body; the "in <mds.json>:" prefix carries source provenance.
     let core_msg = mds::format_unknown_rule_names_warning(unknown);
-    eprint_warning(&format!("warning: in mds.json: {}", safe_inline(&core_msg)));
+    eprint_warning(&format!(
+        "warning: in {}: {}",
+        safe_path(shown_file),
+        safe_inline(&core_msg)
+    ));
 }
 
 // ── Display-path remap ────────────────────────────────────────────────────────
@@ -1718,11 +1723,13 @@ impl<'a> LintDirCtx<'a> {
                     .insert(base_dir.to_path_buf(), Rc::clone(&rc));
                 Ok(rc)
             }
-            Some(ProjectConfig {
-                config: mds_config,
-                dir: config_dir,
-                ..
-            }) => {
+            Some(project) => {
+                let shown_file = project.shown_file();
+                let ProjectConfig {
+                    config: mds_config,
+                    dir: config_dir,
+                    ..
+                } = project;
                 // Fast path 2: a different base_dir already resolved to this same
                 // config directory (e.g. a/file.mds and b/file.mds both governed by
                 // root/mds.json). Return the cached config without emitting a
@@ -1752,7 +1759,7 @@ impl<'a> LintDirCtx<'a> {
                 // load_lint_config (PF-009).
                 let (lint_config, unknown) = mds_config.lint.into_core_config();
                 if let Some(unknown) = unknown {
-                    emit_unknown_rule_warning(&unknown, self.flags.quiet);
+                    emit_unknown_rule_warning(&unknown, &shown_file, self.flags.quiet);
                 }
 
                 // Populate BOTH caches. `config_dir_cache` enables fast path 2 for
