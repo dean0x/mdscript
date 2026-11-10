@@ -1575,8 +1575,10 @@ The CLI's own **display text** — `file` per the per-field rule above — gets 
 respelling through a separate mechanism, `mds::display_native_path` (a no-op off
 Windows): the diagnostic `file` field is WIRE-escaped for control/bidi/separator
 characters as the table above describes, and independently of that, any path a CLI
-status line or error message shows (an `atomic_write_file` I/O failure below a
-canonicalized `--out-dir`, say) is passed through `display_native_path` before display, at the CLI's
+status line or error message shows (the directory in a `warning: failed to watch
+external dep dir`, say, when it lies outside the entry's directory and the directory
+argument, so that it has no typed form and keeps the canonical path the compile reports)
+is passed through `display_native_path` before display, at the CLI's
 `safe_path` choke-point. The two are orthogonal: escaping defends against a hostile
 filename, `display_native_path` respells a canonicalization artefact that is not
 hostile, just platform-specific.
