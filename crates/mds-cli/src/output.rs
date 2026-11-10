@@ -263,7 +263,8 @@ pub(crate) fn cancel_clear() {
 }
 
 /// Whether stderr is a terminal. A unit test's child process started with
-/// [`child_process::run_on_a_terminal`] answers yes, so a test can see the clear.
+/// `child_process::run_on_a_terminal` (test builds only) answers yes, so a test can see
+/// the clear.
 fn stderr_is_a_terminal() -> bool {
     #[cfg(test)]
     if child_process::on_a_terminal() {
