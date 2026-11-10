@@ -112,7 +112,8 @@ Build/Watch options:
                               templates contain secrets or PII.
 
 Watch-only options:
-  --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
+  --clear                     Clear terminal before the first line each rebuild prints
+                              (only when stderr is a TTY)
   --debounce <MS>             Quiet period in milliseconds before a rebuild (default: 100).
                               Each file change restarts the window, so a save burst longer
                               than MS still coalesces into a single rebuild. The window is

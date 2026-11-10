@@ -225,7 +225,7 @@ enum Commands {
         /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3"; repeating a key warns, last value wins)
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
-        /// Clear the terminal before each rebuild (only when stderr is a TTY)
+        /// Clear the terminal before the first line each rebuild prints (only when stderr is a TTY)
         #[arg(long)]
         clear: bool,
         /// Quiet period in milliseconds before a rebuild (default 100).

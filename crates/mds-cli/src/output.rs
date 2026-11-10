@@ -9,7 +9,7 @@
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: a directory build's stale-output cleanup after a change of
 //!   kind, which removes only a `.json` mds provably wrote (#160).
-//! - `ewrite!` / `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr choke point,
+//! - `ewriteln!` over [`write_stderr_fmt`]: the CLI's stderr choke point,
 //!   which never panics — a closed pipe or a failed write becomes sticky [`OutputState`]
 //!   instead (#157). [`write_stdout`] writes a command's product and reports a
 //!   [`StdoutOutcome`], writing nothing once stdout's reader is gone; [`exit`] ends the
@@ -32,7 +32,7 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use miette::Result;
 
@@ -41,19 +41,12 @@ use crate::write::{DirIdentity, NotRemoved, Removal};
 
 // ── Streams and the exit funnel (#157) ───────────────────────────────────────
 
-/// `eprint!` for the CLI: write to stderr through [`write_stderr_fmt`], which never
-/// panics.
+/// `eprintln!` for the CLI: write a line to stderr through [`write_stderr_fmt`], which
+/// never panics.
 ///
-/// `tests/print_discipline.rs` lists this macro and `ewriteln!` beside the std print
-/// macros and scans their arguments the same way. A stderr writer the guard does not
-/// list would take every site that uses it out of the guard.
-macro_rules! ewrite {
-    ($($arg:tt)*) => {
-        $crate::output::write_stderr_fmt(::std::format_args!($($arg)*))
-    };
-}
-
-/// `eprintln!` for the CLI: `ewrite!` plus a trailing newline.
+/// `tests/print_discipline.rs` lists this macro beside the std print macros and scans
+/// its arguments the same way. A stderr writer the guard does not list would take every
+/// site that uses it out of the guard.
 macro_rules! ewriteln {
     () => {
         $crate::output::write_stderr_fmt(::std::format_args!("\n"))
@@ -66,7 +59,6 @@ macro_rules! ewriteln {
     };
 }
 
-pub(crate) use ewrite;
 pub(crate) use ewriteln;
 
 /// Sticky facts about the CLI's output streams, read when the process exits.
@@ -79,8 +71,12 @@ pub(crate) use ewriteln;
 /// test in the binary.
 ///
 /// Adding a fact is adding one bit and its accessors.
+///
+/// It also holds one request that is not a fact for the exit code: a terminal clear that
+/// `mds watch --clear` asked for and the next printed byte makes ([`OutputState::ask_clear`]).
 pub(crate) struct OutputState {
     bits: AtomicU8,
+    clear_asked: AtomicBool,
 }
 
 impl OutputState {
@@ -103,6 +99,7 @@ impl OutputState {
     pub(crate) const fn new() -> Self {
         Self {
             bits: AtomicU8::new(0),
+            clear_asked: AtomicBool::new(false),
         }
     }
 
@@ -174,6 +171,29 @@ impl OutputState {
         self.has(Self::PANICKED)
     }
 
+    /// Ask for a terminal clear before the next byte this process prints (#380): the
+    /// next non-empty stderr write, or the next non-empty stdout write, makes it first.
+    pub(crate) fn ask_clear(&self) {
+        self.clear_asked.store(true, Ordering::Release);
+    }
+
+    /// Drop an asked clear without making it: a rebuild that printed nothing, or a
+    /// panic report, which a clear must neither precede nor wipe (#380, #389).
+    pub(crate) fn cancel_clear(&self) {
+        self.clear_asked.store(false, Ordering::Release);
+    }
+
+    /// Take the asked clear: `true` once for each [`OutputState::ask_clear`], so one
+    /// request makes one clear.
+    fn take_clear(&self) -> bool {
+        self.clear_asked.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_is_asked(&self) -> bool {
+        self.clear_asked.load(Ordering::Acquire)
+    }
+
     /// The rule [`final_exit_code`] applies when the process exits:
     /// [`ExitPolicy::WatchSession`] once a watch session went live,
     /// [`ExitPolicy::Batch`] for every other run.
@@ -212,6 +232,34 @@ pub(crate) fn note_watch_session_live() {
     OUTPUT_STATE.note_watch_live();
 }
 
+/// Erase the screen and the scrollback, then move the cursor home.
+const CLEAR_SEQUENCE: &str = "\x1b[2J\x1b[3J\x1b[H";
+
+/// Ask for `mds watch --clear`'s terminal clear (#380). The clear is made before the
+/// next byte the process prints, on stderr, so it never wipes a line already printed —
+/// a compile warning, a failure report — and a rebuild that prints nothing makes none.
+/// Asked only when stderr is a terminal: the clear is a terminal control sequence.
+pub(crate) fn ask_clear() {
+    if stderr_is_a_terminal() {
+        OUTPUT_STATE.ask_clear();
+    }
+}
+
+/// Drop an asked clear without making it ([`OutputState::cancel_clear`]).
+pub(crate) fn cancel_clear() {
+    OUTPUT_STATE.cancel_clear();
+}
+
+/// Whether stderr is a terminal. A unit test's child process started with
+/// [`child_process::run_on_a_terminal`] answers yes, so a test can see the clear.
+fn stderr_is_a_terminal() -> bool {
+    #[cfg(test)]
+    if child_process::on_a_terminal() {
+        return true;
+    }
+    std::io::stderr().is_terminal()
+}
+
 /// Report an I/O failure of a run that carries on past it — a directory build,
 /// `mds fmt <dir>` — as one `mds::io` error, and record it for the exit code (#157).
 pub(crate) fn eprint_io_failure(e: mds::MdsError) {
@@ -233,7 +281,7 @@ pub(crate) fn eprint_file_failure(report: miette::Report) {
     eprint_error(report);
 }
 
-/// The body of `ewrite!` / `ewriteln!`: write `args` to stderr, never panicking.
+/// The body of `ewriteln!`: write `args` to stderr, never panicking.
 ///
 /// std's `eprintln!` panics when the write fails, which ends the run with exit 101.
 /// Here instead:
@@ -252,7 +300,8 @@ pub(crate) fn write_stderr_fmt(args: std::fmt::Arguments<'_>) {
 ///
 /// The text is rendered first and written with one `write_all`, then flushed. A
 /// `Display` that fails ends the text where it failed: that is a bug in the impl, not an
-/// output failure, so it records nothing.
+/// output failure, so it records nothing. A clear asked for ([`ask_clear`]) goes in front
+/// of the first non-empty text, in the same `write_all`.
 fn write_stderr_to<W: std::io::Write + ?Sized>(
     state: &OutputState,
     sink: &mut W,
@@ -263,6 +312,23 @@ fn write_stderr_to<W: std::io::Write + ?Sized>(
     }
     let mut text = String::new();
     let _ = std::fmt::Write::write_fmt(&mut text, args);
+    if !text.is_empty() && state.take_clear() {
+        text.insert_str(0, CLEAR_SEQUENCE);
+    }
+    write_stderr_text(state, sink, &text);
+}
+
+/// Make an asked clear ([`ask_clear`]) on stderr now, before a command's product reaches
+/// stdout: the screen clears before the rebuild's output appears, also under `--quiet`.
+fn write_pending_clear_to<W: std::io::Write + ?Sized>(state: &OutputState, sink: &mut W) {
+    if !state.stderr_closed() && state.take_clear() {
+        write_stderr_text(state, sink, CLEAR_SEQUENCE);
+    }
+}
+
+/// Write `text` to stderr with one `write_all`, then flush, recording a failure as
+/// [`write_stderr_fmt`] says.
+fn write_stderr_text<W: std::io::Write + ?Sized>(state: &OutputState, sink: &mut W, text: &str) {
     match sink.write_all(text.as_bytes()).and_then(|()| sink.flush()) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => state.note_stderr_closed(),
@@ -324,7 +390,13 @@ pub(crate) fn stdout_failure(e: &std::io::Error) -> mds::MdsError {
 /// [`StdoutOutcome::Failed`] again — a `mds watch -o -` session whose stdout recovers
 /// and fails again reports both (#157). A write of no bytes shows nothing about stdout
 /// and ends nothing.
+///
+/// A clear asked for ([`ask_clear`]) is made on stderr before non-empty bytes go to an
+/// open stdout.
 pub(crate) fn write_stdout(bytes: &[u8]) -> StdoutOutcome {
+    if !bytes.is_empty() && !OUTPUT_STATE.stdout_closed() {
+        write_pending_clear_to(&OUTPUT_STATE, &mut std::io::stderr().lock());
+    }
     write_stdout_to(&OUTPUT_STATE, &mut std::io::stdout().lock(), bytes)
 }
 
@@ -496,6 +568,7 @@ pub(crate) fn install_panic_hook() {
 /// is. Inside a [`catch_panic`] it prints the text, and then std aborts.
 fn on_panic(backtrace: Option<BacktraceStyle>, info: &std::panic::PanicHookInfo<'_>) {
     OUTPUT_STATE.note_panicked();
+    OUTPUT_STATE.cancel_clear();
     let mut stderr = std::io::stderr();
     let _ = stderr.write_all(ICE_TEXT.as_bytes());
     if let Some(style) = backtrace {
@@ -2715,6 +2788,32 @@ pub(crate) mod child_process {
     pub(crate) fn is_child(name: &str) -> bool {
         std::env::var_os(CHILD).is_some_and(|value| value == name)
     }
+
+    /// The variable that makes the child's stderr count as a terminal.
+    const TERMINAL: &str = "MDS_UNIT_TEST_TERMINAL";
+
+    /// [`run`], with the child's stderr counted as a terminal ([`on_a_terminal`]), so the
+    /// test sees the clear that `--clear` makes only on a terminal.
+    pub(crate) fn run_on_a_terminal(name: &str) -> std::process::Output {
+        let binary = std::env::current_exe().expect("the test binary's path");
+        std::process::Command::new(binary)
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env(TERMINAL, "1")
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .expect("the child runs")
+    }
+
+    /// Whether this process is a child that [`run_on_a_terminal`] started.
+    pub(crate) fn on_a_terminal() -> bool {
+        std::env::var_os(CHILD).is_some() && std::env::var_os(TERMINAL).is_some()
+    }
+
+    /// Whether this process's clear is asked for and not made yet (#380).
+    pub(crate) fn clear_is_asked() -> bool {
+        super::OUTPUT_STATE.clear_is_asked()
+    }
 }
 
 #[cfg(test)]
@@ -4773,6 +4872,62 @@ mod tests {
         );
     }
 
+    /// #380: an asked clear goes in front of the first non-empty stderr text, in the same
+    /// write, and only once; an empty text keeps it for the next.
+    #[test]
+    fn an_asked_clear_goes_before_the_first_printed_byte_once() {
+        let state = OutputState::new();
+        state.ask_clear();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_stderr_to(&state, &mut sink, format_args!(""));
+        assert!(sink.bytes.is_empty(), "an empty text makes no clear");
+        assert!(state.clear_is_asked(), "an empty text keeps the request");
+
+        write_stderr_to(&state, &mut sink, format_args!("warning: w\n"));
+        write_stderr_to(&state, &mut sink, format_args!("Recompiled\n"));
+        let expected = format!("{CLEAR_SEQUENCE}warning: w\nRecompiled\n");
+        assert_eq!(sink.bytes, expected.as_bytes());
+        assert_eq!(sink.writes, 2, "the clear and its line go out in one write");
+        assert!(!state.clear_is_asked());
+    }
+
+    /// #380: without a request, a cancelled request, or a closed stderr, no clear is
+    /// written.
+    #[test]
+    fn no_clear_is_written_unless_one_is_asked_and_stderr_is_open() {
+        let unasked = OutputState::new();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_stderr_to(&unasked, &mut sink, format_args!("x\n"));
+        assert_eq!(sink.bytes, b"x\n");
+
+        let cancelled = OutputState::new();
+        cancelled.ask_clear();
+        cancelled.cancel_clear();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_stderr_to(&cancelled, &mut sink, format_args!("x\n"));
+        assert_eq!(sink.bytes, b"x\n");
+
+        let closed = OutputState::new();
+        closed.note_stderr_closed();
+        closed.ask_clear();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_pending_clear_to(&closed, &mut sink);
+        assert_eq!(sink.writes, 0, "a closed stderr gets no clear");
+    }
+
+    /// #380: before a command's product goes to stdout, an asked clear is made on its
+    /// own, once.
+    #[test]
+    fn a_pending_clear_is_made_on_its_own_before_stdout_output() {
+        let state = OutputState::new();
+        state.ask_clear();
+        let mut sink = Sink::new(OnWrite::Accept);
+        write_pending_clear_to(&state, &mut sink);
+        write_pending_clear_to(&state, &mut sink);
+        assert_eq!(sink.bytes, CLEAR_SEQUENCE.as_bytes());
+        assert_eq!(sink.writes, 1);
+    }
+
     #[test]
     fn write_stdout_is_written_only_when_the_write_and_the_flush_succeed() {
         let state = OutputState::new();
@@ -5290,6 +5445,48 @@ mod tests {
             "both panics were caught and the run went on to the exit; stdout:\n{report}"
         );
         assert_eq!(shown, ICE_TEXT.repeat(2), "one text per panic");
+    }
+
+    /// #380, #389: a panic's report cancels the clear a rebuild asked for. The report is
+    /// not preceded by one, and no print after it makes one: it is never wiped.
+    ///
+    /// Controls: the child really ran the test; a clear asked for after the panic is made
+    /// before the next line, so the funnel in the child does clear.
+    #[test]
+    fn a_panic_report_cancels_the_pending_clear() {
+        const NAME: &str = "output::tests::a_panic_report_cancels_the_pending_clear";
+        if child_process::is_child(NAME) {
+            install_panic_hook();
+            OUTPUT_STATE.ask_clear();
+            let caught = catch_panic(|| {
+                panic!("while a clear is asked for");
+            });
+            assert!(caught.is_err(), "the panic unwound to the catch");
+            assert!(
+                !OUTPUT_STATE.clear_is_asked(),
+                "the report took the request"
+            );
+            ewriteln!("after the report");
+            OUTPUT_STATE.ask_clear();
+            ewriteln!("control");
+            exit(0);
+        }
+        let child = child_process::run(NAME);
+        let (report, shown) = streams(&child);
+        assert!(
+            report.contains("running 1 test"),
+            "control: the child ran the test; stdout:\n{report}"
+        );
+        assert_eq!(
+            shown,
+            format!("{ICE_TEXT}after the report\n{CLEAR_SEQUENCE}control\n"),
+            "no clear before the report or after it; the control's clear comes before its line"
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(101),
+            "a run that caught a panic exits 101; stdout:\n{report}\nstderr:\n{shown}"
+        );
     }
 
     /// A panic that nothing catches ends the process at once with 101, after the text —
