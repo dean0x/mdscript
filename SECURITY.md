@@ -330,9 +330,21 @@ A release build therefore does not contain it — the variable is never read —
 profile turns debug assertions on. Build with debug assertions for development, not for
 anything you ship.
 
-So is `MDS_TEST_READY`, with which the test suite has `mds watch` create a file once it
-is watching — by path, outside the write primitive's checks: a release build never reads
-the variable, which `panic_hook.rs` pins as well.
+Five more test-only hooks are compiled in the same way. Four of them stop the run at one
+point until a test lets it go, so that the test can change a file in the window that point
+opens. `MDS_TEST_PAUSE_BEFORE_REPLACE` stops a rewrite between its read and its replace,
+and a write of a new file between its look at the name and its commit.
+`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` stops a directory `mds watch` rebuild after it has told
+the sources still there from the sources gone, and before it compiles them.
+`MDS_TEST_PAUSE_AFTER_LOOK` stops a rebuild, in either watch mode, after it has looked for
+emptied files and before it reads any. `MDS_TEST_PAUSE_AFTER_READ` stops a file-mode
+rebuild after its compile has read every file, before it takes its baseline. Each variable
+names a file: the run writes `<file>.paused` when it stops, and goes on once `<file>`
+exists, or after ten seconds. The fifth, `MDS_TEST_READY`, has `mds watch` create the file
+the variable names once it is watching — by path, outside the write primitive's checks.
+A release build contains none of them: each has an empty stub there, so it never reads the
+variable and never writes the file, unless its profile turns debug assertions on.
+`panic_hook.rs` pins this for each hook, as it does for `MDS_TEST_PANIC`.
 
 **Never enable `debug-panics` in a published or production build.** Panic messages
 can contain absolute filesystem paths and other internal details that should not be

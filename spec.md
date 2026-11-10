@@ -1082,7 +1082,13 @@ never-shipped `debug-panics` feature (`SECURITY.md`) prints the message and loca
 after the text. A build with debug assertions — `cargo install --debug`, or a profile
 that turns them on — also holds a test-only trigger that panics on purpose when
 `MDS_TEST_PANIC` is `main`, `thread`, `compile:<file stem>`, `notify` or `ctrlc`; a
-release build compiles it out unless its profile turns debug assertions on.
+release build compiles it out unless its profile turns debug assertions on. Such a build
+holds five more test-only hooks, compiled out in the same way: the pauses
+`MDS_TEST_PAUSE_BEFORE_REPLACE`, `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`,
+`MDS_TEST_PAUSE_AFTER_LOOK` and `MDS_TEST_PAUSE_AFTER_READ`, each of which stops a write or
+a rebuild at one point until a test lets it go, and the readiness marker `MDS_TEST_READY`,
+the file `mds watch` creates once it is watching. `tests/panic_hook.rs` pins that each is
+compiled only under `cfg(debug_assertions)` and has an empty release stub.
 
 The `mds::syntax`-through-`mds::formatter_invariant` rows correspond one-to-one to the
 `MdsError` variants in `crates/mds-core/src/error.rs`; the last four are synthesised
