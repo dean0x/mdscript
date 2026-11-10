@@ -2691,6 +2691,32 @@ pub(crate) fn notify_cause(e: &notify::Error) -> String {
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
+/// A unit test that runs again as a child process, for what only a process of its own
+/// can show: the panic hook, and the stderr funnel the whole process shares (#389).
+#[cfg(test)]
+pub(crate) mod child_process {
+    /// The variable that makes a test run as the child [`run`] starts.
+    const CHILD: &str = "MDS_UNIT_TEST_CHILD";
+
+    /// Run the test `name` again as a child — this test binary, that one test — with
+    /// [`CHILD`] set, in a process of its own. The child's `RUST_BACKTRACE` is removed: CI
+    /// sets it for every job.
+    pub(crate) fn run(name: &str) -> std::process::Output {
+        let binary = std::env::current_exe().expect("the test binary's path");
+        std::process::Command::new(binary)
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .expect("the child runs")
+    }
+
+    /// Whether this process is the child [`run`] started for the test `name`.
+    pub(crate) fn is_child(name: &str) -> bool {
+        std::env::var_os(CHILD).is_some_and(|value| value == name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5218,26 +5244,6 @@ mod tests {
         assert!(payload.contains(&here.display().to_string()), "{payload:?}");
     }
 
-    /// The variable that makes a test run as the child [`panic_in_a_child`] starts.
-    const PANIC_CHILD: &str = "MDS_OUTPUT_PANIC_CHILD";
-
-    /// Run the test `name` again as a child — this test binary, that one test — with
-    /// [`PANIC_CHILD`] set, so that it installs the panic hook in a process of its own.
-    /// The child's `RUST_BACKTRACE` is removed: CI sets it for every job.
-    fn panic_in_a_child(name: &str) -> std::process::Output {
-        let binary = std::env::current_exe().expect("the test binary's path");
-        std::process::Command::new(binary)
-            .args([name, "--exact", "--nocapture", "--test-threads=1"])
-            .env(PANIC_CHILD, name)
-            .env_remove("RUST_BACKTRACE")
-            .output()
-            .expect("the child runs")
-    }
-
-    fn in_the_child(name: &str) -> bool {
-        std::env::var_os(PANIC_CHILD).is_some_and(|value| value == name)
-    }
-
     /// The child's streams: what the harness and the test wrote to stdout, and stderr.
     fn streams(child: &std::process::Output) -> (String, String) {
         (
@@ -5255,7 +5261,7 @@ mod tests {
     #[test]
     fn a_caught_panic_is_reported_once_and_the_run_goes_on() {
         const NAME: &str = "output::tests::a_caught_panic_is_reported_once_and_the_run_goes_on";
-        if in_the_child(NAME) {
+        if child_process::is_child(NAME) {
             install_panic_hook();
             let first = catch_panic(|| {
                 panic!("first");
@@ -5268,7 +5274,7 @@ mod tests {
             }
             exit(0);
         }
-        let child = panic_in_a_child(NAME);
+        let child = child_process::run(NAME);
         let (report, shown) = streams(&child);
         assert!(
             report.contains("running 1 test"),
@@ -5291,11 +5297,11 @@ mod tests {
     #[test]
     fn a_panic_nothing_catches_ends_the_run_at_once_with_101() {
         const NAME: &str = "output::tests::a_panic_nothing_catches_ends_the_run_at_once_with_101";
-        if in_the_child(NAME) {
+        if child_process::is_child(NAME) {
             install_panic_hook();
             panic!("uncaught");
         }
-        let child = panic_in_a_child(NAME);
+        let child = child_process::run(NAME);
         let (report, shown) = streams(&child);
         assert!(
             report.contains("running 1 test"),
@@ -5327,7 +5333,7 @@ mod tests {
                 panic!("second");
             }
         }
-        if in_the_child(NAME) {
+        if child_process::is_child(NAME) {
             install_panic_hook();
             let _ = catch_panic(|| {
                 let _armed = PanicsWhenDropped;
@@ -5336,7 +5342,7 @@ mod tests {
             let _ = write_stdout(b"the run went on\n");
             exit(0);
         }
-        let child = panic_in_a_child(NAME);
+        let child = child_process::run(NAME);
         let (report, shown) = streams(&child);
         assert!(
             report.contains("running 1 test"),
@@ -5367,7 +5373,7 @@ mod tests {
         /// 10 ms apart.
         const POLLS: u32 = 500;
         const POLL: std::time::Duration = std::time::Duration::from_millis(10);
-        if in_the_child(NAME) {
+        if child_process::is_child(NAME) {
             install_panic_hook();
             // Held until the process ends, so the helper's hook blocks in its write.
             let _held = std::io::stderr().lock();
@@ -5381,7 +5387,7 @@ mod tests {
             let _ = write_stdout(b"at the funnel\n");
             exit(0);
         }
-        let child = panic_in_a_child(NAME);
+        let child = child_process::run(NAME);
         let (report, shown) = streams(&child);
         assert!(
             report.contains("running 1 test"),
@@ -5413,13 +5419,13 @@ mod tests {
         extern "C" fn cannot_unwind() {
             panic!("first");
         }
-        if in_the_child(NAME) {
+        if child_process::is_child(NAME) {
             install_panic_hook();
             let _ = catch_panic(|| cannot_unwind());
             let _ = write_stdout(b"the run went on\n");
             exit(0);
         }
-        let child = panic_in_a_child(NAME);
+        let child = child_process::run(NAME);
         let (report, shown) = streams(&child);
         assert!(
             report.contains("running 1 test"),
