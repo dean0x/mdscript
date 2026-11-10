@@ -1412,6 +1412,9 @@ pub fn lint_str(source: &str) -> Result<LintResult, MdsError> {
 /// directory. `runtime_vars` are injected into the check gate (not into lint rules).
 /// `config` carries per-rule severity overrides.
 ///
+/// The source is linted as [`STRING_SOURCE_MAP_LABEL`] (`input.mds`), never a partial;
+/// [`lint_str_named`] lints it under a file name the caller supplies.
+///
 /// Pipeline (AC-PERF-01): check gate ONCE → lint entry source.
 ///
 /// # Examples
@@ -1433,6 +1436,66 @@ pub fn lint_str_with(
     runtime_vars: Option<HashMap<String, Value>>,
     config: &LintConfig,
 ) -> Result<LintResult, MdsError> {
+    // Use STRING_SOURCE_MAP_LABEL ("input.mds") — the shared const that both
+    // the source-map choke-point (sourcemap.rs) and the WASM DEFAULT_FILENAME
+    // agree on — so lint(source) produces a byte-identical "file" key across
+    // all surfaces.
+    lint_str_named(
+        source,
+        base_dir,
+        runtime_vars,
+        config,
+        crate::sourcemap::STRING_SOURCE_MAP_LABEL,
+    )
+}
+
+/// Lint an MDS source string under a file name the caller supplies.
+///
+/// [`lint_str_with`] under `name`: the same `base_dir`, `runtime_vars`, `config` and
+/// check gate, but the source is linted as the file `name`. Every finding's `file` is
+/// `name`, and a name whose last component starts with `_` is linted as a partial,
+/// exactly as [`lint()`] lints a file of that name: a partial's importers may use what
+/// it defines, so `unused-variable`, `unused-import` and `unused-function` do not
+/// report it, and it is not standalone ([`LintResult::is_standalone`]).
+/// [`lint_str_with`] is this function under [`STRING_SOURCE_MAP_LABEL`].
+///
+/// `name` only labels the source: nothing is read from it, and `@import` paths
+/// resolve against `base_dir` as they do for [`lint_str_with`].
+///
+/// # Errors
+///
+/// [`MdsError::Io`] when `name` carries a forbidden path character
+/// ([`is_forbidden_path_char`]) — `file name contains forbidden character U+XXXX:
+/// "<name>"`, the name escaped — refused before anything else is checked. Otherwise
+/// every error [`lint_str_with`] returns.
+///
+/// # Examples
+///
+/// ```rust
+/// let source = "---\nunused: 1\n---\nHello!\n";
+/// let config = mds::LintConfig::default();
+///
+/// let page = mds::lint_str_named(source, None, None, &config, "page.mds")?;
+/// assert_eq!(page.diagnostics[0].rule, "unused-variable");
+/// assert_eq!(page.diagnostics[0].file.as_deref(), Some("page.mds"));
+///
+/// // A partial: its importers may use the variable.
+/// let partial = mds::lint_str_named(source, None, None, &config, "_page.mds")?;
+/// assert!(partial.diagnostics.is_empty());
+///
+/// let err = mds::lint_str_named(source, None, None, &config, "page\t.mds").unwrap_err();
+/// assert!(matches!(err, mds::MdsError::Io { .. }));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "lint findings should be used"]
+pub fn lint_str_named(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    config: &LintConfig,
+    name: &str,
+) -> Result<LintResult, MdsError> {
+    fs::reject_forbidden_path_chars("file name", name)?;
     let dir = resolve_base_dir(base_dir)?;
     let vars = runtime_vars.unwrap_or_default();
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
@@ -1441,12 +1504,8 @@ pub fn lint_str_with(
         let mut warnings = vec![];
         cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     }
-    // Step 2: lint the entry source.
-    // Use STRING_SOURCE_MAP_LABEL ("input.mds") — the shared const that both
-    // the source-map choke-point (sourcemap.rs) and the WASM DEFAULT_FILENAME
-    // agree on — so lint(source) produces a byte-identical "file" key across
-    // all surfaces (AC-API-06).
-    lint::lint_source(source, crate::sourcemap::STRING_SOURCE_MAP_LABEL, config)
+    // Step 2: lint the entry source under `name`.
+    lint::lint_source(source, name, config)
 }
 
 /// Lint an MDS file.

@@ -70,8 +70,8 @@ fn import_depth_limit() {
 
 #[test]
 fn stdin_size_limit_rejects_oversized_input() {
-    // Feed more than 10 MB to stdin and verify the CLI returns a non-zero exit code
-    // with an appropriate error message.
+    // Feed more than 10 MiB to stdin: the CLI refuses it as a resource limit, exit 3,
+    // like a file over the same cap (#157).
     use std::io::Write;
 
     let oversized: Vec<u8> = vec![b'x'; 10 * 1024 * 1024 + 1];
@@ -90,14 +90,16 @@ fn stdin_size_limit_rejects_oversized_input() {
     }
 
     let output = child.wait_with_output().unwrap();
-    assert!(
-        !output.status.success(),
-        "build from oversized stdin must fail"
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "build from oversized stdin must exit 3; stderr: {stderr}"
+    );
     assert!(
-        stderr.contains("exceeds maximum") || stderr.contains("10 MB"),
-        "error should mention size limit, got: {stderr}"
+        stderr.contains("mds::resource_limit")
+            && stderr.contains("stdin input exceeds maximum size of 10 MiB"),
+        "error should be mds::resource_limit and mention the size limit, got: {stderr}"
     );
 }
 
@@ -1223,9 +1225,9 @@ fn build_refuses_a_newline_in_a_filename_and_builds_its_sibling() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // ── The hostile file is refused, per file: exit 1 is directory mode's
-    //    per-file-failure code (`N built, M failed`) ─────────────────────────────
-    assert_eq!(out.status.code(), Some(1), "got: {combined}");
+    // ── The hostile file is refused, per file: the refusal is `mds::io`, so the
+    //    directory run exits 2 (`N built, M failed`, #157) ────────────────────────
+    assert_eq!(out.status.code(), Some(2), "got: {combined}");
     assert!(
         combined.contains("mds::io"),
         "refusal is mds::io; got: {combined}"

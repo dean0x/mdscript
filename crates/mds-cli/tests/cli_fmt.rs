@@ -16,7 +16,7 @@
 //! - AC-CF-8: -q/--quiet suppresses status but never errors
 
 mod common;
-use common::{fixture, make_symlink, mds_bin};
+use common::{closed_pipe, fixture, make_symlink, mds_bin};
 
 use std::fs;
 use std::path::Path;
@@ -242,32 +242,59 @@ fn stdin_filter_mode_is_idempotent() {
     assert_eq!(once, twice, "stdin filter mode must be idempotent");
 }
 
+/// `mds fmt -` into a pipe nobody reads keeps its verdict: exit 0, and nothing on stderr
+/// that the same run into an open pipe does not print (#157).
+///
+/// #157 proposed `mds fmt --check . | head -n 1` as the check for this. That pipeline
+/// cannot fail: `--check` reports on stderr and writes nothing to stdout. The filter
+/// mode below does write stdout, and `tests/broken_pipe.rs` closes stdout or stderr
+/// under every other `fmt` mode.
 #[test]
-fn stdin_into_closed_pipe_does_not_panic() {
-    // Piping into `true` closes the read end almost immediately; writing the
-    // formatted result to stdout must handle a broken pipe gracefully.
+fn stdin_into_a_closed_pipe_exits_0_and_an_open_pipe_gets_the_formatted_text() {
     use std::io::Write;
+    let input = read_fixture("fmt_unformatted.mds");
+
+    // Control: into an open pipe the reformatted text arrives on stdout, so the closed
+    // run below really loses a write.
+    let open = fmt_stdin(&input, &[]);
+    let open_stderr = String::from_utf8_lossy(&open.stderr).into_owned();
+    assert_eq!(
+        open.status.code(),
+        Some(0),
+        "control: `mds fmt -` into an open pipe must exit 0; stderr: {open_stderr}"
+    );
+    let formatted = String::from_utf8(open.stdout).unwrap();
+    assert!(
+        !formatted.is_empty() && formatted != input && !formatted.contains('\r'),
+        "control: `mds fmt -` must write the reformatted text to stdout; got {formatted:?}"
+    );
+
     let mut child = mds_bin()
         .arg("fmt")
         .arg("-")
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(closed_pipe()))
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-
-    // Drop stdout immediately to force a broken pipe on write.
-    drop(child.stdout.take());
-
-    let big_input = read_fixture("fmt_unformatted.mds").repeat(1000);
-    // Ignore write errors -- the point is the CHILD process must not panic.
-    let _ = child.stdin.take().unwrap().write_all(big_input.as_bytes());
-
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("panicked"),
-        "must not panic on broken pipe, got stderr: {stderr}"
+    // A child that exits before reading all of stdin closes it; that write error says
+    // nothing about the child.
+    let mut child_stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        let _ = child_stdin.write_all(input.as_bytes());
+    });
+    let closed = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    let closed_stderr = String::from_utf8_lossy(&closed.stderr);
+    assert_eq!(
+        closed.status.code(),
+        Some(0),
+        "`mds fmt -` into a closed pipe must exit 0, not a panic (101) or a signal (None); \
+         stderr: {closed_stderr}"
+    );
+    assert_eq!(
+        closed_stderr, open_stderr,
+        "`mds fmt -` into a closed pipe must print nothing the open run does not"
     );
 }
 
@@ -1459,5 +1486,85 @@ fn fmt_non_utf8_path_exits_two() {
     assert!(
         stderr.contains("not valid UTF-8"),
         "the diagnostic must say why; got: {stderr}"
+    );
+}
+
+// ── #390: a directory entry's `--diff` header ───────────────────────────────
+
+/// The first two lines `mds fmt <args> --diff` prints, run in `cwd`.
+fn diff_header(cwd: &Path, args: &[&str]) -> Vec<String> {
+    let out = mds_bin()
+        .current_dir(cwd)
+        .arg("fmt")
+        .args(args)
+        .arg("--diff")
+        .output()
+        .expect("run mds fmt");
+    String::from_utf8(out.stdout)
+        .expect("a diff is UTF-8")
+        .lines()
+        .take(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `--diff` header of a directory's entry names it below the directory argument as
+/// typed, so it equals the header the same file gets as a file argument typed that way
+/// (#390). Control: the file argument's run prints that header.
+#[test]
+fn a_directory_entry_s_diff_header_equals_its_file_mode_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("src").join("inner");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("b.mds"), read_fixture("fmt_unformatted.mds")).unwrap();
+    let typed = ["src", "inner", "b.mds"].join(std::path::MAIN_SEPARATOR_STR);
+
+    let file_mode = diff_header(dir.path(), &[&typed]);
+    assert_eq!(
+        file_mode,
+        [format!("--- {typed}"), format!("+++ {typed}")],
+        "control: the file argument's diff header"
+    );
+    assert_eq!(
+        diff_header(dir.path(), &["src"]),
+        file_mode,
+        "the directory's entry is named as the file argument is"
+    );
+}
+
+/// A directory's entry whose name holds U+001B is refused before its diff, and the
+/// refusal names it escaped; nothing either stream carries holds the raw byte (#390).
+/// Control: the run still prints its other entry's diff header.
+///
+/// Unix-only: Windows file systems refuse a control character in a file name.
+#[cfg(unix)]
+#[test]
+fn a_directory_entry_named_with_a_control_character_is_named_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("b.mds"), read_fixture("fmt_unformatted.mds")).unwrap();
+    let hostile = format!("a{}b.mds", '\x1b');
+    fs::write(src.join(&hostile), read_fixture("fmt_unformatted.mds")).unwrap();
+
+    let out = mds_bin()
+        .current_dir(dir.path())
+        .args(["fmt", "src", "--diff"])
+        .output()
+        .expect("run mds fmt");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.starts_with("--- src/b.mds\n+++ src/b.mds\n"),
+        "control: the other entry's diff; stdout: {stdout}"
+    );
+    assert!(
+        !out.stdout.contains(&0x1B) && !out.stderr.contains(&0x1B),
+        "no raw ESC on either stream; stdout: {stdout:?}; stderr: {stderr:?}"
+    );
+    let escaped = format!("src/a{}u001Bb.mds", '\\');
+    assert!(
+        stderr.contains(&escaped),
+        "the refusal names the entry escaped, {escaped:?}; stderr: {stderr}"
     );
 }

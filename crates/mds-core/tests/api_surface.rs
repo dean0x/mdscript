@@ -1804,6 +1804,10 @@ fn string_funnels_reject_oversize_source() {
         mds::lint_str_with(&over, None, None, &LintConfig::default()).map(|_| ()),
     );
     assert_oversize_rejected(
+        "lint_str_named",
+        mds::lint_str_named(&over, None, None, &LintConfig::default(), "x.mds").map(|_| ()),
+    );
+    assert_oversize_rejected(
         "compile_str_with_deps_opts",
         mds::compile_str_with_deps_opts(&over, None, None, mds::CompileOptions::default())
             .map(|_| ()),
@@ -1846,6 +1850,15 @@ fn lint_api_signatures_exist() {
         Option<HashMap<String, Value>>,
         &LintConfig,
     ) -> Result<LintResult, MdsError> = mds::lint_str_with;
+
+    // lint_str_named (#179): lint_str_with's options plus the file name to lint under.
+    let _: fn(
+        &str,
+        Option<&Path>,
+        Option<HashMap<String, Value>>,
+        &LintConfig,
+        &str,
+    ) -> Result<LintResult, MdsError> = mds::lint_str_named;
 
     // lint: file-based entry point.
     let _: fn(&Path, Option<HashMap<String, Value>>, &LintConfig) -> Result<LintResult, MdsError> =
