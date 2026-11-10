@@ -3798,7 +3798,8 @@ struct DirWatchState {
     /// source is, and the idle tick looks for a change to it as to a source's (#380).
     vars_file: Option<PathBuf>,
     /// `(mtime, size)` baseline over [`DirWatchState::baselined_paths`] — sources,
-    /// dependencies, the `--vars` file and the sources held back. Read by the idle tick's
+    /// dependencies, the `--vars` file, the sources held back and the files a held compile
+    /// read empty. Read by the idle tick's
     /// content backstop over the watched set, and by a batch to tell a file emptied since
     /// (#380); re-written at the end of every batch, so the tick reports only what the
     /// batch did not already handle (#321).
@@ -3820,6 +3821,12 @@ struct DirWatchState {
 /// A batch the `--vars` file cannot be read for is kept here too, with no hold running,
 /// and the next batch rebuilds what it named — the one that fixes the file compiles a
 /// source created meanwhile, which no other record names.
+///
+/// A source whose compile read a file emptied after the batch looked is held alone
+/// ([`HeldBatch::hold_read_empty`]), and the file stays in the baseline's domain until the
+/// hold ends ([`HeldBatch::read_empty`]): the truncation's own event starts a batch that
+/// names it, and a dependency outside the root that the source imports for the first time is
+/// no source and no dependency the session tracks, since the held compile recorded none.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HeldBatch {
     /// The paths of the batches held back.
@@ -3832,6 +3839,11 @@ struct HeldBatch {
     /// imports — is rebuilt with the batch that ends the hold, but kept out of the baseline,
     /// so its emptying holds nothing.
     sources: BTreeSet<PathBuf>,
+    /// The files the compiles held back read empty, after the look that stamped them whole:
+    /// kept in the baseline like [`HeldBatch::sources`], so the look of a batch that names
+    /// one finds it emptied and holds that batch too. A compile reads only files the run
+    /// reads, so none of these is a file nothing reads.
+    read_empty: BTreeSet<PathBuf>,
     /// Whether one of them changed the `--vars` file.
     vars_changed: bool,
 }
@@ -3854,9 +3866,17 @@ impl HeldBatch {
         self.vars_changed |= vars_changed;
     }
 
+    /// Hold `source` back as [`HeldBatch::hold`] does, for a compile that read the files in
+    /// `emptied` empty, and keep them in the baseline until the hold ends.
+    fn hold_read_empty(&mut self, source: &PathBuf, emptied: BTreeSet<PathBuf>, root: &Path) {
+        self.hold([source], false, root);
+        self.read_empty.extend(emptied);
+    }
+
     /// The batch that ends the hold, or the next after a batch the vars file could not be
     /// read for: `batch` and every batch kept, with whether any of them changed the vars
-    /// file. Nothing stays held.
+    /// file. Nothing stays held, the files read empty included: they leave the baseline's
+    /// domain with the hold.
     fn release(
         &mut self,
         batch: &BTreeSet<PathBuf>,
@@ -4029,15 +4049,20 @@ impl DirWatchState {
         self.tracked_paths().chain(self.vars_file.iter())
     }
 
-    /// The domain of the `last_mtimes` baseline (#380): [`Self::watched_paths`] and the
+    /// The domain of the `last_mtimes` baseline (#380): [`Self::watched_paths`], the
     /// sources of the batches held back ([`HeldBatch::sources`]) — a source a batch named
-    /// before any compile of it succeeded, which its compile held, among them — so a source
-    /// held keeps the stamp the look that named it took, and one emptied before the batch that
-    /// ends the hold is found emptied by that batch's look, as a source the session compiled
-    /// is. Every file in it is one the run reads: a path held back that nothing reads is no
-    /// part of it, so its emptying holds nothing.
+    /// before any compile of it succeeded, which its compile held, among them — and the files
+    /// a compile held back read empty ([`HeldBatch::read_empty`]), so a source held keeps the
+    /// stamp the look that named it took, and one emptied before the batch that ends the
+    /// hold is found emptied by that batch's look, as a source the session compiled is. So
+    /// is a file a held compile read empty, a dependency outside the root that a source
+    /// imports for the first time among them, which the held compile recorded no edge for:
+    /// the batch its truncation starts is held too. Every file in it is one the run reads: a
+    /// path held back that nothing reads is no part of it, so its emptying holds nothing.
     fn baselined_paths(&self) -> impl Iterator<Item = &PathBuf> {
-        self.watched_paths().chain(&self.held.sources)
+        self.watched_paths()
+            .chain(&self.held.sources)
+            .chain(&self.held.read_empty)
     }
 
     /// Take the baseline over [`Self::baselined_paths`] again, from the stamps the batch's
@@ -4220,7 +4245,10 @@ impl<'a> BatchVars<'a> {
 /// because `src` is gone since the batch found it there retires it as a deleted source
 /// ([`DirWatchState::retire_deleted`], #160). A compile that read a file emptied since the
 /// batch looked — whether it then failed or would write — holds `src` back, unless the
-/// deadline ended the hold in this rebuild ([`EmptyHold::on_late_empty`], #380). A source
+/// deadline ended the hold in this rebuild ([`EmptyHold::on_late_empty`], #380). A compile
+/// that succeeded keeps the files it read empty in the baseline until the hold ends
+/// ([`HeldBatch::hold_read_empty`]); one that failed read the files its last compile
+/// reported, which the baseline holds already. A source
 /// whose output is written, kept with a notice, or not written with a report shows
 /// something: the batch's `--vars` duplicate keys are reported with it, before its
 /// `Recompiled` line, after the notice, or before the report, unless an earlier source of
@@ -4304,13 +4332,14 @@ fn compile_one_source(
                 let reads = std::iter::once(&source)
                     .chain(&dep_paths)
                     .chain(state.vars_file.as_ref());
-                if any_went_empty(reads, &state.last_mtimes)
+                let read_empty = emptied_paths(reads, &state.last_mtimes);
+                if !read_empty.is_empty()
                     && state.hold.on_late_empty(Instant::now()) == HoldVerdict::Hold
                 {
                     if let Some(kept) = kept_before {
                         state.kept.insert(source.clone(), kept);
                     }
-                    state.held.hold([&source], false, root);
+                    state.held.hold_read_empty(&source, read_empty, root);
                     return;
                 }
                 // The rebuild of `src` before this one kept the same from being written
@@ -7416,6 +7445,45 @@ mod tests {
             (paths(&["/w/c.mds"]), false),
             "positive control: with nothing held, a batch is its own"
         );
+    }
+
+    /// A file a held compile read empty — a dependency outside the root that the source
+    /// imports for the first time, no source and no dependency the session tracks — is in
+    /// the baseline's domain while the source is held, so the look of a batch that names it
+    /// stamps it; the batch that ends the hold rebuilds the source, and the file leaves the
+    /// domain with the hold (#380).
+    #[test]
+    fn a_file_a_held_compile_read_empty_is_in_the_baseline_until_the_hold_ends() {
+        let (_root_dir, root) = canonical_tempdir();
+        let mut state = empty_dir_state();
+        let page = root.join("page.mds");
+        let dependency = PathBuf::from("/outside/_y.mds");
+        let in_domain = |state: &DirWatchState| state.baselined_paths().any(|p| *p == dependency);
+        assert!(
+            !in_domain(&state),
+            "control: the session tracks no such file"
+        );
+
+        state
+            .held
+            .hold_read_empty(&page, BTreeSet::from([dependency.clone()]), &root);
+        assert!(
+            state.held.paths.contains(&page) && state.held.sources.contains(&page),
+            "the source is held; {:?}",
+            state.held
+        );
+        assert!(in_domain(&state), "the file is in the baseline's domain");
+
+        assert_eq!(
+            state.held.release(&BTreeSet::new(), false),
+            (BTreeSet::from([page]), false),
+            "the batch that ends the hold rebuilds the source"
+        );
+        assert!(
+            !in_domain(&state),
+            "the file leaves the domain with the hold"
+        );
+        assert_eq!(state.held, HeldBatch::default(), "nothing stays held");
     }
 
     /// An output the session wrote with bytes, written with none, is emptied; nothing else
@@ -10677,6 +10745,9 @@ mod tests {
         assert!(state.hold.deadline().is_some(), "a hold of its own is set");
         assert!(state.held.paths.contains(&page), "{:?}", state.held);
 
+        // The module is written whole with the page's save: the file the held compile read
+        // empty stays in the baseline until it is, and would hold the next batch itself.
+        std::fs::write(&module, "Inc.\n").unwrap();
         std::fs::write(&page, "Page two\n").unwrap();
         rebuild_dir_batch(&ctx, &BTreeSet::new(), false, &mut state, None);
         assert!(
@@ -10723,6 +10794,11 @@ mod tests {
             "control: page's compile is held; {:?}",
             state.held
         );
+
+        // The module is written whole: the file the held compile read empty stays in the
+        // baseline until it is, and would hold the next batches itself. Only page is empty
+        // from here, so it alone holds them.
+        std::fs::write(&module, "Inc.\n").unwrap();
 
         // page emptied, its event lost: a batch with nothing new.
         std::fs::write(&page, "").unwrap();

@@ -1276,6 +1276,111 @@ fn dir_mode_a_failing_source_truncated_after_a_batch_for_another_looked_is_held(
     }
 }
 
+// ── A dependency outside the root, read empty by a compile that is held ─────
+
+/// In directory mode, a dependency outside the watched directory that a source imports for
+/// the first time, and that is truncated after the batch looked and before its compile read
+/// it, holds the batch whose compile read it empty — and the batch its own truncation event
+/// starts. That second batch names the dependency, which is no source and no dependency the
+/// session tracks: the held compile recorded none. Until the hold ends, the file the held
+/// compile read empty stays among the files the look stamps, so the second batch finds it
+/// emptied and is held too, and the empty output is never published before the deadline.
+///
+/// The debug build's pause after a batch's look (`MDS_TEST_PAUSE_AFTER_LOOK`) makes the
+/// window certain. It stops every batch until the file that ends it exists, so the test
+/// moves that file aside to stop a later batch: the page is saved importing a missing
+/// `_y.mds` and its batch is let go, the pause is set again, and `_y.mds` is created, which
+/// starts the batch that stops after its look, with `_y.mds` full. Outside a test, an editor
+/// that creates a file beside the root and saves it again by truncating it, while the batch
+/// of its creation runs, opens the window.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_dependency_a_held_compile_read_empty_holds_the_batch_its_truncation_starts() {
+    let base = tempfile::tempdir().unwrap();
+    let (root, shared) = (base.path().join("root"), base.path().join("shared"));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // The project's root marker, so the page may import from beside the root.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    std::fs::write(
+        shared.join("_x.mds"),
+        "@define greet():\nX one\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    let page = root.join("page.mds");
+    std::fs::write(&page, "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n").unwrap();
+    let out = base.path().join("out");
+    let output = out.join("page.md");
+    // Outside every watched directory, so the pause's files raise no event.
+    let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "50", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &go)
+            .stdout(Stdio::null()),
+    );
+    let mut log = OutputLog::default();
+    log.wait_for(&output, "X one", TIMEOUT);
+
+    // The page is saved importing a file that is not there: its batch stops after its look,
+    // is let go, and the compile fails, which leaves the page errored.
+    let missing = shared.join("_y.mds");
+    write_atomic(&page, "@import \"../shared/_y.mds\" as y\n@include y\n");
+    wait_for_the_pause(&paused, &tap, "the batch of the page's save");
+    std::fs::write(&go, "").unwrap();
+    wait_for_tap(&tap, "_y.mds", TIMEOUT);
+
+    // The pause is set again: the batch the creation of `_y.mds` starts stops after its look,
+    // with the file full, and the page is compiled again for its failure.
+    std::fs::rename(&go, base.path().join("go.spent")).unwrap();
+    std::fs::rename(&paused, base.path().join("go.paused.spent")).unwrap();
+    write_atomic(&missing, "Y one\n");
+    wait_for_the_pause(&paused, &tap, "the batch of the creation of _y.mds");
+    let hold = Hold::start(&missing);
+    std::fs::write(&go, "").unwrap();
+    log.poll_for(&output, TRUNCATE_HOLD);
+    let timing = hold.write_and_close("Y two\n");
+    // The positive control: once `_y.mds` is written, the output is published with its
+    // content, by the one rebuild that ends the hold.
+    log.wait_for(&output, "Y two", TIMEOUT);
+
+    let stderr = stderr_through_the_marker(&page, tap, &mut child);
+    let what = "directory mode, a dependency beside the root truncated after its batch looked";
+    assert_no_empty_before_the_deadline(&log, timing.started, what);
+    if strict_claims_apply(
+        "dir_mode_a_dependency_a_held_compile_read_empty_holds_the_batch_its_truncation_starts",
+        &timing,
+        what,
+    ) {
+        assert_eq!(
+            log.contents(),
+            ["X one\n", "Y two\n"],
+            "{what}: the output goes from the first import to the content finally written, \
+             never empty; stderr:\n{stderr}"
+        );
+        let before = before_the_marker(&stderr);
+        assert_eq!(
+            count_occurrences(before, EMPTY_OUTPUT_NOTICE),
+            0,
+            "{what}: no empty output is announced; stderr:\n{stderr}"
+        );
+        let rebuilds = before
+            .lines()
+            .filter(|line| line.starts_with("Recompiled ") && line.contains("page.md"))
+            .count();
+        assert_eq!(
+            rebuilds, 1,
+            "{what}: exactly one rebuild of page.md, for the content finally written; \
+             stderr:\n{stderr}"
+        );
+    }
+}
+
 // ── The deadline ────────────────────────────────────────────────────────────
 
 /// Truncate the entry and close it without writing: the empty output IS published —
