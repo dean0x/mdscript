@@ -263,7 +263,9 @@ shared partial rebuilds **all transitive importers** automatically.
   `Wrote an empty output: <file>` (not under `--quiet`).
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
-- `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
+- `--quiet` suppresses status lines and the warnings of a compile. Compile errors and failure
+  reports still print (`warning: could not remove …`, `warning: failed to watch …`,
+  `warning: watch error …`), and the watcher keeps running.
 - Ctrl+C exits with code 0 and prints `Stopped watching.` The exit code is 101 when a compile
   panicked during the session: the watcher takes that as a failed compile and keeps watching.
 - With `-o -`, a reader that goes away ends the session: `mds watch page.mds -o - | head -n 1`
