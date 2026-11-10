@@ -3138,8 +3138,10 @@ mod module_overwrite {
             )))
     }
 
-    /// Why an output is not written over an MDS module.
-    pub(super) const MODULE_CAUSE: &str = "refusing to replace an MDS module";
+    /// Why an output is not written over an MDS module, and the way out: an output that
+    /// declares `type: mds` is a module itself and replaces one.
+    pub(super) const MODULE_CAUSE: &str = "refusing to replace an MDS module (an output that \
+         declares type: mds is a generated module, and is rebuilt from its source)";
 
     /// `mds build` never writes its output over an MDS module (#425): `a.md`, which
     /// declares `type: mds`, at the default output of `a.mds`, and `lib.md` named by

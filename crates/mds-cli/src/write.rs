@@ -311,11 +311,11 @@ pub(crate) fn atomic_write_file(
 ///
 /// As [`atomic_write_file`]; and, for an output that is no module, a module at the target
 /// or a regular `.md` file there that cannot be read to tell, and a file the run reads,
-/// are refused before the rename —
-/// `cannot write <file>: refusing to replace an MDS module`, `cannot write <file>: cannot
-/// tell whether it is an MDS module: <cause>` with the read's cause, or `cannot write
-/// <file>: refusing to replace a file this run reads` — and left as they are, with no
-/// temporary file left behind.
+/// are refused before the rename — `cannot write <file>: refusing to replace an MDS module
+/// (an output that declares type: mds is a generated module, and is rebuilt from its
+/// source)`, `cannot write <file>: cannot tell whether it is an MDS module: <cause>` with
+/// the read's cause, or `cannot write <file>: refusing to replace a file this run reads` —
+/// and left as they are, with no temporary file left behind.
 pub(crate) fn write_compiled(
     target: &WriteTarget,
     content: &str,
@@ -948,7 +948,10 @@ fn worded(target: &WriteTarget, failure: Failure) -> mds::MdsError {
             ),
         ),
         Failure::LinkAtTarget => io_error(&target.shown, SYMLINK_REFUSAL.to_owned()),
-        Failure::Module => io_error(&target.shown, MODULE_REFUSAL.to_owned()),
+        Failure::Module => io_error(
+            &target.shown,
+            format!("{MODULE_REFUSAL} ({MODULE_WAY_OUT})"),
+        ),
         Failure::Input => io_error(&target.shown, INPUT_REFUSAL.to_owned()),
         Failure::UnreadMarkdown(e) => mds::MdsError::Io {
             message: format!(
@@ -975,6 +978,12 @@ const SYMLINK_REMOVAL_REFUSAL: &str = "refusing to remove a symlink";
 
 /// Why [`write_compiled`] refuses to replace an MDS module (#425).
 const MODULE_REFUSAL: &str = "refusing to replace an MDS module";
+
+/// The way out of [`MODULE_REFUSAL`], after it in brackets: an output that declares `type:
+/// mds` is a module itself, so it may replace one (#425). An `mds::io` error has no help of
+/// its own to carry it, so it ends the cause.
+const MODULE_WAY_OUT: &str =
+    "an output that declares type: mds is a generated module, and is rebuilt from its source";
 
 /// Why [`write_compiled`] refuses to replace one of the files the run reads (#425).
 const INPUT_REFUSAL: &str = "refusing to replace a file this run reads";
@@ -2725,6 +2734,12 @@ pub(crate) mod sync_probe {
 mod tests {
     use super::*;
 
+    /// The cause of a write refused for an MDS module, as a user reads it: the refusal, and
+    /// the way out in brackets (#425). Written out, so no test follows a change to the
+    /// constants it is made from.
+    const MODULE_REFUSED: &str = "refusing to replace an MDS module (an output that declares \
+         type: mds is a generated module, and is rebuilt from its source)";
+
     /// [`atomic_write_file`] of a file named as it is written, anchored at its directory.
     fn write_as_typed(
         path: &Path,
@@ -4079,7 +4094,7 @@ mod tests {
             assert_eq!(
                 write(name),
                 Err(format!(
-                    "cannot write {}: {MODULE_REFUSAL}",
+                    "cannot write {}: {MODULE_REFUSED}",
                     shown(name).display()
                 )),
                 "{name}"
@@ -4132,7 +4147,7 @@ mod tests {
 
         assert_eq!(
             write("m.md", "plain\n", &Inputs::default()),
-            Err(format!("cannot write m.md: {MODULE_REFUSAL}")),
+            Err(format!("cannot write m.md: {MODULE_REFUSED}")),
             "control: an output that is no module"
         );
         assert_eq!(
@@ -4141,7 +4156,7 @@ mod tests {
                 "---\nconfig:\n  type: mds\n---\nN\n",
                 &Inputs::default()
             ),
-            Err(format!("cannot write m.md: {MODULE_REFUSAL}")),
+            Err(format!("cannot write m.md: {MODULE_REFUSED}")),
             "control: type: mds below another key is no module"
         );
         assert_eq!(text("m.md"), module, "left as it is");
@@ -4151,7 +4166,7 @@ mod tests {
         std::fs::write(path("lib.mds"), "Hello\n").unwrap();
         assert_eq!(
             write("lib.mds", "plain\n", &Inputs::default()),
-            Err(format!("cannot write lib.mds: {MODULE_REFUSAL}")),
+            Err(format!("cannot write lib.mds: {MODULE_REFUSED}")),
             "control: an output that is no module, over a .mds file"
         );
         assert_eq!(write("lib.mds", GENERATED, &Inputs::default()), Ok(()));
@@ -4511,7 +4526,7 @@ mod tests {
         assert_eq!(
             refused,
             Err(format!(
-                "cannot write {}: {MODULE_REFUSAL}",
+                "cannot write {}: {MODULE_REFUSED}",
                 shown("locked.mds").display()
             )),
             "a .mds file is never read to tell"
@@ -4624,7 +4639,7 @@ mod tests {
         for name in ["m.md.", "m.md ", "lib.mds."] {
             assert_eq!(
                 write(name),
-                Err(format!("cannot write {name}: {MODULE_REFUSAL}")),
+                Err(format!("cannot write {name}: {MODULE_REFUSED}")),
                 "{name:?}"
             );
         }
