@@ -652,11 +652,13 @@ impl<'a> ReverifyGate<'a> {
             .edits
             .iter()
             .all(|e| mds::fix::is_output_neutral(&e.rule));
-        let original_output =
-            mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
-                .ok()
-                .map(|r| r.output)
-                .filter(|_| all_output_neutral);
+        let original_output = all_output_neutral
+            .then(|| {
+                mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
+                    .ok()
+                    .map(|r| r.output)
+            })
+            .flatten();
         Self {
             name,
             base_dir,
