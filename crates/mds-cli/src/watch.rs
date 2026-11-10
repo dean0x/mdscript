@@ -4386,6 +4386,22 @@ impl<'a> BatchVars<'a> {
     }
 }
 
+/// What every source of one directory batch is compiled and shown with: the watched
+/// directory, where an output below it is named, the batch's variables and `--quiet`.
+/// [`run_dir_batch`] builds it once for a batch, from the session's [`DirWatchCtx`] and the
+/// variables it has just resolved.
+struct BatchCtx<'a> {
+    /// The watched directory ([`Watched::Root`]).
+    watch_root: &'a WatchedPath,
+    /// What an output below the root is named by.
+    output_base: &'a OutputBase,
+    /// The variables the batch compiles with, and the `--vars` file's duplicate keys it
+    /// has still to report.
+    vars: BatchVars<'a>,
+    /// Whether `--quiet` is set.
+    quiet: bool,
+}
+
 /// Compile a single in-root source file, update `state`, and optionally write output.
 ///
 /// This is the shared kernel for both the `vars_changed` full-recompile loop and the
@@ -4416,14 +4432,13 @@ impl<'a> BatchVars<'a> {
 ///
 /// Compile success/failure is already signalled via `state.errored`; the caller uses
 /// that set for error tracking.
-fn compile_one_source(
-    src: &Path,
-    watch_root: &WatchedPath,
-    output_base: &OutputBase,
-    vars: &mut BatchVars<'_>,
-    quiet: bool,
-    state: &mut DirWatchState,
-) {
+fn compile_one_source(src: &Path, ctx: &mut BatchCtx<'_>, state: &mut DirWatchState) {
+    let BatchCtx {
+        watch_root,
+        output_base,
+        quiet,
+        ..
+    } = *ctx;
     let root = watch_root.canonical.as_path();
     let t0 = Instant::now();
     // What the rebuild of `src` before this one kept from being written (#160): told again
@@ -4431,7 +4446,7 @@ fn compile_one_source(
     let kept_before = state.kept.remove(src);
     // A debug build's test pause (#160): the batch found `src` there, and has not read it.
     pause_after_batch_split();
-    let compiled = match watch_root.compile_source(src, vars.map.clone(), quiet) {
+    let compiled = match watch_root.compile_source(src, ctx.vars.map.clone(), quiet) {
         Ok(compiled) => compiled,
         // The source went after the batch found it there (#160): whatever the compile
         // said of a file that is no longer there — `file not found`, or a read that
@@ -4547,7 +4562,7 @@ fn compile_one_source(
         // shows something, a kept rebuild that tells nothing does not (#326).
         Ok(Rewritten::Kept) => {
             if !told {
-                vars.shown(quiet);
+                ctx.vars.shown(quiet);
             }
             state.kept.insert(src.to_path_buf(), compiled.content);
             state.record_success(src, dep_paths, root, None, None);
@@ -4560,13 +4575,13 @@ fn compile_one_source(
         // reported, which shows something (#326).
         Err(e) => {
             state.record_success(src, dep_paths, root, None, None);
-            vars.shown(quiet);
+            ctx.vars.shown(quiet);
             settle(SettleInto::Dir(state), Some(e), Settle::MarkErrored(src));
             return;
         }
         Ok(Rewritten::Written) => {}
     }
-    vars.shown(quiet);
+    ctx.vars.shown(quiet);
     if let Some(anchor) = &mut state.out_dir {
         anchor.written();
     }
@@ -5060,10 +5075,12 @@ fn run_dir_batch(ctx: &DirWatchCtx, batch: Batch, state: &mut DirWatchState, due
     process_dir_batch(
         &batch.paths,
         batch.vars_changed,
-        &ctx.root,
-        &ctx.output_base,
-        &mut BatchVars::of(&resolved),
-        ctx.quiet,
+        &mut BatchCtx {
+            watch_root: &ctx.root,
+            output_base: &ctx.output_base,
+            vars: BatchVars::of(&resolved),
+            quiet: ctx.quiet,
+        },
         state,
     );
 }
@@ -5828,7 +5845,7 @@ mod dir_startup {
 /// Called by both the event path and the reconcile path so the same state
 /// transitions apply uniformly.
 ///
-/// `vars` reports the `--vars` file's duplicate keys with the first source that shows
+/// `ctx.vars` reports the `--vars` file's duplicate keys with the first source that shows
 /// something, and only then (#326): a single logical edit can reach this function more
 /// than once (e.g. multiple raw FS events for one write at `--debounce 0`, or a
 /// liveness-probe self-heal tick racing a real FS event for the same change), and only
@@ -5836,16 +5853,13 @@ mod dir_startup {
 fn process_dir_batch(
     changed: &BTreeSet<PathBuf>,
     vars_changed: bool,
-    watch_root: &WatchedPath,
-    output_base: &OutputBase,
-    vars: &mut BatchVars<'_>,
-    quiet: bool,
+    ctx: &mut BatchCtx<'_>,
     state: &mut DirWatchState,
 ) {
     if vars_changed {
-        process_dir_batch_vars_changed(changed, watch_root, output_base, vars, quiet, state);
+        process_dir_batch_vars_changed(changed, ctx, state);
     } else {
-        process_dir_batch_incremental(changed, watch_root, output_base, vars, quiet, state);
+        process_dir_batch_incremental(changed, ctx, state);
     }
 
     // Re-baseline the content backstop over the post-batch watched set (#321) — the
@@ -5904,12 +5918,15 @@ fn names_a_source(root: &Path, path: &Path) -> bool {
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
 fn process_dir_batch_vars_changed(
     changed: &BTreeSet<PathBuf>,
-    watch_root: &WatchedPath,
-    output_base: &OutputBase,
-    vars: &mut BatchVars<'_>,
-    quiet: bool,
+    ctx: &mut BatchCtx<'_>,
     state: &mut DirWatchState,
 ) {
+    let BatchCtx {
+        watch_root,
+        output_base,
+        quiet,
+        ..
+    } = *ctx;
     let root = watch_root.canonical.as_path();
     let all_sources: BTreeSet<PathBuf> = state
         .known_files
@@ -5948,7 +5965,7 @@ fn process_dir_batch_vars_changed(
         if let Some(deps) = previous.remove(src) {
             state.forward_deps.insert(src.clone(), deps);
         }
-        compile_one_source(src, watch_root, output_base, vars, quiet, state);
+        compile_one_source(src, ctx, state);
     }
     state.external_dep_dirs = state.dep_dirs_outside(root);
 
@@ -5978,12 +5995,15 @@ fn process_dir_batch_vars_changed(
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
 fn process_dir_batch_incremental(
     changed: &BTreeSet<PathBuf>,
-    watch_root: &WatchedPath,
-    output_base: &OutputBase,
-    vars: &mut BatchVars<'_>,
-    quiet: bool,
+    ctx: &mut BatchCtx<'_>,
     state: &mut DirWatchState,
 ) {
+    let BatchCtx {
+        watch_root,
+        output_base,
+        quiet,
+        ..
+    } = *ctx;
     let root = watch_root.canonical.as_path();
 
     // 1. Partition.
@@ -6050,7 +6070,7 @@ fn process_dir_batch_incremental(
         // hidden dirs) are graph nodes but never emit their own output (DD3 pattern).
         if !is_in_root || is_excluded_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
-            match watch_root.compile_source(src, vars.map.clone(), true) {
+            match watch_root.compile_source(src, ctx.vars.map.clone(), true) {
                 Ok(compiled) => {
                     state
                         .forward_deps
@@ -6077,7 +6097,7 @@ fn process_dir_batch_incremental(
         }
 
         // In-root source: full compile→dedup→write via shared helper.
-        compile_one_source(src, watch_root, output_base, vars, quiet, state);
+        compile_one_source(src, ctx, state);
     }
 
     // 5. Deletions: after importers recompiled, retire the outputs and forget the graph
@@ -8208,14 +8228,16 @@ mod tests {
         let changed: BTreeSet<PathBuf> = std::iter::once(other).collect();
         process_dir_batch_incremental(
             &changed,
-            &WatchedPath {
-                typed: root.clone(),
-                canonical: root,
-                what: Watched::Root,
+            &mut BatchCtx {
+                watch_root: &WatchedPath {
+                    typed: root.clone(),
+                    canonical: root,
+                    what: Watched::Root,
+                },
+                output_base: &dir_base(out.clone()),
+                vars: BatchVars::map_only(&None),
+                quiet: true,
             },
-            &dir_base(out.clone()),
-            &mut BatchVars::map_only(&None),
-            true,
             &mut state,
         );
 
@@ -8270,14 +8292,16 @@ mod tests {
         process_dir_batch(
             &changed,
             true,
-            &WatchedPath {
-                typed: root.clone(),
-                canonical: root.clone(),
-                what: Watched::Root,
+            &mut BatchCtx {
+                watch_root: &WatchedPath {
+                    typed: root.clone(),
+                    canonical: root.clone(),
+                    what: Watched::Root,
+                },
+                output_base: &dir_base(out.clone()),
+                vars: BatchVars::map_only(&None),
+                quiet: true,
             },
-            &dir_base(out.clone()),
-            &mut BatchVars::map_only(&None),
-            true,
             &mut state,
         );
 
@@ -9650,10 +9674,12 @@ mod tests {
             process_dir_batch(
                 &BTreeSet::new(),
                 true,
-                &ctx.root,
-                &ctx.output_base,
-                &mut BatchVars::map_only(&runtime_vars),
-                true,
+                &mut BatchCtx {
+                    watch_root: &ctx.root,
+                    output_base: &ctx.output_base,
+                    vars: BatchVars::map_only(&runtime_vars),
+                    quiet: true,
+                },
                 &mut state,
             );
 
@@ -11400,10 +11426,12 @@ mod tests {
         process_dir_batch(
             &BTreeSet::from([b.clone()]),
             false,
-            &ctx.root,
-            &ctx.output_base,
-            &mut BatchVars::map_only(&None),
-            true,
+            &mut BatchCtx {
+                watch_root: &ctx.root,
+                output_base: &ctx.output_base,
+                vars: BatchVars::map_only(&None),
+                quiet: true,
+            },
             &mut state,
         );
         assert!(
@@ -11439,10 +11467,12 @@ mod tests {
         process_dir_batch(
             &BTreeSet::from([b.clone()]),
             false,
-            &ctx.root,
-            &ctx.output_base,
-            &mut BatchVars::map_only(&None),
-            true,
+            &mut BatchCtx {
+                watch_root: &ctx.root,
+                output_base: &ctx.output_base,
+                vars: BatchVars::map_only(&None),
+                quiet: true,
+            },
             &mut state,
         );
         let read = std::fs::read_to_string(out.join("b.md")).ok();
