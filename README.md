@@ -142,11 +142,14 @@ Exit codes:
   1   Template error (syntax, undefined variable, arity mismatch), or `fmt --check` found a
       file that would change
   2   I/O error (file not found, not an MDS file, a source that cannot be read, an output
-      that cannot be written, an output directory that cannot be created, a stale `.json`
-      that cannot be read or removed, stdin that cannot be read or is not UTF-8), or invalid CLI
-      argument (clap parse error)
+      that cannot be written, an output directory that cannot be created, a stale `.map`
+      sidecar or `.json` that cannot be read or removed, stdin that cannot be read or is not
+      UTF-8), or invalid CLI argument (clap parse error)
   3   Resource limit exceeded (stdin over 10 MiB included; a directory run exits 3 when
       any of its files exceeds one)
+  101 Internal compiler error: a panic, a bug in mds. It wins over every other code. A panic
+      while one file of a directory run or a watch session compiles fails that file alone:
+      the run goes on, and `mds watch` keeps watching; both exit 101 when they end
 ```
 
 A closed pipe never changes the exit code of `mds build`, `mds check`, `mds fmt`, `mds init` or
@@ -261,7 +264,8 @@ shared partial rebuilds **all transitive importers** automatically.
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
-- Ctrl+C exits with code 0 and prints `Stopped watching.`
+- Ctrl+C exits with code 0 and prints `Stopped watching.` The exit code is 101 when a compile
+  panicked during the session: the watcher takes that as a failed compile and keeps watching.
 - With `-o -`, a reader that goes away ends the session: `mds watch page.mds -o - | head -n 1`
   prints `Stopped watching (stdout closed).` (not under `--quiet`) and exits 0 at the next write —
   unless that is the startup write and stderr has also failed for another reason than a closed
@@ -357,7 +361,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |
 | `duplicate-export` | **error** | Same export name defined more than once (auto-fixable) |
 
-Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, diagnostics and status output are suppressed (the directory summary still prints when any file has errors or hits a resource limit); exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
+Exit codes: `0` = clean, `1` = warnings only, `2` = errors, analysis failure or I/O failure, `3` = resource limit, `101` = internal compiler error (a panic). With `--quiet`, diagnostics and status output are suppressed (the directory summary still prints when any file has errors or hits a resource limit); exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
 JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
 
 ## Project root

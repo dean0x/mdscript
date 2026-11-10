@@ -133,8 +133,8 @@ enum Commands {
     /// Runs 10 static-analysis rules (3 error-level, 6 warning-level, 1 default-off) on the file
     /// without executing it. Partials and imported files are included in directory mode.
     ///
-    /// Exit codes: 0 = clean, 1 = warnings only, 2 = errors or analysis failure,
-    /// 3 = resource limit.
+    /// Exit codes: 0 = clean, 1 = warnings only, 2 = errors, analysis failure or I/O
+    /// failure, 3 = resource limit, 101 = internal compiler error (a panic).
     ///
     /// Directory mode prints one summary line to stderr after processing all files:
     /// N clean, N with warnings, N with errors, N resource-limited
