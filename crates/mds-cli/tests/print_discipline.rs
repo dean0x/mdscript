@@ -838,13 +838,6 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
         "Names the typed watched path through `mds::escape_path_for_message` of its \
          lossy text when it resolves somewhere new.",
     ),
-    (
-        "watch.rs",
-        "handle_fs_event_dir",
-        1,
-        "Compares a changed path's extension with `mds`; the extension reaches no \
-         message.",
-    ),
 ];
 
 /// The functions that turn an io, notify or tempfile error into the cause a message shows,

@@ -1652,11 +1652,11 @@ pub(crate) fn is_within_default_excluded_dir(root: &Path, path: &Path) -> bool {
         // `false` IS the closed value here (#217): this predicate answers "is `path`
         // inside a default-excluded subdirectory OF `root`", and a path that is not
         // under `root` at all has no such subdirectory — the honest answer is no. It is
-        // not a fail-open default, because neither caller acts on this answer alone:
-        // both `handle_fs_event_dir` and `process_dir_batch_incremental` evaluate it
-        // only in conjunction with their own `starts_with(root)` test, so an out-of-root
-        // path is already classified as an external dep (compile for deps, never emit
-        // output) before this function's answer is consulted.
+        // not a fail-open default, because no caller acts on this answer alone: the
+        // watch's `classify` evaluates it only after its own `starts_with(root)` test, so
+        // an out-of-root path is already classified as an external dep (compile for deps,
+        // never emit output) before this function's answer is consulted, and
+        // `handle_fs_event_dir` uses it only to drop a path, never to admit one.
         Err(_) => return false,
         Ok(r) => r,
     };

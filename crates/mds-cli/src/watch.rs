@@ -4285,7 +4285,10 @@ impl DirWatchState {
             Some(out) => Some(out.clone()),
             // Only a source below the root has outputs, so this never takes the flattened
             // arm of a source outside it, nor reports it (#217).
-            None if known && names_a_source(&watch_root.canonical, src) && !is_partial(src) => {
+            None if known
+                && classify(&watch_root.canonical, src, &self.external_dep_dirs)
+                    == Node::Source =>
+            {
                 Some(output_path_for(
                     src,
                     watch_root.root_paths(),
@@ -5169,12 +5172,8 @@ fn handle_fs_event_dir(
     let mds_changed: BTreeSet<PathBuf> = changed
         .iter()
         .filter(|p| {
-            p.extension().and_then(|e| e.to_str()) == Some("mds")
-                && (p.starts_with(&ctx.root.canonical)
-                    || state
-                        .external_dep_dirs
-                        .iter()
-                        .any(|d| p.parent() == Some(d.as_path())))
+            has_mds_extension(p)
+                && classify(&ctx.root.canonical, p, &state.external_dep_dirs) != Node::Unrelated
         })
         .map(|p| graph_key(p))
         .collect();
@@ -5886,14 +5885,70 @@ fn process_dir_batch(
     state.rebaseline();
 }
 
+/// What a path a directory batch names is to the watch, by where it is and what it is
+/// called (#380): the one answer the event filter, the batches' source lists and the
+/// compile dispatch all take ([`classify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Node {
+    /// A `.mds` file below the root, outside the directories the walk skips, whose name
+    /// does not start with `_`: compiled, and its output written.
+    Source,
+    /// A source whose name starts with `_`: compiled for its dependencies, never written.
+    Partial,
+    /// A file below the root that is no `.mds` file and outside the directories the walk
+    /// skips — a `type: mds` `.md` module: left to the sources that import it.
+    InRootModule,
+    /// A file in a directory outside the root that a source imports from.
+    ExternalDep,
+    /// A file in a directory below the root that the walk skips (hidden directories,
+    /// `node_modules/`).
+    ExcludedDep,
+    /// Anything else: no file the watch reads.
+    Unrelated,
+}
+
+impl Node {
+    /// Whether the path is a source of the watch: what a full walk would find.
+    fn is_source(self) -> bool {
+        matches!(self, Node::Source | Node::Partial)
+    }
+}
+
+/// Whether `path` is named as a `.mds` file.
+fn has_mds_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "mds")
+}
+
+/// What `path` is to the watch of `root`, a directory outside which `external_dirs` are the
+/// directories dependencies are read from ([`DirWatchState::external_dep_dirs`]).
+fn classify(root: &Path, path: &Path, external_dirs: &BTreeSet<PathBuf>) -> Node {
+    if path.starts_with(root) {
+        if is_within_default_excluded_dir(root, path) {
+            Node::ExcludedDep
+        } else if !has_mds_extension(path) {
+            Node::InRootModule
+        } else if is_partial(path) {
+            Node::Partial
+        } else {
+            Node::Source
+        }
+    } else if external_dirs
+        .iter()
+        .any(|dir| path.parent() == Some(dir.as_path()))
+    {
+        Node::ExternalDep
+    } else {
+        Node::Unrelated
+    }
+}
+
 /// Whether `path`, which a directory batch names, is a source of the watch below `root`: a
 /// `.mds` file there, outside the directories the walk skips — what a full walk would
 /// find (#380). A dependency the batch names, an in-root module that is no `.mds` file
-/// included, is none.
+/// included, is none. Whether it is one never depends on the directories outside the root,
+/// so a caller that holds none asks this.
 fn names_a_source(root: &Path, path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "mds")
-        && path.starts_with(root)
-        && !is_within_default_excluded_dir(root, path)
+    classify(root, path, &BTreeSet::new()).is_source()
 }
 
 /// Full recompile of every source triggered by a vars-file change: the known ones, and
@@ -5979,17 +6034,43 @@ fn process_dir_batch_vars_changed(
     state.known_files = present;
 }
 
+/// Refresh the edges of `src`, a dependency outside the root or in a directory the walk
+/// skips ([`Node::ExternalDep`], [`Node::ExcludedDep`]): compiled quietly, for the
+/// dependencies it reports and never for an output.
+fn refresh_dependency(src: &Path, ctx: &BatchCtx<'_>, state: &mut DirWatchState) {
+    // Compile to refresh deps only; suppress output by using quiet=true.
+    match ctx
+        .watch_root
+        .compile_source(src, ctx.vars.map.clone(), true)
+    {
+        Ok(compiled) => {
+            state
+                .forward_deps
+                .insert(src.to_path_buf(), graph_keys(&compiled.dependencies));
+            state.errored.remove(src);
+        }
+        Err(failure) => {
+            settle(
+                SettleInto::Dir(state),
+                failure.into_report(),
+                Settle::MarkErrored(src),
+            );
+        }
+    }
+}
+
 /// Incremental recompile: compile only transitive importers of the changed seeds.
 ///
 /// Steps:
 /// 1. Partition changed paths into `existing` / `deleted`.
 /// 2. Compute seeds = existing ∪ deleted ∪ (errored ∩ real-change batch).
 /// 3. Compute affected = transitive importers of seeds (freshness-rule snapshot).
-/// 4. Compile each affected source ([`names_a_source`]) that exists; one in the root
-///    found gone here, or by its compile, is retired as a deleted source (#160). An
-///    affected dependency is no source: one outside the root or in a skipped directory
-///    gets a quiet refresh of its own edges, and one in the root — a `type: mds` `.md`
-///    module — none, its importers being affected with it (#380).
+/// 4. Compile each affected source ([`Node::Source`], [`Node::Partial`]) that exists; one
+///    in the root found gone here, or by its compile, is retired as a deleted source
+///    (#160). An affected dependency is no source: one outside the root or in a skipped
+///    directory gets a quiet refresh of its own edges ([`refresh_dependency`]), and one in
+///    the root — a `type: mds` `.md` module — none, its importers being affected with it
+///    (#380).
 /// 5. Delete outputs for removed sources.
 ///
 /// Uses `compile_one_source` for the shared compile→dedup→write sequence.
@@ -6031,21 +6112,10 @@ fn process_dir_batch_incremental(
     // 4. Compile each affected source that exists; refresh each dependency outside the
     //    root or in a skipped directory, and leave one in the root to its importers.
     for src in &affected {
-        // External-only deps are graph nodes but never emit output (DD3).
-        let is_in_root = src.starts_with(root);
-        // PF-004: paths inside default-excluded subdirs (hidden dirs, node_modules/)
-        // that happen to be under root are treated as external deps — they get a quiet
-        // dep-refresh compile but never emit output.  This is the same invariant as the
-        // initial walker (which never recurses into those dirs), applied here on the
-        // parallel event-processing path so the two paths stay consistent.
-        let is_excluded_in_root = is_in_root && is_within_default_excluded_dir(root, src);
-        let is_known_external = state
-            .external_dep_dirs
-            .iter()
-            .any(|d| src.parent() == Some(d.as_path()));
+        let node = classify(root, src, &state.external_dep_dirs);
 
-        if !is_in_root && !is_known_external {
-            // Not in root and not a known external dep — skip.
+        // Not in root and not a known external dep — skip.
+        if node == Node::Unrelated {
             continue;
         }
 
@@ -6057,47 +6127,29 @@ fn process_dir_batch_incremental(
             // records go with them, so it does not stay a ghost entry (#160). An external
             // dependency has no output (#217), and is only forgotten.
             if !deleted.contains(src) {
-                if is_in_root {
-                    state.retire_deleted(src, watch_root, output_base, quiet);
-                } else {
+                if node == Node::ExternalDep {
                     state.forget(src);
+                } else {
+                    state.retire_deleted(src, watch_root, output_base, quiet);
                 }
             }
             continue;
         }
 
-        // External deps (out-of-root) AND excluded-in-root paths (node_modules/, .git/,
-        // hidden dirs) are graph nodes but never emit their own output (DD3 pattern).
-        if !is_in_root || is_excluded_in_root {
-            // Compile to refresh deps only; suppress output by using quiet=true.
-            match watch_root.compile_source(src, ctx.vars.map.clone(), true) {
-                Ok(compiled) => {
-                    state
-                        .forward_deps
-                        .insert(src.clone(), graph_keys(&compiled.dependencies));
-                    state.errored.remove(src);
-                }
-                Err(failure) => {
-                    settle(
-                        SettleInto::Dir(state),
-                        failure.into_report(),
-                        Settle::MarkErrored(src),
-                    );
-                }
-            }
-            continue;
+        match node {
+            // In-root source: full compile→dedup→write via shared helper.
+            Node::Source | Node::Partial => compile_one_source(src, ctx, state),
+            // External deps (out-of-root) AND excluded-in-root paths (node_modules/, .git/,
+            // hidden dirs) are graph nodes but never emit their own output (DD3 pattern).
+            // The same limit as the initial walker's, which never recurses into those
+            // dirs, applied here on the parallel event-processing path so the two paths
+            // stay consistent.
+            Node::ExternalDep | Node::ExcludedDep => refresh_dependency(src, ctx, state),
+            // An in-root dependency that is no source — a `type: mds` `.md` module — is
+            // rebuilt through its importers, which `affected` holds, and never compiled as
+            // a source (#380).
+            Node::InRootModule | Node::Unrelated => {}
         }
-
-        // An in-root dependency that is no source — a `type: mds` `.md` module, which the
-        // idle tick's content check or a file found emptied puts in a batch, the event path
-        // keeping `.mds` paths alone — is rebuilt through its importers, which `affected`
-        // holds, and never compiled as a source (#380).
-        if !names_a_source(root, src) {
-            continue;
-        }
-
-        // In-root source: full compile→dedup→write via shared helper.
-        compile_one_source(src, ctx, state);
     }
 
     // 5. Deletions: after importers recompiled, retire the outputs and forget the graph
