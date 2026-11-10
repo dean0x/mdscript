@@ -442,11 +442,7 @@ impl ResultSink for JsonSink {
 
     /// The error document `{"error": …, "version": 1}` on stdout.
     fn analysis_failure(&mut self, error: &MdsError, _stdin_source: Option<&str>) {
-        let envelope = serde_json::json!({
-            "version": 1,
-            "error": error.serialize()
-        });
-        emit_stdout(&json_line(&envelope));
+        emit_stdout(&json_line(&error_envelope(error.serialize())));
     }
 
     fn start_document(&mut self) {
@@ -470,15 +466,32 @@ impl ResultSink for JsonSink {
 
     /// The error document (#309). A failure that is not an `MdsError` — auto-detection
     /// finding no `.mds` file in the working directory, or more than one — is `mds::io`,
-    /// as a directory with nothing to lint is.
+    /// as a directory with nothing to lint is: the report's message as the `message` and
+    /// its help, when it has one, as the `help`.
     fn setup_failed(&mut self, error: miette::Report) {
-        let error = error
-            .downcast::<MdsError>()
-            .unwrap_or_else(|report| MdsError::Io {
-                message: report.to_string(),
-            });
-        self.analysis_failure(&error, None);
+        let serialized = match error.downcast::<MdsError>() {
+            Ok(error) => error.serialize(),
+            Err(report) => {
+                let mut serialized = MdsError::Io {
+                    message: report.to_string(),
+                }
+                .serialize();
+                serialized.help = report
+                    .help()
+                    .map(|help| mds::sanitize_control_chars_wire(&help.to_string()).into_owned());
+                serialized
+            }
+        };
+        emit_stdout(&json_line(&error_envelope(serialized)));
     }
+}
+
+/// The error document, `{"error": …, "version": 1}`.
+fn error_envelope(error: mds::SerializedError) -> Value {
+    serde_json::json!({
+        "version": 1,
+        "error": error
+    })
 }
 
 /// Lint's findings document, `{"files": […], "truncated": …, "version": 1}`: one input's

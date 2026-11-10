@@ -8532,6 +8532,80 @@ fn every_failure_that_stops_a_json_run_prints_one_error_document() {
     );
 }
 
+/// Auto-detection that finds no `.mds` file in the working directory, or more than one,
+/// keeps its hint out of the message: under `--format json` the error document's `message`
+/// names the problem on one line and its `help` holds the way out (#309), in every fix
+/// mode; the human report shows the hint as the diagnostic's `help:` line, in place of a
+/// second line of the message.
+///
+/// Controls: the message holds no line break and the document no `hint:` text; the human
+/// report of a directory with two files names the first of them in its example.
+#[test]
+fn an_auto_detection_failure_carries_its_hint_in_help() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in ["none", "several"] {
+        fs::create_dir(root.join(dir)).unwrap();
+    }
+    fs::write(root.join("several").join("b.mds"), "B\n").unwrap();
+    fs::write(root.join("several").join("a.mds"), "A\n").unwrap();
+
+    let rows = [
+        (
+            "none",
+            "no .mds files found in current directory",
+            "run 'mds init' to create a starter template",
+        ),
+        (
+            "several",
+            "multiple .mds files found: a.mds, b.mds",
+            "specify which file, e.g. 'mds lint a.mds'",
+        ),
+    ];
+    for (dir, message, help) in rows {
+        let cwd = root.join(dir);
+        for mode in LINT_MODES {
+            let mut args = vec!["--format", "json"];
+            args.extend_from_slice(mode);
+            let out = lint_with_stdin(&cwd, &args, b"");
+            assert_eq!(
+                (
+                    out.status.code(),
+                    json_documents(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr).into_owned()
+                ),
+                (
+                    Some(2),
+                    Some(vec![serde_json::json!({
+                        "version": 1,
+                        "error": {
+                            "code": "mds::io",
+                            "message": message,
+                            "help": help,
+                            "span": null
+                        }
+                    })]),
+                    String::new()
+                ),
+                "`mds lint {}` in {dir}",
+                args.join(" ")
+            );
+        }
+
+        let human = lint_with_stdin(&cwd, &[], b"");
+        let shown = String::from_utf8_lossy(&human.stderr).into_owned();
+        assert_eq!(human.status.code(), Some(2), "human, {dir}: {shown}");
+        assert!(
+            shown
+                .lines()
+                .any(|line| line.trim() == format!("help: {help}"))
+                && shown.contains(message)
+                && !shown.contains("hint:"),
+            "human, {dir}: the hint is the report's help line; got: {shown}"
+        );
+    }
+}
+
 /// The text `mds lint --fix --format json -` is refused with.
 const STDIN_FIX_JSON_REFUSAL: &str = "--fix --format json with stdin input is not supported; \
      use `mds lint --fix -` for filter mode or `mds lint --format json` for JSON output";

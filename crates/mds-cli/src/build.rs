@@ -994,13 +994,50 @@ pub(crate) fn auto_detect_mds_file(subcommand: &str) -> Result<PathBuf> {
         })
         .collect();
 
-    match entries.as_slice() {
-        [] => Err(miette::miette!(
-            "no .mds files found in current directory\n  \
-             hint: run 'mds init' to create a starter template"
-        )),
+    single_mds_file(subcommand, &entries)
+}
+
+/// The one `.mds` file among `entries`, those [`auto_detect_mds_file`] found in the working
+/// directory, or why there is not one.
+fn single_mds_file(subcommand: &str, entries: &[PathBuf]) -> Result<PathBuf> {
+    match entries {
+        [] => Err(miette::Report::new(AutoDetectError::none())),
         [single] => Ok(single.clone()),
         several => Err(several_mds_files(subcommand, several)),
+    }
+}
+
+/// Why [`auto_detect_mds_file`] found no single `.mds` file to use: what went wrong, and,
+/// apart from it, the way out (#309). A human report shows the way out as the
+/// diagnostic's `help:` line, and `mds lint --format json` as the error document's `help`,
+/// so neither carries it as a second line of the message.
+#[derive(Debug)]
+pub(crate) struct AutoDetectError {
+    message: String,
+    help: String,
+}
+
+impl AutoDetectError {
+    /// The working directory holds no `.mds` file.
+    fn none() -> Self {
+        Self {
+            message: "no .mds files found in current directory".to_owned(),
+            help: "run 'mds init' to create a starter template".to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for AutoDetectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AutoDetectError {}
+
+impl miette::Diagnostic for AutoDetectError {
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        Some(Box::new(&self.help))
     }
 }
 
@@ -1014,12 +1051,13 @@ fn several_mds_files(subcommand: &str, entries: &[PathBuf]) -> miette::Report {
         .map(crate::output::safe_file_display)
         .collect();
     names.sort();
-    miette::miette!(
-        "multiple .mds files found: {}\n  \
-         hint: specify which file, e.g. 'mds {subcommand} {}'",
-        names.join(", "),
-        names.first().map(|s| s.as_str()).unwrap_or("<file>.mds"),
-    )
+    miette::Report::new(AutoDetectError {
+        message: format!("multiple .mds files found: {}", names.join(", ")),
+        help: format!(
+            "specify which file, e.g. 'mds {subcommand} {}'",
+            names.first().map(|s| s.as_str()).unwrap_or("<file>.mds"),
+        ),
+    })
 }
 
 // ── Shared compile-and-write helper (used by build and watch) ─────────────────
@@ -2310,22 +2348,47 @@ mod tests {
             "control: the name carries a raw newline"
         );
         let entries = [PathBuf::from("b.mds"), PathBuf::from(&hostile)];
+        let error = several_mds_files("build", &entries);
         assert_eq!(
-            several_mds_files("build", &entries).to_string(),
+            error.to_string(),
             format!(
-                "multiple .mds files found: b.mds, x{}u000ABuilt forged{}u001B.mds\n  \
-                 hint: specify which file, e.g. 'mds build b.mds'",
+                "multiple .mds files found: b.mds, x{}u000ABuilt forged{}u001B.mds",
                 '\\', '\\'
             ),
             "each name must be shown escaped"
         );
 
         let entries = [PathBuf::from("b.mds"), PathBuf::from("a.mds")];
+        let error = several_mds_files("lint", &entries);
         assert_eq!(
-            several_mds_files("lint", &entries).to_string(),
-            "multiple .mds files found: a.mds, b.mds\n  \
-             hint: specify which file, e.g. 'mds lint a.mds'",
+            error.to_string(),
+            "multiple .mds files found: a.mds, b.mds",
             "control: ordinary names keep their text and their order"
+        );
+        assert_eq!(
+            error.help().map(|help| help.to_string()).as_deref(),
+            Some("specify which file, e.g. 'mds lint a.mds'"),
+            "the way out is the help, apart from the message"
+        );
+    }
+
+    /// A working directory with no `.mds` file says so in the message and holds the way out
+    /// in the help, never as a second line of the message (#309). Control: one file is the
+    /// file.
+    #[test]
+    fn no_mds_file_keeps_its_hint_apart_from_its_message() {
+        let error = single_mds_file("build", &[]).expect_err("no file to use");
+        assert_eq!(
+            (error.to_string(), error.help().map(|help| help.to_string())),
+            (
+                "no .mds files found in current directory".to_owned(),
+                Some("run 'mds init' to create a starter template".to_owned())
+            )
+        );
+        assert_eq!(
+            single_mds_file("build", &[PathBuf::from("a.mds")]).unwrap(),
+            PathBuf::from("a.mds"),
+            "control: a single file is used"
         );
     }
 
