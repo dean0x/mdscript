@@ -1831,20 +1831,7 @@ impl WatchedPath {
         quiet: bool,
     ) -> std::result::Result<CompileOutput, CompileFailure> {
         self.ensure_unmoved().map_err(miette::Error::from)?;
-        let compiled = crate::output::catch_compile(
-            &self.typed,
-            AssertUnwindSafe(|| {
-                compile_to_content(
-                    &self.typed,
-                    runtime_vars,
-                    quiet,
-                    mds::CompileOptions::default(),
-                )
-            }),
-        );
-        compiled
-            .map_err(|Panicked| CompileFailure::Panicked)?
-            .map_err(CompileFailure::from)
+        compile_caught(&self.typed, runtime_vars, quiet)
     }
 
     /// The root in the two forms an output below it is resolved and named by: walked
@@ -1892,15 +1879,7 @@ impl WatchedPath {
         quiet: bool,
     ) -> std::result::Result<CompileOutput, CompileFailure> {
         if !src.starts_with(&self.canonical) {
-            let compiled = crate::output::catch_compile(
-                src,
-                AssertUnwindSafe(|| {
-                    compile_to_content(src, runtime_vars, quiet, mds::CompileOptions::default())
-                }),
-            );
-            return compiled
-                .map_err(|Panicked| CompileFailure::Panicked)?
-                .map_err(CompileFailure::from);
+            return compile_caught(src, runtime_vars, quiet);
         }
         self.ensure_unmoved().map_err(miette::Error::from)?;
         WatchedPath {
@@ -1938,6 +1917,25 @@ impl From<miette::Report> for CompileFailure {
     fn from(e: miette::Report) -> Self {
         Self::Error(e)
     }
+}
+
+/// Compile the file at `path` with the default options: `mds watch` writes no source
+/// maps. The one place a watch compile runs, so the one place a panic in it is caught
+/// and the session goes on (#389).
+fn compile_caught(
+    path: &Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    quiet: bool,
+) -> std::result::Result<CompileOutput, CompileFailure> {
+    let compiled = crate::output::catch_compile(
+        path,
+        AssertUnwindSafe(|| {
+            compile_to_content(path, runtime_vars, quiet, mds::CompileOptions::default())
+        }),
+    );
+    compiled
+        .map_err(|Panicked| CompileFailure::Panicked)?
+        .map_err(CompileFailure::from)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

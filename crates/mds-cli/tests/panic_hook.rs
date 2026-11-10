@@ -2368,8 +2368,7 @@ const COMPILE_CATCHES: &[(&str, &str)] = &[
     ("lint.rs", "lint_dir_entry"),
     ("lint.rs", "lint_input"),
     ("main.rs", "run_check_directory"),
-    ("watch.rs", "compile"),
-    ("watch.rs", "compile_source"),
+    ("watch.rs", "compile_caught"),
 ];
 
 /// What a catch's closure may call, as the call is written there, and the file of mds-cli
