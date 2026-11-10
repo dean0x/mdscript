@@ -667,7 +667,8 @@ pub(crate) enum Rewritten {
     /// The rename landed, but in the [`Durability::Fsync`] tier the directory it was made
     /// in could not be synced after it, so a crash may still undo it: the `mds::io` error
     /// `<file> written, but its directory could not be synced: <cause>`, for the caller to
-    /// report after it says the file was written — the run exits 2.
+    /// report in place of saying the file was written, as it may say so only for a write
+    /// that is durable — the run exits 2.
     NotSynced(mds::MdsError),
 }
 

@@ -22,11 +22,11 @@
 //! - 2: file not found / not `.mds` / I/O / bad UTF-8 — a rewrite or a stdout write
 //!   that fails included, in directory mode too, where one such file makes the run
 //!   exit 2 (#157); a closed stdout is not a failure. So is a rewrite that lands in a
-//!   directory it cannot then sync (#160): given the file, `Formatted:` names it and the
-//!   failed sync is reported after it; a directory run — which syncs each directory once,
-//!   after the last of its files, and shows their `Formatted:` lines only then — reports
-//!   the failed sync in place of each such file's `Formatted:` line, and counts it
-//!   formatted
+//!   directory it cannot then sync (#160): given the file, the failed sync is reported in
+//!   place of its `Formatted:` line, which is shown only for a rewrite that is durable; a
+//!   directory run — which syncs each directory once, after the last of its files, and
+//!   shows their `Formatted:` lines only then — reports the failed sync in place of each
+//!   such file's `Formatted:` line, and counts it formatted
 //! - 3: oversized source (in directory mode, a failed file that leaves the run at 1)
 
 use std::panic::AssertUnwindSafe;
@@ -183,14 +183,16 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
             // if it still holds the bytes formatted, in the directory it was read in
             // (#160).
             let read = read_stamped(&WriteTarget::as_typed(path.to_path_buf()), &source)?;
-            let rewritten = replace_if_unchanged(read, &result.formatted, Durability::Fsync)?;
-            if !quiet {
-                crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
-            }
-            // The file holds the rewrite; a directory that could not then be synced is the
-            // run's failure, reported after it (exit 2).
-            if let Rewritten::NotSynced(e) = rewritten {
-                return Err(e.into());
+            // The file holds the rewrite either way; `Formatted:` says it is durable, so
+            // a directory that could not then be synced is the run's failure, reported in
+            // its place (exit 2).
+            match replace_if_unchanged(read, &result.formatted, Durability::Fsync)? {
+                Rewritten::Done => {
+                    if !quiet {
+                        crate::output::ewriteln!("Formatted: {}", crate::output::safe_path(path));
+                    }
+                }
+                Rewritten::NotSynced(e) => return Err(e.into()),
             }
         } else if !quiet {
             crate::output::ewriteln!("Unchanged: {}", crate::output::safe_path(path));

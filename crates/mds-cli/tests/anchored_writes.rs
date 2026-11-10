@@ -1273,12 +1273,12 @@ fn a_directory_that_cannot_be_listed_takes_an_output_on_linux_alone() {
 /// `src` made `-wx` while the rewrite paused before its rename, so `mds fmt`'s and `mds lint
 /// --fix`'s directory sync cannot open it to read. The file holds the rewrite and no
 /// temporary file is left; `mds::io`, `src/a.mds written, but its directory could not be
-/// synced: Permission denied (os error 13)`, once, exit 2. Given the file, the status line
-/// — `Formatted:`, `Fixed:` — comes first, as for any rewrite that lands. Given the
-/// directory, which shows a file's status line only once its directory is synced, there is
-/// none: the run counts the file as what it holds — formatted, clean — and exits 2 for the
-/// failed sync. Control: the same run with `src` left alone syncs it, shows the status
-/// line, exit 0.
+/// synced: Permission denied (os error 13)`, once, exit 2, in place of the status line —
+/// `Formatted:`, `Fixed:` — which is shown only once the rewrite is synced, so that a line
+/// shown means the rewrite is durable: given the file or given the directory, there is
+/// none. A directory run counts the file as what it holds — formatted, clean — and exits 2
+/// for the failed sync. Control: the same run with `src` left alone syncs it, shows the
+/// status line, exit 0.
 ///
 /// Unix-only: it makes `src` unlistable with unix mode bits (`-wx`).
 #[cfg(unix)]
@@ -1332,14 +1332,14 @@ fn a_rewrite_whose_directory_cannot_be_synced_is_reported_written() {
             !stderr.contains("cannot write"),
             "{args:?}: not a failed write; stderr: {stderr}"
         );
+        // A status line is shown only once its directory is synced, for a file argument as
+        // for a directory run: the failed sync is the file's one line.
+        assert_eq!(
+            at(&status),
+            None,
+            "{args:?}: no status line for a rewrite not synced; stderr: {stderr}"
+        );
         if args.contains(&"src") {
-            // A directory run shows a file's status line only once its directory is
-            // synced: the failed sync is the file's one line.
-            assert_eq!(
-                at(&status),
-                None,
-                "{args:?}: no status line for a rewrite not synced; stderr: {stderr}"
-            );
             let summary = match args[0] {
                 "fmt" => "1 formatted, 0 unchanged, 0 failed",
                 _ => "1 clean, 0 with warnings, 0 with errors, 0 resource-limited",
@@ -1347,11 +1347,6 @@ fn a_rewrite_whose_directory_cannot_be_synced_is_reported_written() {
             assert!(
                 stderr.contains(summary),
                 "{args:?}: counted as what it holds; stderr: {stderr}"
-            );
-        } else {
-            assert!(
-                matches!((at(&status), at(&not_synced)), (Some(s), Some(n)) if s < n),
-                "{args:?}: a file argument's status line comes first; stderr: {stderr}"
             );
         }
 

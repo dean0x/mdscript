@@ -1079,7 +1079,7 @@ enum Rewrite {
 /// durable (#160).
 enum DirectorySync {
     /// A file argument's, made as the rewrite landed: `Some` with the error of a directory
-    /// that could not be synced.
+    /// that could not be synced, which is then shown in place of the `Fixed:` line.
     Made(Option<MdsError>),
     /// A directory's entry's, owed: [`run_lint_directory`] makes it once for every fix in
     /// that directory, after the last of its entries there, and only then shows those
@@ -1391,12 +1391,13 @@ fn fix_stdin(findings: mds::LintResult, text: String, fix: FixPipelineOutcome) -
 ///   findings.
 /// - A rewrite that landed shows the findings the file is left with, rendered against the
 ///   fixed source, then `Fixed:` — never before, so no line claims a fix the file did not
-///   get — then, for one whose directory could not be synced after it, that failure
-///   (#160). A directory's entry, whose directory's sync is owed, shows its findings here
-///   and comes back as [`Shown::owed`]: its `Fixed:` line, or the failed sync in its place,
-///   is [`run_lint_directory`]'s to show once the sync is made. One that failed shows those
-///   findings, where the output keeps them, rendered against the source it failed to write,
-///   then the failure.
+///   get — or, for one whose directory could not be synced after it, that failure in place
+///   of `Fixed:`, so that a line shown means the fix is durable (#160). A directory's
+///   entry, whose directory's sync is owed, shows its findings here and comes back as
+///   [`Shown::owed`]: its `Fixed:` line, or the failed sync in its place, is
+///   [`run_lint_directory`]'s to show once the sync is made. One that failed shows those
+///   findings, where the output keeps them, rendered against the source it failed to
+///   write, then the failure.
 /// - The stdin filter shows its status line, then its findings, rendered against the
 ///   source it emits, then that source.
 fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> Shown {
@@ -1481,12 +1482,8 @@ fn render(report: FileReport<'_>, sink: &mut impl ResultSink) -> Shown {
             } => {
                 sink.findings(&input, &residual.findings, Some(&residual.fixed), truncated);
                 match sync {
-                    DirectorySync::Made(not_synced) => {
-                        sink.fixed(&input, partial);
-                        if let Some(error) = not_synced {
-                            sink.not_synced(&input, error);
-                        }
-                    }
+                    DirectorySync::Made(None) => sink.fixed(&input, partial),
+                    DirectorySync::Made(Some(error)) => sink.not_synced(&input, error),
                     DirectorySync::Owed(renamed) => owed = Some(OwedFix { renamed, partial }),
                 }
                 (tally_from_result(&residual.findings), false)
@@ -3102,12 +3099,12 @@ mod tests {
         assert_eq!(seen, expected);
     }
 
-    /// A fix that landed in a directory that could not then be synced (#160) shows what any
-    /// fix that landed shows — the findings the file is left with, then `Fixed:` — and then
-    /// that failure, and the file counts as those findings say, not as a failed write.
-    /// Control: a fix whose directory was synced shows no failure.
+    /// A fix that landed in a directory that could not then be synced (#160) shows the
+    /// findings the file is left with, then that failure in place of `Fixed:` — a line shown
+    /// means the fix is durable — and the file counts as those findings say, not as a failed
+    /// write. Control: a fix whose directory was synced shows `Fixed:` and no failure.
     #[test]
-    fn a_fix_whose_directory_cannot_be_synced_shows_fixed_then_the_failure() {
+    fn a_fix_whose_directory_cannot_be_synced_shows_the_failure_in_place_of_fixed() {
         let shown = |not_synced| {
             let report = FileReport {
                 input: LintSource::File {
@@ -3141,7 +3138,6 @@ mod tests {
             (
                 vec![
                     "findings (0) x.mds".to_string(),
-                    "fixed None x.mds".to_string(),
                     "not synced x.mds".to_string(),
                 ],
                 true
