@@ -230,6 +230,10 @@ shared partial rebuilds **all transitive importers** automatically.
 - **Cross-root imports**: if a file imports a partial located outside the watched root
   (e.g. `../shared/_x.mds`), editing that external partial rebuilds its in-root importers.
   The external file is never compiled to its own output.
+- **`.md` modules**: a `.md` file whose frontmatter says `type: mds`, which a source
+  imports, is a dependency like a partial, below the directory or outside it. Editing it
+  rebuilds its importers at once, under `--poll-interval 0` too, and it never gets an
+  output of its own.
 - **Removals**: `mds watch` removes only an output it wrote in this session, and only while
   it still holds exactly what was written — when its source is deleted (directory mode), or
   when an edit changes the template's kind and the output moves to `<name>.json` or

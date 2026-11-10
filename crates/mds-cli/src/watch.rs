@@ -81,6 +81,7 @@
 //!   watches cheaply; a full directory rescan happens only on watch loss/recovery, so
 //!   idle cost is O(1) in tree size.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
@@ -5090,7 +5091,7 @@ fn run_dir_batch(ctx: &DirWatchCtx, batch: Batch, state: &mut DirWatchState, due
 
 /// Outcome returned by `handle_fs_event_dir` to tell the loop what to do next.
 enum DirEventOutcome {
-    /// Skip — nothing relevant (Access event, no .mds paths, no vars change).
+    /// Skip — nothing relevant (Access event, no .mds path or imported file, no vars change).
     Skip,
     /// Ctrl+C received — stop watching.
     Stop,
@@ -5168,14 +5169,22 @@ fn handle_fs_event_dir(
     // node_modules/ triggers a full re-scan on every package update).
     changed.retain(|p| !is_within_default_excluded_dir(&ctx.root.canonical, p));
 
-    // Collect .mds paths that are either under root OR in known external dep dirs.
+    // Collect the paths a rebuild may name: .mds paths either under root OR in known
+    // external dep dirs, and any other file some source imports — a `type: mds` `.md`
+    // module, below the root or outside it — which no compile can be told from its own
+    // path, and whose edit rebuilds its importers.
+    let dependencies: OnceCell<HashSet<&PathBuf>> = OnceCell::new();
     let mds_changed: BTreeSet<PathBuf> = changed
         .iter()
-        .filter(|p| {
-            has_mds_extension(p)
-                && classify(&ctx.root.canonical, p, &state.external_dep_dirs) != Node::Unrelated
+        .filter_map(|p| {
+            let key = graph_key(p);
+            let admitted = (has_mds_extension(p)
+                && classify(&ctx.root.canonical, p, &state.external_dep_dirs) != Node::Unrelated)
+                || dependencies
+                    .get_or_init(|| state.forward_deps.values().flatten().collect())
+                    .contains(&key);
+            admitted.then_some(key)
         })
-        .map(|p| graph_key(p))
         .collect();
 
     if mds_changed.is_empty() && !vars_changed {
@@ -10655,9 +10664,9 @@ mod tests {
     }
 
     /// #380: a dependency below the root that is no source — a `type: mds` `.md` module a
-    /// source `@include`s, or one whose function a source calls — edited reaches a batch
-    /// through the idle tick's content check, the event path keeping `.mds` paths alone.
-    /// That batch rebuilds its importers and never compiles the module as a source: no
+    /// source `@include`s, or one whose function a source calls — edited, with no event
+    /// delivered, reaches a batch through the idle tick's content check. That batch
+    /// rebuilds its importers and never compiles the module as a source: no
     /// output is written for it, and it is neither known nor errored.
     #[test]
     fn an_idle_tick_rebuilds_the_importers_of_a_changed_module_never_the_module() {
@@ -10774,6 +10783,58 @@ mod tests {
              known: {:?}",
             state.errored,
             state.known_files
+        );
+    }
+
+    /// #380: an event names a rebuild for a `.md` file only when a source imports it — a
+    /// `README.md` beside the sources, or an output written next to its source, rebuilds
+    /// nothing — and the rebuild it names is of the importers, never of the module.
+    #[test]
+    fn an_event_for_an_md_file_rebuilds_only_when_a_source_imports_it() {
+        let (_root_dir, root) = canonical_tempdir();
+        let (_out_dir, out) = canonical_tempdir();
+        let (a, inc, readme) = (
+            root.join("a.mds"),
+            root.join("inc.md"),
+            root.join("README.md"),
+        );
+        std::fs::write(&a, "@import \"./inc.md\" as inc\nA.\n@include inc\n").unwrap();
+        std::fs::write(&inc, "---\ntype: mds\n---\nIncluded one\n").unwrap();
+        std::fs::write(&readme, "Notes\n").unwrap();
+        let ctx = dir_ctx(&root, &out);
+        let mut state = empty_dir_state();
+        state.known_files.insert(a.clone());
+        rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+        let (_tx, rx) = mpsc::channel::<Msg>();
+
+        let outcome = handle_fs_event_dir(
+            modify_event(readme.to_str().unwrap()),
+            &ctx,
+            &rx,
+            &mut state,
+        );
+        assert!(
+            matches!(outcome, DirEventOutcome::Skip),
+            "a file no source imports names no rebuild"
+        );
+
+        std::fs::write(&inc, "---\ntype: mds\n---\nIncluded two\n").unwrap();
+        let outcome =
+            handle_fs_event_dir(modify_event(inc.to_str().unwrap()), &ctx, &rx, &mut state);
+        assert!(
+            matches!(outcome, DirEventOutcome::Done),
+            "positive control: a module a source imports names one"
+        );
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).ok();
+        assert!(
+            read("a.md").is_some_and(|text| text.contains("Included two")),
+            "its importer is rebuilt; out/a.md: {:?}",
+            read("a.md")
+        );
+        assert_eq!(
+            read("inc.md"),
+            None,
+            "the module is never compiled as a source"
         );
     }
 

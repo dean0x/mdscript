@@ -1567,9 +1567,10 @@ fn watch_dir_mode_recompiles_a_failed_source_on_a_vars_change() {
 }
 
 /// #380: a `type: mds` `.md` module below the root that a source `@include`s is no
-/// source. An edit to it is found by the idle tick's content check, which rebuilds the
-/// source that includes it and never compiles the module as a source of its own — no
-/// output is written for it.
+/// source. With the idle tick on, an edit to it rebuilds the source that includes it — by
+/// the edit's own event, or by the tick's content check when that event is lost — and the
+/// module is never compiled as a source of its own: no output is written for it. The
+/// edit's event alone, with no tick, is the next test's.
 #[test]
 fn watch_dir_mode_tick_rebuilds_an_md_module_s_importer_and_never_the_module() {
     let dir = tempfile::tempdir().unwrap();
@@ -1599,20 +1600,21 @@ fn watch_dir_mode_tick_rebuilds_an_md_module_s_importer_and_never_the_module() {
         "a.md is written at startup; stderr: {}",
         tap.text()
     );
-    // A late event for a.mds, rebuilt after the edit below, would take the module's new
-    // stamp into the baseline before the tick looks, and the tick would find nothing.
+    // Every event queued so far is handled before the edit below.
     settle_queued_events(&tap, &root.join("barrier.mds"), "settle");
 
     write_atomic(&module, "---\ntype: mds\n---\nIncluded two\n");
 
-    // TICK-DEPENDENT: the module is no `.mds` file, so no event batch names it; the idle
-    // tick's content check finds the edit.
+    // Either mechanism delivers the edit: its own event, or the idle tick's content check
+    // when that event is lost. The bound is the tick's.
     assert!(
         wait_for_file_contains(&out.join("a.md"), "Included two", TICK_TIMEOUT),
-        "positive control: the tick rebuilds the source that includes the module; \
-         stderr: {}",
+        "positive control: the source that includes the module is rebuilt; stderr: {}",
         tap.text()
     );
+    // The rebuild that wrote a.md may not be the last of the batch: a module output
+    // written after it is on disk once this barrier's diagnostic is on the tap.
+    settle_queued_events(&tap, &root.join("barrier.mds"), "after_edit");
     let module_out = out.join("notes").join("inc.md");
     assert!(
         !module_out.exists(),
@@ -1621,6 +1623,86 @@ fn watch_dir_mode_tick_rebuilds_an_md_module_s_importer_and_never_the_module() {
         std::fs::read_to_string(&module_out).ok(),
         tap.text()
     );
+
+    drop(child);
+}
+
+/// #380: an edit to a `type: mds` `.md` module that a source `@include`s — one below the
+/// root, one outside it — rebuilds that source from the edit's own event, with the idle
+/// tick off, and the module is never compiled as a source of its own: no output is written
+/// for it. No tick runs, so the edit's own event alone finds it. The previous test is its
+/// control, with the tick on.
+#[test]
+fn watch_dir_mode_event_rebuilds_the_importer_of_an_md_module_below_or_outside_the_root() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("src");
+    let notes = root.join("notes");
+    let shared = base.path().join("shared");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    // The project root is `base`, so the import below reaches `../shared/`.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    std::fs::write(
+        root.join("a.mds"),
+        "@import \"./notes/inc.md\" as inc\n@import \"../shared/ext.md\" as ext\n\
+         A.\n@include inc\n@include ext\n",
+    )
+    .unwrap();
+    let inside = notes.join("inc.md");
+    let outside = shared.join("ext.md");
+    std::fs::write(&inside, "---\ntype: mds\n---\nInside one\n").unwrap();
+    std::fs::write(&outside, "---\ntype: mds\n---\nOutside one\n").unwrap();
+    let out = base.path().join("out");
+
+    let (child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "0", "--poll-interval", "0", "-q"])
+            .stdout(Stdio::null()),
+    );
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "Outside one", TIMEOUT),
+        "a.md is written at startup; stderr: {}",
+        tap.text()
+    );
+    settle_queued_events(&tap, &root.join("barrier.mds"), "settle");
+
+    write_atomic(&inside, "---\ntype: mds\n---\nInside two\n");
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "Inside two", TIMEOUT),
+        "the module below the root: its edit rebuilds the source that includes it; \
+         stderr: {}",
+        tap.text()
+    );
+    settle_queued_events(&tap, &root.join("barrier.mds"), "inside");
+
+    write_atomic(&outside, "---\ntype: mds\n---\nOutside two\n");
+    assert!(
+        wait_for_file_contains(&out.join("a.md"), "Outside two", TIMEOUT),
+        "the module outside the root: its edit rebuilds the source that includes it; \
+         stderr: {}",
+        tap.text()
+    );
+
+    // Everything the last edit's batch did is on disk once the barrier's diagnostic is
+    // on the tap.
+    settle_queued_events(&tap, &root.join("barrier.mds"), "outside");
+    for module_out in [
+        out.join("notes").join("inc.md"),
+        out.join("inc.md"),
+        out.join("ext.md"),
+    ] {
+        assert!(
+            !module_out.exists(),
+            "a module is never compiled as a source; {} holds {:?}; stderr: {}",
+            module_out.display(),
+            std::fs::read_to_string(&module_out).ok(),
+            tap.text()
+        );
+    }
 
     drop(child);
 }
