@@ -14,9 +14,9 @@
 //!
 //! - Human diagnostics → **stderr** via miette Report.
 //! - `--format json` output → **stdout** only: exactly one JSON object, with a trailing
-//!   newline, on every exit but a usage error clap reports — the findings document, or the
-//!   error document of a failure that stops the run; `--fix --diff` writes its diffs
-//!   first (#309).
+//!   newline, on every exit but a usage error clap reports or a panic that ends the run
+//!   (exit 101) — the findings document, or the error document of a failure that stops
+//!   the run; `--fix --diff` writes its diffs first (#309).
 //! - `--quiet` suppresses warning+info human diagnostics and summaries, NOT errors.
 //!
 //! # Results

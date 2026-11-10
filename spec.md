@@ -1253,7 +1253,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 
 **Channel discipline:**
 - Human-readable diagnostics → **stderr** (via miette).
-- `--format json` output → **stdout**: exactly one JSON document, with one trailing newline, on every exit but a usage error the argument parser reports (see "One JSON document on every exit" below).
+- `--format json` output → **stdout**: exactly one JSON document, with one trailing newline, on every exit but a usage error the argument parser reports or a panic that ends the run (exit 101; see "One JSON document on every exit" below).
 - Directory-mode summary → **stderr** (in both human and JSON format modes; stdout remains a single clean JSON document in JSON mode, except under `--fix --diff` which also writes the unified diff to stdout).
 - `--quiet` suppresses warning-severity and info human diagnostics, NOT errors.
 
