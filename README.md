@@ -145,7 +145,8 @@ Exit codes:
       that cannot be written, an output directory that cannot be created, a stale `.json`
       that cannot be read or removed, stdin that cannot be read or is not UTF-8), or invalid CLI
       argument (clap parse error)
-  3   Resource limit exceeded (stdin over 10 MiB included)
+  3   Resource limit exceeded (stdin over 10 MiB included; a directory run exits 3 when
+      any of its files exceeds one)
 ```
 
 A closed pipe never changes the exit code of `mds build`, `mds check`, `mds fmt`, `mds init` or
@@ -153,7 +154,8 @@ A closed pipe never changes the exit code of `mds build`, `mds check`, `mds fmt`
 closed stderr leaves every output written. The failures listed under exit code 2 exit at least 2
 — the CLI's own write, delete and stdin failures as `mds::io` errors — also in directory mode,
 where the other files are still processed; a directory run whose failures are only template
-errors or resource limits exits 1.
+errors exits 1. A directory run with a file over a resource limit exits 3, as that file alone
+does, whatever else failed: `mds build`, `mds check`, `mds fmt` and `mds lint` agree.
 `mds lint` exits at least 2 for an I/O failure: a failed `--fix` rewrite, stdin that cannot be
 read, and a stdout write that fails other than by a closed pipe. The stdout failure is reported
 once, as `mds::io`, and lifts even a clean run (changed in v0.5.0; previously a clean

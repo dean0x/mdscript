@@ -374,6 +374,147 @@ fn dir_build_oversized_file_fails_others_succeed() {
     );
 }
 
+// ── #157: a resource-limited file exits a directory run with 3 ───────────────
+
+/// A source that trips `MAX_BLOCKS_PER_MODULE` (256): `mds::resource_limit`, exit 3 for
+/// the file alone under `build` and `check`. It is small, so those tests need no 10 MiB
+/// file. `mds fmt` does not parse blocks, so its test uses [`oversized_source`].
+fn resource_limited_source() -> String {
+    (0..257)
+        .map(|i| format!("@block block_{i}:\n@end\n"))
+        .collect()
+}
+
+/// A source over the 10 MiB cap: `mds::resource_limit` under every subcommand.
+fn oversized_source() -> String {
+    "x".repeat(10 * 1024 * 1024 + 1)
+}
+
+/// The two failing sources a directory run is tried with: one over a resource limit and
+/// one with an error of the template class, for the subcommand under test.
+struct FailingSources {
+    limited: String,
+    template_error: &'static str,
+}
+
+/// A directory run exits with the code its worst file would exit with alone: a file over
+/// a resource limit makes it exit 3, as `mds lint <dir>` does, whatever else failed.
+///
+/// Controls: the limited file alone exits 3, and a template error alone exits 1, so the
+/// 3 is the limit's and not a side effect of any failure.
+fn assert_a_directory_run_exits_3_for_a_resource_limited_file(
+    subcommand: &str,
+    run_dir: fn(&Path, &[&str]) -> std::process::Output,
+    failing: &FailingSources,
+) {
+    let limited = tempfile::tempdir().unwrap();
+    fs::write(limited.path().join("limited.mds"), &failing.limited).unwrap();
+    let alone = mds_bin()
+        .arg(subcommand)
+        .arg(limited.path().join("limited.mds"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        alone.status.code(),
+        Some(3),
+        "control: the limited file alone must exit 3; stderr: {}",
+        String::from_utf8_lossy(&alone.stderr)
+    );
+
+    let template_error = tempfile::tempdir().unwrap();
+    create_plain_mds(template_error.path(), "good.mds");
+    fs::write(
+        template_error.path().join("bad.mds"),
+        failing.template_error,
+    )
+    .unwrap();
+    let control = run_dir(template_error.path(), &[]);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: a template error alone must exit 1; stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // The limited file beside a good file, beside a template error, and under --quiet.
+    for (label, with_template_error, extra) in [
+        ("beside a good file", false, &[][..]),
+        ("beside a template error", true, &[][..]),
+        ("under --quiet", false, &["--quiet"][..]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        create_plain_mds(dir.path(), "good.mds");
+        fs::write(dir.path().join("limited.mds"), &failing.limited).unwrap();
+        if with_template_error {
+            fs::write(dir.path().join("bad.mds"), failing.template_error).unwrap();
+        }
+        let output = run_dir(dir.path(), extra);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "`mds {subcommand} <dir>` with a resource-limited file {label} must exit 3; \
+             stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("resource limit exceeded"),
+            "the limit is reported, {label}; stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn dir_build_with_a_resource_limited_file_exits_3() {
+    assert_a_directory_run_exits_3_for_a_resource_limited_file(
+        "build",
+        build_dir,
+        &FailingSources {
+            limited: resource_limited_source(),
+            template_error: "{{undefined_var_xyz}}\n",
+        },
+    );
+
+    // The other files are still built, and the summary counts the limited one as failed.
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "good.mds");
+    fs::write(src.path().join("limited.mds"), resource_limited_source()).unwrap();
+    let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        out.path().join("good.md").is_file() && !out.path().join("limited.md").exists(),
+        "the good file is built and the limited one is not; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 built, 1 failed"),
+        "the summary is unchanged; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn dir_check_with_a_resource_limited_file_exits_3() {
+    assert_a_directory_run_exits_3_for_a_resource_limited_file(
+        "check",
+        check_dir,
+        &FailingSources {
+            limited: resource_limited_source(),
+            template_error: "{{undefined_var_xyz}}\n",
+        },
+    );
+}
+
+#[test]
+fn dir_fmt_with_a_resource_limited_file_exits_3() {
+    assert_a_directory_run_exits_3_for_a_resource_limited_file(
+        "fmt",
+        fmt_dir,
+        &FailingSources {
+            limited: oversized_source(),
+            template_error: "```\nunclosed fence\n",
+        },
+    );
+}
+
 // ── T-CLI-20 (FUNC-26): `check <dir>` ────────────────────────────────────────
 
 #[test]

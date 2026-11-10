@@ -438,7 +438,8 @@ fn run_check_directory(
             Ok(Err(e)) => {
                 // Route through the single render choke point (avoids PF-004 /
                 // architecture-6: hand-rolled sanitize_control_chars bypass); a source
-                // that cannot be read lifts the exit code to 2 (#157).
+                // that cannot be read lifts the exit code to 2, one over a resource
+                // limit to 3 (#157).
                 output::eprint_file_failure(miette::Error::from(e));
                 fail_count += 1;
             }

@@ -1749,11 +1749,11 @@ fn a_directory_build_or_check_with_a_missing_import_exits_2() {
     }
 }
 
-/// Control for the tests above: a directory run whose only failures are a
-/// template error and a file over the size cap still exits 1 — only an I/O or
-/// file-system failure lifts it to 2 (#157).
+/// A directory run whose only failures are a template error and a file over the size
+/// cap exits 3, the file's own code alone, not the template error's 1; and it reports no
+/// I/O failure, which would lift it to 2 (#157).
 #[test]
-fn a_directory_run_whose_failures_are_a_template_error_and_a_resource_limit_exits_1() {
+fn a_directory_run_whose_failures_are_a_template_error_and_a_resource_limit_exits_3() {
     let over_cap = "x".repeat(STDIN_CAP + 1);
     for (args, summary) in [
         (&["build", "t"][..], "1 built, 2 failed"),
@@ -1768,7 +1768,7 @@ fn a_directory_run_whose_failures_are_a_template_error_and_a_resource_limit_exit
         std::fs::write(t.join("bad.mds"), "@if flag:\nunterminated\n").expect("write t/bad.mds");
         std::fs::write(t.join("big.mds"), &over_cap).expect("write t/big.mds");
         let run = run(dir.path(), args, "", None);
-        assert_exit_and_code(&run, &what, 1, "mds::resource_limit");
+        assert_exit_and_code(&run, &what, 3, "mds::resource_limit");
         assert!(
             run.stderr.contains("mds::syntax") && !run.stderr.contains("mds::io"),
             "`mds {what}` must report the template error and no I/O failure; stderr: {:?}",

@@ -2066,9 +2066,10 @@ fn file_name_of(output: &WriteTarget) -> String {
 /// [`crate::output::eprint_io_failure`], which records it for the exit code, so the run
 /// exits 2 while the other files are still built. A compile that fails is reported
 /// through [`crate::output::eprint_file_failure`], which records it the same way when it
-/// is an I/O or file-system failure — a source that cannot be read, say. All but the
-/// stale sibling count their file as failed; its file was built. A run whose failures are
-/// only template errors or resource limits exits 1.
+/// is an I/O or file-system failure — a source that cannot be read, say — and as a
+/// resource limit when it is one, so the run exits 3. All but the stale sibling count
+/// their file as failed; its file was built. A run whose failures are only template
+/// errors exits 1.
 ///
 /// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
 /// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
@@ -2301,7 +2302,8 @@ fn run_build_directory(
             Ok(Err(e)) => {
                 // Route through the single render choke point (avoids PF-004 /
                 // architecture-6: hand-rolled sanitize_control_chars bypass); a source
-                // that cannot be read lifts the exit code to 2 (#157).
+                // that cannot be read lifts the exit code to 2, one over a resource
+                // limit to 3 (#157).
                 crate::output::eprint_file_failure(e);
                 fail_count += 1;
             }
@@ -2314,7 +2316,8 @@ fn run_build_directory(
     // suppress the summary under --quiet when every file succeeded, so a quiet CI job
     // produces no output on a clean run.  AD-216-2: exit codes are untouched — a
     // --quiet build with failures still exits non-zero with the summary explaining why
-    // (1, or 2 once an I/O failure was recorded — the exit funnel applies it, #157).
+    // (1, or 2 once an I/O failure was recorded, or 3 once a resource limit was — the exit
+    // funnel applies it, #157).
     // R5: the empty clause appears ONLY when empty_count > 0 — the historical
     // `{ok} built, {fail} failed` form is byte-identical otherwise (no golden
     // churn).  The suppression gate itself is unchanged (AD-216-1): empty

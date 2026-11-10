@@ -242,7 +242,8 @@ enum FileOutcome {
 /// returned as [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
 /// read and format errors are treated in the surrounding loop — and recorded as I/O
 /// failures, so the run exits at least 2; so is a read or format error in the I/O and
-/// file-system class. A failing stdout is reported once per failure episode — the first
+/// file-system class, and one over a resource limit is recorded as such, so the run exits
+/// 3 (`crate::output::eprint_file_failure`). A failing stdout is reported once per failure episode — the first
 /// failed write since the run began or since a write last landed; every file whose diff
 /// it lost counts as failed. A closed stdout is not a failure: the diff has no reader,
 /// and the file's outcome stands (#157). A rewrite that lands is
