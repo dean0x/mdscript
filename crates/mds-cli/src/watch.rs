@@ -11135,6 +11135,104 @@ mod tests {
         );
     }
 
+    /// A directory state below `root` that has compiled `page.mds`, which imports
+    /// `_dep.mds`, with `vars.json` as its `--vars` file: each holds bytes, and the baseline
+    /// holds their stamps, as a batch's look leaves them. Returns the state and the three
+    /// paths: `[page, dependency, vars file]`.
+    fn state_with_a_vars_file(root: &Path) -> (DirWatchState, [PathBuf; 3]) {
+        let paths = ["page.mds", "_dep.mds", "vars.json"].map(|name| root.join(name));
+        for path in &paths {
+            std::fs::write(path, "bytes\n").unwrap();
+        }
+        let [page, dep, vars] = &paths;
+        let mut state = empty_dir_state();
+        state.known_files.insert(page.clone());
+        state.forward_deps.insert(page.clone(), vec![dep.clone()]);
+        state.vars_file = Some(vars.clone());
+        state.last_mtimes = snapshot_state(&state.watched_set());
+        (state, paths)
+    }
+
+    /// #380: a batch whose `--vars` load fails on a file emptied since its look — a
+    /// truncation that began between the two — is held with that file joined to it, its own
+    /// event lost: the file is a path of the batch the hold ends with.
+    #[test]
+    fn a_batch_whose_vars_load_failed_on_an_emptied_dependency_is_held_with_it() {
+        let (_dir, root) = canonical_tempdir();
+        let (mut state, [page, dep, _vars]) = state_with_a_vars_file(&root);
+        let batch = BTreeSet::from([page.clone()]);
+
+        std::fs::write(&dep, "").unwrap();
+        assert!(
+            state.hold_after_vars_load_failed(&batch, false, &root),
+            "the batch is held"
+        );
+
+        assert_eq!(
+            state.held.paths,
+            BTreeSet::from([page, dep]),
+            "the batch and the file found emptied"
+        );
+        assert!(!state.held.vars_changed, "no change to the vars file");
+        assert!(
+            state.hold.deadline().is_some(),
+            "the hold runs towards its deadline"
+        );
+    }
+
+    /// #380: a batch whose `--vars` load fails on the vars file itself, emptied since the
+    /// look, is held with that file as a change to it, not as a path of the batch.
+    #[test]
+    fn a_batch_whose_vars_load_failed_on_an_emptied_vars_file_is_held_as_a_change_to_it() {
+        let (_dir, root) = canonical_tempdir();
+        let (mut state, [page, _dep, vars]) = state_with_a_vars_file(&root);
+        let batch = BTreeSet::from([page.clone()]);
+
+        std::fs::write(&vars, "").unwrap();
+        assert!(
+            state.hold_after_vars_load_failed(&batch, false, &root),
+            "the batch is held"
+        );
+
+        assert!(state.held.vars_changed, "a change to the vars file");
+        assert_eq!(
+            state.held.paths,
+            BTreeSet::from([page]),
+            "the vars file is no path of the batch"
+        );
+    }
+
+    /// #380: a batch whose `--vars` load failed is held only while a file is found emptied
+    /// and the hold's deadline is still ahead: with none emptied it holds nothing, and the
+    /// rebuild the deadline runs compiles the files as they are.
+    #[test]
+    fn a_batch_whose_vars_load_failed_is_held_only_for_a_file_emptied_before_the_deadline() {
+        let (_dir, root) = canonical_tempdir();
+        let (mut state, [page, dep, _vars]) = state_with_a_vars_file(&root);
+        let batch = BTreeSet::from([page]);
+
+        assert!(
+            !state.hold_after_vars_load_failed(&batch, false, &root),
+            "no file went empty"
+        );
+        assert_eq!(state.held, HeldBatch::default(), "nothing is held");
+        assert_eq!(state.hold, EmptyHold::Off, "and no hold runs");
+
+        std::fs::write(&dep, "").unwrap();
+        state.hold = EmptyHold::Expired;
+        assert!(
+            !state.hold_after_vars_load_failed(&batch, false, &root),
+            "the deadline ended the hold in this rebuild"
+        );
+        assert_eq!(state.held, HeldBatch::default(), "nothing is held");
+
+        state.hold = EmptyHold::Off;
+        assert!(
+            state.hold_after_vars_load_failed(&batch, false, &root),
+            "positive control: the same file, with the deadline still ahead, holds the batch"
+        );
+    }
+
     /// #380: a baseline is the stamps taken before the read it describes. Every file keeps
     /// the stamp taken whatever it holds now — one emptied since, one edited since, one taken
     /// empty — only a file none was taken for is stamped now, a file named twice is one
