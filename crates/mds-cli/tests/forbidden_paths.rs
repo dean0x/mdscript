@@ -337,7 +337,7 @@ mod walker {
         let (code, text) = run(dir.path(), &["watch", "in.mds", "--vars", "link.json"]);
         assert_eq!(code, Some(2), "got: {text}");
         assert!(
-            text.contains("--vars file must not be a symlink: link.json"),
+            text.contains("--vars file must not be a symlink: \"link.json\""),
             "control: a symlink keeps the symlink message; got: {text}"
         );
     }
@@ -346,8 +346,8 @@ mod walker {
 // ── A symlinked --vars file is an I/O failure on every command (#157) ───────
 
 /// A `--vars` file that is a symlink is refused by every command that takes the flag as
-/// `mds watch` refuses it: `mds::io`, exit 2, `--vars file must not be a symlink: <path
-/// as typed>` (#157). `mds build` and `mds check` passed the library's own refusal through
+/// `mds watch` refuses it: `mds::io`, exit 2, `--vars file must not be a symlink: "<path
+/// as typed>"`, the path quoted as every path refusal quotes it (#157, #390). `mds build` and `mds check` passed the library's own refusal through
 /// (`mds::import`, `symlinks are not allowed in vars file path: …`, exit 1), and
 /// `mds lint` showed it under that code. Control: the file the link leads to, named by its
 /// own path, is read.
@@ -365,8 +365,9 @@ fn a_symlinked_vars_file_is_an_io_error_on_every_command() {
         assert_eq!(code, Some(2), "{command}: exit 2; got: {text}");
         assert!(text.contains("mds::io"), "{command}: mds::io; got: {text}");
         assert!(
-            squash(&text).contains(&squash("--vars file must not be a symlink: link.json")),
-            "{command}: names the file as typed, in the words mds watch uses; got: {text}"
+            squash(&text).contains(&squash("--vars file must not be a symlink: \"link.json\"")),
+            "{command}: names the file as typed, in quotes, in the words mds watch uses; got: \
+             {text}"
         );
         assert!(
             !text.contains("mds::import") && !text.contains("symlinks are not allowed"),

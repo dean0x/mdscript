@@ -704,14 +704,15 @@ pub(crate) fn load_optional_vars_file(path: Option<PathBuf>) -> Result<Option<md
 ///
 /// The symlink check's refusal (`ImportError`, the only one a vars file's load or its
 /// symlink check gives) is an I/O failure on the command line, the same on every
-/// command: `mds::io`, exit 2, `--vars file must not be a symlink: <path>`, the path
-/// escaped. Every other error — a forbidden character in the resolved path, a file
-/// missing, unreadable, too large or not a JSON object — keeps its own message and code.
+/// command: `mds::io`, exit 2, `--vars file must not be a symlink: "<path>"`, the path
+/// escaped and quoted, as the directory argument's refusal quotes it. Every other error — a
+/// forbidden character in the resolved path, a file missing, unreadable, too large or not
+/// a JSON object — keeps its own message and code.
 pub(crate) fn vars_file_error(typed: &Path, e: MdsError) -> MdsError {
     match e {
         MdsError::ImportError { .. } => MdsError::Io {
             message: format!(
-                "--vars file must not be a symlink: {}",
+                "--vars file must not be a symlink: \"{}\"",
                 mds::escape_path_for_message(&typed.to_string_lossy())
             ),
         },
