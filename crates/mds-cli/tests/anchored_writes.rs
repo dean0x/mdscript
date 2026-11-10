@@ -266,12 +266,13 @@ fn an_output_path_ending_in_a_separator_is_refused_as_a_directory() {
 /// A write refused at its output path — an MDS module there, or a file the run reads — is
 /// refused after the directories it needs have been made, and leaves them (#160): `-o
 /// nd/../<file>` reaches such a file by way of a directory that does not exist yet, and
-/// the run exits 2 with the refusal, the file keeps its content, no temporary file is left,
-/// and `nd` stays, empty. Spec §7.2 says so: a cleanup that removed the directory would
-/// change that sentence. Each row first shows there is no `nd`, so the directory is the
-/// run's own; the refusal itself shows the write was attempted.
-///
-/// Runs on every OS.
+/// the run exits 2 with the refusal, the file keeps its content, and no temporary file is
+/// left. On Unix `nd` stays, empty: the write makes each directory of its anchor in turn,
+/// `nd` first. Spec §7.2 says so: a cleanup that removed the directory would change that
+/// sentence. On Windows no `nd` is made: Windows resolves `nd\..` by its text, as the
+/// root, which exists, so the write has no directory to make. Each row first shows there is no
+/// `nd`, so a directory left is the run's own; the refusal itself shows the write was
+/// attempted.
 #[test]
 fn a_refused_write_leaves_the_directories_it_created() {
     const MODULE: &str = "---\ntype: mds\n---\nA module\n";
@@ -309,20 +310,32 @@ fn a_refused_write_leaves_the_directories_it_created() {
             diagnostics.contains("mds::io") && squash(&diagnostics).contains(&squash(&refusal)),
             "{file}: refused as `{cause}`; stderr: {diagnostics}"
         );
-        assert!(
-            root.join("nd").is_dir(),
-            "{file}: the directory the write made is left"
-        );
-        assert!(
-            entries(&root.join("nd")).is_empty(),
-            "{file}: the directory is empty"
-        );
-        assert_eq!(
-            entries(root),
-            after,
-            "{file}: nothing else is created, no temporary file included"
-        );
-        std::fs::remove_dir(root.join("nd")).expect("remove the directory for the next row");
+        if cfg!(windows) {
+            assert!(
+                !root.join("nd").exists(),
+                "{file}: `nd\\..` is the root by its text, so no directory is made"
+            );
+            assert_eq!(
+                entries(root),
+                before,
+                "{file}: nothing is created, no temporary file included"
+            );
+        } else {
+            assert!(
+                root.join("nd").is_dir(),
+                "{file}: the directory the write made is left"
+            );
+            assert!(
+                entries(&root.join("nd")).is_empty(),
+                "{file}: the directory is empty"
+            );
+            assert_eq!(
+                entries(root),
+                after,
+                "{file}: nothing else is created, no temporary file included"
+            );
+            std::fs::remove_dir(root.join("nd")).expect("remove the directory for the next row");
+        }
     }
     assert_eq!(
         read(&root.join("lib.md")),
