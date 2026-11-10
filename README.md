@@ -266,6 +266,10 @@ shared partial rebuilds **all transitive importers** automatically.
   at most the window's cap of max(10 × `--debounce`, 1000) ms. A rebuild
   that empties an output it had written with content prints
   `Wrote an empty output: <file>` (not under `--quiet`).
+- **Lost events**: when the operating system says it lost events (an overflowed inotify
+  queue, a macOS event stream that must rescan), a directory watch looks at once for what
+  they would have said — a source created or removed, a watched file or the `--vars` file
+  changed — and rebuilds with it, under `--poll-interval 0` too.
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
 - `--quiet` suppresses status lines and the warnings of a compile. Compile errors and failure

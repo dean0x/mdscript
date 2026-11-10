@@ -1110,6 +1110,8 @@ enum WindowEnd {
 struct DebounceOutcome {
     /// Every path seen in a content event during the window.
     paths: BTreeSet<PathBuf>,
+    /// Whether an event of the window said events were lost ([`notify::Event::need_rescan`]).
+    rescan: bool,
     /// Why the window ended.
     end: DebounceEnd,
 }
@@ -1159,6 +1161,8 @@ struct DebounceWindow {
     messages: usize,
     /// Every path seen in a content event.
     paths: BTreeSet<PathBuf>,
+    /// Whether an event said events were lost.
+    rescan: bool,
 }
 
 impl DebounceWindow {
@@ -1171,12 +1175,13 @@ impl DebounceWindow {
             deadline: start + window,
             messages: 0,
             paths: BTreeSet::new(),
+            rescan: false,
         }
     }
 
     /// A filesystem event drained at `now`. It counts toward the message limit; a
-    /// content event also contributes its paths and extends the window
-    /// ([`Self::on_content`]). An `Access` event does neither (inotify
+    /// content event also contributes its paths and whether it says events were lost, and
+    /// extends the window ([`Self::on_content`]). An `Access` event does neither (inotify
     /// IN_ACCESS/IN_OPEN/IN_CLOSE_NOWRITE — reads must not trigger recompiles; see
     /// [`is_content_event`]).
     fn on_event(&mut self, event: notify::Event, now: Instant) {
@@ -1184,6 +1189,7 @@ impl DebounceWindow {
         if !is_content_event(&event.kind) {
             return;
         }
+        self.rescan |= event.need_rescan();
         self.paths.extend(event.paths);
         self.on_content(now);
     }
@@ -1268,6 +1274,7 @@ fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome
         // event is delivered to the loop as its own batch.
         return DebounceOutcome {
             paths: BTreeSet::new(),
+            rescan: false,
             end: DebounceEnd::Disabled,
         };
     };
@@ -1299,6 +1306,7 @@ fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> DebounceOutcome
 
     DebounceOutcome {
         paths: open.paths,
+        rescan: open.rescan,
         end,
     }
 }
@@ -4869,29 +4877,60 @@ fn liveness_probe_dir(
     liveness.root_was_missing = !root_now_exists;
     liveness.missing_external_dirs = now_missing_external;
 
-    // 3. Content backstop (#321).
-    //
-    // The reconcile below diffs `collect_mds_files(root)` against `known_files`, which
-    // reports only files that *appeared* or were *removed* under the root. A change to
-    // a file's contents is invisible to it, and a cross-root dependency is not even in
-    // that walk — so until this check existed, `last_mtimes` was written on every batch
-    // in dir mode and never once read, and an edit whose event went undelivered was
-    // lost for good. The events that go undelivered are not hypothetical: a
-    // cross-root dependency is discovered by the compile that reads it, so its
-    // directory cannot be armed until after that first read.
-    //
-    // Cost is one `stat` per watched path per tick, short-circuited by nothing — the
-    // full set is walked so every changed path joins the same batch. That is the same
-    // price single-file mode has always paid via `state_differs` on its
-    // files-of-interest, and it is O(sources + deps), not O(tree).
-    //
-    // The watched set holds the `--vars` file too, as single-file mode's files of interest
-    // do (#380): its event can be lost like any other — to an inotify queue overflow, to
-    // an FSEvents stream restart — and nothing else would ever rebuild the outputs with
-    // the file as it now reads. A change found there is a vars change, which recompiles
-    // every source, as the batch of its event does.
+    // 3. Content backstop (#321), and the full reconcile (appeared/removed) on a recovery
+    //    edge ([`scan_directory`]).
+    let found = scan_directory(ctx, state, recovery);
+
+    if !found.paths.is_empty() || found.vars_changed {
+        // The event handler's rebuild path, so a recompile driven purely by this
+        // content-backstop/full-reconcile tick (no FS event ever delivered, e.g. after a
+        // root delete+recreate) re-reports the vars-file duplicate keys under the same
+        // content-changed gate, and one logical edit observed by both paths still warns
+        // once — tests I17 and I19.
+        rebuild_dir_batch(ctx, &found.paths, found.vars_changed, state, None);
+        arm_external_dirs_after_rebuild(ctx, watcher, liveness, state);
+    }
+    // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
+    // post-batch watched set, and an empty batch means nothing appeared, was removed, or
+    // changed — so the existing baseline is by definition still accurate.
+}
+
+/// What a directory watch finds by looking for changes it was not told of (#321, #257): the
+/// watched files whose `(mtime, size)` differ from the baseline — the `--vars` file among them,
+/// as a change to it — and, with `walk`, the `.mds` files that appeared under the root since
+/// the last walk or were removed from it. The idle tick looks for the first alone, and for
+/// both on a recovery edge; an event that says events were lost looks for both at once
+/// ([`handle_fs_event_dir`]).
+///
+/// Content backstop (#321). A reconcile diffs `collect_mds_files(root)` against
+/// `known_files`, which reports only files that *appeared* or were *removed* under the root.
+/// A change to a file's contents is invisible to it, and a cross-root dependency is not even
+/// in that walk — so until this check existed, `last_mtimes` was written on every batch in
+/// dir mode and never once read, and an edit whose event went undelivered was lost for good.
+/// The events that go undelivered are not hypothetical: a cross-root dependency is discovered
+/// by the compile that reads it, so its directory cannot be armed until after that first
+/// read.
+///
+/// Cost is one `stat` per watched path, short-circuited by nothing — the full set is walked
+/// so every changed path joins the same batch. That is the same price single-file mode has
+/// always paid via `state_differs` on its files-of-interest, and it is O(sources + deps), not
+/// O(tree).
+///
+/// The watched set holds the `--vars` file too, as single-file mode's files of interest do
+/// (#380): its event can be lost like any other — to an inotify queue overflow, to an
+/// FSEvents stream restart — and nothing else would ever rebuild the outputs with the file as
+/// it now reads. A change found there is a vars change, which recompiles every source, as the
+/// batch of its event does.
+///
+/// Full reconcile (appeared/removed). `known_files` is replaced with the fresh walk *before*
+/// the batch runs, so the re-baseline at the end of `process_dir_batch` already covers every
+/// file the walk found — including one that appeared and then failed to compile, which
+/// `record_error` deliberately does not add to `known_files`. Replacing afterwards would
+/// leave such a file outside the baseline and cost one redundant compile on the following
+/// tick.
+fn scan_directory(ctx: &DirWatchCtx, state: &mut DirWatchState, walk: bool) -> Batch {
     let watched = state.watched_set();
-    let mut batch: BTreeSet<PathBuf> = watched
+    let mut paths: BTreeSet<PathBuf> = watched
         .iter()
         .filter(|p| path_state_differs(p, &state.last_mtimes))
         .cloned()
@@ -4899,17 +4938,9 @@ fn liveness_probe_dir(
     let vars_changed = state
         .vars_file
         .as_ref()
-        .is_some_and(|vars| batch.remove(vars));
+        .is_some_and(|vars| paths.remove(vars));
 
-    // 4. Full reconcile (appeared/removed), only on a recovery edge.
-    //
-    // `known_files` is replaced with the fresh walk *before* the batch runs, so the
-    // re-baseline at the end of `process_dir_batch` already covers every file the walk
-    // found — including one that appeared and then failed to compile, which
-    // `record_error` deliberately does not add to `known_files`. Replacing afterwards
-    // would leave such a file outside the baseline and cost one redundant compile on
-    // the following tick.
-    if recovery {
+    if walk {
         let current: BTreeSet<PathBuf> = collect_mds_files(
             &ctx.root.canonical,
             MAX_COLLECT_DEPTH,
@@ -4918,23 +4949,14 @@ fn liveness_probe_dir(
         .into_iter()
         .map(|p| graph_key(&p))
         .collect();
-        batch.extend(current.difference(&state.known_files).cloned());
-        batch.extend(state.known_files.difference(&current).cloned());
+        paths.extend(current.difference(&state.known_files).cloned());
+        paths.extend(state.known_files.difference(&current).cloned());
         state.known_files = current;
     }
-
-    if !batch.is_empty() || vars_changed {
-        // The event handler's rebuild path, so a recompile driven purely by this
-        // content-backstop/full-reconcile tick (no FS event ever delivered, e.g. after a
-        // root delete+recreate) re-reports the vars-file duplicate keys under the same
-        // content-changed gate, and one logical edit observed by both paths still warns
-        // once — tests I17 and I19.
-        rebuild_dir_batch(ctx, &batch, vars_changed, state, None);
-        arm_external_dirs_after_rebuild(ctx, watcher, liveness, state);
+    Batch {
+        paths,
+        vars_changed,
     }
-    // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
-    // post-batch watched set, and an empty batch means nothing appeared, was removed, or
-    // changed — so the existing baseline is by definition still accurate.
 }
 
 /// Rebuild `batch` in directory mode — the one rebuild path of the event handler, of the
@@ -5111,6 +5133,8 @@ fn handle_fs_event_dir(
     state: &mut DirWatchState,
 ) -> DirEventOutcome {
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
+    // Whether an event said events were lost ([`notify::Event::need_rescan`]).
+    let mut rescan = false;
 
     let interrupted = match msg {
         Msg::Interrupt => true,
@@ -5126,6 +5150,7 @@ fn handle_fs_event_dir(
             // On Linux reading a .mds source file during compile emits Access
             // events that would re-seed the watcher in a busy-loop (~3000/s).
             if is_content_event(&event.kind) {
+                rescan = event.need_rescan();
                 for p in event.paths {
                     changed.insert(p);
                 }
@@ -5144,11 +5169,12 @@ fn handle_fs_event_dir(
         return DirEventOutcome::Stop;
     }
     changed.extend(drained.paths);
+    rescan |= drained.rescan;
 
     // Check if the vars file changed — before the filters below drop the paths in the
     // out-dir and in the hidden directories and `node_modules/` below the root: a `--vars`
     // file there is read by every compile all the same (#380).
-    let vars_changed = ctx
+    let mut vars_changed = ctx
         .vars_path
         .as_deref()
         .map(|vf| changed.contains(vf))
@@ -5171,10 +5197,9 @@ fn handle_fs_event_dir(
 
     // Collect the paths a rebuild may name: .mds paths either under root OR in known
     // external dep dirs, and any other file some source imports — a `type: mds` `.md`
-    // module, below the root or outside it — which no compile can be told from its own
-    // path, and whose edit rebuilds its importers.
+    // module, below the root or outside it — whose edit rebuilds its importers.
     let dependencies: OnceCell<HashSet<&PathBuf>> = OnceCell::new();
-    let mds_changed: BTreeSet<PathBuf> = changed
+    let mut mds_changed: BTreeSet<PathBuf> = changed
         .iter()
         .filter_map(|p| {
             let key = graph_key(p);
@@ -5186,6 +5211,17 @@ fn handle_fs_event_dir(
             admitted.then_some(key)
         })
         .collect();
+
+    // An event that says events were lost (an overflowed inotify queue, FSEvents'
+    // `MustScanSubDirs`) names no path: what the lost events would have said is looked for
+    // at once, as a recovery edge of the idle tick would — a source created, one removed, a
+    // watched file or the `--vars` file changed — and joins the batch, whether or not a tick
+    // runs (#257).
+    if rescan {
+        let found = scan_directory(ctx, state, true);
+        mds_changed.extend(found.paths);
+        vars_changed |= found.vars_changed;
+    }
 
     if mds_changed.is_empty() && !vars_changed {
         return DirEventOutcome::Skip; // Nothing relevant changed.
@@ -7765,6 +7801,23 @@ mod tests {
             }
         }
         panic!("the window was still open after {REPLAY_STEPS} steps");
+    }
+
+    /// An event that says events were lost, drained inside a window, reaches the window's
+    /// result: the flag is not dropped with the paths the event does not have (#257).
+    #[test]
+    fn a_debounce_window_keeps_that_an_event_said_events_were_lost() {
+        let t0 = Instant::now();
+        let rescan =
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        let (_, _, closed) = replay(ms(100), t0, [(t0 + ms(10), rescan)]);
+        assert!(closed.rescan, "the window says events were lost");
+
+        let (_, _, closed) = replay(ms(100), t0, [(t0 + ms(10), content_event("/w/a.mds"))]);
+        assert!(
+            !closed.rescan,
+            "control: a window of ordinary events does not"
+        );
     }
 
     /// Every content event restarts the window: a burst longer than the window
@@ -10840,6 +10893,85 @@ mod tests {
             None,
             "the module is never compiled as a source"
         );
+    }
+
+    /// An event that says events were lost: what inotify reports for an overflowed queue
+    /// and FSEvents for `MustScanSubDirs`. It names no path.
+    fn rescan_event() -> Msg {
+        Msg::Fs(Ok(
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ))
+    }
+
+    /// #257: an event that says events were lost makes a directory watch look for what they
+    /// would have said, with the idle tick off: a source created meanwhile is compiled, and a
+    /// `--vars` edit meanwhile is rebuilt with. It does, whether the event starts the batch
+    /// or arrives in its debounce window. An event that names no path and says nothing of
+    /// lost events rebuilds nothing.
+    #[test]
+    fn a_rescan_event_finds_what_the_lost_events_would_have_said() {
+        let unflagged = || Msg::Fs(Ok(notify::Event::new(notify::EventKind::Other)));
+        for (debounce_ms, place) in [(0, "the event itself"), (20, "an event of the window")] {
+            let (_root_dir, root) = canonical_tempdir();
+            let (_out_dir, out) = canonical_tempdir();
+            let (_vars_dir, vars_dir) = canonical_tempdir();
+            let vars = vars_dir.join("vars.json");
+            let (a, created) = (root.join("a.mds"), root.join("created.mds"));
+            std::fs::write(&a, "A {{v}}\n").unwrap();
+            std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+            let (ctx, mut state) = dir_ctx_with_vars(&root, &out, &vars);
+            let ctx = DirWatchCtx { debounce_ms, ..ctx };
+            state.known_files.insert(a.clone());
+            rebuild_dir_batch(&ctx, &BTreeSet::from([a.clone()]), false, &mut state, None);
+            let read = |name: &str| std::fs::read_to_string(out.join(name)).ok();
+            assert!(
+                read("a.md").is_some_and(|text| text.contains("A one")),
+                "{place}: control: the source is compiled; out/a.md: {:?}",
+                read("a.md")
+            );
+
+            // Both changes made with their events lost: nothing names them.
+            std::fs::write(&created, "Created {{v}}\n").unwrap();
+            std::fs::write(&vars, r#"{"v": "two, longer"}"#).unwrap();
+            let (tx, rx) = mpsc::channel::<Msg>();
+            if debounce_ms > 0 {
+                tx.send(unflagged()).unwrap();
+            }
+            let outcome = handle_fs_event_dir(unflagged(), &ctx, &rx, &mut state);
+            assert!(
+                matches!(outcome, DirEventOutcome::Skip) && read("created.md").is_none(),
+                "{place}: control: events that name no path and say nothing of lost events \
+                 rebuild nothing; out/created.md: {:?}",
+                read("created.md")
+            );
+
+            let first = if debounce_ms > 0 {
+                tx.send(rescan_event()).unwrap();
+                unflagged()
+            } else {
+                rescan_event()
+            };
+            let outcome = handle_fs_event_dir(first, &ctx, &rx, &mut state);
+            assert!(
+                matches!(outcome, DirEventOutcome::Done),
+                "{place}: the rescan event rebuilds"
+            );
+            assert!(
+                read("created.md").is_some_and(|text| text.contains("Created two, longer")),
+                "{place}: the source created meanwhile is compiled; out/created.md: {:?}",
+                read("created.md")
+            );
+            assert!(
+                read("a.md").is_some_and(|text| text.contains("A two, longer")),
+                "{place}: the vars edit made meanwhile is rebuilt with; out/a.md: {:?}",
+                read("a.md")
+            );
+            assert!(
+                state.known_files.contains(&created),
+                "{place}: the source created meanwhile is known: {:?}",
+                state.known_files
+            );
+        }
     }
 
     /// #380: a file rebuild whose compile read a file of interest emptied after the
