@@ -626,11 +626,11 @@ enum FixPipelineOutcome {
 /// `mds::fix::apply_fixes_incremental` refuses a candidate that has more findings than the
 /// original for a rule the plan does not target.
 ///
-/// When the original does not compile (e.g. it needs runtime vars) the output check is
-/// skipped; the other checks still apply, and Tier B is already suggestion-only for such
-/// a source (it is not standalone). `legacy-interpolation` edits change compiled output
-/// on purpose — they turn plain `{x}` text into `{{x}}` interpolation — so a plan with any
-/// such edit skips the output check for every edit in it.
+/// The original is compiled with the run's variables, as each candidate is. When the
+/// original does not compile, the output check is skipped; the other checks still apply.
+/// `legacy-interpolation` edits change compiled output on purpose — they turn plain `{x}`
+/// text into `{{x}}` interpolation — so a plan with any such edit skips the output check
+/// for every edit in it, and the original is not compiled at all.
 struct ReverifyGate<'a> {
     /// The name each candidate is linted under: the original's.
     name: &'a str,
