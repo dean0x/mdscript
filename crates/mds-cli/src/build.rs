@@ -1589,21 +1589,28 @@ pub(crate) fn verify_then_delete_map(
             Ok(())
         }
         Ok(Removal::Missing) => Ok(()),
-        Ok(Removal::Kept) | Err(NotRemoved::NotAFile) => {
-            if !quiet {
-                crate::output::ewriteln!(
-                    "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
-                    crate::output::safe_path(&map.shown)
-                );
-            }
-            Ok(())
-        }
+        Ok(Removal::Kept) => keep_stale_map(map, "not proven to be written by mds", quiet),
+        Err(not_a_file @ NotRemoved::NotAFile) => keep_stale_map(map, not_a_file.cause(), quiet),
         Err(not_removed) => Err(crate::output::stale_removal_error(
             "stale map",
             &map.shown,
             &not_removed,
         )),
     }
+}
+
+/// The warning for a stale map left in place, `warning: kept stale map <path>: <why>`, in
+/// the words of the stale outputs `mds build` keeps ([`crate::output::probe_and_remove_stale`]);
+/// none under `quiet`. The path is `map.shown` (#390).
+fn keep_stale_map(map: &WriteTarget, why: &str, quiet: bool) -> Result<(), MdsError> {
+    if !quiet {
+        crate::output::ewriteln!(
+            "warning: kept stale map {}: {}",
+            crate::output::safe_path(&map.shown),
+            crate::output::safe_inline(why)
+        );
+    }
+    Ok(())
 }
 
 /// Whether `reader` starts with the bytes every sidecar mds writes for the output named
