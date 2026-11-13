@@ -316,7 +316,7 @@ jobs:
       # silent cargo-binstall/source-build substitution.
       - name: Install cargo-zigbuild (pinned)
         if: matrix.settings.use-zig
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532  # v2.86.3
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8  # v2.87.28
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
