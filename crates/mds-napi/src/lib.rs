@@ -254,6 +254,20 @@ fn throw_options_error(env: &Env, msg: &str) -> napi::Error {
     throw_coded_error(env, msg, "mds::invalid_options")
 }
 
+/// Preserve a pending JS exception; code and wire-escape other conversion errors.
+fn conversion_error(env: &Env, prefix: &str, error: napi::Error) -> napi::Error {
+    if error.status == Status::PendingException {
+        return error;
+    }
+    throw_options_error(
+        env,
+        &format!(
+            "{prefix}{}",
+            mds::sanitize_control_chars_wire(&error.to_string())
+        ),
+    )
+}
+
 /// Create a `mds::resource_limit` JS exception and return `PendingException`.
 fn throw_resource_limit(env: &Env, msg: &str) -> napi::Error {
     throw_coded_error(env, msg, "mds::resource_limit")
@@ -383,7 +397,9 @@ fn napi_type_name(vt: ValueType) -> &'static str {
 fn reject_unknown_napi_keys(env: &Env, obj: &Object, known: &[&str]) -> napi::Result<()> {
     let names_obj: Object = obj.get_property_names()?;
     // Deserialize the property-names Array into a JSON array of strings.
-    let names_json: serde_json::Value = env.from_js_value(names_obj)?;
+    let names_json: serde_json::Value = env
+        .from_js_value(names_obj)
+        .map_err(|e| conversion_error(env, "invalid options: ", e))?;
     let keys: Vec<String> = match names_json {
         serde_json::Value::Array(arr) => arr
             .into_iter()
@@ -457,7 +473,9 @@ fn extract_vars_direct(env: &Env, obj: &Object) -> napi::Result<Option<HashMap<S
         ValueType::Undefined | ValueType::Null => Ok(None),
         ValueType::Object => {
             // Deserialize only the vars sub-value.
-            let vars_json: serde_json::Value = env.from_js_value(val)?;
+            let vars_json: serde_json::Value = env
+                .from_js_value(val)
+                .map_err(|e| conversion_error(env, "invalid options.vars: ", e))?;
             // Note: ValueType::Object includes JS arrays, which serde deserializes
             // as Value::Array. The `let Value::Object(map) else` guard inside
             // parse_json_vars rejects arrays and non-objects.
@@ -807,7 +825,9 @@ fn extract_rules_direct(
         ValueType::Object => {
             // Deserialize the rules sub-object; js arrays also satisfy Object so
             // we guard against that in the JSON shape check below.
-            let rules_json: serde_json::Value = env.from_js_value(val)?;
+            let rules_json: serde_json::Value = env
+                .from_js_value(val)
+                .map_err(|e| conversion_error(env, "invalid options.rules: ", e))?;
             let serde_json::Value::Object(rules_map) = rules_json else {
                 return Err(throw_options_error(
                     env,

@@ -2,11 +2,12 @@
  * Backend contract parity tests for @mdscript/mds.
  * Tests: U-BC1 through U-BC20
  *
- * All tests use STUB backend objects — no live wasm build required.
- * This file is env-independent and must pass in CI on every platform.
+ * Shape tests use stub backends. Conversion parity tests require current native
+ * and WASM builds and fail if either backend is absent.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import {
   assertResultShape,
   validateBackendMethods,
@@ -14,8 +15,40 @@ import {
   NODE_METHODS,
   WASM_EXPORTS,
 } from '../dist/backend/contract.js';
-import { createWasmBackend } from '../dist/backend/wasm.js';
+import { createWasmBackend, initWasmNode } from '../dist/backend/wasm.js';
 import { createNativeBackend } from '../dist/backend/native.js';
+
+// Both live backends must reject the same unsupported value at the same field.
+test('native and WASM conversion errors share their code and field prefix', async () => {
+  const require = createRequire(import.meta.url);
+  const native = createNativeBackend(require('../../../crates/mds-napi/mds-napi.node'));
+  const wasm = createWasmBackend(await initWasmNode());
+  const prefix = 'invalid options.vars: ';
+  const summarize = (backend) => {
+    let error;
+    try {
+      backend.compile('ok', { vars: { bad: Symbol('unsupported') } });
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error instanceof Error, 'the unsupported value must reach the converter');
+    return [error.code, error.message.slice(0, prefix.length)];
+  };
+  assert.deepEqual(
+    [summarize(native), summarize(wasm)],
+    Array.from({ length: 2 }, () => ['mds::invalid_options', prefix]),
+  );
+  const assertClean = (backend) => assert.equal(
+    backend.compile('{{value}}', { vars: { value: 'ok' } }).output,
+    'ok\n',
+  );
+  assertClean(native);
+  assertClean(wasm);
+  assert.throws(
+    () => assertClean({ compile: () => ({ output: 'wrong' }) }),
+    assert.AssertionError,
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Method manifest assertions (AC-API-09)

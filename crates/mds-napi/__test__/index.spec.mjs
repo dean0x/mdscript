@@ -595,6 +595,85 @@ describe('options validation', () => {
   });
 });
 
+describe('options conversion errors', () => {
+  const hostile = `value${String.fromCharCode(0x1b)}[31m${String.fromCharCode(0x202e)}`;
+  const cases = [
+    ['Symbol', () => Symbol(hostile)],
+    ['Function', () => function unsupported() {}],
+  ];
+  const fields = [
+    ['vars', (value) => compile('ok', { vars: { bad: value } })],
+    ['rules', (value) => addon.lint('ok', { rules: { bad: value } })],
+  ];
+
+  for (const [field, invoke] of fields) {
+    for (const [type, makeValue] of cases) {
+      test(`${field} conversion rejects ${type} with a coded field prefix`, () => {
+        assert.throws(() => invoke(makeValue()), (err) => {
+          assert.equal(err.code, 'mds::invalid_options');
+          assert.ok(err.message.startsWith(`invalid options.${field}: `), err.message);
+          assert.ok(err.message.includes(`typeof ${type} value could not be deserialized`), err.message);
+          assert.ok(!err.message.includes(String.fromCharCode(0x1b)), err.message);
+          assert.ok(!err.message.includes(String.fromCharCode(0x202e)), err.message);
+          return true;
+        });
+      });
+    }
+
+    test(`${field} conversion preserves a getter exception without a second throw`, () => {
+      const original = new Error(`getter ${hostile}`);
+      let calls = 0;
+      const value = { get bad() { calls += 1; throw original; } };
+      const invokeObject = (object) => field === 'vars'
+        ? compile('ok', { vars: object })
+        : addon.lint('ok', { rules: object });
+      assert.throws(() => invokeObject(value), (err) => err === original);
+      assert.equal(calls, 1);
+      assert.equal(original.code, undefined);
+      assert.equal(original.message, `getter ${hostile}`);
+      // The same assertion must refuse a value whose getter returns normally.
+      assert.throws(
+        () => assert.throws(
+          () => invokeObject({ get bad() { return field === 'vars' ? 'ok' : 'off'; } }),
+          (err) => err === original,
+        ),
+        assert.AssertionError,
+      );
+    });
+  }
+
+  test('all JSON conversion sites use the coded, wire-escaped error boundary', () => {
+    // napi-rs currently returns fixed text for Symbol and Function values. Inspect
+    // the boundary too, so those messages cannot hide a missing wire escaper.
+    const source = fs.readFileSync(new URL('../src/lib.rs', import.meta.url), 'utf8');
+    const assertBoundary = (text) => {
+      const calls = [...text.matchAll(
+        /\.from_js_value\(\w+\)\s*\.map_err\(\|e\| conversion_error\(env, "([^"]+)", e\)\)\?/g,
+      )].map((match) => match[1]);
+      assert.deepEqual(calls, ['invalid options: ', 'invalid options.vars: ', 'invalid options.rules: ']);
+      assert.equal([...text.matchAll(/\.from_js_value\(/g)].length, calls.length);
+      const helper = text.slice(text.indexOf('fn conversion_error('), text.indexOf('fn throw_resource_limit('));
+      assert.match(helper, /mds::sanitize_control_chars_wire\(&error\.to_string\(\)\)/);
+    };
+    assertBoundary(source);
+    assert.throws(
+      () => assertBoundary(source.replace('mds::sanitize_control_chars_wire(&error.to_string())', 'error.to_string()')),
+      assert.AssertionError,
+    );
+    assert.throws(
+      () => assertBoundary(source.replace('invalid options: ', 'wrong prefix: ')),
+      assert.AssertionError,
+    );
+  });
+
+  test('clean vars and rules still compile and lint', () => {
+    const assertClean = (result) => assert.equal(result.output, 'ok\n');
+    assertClean(compile('{{value}}', { vars: { value: 'ok' } }));
+    assert.equal(addon.lint('ok', { rules: { 'unused-variable': 'off' } }).version, 1);
+    assert.throws(() => assertClean({ output: 'wrong' }), assert.AssertionError);
+  });
+});
+
 // ── Resource limit tests ──────────────────────────────────────────────────────
 
 describe('resource limits', () => {
