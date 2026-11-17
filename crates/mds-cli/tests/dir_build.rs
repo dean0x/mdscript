@@ -2823,6 +2823,41 @@ fn dir_build_writes_a_module_output_over_a_module_but_never_over_its_import() {
     );
 }
 
+/// A directory build applies the input rule per source (#425). A module generator may
+/// replace a module another source imports. These results do not depend on source order;
+/// the test does not assert which version the consumer reads.
+#[test]
+fn dir_build_regenerates_a_module_another_source_imports() {
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(
+        base.path().join("v.json"),
+        r#"{"fm":"---\ntype: mds\n---"}"#,
+    )
+    .unwrap();
+    fs::write(src.join("gen.mds"), "{{fm}}\nGenerated\n").unwrap();
+    fs::write(src.join("gen.md"), MODULE).unwrap();
+    fs::write(src.join("user.mds"), "@import \"./gen.md\" as g\nUser\n").unwrap();
+
+    let (code, report) = build_in(base.path(), &["src", "--vars", "v.json"]);
+    assert!(
+        !report.contains("refusing to replace a file this run reads"),
+        "another source's import does not refuse the generator's write: {report}"
+    );
+    assert_eq!(code, Some(0), "report: {report}");
+    assert_eq!(
+        fs::read_to_string(src.join("gen.md")).unwrap(),
+        "---\ntype: mds\n---\nGenerated\n",
+        "the generator replaces the hand-written module; report: {report}"
+    );
+    assert_eq!(
+        fs::read_to_string(src.join("user.md")).unwrap(),
+        "User\n",
+        "the consumer writes its output; report: {report}"
+    );
+}
+
 /// A directory build never writes an output over the `mds.json` nearest a source (#425) —
 /// the one `mds build <source>` holds in force — as file mode never does: `mds build .`
 /// refuses `sub/mds.mds`'s messages output `./sub/mds.json`, `mds::io`, leaves it as it
