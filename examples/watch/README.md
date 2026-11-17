@@ -185,9 +185,10 @@ mds watch examples/watch --out-dir /tmp/watch-demo --poll-interval 0
 
 ### `--clear`
 
-Clear the terminal before each rebuild, so the latest output is always at the
-top. Only takes effect when stderr is a TTY (has no effect when output is
-redirected):
+Clear the terminal before the first line each rebuild prints, so the latest
+output is always at the top. A rebuild that prints nothing — its output did not
+change — leaves the screen as it is. Only takes effect when stderr is a TTY
+(has no effect when output is redirected):
 
 ```bash
 mds watch examples/watch/prompt.mds -o - --clear

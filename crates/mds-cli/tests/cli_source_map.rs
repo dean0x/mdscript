@@ -1081,8 +1081,9 @@ fn sm16_stale_map_not_smv3_preserved_with_warning() {
     // (ii) A warning must appear on stderr.
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("warning:") && stderr.contains("out.md.map"),
-        "expected a warning about leaving the non-SMv3 map in place, got stderr: {stderr:?}"
+        stderr.contains("warning: kept stale map")
+            && stderr.contains("out.md.map: not proven to be written by mds"),
+        "expected a warning about keeping the non-SMv3 map, got stderr: {stderr:?}"
     );
 
     // With --quiet the warning must be suppressed (but the file is still preserved).
@@ -1143,17 +1144,20 @@ fn run_bounded(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
 
 /// #428: a build without `--source-map` deletes the sidecar an earlier `--source-map`
 /// build wrote (the control), and leaves anything else at `<output>.map` in place with
-/// the warning: a hand-formatted map with the same fields, a 64 MiB file of anything
-/// else (only a sidecar's first bytes are read), and on Unix a FIFO, which is never
-/// opened — opening one with no writer blocks.
+/// a warning: for a regular file that is no sidecar — a hand-formatted map with the same
+/// fields, a 64 MiB file of anything else (only a sidecar's first bytes are read) —
+/// `kept stale map <path>: not proven to be written by mds`; and for what is no regular
+/// file, on Unix a FIFO, which is never opened — opening one with no writer blocks — and
+/// a directory, `kept stale map <path>: not a regular file` (#160).
 #[test]
 fn sm16c_stale_map_check_leaves_anything_but_a_sidecar_in_place() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("page.mds"), "Hi\n").unwrap();
     let map = dir.path().join("out.md.map");
     let rebuild = ["build", "page.mds", "-o", "out.md"];
-    let warning =
-        "warning: leaving out.md.map in place — not a tool-generated SMv3 map (version/file mismatch)";
+    let warning = "warning: kept stale map out.md.map: not proven to be written by mds";
+    #[cfg(unix)]
+    let not_a_file = "warning: kept stale map out.md.map: not a regular file";
 
     let (code, stderr) = run_bounded(
         dir.path(),
@@ -1201,9 +1205,21 @@ fn sm16c_stale_map_check_leaves_anything_but_a_sidecar_in_place() {
         assert!(made.success(), "mkfifo out.md.map");
         let (code, stderr) = run_bounded(dir.path(), &rebuild);
         let fifo = std::fs::symlink_metadata(&map).is_ok_and(|m| m.file_type().is_fifo());
-        if code != Some(0) || !fifo || !stderr.lines().any(|l| l == warning) {
+        if code != Some(0) || !fifo || !stderr.lines().any(|l| l == not_a_file) {
             mismatches.push(format!(
                 "FIFO: exit {code:?}, left in place: {fifo}; stderr: {stderr}"
+            ));
+        }
+
+        // A directory is no regular file either; it is not opened, and says so. Unix-only
+        // with the FIFO: what opening a directory by path does is not the same on Windows.
+        std::fs::remove_file(&map).unwrap();
+        std::fs::create_dir(&map).unwrap();
+        let (code, stderr) = run_bounded(dir.path(), &rebuild);
+        if code != Some(0) || !map.is_dir() || !stderr.lines().any(|l| l == not_a_file) {
+            mismatches.push(format!(
+                "directory: exit {code:?}, left in place: {}; stderr: {stderr}",
+                map.is_dir()
             ));
         }
     }
