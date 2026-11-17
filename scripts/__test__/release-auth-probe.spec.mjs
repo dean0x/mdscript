@@ -610,6 +610,10 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
   // matches the release-surface paths filter) the upload would have SUCCEEDED,
   // publishing an unreleased version from an unmerged branch.
   //
+  // The planted fixture below keeps the v1.14.2 line that run executed: the
+  // check matches the action name, not its version. v1.14.3 has no dry-run
+  // input either.
+  //
   // There is no no-upload mode to configure. The rehearsal must reproduce what
   // the action does — pull its GHCR image and run twine out of it — never call it.
   // -------------------------------------------------------------------------
@@ -747,6 +751,53 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
       `positive control: "a892a5a61159132606e93a2fa6f4358831b04d26" must be REJECTED ` +
       `(it matches /^[0-9a-f]{40}$/ but not /^v\\d+\\.\\d+\\.\\d+$/)`,
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // S23: the publish pin is v1.14.3 or later.
+  //
+  // v1.14.3 updates the certifi and sigstore releases that the PyPI upload and
+  // its attestations use. S16 keeps the three pins equal; it does not stop all
+  // three from moving back together. This test does. The compare is numeric:
+  // as text, "v1.9.9" sorts after "v1.14.3".
+  // -------------------------------------------------------------------------
+  test('S23: every pypa/gh-action-pypi-publish pin is v1.14.3 or later', () => {
+    const FLOOR = [1, 14, 3];
+    const parse = ref => {
+      const m = /^v(\d+)\.(\d+)\.(\d+)$/.exec(ref);
+      return m === null ? null : m.slice(1).map(Number);
+    };
+    const atLeastFloor = ref => {
+      const v = parse(ref);
+      if (v === null) return false;
+      const i = v.findIndex((n, k) => n !== FLOOR[k]);
+      return i === -1 || v[i] > FLOOR[i];
+    };
+
+    // Positive controls (PF-013): the check must reject a pin below the floor,
+    // a pin that only text order puts above it, and a SHA; and accept the floor.
+    for (const bad of ['v1.14.2', 'v1.9.9', 'v0.99.99', 'a892a5a61159132606e93a2fa6f4358831b04d26']) {
+      assert.equal(atLeastFloor(bad), false, `positive control: "${bad}" must be REJECTED`);
+    }
+    for (const good of ['v1.14.3', 'v1.15.0', 'v2.0.0']) {
+      assert.equal(atLeastFloor(good), true, `control: "${good}" must be ACCEPTED`);
+    }
+
+    const raw = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(raw !== null, 'rehearse-publish-python must exist (see S5)');
+    const pinRef = /^\s+PIN_REF:\s*(\S+)\s*$/m.exec(stripCommentLines(raw));
+    assert.ok(pinRef !== null, 'rehearse-publish-python must declare PIN_REF (see S16)');
+    const refs = [pinRef[1], ...[...stripCommentLines(yml)
+      .matchAll(/uses:\s*pypa\/gh-action-pypi-publish@(\S+)/g)].map(x => x[1])];
+    // Non-vacuity: PIN_REF plus the two publish steps (S14).
+    assert.equal(refs.length, 3, `expected PIN_REF and 2 uses: pins; found ${JSON.stringify(refs)}`);
+    for (const ref of refs) {
+      assert.ok(
+        atLeastFloor(ref),
+        `pypa/gh-action-pypi-publish pin "${ref}" is below v1.14.3. Earlier releases ` +
+        'carry older certifi and sigstore. Bump PIN_REF and both uses: pins together (S16).',
+      );
+    }
   });
 
   // -------------------------------------------------------------------------
