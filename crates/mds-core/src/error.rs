@@ -418,7 +418,13 @@ pub enum MdsError {
         code(mds::not_mds),
         help("use .mds extension or add 'type: mds' to frontmatter")
     )]
-    NotMdsFile { path: String },
+    NotMdsFile {
+        path: String,
+        #[label("imported here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
 
     #[error("{message}")]
     #[diagnostic(code(mds::io))]
@@ -997,7 +1003,31 @@ impl MdsError {
     }
 
     pub(crate) fn not_mds_file(path: impl Into<String>) -> Self {
-        MdsError::NotMdsFile { path: path.into() }
+        MdsError::NotMdsFile {
+            path: path.into(),
+            span: None,
+            src: None,
+        }
+    }
+
+    /// Construct a [`NotMdsFile`][MdsError::NotMdsFile] error at an importing directive.
+    ///
+    /// `path` is the target's display text, escaped with [`crate::escape_path_for_message`].
+    /// `file` is the importer's root-relative label; `offset` and `len` index its `source`.
+    /// The shared span constructor sanitizes the label and source for display.
+    pub fn not_mds_file_at(
+        path: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::NotMdsFile {
+            path: path.into(),
+            span,
+            src,
+        }
     }
 
     /// Construct a `FormatterInvariant` error, signaling that the formatter's
@@ -1058,6 +1088,7 @@ impl MdsError {
             | MdsError::TypeMismatch { span, src, .. }
             | MdsError::CircularImport { span, src, .. }
             | MdsError::FileNotFound { span, src, .. }
+            | MdsError::NotMdsFile { span, src, .. }
             | MdsError::ModuleNotFound { span, src, .. }
             | MdsError::ImportError { span, src, .. }
             | MdsError::NameCollision { span, src, .. }
@@ -1084,8 +1115,7 @@ impl MdsError {
                     }
                 })
             }
-            MdsError::NotMdsFile { .. }
-            | MdsError::Io { .. }
+            MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
@@ -1169,6 +1199,7 @@ impl MdsError {
             | MdsError::TypeMismatch { src, .. }
             | MdsError::CircularImport { src, .. }
             | MdsError::FileNotFound { src, .. }
+            | MdsError::NotMdsFile { src, .. }
             | MdsError::ModuleNotFound { src, .. }
             | MdsError::ImportError { src, .. }
             | MdsError::NameCollision { src, .. }
@@ -1177,8 +1208,7 @@ impl MdsError {
             | MdsError::BuiltinError { src, .. }
             | MdsError::Extends { src, .. }
             | MdsError::MixedContent { src, .. } => src.as_deref(),
-            MdsError::NotMdsFile { .. }
-            | MdsError::Io { .. }
+            MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }

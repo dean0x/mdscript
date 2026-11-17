@@ -668,6 +668,8 @@ pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
     if path.extension().and_then(|e| e.to_str()) != Some("mds") {
         return Err(MdsError::NotMdsFile {
             path: shown.into_owned(),
+            span: None,
+            src: None,
         });
     }
     Ok(())

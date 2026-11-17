@@ -1829,19 +1829,18 @@ impl ModuleCache {
             ExportDirective::ReExport {
                 name,
                 path: import_path,
-                ..
+                offset,
             } => {
                 // Resolve the source module and bring in the function for
                 // re-export only. Per spec: "@export from does not bring the
                 // symbol into the current file's scope".
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
-                let source_module = self.resolve_import_from(
-                    ctx.base_dir,
-                    import_path,
-                    ctx.runtime_vars,
-                    warnings,
-                )?;
+                let source_module = self
+                    .resolve_import_from(ctx.base_dir, import_path, ctx.runtime_vars, warnings)
+                    .map_err(|e| {
+                        attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
+                    })?;
                 let func = source_module.get_export(name).ok_or_else(|| {
                     MdsError::export_error(format!(
                         "cannot re-export '{name}': not exported from \"{import_path}\""
@@ -1858,12 +1857,11 @@ impl ModuleCache {
                 // available to importers but NOT in the current file's scope.
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
-                let source_module = self.resolve_import_from(
-                    ctx.base_dir,
-                    import_path,
-                    ctx.runtime_vars,
-                    warnings,
-                )?;
+                let source_module = self
+                    .resolve_import_from(ctx.base_dir, import_path, ctx.runtime_vars, warnings)
+                    .map_err(|e| {
+                        attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
+                    })?;
                 let line_len = line_len_at(ctx.source, *offset);
                 for (name, func) in source_module.get_all_exports() {
                     if defs.functions.contains_key(&name) {
@@ -2779,10 +2777,8 @@ fn key_display_name(key: &str) -> &str {
     key.rsplit(['/', '\\']).next().unwrap_or(key)
 }
 
-/// If `err` is a `FileNotFound` error with no source span, attach a span pointing
-/// to the `@import` directive in the parent file. Other error variants are returned
-/// unchanged so that cascading errors (e.g. circular imports inside the missing
-/// file) still report their own locations.
+/// Attach the importing directive's span to a spanless file, module, or cycle error.
+/// Keep an existing span so errors inside another module retain their own source.
 fn attach_import_span(
     err: MdsError,
     path: &str,
@@ -2802,6 +2798,9 @@ fn attach_import_span(
         MdsError::FileNotFound { span: None, .. } => {
             MdsError::file_not_found_at(path, file_str, source, offset, line_len)
         }
+        MdsError::NotMdsFile {
+            path, span: None, ..
+        } => MdsError::not_mds_file_at(path, file_str, source, offset, line_len),
         MdsError::ModuleNotFound {
             key, span: None, ..
         } => MdsError::module_not_found_at(key, file_str, source, offset, line_len),

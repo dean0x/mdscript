@@ -4347,3 +4347,111 @@ fn check_module_type_judges_the_key_and_names_the_typed_path_escaped() {
         Err("not an MDS file: ./page.md".to_string())
     );
 }
+
+// #423 directive coverage: import (alias/merge/selective), export-from
+// (named/wildcard), and extends: span yes. Include does not load a file; its
+// namespace import owns the span. Entry and frontmatter imports: span no.
+fn assert_not_mds_directive_span(directive: &str) {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub").join("b.mds");
+    let source = format!("\n\n{directive}\n");
+    std::fs::write(&entry, "@import \"./sub/b.mds\" as b\nEntry\n").unwrap();
+    std::fs::write(root.join("sub").join("c.txt"), "@import \"./never.mds\"\n").unwrap();
+    std::fs::write(
+        root.join("sub").join("c.mds"),
+        "@define f():\nOK\n@end\nBody\n",
+    )
+    .unwrap();
+
+    // The same directive accepts an MDS target before it refuses c.txt.
+    std::fs::write(&importer, source.replace("c.txt", "c.mds")).unwrap();
+    crate::compile(&entry, None).expect("control: the directive reaches an MDS target");
+    std::fs::write(&importer, &source).unwrap();
+    assert!(importer.canonicalize().unwrap().is_absolute());
+
+    let intrinsic = crate::compile(&entry, None).unwrap_err();
+    let cached = ModuleCache::native()
+        .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    for err in [intrinsic, cached] {
+        let serialized = err.serialize();
+        assert_eq!(serialized.code, "mds::not_mds");
+        assert_eq!(serialized.message, "not an MDS file: ./c.txt");
+        let span = serialized
+            .span
+            .expect("the inner directive must carry a span");
+        assert_eq!(
+            (span.offset, span.length),
+            (2, directive.lines().next().unwrap().len())
+        );
+        assert_eq!((span.line, span.column), (Some(3), Some(1)));
+        assert_eq!(err.source_name(), Some("sub/b.mds"));
+        assert!(!std::path::Path::new(err.source_name().unwrap()).is_absolute());
+    }
+}
+
+#[test]
+fn not_mds_alias_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\" as c");
+}
+
+#[test]
+fn not_mds_merge_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_selective_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import { f } from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_named_reexport_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@export f from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_wildcard_reexport_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@export * from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_extends_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@extends \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_include_uses_its_namespace_import_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\" as c\n@include c");
+}
+
+#[test]
+fn not_mds_frame_neutralizes_control_on_import_line() {
+    let source = "\n@import \x0b\"./c.txt\"\n";
+    assert!(
+        source.contains(char::from(0x0b)),
+        "control: source has a control byte"
+    );
+    let err = compile_virtual(&[("a.mds", source), ("c.txt", "Hi\n")], "a.mds").unwrap_err();
+    assert_eq!(err.serialize().code, "mds::not_mds");
+    let mut frame = String::new();
+    miette::NarratableReportHandler::new()
+        .render_report(&mut frame, &err)
+        .unwrap();
+    assert!(frame.contains("@import ?\"./c.txt\""), "{frame}");
+    assert!(!frame.contains(char::from(0x0b)), "{frame}");
+}
+
+#[test]
+fn not_mds_entry_and_frontmatter_imports_keep_no_span() {
+    let entry = compile_virtual(&[("c.txt", "Hi\n")], "c.txt").unwrap_err();
+    for err in std::iter::once(entry).chain(["", "    as: c\n", "    names: [f]\n"].map(|form| {
+        let source = format!("---\nimports:\n  - path: ./c.txt\n{form}---\nBody\n");
+        compile_virtual(&[("a.mds", &source), ("c.txt", "Hi\n")], "a.mds").unwrap_err()
+    })) {
+        assert_eq!(err.serialize().code, "mds::not_mds");
+        assert!(err.serialize().span.is_none());
+        assert!(err.source_name().is_none());
+    }
+}

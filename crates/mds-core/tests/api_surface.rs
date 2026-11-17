@@ -142,6 +142,48 @@ fn check_module_type_function_exists() {
     .unwrap();
 }
 
+/// #423: a not-MDS error exposes the importing directive's span and source name.
+#[test]
+fn not_mds_import_span_is_public() {
+    let err = mds::compile_virtual(
+        HashMap::from([
+            ("a.mds".to_string(), "\n@import \"./c.txt\"\n".to_string()),
+            ("c.txt".to_string(), "Hi\n".to_string()),
+        ]),
+        "a.mds",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.serialize().code, "mds::not_mds");
+    let span = err.serialize().span.expect("not-MDS import span is public");
+    assert_eq!((span.offset, span.length), (1, 17));
+    assert_eq!((span.line, span.column), (Some(2), Some(1)));
+    assert_eq!(err.source_name(), Some("a.mds"));
+
+    let _: fn(String, &str, &str, usize, usize) -> MdsError = MdsError::not_mds_file_at;
+    let constructed =
+        MdsError::not_mds_file_at("./c.txt", "a.mds", "\n@import \"./c.txt\"\n", 1, 17);
+    match &constructed {
+        MdsError::NotMdsFile { path, span, src } => {
+            let _: &String = path;
+            let _: &Option<miette::SourceSpan> = span;
+            let _: &Option<std::sync::Arc<miette::NamedSource<String>>> = src;
+            assert_eq!(path, "./c.txt");
+            assert_eq!(span.as_ref().map(|s| (s.offset(), s.len())), Some((1, 17)));
+            assert_eq!(src.as_ref().map(|s| s.name()), Some("a.mds"));
+        }
+        other => panic!("expected NotMdsFile, got {other:?}"),
+    }
+    assert_eq!(constructed.serialize().span, err.serialize().span);
+    assert_eq!(constructed.source_name(), err.source_name());
+
+    // A caller-supplied label uses the same escape rule as resolver-built labels.
+    let label = "a\x1b\n.mds";
+    assert!(label.contains(char::from(0x1b)) && label.contains('\n'));
+    let escaped = MdsError::not_mds_file_at("./c.txt", label, "@import \"./c.txt\"\n", 0, 17);
+    assert_eq!(escaped.source_name(), Some("a\\u001B\\u000A.mds"));
+}
+
 /// #414: `scan_import_records` and its `#[non_exhaustive]` `ImportRecord` /
 /// `ImportKind` / `ResolveAs` are reachable from the crate root: the fields are
 /// readable, and a match on the kind or on `ResolveAs` needs a wildcard arm, as a new
@@ -330,6 +372,8 @@ fn mds_error_variants_exist() {
     };
     let _ = MdsError::NotMdsFile {
         path: "test.md".to_string(),
+        span: None,
+        src: None,
     };
     let _ = MdsError::Io {
         message: "test".to_string(),
