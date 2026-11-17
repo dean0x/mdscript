@@ -697,9 +697,9 @@ pub fn display_native_path(path: &Path) -> std::borrow::Cow<'_, Path> {
 /// `\uXXXX` literals. HUMAN mode — this is terminal output, so `\n` stays raw
 /// (the wire counterpart is `CompileResult::to_canonical_json`, which escapes it).
 ///
-/// A failed write (a closed stderr, for example) stops the print and is dropped:
-/// the warnings are still in the result, and a print failure must not fail or
-/// panic a good compile (#435).
+/// A failed write (a pipe whose reader has exited, for example) stops the print
+/// and is dropped: the warnings are still in the result, and a print failure must
+/// not fail or panic a good compile (#435).
 fn emit_warnings(warnings: &[String]) {
     use std::io::Write;
 

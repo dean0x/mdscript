@@ -1,8 +1,9 @@
-//! A closed stderr does not crash a compile that prints its warnings (#435).
+//! A stderr with no reader does not crash a compile that prints its warnings (#435).
 //!
-//! The non-collecting entry points (`compile`, `compile_str_with`, `check`,
-//! `check_str_with`, `compile_virtual`, `check_virtual`) print each warning to stderr.
-//! A write to a closed stderr fails; the print must drop that error, not panic.
+//! The non-collecting entry points (`compile`, `compile_file`, `compile_str_with`,
+//! `check`, `check_str_with`, `compile_virtual`, `check_virtual`) print each warning
+//! to stderr. A write to a pipe with no reader fails; the print must drop that error,
+//! not panic.
 //!
 //! Each parent test runs this binary again as a child that compiles a template with
 //! one warning. In the closed mode, the child's stderr is a pipe whose read end is
@@ -14,6 +15,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
 
 /// Set in the child's environment only, to the child's mode; the child test does
 /// nothing without it.
@@ -73,7 +75,15 @@ fn closed_stderr_child() {
     println!("{COMPILE_DONE}");
 }
 
-/// Runs the child test in `mode`, with `stderr` as its stderr.
+/// Held by each parent test from its pipe's creation to its child's exit. Under
+/// `cargo test` the parent tests run as threads of one process; on macOS a new
+/// pipe end is close-on-exec only after a second call, so a child spawned by the
+/// other test in that window would inherit the closed mode's read end, and the
+/// closed mode's stderr would then have a reader.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+/// Runs the child test in `mode`, with `stderr` as its stderr. The caller holds
+/// [`SPAWN`] from before it makes `stderr`.
 fn run_child(mode: &str, stderr: Stdio) -> Output {
     let exe = std::env::current_exe().expect("locate the test binary");
     Command::new(exe)
@@ -107,6 +117,7 @@ fn assert_child_passed(output: &Output) -> String {
 
 #[test]
 fn a_compile_that_prints_a_warning_to_a_closed_stderr_succeeds() {
+    let _spawn = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
     let (reader, writer) = std::io::pipe().expect("create a pipe");
     drop(reader);
 
@@ -120,6 +131,7 @@ fn a_compile_that_prints_a_warning_to_a_closed_stderr_succeeds() {
 
 #[test]
 fn a_compile_prints_its_warning_to_an_open_stderr() {
+    let _spawn = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
     let output = run_child(MODE_OPEN, Stdio::piped());
     assert_child_passed(&output);
 
