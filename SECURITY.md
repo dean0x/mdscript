@@ -202,7 +202,10 @@ input. The compiler enforces several defense-in-depth controls:
   whose frontmatter declares `type: mds`, which a template can import — or over a
   file the run reads: the entry, an imported module, the `--vars` file, the
   `mds.json` in force — in directory mode also the `mds.json` nearest each source,
-  which a file-mode build of it would hold in force. Just before the rename the
+  which a file-mode build of it would hold in force.
+  In directory mode, this input rule applies per source: its own compile's entry and imported modules.
+  The `--vars` file and the `mds.json` files named above count too.
+  Just before the rename the
   file at the output path is looked at in the directory the write walked to: a
   `.mds` file is a module by its name, never read, and a `.md` file is read as
   opened there (on Windows, by path); it is compared with each file the run reads,
@@ -211,7 +214,9 @@ input. The compiler enforces several defense-in-depth controls:
   file the run reads are refused and left as they are (`mds::io`, #425). One put
   there in the instant between that look and the rename is replaced. An output that
   itself declares `type: mds` — a module a template generates — replaces a module,
-  its own or one written by hand, though never a file the run reads. On Windows a
+  its own or one written by hand, though never a file the run reads.
+  A generator may replace a module that another source of the same directory run imports.
+  A source compiled before the generator reads the module as it was. On Windows a
   name holding a `:` — NTFS stream syntax, `lib.mds::$DATA` being `lib.mds` itself —
   is refused before anything is written (`invalid filename`), so no write reaches a
   module by a name the check does not take for one.
