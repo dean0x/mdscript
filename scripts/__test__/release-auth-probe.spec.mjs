@@ -785,17 +785,21 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
 
     const raw = extractJobSection(yml, 'rehearse-publish-python');
     assert.ok(raw !== null, 'rehearse-publish-python must exist (see S5)');
-    const pinRef = /^\s+PIN_REF:\s*(\S+)\s*$/m.exec(stripCommentLines(raw));
-    assert.ok(pinRef !== null, 'rehearse-publish-python must declare PIN_REF (see S16)');
-    const refs = [pinRef[1], ...[...stripCommentLines(yml)
+    // Every PIN_REF line: a second one set at step level must not escape the floor.
+    const pinRefs = [...stripCommentLines(raw).matchAll(/^\s+PIN_REF:\s*(\S+)\s*$/gm)].map(x => x[1]);
+    assert.equal(pinRefs.length, 1,
+      `rehearse-publish-python must declare PIN_REF exactly once (see S16); found ${JSON.stringify(pinRefs)}`);
+    const refs = [...pinRefs, ...[...stripCommentLines(yml)
       .matchAll(/uses:\s*pypa\/gh-action-pypi-publish@(\S+)/g)].map(x => x[1])];
     // Non-vacuity: PIN_REF plus the two publish steps (S14).
     assert.equal(refs.length, 3, `expected PIN_REF and 2 uses: pins; found ${JSON.stringify(refs)}`);
+    const floor = `v${FLOOR.join('.')}`;
     for (const ref of refs) {
       assert.ok(
         atLeastFloor(ref),
-        `pypa/gh-action-pypi-publish pin "${ref}" is below v1.14.3. Earlier releases ` +
-        'carry older certifi and sigstore. Bump PIN_REF and both uses: pins together (S16).',
+        `pypa/gh-action-pypi-publish pin "${ref}" is not a vX.Y.Z tag at or above ${floor}. ` +
+        'Earlier releases carry older certifi and sigstore. Bump PIN_REF and both uses: ' +
+        'pins together (S16).',
       );
     }
   });
