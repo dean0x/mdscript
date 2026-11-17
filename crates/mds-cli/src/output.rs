@@ -5390,9 +5390,7 @@ mod tests {
                 false,
             ),
             (
-                miette::Report::new(MdsError::NotMdsFile {
-                    path: "a.txt".to_owned(),
-                }),
+                miette::Report::new(MdsError::not_mds_file("a.txt")),
                 true,
                 false,
             ),

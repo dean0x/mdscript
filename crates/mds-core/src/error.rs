@@ -1002,7 +1002,10 @@ impl MdsError {
         }
     }
 
-    pub(crate) fn not_mds_file(path: impl Into<String>) -> Self {
+    /// Construct a spanless [`NotMdsFile`][MdsError::NotMdsFile] error.
+    ///
+    /// `path` is display text escaped with [`crate::escape_path_for_message`].
+    pub fn not_mds_file(path: impl Into<String>) -> Self {
         MdsError::NotMdsFile {
             path: path.into(),
             span: None,

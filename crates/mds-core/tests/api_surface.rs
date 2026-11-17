@@ -142,6 +142,24 @@ fn check_module_type_function_exists() {
     .unwrap();
 }
 
+#[test]
+fn not_mds_file_constructor_is_public_and_spanless() {
+    let constructor: fn(String) -> MdsError = MdsError::not_mds_file;
+    let err = constructor("./sub/../doc.txt".to_owned());
+    match &err {
+        MdsError::NotMdsFile { path, span, src } => {
+            assert_eq!(path, "./sub/../doc.txt");
+            assert!(span.is_none());
+            assert!(src.is_none());
+        }
+        other => panic!("expected NotMdsFile, got {other:?}"),
+    }
+    assert_eq!(err.to_string(), "not an MDS file: ./sub/../doc.txt");
+    assert_eq!(err.serialize().code, "mds::not_mds");
+    assert!(err.serialize().span.is_none());
+    assert_eq!(err.source_name(), None);
+}
+
 /// #423: a not-MDS error exposes the importing directive's span and source name.
 #[test]
 fn not_mds_import_span_is_public() {
