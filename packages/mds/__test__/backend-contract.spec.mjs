@@ -8,6 +8,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { compileFileOutcomes } from './helpers.mjs';
 import {
   assertResultShape,
   validateBackendMethods,
@@ -48,6 +52,94 @@ test('native and WASM conversion errors share their code and field prefix', asyn
     () => assertClean({ compile: () => ({ output: 'wrong' }) }),
     assert.AssertionError,
   );
+});
+
+test('native and WASM import refusals share code, message, span and importer source', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-not-mds-parity-'));
+  try {
+    await mkdir(path.join(root, 'sub'));
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const entry = path.join(root, 'a.mds');
+    const importer = path.join(root, 'sub', 'b.mds');
+    const entrySource = '@import "./sub/b.mds" as b\nEntry\n';
+    const targetSource = '@import "./never.mds"\n';
+    const directives = [
+      ['alias import', '@import "./c.txt" as c'],
+      ['merge import', '@import "./c.txt"'],
+      ['selective import', '@import { f } from "./c.txt"'],
+      ['named re-export', '@export f from "./c.txt"'],
+      ['wildcard re-export', '@export * from "./c.txt"'],
+      ['extends', '@extends "./c.txt"'],
+      ['include namespace import', '@import "./c.txt" as c\n@include c'],
+    ];
+    await writeFile(entry, entrySource);
+    await writeFile(path.join(root, 'sub', 'c.txt'), targetSource);
+    await writeFile(path.join(root, 'sub', 'c.mds'), '@define f():\nOK\n@end\nBody\n');
+    const cases = directives.flatMap(([label, directive]) => [
+      [label, directive, 'c.txt', 'mds::not_mds', 'not an MDS file: ./c.txt'],
+      [label, directive.replace('c.txt', 'missing.mds'), 'missing.mds', 'mds::file_not_found', 'file not found: ./missing.mds'],
+    ]);
+    for (const [label, directive, target, code, message] of cases) {
+      await t.test(`${label}: ${code}`, async () => {
+        const prefix = label === 'extends' ? '\n'.repeat(112) : '# Importer é\n'.repeat(8);
+        const source = `${prefix}${directive}\n`;
+        await writeFile(importer, source.replace(target, 'c.mds'));
+        const cleanNative = await compileFileOutcomes('native', [entry]);
+        const cleanWasm = await compileFileOutcomes('wasm', [entry]);
+        assert.ok(Object.hasOwn(cleanNative[0], 'output'), 'the native control must compile');
+        assert.deepEqual(cleanWasm, cleanNative, 'the valid target must compile on both backends');
+        await writeFile(importer, source);
+        const [native] = await compileFileOutcomes('native', [entry]);
+        const [wasm] = await compileFileOutcomes('wasm', [entry]);
+        const sources = { 'a.mds': entrySource, 'sub/b.mds': source, 'sub/c.txt': targetSource };
+        const line = directive.split('\n')[0];
+        const summarize = (err) => {
+          // The JS error has no source-name field. Identify the source by its unique
+          // byte slice instead of assuming that an in-bounds span belongs to b.mds.
+          const files = Object.entries(sources).filter(([, text]) => err.span != null &&
+            Buffer.from(text).subarray(err.span.offset, err.span.offset + err.span.length).toString() === line,
+          ).map(([file]) => file);
+          return [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null, files];
+        };
+        const expected = [code, message, Buffer.byteLength(prefix), Buffer.byteLength(line), ['sub/b.mds']];
+        // Compare WASM directly with native, then pin the reference to the importer.
+        assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected], label);
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native and WASM nested frontmatter failures keep their code and no outer span', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-frontmatter-parity-'));
+  try {
+    await mkdir(path.join(root, 'sub'));
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const entry = path.join(root, 'a.mds');
+    const importer = path.join(root, 'sub', 'b.mds');
+    await writeFile(entry, '\n\n@import "./sub/b.mds" as b\nEntry\n');
+    await writeFile(path.join(root, 'sub', 'c.txt'), 'Text\n');
+    await writeFile(path.join(root, 'sub', 'c.mds'), 'Body\n');
+    for (const [target, code, message] of [
+      ['c.mds', null, null],
+      ['missing.mds', 'mds::import', 'import error: file not found: "./missing.mds" (in frontmatter imports[0])'],
+      ['c.txt', 'mds::not_mds', 'not an MDS file: ./c.txt'],
+    ]) {
+      await writeFile(importer, `---\nimports:\n  - path: ./${target}\n    as: c\n---\nBody\n`);
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      if (code === null) {
+        assert.deepEqual([wasm, native], [native, { output: '\n\nEntry\n' }], 'the valid target must compile');
+      } else {
+        const summarize = (err) => [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null];
+        const expected = [code, message, null, null];
+        assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected], target);
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

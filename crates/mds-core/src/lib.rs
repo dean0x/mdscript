@@ -1724,9 +1724,9 @@ pub struct ImportRecord {
     /// For a frontmatter import, its position in the `imports:` list — the `<i>` a
     /// resolution error names as `(in frontmatter imports[<i>])`. `None` otherwise.
     pub frontmatter_index: Option<usize>,
-    /// For `@extends` and `@import`, the span a `mds::file_not_found` error for the
-    /// path points at: the whole directive line. `None` for a frontmatter import and
-    /// for `@export … from`, whose errors the resolver gives no span.
+    /// For `@extends`, `@import` and `@export … from`, the span a
+    /// `mds::file_not_found` or `mds::not_mds` error for the path points at:
+    /// the whole directive line. `None` for a frontmatter import.
     pub span: Option<SerializedSpan>,
 }
 
@@ -1759,11 +1759,11 @@ pub enum ResolveAs {
 /// import's record first. A record says how a failure to resolve its path is reported,
 /// in the resolver's own terms:
 ///
-/// - `@extends` and `@import`: a `mds::file_not_found` error is given
-///   [`ImportRecord::span`], the directive's line;
-/// - a frontmatter import: an error with no span is reported as `mds::import`, with
-///   `(in frontmatter imports[<i>])` appended ([`ImportRecord::frontmatter_index`]);
-/// - `@export … from`: no context is added.
+/// - `@extends`, `@import` and `@export … from`: a `mds::file_not_found` or
+///   `mds::not_mds` error for the path gets [`ImportRecord::span`], the directive's line;
+/// - a frontmatter import: a file, module, cycle or import error with no span becomes
+///   `mds::import`, with `(in frontmatter imports[<i>])` appended
+///   ([`ImportRecord::frontmatter_index`]); a `mds::not_mds` error stays spanless.
 ///
 /// `@mdscript/mds`'s WASM backend reads the modules of a `compileFile` itself and
 /// raises some of their errors before its engine runs; it reports them with this
@@ -1806,10 +1806,8 @@ pub fn scan_import_records(
     enum Placement {
         /// A frontmatter `imports:` entry, at this index in the list.
         Frontmatter(usize),
-        /// An `@extends` or `@import` directive, at this byte offset.
+        /// An `@extends`, `@import` or `@export … from` directive, at this byte offset.
         Directive(usize),
-        /// An `@export … from` directive, whose errors get no context.
-        Unplaced,
     }
 
     let tokens = lexer::tokenize(source, "")?;
@@ -1858,9 +1856,9 @@ pub fn scan_import_records(
                 | ast::ImportDirective::Selective { path, offset, .. },
             ) => record(path, ImportKind::Import, Placement::Directive(*offset)),
             ast::Node::Export(
-                ast::ExportDirective::ReExport { path, .. }
-                | ast::ExportDirective::Wildcard { path, .. },
-            ) => record(path, ImportKind::ExportFrom, Placement::Unplaced),
+                ast::ExportDirective::ReExport { path, offset, .. }
+                | ast::ExportDirective::Wildcard { path, offset },
+            ) => record(path, ImportKind::ExportFrom, Placement::Directive(*offset)),
             _ => {}
         }
     }
@@ -1892,7 +1890,6 @@ pub fn scan_import_records(
                     };
                     (None, Some(span))
                 }
-                Placement::Unplaced => (None, None),
             };
             ImportRecord {
                 path,
@@ -2806,9 +2803,9 @@ mod tests {
     }
 
     /// A record carries exactly the context the resolver adds to an error resolving its
-    /// path: an `@extends` or `@import` its span — multi-byte text, CRLF line ends and a
-    /// byte-order mark before it included — a frontmatter import its index, an
-    /// `@export … from` nothing. Each row is judged against the resolver's own error.
+    /// path: a directive its span — multi-byte text, CRLF line ends and a byte-order
+    /// mark before it included — a frontmatter import its index. Each row is judged
+    /// against the resolver's own error.
     #[test]
     fn scan_import_records_carry_the_context_the_resolver_adds() {
         let bom = char::from_u32(0xfeff).expect("U+FEFF is a char");
@@ -2861,16 +2858,13 @@ mod tests {
             "@export * from \"./missing.mds\"\n",
         ] {
             let err = missing_import_error(source, &[]);
-            // Non-vacuity: this is the missing module's own error, with no span added.
             assert_eq!(err.code, "mds::module_not_found", "{err:?}");
-            assert_eq!(err.span, None, "{source:?}");
+            let span = err.span.expect("a re-export points at its directive");
+            assert_eq!((span.offset, span.length), (0, source.trim_end().len()));
             let record = record_of(source, "./missing.mds");
             assert_eq!(record.kind, ImportKind::ExportFrom);
-            assert_eq!(
-                (record.frontmatter_index, record.span),
-                (None, None),
-                "{source:?}"
-            );
+            assert_eq!(record.frontmatter_index, None);
+            assert_eq!(record.span, Some(span), "{source:?}");
         }
     }
 
@@ -2960,7 +2954,18 @@ mod tests {
                 ],
                 "{resolve_as:?}"
             );
-            assert!(records.iter().all(|r| r.span.is_none()), "{records:?}");
+            assert_eq!(records[0].span, None, "the frontmatter import has no span");
+            let span = records[1]
+                .span
+                .as_ref()
+                .expect("the first re-export has a span");
+            assert_eq!(
+                (span.offset, span.length),
+                (
+                    source.find("@export").unwrap(),
+                    "@export x from \"./c.mds\"".len()
+                )
+            );
         }
         assert_eq!(
             scan_imports(source).expect("parses"),

@@ -660,7 +660,7 @@ fn scan_import_records_carry_the_errors_context() {
     assert!(get_prop(&record(1), "frontmatterIndex").is_null());
     assert_eq!(
         fields(2),
-        ("./exp.mds".into(), "export-from".into(), None, true)
+        ("./exp.mds".into(), "export-from".into(), None, false)
     );
 
     // The engine's own error for the missing module: the same span object.
@@ -678,6 +678,17 @@ fn scan_import_records_carry_the_errors_context() {
     // Non-vacuity: the directive is past the frontmatter and a multi-byte line.
     assert_eq!(span[2].as_f64(), Some(6.0));
     assert_eq!(span[1].as_f64(), Some(28.0));
+
+    let err = mds_wasm::compile(
+        source,
+        modules_opts(&serde_json::json!({ "fm.mds": "F\n", "missing.mds": "M\n" })),
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
+    let span = span_fields(&get_prop(&record(2), "span")).expect("a re-export has a span");
+    assert_eq!(span_fields(&get_prop(&err, "span")), Some(span.clone()));
+    assert_eq!(span[2].as_f64(), Some(7.0));
+    assert_eq!(span[1].as_f64(), Some(26.0));
 }
 
 /// `asBase` places a template's `@extends` base where the resolver resolves it: before

@@ -255,6 +255,9 @@ type RefusalParts =
 
 const refusalParts = new WeakMap<Error, RefusalParts>();
 
+// A spanless frontmatter refusal must not gain an outer import's span as it propagates.
+const notMdsContextSeen = new WeakSet<Error>();
+
 /** `mds::import`, with the `import error: ` prefix the Rust error's display adds. */
 function importError(detail: string): PathError {
   const err = pathError('mds::import', `import error: ${detail}`);
@@ -280,17 +283,24 @@ function fileNotFoundError(shown: string): PathError {
 /**
  * `err`, thrown while the import `record` was resolved — by the import itself or by a
  * module below it — with the context the Rust resolver adds at that step
- * (`attach_import_span` and `attach_frontmatter_index`, #414). Only a refusal built
- * here (`refusalParts`) that points into no source yet gains any:
+ * (`attach_import_span` and `attach_frontmatter_index`, #414). A spanless
+ * `preflightModule` not-MDS refusal gains only its immediate import's span. Otherwise,
+ * only a refusal built here (`refusalParts`) that points into no source yet gains any:
  * - through a frontmatter import, `mds::file_not_found` becomes `mds::import`
  *   (`file not found: "<path>" (in frontmatter imports[<i>])`), and an `mds::import`
  *   error not already placed in a frontmatter gets ` (in frontmatter imports[<i>])`;
- * - through `@extends` or `@import`, `mds::file_not_found` names the import as written
- *   and points at its directive;
- * - through `@export … from`, nothing changes. So does every other error: the engine's
- *   own checks, `preflightModule` and `scanImportRecords`, raise neither code.
+ * - through `@extends`, `@import` or `@export … from`, `mds::file_not_found` names
+ *   the import as written and points at its directive.
+ * Every other engine error passes through unchanged.
  */
 function withImportContext(err: unknown, record: ImportRecord): unknown {
+  if (isMdsError(err) && err.code === 'mds::not_mds' && err.span === undefined && !notMdsContextSeen.has(err)) {
+    notMdsContextSeen.add(err);
+    if (record.span !== null) {
+      return Object.assign(new Error(err.message), err, { span: { ...record.span } });
+    }
+    return err;
+  }
   const parts = isMdsError(err) && err.span === undefined ? refusalParts.get(err) : undefined;
   if (parts === undefined) {
     return err;

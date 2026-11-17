@@ -4444,6 +4444,40 @@ fn not_mds_frame_neutralizes_control_on_import_line() {
 }
 
 #[test]
+fn not_mds_nested_frontmatter_imports_stay_spanless_like_missing_files() {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub").join("b.mds");
+    std::fs::write(root.join("sub").join("c.txt"), "Text\n").unwrap();
+    for directive in [
+        "@import \"./sub/b.mds\" as b",
+        "@import \"./sub/b.mds\"",
+        "@import { f } from \"./sub/b.mds\"",
+        "@export f from \"./sub/b.mds\"",
+        "@export * from \"./sub/b.mds\"",
+        "@extends \"./sub/b.mds\"",
+    ] {
+        std::fs::write(&entry, format!("\n\n{directive}\n")).unwrap();
+        for form in ["", "    as: c\n", "    names: [f]\n"] {
+            for (target, code) in [("missing.mds", "mds::import"), ("c.txt", "mds::not_mds")] {
+                let source = format!("---\nimports:\n  - path: ./{target}\n{form}---\nBody\n");
+                std::fs::write(&importer, source).unwrap();
+                let intrinsic = crate::compile(&entry, None).unwrap_err();
+                let cached = ModuleCache::native()
+                    .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+                    .unwrap_err();
+                for err in [intrinsic, cached] {
+                    let serialized = err.serialize();
+                    assert_eq!(serialized.code, code, "{directive}: {serialized:?}");
+                    assert_eq!(serialized.span, None, "{directive}: {serialized:?}");
+                    assert_eq!(err.source_name(), None, "{directive}: {serialized:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn not_mds_entry_and_frontmatter_imports_keep_no_span() {
     let entry = compile_virtual(&[("c.txt", "Hi\n")], "c.txt").unwrap_err();
     for err in std::iter::once(entry).chain(["", "    as: c\n", "    names: [f]\n"].map(|form| {

@@ -1689,10 +1689,14 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
           importError('import path escapes project directory: "../outside.mds" (in frontmatter imports[0])')],
         ['fm-link.mds', frontmatterImports('./ok.mds', './link.mds'),
           importError('symlinks are not allowed in imports: ./link.mds (in frontmatter imports[1])')],
-        // Raised below a frontmatter import with no span: the index of the import that
-        // reached it is added, whatever the module that names the missing file.
-        ['fm-nested.mds', frontmatterImports('./mid.mds'),
-          importError('file not found: "./gone.mds" (in frontmatter imports[0])')],
+        // A re-export already points at its own directive. An outer frontmatter
+        // import keeps that location and does not add its index.
+        ['fm-nested.mds', frontmatterImports('./mid.mds'), {
+          code: 'mds::file_not_found',
+          message: 'file not found: ./gone.mds',
+          help: FILE_NOT_FOUND_HELP,
+          span: firstLineSpan('@export x from "./gone.mds"'),
+        }],
         // Already placed in a frontmatter: nothing more is added.
         ['fm-fm.mds', frontmatterImports('./fmid.mds'),
           importError('file not found: "./nope.mds" (in frontmatter imports[1])')],
@@ -1734,12 +1738,10 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         ['bom.mds', `${bom}hi\n@import "./missing.mds"\nhi\n`, 'file not found: ./missing.mds', 2],
         ['selective.mds', 'ünï\n@import { a } from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', 2],
         ['extends.mds', '---\nx: é\n---\n@extends "./missing.mds"\n', 'file not found: ./missing.mds', 4],
-        // `@export … from` adds no span.
-        ['export-from.mds', '@export x from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', null],
-        ['wildcard.mds', 'ü\n@export * from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', null],
-        // Raised below an @import with no span: native names the import that reached it
-        // and points at its directive.
-        ['body-nested.mds', 'ü\n@import "./mid.mds" as m\nhi\n', 'file not found: ./mid.mds', 2],
+        ['export-from.mds', '@export x from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', 1],
+        ['wildcard.mds', 'ü\n@export * from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', 2],
+        // An inner re-export keeps its own path and directive through an outer import.
+        ['body-nested.mds', 'ü\n@import "./mid.mds" as m\nhi\n', 'file not found: ./gone.mds', 1],
       ];
       for (const [name, content] of rows) {
         await writeFile(path.join(proj, name), content);
@@ -2130,6 +2132,8 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     const engine = { scanImportRecords: engines.wasm.scanImportRecords, preflightModule };
     await withNestedProject(async (proj, parent) => {
       await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
+      await writeFile(path.join(proj, 'c.txt'), '@import "./never.mds"\n');
+      await writeFile(path.join(proj, 'b.mds'), frontmatterImports('./c.txt'));
       // [label, entry source, scan options, the refusal's code, its own enumerable fields].
       // The frontmatter rows are rebuilt with the context the resolver adds to them; a
       // missing module there becomes `mds::import`, which has no `help`.
@@ -2143,6 +2147,9 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         // Controls (PF-013): the engine gives `mds::file_not_found` a `help`, and a
         // missing `@import` a `span` too.
         ['a missing import', '@import "./gone.mds" as g\nhi\n', {}, 'mds::file_not_found', ['code', 'help', 'span']],
+        ['a not-MDS import', '@import "./c.txt" as c\nhi\n', {}, 'mds::not_mds', ['code', 'help', 'span']],
+        ['a not-MDS frontmatter import', frontmatterImports('./c.txt'), {}, 'mds::not_mds', ['code', 'help']],
+        ['a nested not-MDS frontmatter import', '@import "./b.mds" as b\nhi\n', {}, 'mds::not_mds', ['code', 'help']],
       ];
       for (const [i, [label, source, options, code, fields]] of rows.entries()) {
         const entry = path.join(proj, `e${i}.mds`);
@@ -2155,6 +2162,12 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const missing = await rejectionOf(buildModulesMapWith(path.join(proj, 'gone.mds'), engine), 'a missing entry');
       assert.equal(missing.code, 'mds::file_not_found', missing.message);
       assert.deepEqual(Object.keys(missing).sort(), ['code', 'help']);
+      const notMdsEntry = await rejectionOf(buildModulesMapWith(path.join(proj, 'c.txt'), engine), 'a not-MDS entry');
+      assert.equal(notMdsEntry.code, 'mds::not_mds', notMdsEntry.message);
+      assert.deepEqual(Object.keys(notMdsEntry).sort(), ['code', 'help']);
+      const preflight = thrownBy(() => preflightModule(Buffer.from('Text\n'), 'c.txt', './c.txt'), 'a not-MDS preflight');
+      assert.equal(preflight.code, 'mds::not_mds', preflight.message);
+      assert.deepEqual(Object.keys(preflight).sort(), ['code', 'help']);
     });
   });
 
