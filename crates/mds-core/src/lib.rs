@@ -696,9 +696,18 @@ pub fn display_native_path(path: &Path) -> std::borrow::Cow<'_, Path> {
 /// may embed a hostile filename, so control/bidi/separator characters are escaped to
 /// `\uXXXX` literals. HUMAN mode — this is terminal output, so `\n` stays raw
 /// (the wire counterpart is `CompileResult::to_canonical_json`, which escapes it).
+///
+/// A failed write (a closed stderr, for example) stops the print and is dropped:
+/// the warnings are still in the result, and a print failure must not fail or
+/// panic a good compile (#435).
 fn emit_warnings(warnings: &[String]) {
+    use std::io::Write;
+
+    let mut stderr = std::io::stderr().lock();
     for w in warnings {
-        eprintln!("{}", crate::lint::sanitize_control_chars(w));
+        if writeln!(stderr, "{}", crate::lint::sanitize_control_chars(w)).is_err() {
+            return;
+        }
     }
 }
 
