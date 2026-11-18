@@ -98,6 +98,141 @@ fn lint_stdin(input: &str, extra_args: &[&str]) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
+#[cfg(unix)]
+fn lint_refuses_replacement_after_walk(extra: &[&str]) {
+    let dir = tempfile::tempdir().unwrap();
+    let page = dir.path().join("page.mds");
+    let replacement =
+        "---\nunused_after_walk: 1\n---\n@if \"x\" == \"x\":\nHello\n@else:\nRemoved\n@end\n";
+    fs::write(&page, "Original\n").unwrap();
+    fs::write(dir.path().join("good.mds"), "Good\n").unwrap();
+    let out = common::run_after_walk(mds_bin().arg("lint").arg(dir.path()).args(extra), || {
+        fs::rename(&page, dir.path().join("saved.txt")).unwrap();
+        fs::write(&page, replacement).unwrap();
+    });
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{stderr}\n{stdout}");
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 1 with errors"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unused_after_walk"), "{stderr}");
+    assert!(!stdout.contains("unused_after_walk"), "{stdout}");
+    assert!(!stdout.contains("--- page.mds"), "{stdout}");
+    if extra.contains(&"json") {
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(json["files"].as_array().unwrap().len(), 1, "{json}");
+        assert_eq!(json["files"][0]["error"]["code"], "mds::io", "{json}");
+        assert!(
+            json["files"][0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("file changed"),
+            "{json}"
+        );
+    } else {
+        assert!(
+            stderr.contains("mds::io") && stderr.contains("file changed"),
+            "{stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{stdout}");
+    }
+    assert_eq!(fs::read_to_string(page).unwrap(), replacement);
+}
+
+#[test]
+#[cfg(unix)]
+fn dir_lint_refuses_a_file_replaced_after_walk() {
+    lint_refuses_replacement_after_walk(&[]);
+}
+
+#[test]
+#[cfg(unix)]
+fn dir_lint_json_refuses_a_file_replaced_after_walk() {
+    lint_refuses_replacement_after_walk(&["--format", "json"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn dir_lint_fix_refuses_a_file_replaced_after_walk() {
+    lint_refuses_replacement_after_walk(&["--fix", "--format", "json"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn dir_lint_fix_diff_refuses_a_file_replaced_after_walk() {
+    lint_refuses_replacement_after_walk(&["--fix", "--diff"]);
+}
+
+#[test]
+fn dir_lint_refuses_a_parent_redirected_after_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    let moved = dir.path().join("moved");
+    fs::create_dir(&sub).unwrap();
+    fs::write(
+        sub.join("page.mds"),
+        "---\nunused_after_walk: 1\n---\nHello\n",
+    )
+    .unwrap();
+    if !common::make_symlink(&sub, &dir.path().join("probe")) {
+        return;
+    }
+    let out = common::run_after_walk(mds_bin().arg("lint").arg(dir.path()), || {
+        fs::rename(&sub, &moved).unwrap();
+        assert!(common::make_symlink(&moved, &sub));
+    });
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("file changed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("0 clean, 0 with warnings, 1 with errors"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unused_after_walk"), "{stderr}");
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn dir_lint_accepts_an_unchanged_tree_after_walk() {
+    for extra in [
+        &[][..],
+        &["--format", "json"][..],
+        &["--fix", "--format", "json"][..],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(
+            dir.path().join("sub/page.mds"),
+            "---\nunused_after_walk: 1\n---\nHello\n",
+        )
+        .unwrap();
+        let out = common::run_after_walk(mds_bin().arg("lint").arg(dir.path()).args(extra), || {});
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{stderr}\n{stdout}");
+        assert!(
+            stderr.contains("0 clean, 1 with warnings, 0 with errors"),
+            "{stderr}"
+        );
+        if extra.contains(&"json") {
+            let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(json["files"][0]["file"], "sub/page.mds");
+            assert_eq!(
+                json["files"][0]["diagnostics"][0]["rule"], "unused-variable",
+                "{json}"
+            );
+        } else {
+            assert!(stderr.contains("unused_after_walk"), "{stderr}");
+            assert!(out.stdout.is_empty());
+        }
+    }
+}
+
 // ── L-CLI-CHAN1: clean file ───────────────────────────────────────────────────
 
 #[test]

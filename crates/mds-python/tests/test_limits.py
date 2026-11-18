@@ -68,20 +68,23 @@ def test_l1_source_at_exactly_limit_not_rejected_by_guard() -> None:
 # ── L2: virtual count / aggregate size / entry∉modules ──────────────────────────
 
 
-def test_l2_too_many_modules() -> None:
-    mods = {f"m{i}.mds": "x" for i in range(257)}
+@pytest.mark.parametrize(
+    "fn", [m.compile_virtual, m.check_virtual, m.lint_virtual],
+    ids=["compile", "check", "lint"],
+)
+@pytest.mark.parametrize("imported", [False, True], ids=["unused", "imported"])
+def test_l2_virtual_map_accepts_257_entries_and_refuses_258(fn, imported: bool) -> None:  # type: ignore[no-untyped-def]
+    mods = {f"m{i}.mds": "Body\n" for i in range(257)}
+    imports = "".join(f'@import "./m{i}.mds" as m{i}\n' for i in range(1, 257))
+    mods["m0.mds"] = (imports if imported else "") + "OK\n"
+    result = fn(mods, "m0.mds")
+    if fn is m.compile_virtual:
+        assert result.output == "OK\n"
+    mods["unused.mds"] = "Body\n"
     with pytest.raises(m.MdsError) as ei:
-        m.compile_virtual(mods, "m0.mds")
+        fn(mods, "m0.mds")
     assert ei.value.code == "mds::resource_limit"
-
-
-def test_l2_check_virtual_too_many_modules() -> None:
-    # Boundary guards are shared via parse_modules, not forked per function —
-    # check_virtual must enforce the same module-count cap as compile_virtual.
-    mods = {f"m{i}.mds": "x" for i in range(257)}
-    with pytest.raises(m.MdsError) as ei:
-        m.check_virtual(mods, "m0.mds")
-    assert ei.value.code == "mds::resource_limit"
+    assert ei.value.message == "modules exceeds maximum module count of 257 (258 provided)"
 
 
 def test_l2_single_module_over_size() -> None:

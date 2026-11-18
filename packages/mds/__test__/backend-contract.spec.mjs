@@ -2,11 +2,16 @@
  * Backend contract parity tests for @mdscript/mds.
  * Tests: U-BC1 through U-BC20
  *
- * All tests use STUB backend objects — no live wasm build required.
- * This file is env-independent and must pass in CI on every platform.
+ * Shape tests use stub backends. Conversion parity tests require current native
+ * and WASM builds and fail if either backend is absent.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { compileFileOutcomes } from './helpers.mjs';
 import {
   assertResultShape,
   validateBackendMethods,
@@ -14,8 +19,202 @@ import {
   NODE_METHODS,
   WASM_EXPORTS,
 } from '../dist/backend/contract.js';
-import { createWasmBackend } from '../dist/backend/wasm.js';
+import { createWasmBackend, initWasmNode } from '../dist/backend/wasm.js';
 import { createNativeBackend } from '../dist/backend/native.js';
+
+// Both live backends must reject the same unsupported value at the same field.
+test('native and WASM conversion errors share their code and field prefix', async () => {
+  const require = createRequire(import.meta.url);
+  const native = createNativeBackend(require('../../../crates/mds-napi/mds-napi.node'));
+  const wasm = createWasmBackend(await initWasmNode());
+  const prefix = 'invalid options.vars: ';
+  const summarize = (backend) => {
+    let error;
+    try {
+      backend.compile('ok', { vars: { bad: Symbol('unsupported') } });
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error instanceof Error, 'the unsupported value must reach the converter');
+    return [error.code, error.message.slice(0, prefix.length)];
+  };
+  assert.deepEqual(
+    [summarize(native), summarize(wasm)],
+    Array.from({ length: 2 }, () => ['mds::invalid_options', prefix]),
+  );
+  const assertClean = (backend) => assert.equal(
+    backend.compile('{{value}}', { vars: { value: 'ok' } }).output,
+    'ok\n',
+  );
+  assertClean(native);
+  assertClean(wasm);
+  assert.throws(
+    () => assertClean({ compile: () => ({ output: 'wrong' }) }),
+    assert.AssertionError,
+  );
+});
+
+test('native and WASM import refusals share code, message, span and importer source', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-not-mds-parity-'));
+  try {
+    await mkdir(path.join(root, 'sub'));
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const entry = path.join(root, 'a.mds');
+    const importer = path.join(root, 'sub', 'b.mds');
+    const entrySource = '@import "./sub/b.mds" as b\nEntry\n';
+    const targetSource = '@import "./never.mds"\n';
+    const directives = [
+      ['alias import', '@import "./c.txt" as c'],
+      ['merge import', '@import "./c.txt"'],
+      ['selective import', '@import { f } from "./c.txt"'],
+      ['named re-export', '@export f from "./c.txt"'],
+      ['wildcard re-export', '@export * from "./c.txt"'],
+      ['extends', '@extends "./c.txt"'],
+      ['include namespace import', '@import "./c.txt" as c\n@include c'],
+    ];
+    await writeFile(entry, entrySource);
+    await writeFile(path.join(root, 'sub', 'c.txt'), targetSource);
+    await writeFile(path.join(root, 'sub', 'c.mds'), '@define f():\nOK\n@end\nBody\n');
+    const cases = directives.flatMap(([label, directive]) => [
+      [label, directive, 'c.txt', 'mds::not_mds', 'not an MDS file: ./c.txt'],
+      [label, directive.replace('c.txt', 'missing.mds'), 'missing.mds', 'mds::file_not_found', 'file not found: ./missing.mds'],
+    ]);
+    for (const [label, directive, target, code, message] of cases) {
+      await t.test(`${label}: ${code}`, async () => {
+        const prefix = label === 'extends' ? '\n'.repeat(112) : '# Importer é\n'.repeat(8);
+        const source = `${prefix}${directive}\n`;
+        await writeFile(importer, source.replace(target, 'c.mds'));
+        const cleanNative = await compileFileOutcomes('native', [entry]);
+        const cleanWasm = await compileFileOutcomes('wasm', [entry]);
+        assert.ok(Object.hasOwn(cleanNative[0], 'output'), 'the native control must compile');
+        assert.deepEqual(cleanWasm, cleanNative, 'the valid target must compile on both backends');
+        await writeFile(importer, source);
+        const [native] = await compileFileOutcomes('native', [entry]);
+        const [wasm] = await compileFileOutcomes('wasm', [entry]);
+        const sources = { 'a.mds': entrySource, 'sub/b.mds': source, 'sub/c.txt': targetSource };
+        const line = directive.split('\n')[0];
+        const summarize = (err) => {
+          // The JS error has no source-name field. Identify the source by its unique
+          // byte slice instead of assuming that an in-bounds span belongs to b.mds.
+          const files = Object.entries(sources).filter(([, text]) => err.span != null &&
+            Buffer.from(text).subarray(err.span.offset, err.span.offset + err.span.length).toString() === line,
+          ).map(([file]) => file);
+          return [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null, files];
+        };
+        const expected = [code, message, Buffer.byteLength(prefix), Buffer.byteLength(line), ['sub/b.mds']];
+        // Compare WASM directly with native, then pin the reference to the importer.
+        assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected], label);
+      });
+    }
+    await t.test('intermediate extends: mds::not_mds', async () => {
+      const base = path.join(root, 'sub', 'c.mds');
+      const importerSource = '@extends "./c.mds"\n';
+      const directive = '@extends "./d.txt"';
+      const prefix = '\n'.repeat(23);
+      const source = `${prefix}${directive}\n`;
+      await writeFile(importer, importerSource);
+      await writeFile(path.join(root, 'sub', 'd.txt'), targetSource);
+      await writeFile(path.join(root, 'sub', 'd.mds'), 'Body\n');
+      await writeFile(base, source.replace('d.txt', 'd.mds'));
+      const cleanNative = await compileFileOutcomes('native', [entry]);
+      const cleanWasm = await compileFileOutcomes('wasm', [entry]);
+      assert.ok(Object.hasOwn(cleanNative[0], 'output'), 'the intermediate-base control must compile');
+      assert.deepEqual(cleanWasm, cleanNative, 'the intermediate-base control must match on both backends');
+      await writeFile(base, source);
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      const sources = {
+        'a.mds': entrySource, 'sub/b.mds': importerSource,
+        'sub/c.mds': source, 'sub/d.txt': targetSource,
+      };
+      const summarize = (err) => {
+        const files = Object.entries(sources).filter(([, text]) => err.span != null &&
+          Buffer.from(text).subarray(err.span.offset, err.span.offset + err.span.length).toString() === directive,
+        ).map(([file]) => file);
+        return [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null, files];
+      };
+      const expected = ['mds::not_mds', 'not an MDS file: ./d.txt', Buffer.byteLength(prefix), Buffer.byteLength(directive), ['sub/c.mds']];
+      assert.deepEqual(wasm, native, 'the complete intermediate-base errors must match');
+      assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected]);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native and WASM nested frontmatter failures keep their code and no outer span', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-frontmatter-parity-'));
+  try {
+    await mkdir(path.join(root, 'sub'));
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const entry = path.join(root, 'a.mds');
+    const importer = path.join(root, 'sub', 'b.mds');
+    await writeFile(entry, '\n\n@import "./sub/b.mds" as b\nEntry\n');
+    await writeFile(path.join(root, 'sub', 'c.txt'), 'Text\n');
+    await writeFile(path.join(root, 'sub', 'c.mds'), 'Body\n');
+    for (const [target, code, message] of [
+      ['c.mds', null, null],
+      ['missing.mds', 'mds::import', 'import error: file not found: "./missing.mds" (in frontmatter imports[0])'],
+      ['c.txt', 'mds::not_mds', 'not an MDS file: ./c.txt'],
+    ]) {
+      await writeFile(importer, `---\nimports:\n  - path: ./${target}\n    as: c\n---\nBody\n`);
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      if (code === null) {
+        assert.deepEqual([wasm, native], [native, { output: '\n\nEntry\n' }], 'the valid target must compile');
+      } else {
+        const summarize = (err) => [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null];
+        const expected = [code, message, null, null];
+        assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected], target);
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native and WASM compileFile agree at 255–259 total modules in flat and nested graphs', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-module-count-parity-'));
+  try {
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const cases = [];
+    for (const nested of [false, true]) {
+      for (const total of [255, 256, 257, 258, 259]) {
+        const label = `${nested ? 'nested' : 'flat'}-${total}`;
+        const dir = path.join(root, label);
+        await mkdir(dir);
+        const imports = (start) => Array.from({ length: total - start }, (_, i) => {
+          const id = start + i;
+          return `@import "./m${id}.mds" as m${id}\n`;
+        }).join('');
+        for (let i = 1; i < total; i++) {
+          // Two modules stay in flight while the nested graph resolves its leaves.
+          const source = nested && i === 1 ? `${imports(2)}Branch\n` : 'Leaf\n';
+          await writeFile(path.join(dir, `m${i}.mds`), source);
+        }
+        const entry = path.join(dir, 'entry.mds');
+        await writeFile(entry, `${nested ? '@import "./m1.mds" as m1\n' : imports(1)}OK\n`);
+        cases.push({ label, entry, total });
+      }
+    }
+    // The helper forces each public backend and fails if that backend is absent.
+    const files = cases.map(({ entry }) => entry);
+    const native = await compileFileOutcomes('native', files);
+    const wasm = await compileFileOutcomes('wasm', files);
+    const sharedMessage = native[cases.findIndex(({ total }) => total === 258)].message;
+    assert.equal(typeof sharedMessage, 'string', 'native must refuse the first graph above the cap');
+    for (const [i, { label, total }] of cases.entries()) {
+      await t.test(label, () => {
+        const expected = total <= 257 ? { output: 'OK\n' } : {
+          code: 'mds::resource_limit', message: sharedMessage, help: null, span: null,
+        };
+        assert.deepEqual([wasm[i], native[i]], [native[i], expected], label);
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Method manifest assertions (AC-API-09)

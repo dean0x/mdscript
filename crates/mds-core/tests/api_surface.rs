@@ -37,6 +37,12 @@ fn public_functions_exist() {
     let _ = mds::load_vars_str_reporting_duplicates("{}");
 }
 
+#[test]
+fn host_panic_helper_signatures_exist_without_an_implicit_install() {
+    let _: fn() = mds::host_panic::install;
+    let _: fn(fn() -> u8) -> std::thread::Result<u8> = mds::host_panic::catching;
+}
+
 /// #409: `display_native_path` is callable via the crate root with the expected
 /// `Path -> Cow<Path>` signature. It is the single public entry point CLI and
 /// binding display sinks use to strip a Windows verbatim prefix (`\\?\C:\…`)
@@ -140,6 +146,78 @@ fn check_module_type_function_exists() {
         "hi\n",
     )
     .unwrap();
+}
+
+#[test]
+fn module_count_exceeded_constructor_is_public() {
+    let constructor: fn() -> MdsError = mds::module_count_exceeded;
+    let err = constructor();
+    assert!(matches!(err, MdsError::ResourceLimit { .. }));
+    assert_eq!(err.serialize().code, "mds::resource_limit");
+    assert_eq!(
+        err.to_string(),
+        "resource limit exceeded: module count exceeds maximum of 256 modules besides the entry"
+    );
+}
+
+#[test]
+fn not_mds_file_constructor_is_public_and_spanless() {
+    let constructor: fn(String) -> MdsError = MdsError::not_mds_file;
+    let err = constructor("./sub/../doc.txt".to_owned());
+    match &err {
+        MdsError::NotMdsFile { path, span, src } => {
+            assert_eq!(path, "./sub/../doc.txt");
+            assert!(span.is_none());
+            assert!(src.is_none());
+        }
+        other => panic!("expected NotMdsFile, got {other:?}"),
+    }
+    assert_eq!(err.to_string(), "not an MDS file: ./sub/../doc.txt");
+    assert_eq!(err.serialize().code, "mds::not_mds");
+    assert!(err.serialize().span.is_none());
+    assert_eq!(err.source_name(), None);
+}
+
+/// #423: a not-MDS error exposes the importing directive's span and source name.
+#[test]
+fn not_mds_import_span_is_public() {
+    let err = mds::compile_virtual(
+        HashMap::from([
+            ("a.mds".to_string(), "\n@import \"./c.txt\"\n".to_string()),
+            ("c.txt".to_string(), "Hi\n".to_string()),
+        ]),
+        "a.mds",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.serialize().code, "mds::not_mds");
+    let span = err.serialize().span.expect("not-MDS import span is public");
+    assert_eq!((span.offset, span.length), (1, 17));
+    assert_eq!((span.line, span.column), (Some(2), Some(1)));
+    assert_eq!(err.source_name(), Some("a.mds"));
+
+    let _: fn(String, &str, &str, usize, usize) -> MdsError = MdsError::not_mds_file_at;
+    let constructed =
+        MdsError::not_mds_file_at("./c.txt", "a.mds", "\n@import \"./c.txt\"\n", 1, 17);
+    match &constructed {
+        MdsError::NotMdsFile { path, span, src } => {
+            let _: &String = path;
+            let _: &Option<miette::SourceSpan> = span;
+            let _: &Option<std::sync::Arc<miette::NamedSource<String>>> = src;
+            assert_eq!(path, "./c.txt");
+            assert_eq!(span.as_ref().map(|s| (s.offset(), s.len())), Some((1, 17)));
+            assert_eq!(src.as_ref().map(|s| s.name()), Some("a.mds"));
+        }
+        other => panic!("expected NotMdsFile, got {other:?}"),
+    }
+    assert_eq!(constructed.serialize().span, err.serialize().span);
+    assert_eq!(constructed.source_name(), err.source_name());
+
+    // A caller-supplied label uses the same escape rule as resolver-built labels.
+    let label = "a\x1b\n.mds";
+    assert!(label.contains(char::from(0x1b)) && label.contains('\n'));
+    let escaped = MdsError::not_mds_file_at("./c.txt", label, "@import \"./c.txt\"\n", 0, 17);
+    assert_eq!(escaped.source_name(), Some("a\\u001B\\u000A.mds"));
 }
 
 /// #414: `scan_import_records` and its `#[non_exhaustive]` `ImportRecord` /
@@ -330,6 +408,8 @@ fn mds_error_variants_exist() {
     };
     let _ = MdsError::NotMdsFile {
         path: "test.md".to_string(),
+        span: None,
+        src: None,
     };
     let _ = MdsError::Io {
         message: "test".to_string(),
@@ -546,6 +626,30 @@ fn filesystem_trait_importable() {
     fn _accepts_fs(_fs: &dyn FileSystem) {}
     let fs = NativeFs::new();
     _accepts_fs(&fs);
+}
+
+#[test]
+fn native_entry_pin_and_entry_points_are_public() {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<mds::EntryPin>();
+    send_sync::<NativeFs>();
+    let dir = tempfile::TempDir::new().unwrap();
+    let entry = dir.path().join("main.mds");
+    std::fs::write(&entry, "Hello\n").unwrap();
+    let key = entry.canonicalize().unwrap();
+    let walked = std::fs::symlink_metadata(&entry).unwrap();
+    let pin = mds::EntryPin::key(&key).with_walked(&walked);
+    let _ = format!("{pin:?}");
+    let fs = NativeFs::new().with_entry_pin(pin);
+    let result: Result<CompileResult, MdsError> =
+        mds::compile_native_fs(fs, &entry, None, mds::CompileOptions::default());
+    assert!(result.is_ok());
+    let fs = NativeFs::new().with_entry_pin(mds::EntryPin::parent_dir(key.parent().unwrap()));
+    let result: Result<Vec<String>, MdsError> = mds::check_native_fs(fs, &entry, None);
+    assert!(result.is_ok());
+    let result: Result<mds::LintResult, MdsError> =
+        mds::lint_native_fs(NativeFs::new(), &entry, None, &mds::LintConfig::default());
+    assert!(result.is_ok());
 }
 
 #[test]

@@ -595,6 +595,93 @@ describe('options validation', () => {
   });
 });
 
+describe('options conversion errors', () => {
+  const hostile = `value${String.fromCharCode(0x1b)}[31m${String.fromCharCode(0x202e)}`;
+  const cases = [
+    ['Symbol', () => Symbol(hostile)],
+    ['Function', () => function unsupported() {}],
+  ];
+  const fields = [
+    ['vars', (value) => compile('ok', { vars: { bad: value } })],
+    ['rules', (value) => addon.lint('ok', { rules: { bad: value } })],
+  ];
+
+  for (const [field, invoke] of fields) {
+    for (const [type, makeValue] of cases) {
+      test(`${field} conversion rejects ${type} with a coded field prefix`, () => {
+        assert.throws(() => invoke(makeValue()), (err) => {
+          assert.equal(err.code, 'mds::invalid_options');
+          assert.equal(
+            err.message,
+            `invalid options.${field}: InvalidArg, typeof ${type} value could not be deserialized`,
+          );
+          return true;
+        });
+      });
+    }
+
+    test(`${field} conversion preserves a getter exception without a second throw`, () => {
+      const original = new Error(`getter ${hostile}`);
+      let calls = 0;
+      const value = { get bad() { calls += 1; throw original; } };
+      const invokeObject = (object) => field === 'vars'
+        ? compile('ok', { vars: object })
+        : addon.lint('ok', { rules: object });
+      assert.throws(() => invokeObject(value), (err) => err === original);
+      assert.equal(calls, 1);
+      assert.equal(original.code, undefined);
+      assert.equal(original.message, `getter ${hostile}`);
+      // The same assertion must refuse a value whose getter returns normally.
+      assert.throws(
+        () => assert.throws(
+          () => invokeObject({ get bad() { return field === 'vars' ? 'ok' : 'off'; } }),
+          (err) => err === original,
+        ),
+        assert.AssertionError,
+      );
+    });
+  }
+
+  test('all JSON conversion sites use the coded, wire-escaped error boundary', () => {
+    // napi-rs returns fixed text for Symbol and Function values. Rust unit tests
+    // cover caller text; this scan checks that every site uses the tested formatter.
+    const source = fs.readFileSync(new URL('../src/lib.rs', import.meta.url), 'utf8');
+    const assertBoundary = (text) => {
+      const calls = [...text.matchAll(
+        /\.from_js_value\(\w+\)\s*\.map_err\(\|e\| conversion_error\(env, "([^"]+)", e\)\)\?/g,
+      )].map((match) => match[1]);
+      assert.deepEqual(calls, ['invalid options: ', 'invalid options.vars: ', 'invalid options.rules: ']);
+      assert.equal([...text.matchAll(/\.from_js_value\(/g)].length, calls.length);
+      const helper = text.slice(text.indexOf('fn conversion_error('), text.indexOf('fn throw_resource_limit('));
+      assert.match(helper, /throw_options_error\(env, &conversion_error_message\(prefix, &error\.to_string\(\)\)\)/);
+      assert.match(helper, /mds::sanitize_control_chars_wire\(detail\)/);
+    };
+    assertBoundary(source);
+    assert.throws(
+      () => assertBoundary(source.replace('mds::sanitize_control_chars_wire(detail)', 'detail')),
+      assert.AssertionError,
+    );
+    assert.throws(
+      () => assertBoundary(source.replace('conversion_error_message(prefix, &error.to_string())', 'error.to_string()')),
+      assert.AssertionError,
+    );
+    assert.throws(
+      () => assertBoundary(source.replace(
+        'conversion_error(env, "invalid options: ", e)',
+        'conversion_error(env, "wrong prefix: ", e)',
+      )),
+      assert.AssertionError,
+    );
+  });
+
+  test('clean vars and rules still compile and lint', () => {
+    const assertClean = (result) => assert.equal(result.output, 'ok\n');
+    assertClean(compile('{{value}}', { vars: { value: 'ok' } }));
+    assert.equal(addon.lint('ok', { rules: { 'unused-variable': 'off' } }).version, 1);
+    assert.throws(() => assertClean({ output: 'wrong' }), assert.AssertionError);
+  });
+});
+
 // ── Resource limit tests ──────────────────────────────────────────────────────
 
 describe('resource limits', () => {
@@ -1984,6 +2071,27 @@ describe('unknown rule name warning (AC-224 D8)', () => {
 // fast, without materialising the tree. Deep flow-nesting is the second axis, rejected
 // by the pre-parse flow-depth guard. Every rejection throws with `err.code ===
 // 'mds::resource_limit'` and never echoes the raw hostile bytes (`*a`, the sentinel).
+describe('virtual map entry limit', () => {
+  for (const imported of [false, true]) {
+    test(`lintVirtual accepts 257 entries and refuses 258 (${imported ? 'imported' : 'unused'})`, () => {
+      const modules = Object.fromEntries(
+        Array.from({ length: 257 }, (_, i) => [`m${i}.mds`, 'Body\n']),
+      );
+      const imports = Array.from({ length: 256 }, (_, i) =>
+        `@import "./m${i + 1}.mds" as m${i + 1}\n`,
+      ).join('');
+      modules['m0.mds'] = (imported ? imports : '') + 'OK\n';
+      assert.ok(Array.isArray(lintVirtual(modules, 'm0.mds').files));
+      modules['unused.mds'] = 'Body\n';
+      assert.throws(() => lintVirtual(modules, 'm0.mds'), (err) => {
+        assert.equal(err.code, 'mds::resource_limit');
+        assert.equal(err.message, 'modules exceeds maximum module count of 257 (258 provided)');
+        return true;
+      });
+    });
+  }
+});
+
 describe('resource limits', () => {
   const MAX_FRONTMATTER_SIZE = 1 << 20; // 1 MiB
   const wrapFm = (y) => `---\n${y}---\nHi\n`;

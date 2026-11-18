@@ -46,6 +46,8 @@ pub(crate) mod error;
 pub(crate) mod evaluator;
 pub(crate) mod formatter;
 pub(crate) mod fs;
+#[doc(hidden)]
+pub mod host_panic;
 pub(crate) mod lexer;
 pub(crate) mod limits;
 pub(crate) mod lint;
@@ -63,8 +65,8 @@ pub(crate) mod verbatim;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{
-    check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, FileSystem,
-    ModuleAliasError, NativeFs, VirtualFs,
+    check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, EntryPin,
+    FileSystem, ModuleAliasError, NativeFs, VirtualFs,
 };
 pub use lint::{
     escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
@@ -107,7 +109,7 @@ impl From<evaluator::EvalMessage> for Message {
 use std::collections::HashMap;
 use std::path::Path;
 
-pub use error::{MdsError, SerializedError, SerializedSpan};
+pub use error::{module_count_exceeded, MdsError, SerializedError, SerializedSpan};
 pub use value::Value;
 
 /// The output of a compiled MDS template — either Markdown or structured messages.
@@ -815,15 +817,29 @@ pub fn check_collecting_warnings(
     path: impl AsRef<Path>,
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<((), Vec<String>), MdsError> {
-    let path = path.as_ref();
+    check_native_fs(NativeFs::new(), path, runtime_vars).map(|warnings| ((), warnings))
+}
+
+/// Check a native entry with a caller-built filesystem and return its warnings.
+/// Use [`NativeFs::with_entry_pin`] to require a known entry key or parent directory.
+///
+/// # Errors
+/// Returns the same read, resolve, and template errors as [`check_collecting_warnings`].
+#[must_use = "warnings should be used"]
+pub fn check_native_fs(
+    fs: NativeFs,
+    entry: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<Vec<String>, MdsError> {
+    let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
     let mut warnings = vec![];
     // Dispatch on output shape so a messages template's mixed-content check runs
     // during validation; the CompiledOutput itself is discarded.
     cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
-    Ok(((), warnings))
+    Ok(warnings)
 }
 
 /// Check (validate) MDS source from a string and return any collected warnings without rendering output.
@@ -1167,10 +1183,25 @@ pub fn compile_with_deps_opts(
     runtime_vars: Option<HashMap<String, Value>>,
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
-    let path = path.as_ref();
+    compile_native_fs(NativeFs::new(), path, runtime_vars, opts)
+}
+
+/// Compile a native entry with a caller-built filesystem.
+/// Use [`NativeFs::with_entry_pin`] to require a known entry key or parent directory.
+///
+/// # Errors
+/// Returns the same read, resolve, and template errors as [`compile_with_deps_opts`].
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_native_fs(
+    fs: NativeFs,
+    entry: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
+    let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_path_intrinsic_opts(path_str, &vars, &opts, &mut warnings)?;
@@ -1535,18 +1566,28 @@ pub fn lint(
     runtime_vars: Option<HashMap<String, Value>>,
     config: &LintConfig,
 ) -> Result<LintResult, MdsError> {
+    lint_native_fs(NativeFs::new(), path, runtime_vars, config)
+}
+
+/// Lint a native entry with a caller-built filesystem.
+/// The lint rules use the exact entry text read by the check gate.
+/// Use [`NativeFs::with_entry_pin`] to require a known entry key or parent directory.
+///
+/// # Errors
+/// Returns the same read, resolve, and template errors as [`lint`].
+#[must_use = "lint findings should be used"]
+pub fn lint_native_fs(
+    fs: NativeFs,
+    entry: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    config: &LintConfig,
+) -> Result<LintResult, MdsError> {
+    let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
-    let (_, key) = {
-        let mut cache = ModuleCache::new();
-        let mut warnings = vec![];
-        cache.resolve_path_intrinsic_keyed(path_str, &vars, &mut warnings)?
-    };
-    // Read source for lint re-parse as NativeFs::read reads a module: at most one byte
-    // past the cap (#428), then its own post-read checks. It re-reads the key the gate
-    // checked — the canonical path — never the path as typed; messages name the latter.
-    let source = fs::read_module_file(Path::new(&key), path_str)?;
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let mut warnings = vec![];
+    let (_, source) = cache.resolve_path_intrinsic_source(path_str, &vars, &mut warnings)?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1724,9 +1765,9 @@ pub struct ImportRecord {
     /// For a frontmatter import, its position in the `imports:` list — the `<i>` a
     /// resolution error names as `(in frontmatter imports[<i>])`. `None` otherwise.
     pub frontmatter_index: Option<usize>,
-    /// For `@extends` and `@import`, the span a `mds::file_not_found` error for the
-    /// path points at: the whole directive line. `None` for a frontmatter import and
-    /// for `@export … from`, whose errors the resolver gives no span.
+    /// For `@extends`, `@import` and `@export … from`, the span a
+    /// `mds::file_not_found` or `mds::not_mds` error for the path points at:
+    /// the whole directive line. `None` for a frontmatter import.
     pub span: Option<SerializedSpan>,
 }
 
@@ -1759,11 +1800,11 @@ pub enum ResolveAs {
 /// import's record first. A record says how a failure to resolve its path is reported,
 /// in the resolver's own terms:
 ///
-/// - `@extends` and `@import`: a `mds::file_not_found` error is given
-///   [`ImportRecord::span`], the directive's line;
-/// - a frontmatter import: an error with no span is reported as `mds::import`, with
-///   `(in frontmatter imports[<i>])` appended ([`ImportRecord::frontmatter_index`]);
-/// - `@export … from`: no context is added.
+/// - `@extends`, `@import` and `@export … from`: a `mds::file_not_found` or
+///   `mds::not_mds` error for the path gets [`ImportRecord::span`], the directive's line;
+/// - a frontmatter import: a file, module, cycle or import error with no span becomes
+///   `mds::import`, with `(in frontmatter imports[<i>])` appended
+///   ([`ImportRecord::frontmatter_index`]); a `mds::not_mds` error stays spanless.
 ///
 /// `@mdscript/mds`'s WASM backend reads the modules of a `compileFile` itself and
 /// raises some of their errors before its engine runs; it reports them with this
@@ -1806,10 +1847,8 @@ pub fn scan_import_records(
     enum Placement {
         /// A frontmatter `imports:` entry, at this index in the list.
         Frontmatter(usize),
-        /// An `@extends` or `@import` directive, at this byte offset.
+        /// An `@extends`, `@import` or `@export … from` directive, at this byte offset.
         Directive(usize),
-        /// An `@export … from` directive, whose errors get no context.
-        Unplaced,
     }
 
     let tokens = lexer::tokenize(source, "")?;
@@ -1858,9 +1897,9 @@ pub fn scan_import_records(
                 | ast::ImportDirective::Selective { path, offset, .. },
             ) => record(path, ImportKind::Import, Placement::Directive(*offset)),
             ast::Node::Export(
-                ast::ExportDirective::ReExport { path, .. }
-                | ast::ExportDirective::Wildcard { path, .. },
-            ) => record(path, ImportKind::ExportFrom, Placement::Unplaced),
+                ast::ExportDirective::ReExport { path, offset, .. }
+                | ast::ExportDirective::Wildcard { path, offset },
+            ) => record(path, ImportKind::ExportFrom, Placement::Directive(*offset)),
             _ => {}
         }
     }
@@ -1892,7 +1931,6 @@ pub fn scan_import_records(
                     };
                     (None, Some(span))
                 }
-                Placement::Unplaced => (None, None),
             };
             ImportRecord {
                 path,
@@ -1998,22 +2036,7 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 #[must_use = "the loaded variables and duplicate keys should be used"]
 pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsError> {
     let path_str = path_to_str(path)?;
-    // PF-004: guard the vars-file path through the same symlink check that the
-    // resolver applies to every imported file — avoids a raw read that bypasses
-    // the security gate. check_symlink returns the canonical path, and that is the
-    // file read — the one checked, never the path as typed again (#428); we use the
-    // original path for error messages (it names what the caller passed).
-    let canonical = NativeFs::check_symlink(path).map_err(|e| match e {
-        MdsError::ImportError { .. } => MdsError::import_error(format!(
-            "symlinks are not allowed in vars file path: {path_str}"
-        )),
-        other => other,
-    })?;
-    // Read at most one byte past the cap (#428): a file over it when it is opened is
-    // never read, and one that grows past it while it is read is read no further.
-    let bytes = match fs::read_capped(&canonical, MAX_FILE_SIZE)
-        .map_err(|e| MdsError::io(format!("cannot read vars file {path_str}: {e}")))?
-    {
+    let bytes = match fs::VarsFile::resolve(path, path_str)?.read(MAX_FILE_SIZE)? {
         fs::Capped::Bytes(bytes) if bytes.len() as u64 <= MAX_FILE_SIZE => bytes,
         fs::Capped::Bytes(_) | fs::Capped::TooLarge(_) => {
             return Err(MdsError::resource_limit(format!(
@@ -2131,6 +2154,45 @@ pub fn load_vars_str_reporting_duplicates(json: &str) -> Result<VarsLoad, MdsErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lint_gate_returns_the_text_from_its_only_entry_read() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct CountReads(Arc<AtomicUsize>);
+        impl FileSystem for CountReads {
+            fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+                Ok(path.into())
+            }
+            fn normalize_in_dir(&self, _dir: &str, relative: &str) -> Result<String, MdsError> {
+                Ok(relative.into())
+            }
+            fn parent_dir(&self, _key: &str) -> String {
+                String::new()
+            }
+            fn is_markdown(&self, _key: &str) -> bool {
+                false
+            }
+            fn read(&self, _key: &str) -> Result<String, MdsError> {
+                Ok(if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "Hello\n"
+                } else {
+                    "different\n"
+                }
+                .into())
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut cache = ModuleCache::with_fs(Box::new(CountReads(Arc::clone(&reads))));
+        let (output, source) = cache
+            .resolve_path_intrinsic_source("main.mds", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(source, "Hello\n");
+        assert_eq!(output, CompiledOutput::Markdown(source));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn clean_output_preserves_interior_blank_runs() {
@@ -2806,9 +2868,9 @@ mod tests {
     }
 
     /// A record carries exactly the context the resolver adds to an error resolving its
-    /// path: an `@extends` or `@import` its span — multi-byte text, CRLF line ends and a
-    /// byte-order mark before it included — a frontmatter import its index, an
-    /// `@export … from` nothing. Each row is judged against the resolver's own error.
+    /// path: a directive its span — multi-byte text, CRLF line ends and a byte-order
+    /// mark before it included — a frontmatter import its index. Each row is judged
+    /// against the resolver's own error.
     #[test]
     fn scan_import_records_carry_the_context_the_resolver_adds() {
         let bom = char::from_u32(0xfeff).expect("U+FEFF is a char");
@@ -2861,16 +2923,13 @@ mod tests {
             "@export * from \"./missing.mds\"\n",
         ] {
             let err = missing_import_error(source, &[]);
-            // Non-vacuity: this is the missing module's own error, with no span added.
             assert_eq!(err.code, "mds::module_not_found", "{err:?}");
-            assert_eq!(err.span, None, "{source:?}");
+            let span = err.span.expect("a re-export points at its directive");
+            assert_eq!((span.offset, span.length), (0, source.trim_end().len()));
             let record = record_of(source, "./missing.mds");
             assert_eq!(record.kind, ImportKind::ExportFrom);
-            assert_eq!(
-                (record.frontmatter_index, record.span),
-                (None, None),
-                "{source:?}"
-            );
+            assert_eq!(record.frontmatter_index, None);
+            assert_eq!(record.span, Some(span), "{source:?}");
         }
     }
 
@@ -2960,7 +3019,18 @@ mod tests {
                 ],
                 "{resolve_as:?}"
             );
-            assert!(records.iter().all(|r| r.span.is_none()), "{records:?}");
+            assert_eq!(records[0].span, None, "the frontmatter import has no span");
+            let span = records[1]
+                .span
+                .as_ref()
+                .expect("the first re-export has a span");
+            assert_eq!(
+                (span.offset, span.length),
+                (
+                    source.find("@export").unwrap(),
+                    "@export x from \"./c.mds\"".len()
+                )
+            );
         }
         assert_eq!(
             scan_imports(source).expect("parses"),

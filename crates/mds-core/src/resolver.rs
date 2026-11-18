@@ -335,19 +335,22 @@ impl ModuleCache {
         Ok(())
     }
 
-    /// Guard against unbounded module loading from adversarial import graphs (REL-2).
+    /// Permit the entry plus at most `MAX_MODULE_COUNT` other distinct modules.
     ///
-    /// Enforced on the native file-resolution paths as each new module is resolved
-    /// from disk; the virtual/WASM/napi binding layers enforce the same cap at
-    /// input-validation time before resolution begins, so all paths share an
-    /// identical bound.  Runtime guard, not `debug_assert` — must hold in release
-    /// builds (applies PF-004/PF-005).
-    fn check_module_count(&self) -> Result<(), MdsError> {
-        if self.modules.len() >= MAX_MODULE_COUNT {
-            return Err(MdsError::resource_limit(format!(
-                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
-                self.modules.len(),
-            )));
+    /// Count cached keys, keys still being resolved, and the candidate before any
+    /// read. A cached skeleton can also be on the resolving stack during an
+    /// upgrade; count that key once. Binding input guards separately bound the
+    /// supplied virtual map, including unused entries.
+    fn check_module_count(&self, key: &str) -> Result<(), MdsError> {
+        let distinct = self.modules.len()
+            + self
+                .resolving
+                .iter()
+                .filter(|key| !self.modules.contains_key(key.as_str()))
+                .count()
+            + usize::from(!self.modules.contains_key(key) && !self.resolving.contains(key));
+        if distinct > MAX_MODULE_COUNT + 1 {
+            return Err(crate::error::module_count_exceeded());
         }
         Ok(())
     }
@@ -411,7 +414,7 @@ impl ModuleCache {
             key: &key,
             typed: path,
         };
-        self.resolve_by_key(entry, runtime_vars, warnings)
+        self.resolve_by_key(entry, runtime_vars, None, warnings)
     }
 
     /// Resolve a module from a filesystem path string, dispatching on output shape.
@@ -427,14 +430,12 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        self.resolve_path_intrinsic_keyed(path, runtime_vars, warnings)
+        self.resolve_path_intrinsic_source(path, runtime_vars, warnings)
             .map(|(output, _)| output)
     }
 
-    /// [`Self::resolve_path_intrinsic`], also returning the entry's key — on [`NativeFs`]
-    /// its canonical path — for a caller that reads the entry again itself, so that it
-    /// re-reads the file this resolved and checked, never the path as typed (#428).
-    pub(crate) fn resolve_path_intrinsic_keyed(
+    /// Resolve the entry and return the exact source text read by its check gate.
+    pub(crate) fn resolve_path_intrinsic_source(
         &mut self,
         path: &str,
         runtime_vars: &HashMap<String, Value>,
@@ -445,8 +446,13 @@ impl ModuleCache {
             key: &key,
             typed: path,
         };
-        let output = self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)?;
-        Ok((output, key))
+        let ((output, _), source) = self.resolve_intrinsic_by_key_opts_source(
+            entry,
+            runtime_vars,
+            &Default::default(),
+            warnings,
+        )?;
+        Ok((output, source))
     }
 
     /// Like [`Self::resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -475,6 +481,7 @@ impl ModuleCache {
         &mut self,
         module: ModuleRef<'_>,
         runtime_vars: &HashMap<String, Value>,
+        import_site: Option<ImportSite<'_>>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         let key = module.key;
@@ -500,7 +507,7 @@ impl ModuleCache {
         self.check_import_depth()?;
 
         // Step 3.5: module count guard (REL-2, applies PF-004).
-        self.check_module_count()?;
+        self.check_module_count(key)?;
 
         // Step 4: read the file only on a cache miss.
         let source = self.fs.read(key)?;
@@ -508,8 +515,12 @@ impl ModuleCache {
         // Step 5: determine if markdown (for frontmatter type-key handling).
         let is_md = self.fs.is_markdown(key);
 
-        // Step 6: validate file type.
-        check_module_type(module, &source)?;
+        // Attach a type refusal here, before recursion. A spanless frontmatter
+        // refusal from a child must not acquire this module's importing directive.
+        check_module_type(module, &source).map_err(|err| match import_site {
+            Some(site) => site.attach_type_error(err),
+            None => err,
+        })?;
 
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
@@ -564,6 +575,7 @@ impl ModuleCache {
         base_dir: &str,
         relative: &str,
         runtime_vars: &HashMap<String, Value>,
+        import_site: Option<ImportSite<'_>>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         validate_import_path(relative)?;
@@ -572,7 +584,7 @@ impl ModuleCache {
             key: &key,
             typed: relative,
         };
-        self.resolve_by_key(module, runtime_vars, warnings)
+        self.resolve_by_key(module, runtime_vars, import_site, warnings)
     }
 
     /// Resolve an entry module by its key.
@@ -594,7 +606,7 @@ impl ModuleCache {
             key: &resolved,
             typed: key,
         };
-        self.resolve_by_key(entry, runtime_vars, warnings)
+        self.resolve_by_key(entry, runtime_vars, None, warnings)
     }
 
     /// Resolve a module from an in-memory source string.
@@ -623,6 +635,7 @@ impl ModuleCache {
         // resolve_by_key so that cycle detection and depth checks apply to the
         // root module as well.
         self.check_import_depth()?;
+        self.check_module_count(SOURCE_LABEL)?;
         self.resolving.insert(SOURCE_LABEL.into());
 
         let ctx = ModuleCtx {
@@ -703,6 +716,17 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        self.resolve_intrinsic_by_key_opts_source(entry, runtime_vars, opts, warnings)
+            .map(|(result, _)| result)
+    }
+
+    fn resolve_intrinsic_by_key_opts_source(
+        &mut self,
+        entry: ModuleRef<'_>,
+        runtime_vars: &HashMap<String, Value>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<((crate::CompiledOutput, Option<crate::SourceMap>), String), MdsError> {
         let key = entry.key;
         // Cycle detection: if this key is already on the resolving stack it forms
         // a circular import that must be rejected.
@@ -712,6 +736,7 @@ impl ModuleCache {
         }
 
         self.check_import_depth()?;
+        self.check_module_count(key)?;
 
         let source = self.fs.read(key)?;
         let is_md = self.fs.is_markdown(key);
@@ -731,7 +756,7 @@ impl ModuleCache {
         let result = self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings);
 
         let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, key)
+        Self::check_lifo_pop(result, popped, key).map(|result| (result, source))
     }
 
     /// Resolve a module from an in-memory source string, dispatching on output shape.
@@ -748,6 +773,7 @@ impl ModuleCache {
         Self::check_source_size(source)?;
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
+        self.check_module_count(SOURCE_LABEL)?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -774,6 +800,7 @@ impl ModuleCache {
         Self::check_source_size(source)?;
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
+        self.check_module_count(SOURCE_LABEL)?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -1385,7 +1412,12 @@ impl ModuleCache {
             typed: &ext.path,
         };
         let base = self
-            .resolve_by_key_skeleton(base_ref, ctx.runtime_vars, warnings)
+            .resolve_by_key_skeleton(
+                base_ref,
+                ctx.runtime_vars,
+                ctx.import_site(ext.offset),
+                warnings,
+            )
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // ── Step 3b: child-only-blocks check ─────────────────────────────────
@@ -1554,6 +1586,7 @@ impl ModuleCache {
         &mut self,
         module: ModuleRef<'_>,
         runtime_vars: &HashMap<String, Value>,
+        import_site: ImportSite<'_>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         let key = module.key;
@@ -1572,12 +1605,12 @@ impl ModuleCache {
         self.check_import_depth()?;
 
         // Module count guard (REL-2, applies PF-004).
-        self.check_module_count()?;
+        self.check_module_count(key)?;
 
         // PF-004: read via FileSystem trait — NEVER std::fs.
         let source = self.fs.read(key)?;
         let is_md = self.fs.is_markdown(key);
-        check_module_type(module, &source)?;
+        check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
         self.resolving.insert(key.to_string());
 
@@ -1644,7 +1677,12 @@ impl ModuleCache {
             typed: &ext.path,
         };
         let grandparent = self
-            .resolve_by_key_skeleton(grandparent_ref, ctx.runtime_vars, warnings)
+            .resolve_by_key_skeleton(
+                grandparent_ref,
+                ctx.runtime_vars,
+                ctx.import_site(ext.offset),
+                warnings,
+            )
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // Child-only-blocks check for this intermediate base (3b).
@@ -1829,19 +1867,24 @@ impl ModuleCache {
             ExportDirective::ReExport {
                 name,
                 path: import_path,
-                ..
+                offset,
             } => {
                 // Resolve the source module and bring in the function for
                 // re-export only. Per spec: "@export from does not bring the
                 // symbol into the current file's scope".
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
-                let source_module = self.resolve_import_from(
-                    ctx.base_dir,
-                    import_path,
-                    ctx.runtime_vars,
-                    warnings,
-                )?;
+                let source_module = self
+                    .resolve_import_from(
+                        ctx.base_dir,
+                        import_path,
+                        ctx.runtime_vars,
+                        Some(ctx.import_site(*offset)),
+                        warnings,
+                    )
+                    .map_err(|e| {
+                        attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
+                    })?;
                 let func = source_module.get_export(name).ok_or_else(|| {
                     MdsError::export_error(format!(
                         "cannot re-export '{name}': not exported from \"{import_path}\""
@@ -1858,12 +1901,17 @@ impl ModuleCache {
                 // available to importers but NOT in the current file's scope.
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
-                let source_module = self.resolve_import_from(
-                    ctx.base_dir,
-                    import_path,
-                    ctx.runtime_vars,
-                    warnings,
-                )?;
+                let source_module = self
+                    .resolve_import_from(
+                        ctx.base_dir,
+                        import_path,
+                        ctx.runtime_vars,
+                        Some(ctx.import_site(*offset)),
+                        warnings,
+                    )
+                    .map_err(|e| {
+                        attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
+                    })?;
                 let line_len = line_len_at(ctx.source, *offset);
                 for (name, func) in source_module.get_all_exports() {
                     if defs.functions.contains_key(&name) {
@@ -1902,7 +1950,13 @@ impl ModuleCache {
             ));
         }
         let resolved = self
-            .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
+            .resolve_import_from(
+                ctx.base_dir,
+                path,
+                ctx.runtime_vars,
+                Some(ctx.import_site(offset)),
+                warnings,
+            )
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         scope.set_namespace(alias, resolved.to_namespace());
         Ok(())
@@ -1924,13 +1978,13 @@ impl ModuleCache {
                         return Err(MdsError::name_collision(alias.to_string()));
                     }
                     let resolved = self
-                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
+                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     scope.set_namespace(alias, resolved.to_namespace());
                 }
                 FrontmatterImport::Merge { path } => {
                     let resolved = self
-                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
+                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     for (name, func) in resolved.get_all_exports() {
                         if scope.get_function(&name).is_some() {
@@ -1944,7 +1998,7 @@ impl ModuleCache {
                 }
                 FrontmatterImport::Selective { path, names } => {
                     let resolved = self
-                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
+                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     let not_exported = |name: &str| {
                         MdsError::import_error(format!(
@@ -1983,7 +2037,13 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         let resolved = self
-            .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
+            .resolve_import_from(
+                ctx.base_dir,
+                path,
+                ctx.runtime_vars,
+                Some(ctx.import_site(offset)),
+                warnings,
+            )
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         // Per spec: only functions and the prompt body are imported via merge.
         // Frontmatter variables from the imported module are NOT brought into scope.
@@ -2016,7 +2076,13 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         let resolved = self
-            .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
+            .resolve_import_from(
+                ctx.base_dir,
+                path,
+                ctx.runtime_vars,
+                Some(ctx.import_site(offset)),
+                warnings,
+            )
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         let line_len = line_len_at(ctx.source, offset);
         let not_exported = |name: &str| {
@@ -2192,6 +2258,40 @@ struct ExtendsComponents {
     /// children emit the full merged key set rather than only their own keys (#154).
     /// `None` when the merged mapping is empty (no non-reserved FM keys on either side).
     merged_frontmatter: Option<String>,
+}
+
+/// The immediate directive that requests a module's type check.
+struct ImportSite<'a> {
+    file_str: &'a str,
+    source: &'a str,
+    offset: usize,
+}
+
+impl ImportSite<'_> {
+    fn attach_type_error(self, err: MdsError) -> MdsError {
+        match err {
+            MdsError::NotMdsFile {
+                path, span: None, ..
+            } => MdsError::not_mds_file_at(
+                path,
+                self.file_str,
+                self.source,
+                self.offset,
+                line_len_at(self.source, self.offset),
+            ),
+            other => other,
+        }
+    }
+}
+
+impl ModuleCtx<'_> {
+    fn import_site(&self, offset: usize) -> ImportSite<'_> {
+        ImportSite {
+            file_str: self.file_str,
+            source: self.source,
+            offset,
+        }
+    }
 }
 
 /// Bundle of borrowed per-module context threaded through the AST walk helpers.
@@ -2779,10 +2879,8 @@ fn key_display_name(key: &str) -> &str {
     key.rsplit(['/', '\\']).next().unwrap_or(key)
 }
 
-/// If `err` is a `FileNotFound` error with no source span, attach a span pointing
-/// to the `@import` directive in the parent file. Other error variants are returned
-/// unchanged so that cascading errors (e.g. circular imports inside the missing
-/// file) still report their own locations.
+/// Attach the importing directive's span to a spanless file, module, or cycle error.
+/// Keep an existing span so errors inside another module retain their own source.
 fn attach_import_span(
     err: MdsError,
     path: &str,

@@ -1565,6 +1565,8 @@ fn flat_output(source: &Path, ext: &str) -> (PathBuf, bool) {
 pub(crate) struct WalkResult {
     /// Files that were collected and are eligible for processing.
     pub files: Vec<PathBuf>,
+    /// No-follow metadata from the walk for each collected file.
+    metadata: std::collections::HashMap<PathBuf, std::fs::Metadata>,
     /// Count of `.mds` files found inside default-excluded directories.
     pub excluded_by_default: usize,
 }
@@ -1581,21 +1583,75 @@ pub(crate) fn collect_mds_files_detailed(
     max_depth: usize,
     exclude_prefix: Option<&Path>,
 ) -> WalkResult {
-    let mut files = Vec::new();
-    let mut excluded_by_default = 0;
-    collect_mds_files_inner(
-        root,
-        0,
-        max_depth,
-        exclude_prefix,
-        &mut files,
-        &mut excluded_by_default,
-    );
-    WalkResult {
-        files,
-        excluded_by_default,
+    let mut walk = WalkResult {
+        files: Vec::new(),
+        metadata: std::collections::HashMap::new(),
+        excluded_by_default: 0,
+    };
+    collect_mds_files_inner(root, 0, max_depth, exclude_prefix, &mut walk);
+    pause_after_walk();
+    walk
+}
+
+/// Pin a collected file to its walk-time location and no-follow metadata.
+/// The file and typed root must come from the same walk.
+pub(crate) fn walked_pin(
+    walk: &WalkResult,
+    file: &Path,
+    typed_dir: &Path,
+    canonical_dir: &Path,
+) -> std::result::Result<mds::EntryPin, mds::MdsError> {
+    let invalid = || mds::MdsError::Io {
+        message: format!(
+            "cannot read {}: missing or invalid walk metadata",
+            safe_path(file)
+        ),
+    };
+    let relative = file.strip_prefix(typed_dir).map_err(|_| invalid())?;
+    let metadata = walk.metadata.get(file).ok_or_else(invalid)?;
+    Ok(mds::EntryPin::key(canonical_dir.join(relative)).with_walked(metadata))
+}
+
+#[cfg(debug_assertions)]
+mod walk_pause_trigger {
+    use super::*;
+    use crate::write::{atomic_write_file, Durability, Parents};
+
+    const VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_WALK";
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    const MAX_POLLS: u32 = 2_000;
+
+    pub(crate) fn pause_after_walk() {
+        let Some(go) = std::env::var_os(VARIABLE).map(PathBuf::from) else {
+            return;
+        };
+        let mut paused = go.clone().into_os_string();
+        paused.push(".paused");
+        // If the marker fails, the test reports that the walk did not pause.
+        if atomic_write_file(
+            &WriteTarget::as_typed(PathBuf::from(paused)),
+            "",
+            Durability::RenameOnly,
+            Parents::Existing,
+        )
+        .is_err()
+        {
+            return;
+        }
+        for _ in 0..MAX_POLLS {
+            if go.exists() {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
     }
 }
+
+#[cfg(debug_assertions)]
+use walk_pause_trigger::pause_after_walk;
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn pause_after_walk() {}
 
 /// Recursively collect all `.mds` files under `root`, bounded by `max_depth`.
 ///
@@ -1677,8 +1733,7 @@ fn collect_mds_files_inner(
     depth: usize,
     max_depth: usize,
     exclude_prefix: Option<&Path>,
-    results: &mut Vec<PathBuf>,
-    excluded_count: &mut usize,
+    results: &mut WalkResult,
 ) {
     if depth > max_depth {
         // The directory name is discovered by the walk — the user never types it — so it
@@ -1728,20 +1783,25 @@ fn collect_mds_files_inner(
                 if is_default_excluded_dir(name) {
                     // Count the .mds files we're skipping so callers can emit a
                     // meaningful diagnostic when all candidates are excluded.
-                    count_mds_in_excluded_dir(&path, depth + 1, max_depth, excluded_count);
+                    count_mds_in_excluded_dir(
+                        &path,
+                        depth + 1,
+                        max_depth,
+                        &mut results.excluded_by_default,
+                    );
                     continue;
                 }
             }
-            collect_mds_files_inner(
-                &path,
-                depth + 1,
-                max_depth,
-                exclude_prefix,
-                results,
-                excluded_count,
-            );
+            collect_mds_files_inner(&path, depth + 1, max_depth, exclude_prefix, results);
         } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds") {
-            results.push(path);
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            results.metadata.insert(path.clone(), metadata);
+            results.files.push(path);
         }
     }
 }
@@ -2868,6 +2928,35 @@ pub(crate) mod child_process {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn walked_pin_reports_missing_metadata_without_a_panic() {
+        let file = Path::new("src").join("a.mds");
+        let walk = WalkResult {
+            files: vec![file.clone()],
+            metadata: std::collections::HashMap::new(),
+            excluded_by_default: 0,
+        };
+        let error = walked_pin(&walk, &file, Path::new("src"), Path::new("canonical")).unwrap_err();
+        assert!(matches!(error, mds::MdsError::Io { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cannot read {}: missing or invalid walk metadata",
+                safe_path(&file)
+            )
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.mds");
+        std::fs::write(&source, "Hello\n").unwrap();
+        let mut complete = walk;
+        complete
+            .metadata
+            .insert(file.clone(), std::fs::symlink_metadata(source).unwrap());
+        assert!(walked_pin(&complete, &file, Path::new("src"), dir.path()).is_ok());
+        assert!(walked_pin(&complete, &file, Path::new("other"), dir.path()).is_err());
+    }
 
     /// An out-dir written at `/out` and typed as `out`, so every assertion tells the two
     /// forms apart.
@@ -5390,9 +5479,7 @@ mod tests {
                 false,
             ),
             (
-                miette::Report::new(MdsError::NotMdsFile {
-                    path: "a.txt".to_owned(),
-                }),
+                miette::Report::new(MdsError::not_mds_file("a.txt")),
                 true,
                 false,
             ),

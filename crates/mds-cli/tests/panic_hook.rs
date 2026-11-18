@@ -1772,6 +1772,44 @@ fn the_pause_before_a_replace_is_compiled_only_into_debug_builds() {
     }
 }
 
+#[test]
+fn the_pause_after_a_walk_is_compiled_only_into_debug_builds() {
+    let output = read_source("src/output.rs");
+    let sources = crate_sources();
+    let gate = DebugGate {
+        module: "walk_pause_trigger",
+        needles: &[("MDS_TEST_PAUSE_AFTER_WALK", true)],
+        fns: &["pause_after_walk"],
+    };
+    let found = gate_findings(&sources, &gate);
+    assert!(found.is_empty(), "{}", found.join("\n"));
+
+    let stub = "pub(crate) fn pause_after_walk() {}";
+    for (from, to) in [
+        (
+            "#[cfg(debug_assertions)]\nmod walk_pause_trigger",
+            "mod walk_pause_trigger",
+        ),
+        (
+            stub,
+            "pub(crate) fn pause_after_walk() { let _ = std::env::var_os(\"MDS_TEST_PAUSE_AFTER_WALK\"); }",
+        ),
+        (stub, "pub(crate) fn pause_after_walk() { let _ = 1; }"),
+        (stub, ""),
+    ] {
+        let planted = output.replacen(from, to, 1);
+        assert_ne!(planted, output, "precondition: output.rs holds {from:?}");
+        let planted_sources: Vec<_> = sources
+            .iter()
+            .map(|(name, src)| {
+                let src = if name == "output.rs" { &planted } else { src };
+                (name.clone(), src.clone())
+            })
+            .collect();
+        assert!(!gate_findings(&planted_sources, &gate).is_empty());
+    }
+}
+
 /// The pause between a directory watch batch's split and its compile (#160), the pause
 /// between a watch rebuild's look and its reads (#380) and the pause between a file
 /// rebuild's reads and its baseline (#380) compile only into a debug build, as the pause
@@ -1810,6 +1848,7 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     let stub = "fn pause_after_batch_split() {}";
     let look_stub = "fn pause_after_look() {}";
     let read_stub = "fn pause_after_read() {}";
+    let compile_stub = "fn pause_before_compile() {}";
     for (planted, what) in [
         (
             with(
@@ -1849,6 +1888,22 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
             "the read pause's variable outside its module",
         ),
         (with(read_stub, ""), "a read pause without a release stub"),
+        (
+            with(
+                compile_stub,
+                "fn pause_before_compile() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE\");\n}",
+            ),
+            "the compile pause's variable outside its module",
+        ),
+        (
+            with(compile_stub, "fn pause_before_compile() { let _ = 1; }"),
+            "a compile release stub that does something",
+        ),
+        (
+            with(compile_stub, ""),
+            "a compile pause without a release stub",
+        ),
     ] {
         assert!(
             !gate_findings(&planted, &BATCH_PAUSE_TRIGGER).is_empty(),
@@ -1978,9 +2033,9 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "build.rs",
-                "AssertUnwindSafe(|| compile_to_content(file, runtime_vars.clone(), quiet, opts))",
-                "AssertUnwindSafe(|| { fail_count += 1; compile_to_content(file, \
-                 runtime_vars.clone(), quiet, opts) })",
+                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)",
+                "{ fail_count += 1; compile_native_to_content(fs, file, \
+                 runtime_vars.clone(), quiet, opts) }",
             ),
             "more than one call",
             "a state change beside the compile",
@@ -1997,8 +2052,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "lint.rs",
-                "mds::lint(path, ctx.runtime_vars.clone(), &config)",
-                "mds::lint(path, ctx.base_dir_cache.borrow_mut().remove(path), &config)",
+                "mds::lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config)",
+                "mds::lint_native_fs(fs, path, ctx.base_dir_cache.borrow_mut().remove(path), &config)",
             ),
             "changes state",
             "an argument that changes state",
@@ -2006,8 +2061,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "build.rs",
-                "compile_to_content(file, runtime_vars.clone(), quiet, opts)",
-                "compile_to_content(file, runtime_vars.clone(), quiet, &mut opts)",
+                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)",
+                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, &mut opts)",
             ),
             "changes state",
             "a mutable borrow",
@@ -2015,8 +2070,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "main.rs",
-                "mds::check_collecting_warnings(file, runtime_vars.clone()))",
-                "mds::check_collecting_warnings(file, runtime_vars.clone()).map(|c| c))",
+                "mds::check_native_fs(fs, file, runtime_vars.clone()))",
+                "mds::check_native_fs(fs, file, runtime_vars.clone()).map(|c| c))",
             ),
             "more than its one call",
             "a call chained onto the compile",
@@ -2024,8 +2079,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "main.rs",
-                "AssertUnwindSafe(|| mds::check_collecting_warnings(file, runtime_vars.clone()))",
-                "|| mds::check_collecting_warnings(file, runtime_vars.clone())",
+                "AssertUnwindSafe(|| mds::check_native_fs(fs, file, runtime_vars.clone()))",
+                "|| mds::check_native_fs(fs, file, runtime_vars.clone())",
             ),
             "AssertUnwindSafe",
             "a closure not wrapped in `AssertUnwindSafe`",
@@ -2052,8 +2107,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "lint.rs",
-                "AssertUnwindSafe(|| mds::lint(path, ctx.runtime_vars.clone(), &config))",
-                "AssertUnwindSafe(|| lint(path, ctx.runtime_vars.clone(), &config))",
+                "AssertUnwindSafe(|| mds::lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config))",
+                "AssertUnwindSafe(|| lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config))",
             ),
             "not a compile",
             "a helper named like the compile in its place",
@@ -2130,34 +2185,39 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
     );
 }
 
-/// `debug-panics` is declared, enables nothing, and is off unless asked for: nothing in
-/// `mds-cli`'s manifest names it as a value, so no `default` feature and no other feature
-/// turns it on, however the list is written.
+/// Each native or WASM host manifest declares `debug-panics` but never enables it
+/// through a default or another feature. Each manifest gets the same controls.
 ///
 /// Controls ([`assert_never_on_by_default`]): each way of turning it on, a declaration
 /// that enables something, and a manifest that does not declare it are reported; a mention
 /// in a comment is not.
 #[test]
 fn debug_panics_is_never_on_by_default() {
-    assert_never_on_by_default("debug-panics", "startup-race-probe");
+    for (manifest, other) in [
+        ("Cargo.toml", "startup-race-probe"),
+        ("../mds-napi/Cargo.toml", "verbose"),
+        ("../mds-python/Cargo.toml", "extension-module"),
+        ("../mds-wasm/Cargo.toml", "verbose"),
+    ] {
+        assert_never_on_by_default(manifest, "debug-panics", other);
+    }
 }
 
 /// `startup-race-probe`, which delays `mds watch`'s startup on purpose, must never ship
 /// enabled either, and is held to the same rule as `debug-panics`, with the same controls.
 #[test]
 fn startup_race_probe_is_never_on_by_default() {
-    assert_never_on_by_default("startup-race-probe", "debug-panics");
+    assert_never_on_by_default("Cargo.toml", "startup-race-probe", "debug-panics");
 }
 
-/// `feature` has no finding in `mds-cli`'s manifest ([`feature_findings`]), and every
-/// planted way of turning it on — `other` is another feature the manifest declares — is
-/// reported, while a mention in a comment is not.
-fn assert_never_on_by_default(feature: &str, other: &str) {
-    let manifest = read_source("Cargo.toml");
+/// `feature` has no finding in the manifest, and each planted way to enable it is
+/// reported. `other` names a companion feature. A comment enables nothing.
+fn assert_never_on_by_default(path: &str, feature: &str, other: &str) {
+    let manifest = read_source(path);
     let found = feature_findings(&manifest, feature);
     assert!(
         found.is_empty(),
-        "mds-cli's `{feature}` feature must stay off by default:\n{}",
+        "{path}'s `{feature}` feature must stay off by default:\n{}",
         found.join("\n")
     );
     let declared = format!("{feature} = []");
@@ -2217,6 +2277,164 @@ fn assert_never_on_by_default(feature: &str, other: &str) {
         Vec::<String>::new(),
         "a mention of `{feature}` in a comment turns nothing on"
     );
+}
+
+/// Both native host funnels enter the shared boundary. A helper name in a
+/// comment, literal, or different function must not satisfy the scan.
+#[test]
+fn native_host_funnels_use_the_shared_panic_boundary() {
+    let mut found = Vec::new();
+    for (path, funnel) in [
+        ("../mds-napi/src/lib.rs", "run_catching"),
+        ("../mds-python/src/lib.rs", "guard"),
+    ] {
+        let source = read_source(path);
+        let planted = format!(
+            "fn {funnel}() {{\n\
+             // mds::host_panic::catching(f);\n\
+             let text = \"mds::host_panic::catching(f)\";\n\
+             std::panic::catch_unwind(f);\n\
+             }}\nfn decoy() {{ mds::host_panic::catching(f); }}"
+        );
+        assert_eq!(
+            host_boundary_findings(&planted, funnel),
+            [format!("{funnel} must call mds::host_panic::catching once")],
+            "{path}: a planted funnel without the call must fail the scan"
+        );
+        found.extend(
+            host_boundary_findings(&source, funnel)
+                .into_iter()
+                .map(|finding| format!("{path}: {finding}")),
+        );
+    }
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "native funnels must use the shared boundary"
+    );
+}
+
+fn host_boundary_findings(source: &str, funnel: &str) -> Vec<String> {
+    let code = blank(source, true);
+    let bodies: Vec<_> = fn_bodies(&code)
+        .into_iter()
+        .filter(|(name, _)| name == funnel)
+        .collect();
+    if bodies.len() != 1
+        || calls_ending_with(&code[bodies[0].1.clone()], "mds::host_panic::catching").len() != 1
+    {
+        return vec![format!("{funnel} must call mds::host_panic::catching once")];
+    }
+    Vec::new()
+}
+
+/// Build inputs must not select the local-only panic feature. Each input gets a
+/// planted selection in memory. Commands also get an all-features control.
+#[test]
+fn build_entry_points_leave_debug_panics_off() {
+    let inputs = [
+        (
+            "../mds-python/pyproject.toml",
+            "features = [\"pyo3/abi3-py311\"]",
+        ),
+        ("../mds-napi/package.json", "napi build --release --no-js"),
+        (
+            "../../packages/mds-wasm/package.json",
+            "wasm-pack build ../../crates/mds-wasm --target nodejs",
+        ),
+        (
+            "../../.github/workflows/release.yml",
+            "napi build --platform --release",
+        ),
+    ];
+    assert!(
+        inputs
+            .iter()
+            .any(|(path, _)| *path == "../../packages/mds-wasm/package.json"),
+        "the WASM workspace build script must receive the planted feature controls"
+    );
+    for (path, anchor) in inputs {
+        let source = read_source(path);
+        assert!(
+            source.contains(anchor),
+            "{path}: the build input must exist"
+        );
+        let replacements = if anchor.starts_with("features =") {
+            vec!["features = [\"pyo3/abi3-py311\", \"debug-panics\"]".to_string()]
+        } else {
+            vec![
+                format!("{anchor} --features debug-panics"),
+                format!("{anchor} --all-features"),
+            ]
+        };
+        for replacement in replacements {
+            let planted = source.replacen(anchor, &replacement, 1);
+            assert_ne!(planted, source, "{path}: the control must change the input");
+            assert_eq!(
+                build_feature_findings(&planted).len(),
+                1,
+                "{path}: the planted {replacement} must fail the scan"
+            );
+        }
+        assert_eq!(
+            build_feature_findings(&source),
+            Vec::<String>::new(),
+            "{path}: build entry points must not enable panic details"
+        );
+        assert!(
+            build_feature_findings(&format!("{source}\n# debug-panics --all-features")).is_empty()
+        );
+    }
+}
+
+/// Conservatively refuse either spelling anywhere outside a line comment.
+fn build_feature_findings(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let code = toml_code(line);
+            code.contains("debug-panics") || code.contains("--all-features")
+        })
+        .map(|(line, _)| format!("line {} enables panic details", line + 1))
+        .collect()
+}
+
+#[test]
+fn wasm_installs_no_panic_hook_and_the_policy_states_why() {
+    let sources = rust_sources("../mds-wasm/src", "lib.rs", 1);
+    for needle in [
+        "set_hook",
+        "take_hook",
+        "mds::host_panic::install",
+        "mds::host_panic::catching",
+    ] {
+        let planted = plant_in(&sources, "lib.rs", |source| {
+            source.push_str(&format!("\nfn planted() {{ {needle}(f); }}\n"));
+        });
+        assert_eq!(
+            wasm_hook_findings(&planted).len(),
+            1,
+            "the WASM scan must reject a planted {needle}"
+        );
+    }
+    assert_eq!(wasm_hook_findings(&sources), Vec::<String>::new());
+    let policy = read_source("../../SECURITY.md");
+    assert!(policy.contains("on wasm32-unknown-unknown, the default hook has no output channel"));
+}
+
+fn wasm_hook_findings(sources: &[(String, String)]) -> Vec<String> {
+    sources
+        .iter()
+        .flat_map(|(path, source)| {
+            let code = blank(source, true);
+            ["set_hook", "take_hook", "host_panic"]
+                .into_iter()
+                .filter(|needle| !ident_positions(&code, needle).is_empty())
+                .map(|needle| format!("{path} must not name {needle}"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 // ── Lexical helpers ───────────────────────────────────────────────────────────
@@ -2307,11 +2525,13 @@ const CLI_PANIC_MACHINERY: &[(&str, &str, &str)] = &[
     ("catch_unwind", "output.rs", "catch_panic"),
 ];
 
-/// Where mds-core's sources name the [`PANIC_MACHINERY`]: two unit tests, each catching
-/// the panic of a check that debug builds compile in. mds-core's library code runs inside
-/// the CLI's catch, where a hook or a catch of its own would take a panic away from the
-/// CLI's hook, and an unwind without the hook would report nothing.
+/// Where mds-core's sources name the [`PANIC_MACHINERY`]: two unit tests and the
+/// native hosts' opt-in boundary helper. Core compile functions do not call that
+/// helper, so the CLI keeps its own hook and catch.
 const CORE_PANIC_MACHINERY: &[(&str, &str, &str)] = &[
+    ("take_hook", "host_panic.rs", "install"),
+    ("set_hook", "host_panic.rs", "install"),
+    ("catch_unwind", "host_panic.rs", "catching"),
     (
         "catch_unwind",
         "resolver_tests.rs",
@@ -2377,9 +2597,10 @@ const COMPILE_CATCHES: &[(&str, &str)] = &[
 /// defines.
 const COMPILE_CALLS: &[(&str, Option<&str>)] = &[
     ("compile_to_content", Some("build.rs")),
-    ("mds::check_collecting_warnings", None),
+    ("compile_native_to_content", Some("build.rs")),
+    ("mds::check_native_fs", None),
     ("format_source_named", Some("fmt.rs")),
-    ("mds::lint", None),
+    ("mds::lint_native_fs", None),
     ("run_fix_pipeline", Some("lint.rs")),
 ];
 
@@ -2870,17 +3091,20 @@ const PAUSE_TRIGGER: DebugGate = DebugGate {
 /// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, the pause between a watch rebuild's look and its
 /// reads (#380), `MDS_TEST_PAUSE_AFTER_LOOK`, and the pause between a file rebuild's reads
 /// and its baseline (#380), `MDS_TEST_PAUSE_AFTER_READ`, all in `mod batch_pause_trigger`.
+/// The same module holds `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` before entry resolution.
 const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
     module: "batch_pause_trigger",
     needles: &[
         ("MDS_TEST_PAUSE_AFTER_BATCH_SPLIT", true),
         ("MDS_TEST_PAUSE_AFTER_LOOK", true),
         ("MDS_TEST_PAUSE_AFTER_READ", true),
+        ("MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE", true),
     ],
     fns: &[
         "pause_after_batch_split",
         "pause_after_look",
         "pause_after_read",
+        "pause_before_compile",
     ],
 };
 

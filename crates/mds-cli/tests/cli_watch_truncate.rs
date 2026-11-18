@@ -249,7 +249,9 @@ fn flag_strict_claims(test: &str, strict: bool, details: &str) -> bool {
 /// through its diagnostic — every earlier rebuild's lines included.
 #[track_caller]
 fn stderr_through_the_marker(src: &Path, tap: StderrTap, child: &mut ChildGuard) -> String {
-    write_atomic(src, ORDER_MARKER_SOURCE);
+    // Keep the source identity for a rebuild that has not finished its reads.
+    // The marker uses the same truncate-then-write save as these fixtures.
+    std::fs::write(src, ORDER_MARKER_SOURCE).expect("write the order marker in place");
     wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
     tap.finish_text(child)
 }

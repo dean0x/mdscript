@@ -666,9 +666,7 @@ pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
         });
     }
     if path.extension().and_then(|e| e.to_str()) != Some("mds") {
-        return Err(MdsError::NotMdsFile {
-            path: shown.into_owned(),
-        });
+        return Err(MdsError::not_mds_file(shown.into_owned()));
     }
     Ok(())
 }
@@ -1148,7 +1146,24 @@ pub(crate) fn compile_to_content(
         // MAX_FILE_SIZE and check_symlink (PF-004 compliance).
         mds::compile_with_deps_opts(input, runtime_vars, opts).map_err(miette::Error::from)?
     };
+    compiled_content(result, quiet)
+}
 
+/// Compile a native entry through the caller's filesystem and entry pin.
+pub(crate) fn compile_native_to_content(
+    fs: mds::NativeFs,
+    input: &Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    quiet: bool,
+    opts: mds::CompileOptions,
+) -> Result<CompileOutput> {
+    let result =
+        mds::compile_native_fs(fs, input, runtime_vars, opts).map_err(miette::Error::from)?;
+    compiled_content(result, quiet)
+}
+
+/// Emit compile warnings and convert a core result to the CLI output format.
+fn compiled_content(result: mds::CompileResult, quiet: bool) -> Result<CompileOutput> {
     if !quiet {
         for w in &result.warnings {
             crate::output::eprint_warning(w);
@@ -2110,13 +2125,9 @@ fn run_build_directory(
     // is the out-dir as typed (#390).
     let output_base = resolve_output_base(out_dir.as_ref(), &config)?;
 
-    // Canonicalize dir for the starts_with comparison (issue 4): the out-dir's canonical
-    // form (d) is canonical, but `dir` may be a raw relative or pre-resolved-but-not-canonical path.
-    // Mismatch (e.g. /private/tmp vs /tmp on macOS) causes the exclusion to silently fail
-    // and includes the out-dir in the collection — not a security issue (only .mds are
-    // gathered) but causes redundant scanning. Fall back to raw dir when canonicalize fails
-    // (dir may not exist yet in unusual configurations).
-    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Keep the canonical directory for output exclusion and the walk-time entry pins.
+    let canonical_dir =
+        crate::input::resolve_directory_argument(dir).map_err(miette::Error::from)?;
 
     // Exclude the out-dir from collection when it is nested inside the source root.
     let exclude_prefix: Option<PathBuf> = match &output_base {
@@ -2125,7 +2136,7 @@ fn run_build_directory(
     };
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, exclude_prefix.as_deref());
-    let files = walk.files;
+    let files = &walk.files;
 
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
@@ -2159,7 +2170,7 @@ fn run_build_directory(
     // #204 closed for the empty tree. Same shape as the all-excluded arm: count-carrying,
     // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
     // behaviour; `mds watch <dir>` still starts.
-    if let Some(partials_only_count) = crate::output::partials_only(&files) {
+    if let Some(partials_only_count) = crate::output::partials_only(files) {
         crate::output::ewriteln!(
             "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
              nothing was built",
@@ -2177,7 +2188,7 @@ fn run_build_directory(
     // implies N useful artifacts (PF-034-adjacent).
     let mut empty_count: usize = 0;
 
-    for file in &files {
+    for file in files {
         // Skip partials: they contribute to imports but produce no standalone output.
         if is_partial(file) {
             continue;
@@ -2196,9 +2207,20 @@ fn run_build_directory(
 
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
         // A panic in it fails this file alone, and the batch goes on (#389).
+        let pin = match crate::output::walked_pin(&walk, file, dir, &canonical_dir) {
+            Ok(pin) => pin,
+            Err(e) => {
+                crate::output::eprint_file_failure(e.into());
+                fail_count += 1;
+                continue;
+            }
+        };
+        let fs = mds::NativeFs::new().with_entry_pin(pin);
         let compiled = crate::output::catch_compile(
             file,
-            AssertUnwindSafe(|| compile_to_content(file, runtime_vars.clone(), quiet, opts)),
+            AssertUnwindSafe(|| {
+                compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)
+            }),
         );
         match compiled {
             Ok(Ok(mut compiled)) => {

@@ -158,6 +158,25 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
     }
 }
 
+#[test]
+fn mask_keeps_long_lifetimes_and_masks_a_complete_char_escape() {
+    let prefix = "fn f<'long_lifetime>() { out += ";
+    let literal = r"'\u{10ffff}'";
+    let raw = format!("{prefix}{literal}; }}");
+    assert_eq!(
+        mask(&raw, true),
+        format!("{prefix}{}; }}", " ".repeat(literal.len()))
+    );
+    assert_eq!(mask(&raw, false), raw);
+}
+
+#[test]
+fn mask_keeps_an_append_between_a_lifetime_and_a_nearby_char() {
+    let raw = "'a:{s+='x';}";
+    assert_eq!(mask(raw, true), "'a:{s+=   ;}");
+    assert_eq!(mask(raw, false), raw);
+}
+
 /// Byte range of the function opened by the unique `anchor`, from the anchor to its
 /// matching closing brace, in masked source.
 fn function_range(code: &str, anchor: &str, file: &str) -> std::ops::Range<usize> {
@@ -280,28 +299,45 @@ fn mask(src: &str, strings: bool) -> String {
             continue;
         }
         if b[i] == b'\'' {
-            // A char literal, not a lifetime: a closing quote follows within a few bytes.
+            // A char literal holds exactly one character or one complete escape.
+            // A lifetime ends at its identifier, not at a nearby literal's quote.
             let mut j = i + 1;
-            let mut closed = false;
-            let mut steps = 0;
-            while j < b.len() && steps < 8 {
-                if b[j] == b'\\' {
-                    j += 2;
-                    steps += 1;
-                    continue;
-                }
-                if b[j] == b'\'' {
-                    closed = true;
-                    j += 1;
-                    break;
-                }
+            let first = src[j..].chars().next();
+            if first == Some('\\') {
                 j += 1;
-                steps += 1;
+                match b.get(j) {
+                    Some(b'u') if b.get(j + 1) == Some(&b'{') => {
+                        j += 2;
+                        // Bounded by the source length, not by an escape-size guess.
+                        while j < b.len() && !matches!(b[j], b'}' | b'\'') {
+                            j += 1;
+                        }
+                        if b.get(j) == Some(&b'}') {
+                            j += 1;
+                        }
+                    }
+                    Some(b'x') => j = (j + 3).min(b.len()),
+                    Some(_) => j += 1,
+                    None => {}
+                }
+            } else if let Some(ch) = first {
+                j += ch.len_utf8();
             }
-            if closed {
-                let end = j.min(b.len());
+            if b.get(j) == Some(&b'\'') {
+                let end = j + 1;
                 keep(&mut out, i, end);
                 i = end;
+                continue;
+            }
+            if first.is_some_and(|ch| ch == '_' || ch.is_alphabetic()) {
+                for ch in src[j..].chars() {
+                    if ch != '_' && !ch.is_alphanumeric() {
+                        break;
+                    }
+                    j += ch.len_utf8();
+                }
+                out[i..j].copy_from_slice(&b[i..j]);
+                i = j;
                 continue;
             }
         }

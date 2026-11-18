@@ -50,10 +50,30 @@ input. The compiler enforces several defense-in-depth controls:
   checks the directory argument of `mds build`, `mds check`, `mds fmt`, `mds lint`
   and `mds watch` by the same rule before it is walked, however it is typed (`link/`
   and `link/.` included), and refuses a symlinked one, or the filesystem root, as
-  `mds::io`, exit 2 (#413). `mds watch` re-checks the path it watches before every
-  rebuild — the entry in file mode, the directory argument and each source below
-  it in directory mode — and refuses the rebuild once a symbolic link on that path
-  has been retargeted (#417, #413).
+  `mds::io`, exit 2 (#413).
+- **Native source reads**: `NativeFs::read` accepts only a key that the same instance
+  resolved as an entry or import. Before it reads bytes, it compares the opened file
+  with that resolve record: device and inode on Unix, the handle's final path on Windows.
+  A mismatch returns `mds::io`: `cannot read <display>: the file changed while it was opened`.
+  An absent or unreadable record returns `mds::io`: `cannot read <display>: it was not resolved first`.
+  Other targets refuse native source reads. `mds::lint` applies its rules to the entry text
+  that the check gate read. Imported-module reads can still select a same-named file from
+  another directory. On Windows, a replacement regular file at the same path is still read.
+  Some overlay or network filesystems report different identities and refuse the read.
+  A source open can still wait indefinitely for a named pipe.
+- **Directory and watch entries**: a directory build, check, lint or fmt compares each
+  entry with its walked canonical path, plus the walk's device and inode on Unix.
+  `mds watch` compares the directory argument with its watched canonical directory before each rebuild.
+  It compares each entry or source's canonical parent with its watched parent before the compile
+  and again during entry resolution. A case-only file-name change within that parent is not a move.
+  A path lookup error, a different root or a different parent refuses the compile.
+  Watch reports the rebuild error and keeps the session active.
+  Watch uses the parent path, not a stored file identity; same-parent replacements remain possible.
+- **Vars file reads**: `--vars` accepts a regular file or a named pipe, with the same 10 MiB cap.
+  Regular files use the opened-file comparison above. Named pipes must have that type at lookup and open;
+  their device and inode are not compared. Other types and type mismatches return `mds::io`.
+  Process substitution works on macOS; Linux refuses `/dev/fd` links.
+  A watch vars path can still read a same-named file from another directory.
 - **Null-byte rejection**: paths containing NUL bytes are rejected at the API
   boundary rather than being passed to the OS.
 - **Forbidden path characters are refused at input, not only escaped on output**
@@ -248,6 +268,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max output size | 50 MiB (52,428,800 bytes) per output buffer, checked before every append; it does not bound a compile's total memory, since nested blocks, function results and imported modules each hold a buffer of their own ([#420](https://github.com/dean0x/mdscript/issues/420)) | `limits.rs` (`MAX_OUTPUT_SIZE`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
+| Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver.rs` |
 | Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
 | Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
 | Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |
@@ -267,6 +288,23 @@ the raw Rust panic payload as `err.detail` on `mds::internal` errors thrown at t
 binding boundary; in the CLI it prints the panic's message and location after the
 internal-compiler-error text below. Both exist to help diagnose unexpected panics
 during local development.
+
+**Native host panic boundaries (#436).** The napi and Python bindings use the shared
+`mds::host_panic::catching` helper around core calls. It installs one hook per library
+and silences the previous hook only inside the current thread's catch boundary.
+Outside that boundary, the previous hook receives the original panic information.
+The previous hook is Rust's default hook unless the host replaced it first.
+Nested calls restore the prior boundary state. Other threads keep their own state.
+The error remains `mds::internal` with message `internal compiler error`.
+The off-by-default `debug-panics` feature still adds the payload as error detail.
+
+A later host `set_hook` call replaces this hook. The library does not reinstall it
+per call, because that would race with the host. With `panic = "abort"`, a panic
+cannot return through the catch boundary. A Python panic outside `guard` can still
+become a `PanicException` with the payload.
+
+WASM installs no hook: on wasm32-unknown-unknown, the default hook has no output channel.
+A panic traps on that target.
 
 **The CLI's panic output (#389).** A panic in `mds` is reported with these two lines on
 stderr, and the run exits 101:
@@ -335,18 +373,18 @@ A release build therefore does not contain it — the variable is never read —
 profile turns debug assertions on. Build with debug assertions for development, not for
 anything you ship.
 
-Five more test-only hooks are compiled in the same way. Four of them stop the run at one
-point until a test lets it go, so that the test can change a file in the window that point
-opens. `MDS_TEST_PAUSE_BEFORE_REPLACE` stops a rewrite between its read and its replace,
-and a write of a new file between its look at the name and its commit.
-`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` stops a directory `mds watch` rebuild after it has told
-the sources still there from the sources gone, and before it compiles them.
-`MDS_TEST_PAUSE_AFTER_LOOK` stops a rebuild, in either watch mode, after it has looked for
-emptied files and before it reads any. `MDS_TEST_PAUSE_AFTER_READ` stops a file-mode
-rebuild after its compile has read every file, before it takes its baseline. Each variable
-names a file: the run writes `<file>.paused` when it stops, and goes on once `<file>`
-exists, or after ten seconds. The fifth, `MDS_TEST_READY`, has `mds watch` create the file
-the variable names once it is watching — by path, outside the write primitive's checks.
+Seven more test-only hooks use the same compile condition. Six pause the run at one point until a test releases it.
+`MDS_TEST_PAUSE_BEFORE_REPLACE` pauses a rewrite between its read and its replace.
+For a new file, it pauses the write between its name lookup and its commit.
+`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` pauses a directory `mds watch` rebuild after its source-presence check, before the compile.
+`MDS_TEST_PAUSE_AFTER_LOOK` pauses a rebuild, in either watch mode, after its empty-file check, before any source read.
+`MDS_TEST_PAUSE_AFTER_READ` pauses a file-mode rebuild after the compile reads its files, before its baseline snapshot.
+`MDS_TEST_PAUSE_AFTER_WALK` pauses a directory command after its file walk.
+`MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` pauses a watch compile after its path check, before entry resolution.
+Each pause variable names a file. The run writes `<file>.paused` at the pause point.
+It resumes once `<file>` exists, or after ten seconds.
+`MDS_TEST_READY` has `mds watch` create the file the variable names once the watch is active.
+It creates that file by path, outside the write primitive's checks.
 A release build contains none of them: each has an empty stub there, so it never reads the
 variable and never writes the file, unless its profile turns debug assertions on.
 `panic_hook.rs` pins this for each hook, as it does for `MDS_TEST_PANIC`.
@@ -360,10 +398,11 @@ published artifacts — `napi build --release` in `release.yml` for the addon, t
 `@mdscript/mds-wasm` build script (`wasm-pack build ../../crates/mds-wasm --target
 nodejs …` and `--target web …`) for the WASM package, and `maturin` with
 `pyproject.toml`'s `features = ["pyo3/abi3-py311"]` for the wheels — pass no
-`--features debug-panics`. For `mds-cli` alone, `crates/mds-cli/tests/panic_hook.rs`
-fails when a line of its manifest names the feature in quotes outside a comment — how a
-`default` feature or any other feature turns it on, on one line or several — or when the
-manifest declares it as anything but `debug-panics = []`; the build sites are checked by
-reading them. `mds-cli` is published to crates.io, so
+`--features debug-panics`. `crates/mds-cli/tests/panic_hook.rs` checks all four
+manifests. It rejects a quoted feature value outside a comment, or a declaration
+other than `debug-panics = []`. It also checks the maturin features, napi package
+scripts and `release.yml` for feature selection. Each input has a planted control.
+The same test file checks both native catch funnels and the WASM hook policy.
+`mds-cli` is published to crates.io, so
 `cargo install mds-cli --features debug-panics` builds a CLI that prints panic
 messages: build one only for your own debugging.

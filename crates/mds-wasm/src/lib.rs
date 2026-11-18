@@ -52,9 +52,10 @@ const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
 /// Maximum number of module entries in `options.modules`.
 ///
-/// Prevents a caller from exhausting WASM linear memory by passing thousands
-/// of small modules. 256 modules is well above any realistic template graph.
-const MAX_MODULE_COUNT: usize = 256;
+/// Permits the entry plus 256 other modules. This input-size bound counts unused
+/// entries too. The core separately bounds the resolved graph, including modules
+/// still being resolved.
+const MAX_MODULE_COUNT: usize = 256 + 1;
 
 /// Maximum aggregate byte size of all module values combined (same as source limit).
 const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;

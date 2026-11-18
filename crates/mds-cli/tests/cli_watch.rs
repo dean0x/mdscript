@@ -11313,6 +11313,65 @@ fn watch_handles_a_source_deleted_during_its_rebuild_as_deleted() {
     }
 }
 
+/// The parent check in entry resolution still applies after the watch path check.
+/// Both modes use the same file through another canonical parent in the changed case.
+#[cfg(debug_assertions)]
+#[test]
+fn watch_refuses_a_parent_changed_after_its_path_check() {
+    for directory_mode in [false, true] {
+        for change_parent in [false, true] {
+            let base = tempfile::TempDir::new().unwrap();
+            let sub = base.path().join("notes").join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("page.mds"), "Original\n").unwrap();
+            let held = base.path().join("held");
+            // Probe link support before the child starts. Windows can lack this right.
+            let probe = base.path().join("probe");
+            if !make_symlink(&sub, &probe) {
+                return;
+            }
+            remove_symlink(&probe);
+            let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+            let ready = base.path().join("ready");
+            let entry = Path::new("notes").join("sub").join("page.mds");
+            let mut command = mds_bin();
+            command.current_dir(base.path()).arg("watch");
+            let output = if directory_mode {
+                command.args(["notes", "--out-dir", "out"]);
+                base.path().join("out").join("sub").join("page.md")
+            } else {
+                command.arg(&entry).args(["-o", "out.md"]);
+                base.path().join("out.md")
+            };
+            let (mut child, tap) = spawn_unsynchronized(
+                command
+                    .args(["--debounce", "0", "--poll-interval", "0"])
+                    .env("MDS_TEST_READY", &ready)
+                    .env("MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE", &go)
+                    .stdout(Stdio::null()),
+            );
+            wait_paused(&paused, &mut child, &tap, "before entry resolution");
+            if change_parent {
+                std::fs::rename(&sub, &held).unwrap();
+                assert!(make_symlink(&held, &sub));
+            }
+            std::fs::write(&go, "").unwrap();
+            wait_paused(&ready, &mut child, &tap, "startup complete");
+            let stderr = tap.finish_text(&mut child);
+            if change_parent {
+                assert!(
+                    stderr.contains("the file changed while it was opened"),
+                    "the compile must refuse the changed parent; stderr: {stderr}"
+                );
+                assert!(!output.exists(), "a refused compile writes no output");
+            } else {
+                assert_eq!(std::fs::read_to_string(&output).unwrap(), "Original\n");
+                assert!(!stderr.contains("the file changed while it was opened"));
+            }
+        }
+    }
+}
+
 // ── #425: an output never replaces an MDS module ─────────────────────────────
 
 /// An MDS module: a `.md` file whose frontmatter declares `type: mds`.

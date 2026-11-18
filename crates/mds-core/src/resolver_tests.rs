@@ -246,6 +246,183 @@ fn has_type_mds_frontmatter_ignores_indented() {
     );
 }
 
+// ── Module count: the entry plus 256 distinct modules ────────────────────
+
+fn module_count_graph(total: usize, nested: bool) -> HashMap<String, String> {
+    let imports = |start, end| {
+        (start..end)
+            .map(|i| format!("@import \"./m{i}.mds\" as m{i}\n"))
+            .collect::<String>()
+    };
+    let mut files: HashMap<_, _> = (0..total)
+        .map(|i| (format!("m{i}.mds"), "Body\n".to_string()))
+        .collect();
+    let entry = if nested {
+        files.insert("m1.mds".into(), imports(2, total));
+        imports(1, 2)
+    } else {
+        imports(1, total)
+    };
+    files.insert("m0.mds".into(), format!("{entry}OK\n"));
+    files
+}
+
+fn assert_module_count_outcome<T: std::fmt::Debug>(result: Result<T, MdsError>, total: usize) {
+    if total <= 257 {
+        result.expect("the entry plus at most 256 modules must compile");
+    } else {
+        assert!(result.is_err(), "a graph of {total} modules must fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.serialize().code, "mds::resource_limit");
+        assert_eq!(
+            err.to_string(),
+            "resource limit exceeded: module count exceeds maximum of 256 modules besides the entry"
+        );
+    }
+}
+
+#[test]
+fn module_count_legacy_graph_boundaries() {
+    for nested in [true, false] {
+        for total in 255..=259 {
+            let mut cache = ModuleCache::virtual_fs(module_count_graph(total, nested));
+            assert_module_count_outcome(
+                cache.resolve_key("m0.mds", &HashMap::new(), &mut Vec::new()),
+                total,
+            );
+        }
+    }
+}
+
+#[test]
+fn module_count_intrinsic_graph_boundaries() {
+    for nested in [true, false] {
+        for total in 255..=259 {
+            for with_opts in [false, true] {
+                let mut cache = ModuleCache::virtual_fs(module_count_graph(total, nested));
+                let result = if with_opts {
+                    cache
+                        .resolve_virtual_intrinsic_opts(
+                            "m0.mds",
+                            &HashMap::new(),
+                            &Default::default(),
+                            &mut Vec::new(),
+                        )
+                        .map(|(output, _)| output)
+                } else {
+                    cache.resolve_virtual_intrinsic("m0.mds", &HashMap::new(), &mut Vec::new())
+                };
+                assert_module_count_outcome(result, total);
+            }
+        }
+    }
+}
+
+#[test]
+fn module_count_native_graph_boundaries() {
+    for nested in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        for total in 255..=259 {
+            for (key, source) in module_count_graph(total, nested) {
+                std::fs::write(dir.path().join(key), source).unwrap();
+            }
+            assert_module_count_outcome(crate::compile(dir.path().join("m0.mds"), None), total);
+        }
+    }
+}
+
+#[test]
+fn module_count_string_entry_counts_root() {
+    for total in 257..=258 {
+        for mode in 0..3 {
+            let mut files = module_count_graph(total, true);
+            let source = files.remove("m0.mds").unwrap();
+            let mut cache = ModuleCache::virtual_fs(files);
+            let result = match mode {
+                0 => cache
+                    .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+                    .map(|_| ()),
+                1 => cache
+                    .resolve_source_intrinsic(&source, "", &HashMap::new(), &mut Vec::new())
+                    .map(|_| ()),
+                _ => cache
+                    .resolve_source_intrinsic_opts(
+                        &source,
+                        "",
+                        &HashMap::new(),
+                        &Default::default(),
+                        &mut Vec::new(),
+                    )
+                    .map(|_| ()),
+            };
+            assert_module_count_outcome(result, total);
+        }
+    }
+}
+
+#[test]
+fn module_count_skeleton_graph_boundaries() {
+    for total in 257..=258 {
+        let mut files = module_count_graph(total, true);
+        files.insert("m0.mds".into(), "@extends \"./m1.mds\"\n".into());
+        assert_module_count_outcome(crate::compile_virtual(files, "m0.mds", None), total);
+    }
+}
+
+#[test]
+fn module_count_reused_cache_checks_each_entry_path() {
+    for mode in 0..5 {
+        let mut files = module_count_graph(257, false);
+        files.insert("fresh.mds".into(), "Fresh\n".into());
+        let mut cache = ModuleCache::virtual_fs(files);
+        cache
+            .resolve_key("m0.mds", &HashMap::new(), &mut Vec::new())
+            .expect("the cache can hold the entry plus 256 modules");
+        let result = match mode {
+            0 => cache
+                .resolve_virtual_intrinsic("fresh.mds", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            1 => cache
+                .resolve_virtual_intrinsic_opts(
+                    "fresh.mds",
+                    &HashMap::new(),
+                    &Default::default(),
+                    &mut Vec::new(),
+                )
+                .map(|_| ()),
+            2 => cache
+                .resolve_source("Fresh\n", "", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            3 => cache
+                .resolve_source_intrinsic("Fresh\n", "", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            _ => cache
+                .resolve_source_intrinsic_opts(
+                    "Fresh\n",
+                    "",
+                    &HashMap::new(),
+                    &Default::default(),
+                    &mut Vec::new(),
+                )
+                .map(|_| ()),
+        };
+        assert_module_count_outcome(result, 258);
+    }
+}
+
+#[test]
+fn module_count_cached_skeleton_upgrade_counts_once() {
+    let mut files = module_count_graph(257, false);
+    files.insert("m1.mds".into(), "@extends \"./m2.mds\"\n".into());
+    let entry = files.get_mut("m0.mds").unwrap();
+    *entry = entry.replace("@import \"./m2.mds\" as m2\n", "");
+    entry.push_str("@import \"./m2.mds\" as m2\n@import \"./m3.mds\" as again\n");
+    let result = crate::compile_virtual(files, "m0.mds", None)
+        .expect("cached modules and a skeleton upgrade must not consume another slot");
+    assert_eq!(result.dependencies.len(), 256);
+    assert_eq!(result.into_markdown().unwrap(), "OK\n");
+}
+
 // ── Phase 1: @block collision and resource-limit tests ────────────────────
 
 #[test]
@@ -4346,4 +4523,178 @@ fn check_module_type_judges_the_key_and_names_the_typed_path_escaped() {
         check("/abs/proj/page.md", "./page.md", "Hi\n"),
         Err("not an MDS file: ./page.md".to_string())
     );
+}
+
+// #423 directive coverage: import (alias/merge/selective), export-from
+// (named/wildcard), and extends: span yes. Include does not load a file; its
+// namespace import owns the span. Entry and frontmatter imports: span no.
+fn assert_not_mds_directive_span(directive: &str) {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub").join("b.mds");
+    let source = format!("\n\n{directive}\n");
+    std::fs::write(&entry, "@import \"./sub/b.mds\" as b\nEntry\n").unwrap();
+    std::fs::write(root.join("sub").join("c.txt"), "@import \"./never.mds\"\n").unwrap();
+    std::fs::write(
+        root.join("sub").join("c.mds"),
+        "@define f():\nOK\n@end\nBody\n",
+    )
+    .unwrap();
+
+    // The same directive accepts an MDS target before it refuses c.txt.
+    std::fs::write(&importer, source.replace("c.txt", "c.mds")).unwrap();
+    crate::compile(&entry, None).expect("control: the directive reaches an MDS target");
+    std::fs::write(&importer, &source).unwrap();
+    assert!(importer.canonicalize().unwrap().is_absolute());
+
+    let intrinsic = crate::compile(&entry, None).unwrap_err();
+    let cached = ModuleCache::native()
+        .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    for err in [intrinsic, cached] {
+        let serialized = err.serialize();
+        assert_eq!(serialized.code, "mds::not_mds");
+        assert_eq!(serialized.message, "not an MDS file: ./c.txt");
+        let span = serialized
+            .span
+            .expect("the inner directive must carry a span");
+        assert_eq!(
+            (span.offset, span.length),
+            (2, directive.lines().next().unwrap().len())
+        );
+        assert_eq!((span.line, span.column), (Some(3), Some(1)));
+        assert_eq!(err.source_name(), Some("sub/b.mds"));
+        assert!(!std::path::Path::new(err.source_name().unwrap()).is_absolute());
+    }
+}
+
+#[test]
+fn not_mds_alias_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\" as c");
+}
+
+#[test]
+fn not_mds_merge_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_selective_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import { f } from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_named_reexport_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@export f from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_wildcard_reexport_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@export * from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_extends_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@extends \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_intermediate_extends_keeps_the_base_importer_span() {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub/c.mds");
+    let directive = "@extends \"./d.txt\"";
+    let source = format!("\n\n{directive}\n");
+    std::fs::write(&entry, "@import \"./sub/b.mds\" as b\nEntry\n").unwrap();
+    std::fs::write(root.join("sub/b.mds"), "@extends \"./c.mds\"\n").unwrap();
+    std::fs::write(root.join("sub/d.txt"), "@import \"./never.mds\"\n").unwrap();
+    std::fs::write(root.join("sub/d.mds"), "Body\n").unwrap();
+    std::fs::write(&importer, source.replace("d.txt", "d.mds")).unwrap();
+    crate::compile(&entry, None).expect("control: the intermediate base reaches an MDS target");
+    std::fs::write(&importer, &source).unwrap();
+
+    let intrinsic = crate::compile(&entry, None).unwrap_err();
+    let cached = ModuleCache::native()
+        .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    for err in [intrinsic, cached] {
+        let serialized = err.serialize();
+        assert_eq!(serialized.code, "mds::not_mds");
+        assert_eq!(serialized.message, "not an MDS file: ./d.txt");
+        assert_eq!(err.source_name(), Some("sub/c.mds"));
+        let span = serialized
+            .span
+            .expect("the intermediate extends must carry a span");
+        assert_eq!((span.offset, span.length), (2, directive.len()));
+        assert_eq!((span.line, span.column), (Some(3), Some(1)));
+    }
+}
+
+#[test]
+fn not_mds_include_uses_its_namespace_import_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\" as c\n@include c");
+}
+
+#[test]
+fn not_mds_frame_neutralizes_control_on_import_line() {
+    let source = "\n@import \x0b\"./c.txt\"\n";
+    assert!(
+        source.contains(char::from(0x0b)),
+        "control: source has a control byte"
+    );
+    let err = compile_virtual(&[("a.mds", source), ("c.txt", "Hi\n")], "a.mds").unwrap_err();
+    assert_eq!(err.serialize().code, "mds::not_mds");
+    let mut frame = String::new();
+    miette::NarratableReportHandler::new()
+        .render_report(&mut frame, &err)
+        .unwrap();
+    assert!(frame.contains("@import ?\"./c.txt\""), "{frame}");
+    assert!(!frame.contains(char::from(0x0b)), "{frame}");
+}
+
+#[test]
+fn not_mds_nested_frontmatter_imports_stay_spanless_like_missing_files() {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub").join("b.mds");
+    std::fs::write(root.join("sub").join("c.txt"), "Text\n").unwrap();
+    for directive in [
+        "@import \"./sub/b.mds\" as b",
+        "@import \"./sub/b.mds\"",
+        "@import { f } from \"./sub/b.mds\"",
+        "@export f from \"./sub/b.mds\"",
+        "@export * from \"./sub/b.mds\"",
+        "@extends \"./sub/b.mds\"",
+    ] {
+        std::fs::write(&entry, format!("\n\n{directive}\n")).unwrap();
+        for form in ["", "    as: c\n", "    names: [f]\n"] {
+            for (target, code) in [("missing.mds", "mds::import"), ("c.txt", "mds::not_mds")] {
+                let source = format!("---\nimports:\n  - path: ./{target}\n{form}---\nBody\n");
+                std::fs::write(&importer, source).unwrap();
+                let intrinsic = crate::compile(&entry, None).unwrap_err();
+                let cached = ModuleCache::native()
+                    .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+                    .unwrap_err();
+                for err in [intrinsic, cached] {
+                    let serialized = err.serialize();
+                    assert_eq!(serialized.code, code, "{directive}: {serialized:?}");
+                    assert_eq!(serialized.span, None, "{directive}: {serialized:?}");
+                    assert_eq!(err.source_name(), None, "{directive}: {serialized:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn not_mds_entry_and_frontmatter_imports_keep_no_span() {
+    let entry = compile_virtual(&[("c.txt", "Hi\n")], "c.txt").unwrap_err();
+    for err in std::iter::once(entry).chain(["", "    as: c\n", "    names: [f]\n"].map(|form| {
+        let source = format!("---\nimports:\n  - path: ./c.txt\n{form}---\nBody\n");
+        compile_virtual(&[("a.mds", &source), ("c.txt", "Hi\n")], "a.mds").unwrap_err()
+    })) {
+        assert_eq!(err.serialize().code, "mds::not_mds");
+        assert!(err.serialize().span.is_none());
+        assert!(err.source_name().is_none());
+    }
 }

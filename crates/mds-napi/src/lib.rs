@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::ptr;
 
@@ -67,10 +67,10 @@ const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
 /// Maximum number of module entries accepted by `lintVirtual`.
 ///
-/// Mirrors the WASM and Python bindings. 256 modules is well above any realistic
-/// template graph; the cap prevents a caller from exhausting memory with thousands
-/// of small virtual modules.
-const MAX_MODULE_COUNT: usize = 256;
+/// Mirrors the WASM and Python bindings: the entry plus 256 other modules.
+/// This input-size bound counts unused entries too. The core separately bounds
+/// the resolved graph, including modules still being resolved.
+const MAX_MODULE_COUNT: usize = 256 + 1;
 
 /// Maximum aggregate byte size of all `lintVirtual` module values combined
 /// (same ceiling as a single source input).
@@ -254,6 +254,52 @@ fn throw_options_error(env: &Env, msg: &str) -> napi::Error {
     throw_coded_error(env, msg, "mds::invalid_options")
 }
 
+/// Preserve a pending JS exception; code and wire-escape other conversion errors.
+fn conversion_error(env: &Env, prefix: &str, error: napi::Error) -> napi::Error {
+    if error.status == Status::PendingException {
+        return error;
+    }
+    throw_options_error(env, &conversion_error_message(prefix, &error.to_string()))
+}
+
+fn conversion_error_message(prefix: &str, detail: &str) -> String {
+    format!("{prefix}{}", mds::sanitize_control_chars_wire(detail))
+}
+
+#[cfg(test)]
+mod conversion_error_tests {
+    use super::conversion_error_message;
+
+    fn assert_escaped_message(format_message: fn(&str, &str) -> String) {
+        let detail = format!(
+            "InvalidArg, value{}[31m{}",
+            char::from(0x1b),
+            char::from_u32(0x202e).unwrap()
+        );
+        for prefix in [
+            "invalid options: ",
+            "invalid options.vars: ",
+            "invalid options.rules: ",
+        ] {
+            let expected = format!("{prefix}InvalidArg, value{}u001B[31m{}u202E", '\\', '\\');
+            assert_eq!(format_message(prefix, &detail), expected);
+            assert_eq!(
+                format_message(prefix, "InvalidArg, plain detail"),
+                format!("{prefix}InvalidArg, plain detail")
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_messages_escape_caller_text_and_keep_the_prefix() {
+        assert_escaped_message(conversion_error_message);
+        assert!(std::panic::catch_unwind(|| {
+            assert_escaped_message(|prefix, detail| format!("{prefix}{detail}"));
+        })
+        .is_err());
+    }
+}
+
 /// Create a `mds::resource_limit` JS exception and return `PendingException`.
 fn throw_resource_limit(env: &Env, msg: &str) -> napi::Error {
     throw_coded_error(env, msg, "mds::resource_limit")
@@ -283,7 +329,7 @@ fn run_catching<F, T>(env: &Env, f: F) -> napi::Result<T>
 where
     F: FnOnce() -> std::result::Result<T, mds::MdsError> + std::panic::UnwindSafe,
 {
-    match catch_unwind(f) {
+    match mds::host_panic::catching(f) {
         Ok(Ok(val)) => Ok(val),
         Ok(Err(mds_err)) => Err(throw_mds_error(env, mds_err)),
         Err(payload) => {
@@ -383,7 +429,9 @@ fn napi_type_name(vt: ValueType) -> &'static str {
 fn reject_unknown_napi_keys(env: &Env, obj: &Object, known: &[&str]) -> napi::Result<()> {
     let names_obj: Object = obj.get_property_names()?;
     // Deserialize the property-names Array into a JSON array of strings.
-    let names_json: serde_json::Value = env.from_js_value(names_obj)?;
+    let names_json: serde_json::Value = env
+        .from_js_value(names_obj)
+        .map_err(|e| conversion_error(env, "invalid options: ", e))?;
     let keys: Vec<String> = match names_json {
         serde_json::Value::Array(arr) => arr
             .into_iter()
@@ -457,7 +505,9 @@ fn extract_vars_direct(env: &Env, obj: &Object) -> napi::Result<Option<HashMap<S
         ValueType::Undefined | ValueType::Null => Ok(None),
         ValueType::Object => {
             // Deserialize only the vars sub-value.
-            let vars_json: serde_json::Value = env.from_js_value(val)?;
+            let vars_json: serde_json::Value = env
+                .from_js_value(val)
+                .map_err(|e| conversion_error(env, "invalid options.vars: ", e))?;
             // Note: ValueType::Object includes JS arrays, which serde deserializes
             // as Value::Array. The `let Value::Object(map) else` guard inside
             // parse_json_vars rejects arrays and non-objects.
@@ -807,7 +857,9 @@ fn extract_rules_direct(
         ValueType::Object => {
             // Deserialize the rules sub-object; js arrays also satisfy Object so
             // we guard against that in the JSON shape check below.
-            let rules_json: serde_json::Value = env.from_js_value(val)?;
+            let rules_json: serde_json::Value = env
+                .from_js_value(val)
+                .map_err(|e| conversion_error(env, "invalid options.rules: ", e))?;
             let serde_json::Value::Object(rules_map) = rules_json else {
                 return Err(throw_options_error(
                     env,

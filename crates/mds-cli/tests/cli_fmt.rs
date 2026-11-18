@@ -42,6 +42,92 @@ fn fmt_path(path: &Path, extra_args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+#[cfg(unix)]
+fn fmt_refuses_replacement_after_walk(extra: &[&str]) {
+    let dir = tempfile::tempdir().unwrap();
+    let page = dir.path().join("page.mds");
+    let replacement = "Replacement   \n";
+    fs::write(&page, "Original\n").unwrap();
+    fs::write(dir.path().join("good.mds"), "Good\n").unwrap();
+    let out = common::run_after_walk(mds_bin().arg("fmt").arg(dir.path()).args(extra), || {
+        fs::rename(&page, dir.path().join("saved.txt")).unwrap();
+        fs::write(&page, replacement).unwrap();
+    });
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("file changed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 unchanged, 1 failed"), "{stderr}");
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(fs::read_to_string(page).unwrap(), replacement);
+}
+
+#[test]
+#[cfg(unix)]
+fn dir_fmt_refuses_a_file_replaced_after_walk() {
+    fmt_refuses_replacement_after_walk(&[]);
+}
+
+#[test]
+#[cfg(unix)]
+fn dir_fmt_diff_refuses_a_file_replaced_after_walk() {
+    fmt_refuses_replacement_after_walk(&["--diff"]);
+}
+
+#[test]
+fn dir_fmt_refuses_a_parent_redirected_after_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    let moved = dir.path().join("moved");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("page.mds"), "Replacement   \n").unwrap();
+    if !make_symlink(&sub, &dir.path().join("probe")) {
+        return;
+    }
+    let out = common::run_after_walk(mds_bin().arg("fmt").arg(dir.path()).arg("--diff"), || {
+        fs::rename(&sub, &moved).unwrap();
+        assert!(make_symlink(&moved, &sub));
+    });
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("file changed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("0 would reformat, 0 unchanged, 1 failed"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn dir_fmt_accepts_an_unchanged_tree_after_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    let page = dir.path().join("sub").join("page.mds");
+    fs::write(&page, "Original   \n").unwrap();
+    let out = common::run_after_walk(mds_bin().arg("fmt").arg(dir.path()).arg("--diff"), || {});
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("1 would reformat, 0 unchanged, 0 failed"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("+++ {}", page.display())),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(page).unwrap(), "Original   \n");
+}
+
 // ── AC-CF-1: single-file in-place rewrite, mtime, status lines ──────────────
 
 #[test]

@@ -579,11 +579,13 @@ version = "0.4.4"
 dependencies = [
  "indexmap",
  "miette",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
  "thiserror",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
