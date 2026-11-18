@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,7 +44,23 @@ impl FileSystem for ChangeOnRead {
                 Change::ReplaceParent => {
                     let parent = self.target.parent().unwrap();
                     std::fs::rename(parent, parent.with_extension("saved")).unwrap();
+                    #[cfg(unix)]
                     std::os::unix::fs::symlink(parent.with_extension("other"), parent).unwrap();
+                    #[cfg(windows)]
+                    {
+                        let output = std::process::Command::new("cmd")
+                            .args(["/D", "/C", "mklink", "/J"])
+                            .arg(mds::display_native_path(parent).as_ref())
+                            .arg(mds::display_native_path(&parent.with_extension("other")).as_ref())
+                            .output()
+                            .expect("run mklink /J");
+                        assert!(output.status.success(), "create a junction: {output:?}");
+                        assert_eq!(
+                            std::fs::read_to_string(&self.target).unwrap(),
+                            "different\n",
+                            "the replacement parent reaches the other file"
+                        );
+                    }
                 }
             }
         }
@@ -97,6 +113,7 @@ fn assert_changed(result: Result<CompiledOutput, MdsError>) {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn entry_replaced_by_another_regular_file_is_refused() {
     assert_changed(resolve_with_change(false, Change::ReplaceFile));
@@ -107,6 +124,7 @@ fn entry_with_a_changed_parent_is_refused() {
     assert_changed(resolve_with_change(false, Change::ReplaceParent));
 }
 
+#[cfg(unix)]
 #[test]
 fn import_replaced_by_another_regular_file_is_refused() {
     assert_changed(resolve_with_change(true, Change::ReplaceFile));
@@ -115,6 +133,48 @@ fn import_replaced_by_another_regular_file_is_refused() {
 #[test]
 fn import_with_a_changed_parent_is_refused() {
     assert_changed(resolve_with_change(true, Change::ReplaceParent));
+}
+
+#[cfg(windows)]
+#[test]
+fn entry_replaced_by_another_regular_file_of_the_same_name_reads() {
+    assert_eq!(
+        resolve_with_change(false, Change::ReplaceFile).unwrap(),
+        CompiledOutput::Markdown("different\n".to_string())
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn import_replaced_by_another_regular_file_of_the_same_name_reads() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let target = root.join("part.mds");
+    std::fs::write(&target, "original\n").unwrap();
+    let fs = ChangeOnRead {
+        inner: NativeFs::new(),
+        target: target.clone(),
+        change: Change::ReplaceFile,
+    };
+    let key = fs
+        .normalize_in_dir(root.to_str().unwrap(), "./part.mds")
+        .unwrap();
+    assert_eq!(fs.read(&key).unwrap(), "different\n");
+}
+
+#[cfg(windows)]
+#[test]
+fn unchanged_source_with_a_long_verbatim_path_reads() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let parent = root.join("a".repeat(100)).join("b".repeat(100));
+    std::fs::create_dir_all(&parent).unwrap();
+    let target = parent.join(format!("{}.mds", "c".repeat(100)));
+    std::fs::write(&target, "Hello\n").unwrap();
+    let fs = NativeFs::new();
+    let key = fs.resolve_entry(target.to_str().unwrap()).unwrap();
+    assert!(key.encode_utf16().count() >= 260);
+    assert_eq!(fs.read(&key).unwrap(), "Hello\n");
 }
 
 #[test]

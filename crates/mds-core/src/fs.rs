@@ -553,13 +553,63 @@ fn verify_opened_file(
 
 #[cfg(windows)]
 fn verify_opened_file(
-    _file: &std::fs::File,
+    file: &std::fs::File,
     _opened: &std::fs::Metadata,
-    _expected: &FileId,
-    _display: &str,
+    expected: &FileId,
+    display: &str,
 ) -> Result<(), MdsError> {
-    // The Windows follow-up will compare the opened handle's final path here.
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+
+    let wide = query_final_path(|buffer| {
+        // SAFETY: file keeps the handle live. The writable buffer has the stated
+        // length in UTF-16 code units and stays allocated for the whole call.
+        unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                VOLUME_NAME_DOS,
+            )
+        }
+    })
+    .ok_or_else(|| file_changed(display))?;
+    let opened_path = OsString::from_wide(&wide);
+    if opened_path == expected.as_os_str() {
+        return Ok(());
+    }
+    // The API returns a verbatim path. Accept a conventional key only when the
+    // existing lossless conversion preserves the complete name.
+    let matches_conventional = opened_path
+        .to_str()
+        .and_then(crate::verbatim::simplify_verbatim)
+        .is_some_and(|path| OsStr::new(&path) == expected.as_os_str());
+    if !matches_conventional {
+        return Err(file_changed(display));
+    }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn query_final_path(mut query: impl FnMut(&mut [u16]) -> u32) -> Option<Vec<u16>> {
+    const MAX_PATH_UNITS: usize = 32_768;
+    let mut buffer = vec![0; 260];
+    for attempt in 0..2 {
+        let length = query(&mut buffer) as usize;
+        if length == 0 || length > MAX_PATH_UNITS {
+            return None;
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Some(buffer);
+        }
+        if attempt == 0 {
+            // An insufficient-buffer response includes the terminating NUL.
+            buffer.resize(length, 0);
+        }
+    }
+    None
 }
 
 /// Read the opened `file`, whose size taken from it is `size`, as [`read_capped`] reads.
@@ -2231,6 +2281,71 @@ mod tests {
             .unwrap_err()
             .to_string()
             .starts_with("invalid UTF-8 in sub/changed.mds"));
+    }
+
+    #[test]
+    fn final_path_query_refuses_zero_and_unbounded_or_repeated_growth() {
+        for replies in [[0, 0], [260, 0], [260, 260], [32_769, 0], [260, 32_769]] {
+            let mut calls = 0;
+            let path = query_final_path(|_| {
+                let reply = replies[calls];
+                calls += 1;
+                reply
+            });
+            assert!(path.is_none(), "replies: {replies:?}");
+            assert!(calls <= 2);
+        }
+    }
+
+    #[test]
+    fn final_path_query_keeps_exact_code_units_and_retries_once() {
+        for size in [20, 259, 260, 1_000, 32_767] {
+            let expected = vec![0xd800; size];
+            let mut calls = 0;
+            let path = query_final_path(|buffer| {
+                calls += 1;
+                if buffer.len() <= expected.len() {
+                    (expected.len() + 1) as u32
+                } else {
+                    buffer[..expected.len()].copy_from_slice(&expected);
+                    buffer[expected.len()] = 0;
+                    expected.len() as u32
+                }
+            });
+            assert_eq!(path.as_deref(), Some(expected.as_slice()));
+            assert_eq!(calls, if size < 260 { 1 } else { 2 });
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opened_file_path_matches_verbatim_and_lossless_conventional_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = make_temp_file(&dir, "hello.mds", "Hello World!")
+            .canonicalize()
+            .unwrap();
+        let conventional = PathBuf::from(
+            crate::verbatim::simplify_verbatim(path.to_str().unwrap())
+                .expect("the short fixture has a lossless conventional path"),
+        );
+        assert_ne!(path.as_os_str(), conventional.as_os_str());
+        let file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        for expected in [&path, &conventional] {
+            verify_opened_file(&file, &metadata, expected, "hello.mds").unwrap();
+        }
+        let error = verify_opened_file(
+            &file,
+            &metadata,
+            &path.with_file_name("other.mds"),
+            "hello.mds",
+        )
+        .unwrap_err();
+        assert_eq!(code_of(&error).as_deref(), Some("mds::io"));
+        assert_eq!(
+            error.to_string(),
+            "cannot read hello.mds: the file changed while it was opened"
+        );
     }
 
     #[test]
