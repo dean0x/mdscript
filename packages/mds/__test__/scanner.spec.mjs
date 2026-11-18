@@ -70,6 +70,18 @@ function buildModulesMap(entryPath, scan, options) {
   return buildModulesMapWith(entryPath, { scanImportRecords: importRecordsOf(scan), preflightModule }, options);
 }
 
+/** Reach the core graph guard without exceeding the separate 257-entry map guard. */
+function coreModuleCountFixture() {
+  assert.notEqual(wasmEngine, null, 'the current WASM build is required');
+  const modules = Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`m${i}.mds`, 'Leaf\n']));
+  const importsOf = (n) => Array.from({ length: n }, (_, i) => `@import "./m${i}.mds" as m${i}\n`).join('');
+  assert.equal(wasmEngine.compile(`${importsOf(256)}OK\n`, { modules }).output, 'OK\n');
+  const source = `${importsOf(257)}OK\n`;
+  const core = thrownBy(() => wasmEngine.compile(source, { modules }), 'the core graph limit');
+  assert.equal(core.code, 'mds::resource_limit');
+  return { modules, source, core };
+}
+
 // A minimal scanImports implementation using the napi addon.
 function scanImports(source) {
   // The napi addon doesn't expose scanImports directly, so we use
@@ -409,18 +421,43 @@ describe('buildModulesMap', () => {
     assert.ok(Object.keys(result.modules).length >= 3, 'should resolve all modules in shallow chain');
   });
 
-  test('U-SM5: rejects when module count exceeds maxModules', async () => {
-    // The fixtures/imports chain has 3+ modules. Setting maxModules=1 means even
-    // the first import discovered triggers the resource-limit guard, confirming
-    // that path works. The depth guard (MAX_IMPORT_DEPTH=64) is structurally
-    // verified: depth is incremented on every recursive call and compared against
-    // the constant before filesystem access. True depth-limit testing would require
-    // 65 unique real files (too heavyweight for unit tests).
-    const entryPath = path.join(FIXTURES, 'imports', 'entry.mds');
-    await assert.rejects(
-      () => buildModulesMap(entryPath, scanImports, { maxModules: 1 }),
-      /resource limit/,
-    );
+  test('U-SM5: maxModules counts distinct imports, including in-flight modules, but not the entry', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-count-'));
+    try {
+      const entry = path.join(root, 'entry.mds');
+      await writeFile(path.join(root, '.mdsroot'), '');
+      await writeFile(entry, 'OK\n');
+      const alone = await buildModulesMap(entry, scanImports, { maxModules: 0 })
+        .then(({ modules }) => Object.keys(modules), errorShape);
+      assert.deepEqual(alone, ['entry.mds']);
+
+      await writeFile(path.join(root, 'child.mds'), 'Child\n');
+      await writeFile(path.join(root, 'leaf.mds'), 'Leaf\n');
+      await writeFile(entry, '@import "./child.mds" as a\n@import "./child.mds" as b\nOK\n');
+      const repeated = await buildModulesMap(entry, scanImports, { maxModules: 1 });
+      assert.deepEqual(Object.keys(repeated.modules).sort(), ['child.mds', 'entry.mds']);
+
+      await writeFile(path.join(root, 'child.mds'), '@import "./leaf.mds" as leaf\nChild\n');
+      const err = await rejectionOf(buildModulesMap(entry, scanImports, { maxModules: 1 }), 'in-flight modules');
+      assert.equal(err.code, 'mds::resource_limit');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the scanner module-count message equals the core message from the WASM build', async () => {
+    const { modules, source, core } = coreModuleCountFixture();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-message-'));
+    try {
+      await writeFile(path.join(root, '.mdsroot'), '');
+      for (const [name, text] of Object.entries(modules)) await writeFile(path.join(root, name), text);
+      const entry = path.join(root, 'entry.mds');
+      await writeFile(entry, source);
+      const scanner = await rejectionOf(buildModulesMap(entry, scanImports), 'the scanner graph limit');
+      assert.deepEqual(errorShape(scanner), errorShape(core));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test('U-SM6: rejects when aggregate size exceeds maxAggregateSize', async () => {
@@ -1336,7 +1373,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         }],
         ['import: one module too many', await write('count-258.mds', `${importsOf(257)}\nhi\n`), {
           code: 'mds::resource_limit',
-          message: 'resource limit exceeded: module count exceeds maximum of 256 (256 modules resolved)',
+          message: coreModuleCountFixture().core.message,
           help: null,
           span: null,
         }],
@@ -2134,6 +2171,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
       await writeFile(path.join(proj, 'c.txt'), '@import "./never.mds"\n');
       await writeFile(path.join(proj, 'b.mds'), frontmatterImports('./c.txt'));
+      await writeFile(path.join(proj, 'leaf.mds'), 'Leaf\n');
       // [label, entry source, scan options, the refusal's code, its own enumerable fields].
       // The frontmatter rows are rebuilt with the context the resolver adds to them; a
       // missing module there becomes `mds::import`, which has no `help`.
@@ -2143,7 +2181,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         ['a frontmatter import out of the project', frontmatterImports('../outside.mds'), {}, 'mds::import', ['code']],
         ['a missing frontmatter import', frontmatterImports('./gone.mds'), {}, 'mds::import', ['code']],
         ["the importing module's own directory", '@import "./" as o\nhi\n', {}, 'mds::io', ['code']],
-        ['one module too many', 'hi\n', { maxModules: 0 }, 'mds::resource_limit', ['code']],
+        ['one module too many', '@import "./leaf.mds" as leaf\nhi\n', { maxModules: 0 }, 'mds::resource_limit', ['code']],
         // Controls (PF-013): the engine gives `mds::file_not_found` a `help`, and a
         // missing `@import` a `span` too.
         ['a missing import', '@import "./gone.mds" as g\nhi\n', {}, 'mds::file_not_found', ['code', 'help', 'span']],

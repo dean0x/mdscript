@@ -142,6 +142,49 @@ test('native and WASM nested frontmatter failures keep their code and no outer s
   }
 });
 
+test('native and WASM compileFile agree at 255–259 total modules in flat and nested graphs', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-module-count-parity-'));
+  try {
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const cases = [];
+    for (const nested of [false, true]) {
+      for (const total of [255, 256, 257, 258, 259]) {
+        const label = `${nested ? 'nested' : 'flat'}-${total}`;
+        const dir = path.join(root, label);
+        await mkdir(dir);
+        const imports = (start) => Array.from({ length: total - start }, (_, i) => {
+          const id = start + i;
+          return `@import "./m${id}.mds" as m${id}\n`;
+        }).join('');
+        for (let i = 1; i < total; i++) {
+          // Two modules stay in flight while the nested graph resolves its leaves.
+          const source = nested && i === 1 ? `${imports(2)}Branch\n` : 'Leaf\n';
+          await writeFile(path.join(dir, `m${i}.mds`), source);
+        }
+        const entry = path.join(dir, 'entry.mds');
+        await writeFile(entry, `${nested ? '@import "./m1.mds" as m1\n' : imports(1)}OK\n`);
+        cases.push({ label, entry, total });
+      }
+    }
+    // The helper forces each public backend and fails if that backend is absent.
+    const files = cases.map(({ entry }) => entry);
+    const native = await compileFileOutcomes('native', files);
+    const wasm = await compileFileOutcomes('wasm', files);
+    const sharedMessage = native[cases.findIndex(({ total }) => total === 258)].message;
+    assert.equal(typeof sharedMessage, 'string', 'native must refuse the first graph above the cap');
+    for (const [i, { label, total }] of cases.entries()) {
+      await t.test(label, () => {
+        const expected = total <= 257 ? { output: 'OK\n' } : {
+          code: 'mds::resource_limit', message: sharedMessage, help: null, span: null,
+        };
+        assert.deepEqual([wasm[i], native[i]], [native[i], expected], label);
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Method manifest assertions (AC-API-09)
 // ---------------------------------------------------------------------------

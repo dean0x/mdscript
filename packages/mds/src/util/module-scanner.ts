@@ -375,9 +375,9 @@ function importDepthError(): PathError {
   return importError(`import depth exceeds maximum of ${MAX_IMPORT_DEPTH} (possible deep chain)`);
 }
 
-/** The Rust resolver's module-count refusal, naming how many modules were resolved. */
-function moduleCountError(maxModules: number, resolved: number): PathError {
-  return resourceLimitError(`module count exceeds maximum of ${maxModules} (${resolved} modules resolved)`);
+/** The shared core module-count refusal; the WASM differential pins this literal. */
+function moduleCountError(): PathError {
+  return resourceLimitError('module count exceeds maximum of 256 modules besides the entry');
 }
 
 /** NativeFs's refusal of a module over `MAX_FILE_SIZE`, naming its root-relative path. */
@@ -617,8 +617,8 @@ export type ScannerEngine = Pick<WasmModule, 'scanImportRecords' | 'preflightMod
 
 export interface ModuleScannerOptions {
   /**
-   * How many modules besides the entry a scan may resolve — the WASM engine takes
-   * the entry plus this many. Default 256, the engine's own limit.
+   * How many distinct modules besides the entry a scan may admit, including modules
+   * still being resolved. Default 256, the engine's own limit.
    */
   maxModules?: number;
   /**
@@ -1087,8 +1087,9 @@ async function readModule(
  *   directory reached through a symlink (`mds::io`) — or is not valid UTF-8 (`mds::io`,
  *   `resolved path is not valid UTF-8: "<path as written>"`): no string names such a
  *   path, and the one closest to it names another, which is never read;
- * - an import chain deeper than 64 modules (`mds::import`); more modules than the
- *   engine takes, the entry plus `maxModules` (`mds::resource_limit`);
+ * - an import chain deeper than 64 modules (`mds::import`); more than `maxModules`
+ *   distinct modules besides the entry, including modules still being resolved
+ *   (`mds::resource_limit`);
  * - a module that is not a regular file — a directory, device, FIFO or socket —
  *   before it is opened (`mds::io`, `cannot read <path as written>: not a regular
  *   file`, #428), and one that cannot be read (`mds::io`, `cannot read <path as
@@ -1132,31 +1133,28 @@ async function readModule(
  *    never pre-empts a refusal native makes of that module (U-SM39).
  * 3. A `../` import from a project rooted at the filesystem root is refused as
  *    escaping it, where native resolves `/..` to `/` (#424).
- * 4. Module count: native refuses a module once 256 others are fully resolved, so a
- *    graph whose modules are still being resolved can hold more; the engine takes
- *    the entry plus 256, and a larger graph is refused here (#427).
- * 5. On POSIX, an import that names a symlinked directory and leaves it again through
+ * 4. On POSIX, an import that names a symlinked directory and leaves it again through
  *    `..` (`./link/../x.mds`) is refused (`mds::import`): the engine resolves the name,
  *    NativeFs the disk, so the key it resolves to names another file than the one
  *    native reads (#408, U-SM22). Windows collapses `link\..` lexically before it
  *    follows the link, on both backends, so there such an import compiles as on native.
- * 6. A module more than 256 directories below the project root is refused: the
+ * 5. A module more than 256 directories below the project root is refused: the
  *    engine's key of it is capped at 256 segments, where native caps only the path
  *    as written.
- * 7. A `cannot read` message names the path as written, where native names the
+ * 6. A `cannot read` message names the path as written, where native names the
  *    root-relative path, and a file that cannot be read by its errno name, where
  *    native gives the OS error text; the code agrees, and so does the reason for a
  *    module that is not a regular file.
- * 8. Every module is read before the engine runs, so a refusal of a later import is
+ * 7. Every module is read before the engine runs, so a refusal of a later import is
  *    reported before an error the engine raises at a point native reaches first: a
  *    compile error in a module native reads first, or a circular import native meets
  *    first (U-SM38).
- * 9. The engine takes at most 65,536 `aliases`, whose keys and module keys total at
+ * 8. The engine takes at most 65,536 `aliases`, whose keys and module keys total at
  *    most 10 MiB, and refuses more (`mds::resource_limit`, naming
  *    `options.moduleAliases`): a graph whose imports reach its modules by more
  *    spellings than that, other than their on-disk keys, compiles only on native,
  *    which has no aliases to count (#414).
- * 10. A module below a directory whose canonical path is not valid UTF-8 — reached
+ * 9. A module below a directory whose canonical path is not valid UTF-8 — reached
  *    through a symlink, or the working directory of a relative entry — is refused as
  *    soon as that directory is resolved, before the file in it is looked at: the
  *    scanner reaches every file through a string, and none names that directory.
@@ -1289,20 +1287,16 @@ export async function buildModulesMap(
   }
 
   /**
-   * Admit a module `depth` imports below the entry to the walk, under the limits the
-   * native resolver applies before it reads one: the import depth, then the module
-   * count — native's, of the modules fully resolved, then the engine's, of the entry
-   * plus `maxModules` (difference 4 in the list above).
+   * Admit a distinct module `depth` imports below the entry to the walk. Check the
+   * import depth, then the count, as native does. `admitted` includes the entry and
+   * every module still being resolved; permit the entry plus `maxModules` others.
    */
   function admit(depth: number): void {
     if (depth >= MAX_IMPORT_DEPTH) {
       throw importDepthError();
     }
-    if (completed.size >= maxModules) {
-      throw moduleCountError(maxModules, completed.size);
-    }
     if (admitted > maxModules) {
-      throw moduleCountError(maxModules, admitted);
+      throw moduleCountError();
     }
     admitted += 1;
   }
