@@ -694,6 +694,89 @@ fn imported_defines_share_the_runtime_layer_of_their_call() {
     ));
 }
 
+#[test]
+fn selective_import_shadows_a_define_in_the_next_capture() {
+    let source = concat!(
+        "@define same():\nlocal\n@end\n@define earlier():\n{{same()}}\n@end\n",
+        "@import { same } from \"./lib.mds\"\n",
+        "@define captured():\n{{same()}}\n@end\n{{earlier()}}/{{same()}}/{{captured()}}",
+    );
+    let module = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(
+        module.prompt_body.as_deref(),
+        Some("local/imported/imported")
+    );
+}
+
+#[test]
+fn define_shadows_an_earlier_merge_import_in_the_next_capture() {
+    let source = concat!(
+        "@import \"./lib.mds\"\n@define same():\nlocal\n@end\n",
+        "@define captured():\n{{same()}}\n@end\n{{same()}}/{{captured()}}",
+    );
+    let module = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("local/local"));
+}
+
+#[test]
+fn merge_import_refuses_a_name_that_a_define_already_uses() {
+    let source = "@define same():\nlocal\n@end\n@import \"./lib.mds\"";
+    let err = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(
+        miette::Diagnostic::code(&err).unwrap().to_string(),
+        "mds::name_collision"
+    );
+}
+
+#[test]
+fn interleaved_imports_and_defines_keep_one_capture_entry_per_write() {
+    use std::fmt::Write as _;
+
+    let mut library = String::new();
+    let mut source = String::new();
+    for i in 1..=128 {
+        writeln!(library, "@define i{i}():\nimported\n@end").unwrap();
+        writeln!(
+            source,
+            "@import {{ i{i} }} from \"./lib.mds\"\n@define f{i}():\n{{{{i{i}()}}}}\n@end"
+        )
+        .unwrap();
+    }
+    source.push_str("{{f128()}}");
+    let tokens = tokenize(&source, "entry.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "entry.mds", &source).unwrap();
+    let ctx = ModuleCtx {
+        key: "entry.mds",
+        file_str: "entry.mds",
+        source: &source,
+        base_dir: "",
+        runtime_vars: &Arc::default(),
+    };
+    let mut scope = Scope::new();
+    let defs = virtual_cache(&[("lib.mds", &library)])
+        .collect_definitions_and_imports(&module.body, &mut scope, &ctx, &mut Vec::new())
+        .unwrap();
+    assert_eq!(defs.functions.len(), 128);
+    assert_eq!(
+        evaluate(
+            &module.body,
+            &mut scope,
+            &mut Vec::new(),
+            ctx.file_str,
+            &source
+        )
+        .unwrap(),
+        "imported"
+    );
+    assert_eq!(crate::scope::captured_entry_count(&scope), 256);
+}
+
 /// Helper: compile a VirtualFs entry and return the Markdown output string.
 fn compile_virtual(files: &[(&str, &str)], entry: &str) -> Result<String, MdsError> {
     let map: std::collections::HashMap<String, String> = files

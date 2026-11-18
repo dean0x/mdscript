@@ -143,6 +143,19 @@ pub(crate) fn captured_function_nodes(root: &FunctionDef) -> usize {
     panic!("capture count exceeds the test limit of {MAX_NODES} nodes");
 }
 
+#[cfg(test)]
+pub(crate) fn captured_entry_count(scope: &Scope) -> usize {
+    let capture = CapturedScope {
+        head: scope.head.clone(),
+        ..CapturedScope::default()
+    };
+    let frozen: usize = capture
+        .links()
+        .map(|link| link.functions.len() + link.namespaces.len())
+        .sum();
+    frozen + scope.pending_functions.len() + scope.pending_namespaces.len()
+}
+
 pub(crate) type VarLayer = HashMap<String, Arc<Value>>;
 
 #[derive(Debug, Clone)]
@@ -534,6 +547,64 @@ mod tests {
             .contains("cannot capture outside the global scope frame"));
         scope.pop().unwrap();
         assert!(scope.capture().is_ok());
+    }
+
+    fn define(scope: &mut Scope, name: &str) -> Arc<FunctionDef> {
+        let function = Arc::new(FunctionDef {
+            params: vec![],
+            body: vec![],
+            captured: scope.capture().unwrap(),
+            origin: None,
+        });
+        scope.set_function(name, Arc::clone(&function));
+        function
+    }
+
+    #[test]
+    fn captures_without_writes_reuse_the_head() {
+        let mut scope = Scope::new();
+        assert!(scope.capture().unwrap().head.is_none());
+        assert!(scope.capture().unwrap().head.is_none());
+
+        let a = define(&mut scope, "a");
+        assert!(a.captured.head.is_none());
+        let b = define(&mut scope, "b");
+        let head = b.captured.head.as_ref().unwrap();
+        assert_eq!(head.functions.len(), 1);
+        assert!(Arc::ptr_eq(&head.functions["a"], &a));
+        assert!(head.prev.is_none());
+
+        let first = scope.capture().unwrap();
+        let second = scope.capture().unwrap();
+        assert!(Arc::ptr_eq(
+            first.head.as_ref().unwrap(),
+            second.head.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn capture_freezes_sibling_and_import_and_reuses_unchanged_vars() {
+        let mut scope = Scope::new();
+        scope.set_var("prompt", Value::String("text".into()));
+        let imported = define(&mut Scope::new(), "imported");
+        scope.set_function("earlier", Arc::clone(&imported));
+        let a = define(&mut scope, "a");
+        scope.set_function("imported", Arc::clone(&imported));
+        let b = define(&mut scope, "b");
+
+        let head = b.captured.head.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            head.prev.as_ref().unwrap(),
+            a.captured.head.as_ref().unwrap()
+        ));
+        assert_eq!(head.functions.len(), 2);
+        assert!(head.namespaces.is_empty());
+        assert!(Arc::ptr_eq(&head.functions["a"], &a));
+        assert!(Arc::ptr_eq(&head.functions["imported"], &imported));
+        assert!(Arc::ptr_eq(
+            a.captured.own_vars.as_ref().unwrap(),
+            b.captured.own_vars.as_ref().unwrap()
+        ));
     }
 
     // ── Variable not visible after pop ───────────────────────────────────────
