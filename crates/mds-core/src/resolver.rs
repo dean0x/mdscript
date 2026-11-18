@@ -1,6 +1,7 @@
 mod frontmatter;
 mod inheritance;
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -555,6 +556,7 @@ impl ModuleCache {
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
+            origin: OnceCell::new(),
         };
         let resolved = self.process_module(&ctx, is_md, warnings);
 
@@ -664,6 +666,7 @@ impl ModuleCache {
             source,
             base_dir: &canonical_str,
             runtime_vars: &runtime_layer(runtime_vars),
+            origin: OnceCell::new(),
         };
         let resolved = self.process_module(&ctx, false, warnings);
 
@@ -772,6 +775,7 @@ impl ModuleCache {
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
+            origin: OnceCell::new(),
         };
         let result = self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings);
 
@@ -801,6 +805,7 @@ impl ModuleCache {
             source,
             base_dir: &canonical_str,
             runtime_vars: &runtime_layer(runtime_vars),
+            origin: OnceCell::new(),
         };
         let result = self.process_module_intrinsic(&ctx, false, warnings);
         let popped = self.resolving.pop();
@@ -828,6 +833,7 @@ impl ModuleCache {
             source,
             base_dir: &canonical_str,
             runtime_vars: &runtime_layer(runtime_vars),
+            origin: OnceCell::new(),
         };
         let result = self.process_module_intrinsic_opts(&ctx, false, opts, warnings);
         let popped = self.resolving.pop();
@@ -1131,11 +1137,7 @@ impl ModuleCache {
         let map_out = if opts.source_map {
             // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
-            let builder = crate::sourcemap::MapBuilder::new(Origin {
-                file: Arc::from(ctx.key),
-                display: Arc::from(ctx.file_str),
-                source: Arc::from(ctx.source),
-            });
+            let builder = crate::sourcemap::MapBuilder::new(ctx.origin().clone());
             let returned = evaluate_with_map_seeded(
                 &module.body,
                 &mut scope,
@@ -1260,13 +1262,7 @@ impl ModuleCache {
         // `ResolvedModule::is_exported` applies).
         let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
 
-        // Build Origin once for this module — Arc::clone'd into the source-map builder
-        // below and into each EffectiveBlock (P3), so every copy shares one source text.
-        let origin = Origin {
-            file: Arc::from(ctx.key),
-            display: Arc::from(ctx.file_str),
-            source: Arc::from(ctx.source),
-        };
+        let origin = ctx.origin();
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
@@ -1303,7 +1299,7 @@ impl ModuleCache {
             prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         // Build effective_blocks first so module.body can be moved into the Arc below.
-        let effective_blocks = seed_effective_blocks(&module.body, &block_names, &origin);
+        let effective_blocks = seed_effective_blocks(&module.body, &block_names, origin);
 
         // Move module.body into Arc<[Node]> (reuses the Vec allocation, no element clones, P1).
         let effective_skeleton: Arc<[Node]> = Arc::from(module.body);
@@ -1325,7 +1321,7 @@ impl ModuleCache {
             explicit_exports,
             effective_skeleton,
             effective_blocks,
-            skeleton_origin: origin,
+            skeleton_origin: origin.clone(),
             frontmatter_values,
             is_skeleton: false,
         })
@@ -1409,6 +1405,7 @@ impl ModuleCache {
             source: base_source_ref,
             base_dir: &base_base_dir,
             runtime_vars: ctx.runtime_vars,
+            origin: OnceCell::new(),
         };
         self.resolve_frontmatter_imports(&base_fm_imports, &mut scope, &base_ctx, warnings)?;
 
@@ -1694,6 +1691,7 @@ impl ModuleCache {
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
+            origin: OnceCell::new(),
         };
         let resolved = self.process_module_skeleton(&ctx, is_md, warnings);
 
@@ -1830,12 +1828,7 @@ impl ModuleCache {
                 self.resolve_intermediate_base(ext, &own_fm_values, &module.body, ctx, warnings)?
             } else {
                 // Root base: own body is the skeleton; blocks seeded from own @block declarations.
-                // Build Origin once — Arc::clone'd into each seeded EffectiveBlock (P3).
-                let root_origin = Origin {
-                    file: Arc::from(ctx.key),
-                    display: Arc::from(ctx.file_str),
-                    source: Arc::from(ctx.source),
-                };
+                let root_origin = ctx.origin().clone();
                 // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
                 let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
                 let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
@@ -1890,28 +1883,12 @@ impl ModuleCache {
             block_names: HashSet::new(),
         };
 
-        // S7 (extended by B1): lazily build module_origin — at most one Arc::from per
-        // module, only when a @define block is encountered. Define-free modules (the
-        // common template shape) pay zero allocation; modules with @defines still
-        // satisfy the one-origin-per-module invariant for correct cross-source span
-        // attribution (PF-012). Correctness is unchanged: every FunctionDef.origin
-        // carries the same Arc<str> bytes as before — same ctx.source, same
-        // ctx.file_str. (Applies PF-012; ISS-08)
-        let mut module_origin: Option<Origin> = None;
-
         let mut block_count: usize = 0;
         let mut define_count: usize = 0;
         for node in body {
             count_module_defines(node, &mut define_count)?;
             match node {
-                Node::Define(def) => {
-                    let origin = module_origin.get_or_insert_with(|| Origin {
-                        file: Arc::from(ctx.key),
-                        display: Arc::from(ctx.file_str),
-                        source: Arc::from(ctx.source),
-                    });
-                    collect_define(def, &mut defs, scope, ctx, Some(origin))?
-                }
+                Node::Define(def) => collect_define(def, &mut defs, scope, ctx)?,
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
                 Node::Block(block) => {
@@ -2367,6 +2344,14 @@ impl ImportSite<'_> {
 }
 
 impl ModuleCtx<'_> {
+    fn origin(&self) -> &Origin {
+        self.origin.get_or_init(|| Origin {
+            file: Arc::from(self.key),
+            display: Arc::from(self.file_str),
+            source: Arc::from(self.source),
+        })
+    }
+
     fn import_site(&self, offset: usize) -> ImportSite<'_> {
         ImportSite {
             file_str: self.file_str,
@@ -2403,6 +2388,8 @@ struct ModuleCtx<'a> {
     base_dir: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
     runtime_vars: &'a Arc<VarLayer>,
+    /// Shared provenance, allocated only if this resolution needs an owned origin.
+    origin: OnceCell<Origin>,
 }
 
 /// Whether `name` is an available export of a module: every name when the module
@@ -2592,7 +2579,6 @@ fn collect_define(
     defs: &mut CollectedDefs,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
-    origin: Option<&Origin>,
 ) -> Result<(), MdsError> {
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
@@ -2606,8 +2592,7 @@ fn collect_define(
     let mut func = FunctionDef::from(def);
     // Freeze the definition site before inserting this function into scope.
     func.captured = scope.capture()?;
-    // S7: stamp provenance — two Arc refcount bumps, no allocation.
-    func.origin = origin.cloned();
+    func.origin = Some(ctx.origin().clone());
     // Wrap in Arc for cheap storage and O(1) scope insertion.
     let arc = Arc::new(func);
     defs.functions.insert(def.name.clone(), Arc::clone(&arc));

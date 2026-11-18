@@ -1218,6 +1218,7 @@ fn interleaved_imports_and_defines_keep_one_capture_entry_per_write() {
         source: &source,
         base_dir: "",
         runtime_vars: &Arc::default(),
+        origin: OnceCell::new(),
     };
     let mut scope = Scope::new();
     let defs = virtual_cache(&[("lib.mds", &library)])
@@ -3794,6 +3795,38 @@ fn p_block_sources_share_one_arc() {
     let _ = origins.pop(); // suppress unused warning
 }
 
+#[test]
+fn definitions_and_blocks_share_one_module_source() {
+    let source = "@define greet():\nHello\n@end\n@block content:\n{{greet()}}\n@end\n";
+    let child = "@extends \"./base.mds\"\n";
+    let files = [("base.mds", source), ("child.mds", child)];
+    for entry in ["base.mds", "child.mds"] {
+        let mut cache = virtual_cache(&files);
+        let vars = Default::default();
+        let mut warnings = Vec::new();
+        cache.resolve_key(entry, &vars, &mut warnings).unwrap();
+        let base = Arc::clone(&cache.modules["base.mds"]);
+        let module_origin = &base.skeleton_origin;
+        assert_eq!(module_origin.source.as_ref(), source);
+        assert_eq!(module_origin.display.as_ref(), "base.mds");
+        let origins = [
+            &base.effective_blocks["content"].origin,
+            base.functions["greet"].origin.as_ref().unwrap(),
+        ];
+        let shared = origins.map(|origin| Arc::ptr_eq(&module_origin.source, &origin.source));
+        assert_eq!(shared, [true, true], "entry: {entry}");
+        let upgraded = cache.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+        assert!(Arc::ptr_eq(
+            &module_origin.source,
+            &upgraded.skeleton_origin.source
+        ));
+        assert!(Arc::ptr_eq(
+            &base.effective_skeleton,
+            &upgraded.effective_skeleton
+        ));
+    }
+}
+
 // ── PF-003 / #133: Windows verbatim-path parent_dir invariant ────────────────
 
 // Guards that `NativeFs::parent_dir` uses `Path::new(key).parent()` — the same
@@ -4325,6 +4358,7 @@ fn extends_ctx<'a>(source: &'a str, vars: &'a Arc<VarLayer>) -> ModuleCtx<'a> {
         source,
         base_dir: ".",
         runtime_vars: vars,
+        origin: OnceCell::new(),
     }
 }
 
