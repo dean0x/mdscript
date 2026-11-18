@@ -1486,6 +1486,175 @@ mod tests {
         })
     }
 
+    fn test_context(warnings: &mut Vec<String>) -> EvalContext<'_> {
+        EvalContext {
+            call_stack: Vec::new(),
+            budget: EvalBudget::default(),
+            warnings,
+            map: None,
+            fn_body_owned: false,
+            file: "",
+            source: "",
+            body_origin: None,
+        }
+    }
+
+    fn test_loop(iterable: Expr) -> ForBlock {
+        ForBlock {
+            var: "item".into(),
+            key_var: None,
+            iterable,
+            body: Vec::new(),
+            offset: 0,
+            end_offset: 0,
+        }
+    }
+
+    fn member(object: &str, field: &str) -> Expr {
+        Expr::MemberAccess {
+            object: object.into(),
+            fields: vec![field.into()],
+        }
+    }
+
+    #[test]
+    fn shared_reads_nested_loop_binds_the_original_elements() {
+        let mut scope = Scope::new();
+        scope.set_var("items", Value::Array(vec![Value::Array(vec![Value::Null])]));
+        let outer = test_loop(Expr::Var("items".into()));
+        let mut inner = test_loop(Expr::Var("item".into()));
+        inner.var = "leaf".into();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let mut shared = Vec::new();
+        drive_for(&outer, &mut scope, &mut ctx, |scope, ctx| {
+            let item = &scope.get_var("items").unwrap().as_array().unwrap()[0];
+            let leaf = std::ptr::from_ref(&item.as_array().unwrap()[0]);
+            shared.push(std::ptr::eq(scope.get_var("item").unwrap(), item));
+            drive_for(&inner, scope, ctx, |scope, _| {
+                shared.push(std::ptr::eq(scope.get_var("leaf").unwrap(), leaf));
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert_eq!(shared, [true, true]);
+    }
+
+    #[test]
+    fn shared_reads_dot_loop_binds_the_original_elements() {
+        let items = Value::Array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let config = Arc::new(Value::Object(std::collections::HashMap::from([(
+            "items".into(),
+            items,
+        )])));
+        let frontmatter = [("cfg".into(), Arc::clone(&config))].into_iter().collect();
+        let mut scope = Scope::with_layers(Arc::default(), Arc::new(frontmatter));
+        let block = test_loop(member("cfg", "items"));
+        let Value::Object(fields) = config.as_ref() else {
+            panic!("expected object");
+        };
+        let items = &fields["items"];
+        let elements = items.as_array().unwrap();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let iterable = evaluate_expr(&block.iterable, &mut scope, &mut ctx).unwrap();
+        let mut shared = vec![std::ptr::eq(&iterable, items)];
+        drive_for(&block, &mut scope, &mut ctx, |scope, _| {
+            let item = scope.get_var("item").unwrap();
+            shared.push(std::ptr::eq(item, &elements[shared.len() - 1]));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(shared, [true, true, true]);
+    }
+
+    #[test]
+    fn shared_reads_function_arguments_refer_to_the_caller_values() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "cfg",
+            Value::Object(std::collections::HashMap::from([(
+                "item".into(),
+                Value::Null,
+            )])),
+        );
+        let args = [
+            Arg::Var("cfg".into()),
+            Arg::MemberAccess {
+                object: "cfg".into(),
+                fields: vec!["item".into()],
+            },
+        ];
+        let resolved =
+            resolve_args(&args, &mut scope, &mut test_context(&mut Vec::new()), 0).unwrap();
+        let config = scope.get_var("cfg").unwrap();
+        let Value::Object(fields) = config else {
+            panic!("expected object");
+        };
+        assert_eq!(
+            [
+                std::ptr::eq(&resolved[0], config),
+                std::ptr::eq(&resolved[1], &fields["item"])
+            ],
+            [true, true],
+        );
+    }
+
+    #[test]
+    fn shared_reads_key_value_loop_shares_values_in_key_order() {
+        let entries = std::collections::HashMap::from([
+            ("z".into(), Value::Number(2.0)),
+            ("a".into(), Value::Number(1.0)),
+        ]);
+        let mut scope = Scope::new();
+        scope.set_var("entries", Value::Object(entries));
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.key_var = Some("key".into());
+        let mut seen = Vec::new();
+        drive_for(
+            &block,
+            &mut scope,
+            &mut test_context(&mut Vec::new()),
+            |scope, _| {
+                let key = scope.get_var("key").unwrap().to_string();
+                let Value::Object(entries) = scope.get_var("entries").unwrap() else {
+                    panic!("expected object");
+                };
+                let shared = std::ptr::eq(scope.get_var("item").unwrap(), &entries[&key]);
+                seen.push((key, shared));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, [(String::from("a"), true), (String::from("z"), true)]);
+    }
+
+    #[test]
+    fn shared_reads_large_array_refused_before_first_pass() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "items",
+            Value::Array(vec![Value::Null; MAX_LOOP_ITERATIONS + 1]),
+        );
+        let block = test_loop(Expr::Var("items".into()));
+        let mut passes = 0;
+        let err = drive_for(
+            &block,
+            &mut scope,
+            &mut test_context(&mut Vec::new()),
+            |_, _| {
+                passes += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(passes, 0);
+        assert_eq!(
+            err.to_string(),
+            format!("resource limit exceeded: array has {} elements, exceeding maximum loop iteration limit of {MAX_LOOP_ITERATIONS}", MAX_LOOP_ITERATIONS + 1),
+        );
+    }
+
     #[test]
     fn evaluate_text() {
         let nodes = vec![text("Hello world!")];
