@@ -858,13 +858,13 @@ fn assert_refused_after_the_swap(dir: &Path, code: Option<i32>, stderr: &str, fi
     );
 }
 
-/// `mds fmt <dir>` refuses to rewrite a file below a directory that was swapped for a
+/// `mds fmt <dir>` refuses to read a file below a directory that was swapped for a
 /// symlink after the walk found it. Control: the file before it was rewritten.
 ///
 /// Unix-only: it runs [`rewrite_with_sub_swapped`].
 #[cfg(unix)]
 #[test]
-fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
+fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_read() {
     let files = Rewrite {
         first: "Alpha\r\n",
         first_rewritten: "Alpha\n",
@@ -875,13 +875,13 @@ fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
     assert_refused_after_the_swap(dir.path(), code, &stderr, &files);
 }
 
-/// `mds lint --fix <dir>` refuses to rewrite a file below a directory that was swapped for
+/// `mds lint --fix <dir>` refuses to read a file below a directory that was swapped for
 /// a symlink after the walk found it. Control: the file before it was fixed.
 ///
 /// Unix-only: it runs [`rewrite_with_sub_swapped`].
 #[cfg(unix)]
 #[test]
-fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
+fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_read() {
     let files = Rewrite {
         first: "@if \"x\" == \"y\":\nhidden\n@end\nAlpha\n",
         first_rewritten: "Alpha\n",
