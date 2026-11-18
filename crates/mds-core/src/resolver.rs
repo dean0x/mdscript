@@ -1070,14 +1070,15 @@ impl ModuleCache {
                 self.budget.start_module(),
             )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
+            let pending_map = builder
+                .and_then(|b| apply_map_degradation(b, opts, warnings))
+                .map(|b| b.finalize_points(&body_raw));
 
             let body_clean = crate::clean_output(&body_raw);
             let body_clean_len = body_clean.len();
             let final_str = crate::prepend_frontmatter(merged_frontmatter.as_deref(), body_clean);
             let fm_prefix_len = final_str.len() - body_clean_len;
-            let source_map =
-                map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+            let source_map = pending_map.map(|map| map.finish(&final_str, fm_prefix_len, None));
             // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
             // relativize ALL sources[] entries so no absolute path can leak into
             // the published map.  Unconditional — never opt-in, never debug_assert.
@@ -1161,11 +1162,12 @@ impl ModuleCache {
             None
         };
 
+        let pending_map = map_out.map(|b| b.finalize_points(&body_raw));
         let body_clean = crate::clean_output(&body_raw);
         let body_clean_len = body_clean.len();
         let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
         let fm_prefix_len = final_str.len() - body_clean_len;
-        let source_map = map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+        let source_map = pending_map.map(|map| map.finish(&final_str, fm_prefix_len, None));
         // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
         // relativize ALL sources[] entries so no absolute path can leak into
         // the published map.  Unconditional — never opt-in, never debug_assert.
@@ -2465,7 +2467,7 @@ fn prompt_body_and_map(
 /// - AC-PERF-03: if the segment cap was hit, degrade to `None` (a partial map
 ///   is misleading; warn and discard the builder).
 /// - AC-SEC-04: if `sourcesContent` total bytes exceed the ceiling, set
-///   `no_sources_content` so [`MapBuilder::finalize`] omits the array.
+///   `no_sources_content` so [`crate::sourcemap::PendingMap::finish`] omits the array.
 /// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
 fn apply_map_degradation(
     mut builder: crate::sourcemap::MapBuilder,

@@ -4,7 +4,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use mds::{CompileResult, MdsError, Value};
+use mds::{CompileOptions, CompileResult, MdsError, Value};
 
 const MIB: usize = 1024 * 1024;
 const CAP_PASS: usize = MIB + 1;
@@ -155,6 +155,36 @@ fn assert_small_messages_do_not_keep_padding() {
     assert!(peak <= 17 * MIB, "padded messages kept {peak} B at peak");
 }
 
+fn assert_mapped_output_peak() {
+    let source = "---\ntype: mds\nlabel: value\n---\n{{body}}";
+    let vars = HashMap::from([(
+        "body".to_owned(),
+        Value::String(format!("{}\rb", "a".repeat(8 * MIB - 2))),
+    )]);
+    let modules = HashMap::from([("main.mds".to_owned(), source.to_owned())]);
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    let (result, peak) =
+        peak_growth(|| mds::compile_virtual_with_deps_opts(modules, "main.mds", Some(vars), opts));
+    let result = result.unwrap();
+    let map = result.source_map.as_ref().unwrap();
+    assert_eq!(
+        map.sources_content.as_deref(),
+        Some([source.to_owned()].as_slice())
+    );
+    assert!(!map.mappings.is_empty());
+    let output = result.into_markdown().unwrap();
+    assert_eq!(output.len(), "---\nlabel: value\n---\n".len() + 8 * MIB);
+    assert!(output.starts_with("---\nlabel: value\n---\na"));
+    assert!(output.ends_with("ab\n"));
+    assert!(!output.contains('\r'));
+    assert!(peak >= 8 * MIB, "output control: {peak} B");
+    let bound = 48 * MIB;
+    eprintln!("mapped output peak: {peak} B; limit: {bound} B");
+    assert!(peak <= bound, "mapped output exceeds peak limit");
+}
+
 #[test]
 fn nested_if_output_does_not_raise_the_peak_heap() {
     let source = include_str!("memory_bound.rs");
@@ -195,4 +225,5 @@ fn nested_if_output_does_not_raise_the_peak_heap() {
 
     assert_message_edge_trim_peak();
     assert_small_messages_do_not_keep_padding();
+    assert_mapped_output_peak();
 }
