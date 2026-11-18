@@ -347,6 +347,14 @@ impl ChildGuard {
     }
 }
 
+const WALK_POLL: Duration = Duration::from_millis(5);
+const WALK_MAX_POLLS: u32 = READY_TIMEOUT.as_millis().div_ceil(WALK_POLL.as_millis()) as u32;
+
+#[test]
+fn after_walk_wait_covers_the_readiness_timeout() {
+    assert!(WALK_POLL * WALK_MAX_POLLS >= READY_TIMEOUT);
+}
+
 /// Run one directory command with a fixture change after its walk.
 #[allow(dead_code)]
 pub fn run_after_walk(cmd: &mut Command, change: impl FnOnce()) -> std::process::Output {
@@ -362,17 +370,17 @@ pub fn run_after_walk(cmd: &mut Command, change: impl FnOnce()) -> std::process:
     );
     let stdout = tap_reader(child.0.stdout.take().unwrap());
     let stderr = tap_reader(child.0.stderr.take().unwrap());
-    for _ in 0..1_000 {
+    for _ in 0..WALK_MAX_POLLS {
         if paused.exists() {
             break;
         }
         assert!(child.0.try_wait().unwrap().is_none(), "{}", stderr.text());
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(WALK_POLL);
     }
     assert!(paused.exists(), "the walk must pause: {}", stderr.text());
     change();
     std::fs::write(go, "").unwrap();
-    for _ in 0..1_000 {
+    for _ in 0..WALK_MAX_POLLS {
         if let Some(status) = child.0.try_wait().unwrap() {
             return std::process::Output {
                 status,
@@ -380,7 +388,7 @@ pub fn run_after_walk(cmd: &mut Command, change: impl FnOnce()) -> std::process:
                 stderr: stderr.finish(&mut child),
             };
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(WALK_POLL);
     }
     panic!("the directory command did not exit: {}", stderr.text());
 }
