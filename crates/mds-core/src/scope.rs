@@ -54,6 +54,20 @@ impl From<&DefineBlock> for FunctionDef {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn captured_function_nodes(root: &FunctionDef) -> usize {
+    // Count the root and every owned function in its captures. The test uses at most 13 defines.
+    const MAX_NODES: usize = 1 << 12;
+    let mut pending = vec![root];
+    for count in 0..=MAX_NODES {
+        let Some(function) = pending.pop() else {
+            return count;
+        };
+        pending.extend(function.captured.functions.values());
+    }
+    panic!("capture count exceeds the test limit of {MAX_NODES} nodes");
+}
+
 /// A scope chain supporting variable and function lookup with shadowing.
 #[derive(Debug, Clone)]
 pub struct Scope {

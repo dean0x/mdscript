@@ -498,6 +498,33 @@ fn block_exactly_at_max_allowed() {
     );
 }
 
+#[test]
+fn define_capture_holds_one_function_node_per_define() {
+    use std::fmt::Write as _;
+
+    let defines = [1, 2, 3, 12, 13];
+    let counts = defines.map(|k| {
+        let mut source = String::new();
+        for i in 1..=k {
+            writeln!(source, "@define f{i}(x):\nv{{{{x}}}}\n@end").unwrap();
+        }
+        let name = format!("f{k}");
+        write!(source, "{{{{{name}(\"a\")}}}}").unwrap();
+
+        let module = virtual_cache(&[("main.mds", &source)])
+            .resolve_key("main.mds", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref(), Some("va"), "K={k}");
+        crate::scope::captured_function_nodes(&module.functions[&name])
+    });
+    let delta = counts[4].checked_sub(counts[3]);
+    assert_eq!(
+        (&counts[..4], delta),
+        (&[1, 2, 3, 12][..], Some(1)),
+        "FunctionDef counts for K={defines:?}: {counts:?}; change from K=12 to K=13: {delta:?}"
+    );
+}
+
 // ── Phase 2: Template inheritance ─────────────────────────────────────────
 
 /// Helper: create a VirtualFs-backed ModuleCache from a &[(&str, &str)] slice.
