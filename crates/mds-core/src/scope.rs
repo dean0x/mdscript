@@ -103,12 +103,12 @@ impl From<&DefineBlock> for FunctionDef {
 #[cfg(test)]
 pub(crate) fn captured_function_nodes(root: &FunctionDef) -> usize {
     use std::collections::HashSet;
-    const MAX_NODES: usize = 1 << 12;
+    const MAX_STEPS: usize = 1 << 19;
     let mut pending = vec![root];
     let mut functions = HashSet::new();
     let mut links = HashSet::new();
     let mut namespaces = HashSet::new();
-    for _ in 0..=MAX_NODES {
+    for _ in 0..=MAX_STEPS {
         let Some(function) = pending.pop() else {
             return functions.len();
         };
@@ -127,7 +127,7 @@ pub(crate) fn captured_function_nodes(root: &FunctionDef) -> usize {
             }
         }
     }
-    panic!("capture count exceeds the test limit of {MAX_NODES} nodes");
+    panic!("capture count exceeds the test limit of {MAX_STEPS} worklist steps");
 }
 
 #[cfg(test)]
@@ -615,15 +615,52 @@ mod tests {
         assert!(scope.capture().is_ok());
     }
 
-    fn define(scope: &mut Scope, name: &str) -> Arc<FunctionDef> {
-        let function = Arc::new(FunctionDef {
+    fn capture_function(scope: &mut Scope) -> Arc<FunctionDef> {
+        Arc::new(FunctionDef {
             params: vec![],
             body: vec![],
             captured: scope.capture().unwrap(),
             origin: None,
-        });
+        })
+    }
+
+    fn define(scope: &mut Scope, name: &str) -> Arc<FunctionDef> {
+        let function = capture_function(scope);
         scope.set_function(name, Arc::clone(&function));
         function
+    }
+
+    #[test]
+    fn deep_capture_graph_drops_on_a_small_stack() {
+        const DEPTH: usize = 200_000;
+        let mut root = capture_function(&mut Scope::new());
+        let first = Arc::downgrade(&root);
+        for index in 1..DEPTH {
+            let mut scope = Scope::new();
+            scope.set_function("previous", Arc::clone(&root));
+            if index % 2 == 0 {
+                let mut namespace = make_ns();
+                namespace.functions.insert("previous".into(), root);
+                scope.set_namespace("lib", namespace);
+            }
+            root = capture_function(&mut scope);
+        }
+        assert!(captured_function_nodes(&root) >= DEPTH);
+        assert!(first.upgrade().is_some());
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let debug = format!("{:?}", root.captured);
+                assert!(debug.contains("links: 1"));
+                assert!(!debug.contains("previous"));
+                assert!(debug.len() < 256);
+                drop(root);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(first.upgrade().is_none());
     }
 
     #[test]
