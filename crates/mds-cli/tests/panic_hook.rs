@@ -2332,17 +2332,28 @@ fn host_boundary_findings(source: &str, funnel: &str) -> Vec<String> {
 /// planted selection in memory. Commands also get an all-features control.
 #[test]
 fn build_entry_points_leave_debug_panics_off() {
-    for (path, anchor) in [
+    let inputs = [
         (
             "../mds-python/pyproject.toml",
             "features = [\"pyo3/abi3-py311\"]",
         ),
         ("../mds-napi/package.json", "napi build --release --no-js"),
         (
+            "../../packages/mds-wasm/package.json",
+            "wasm-pack build ../../crates/mds-wasm --target nodejs",
+        ),
+        (
             "../../.github/workflows/release.yml",
             "napi build --platform --release",
         ),
-    ] {
+    ];
+    assert!(
+        inputs
+            .iter()
+            .any(|(path, _)| *path == "../../packages/mds-wasm/package.json"),
+        "the WASM workspace build script must receive the planted feature controls"
+    );
+    for (path, anchor) in inputs {
         let source = read_source(path);
         assert!(
             source.contains(anchor),
