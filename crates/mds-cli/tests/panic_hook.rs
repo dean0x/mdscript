@@ -2307,11 +2307,13 @@ const CLI_PANIC_MACHINERY: &[(&str, &str, &str)] = &[
     ("catch_unwind", "output.rs", "catch_panic"),
 ];
 
-/// Where mds-core's sources name the [`PANIC_MACHINERY`]: two unit tests, each catching
-/// the panic of a check that debug builds compile in. mds-core's library code runs inside
-/// the CLI's catch, where a hook or a catch of its own would take a panic away from the
-/// CLI's hook, and an unwind without the hook would report nothing.
+/// Where mds-core's sources name the [`PANIC_MACHINERY`]: two unit tests and the
+/// native hosts' opt-in boundary helper. Core compile functions do not call that
+/// helper, so the CLI keeps its own hook and catch.
 const CORE_PANIC_MACHINERY: &[(&str, &str, &str)] = &[
+    ("take_hook", "host_panic.rs", "install"),
+    ("set_hook", "host_panic.rs", "install"),
+    ("catch_unwind", "host_panic.rs", "catching"),
     (
         "catch_unwind",
         "resolver_tests.rs",

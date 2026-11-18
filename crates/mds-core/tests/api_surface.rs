@@ -37,6 +37,12 @@ fn public_functions_exist() {
     let _ = mds::load_vars_str_reporting_duplicates("{}");
 }
 
+#[test]
+fn host_panic_helper_signatures_exist_without_an_implicit_install() {
+    let _: fn() = mds::host_panic::install;
+    let _: fn(fn() -> u8) -> std::thread::Result<u8> = mds::host_panic::catching;
+}
+
 /// #409: `display_native_path` is callable via the crate root with the expected
 /// `Path -> Cow<Path>` signature. It is the single public entry point CLI and
 /// binding display sinks use to strip a Windows verbatim prefix (`\\?\C:\…`)

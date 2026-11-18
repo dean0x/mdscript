@@ -46,6 +46,8 @@ pub(crate) mod error;
 pub(crate) mod evaluator;
 pub(crate) mod formatter;
 pub(crate) mod fs;
+#[doc(hidden)]
+pub mod host_panic;
 pub(crate) mod lexer;
 pub(crate) mod limits;
 pub(crate) mod lint;
