@@ -329,8 +329,9 @@ fn run_check(
     if input != std::path::Path::new("-") && input.is_dir() {
         // #413: the one directory-argument check every directory-mode subcommand makes
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
-        input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
-        return run_check_directory(&input, runtime_vars, quiet);
+        let canonical_dir =
+            input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
+        return run_check_directory(&input, &canonical_dir, runtime_vars, quiet);
     }
 
     // Single-file / stdin path.
@@ -370,6 +371,7 @@ fn run_check(
 /// failed with a resource limit.
 fn run_check_directory(
     dir: &std::path::Path,
+    canonical_dir: &std::path::Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<()> {
@@ -378,7 +380,7 @@ fn run_check_directory(
     const MAX_DEPTH: usize = 64;
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
-    let files = walk.files;
+    let files = &walk.files;
 
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
@@ -406,7 +408,7 @@ fn run_check_directory(
     // #204 closed for the empty tree. Same shape as the all-excluded arm: count-carrying,
     // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
     // behaviour; `mds watch <dir>` still starts.
-    if let Some(partials_only_count) = output::partials_only(&files) {
+    if let Some(partials_only_count) = output::partials_only(files) {
         output::ewriteln!(
             "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
              nothing was checked",
@@ -418,17 +420,19 @@ fn run_check_directory(
     let mut ok_count: usize = 0;
     let mut fail_count: usize = 0;
 
-    for file in &files {
+    for file in files {
         if is_partial(file) {
             continue;
         }
         // A panic in the check fails this file alone, and the batch goes on (#389).
+        let pin = output::walked_pin(&walk, file, dir, canonical_dir);
+        let fs = mds::NativeFs::new().with_entry_pin(pin);
         let checked = output::catch_compile(
             file,
-            AssertUnwindSafe(|| mds::check_collecting_warnings(file, runtime_vars.clone())),
+            AssertUnwindSafe(|| mds::check_native_fs(fs, file, runtime_vars.clone())),
         );
         match checked {
-            Ok(Ok(((), warnings))) => {
+            Ok(Ok(warnings)) => {
                 if !quiet {
                     for w in &warnings {
                         output::eprint_warning(w);

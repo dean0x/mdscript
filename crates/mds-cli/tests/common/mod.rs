@@ -347,6 +347,44 @@ impl ChildGuard {
     }
 }
 
+/// Run one directory command with a fixture change after its walk.
+#[allow(dead_code)]
+pub fn run_after_walk(cmd: &mut Command, change: impl FnOnce()) -> std::process::Output {
+    let gate = tempfile::tempdir().unwrap();
+    let go = gate.path().join("go");
+    let paused = gate.path().join("go.paused");
+    let mut child = ChildGuard(
+        cmd.env("MDS_TEST_PAUSE_AFTER_WALK", &go)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = tap_reader(child.0.stdout.take().unwrap());
+    let stderr = tap_reader(child.0.stderr.take().unwrap());
+    for _ in 0..1_000 {
+        if paused.exists() {
+            break;
+        }
+        assert!(child.0.try_wait().unwrap().is_none(), "{}", stderr.text());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(paused.exists(), "the walk must pause: {}", stderr.text());
+    change();
+    std::fs::write(go, "").unwrap();
+    for _ in 0..1_000 {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return std::process::Output {
+                status,
+                stdout: stdout.finish(&mut child),
+                stderr: stderr.finish(&mut child),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the directory command did not exit: {}", stderr.text());
+}
+
 /// A background-drained capture of one of the child's output pipes.
 ///
 /// Holds **exactly** what the child wrote and nothing else — the readiness handshake

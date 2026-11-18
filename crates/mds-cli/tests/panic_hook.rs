@@ -1772,6 +1772,44 @@ fn the_pause_before_a_replace_is_compiled_only_into_debug_builds() {
     }
 }
 
+#[test]
+fn the_pause_after_a_walk_is_compiled_only_into_debug_builds() {
+    let output = read_source("src/output.rs");
+    let sources = crate_sources();
+    let gate = DebugGate {
+        module: "walk_pause_trigger",
+        needles: &[("MDS_TEST_PAUSE_AFTER_WALK", true)],
+        fns: &["pause_after_walk"],
+    };
+    let found = gate_findings(&sources, &gate);
+    assert!(found.is_empty(), "{}", found.join("\n"));
+
+    let stub = "pub(crate) fn pause_after_walk() {}";
+    for (from, to) in [
+        (
+            "#[cfg(debug_assertions)]\nmod walk_pause_trigger",
+            "mod walk_pause_trigger",
+        ),
+        (
+            stub,
+            "pub(crate) fn pause_after_walk() { let _ = std::env::var_os(\"MDS_TEST_PAUSE_AFTER_WALK\"); }",
+        ),
+        (stub, "pub(crate) fn pause_after_walk() { let _ = 1; }"),
+        (stub, ""),
+    ] {
+        let planted = output.replacen(from, to, 1);
+        assert_ne!(planted, output, "precondition: output.rs holds {from:?}");
+        let planted_sources: Vec<_> = sources
+            .iter()
+            .map(|(name, src)| {
+                let src = if name == "output.rs" { &planted } else { src };
+                (name.clone(), src.clone())
+            })
+            .collect();
+        assert!(!gate_findings(&planted_sources, &gate).is_empty());
+    }
+}
+
 /// The pause between a directory watch batch's split and its compile (#160), the pause
 /// between a watch rebuild's look and its reads (#380) and the pause between a file
 /// rebuild's reads and its baseline (#380) compile only into a debug build, as the pause
@@ -1978,9 +2016,9 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "build.rs",
-                "AssertUnwindSafe(|| compile_to_content(file, runtime_vars.clone(), quiet, opts))",
-                "AssertUnwindSafe(|| { fail_count += 1; compile_to_content(file, \
-                 runtime_vars.clone(), quiet, opts) })",
+                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)",
+                "{ fail_count += 1; compile_native_to_content(fs, file, \
+                 runtime_vars.clone(), quiet, opts) }",
             ),
             "more than one call",
             "a state change beside the compile",
@@ -2006,8 +2044,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "build.rs",
-                "compile_to_content(file, runtime_vars.clone(), quiet, opts)",
-                "compile_to_content(file, runtime_vars.clone(), quiet, &mut opts)",
+                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)",
+                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, &mut opts)",
             ),
             "changes state",
             "a mutable borrow",
@@ -2015,8 +2053,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "main.rs",
-                "mds::check_collecting_warnings(file, runtime_vars.clone()))",
-                "mds::check_collecting_warnings(file, runtime_vars.clone()).map(|c| c))",
+                "mds::check_native_fs(fs, file, runtime_vars.clone()))",
+                "mds::check_native_fs(fs, file, runtime_vars.clone()).map(|c| c))",
             ),
             "more than its one call",
             "a call chained onto the compile",
@@ -2024,8 +2062,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "main.rs",
-                "AssertUnwindSafe(|| mds::check_collecting_warnings(file, runtime_vars.clone()))",
-                "|| mds::check_collecting_warnings(file, runtime_vars.clone())",
+                "AssertUnwindSafe(|| mds::check_native_fs(fs, file, runtime_vars.clone()))",
+                "|| mds::check_native_fs(fs, file, runtime_vars.clone())",
             ),
             "AssertUnwindSafe",
             "a closure not wrapped in `AssertUnwindSafe`",
@@ -2531,7 +2569,8 @@ const COMPILE_CATCHES: &[(&str, &str)] = &[
 /// defines.
 const COMPILE_CALLS: &[(&str, Option<&str>)] = &[
     ("compile_to_content", Some("build.rs")),
-    ("mds::check_collecting_warnings", None),
+    ("compile_native_to_content", Some("build.rs")),
+    ("mds::check_native_fs", None),
     ("format_source_named", Some("fmt.rs")),
     ("mds::lint", None),
     ("run_fix_pipeline", Some("lint.rs")),

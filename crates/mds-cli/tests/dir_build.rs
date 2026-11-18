@@ -79,6 +79,97 @@ fn check_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+#[test]
+#[cfg(unix)]
+fn dir_build_refuses_a_file_replaced_after_walk() {
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "page.mds");
+    create_plain_mds(src.path(), "good.mds");
+    let output = common::run_after_walk(
+        mds_bin()
+            .arg("build")
+            .arg(src.path())
+            .arg("--source-map")
+            .arg("--out-dir")
+            .arg(out.path()),
+        || {
+            fs::rename(src.path().join("page.mds"), src.path().join("saved.txt")).unwrap();
+            fs::write(src.path().join("page.mds"), "Replacement\n").unwrap();
+        },
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("file changed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 built, 1 failed"), "{stderr}");
+    assert!(!out.path().join("page.md").exists());
+    assert!(!out.path().join("page.md.map").exists());
+    assert_eq!(
+        fs::read_to_string(out.path().join("good.md")).unwrap(),
+        "Hello, world!\n"
+    );
+}
+
+#[test]
+fn dir_build_refuses_a_parent_redirected_after_walk() {
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let sub = src.path().join("sub");
+    let moved = src.path().join("moved");
+    fs::create_dir(&sub).unwrap();
+    create_plain_mds(&sub, "page.mds");
+    // Probe link support before the child starts.
+    if !make_symlink(&sub, &src.path().join("probe")) {
+        return;
+    }
+    let output = common::run_after_walk(
+        mds_bin()
+            .arg("build")
+            .arg(src.path())
+            .arg("--out-dir")
+            .arg(out.path()),
+        || {
+            fs::rename(&sub, &moved).unwrap();
+            assert!(make_symlink(&moved, &sub));
+        },
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("file changed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("0 built, 1 failed"), "{stderr}");
+    assert!(!out.path().join("sub/page.md").exists());
+    assert!(!out.path().join("moved/page.md").exists());
+}
+
+#[test]
+fn dir_build_accepts_an_unchanged_tree_after_walk() {
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    fs::create_dir(src.path().join("sub")).unwrap();
+    create_plain_mds(&src.path().join("sub"), "page.mds");
+    let output = common::run_after_walk(
+        mds_bin()
+            .arg("build")
+            .arg(src.path())
+            .arg("--out-dir")
+            .arg(out.path()),
+        || {},
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("1 built, 0 failed"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(out.path().join("sub/page.md")).unwrap(),
+        "Hello, world!\n"
+    );
+}
+
 // ── T-CLI-12 (FUNC-16): subtree mirror + intrinsic ext per file ───────────────
 
 #[test]
