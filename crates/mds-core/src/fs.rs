@@ -485,11 +485,29 @@ impl ReadRule<'_> {
     fn check_before(self, before: &std::fs::Metadata, display: &str) -> Result<(), MdsError> {
         match self {
             Self::Module if !before.is_file() => Err(self.io_error(display, not_a_regular_file())),
-            Self::Vars { lookup_type, .. } if !lookup_type.is_file() && !is_fifo(lookup_type) => {
+            Self::Vars { lookup_type, .. }
+                if (lookup_type.is_file() && !before.is_file())
+                    || (!lookup_type.is_file() && !is_fifo(lookup_type)) =>
+            {
                 Err(file_changed(display))
             }
             _ => Ok(()),
         }
+    }
+
+    fn open(self, path: &Path) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        if matches!(self, Self::Vars { lookup_type, .. } if lookup_type.is_file()) {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // A regular-file lookup must not wait if the path now names a pipe.
+            // The opened-handle type check runs before any byte is read.
+            return std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+                .open(path);
+        }
+        std::fs::File::open(path)
     }
 
     fn skip_identity(self, opened: &std::fs::Metadata, display: &str) -> Result<bool, MdsError> {
@@ -565,7 +583,7 @@ fn read_verified_capped(
     let io_error = |e| rule.io_error(display, e);
     let before = std::fs::metadata(path).map_err(io_error)?;
     rule.check_before(&before, display)?;
-    let file = std::fs::File::open(path).map_err(io_error)?;
+    let file = rule.open(path).map_err(io_error)?;
     let opened = file.metadata().map_err(io_error)?;
     if !rule.skip_identity(&opened, display)? {
         verify_opened_file(&file, &opened, expected, display)?;
@@ -2987,6 +3005,74 @@ mod tests {
             .read(MAX_FILE_SIZE)
             .is_ok());
         snapshot.read(MAX_FILE_SIZE)
+    }
+
+    #[cfg(unix)]
+    fn assert_vars_pipe_replacement_refused(after_metadata: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vars.json");
+        std::fs::write(&path, r#"{"name":"regular"}"#).unwrap();
+        let vars = crate::load_vars_file(&path).unwrap();
+        assert_eq!(
+            crate::compile_str_with("Hello {{name}}!", None, Some(vars))
+                .unwrap()
+                .output,
+            crate::CompiledOutput::Markdown("Hello regular!\n".into())
+        );
+        let snapshot = VarsFile::resolve(&path, "vars.json").unwrap();
+        if after_metadata {
+            snapshot
+                .rule
+                .check_before(&std::fs::metadata(&path).unwrap(), "vars.json")
+                .unwrap();
+        }
+        std::fs::rename(&path, dir.path().join("saved")).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(is_fifo(std::fs::metadata(&path).unwrap().file_type()));
+
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = if after_metadata {
+                // Use the production open and handle check after a stale metadata check.
+                let file = snapshot.rule.open(&path).unwrap();
+                snapshot
+                    .rule
+                    .skip_identity(&file.metadata().unwrap(), "vars.json")
+                    .map(|_| ())
+            } else {
+                snapshot.read(MAX_FILE_SIZE).map(|_| ())
+            };
+            let _ = tx.send(result);
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a regular vars file replaced by a pipe must not wait for a writer");
+        reader.join().unwrap();
+        let error = result.expect_err("changed vars refused");
+        assert_eq!(code_of(&error).as_deref(), Some("mds::io"));
+        assert_eq!(
+            error.to_string(),
+            "cannot read vars.json: the file changed while it was opened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vars_snapshot_refuses_a_regular_file_replaced_by_a_pipe_without_a_writer() {
+        assert_vars_pipe_replacement_refused(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vars_open_refuses_a_regular_file_replaced_by_a_pipe_after_metadata() {
+        assert_vars_pipe_replacement_refused(true);
     }
 
     #[cfg(unix)]

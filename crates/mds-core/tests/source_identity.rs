@@ -193,13 +193,19 @@ fn walked_entry_identity_refuses_a_replaced_file_and_accepts_the_control() {
     let walked = std::fs::symlink_metadata(&entry).unwrap();
     std::fs::rename(&entry, dir.path().join("saved.mds")).unwrap();
     std::fs::write(&entry, "Other\n").unwrap();
-    for metadata in [walked, std::fs::symlink_metadata(&entry).unwrap()] {
+    use std::os::unix::fs::MetadataExt;
+    let current = std::fs::symlink_metadata(&entry).unwrap();
+    assert_ne!(
+        walked.ino(),
+        current.ino(),
+        "the replacement must be a new file"
+    );
+    for (metadata, replaced) in [(walked, true), (current, false)] {
         let pin = mds::EntryPin::key(&canonical).with_walked(&metadata);
         let result = NativeFs::new()
             .with_entry_pin(pin)
             .resolve_entry(entry.to_str().unwrap());
-        use std::os::unix::fs::MetadataExt;
-        if metadata.ino() != std::fs::symlink_metadata(&entry).unwrap().ino() {
+        if replaced {
             let error = result.unwrap_err();
             assert_eq!(error.code().unwrap().to_string(), "mds::io");
             assert_eq!(
@@ -219,6 +225,14 @@ fn parent_pin_accepts_a_new_name_in_the_same_directory_only() {
     std::fs::create_dir(root.join("other")).unwrap();
     let entry = root.join("MAIN.mds");
     std::fs::write(&entry, "Hello\n").unwrap();
+    let next = root.join("next.mds");
+    std::fs::write(&next, "Next\n").unwrap();
+    let fs = NativeFs::new().with_entry_pin(mds::EntryPin::parent_dir(&root));
+    let key = fs.resolve_entry(entry.to_str().unwrap()).unwrap();
+    assert_eq!(fs.read(&key).unwrap(), "Hello\n");
+    let next_key = fs.resolve_entry(next.to_str().unwrap()).unwrap();
+    assert_ne!(key, next_key, "the second resolution must use a new name");
+    assert_eq!(fs.read(&next_key).unwrap(), "Next\n");
     for parent in [root.join("other"), root.clone()] {
         let fs = NativeFs::new().with_entry_pin(mds::EntryPin::parent_dir(&parent));
         let result = fs.resolve_entry(entry.to_str().unwrap());
