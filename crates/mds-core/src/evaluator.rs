@@ -492,18 +492,12 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot
 fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<Slot, MdsError> {
     match expr {
         Expr::Var(name) => resolve_var(name, scope),
-        Expr::Call { name, args } => {
-            let resolved_args = resolve_args(args, scope, ctx, 0)?;
-            call_function(name, resolved_args, scope, ctx)
-        }
+        Expr::Call { name, args } => call_function(name, args, scope, ctx, 0),
         Expr::QualifiedCall {
             namespace,
             name,
             args,
-        } => {
-            let resolved_args = resolve_args(args, scope, ctx, 0)?;
-            call_qualified_function(namespace, name, &resolved_args, scope, ctx)
-        }
+        } => call_qualified_function(namespace, name, args, scope, ctx),
         Expr::MemberAccess { object, fields } => {
             // Give a targeted error when the name refers to an imported namespace rather
             // than a variable — before delegating to resolve_dot_path which only looks up vars.
@@ -568,10 +562,7 @@ fn resolve_args(
             Arg::Call {
                 name,
                 args: inner_args,
-            } => {
-                let resolved = resolve_args(inner_args, scope, ctx, depth + 1)?;
-                call_function(name, resolved, scope, ctx)
-            }
+            } => call_function(name, inner_args, scope, ctx, depth + 1),
             Arg::MemberAccess { object, fields } => resolve_dot_path(object, fields, scope),
         })
         .collect()
@@ -620,6 +611,25 @@ pub(crate) fn literal_expr_to_value(expr: &Expr) -> Result<Value, MdsError> {
     }
 }
 
+fn check_function_arity(
+    func: &FunctionDef,
+    call_key: &str,
+    arg_count: usize,
+) -> Result<(), MdsError> {
+    let required = required_param_count(&func.params);
+    let total = func.params.len();
+    if !check_arity(arg_count, required, total) {
+        return Err(MdsError::arity(
+            call_key,
+            required,
+            total,
+            arg_count,
+            Some(render_signature(call_key, &func.params)),
+        ));
+    }
+    Ok(())
+}
+
 fn invoke_function(
     func: &Arc<FunctionDef>,
     call_key: &str,
@@ -639,17 +649,7 @@ fn invoke_function(
             "{call_key} (call depth exceeds {MAX_CALL_DEPTH})"
         )));
     }
-    let required = required_param_count(&func.params);
-    let total = func.params.len();
-    if !check_arity(args.len(), required, total) {
-        return Err(MdsError::arity(
-            call_key,
-            required,
-            total,
-            args.len(),
-            Some(render_signature(call_key, &func.params)),
-        ));
-    }
+    check_function_arity(func, call_key, args.len())?;
     scope.push_call(func);
     let result = evaluate_function_body(func, call_key, args, scope, ctx);
     prefer_first_error(result, scope.pop())
@@ -823,12 +823,15 @@ fn evaluate_function_body(
 
 fn call_function(
     name: &str,
-    args: Vec<Slot>,
+    args: &[Arg],
     scope: &mut Scope,
     ctx: &mut EvalContext,
+    depth: usize,
 ) -> Result<Slot, MdsError> {
     // User-defined functions take priority (shadowing built-ins).
     if let Some(func) = scope.get_function(name).cloned() {
+        check_function_arity(&func, name, args.len())?;
+        let args = resolve_args(args, scope, ctx, depth)?;
         return invoke_function(&func, name, &args, scope, ctx).map(|s| Value::String(s).into());
     }
     // Fall back to built-ins.
@@ -848,35 +851,40 @@ fn call_function(
         // Call the handler directly using the meta reference we already hold,
         // avoiding a second linear scan through BUILTINS that call_builtin
         // would perform internally.
-        let values = args
+        let values = resolve_args(args, scope, ctx, depth)?
             .into_iter()
             .map(|slot| slot.into_value().ok_or_else(invalid_projection))
             .collect::<Result<Vec<_>, _>>()?;
         return (meta.handler)(&values).map(Slot::from);
     }
+    // An argument error still takes priority when the callee does not exist.
+    resolve_args(args, scope, ctx, depth)?;
     Err(MdsError::undefined_fn(name))
 }
 
 fn call_qualified_function(
     namespace: &str,
     name: &str,
-    args: &[Slot],
+    args: &[Arg],
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<Slot, MdsError> {
     let qualified_name = format!("{namespace}.{name}");
-
-    let ns = scope
+    let callee = scope
         .get_namespace(namespace)
-        .ok_or_else(|| MdsError::undefined_var(namespace))?;
-
-    let func = ns
-        .functions
-        .get(name)
-        .ok_or_else(|| MdsError::undefined_fn(&qualified_name))?
-        .clone();
-
-    invoke_function(&func, &qualified_name, args, scope, ctx).map(|s| Value::String(s).into())
+        .ok_or_else(|| MdsError::undefined_var(namespace))
+        .and_then(|ns| {
+            ns.functions
+                .get(name)
+                .cloned()
+                .ok_or_else(|| MdsError::undefined_fn(&qualified_name))
+        });
+    if let Ok(func) = &callee {
+        check_function_arity(func, &qualified_name, args.len())?;
+    }
+    // Defer a lookup error until after the arguments have been evaluated.
+    let args = resolve_args(args, scope, ctx, 0)?;
+    invoke_function(&callee?, &qualified_name, &args, scope, ctx).map(|s| Value::String(s).into())
 }
 
 /// Compare two runtime `Value` instances for strict same-type equality.
@@ -2626,6 +2634,112 @@ mod tests {
     // context available at runtime); validator errors HAVE a span (source text
     // is present at compile time).
 
+    fn arity_scope() -> Scope {
+        let mut scope = Scope::new();
+        let function = Arc::new(FunctionDef {
+            params: vec![Param::required("x")],
+            body: vec![text("ok")],
+            captured: crate::scope::CapturedScope::default(),
+            origin: None,
+        });
+        scope.set_function("f", Arc::clone(&function));
+        scope.set_namespace(
+            "ns",
+            Arc::new(crate::scope::NamespaceScope {
+                functions: [("f".into(), function)].into_iter().collect(),
+                prompt_body: None,
+                prompt_map: None,
+                prompt_suppressed_by_exports: false,
+            }),
+        );
+        scope
+    }
+
+    fn direct_call(namespace: Option<&str>, name: &str, args: Vec<Arg>) -> Expr {
+        match namespace {
+            Some(namespace) => Expr::QualifiedCall {
+                namespace: namespace.into(),
+                name: name.into(),
+                args,
+            },
+            None => Expr::Call {
+                name: name.into(),
+                args,
+            },
+        }
+    }
+
+    #[test]
+    fn known_callee_reports_arity_before_an_undefined_argument() {
+        let mut scope = arity_scope();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let missing = Arg::Var("missing_arg".into());
+        let wrong = vec![missing.clone(), Arg::NullLiteral];
+        let nested = direct_call(
+            None,
+            "upper",
+            vec![Arg::Call {
+                name: "f".into(),
+                args: wrong.clone(),
+            }],
+        );
+        let calls = [
+            (direct_call(None, "f", wrong.clone()), "f", Some("f(x)")),
+            (
+                direct_call(Some("ns"), "f", wrong.clone()),
+                "ns.f",
+                Some("ns.f(x)"),
+            ),
+            (direct_call(None, "upper", wrong), "upper", None),
+            (nested, "f", Some("f(x)")),
+        ];
+        let mismatches: Vec<_> = calls
+            .into_iter()
+            .filter_map(|(expr, name, signature)| {
+                let actual = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+                let expected = MdsError::arity(name, 1, 1, 2, signature.map(str::to_owned));
+                let actual = format!("{actual:?}");
+                let expected = format!("{expected:?}");
+                (actual != expected).then_some((actual, expected))
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "actual and expected errors: {mismatches:?}"
+        );
+        for (namespace, name) in [(None, "f"), (Some("ns"), "f"), (None, "upper")] {
+            let expr = direct_call(namespace, name, vec![missing.clone()]);
+            let err = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                MdsError::undefined_var("missing_arg").to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_callee_reports_argument_error_before_lookup_error() {
+        let mut scope = arity_scope();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        for (namespace, name, expected) in [
+            (None, "gone", MdsError::undefined_fn("gone")),
+            (Some("gone"), "f", MdsError::undefined_var("gone")),
+            (Some("ns"), "gone", MdsError::undefined_fn("ns.gone")),
+        ] {
+            let expr = direct_call(namespace, name, vec![Arg::Var("missing_arg".into())]);
+            let err = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                MdsError::undefined_var("missing_arg").to_string()
+            );
+            let expr = direct_call(namespace, name, vec![Arg::NullLiteral]);
+            let err = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+            assert_eq!(err.to_string(), expected.to_string());
+        }
+    }
+
     #[test]
     fn arity_error_evaluator_has_no_span() {
         // Bypass the validator so only the evaluator's arity check fires.
@@ -2644,7 +2758,7 @@ mod tests {
         let mut scope = Scope::new();
         scope.set_function("requires_one", Arc::new(FunctionDef::from(&define)));
 
-        // Call with 0 args → arity error from invoke_function (evaluator path).
+        // Call with 0 args → arity error before the function body runs.
         let nodes = vec![Node::Interpolation(Interpolation {
             expr: Expr::Call {
                 name: "requires_one".to_string(),
