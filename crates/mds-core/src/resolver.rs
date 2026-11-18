@@ -1958,7 +1958,7 @@ impl ModuleCache {
                 warnings,
             )
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
-        scope.set_namespace(alias, resolved.to_namespace());
+        scope.set_namespace(alias, Arc::new(resolved.to_namespace()));
         Ok(())
     }
 
@@ -1980,7 +1980,7 @@ impl ModuleCache {
                     let resolved = self
                         .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
-                    scope.set_namespace(alias, resolved.to_namespace());
+                    scope.set_namespace(alias, Arc::new(resolved.to_namespace()));
                 }
                 FrontmatterImport::Merge { path } => {
                     let resolved = self
@@ -2481,16 +2481,8 @@ fn collect_define(
         ));
     }
     let mut func = FunctionDef::from(def);
-    // Capture definition-site scope for lexical closure semantics.
-    func.captured.namespaces = scope.get_all_namespaces();
-    // Convert Arc<FunctionDef> → owned FunctionDef for captured.functions.
-    // Owned captures break potential reference cycles (A captures B captures A).
-    func.captured.functions = scope
-        .get_all_functions()
-        .into_iter()
-        .map(|(k, v)| (k, (*v).clone()))
-        .collect();
-    func.captured.vars = scope.get_all_vars();
+    // Freeze the definition site before inserting this function into scope.
+    func.captured = scope.capture()?;
     // S7: stamp provenance — two Arc refcount bumps, no allocation.
     func.origin = origin.cloned();
     // Wrap in Arc for cheap storage and O(1) scope insertion.

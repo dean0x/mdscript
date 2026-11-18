@@ -5,23 +5,82 @@ use crate::ast::{DefineBlock, Param};
 use crate::sourcemap::Origin;
 use crate::value::Value;
 
-/// Closure captures bundled at function definition time.
+/// Closure captures from the definition site.
 ///
-/// `functions` is owned (not `Arc`) to avoid reference cycles: if function A
-/// captures function B and B captures A, using `Arc<FunctionDef>` inside the
-/// capture would create a cycle that leaks memory. Owned values break the cycle.
-#[derive(Debug, Clone, Default)]
+/// Each capture and link is immutable once shared. A define captures before
+/// it enters scope, so the links and functions form a DAG. The call stack
+/// check rejects recursion by name.
+#[derive(Default)]
 pub struct CapturedScope {
-    /// Namespace aliases captured from the function's definition site.
-    pub namespaces: HashMap<String, NamespaceScope>,
-    /// Functions captured from the function's definition site (owned — avoids reference cycles).
-    pub functions: HashMap<String, FunctionDef>,
-    /// Variables captured from the function's definition site.
-    pub vars: HashMap<String, Value>,
+    own_vars: Option<Arc<HashMap<String, Slot>>>,
+    pub(crate) runtime: Option<Arc<VarLayer>>,
+    frontmatter: Option<Arc<VarLayer>>,
+    head: Option<Arc<CaptureLink>>,
+}
+
+pub(crate) struct CaptureLink {
+    functions: HashMap<String, Arc<FunctionDef>>,
+    namespaces: HashMap<String, Arc<NamespaceScope>>,
+    prev: Option<Arc<CaptureLink>>,
+    depth: usize,
+}
+
+impl std::fmt::Debug for CapturedScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedScope")
+            .field("own_vars", &self.own_vars.as_ref().map_or(0, |v| v.len()))
+            .field("runtime", &self.runtime.as_ref().map_or(0, |v| v.len()))
+            .field(
+                "frontmatter",
+                &self.frontmatter.as_ref().map_or(0, |v| v.len()),
+            )
+            .field("links", &self.head.as_ref().map_or(0, |link| link.depth))
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CaptureLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureLink")
+            .field("functions", &self.functions.len())
+            .field("namespaces", &self.namespaces.len())
+            .field("depth", &self.depth)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CapturedScope {
+    fn links(&self) -> impl Iterator<Item = &CaptureLink> {
+        let head = self.head.as_deref();
+        std::iter::successors(head, |link| link.prev.as_deref())
+            .take(head.map_or(0, |link| link.depth))
+    }
+
+    pub(crate) fn restore_into(&self, scope: &mut Scope) {
+        let links: Vec<_> = self.links().collect();
+        for link in links.into_iter().rev() {
+            for (name, function) in &link.functions {
+                scope.set_function(name, Arc::clone(function));
+            }
+            for (name, namespace) in &link.namespaces {
+                scope.set_namespace(name, Arc::clone(namespace));
+            }
+        }
+        for layer in self.frontmatter.iter().chain(self.runtime.iter()) {
+            for (name, root) in layer.iter() {
+                scope.set_var_shared(name, Arc::clone(root));
+            }
+        }
+        if let Some(vars) = &self.own_vars {
+            for (name, slot) in vars.iter() {
+                scope.set_var_shared(name, Arc::clone(&slot.root));
+            }
+        }
+    }
 }
 
 /// A function definition stored in scope.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FunctionDef {
     pub params: Vec<Param>,
     pub body: Vec<crate::ast::Node>,
@@ -56,14 +115,30 @@ impl From<&DefineBlock> for FunctionDef {
 
 #[cfg(test)]
 pub(crate) fn captured_function_nodes(root: &FunctionDef) -> usize {
-    // Count the root and every owned function in its captures. The test uses at most 13 defines.
+    use std::collections::HashSet;
     const MAX_NODES: usize = 1 << 12;
     let mut pending = vec![root];
-    for count in 0..=MAX_NODES {
+    let mut functions = HashSet::new();
+    let mut links = HashSet::new();
+    let mut namespaces = HashSet::new();
+    for _ in 0..=MAX_NODES {
         let Some(function) = pending.pop() else {
-            return count;
+            return functions.len();
         };
-        pending.extend(function.captured.functions.values());
+        if !functions.insert(std::ptr::from_ref(function)) {
+            continue;
+        }
+        for link in function.captured.links() {
+            if !links.insert(std::ptr::from_ref(link)) {
+                break;
+            }
+            pending.extend(link.functions.values().map(Arc::as_ref));
+            for namespace in link.namespaces.values() {
+                if namespaces.insert(Arc::as_ptr(namespace)) {
+                    pending.extend(namespace.functions.values().map(Arc::as_ref));
+                }
+            }
+        }
     }
     panic!("capture count exceeds the test limit of {MAX_NODES} nodes");
 }
@@ -82,6 +157,17 @@ pub struct Scope {
     frames: Vec<Frame>,
     runtime: Option<Arc<VarLayer>>,
     frontmatter: Option<Arc<VarLayer>>,
+    vars_generation: u64,
+    own_vars_snapshot: Option<OwnVarsSnapshot>,
+    pending_functions: HashMap<String, Arc<FunctionDef>>,
+    pending_namespaces: HashMap<String, Arc<NamespaceScope>>,
+    head: Option<Arc<CaptureLink>>,
+}
+
+#[derive(Debug, Clone)]
+struct OwnVarsSnapshot {
+    generation: u64,
+    vars: Arc<HashMap<String, Slot>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -89,12 +175,11 @@ struct Frame {
     vars: HashMap<String, Slot>,
     /// Functions stored as `Arc` so cloning out of scope is O(1).
     functions: HashMap<String, Arc<FunctionDef>>,
-    /// Namespace imports: alias -> (functions, vars)
-    namespaces: HashMap<String, NamespaceScope>,
+    namespaces: HashMap<String, Arc<NamespaceScope>>,
 }
 
 /// A namespace scope for aliased imports.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NamespaceScope {
     /// Functions stored as `Arc` so cloning out of scope is O(1).
     pub functions: HashMap<String, Arc<FunctionDef>>,
@@ -130,6 +215,11 @@ impl Scope {
             frames: vec![Frame::default()],
             runtime: None,
             frontmatter: None,
+            vars_generation: 0,
+            own_vars_snapshot: None,
+            pending_functions: HashMap::new(),
+            pending_namespaces: HashMap::new(),
+            head: None,
         }
     }
 
@@ -170,6 +260,12 @@ impl Scope {
     }
 
     pub(crate) fn set_var_shared(&mut self, name: &str, root: Arc<Value>) {
+        if self.frames.len() == 1 {
+            self.vars_generation = self.vars_generation.wrapping_add(1);
+            if self.vars_generation == 0 {
+                self.own_vars_snapshot = None;
+            }
+        }
         self.frames
             .last_mut()
             .expect("BUG: scope has no frames")
@@ -193,6 +289,10 @@ impl Scope {
 
     /// Define a function in the current frame.
     pub fn set_function(&mut self, name: &str, func: Arc<FunctionDef>) {
+        if self.frames.len() == 1 {
+            self.pending_functions
+                .insert(name.to_string(), Arc::clone(&func));
+        }
         self.frames
             .last_mut()
             .expect("BUG: scope has no frames")
@@ -206,7 +306,12 @@ impl Scope {
     }
 
     /// Register a namespace (for aliased imports).
-    pub fn set_namespace(&mut self, alias: &str, ns: NamespaceScope) {
+    pub fn set_namespace(&mut self, alias: &str, ns: impl Into<Arc<NamespaceScope>>) {
+        let ns = ns.into();
+        if self.frames.len() == 1 {
+            self.pending_namespaces
+                .insert(alias.to_string(), Arc::clone(&ns));
+        }
         self.frames
             .last_mut()
             .expect("BUG: scope has no frames")
@@ -219,52 +324,45 @@ impl Scope {
         self.frames
             .iter()
             .rev()
-            .find_map(|f| f.namespaces.get(alias))
+            .find_map(|f| f.namespaces.get(alias).map(Arc::as_ref))
     }
 
-    /// Get all namespaces visible in the current scope (for closure capture).
-    /// Iterates outer→inner so duplicate keys are overwritten by inner frames,
-    /// preserving correct shadowing semantics.
-    pub fn get_all_namespaces(&self) -> HashMap<String, NamespaceScope> {
-        self.collect_all(|f| &f.namespaces)
-    }
-
-    /// Get all functions visible in the current scope (for closure capture).
-    /// Iterates outer→inner so duplicate keys are overwritten by inner frames,
-    /// preserving correct shadowing semantics.
-    ///
-    /// Returns `Arc<FunctionDef>` values — cloning is O(1).
-    pub fn get_all_functions(&self) -> HashMap<String, Arc<FunctionDef>> {
-        self.collect_all(|f| &f.functions)
-    }
-
-    /// Get all variables visible in the current scope (for closure capture).
-    /// Iterates outer→inner so duplicate keys are overwritten by inner frames,
-    /// preserving correct shadowing semantics.
-    pub fn get_all_vars(&self) -> HashMap<String, Value> {
-        self.frontmatter
-            .iter()
-            .chain(self.runtime.iter())
-            .flat_map(|layer| layer.iter())
-            .chain(
-                self.frames
-                    .iter()
-                    .flat_map(|frame| frame.vars.iter().map(|(name, slot)| (name, &slot.root))),
-            )
-            .map(|(name, root)| (name.clone(), root.as_ref().clone()))
-            .collect()
-    }
-
-    /// Flatten all scope frames outer→inner into a single map.
-    /// Duplicate keys are overwritten by inner frames, preserving shadowing semantics.
-    fn collect_all<T: Clone>(
-        &self,
-        get: impl Fn(&Frame) -> &HashMap<String, T>,
-    ) -> HashMap<String, T> {
-        self.frames
-            .iter()
-            .flat_map(|f| get(f).iter().map(|(k, v)| (k.clone(), v.clone())))
-            .collect()
+    /// Freeze the frame-zero writes since the last capture.
+    pub(crate) fn capture(&mut self) -> Result<CapturedScope, crate::error::MdsError> {
+        let Some(frame) = self.frames.first().filter(|_| self.frames.len() == 1) else {
+            return Err(crate::error::MdsError::syntax(
+                "internal error: cannot capture outside the global scope frame — this is a compiler bug, please report it",
+            ));
+        };
+        if !self.pending_functions.is_empty() || !self.pending_namespaces.is_empty() {
+            let depth = self.head.as_ref().map_or(1, |link| link.depth + 1);
+            self.head = Some(Arc::new(CaptureLink {
+                functions: std::mem::take(&mut self.pending_functions),
+                namespaces: std::mem::take(&mut self.pending_namespaces),
+                prev: self.head.take(),
+                depth,
+            }));
+        }
+        let own_vars = match &self.own_vars_snapshot {
+            Some(snapshot) if snapshot.generation == self.vars_generation => {
+                Some(Arc::clone(&snapshot.vars))
+            }
+            _ if frame.vars.is_empty() => None,
+            _ => {
+                let vars = Arc::new(frame.vars.clone());
+                self.own_vars_snapshot = Some(OwnVarsSnapshot {
+                    generation: self.vars_generation,
+                    vars: Arc::clone(&vars),
+                });
+                Some(vars)
+            }
+        };
+        Ok(CapturedScope {
+            own_vars,
+            runtime: self.runtime.clone(),
+            frontmatter: self.frontmatter.clone(),
+            head: self.head.clone(),
+        })
     }
 }
 
@@ -302,9 +400,10 @@ mod tests {
     #[test]
     fn captured_scope_default() {
         let cs = CapturedScope::default();
-        assert!(cs.namespaces.is_empty());
-        assert!(cs.functions.is_empty());
-        assert!(cs.vars.is_empty());
+        assert!(cs.links().next().is_none());
+        assert!(cs.own_vars.is_none());
+        assert!(cs.runtime.is_none());
+        assert!(cs.frontmatter.is_none());
     }
 
     // ── pop() on the last (global) frame returns an error ────────────────────
@@ -386,42 +485,55 @@ mod tests {
         );
     }
 
-    // ── collect_all / get_all_* correctness ──────────────────────────────────
-
     #[test]
-    fn get_all_vars_collects_all_frames() {
-        let mut scope = Scope::new();
-        scope.set_var("a", Value::Number(1.0));
-        scope.push();
-        scope.set_var("b", Value::Number(2.0));
-        let all = scope.get_all_vars();
-        assert!(all.contains_key("a"), "outer var visible");
-        assert!(all.contains_key("b"), "inner var visible");
-    }
-
-    #[test]
-    fn get_all_vars_inner_shadows_outer() {
-        let mut scope = Scope::new();
-        scope.set_var("x", Value::Number(1.0));
-        scope.push();
-        scope.set_var("x", Value::Number(99.0));
-        let all = scope.get_all_vars();
-        assert_eq!(
-            all.get("x"),
-            Some(&Value::Number(99.0)),
-            "inner value should win",
+    fn capture_restores_vars_in_layer_order() {
+        let mut scope = Scope::with_layers(
+            Arc::new(HashMap::from([
+                ("b".into(), Arc::new(Value::Number(2.0))),
+                ("c".into(), Arc::new(Value::Number(2.0))),
+            ])),
+            Arc::new(HashMap::from([
+                ("a".into(), Arc::new(Value::Number(1.0))),
+                ("b".into(), Arc::new(Value::Number(1.0))),
+                ("c".into(), Arc::new(Value::Number(1.0))),
+            ])),
         );
+        scope.set_var("c", Value::Number(3.0));
+        let capture = scope.capture().unwrap();
+        let mut call = Scope::new();
+        call.push();
+        capture.restore_into(&mut call);
+        assert_eq!(call.get_var("a"), Some(&Value::Number(1.0)));
+        assert_eq!(call.get_var("b"), Some(&Value::Number(2.0)));
+        assert_eq!(call.get_var("c"), Some(&Value::Number(3.0)));
     }
 
     #[test]
-    fn get_all_namespaces_collects_across_frames() {
+    fn capture_restores_namespaces_from_old_and_new_links() {
         let mut scope = Scope::new();
-        scope.set_namespace("a", make_ns());
+        let old = Arc::new(make_ns());
+        let new = Arc::new(make_ns());
+        scope.set_namespace("a", Arc::clone(&old));
+        scope.set_namespace("b", Arc::clone(&old));
+        scope.capture().unwrap();
+        scope.set_namespace("b", Arc::clone(&new));
+        let mut call = Scope::new();
+        call.push();
+        scope.capture().unwrap().restore_into(&mut call);
+        assert!(std::ptr::eq(call.get_namespace("a").unwrap(), old.as_ref()));
+        assert!(std::ptr::eq(call.get_namespace("b").unwrap(), new.as_ref()));
+    }
+
+    #[test]
+    fn capture_refuses_nested_frames() {
+        let mut scope = Scope::new();
         scope.push();
-        scope.set_namespace("b", make_ns());
-        let all = scope.get_all_namespaces();
-        assert!(all.contains_key("a"));
-        assert!(all.contains_key("b"));
+        let error = scope.capture().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot capture outside the global scope frame"));
+        scope.pop().unwrap();
+        assert!(scope.capture().is_ok());
     }
 
     // ── Variable not visible after pop ───────────────────────────────────────

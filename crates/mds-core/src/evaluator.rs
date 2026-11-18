@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use crate::arity::check_arity;
 use crate::ast::{
@@ -622,16 +621,7 @@ pub(crate) fn literal_expr_to_value(expr: &Expr) -> Result<Value, MdsError> {
 /// site are written into `scope` before parameter binding so that params shadow
 /// captured vars correctly (params take precedence over closure variables).
 fn restore_captured_scope(func: &FunctionDef, scope: &mut Scope) {
-    for (alias, ns) in &func.captured.namespaces {
-        scope.set_namespace(alias, ns.clone());
-    }
-    // captured.functions are owned FunctionDef (not Arc) — wrap in Arc for scope insertion.
-    for (name, f) in &func.captured.functions {
-        scope.set_function(name, Arc::new(f.clone()));
-    }
-    for (name, val) in &func.captured.vars {
-        scope.set_var(name, val.clone());
-    }
+    func.captured.restore_into(scope);
 }
 
 fn invoke_function(

@@ -642,6 +642,58 @@ fn runtime_layer_cache_reuse_preserves_import_values() {
     }
 }
 
+#[test]
+fn captures_keep_each_imported_prompt_write() {
+    let source = concat!(
+        "@import \"./first.mds\"\n@define before():\n{{prompt}}\n@end\n",
+        "@import \"./second.mds\"\n@define after():\n{{prompt}}\n@end\n",
+        "{{before()}}/{{after()}}",
+    );
+    let module = virtual_cache(&[("first.mds", "one"), ("second.mds", "two")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("one/two"));
+}
+
+#[test]
+fn imported_defines_share_the_runtime_layer_of_their_call() {
+    let mut cache = virtual_cache(&[
+        ("first.mds", "@define first():\n{{x}}\n@end"),
+        ("second.mds", "@define second():\n{{x}}\n@end"),
+    ]);
+    let source = concat!(
+        "@import \"./first.mds\"\n@import \"./second.mds\"\n",
+        "@define local():\n{{x}}\n@end\n{{first()}}/{{second()}}/{{local()}}",
+    );
+    let first_vars = HashMap::from([("x".into(), Value::String("one".into()))]);
+    let second_vars = HashMap::from([("x".into(), Value::String("two".into()))]);
+    let first = cache
+        .resolve_source(source, "", &first_vars, &mut Vec::new())
+        .unwrap();
+    let second = cache
+        .resolve_source(source, "", &second_vars, &mut Vec::new())
+        .unwrap();
+    assert_eq!(first.prompt_body.as_deref(), Some("one/one/one"));
+    assert_eq!(second.prompt_body.as_deref(), Some("one/one/two"));
+    fn runtime<'a>(module: &'a ResolvedModule, function: &str) -> &'a Arc<VarLayer> {
+        module.functions[function]
+            .captured
+            .runtime
+            .as_ref()
+            .unwrap()
+    }
+    let imported = runtime(&cache.modules["first.mds"], "first");
+    assert!(Arc::ptr_eq(
+        imported,
+        runtime(&cache.modules["second.mds"], "second")
+    ));
+    assert!(Arc::ptr_eq(imported, runtime(&first, "local")));
+    assert!(!Arc::ptr_eq(
+        runtime(&first, "local"),
+        runtime(&second, "local")
+    ));
+}
+
 /// Helper: compile a VirtualFs entry and return the Markdown output string.
 fn compile_virtual(files: &[(&str, &str)], entry: &str) -> Result<String, MdsError> {
     let map: std::collections::HashMap<String, String> = files
