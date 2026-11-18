@@ -107,7 +107,7 @@ impl From<evaluator::EvalMessage> for Message {
 use std::collections::HashMap;
 use std::path::Path;
 
-pub use error::{MdsError, SerializedError, SerializedSpan};
+pub use error::{module_count_exceeded, MdsError, SerializedError, SerializedSpan};
 pub use value::Value;
 
 /// The output of a compiled MDS template — either Markdown or structured messages.

@@ -335,19 +335,22 @@ impl ModuleCache {
         Ok(())
     }
 
-    /// Guard against unbounded module loading from adversarial import graphs (REL-2).
+    /// Permit the entry plus at most `MAX_MODULE_COUNT` other distinct modules.
     ///
-    /// Enforced on the native file-resolution paths as each new module is resolved
-    /// from disk; the virtual/WASM/napi binding layers enforce the same cap at
-    /// input-validation time before resolution begins, so all paths share an
-    /// identical bound.  Runtime guard, not `debug_assert` — must hold in release
-    /// builds (applies PF-004/PF-005).
-    fn check_module_count(&self) -> Result<(), MdsError> {
-        if self.modules.len() >= MAX_MODULE_COUNT {
-            return Err(MdsError::resource_limit(format!(
-                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
-                self.modules.len(),
-            )));
+    /// Count cached keys, keys still being resolved, and the candidate before any
+    /// read. A cached skeleton can also be on the resolving stack during an
+    /// upgrade; count that key once. Binding input guards separately bound the
+    /// supplied virtual map, including unused entries.
+    fn check_module_count(&self, key: &str) -> Result<(), MdsError> {
+        let distinct = self.modules.len()
+            + self
+                .resolving
+                .iter()
+                .filter(|key| !self.modules.contains_key(key.as_str()))
+                .count()
+            + usize::from(!self.modules.contains_key(key) && !self.resolving.contains(key));
+        if distinct > MAX_MODULE_COUNT + 1 {
+            return Err(crate::error::module_count_exceeded());
         }
         Ok(())
     }
@@ -501,7 +504,7 @@ impl ModuleCache {
         self.check_import_depth()?;
 
         // Step 3.5: module count guard (REL-2, applies PF-004).
-        self.check_module_count()?;
+        self.check_module_count(key)?;
 
         // Step 4: read the file only on a cache miss.
         let source = self.fs.read(key)?;
@@ -629,6 +632,7 @@ impl ModuleCache {
         // resolve_by_key so that cycle detection and depth checks apply to the
         // root module as well.
         self.check_import_depth()?;
+        self.check_module_count(SOURCE_LABEL)?;
         self.resolving.insert(SOURCE_LABEL.into());
 
         let ctx = ModuleCtx {
@@ -718,6 +722,7 @@ impl ModuleCache {
         }
 
         self.check_import_depth()?;
+        self.check_module_count(key)?;
 
         let source = self.fs.read(key)?;
         let is_md = self.fs.is_markdown(key);
@@ -754,6 +759,7 @@ impl ModuleCache {
         Self::check_source_size(source)?;
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
+        self.check_module_count(SOURCE_LABEL)?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -780,6 +786,7 @@ impl ModuleCache {
         Self::check_source_size(source)?;
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
+        self.check_module_count(SOURCE_LABEL)?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -1584,7 +1591,7 @@ impl ModuleCache {
         self.check_import_depth()?;
 
         // Module count guard (REL-2, applies PF-004).
-        self.check_module_count()?;
+        self.check_module_count(key)?;
 
         // PF-004: read via FileSystem trait — NEVER std::fs.
         let source = self.fs.read(key)?;

@@ -570,6 +570,14 @@ pub enum MdsError {
     FormatterInvariant { message: String },
 }
 
+/// The module-count refusal shared by the resolver and binding input guards.
+///
+/// A compile permits the entry plus at most 256 distinct modules, including
+/// modules still being resolved.
+pub fn module_count_exceeded() -> MdsError {
+    MdsError::resource_limit("module count exceeds maximum of 256 modules besides the entry")
+}
+
 impl MdsError {
     pub(crate) fn syntax(message: impl Into<String>) -> Self {
         MdsError::Syntax {

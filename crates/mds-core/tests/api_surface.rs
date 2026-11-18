@@ -143,6 +143,18 @@ fn check_module_type_function_exists() {
 }
 
 #[test]
+fn module_count_exceeded_constructor_is_public() {
+    let constructor: fn() -> MdsError = mds::module_count_exceeded;
+    let err = constructor();
+    assert!(matches!(err, MdsError::ResourceLimit { .. }));
+    assert_eq!(err.serialize().code, "mds::resource_limit");
+    assert_eq!(
+        err.to_string(),
+        "resource limit exceeded: module count exceeds maximum of 256 modules besides the entry"
+    );
+}
+
+#[test]
 fn not_mds_file_constructor_is_public_and_spanless() {
     let constructor: fn(String) -> MdsError = MdsError::not_mds_file;
     let err = constructor("./sub/../doc.txt".to_owned());

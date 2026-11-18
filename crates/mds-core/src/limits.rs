@@ -172,15 +172,11 @@ pub(crate) const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
 /// compiled output it annotates.
 pub(crate) const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
 
-/// Maximum number of distinct modules (files) that may be resolved in a single
-/// compilation, across all paths (native file, virtual/WASM/napi).
+/// Maximum number of distinct modules besides the entry in a compilation.
 ///
-/// Enforced on the native file resolution path by `resolve_by_key` so that
-/// adversarial import graphs cannot cause unbounded module loading.  The
-/// virtual/WASM/napi binding layers enforce the same cap at input-validation time
-/// before any resolution begins (applies PF-004).
-///
-/// 256 matches the binding-layer constant so all code paths behave identically.
+/// The resolver counts both cached keys and keys still being resolved, before
+/// it reads each candidate. Binding input guards separately bound virtual maps,
+/// including unused entries, to the entry plus this many modules.
 pub(crate) const MAX_MODULE_COUNT: usize = 256;
 
 /// Maximum number of aliases a `VirtualFs` takes (`VirtualFs::with_aliases`), and the

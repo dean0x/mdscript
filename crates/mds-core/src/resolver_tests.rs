@@ -246,6 +246,183 @@ fn has_type_mds_frontmatter_ignores_indented() {
     );
 }
 
+// ── Module count: the entry plus 256 distinct modules ────────────────────
+
+fn module_count_graph(total: usize, nested: bool) -> HashMap<String, String> {
+    let imports = |start, end| {
+        (start..end)
+            .map(|i| format!("@import \"./m{i}.mds\" as m{i}\n"))
+            .collect::<String>()
+    };
+    let mut files: HashMap<_, _> = (0..total)
+        .map(|i| (format!("m{i}.mds"), "Body\n".to_string()))
+        .collect();
+    let entry = if nested {
+        files.insert("m1.mds".into(), imports(2, total));
+        imports(1, 2)
+    } else {
+        imports(1, total)
+    };
+    files.insert("m0.mds".into(), format!("{entry}OK\n"));
+    files
+}
+
+fn assert_module_count_outcome<T: std::fmt::Debug>(result: Result<T, MdsError>, total: usize) {
+    if total <= 257 {
+        result.expect("the entry plus at most 256 modules must compile");
+    } else {
+        assert!(result.is_err(), "a graph of {total} modules must fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.serialize().code, "mds::resource_limit");
+        assert_eq!(
+            err.to_string(),
+            "resource limit exceeded: module count exceeds maximum of 256 modules besides the entry"
+        );
+    }
+}
+
+#[test]
+fn module_count_legacy_graph_boundaries() {
+    for nested in [true, false] {
+        for total in 255..=259 {
+            let mut cache = ModuleCache::virtual_fs(module_count_graph(total, nested));
+            assert_module_count_outcome(
+                cache.resolve_key("m0.mds", &HashMap::new(), &mut Vec::new()),
+                total,
+            );
+        }
+    }
+}
+
+#[test]
+fn module_count_intrinsic_graph_boundaries() {
+    for nested in [true, false] {
+        for total in 255..=259 {
+            for with_opts in [false, true] {
+                let mut cache = ModuleCache::virtual_fs(module_count_graph(total, nested));
+                let result = if with_opts {
+                    cache
+                        .resolve_virtual_intrinsic_opts(
+                            "m0.mds",
+                            &HashMap::new(),
+                            &Default::default(),
+                            &mut Vec::new(),
+                        )
+                        .map(|(output, _)| output)
+                } else {
+                    cache.resolve_virtual_intrinsic("m0.mds", &HashMap::new(), &mut Vec::new())
+                };
+                assert_module_count_outcome(result, total);
+            }
+        }
+    }
+}
+
+#[test]
+fn module_count_native_graph_boundaries() {
+    for nested in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        for total in 255..=259 {
+            for (key, source) in module_count_graph(total, nested) {
+                std::fs::write(dir.path().join(key), source).unwrap();
+            }
+            assert_module_count_outcome(crate::compile(dir.path().join("m0.mds"), None), total);
+        }
+    }
+}
+
+#[test]
+fn module_count_string_entry_counts_root() {
+    for total in 257..=258 {
+        for mode in 0..3 {
+            let mut files = module_count_graph(total, true);
+            let source = files.remove("m0.mds").unwrap();
+            let mut cache = ModuleCache::virtual_fs(files);
+            let result = match mode {
+                0 => cache
+                    .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+                    .map(|_| ()),
+                1 => cache
+                    .resolve_source_intrinsic(&source, "", &HashMap::new(), &mut Vec::new())
+                    .map(|_| ()),
+                _ => cache
+                    .resolve_source_intrinsic_opts(
+                        &source,
+                        "",
+                        &HashMap::new(),
+                        &Default::default(),
+                        &mut Vec::new(),
+                    )
+                    .map(|_| ()),
+            };
+            assert_module_count_outcome(result, total);
+        }
+    }
+}
+
+#[test]
+fn module_count_skeleton_graph_boundaries() {
+    for total in 257..=258 {
+        let mut files = module_count_graph(total, true);
+        files.insert("m0.mds".into(), "@extends \"./m1.mds\"\n".into());
+        assert_module_count_outcome(crate::compile_virtual(files, "m0.mds", None), total);
+    }
+}
+
+#[test]
+fn module_count_reused_cache_checks_each_entry_path() {
+    for mode in 0..5 {
+        let mut files = module_count_graph(257, false);
+        files.insert("fresh.mds".into(), "Fresh\n".into());
+        let mut cache = ModuleCache::virtual_fs(files);
+        cache
+            .resolve_key("m0.mds", &HashMap::new(), &mut Vec::new())
+            .expect("the cache can hold the entry plus 256 modules");
+        let result = match mode {
+            0 => cache
+                .resolve_virtual_intrinsic("fresh.mds", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            1 => cache
+                .resolve_virtual_intrinsic_opts(
+                    "fresh.mds",
+                    &HashMap::new(),
+                    &Default::default(),
+                    &mut Vec::new(),
+                )
+                .map(|_| ()),
+            2 => cache
+                .resolve_source("Fresh\n", "", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            3 => cache
+                .resolve_source_intrinsic("Fresh\n", "", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            _ => cache
+                .resolve_source_intrinsic_opts(
+                    "Fresh\n",
+                    "",
+                    &HashMap::new(),
+                    &Default::default(),
+                    &mut Vec::new(),
+                )
+                .map(|_| ()),
+        };
+        assert_module_count_outcome(result, 258);
+    }
+}
+
+#[test]
+fn module_count_cached_skeleton_upgrade_counts_once() {
+    let mut files = module_count_graph(257, false);
+    files.insert("m1.mds".into(), "@extends \"./m2.mds\"\n".into());
+    let entry = files.get_mut("m0.mds").unwrap();
+    *entry = entry.replace("@import \"./m2.mds\" as m2\n", "");
+    entry.push_str("@import \"./m2.mds\" as m2\n@import \"./m3.mds\" as again\n");
+    let result = crate::compile_virtual(files, "m0.mds", None)
+        .expect("cached modules and a skeleton upgrade must not consume another slot");
+    assert_eq!(result.dependencies.len(), 256);
+    assert_eq!(result.into_markdown().unwrap(), "OK\n");
+}
+
 // ── Phase 1: @block collision and resource-limit tests ────────────────────
 
 #[test]
