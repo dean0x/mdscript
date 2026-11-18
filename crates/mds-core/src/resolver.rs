@@ -9,7 +9,7 @@ use indexmap::{IndexMap, IndexSet};
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
 use crate::evaluator::{
-    evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, push_capped, EvalBudget,
+    evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, EvalBudget,
 };
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
@@ -845,9 +845,8 @@ impl ModuleCache {
     /// not reach a diagnostic (R3 / CWE-209). Scope is shared across all regions
     /// (functions defined in earlier regions are visible to later ones).
     ///
-    /// PF-004: one [`EvalBudget`] covers every region, and each region's output is
-    /// appended through the capped append, so each cap applies to the whole module
-    /// evaluation rather than to each region.
+    /// One [`EvalBudget`] and one output buffer cover all regions, so the caps
+    /// apply to the whole module evaluation.
     fn evaluate_regions_with_map(
         regions: &[(&[crate::ast::Node], &Origin)],
         scope: &mut crate::scope::Scope,
@@ -872,18 +871,17 @@ impl ModuleCache {
                 };
                 builder.switch_to_index(src_idx);
                 previous = Some((origin, src_idx));
-                // Cursor must equal accumulated output length before entering each region.
-                // evaluate_with_map_seeded maintains this invariant internally, but after
-                // each region we push the raw output and the builder's cursor is correct.
             }
 
-            let region_output = if let Some(builder) = current_map.take() {
-                // The builder's current source was switched to origin's above;
-                // evaluate_with_map_seeded derives file/source from it (issue #58).
-                let (region_out, returned_builder) =
-                    evaluate_with_map_seeded(nodes, scope, warnings, builder, budget)?;
-                current_map = Some(returned_builder);
-                region_out
+            if let Some(builder) = current_map.take() {
+                current_map = Some(evaluate_with_map_seeded(
+                    nodes,
+                    scope,
+                    warnings,
+                    builder,
+                    budget,
+                    &mut output,
+                )?);
             } else {
                 evaluate_seeded(
                     nodes,
@@ -892,12 +890,9 @@ impl ModuleCache {
                     &origin.display,
                     &origin.source,
                     budget,
-                )?
-            };
-
-            // PF-004: cumulative size guard — the same capped append as every other
-            // output buffer (#415).
-            push_capped(&mut output, &region_output)?;
+                    &mut output,
+                )?;
+            }
         }
 
         Ok((output, current_map))
@@ -1132,7 +1127,8 @@ impl ModuleCache {
             ));
         }
 
-        let (body_raw, map_out) = if opts.source_map {
+        let mut body_raw = String::new();
+        let map_out = if opts.source_map {
             // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
             let builder = crate::sourcemap::MapBuilder::new(Origin {
@@ -1140,27 +1136,27 @@ impl ModuleCache {
                 display: Arc::from(ctx.file_str),
                 source: Arc::from(ctx.source),
             });
-            let (raw, returned) = evaluate_with_map_seeded(
+            let returned = evaluate_with_map_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 builder,
                 self.budget.start_module(),
+                &mut body_raw,
             )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            (raw, apply_map_degradation(returned, opts, warnings))
+            apply_map_degradation(returned, opts, warnings)
         } else {
-            (
-                evaluate_seeded(
-                    &module.body,
-                    &mut scope,
-                    warnings,
-                    ctx.file_str,
-                    ctx.source,
-                    self.budget.start_module(),
-                )?,
-                None,
-            )
+            evaluate_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                ctx.file_str,
+                ctx.source,
+                self.budget.start_module(),
+                &mut body_raw,
+            )?;
+            None
         };
 
         let body_clean = crate::clean_output(&body_raw);
@@ -1278,28 +1274,30 @@ impl ModuleCache {
         // single evaluate_with_map pass to collect both the text and its segment records.
         // The module and its namespace share the fragment map for @include attribution.
         // Evaluate the body even if it is not exported, to distinguish the two include warnings.
-        let (body_raw, builder) = if self.source_map_mode && prompt_exported {
+        let mut body_raw = String::new();
+        let builder = if self.source_map_mode && prompt_exported {
             let builder = crate::sourcemap::MapBuilder::new(origin.clone());
             // evaluate_with_map derives file/source from the builder's current source
             // (issue #58).
-            let (body_raw, returned) = evaluate_with_map_seeded(
+            Some(evaluate_with_map_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 builder,
                 self.budget.start_module(),
-            )?;
-            (body_raw, Some(returned))
+                &mut body_raw,
+            )?)
         } else {
-            let body_raw = evaluate_seeded(
+            evaluate_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 ctx.file_str,
                 ctx.source,
                 self.budget.start_module(),
+                &mut body_raw,
             )?;
-            (body_raw, None)
+            None
         };
         let (prompt_body, prompt_map) =
             prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);

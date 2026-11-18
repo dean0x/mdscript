@@ -34,13 +34,12 @@ const HELPER_DEF: &str = "fn push_capped(";
 const HELPER_CALL: &str = "push_capped(";
 
 /// Every output accumulator: its file under `src/`, the anchor that opens it, and how
-/// many capped appends it makes. `evaluate_nodes` has one, after its `match`: every
-/// arm that renders text (Text, EscapedBrace, Interpolation, If, For, Include,
-/// Message, Block) yields it there.
+/// many capped appends it makes. Leaf text reaches the one append in
+/// `evaluate_nodes`. Loops and regions pass their buffer to `evaluate_nodes`.
 const ACCUMULATORS: &[(&str, &str, usize)] = &[
     ("evaluator.rs", "fn evaluate_nodes(", 1),
-    ("evaluator.rs", "fn evaluate_for(", 1),
-    ("resolver.rs", "fn evaluate_regions_with_map(", 1),
+    ("evaluator.rs", "fn evaluate_for(", 0),
+    ("resolver.rs", "fn evaluate_regions_with_map(", 0),
 ];
 
 /// Appends that bypass the cap.

@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::arity::check_arity;
@@ -11,7 +10,7 @@ use crate::limits::{
     MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGES_TOTAL_SIZE, MAX_MESSAGE_COUNT,
     MAX_OUTPUT_SIZE, MAX_TOTAL_FUNCTION_CALLS,
 };
-use crate::scope::{FunctionDef, PathStep, Scope, Slot};
+use crate::scope::{FunctionDef, PathStep, PromptText, Scope, Slot};
 use crate::value::Value;
 
 /// Maximum call depth to prevent stack overflow from deeply nested calls.
@@ -133,6 +132,7 @@ pub fn evaluate(
     file: &str,
     source: &str,
 ) -> Result<String, MdsError> {
+    let mut out = String::new();
     evaluate_seeded(
         nodes,
         scope,
@@ -140,14 +140,16 @@ pub fn evaluate(
         file,
         source,
         &mut EvalBudget::default(),
-    )
+        &mut out,
+    )?;
+    Ok(out)
 }
 
 /// Evaluate a module body with the caller's cumulative budget.
 ///
 /// Used to evaluate several node slices that make up ONE module (the spliced regions
 /// of an `@extends` chain) under one set of caps. `budget` holds the running totals
-/// when this returns, on success and on error alike.
+/// when this returns, on success and on error alike. Append to the caller's `out`.
 pub(crate) fn evaluate_seeded(
     nodes: &[Node],
     scope: &mut Scope,
@@ -155,7 +157,8 @@ pub(crate) fn evaluate_seeded(
     file: &str,
     source: &str,
     budget: &mut EvalBudget,
-) -> Result<String, MdsError> {
+    out: &mut String,
+) -> Result<(), MdsError> {
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
         budget: *budget,
@@ -166,7 +169,7 @@ pub(crate) fn evaluate_seeded(
         source,
         body_origin: None,
     };
-    let result = evaluate_nodes(nodes, scope, &mut ctx);
+    let result = evaluate_nodes(nodes, scope, &mut ctx, out);
     *budget = ctx.budget;
     result
 }
@@ -192,7 +195,16 @@ fn evaluate_with_map(
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
-    evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut EvalBudget::default())
+    let mut out = String::new();
+    let map = evaluate_with_map_seeded(
+        nodes,
+        scope,
+        warnings,
+        builder,
+        &mut EvalBudget::default(),
+        &mut out,
+    )?;
+    Ok((out, map))
 }
 
 /// Evaluate nodes with source-map recording, spending from the caller's `budget`.
@@ -209,17 +221,16 @@ fn evaluate_with_map(
 /// Used by `evaluate_regions_with_map` (resolver.rs) to enforce a single cumulative
 /// iteration cap across all spliced `@extends` regions (REL-1, applies PF-004).
 ///
-/// The `MapBuilder` is returned as a structured error rather than a panic if it
-/// disappears, and a current source the builder has not registered (an index from
-/// another builder) is an internal error rather than an empty file context — aligns
-/// with PF-005 (don't rely on panic or a silent fallback for invariants).
+/// Append to `out` and return the builder. Its cursor must equal the absolute
+/// output offset on entry. A missing builder or unregistered source returns an error.
 pub(crate) fn evaluate_with_map_seeded(
     nodes: &[Node],
     scope: &mut Scope,
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
     budget: &mut EvalBudget,
-) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
+    out: &mut String,
+) -> Result<crate::sourcemap::MapBuilder, MdsError> {
     // Take the current source's Origin before moving builder into EvalContext.map.
     // This is the single source of truth for diagnostic span attribution —
     // eliminates the redundant explicit params that caused mis-attributed spans
@@ -244,42 +255,33 @@ pub(crate) fn evaluate_with_map_seeded(
         source: &origin.source,
         body_origin: None,
     };
-    let result = evaluate_nodes(nodes, scope, &mut ctx);
+    let result = evaluate_nodes(nodes, scope, &mut ctx, out);
     *budget = ctx.budget;
-    let output = result?;
-    let map = ctx.map.take().ok_or_else(|| {
+    result?;
+    ctx.map.take().ok_or_else(|| {
         MdsError::syntax("internal: MapBuilder disappeared during evaluate_with_map — compiler bug")
-    })?;
-    Ok((output, map))
+    })
 }
 
 fn evaluate_nodes(
     nodes: &[Node],
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
-    let mut output = String::new();
-
-    // `saved_cursor` anchors the absolute output position when this invocation
-    // of evaluate_nodes started.  All segment `out` values are computed as
-    // `saved_cursor + output.len()` so that segments in recursive calls (e.g.
-    // inside @if/@for arms) carry the correct absolute byte offset in the final
-    // compiled output even though each call has its own local `output` string.
-    //
-    // We read cursor once here (O(1)) rather than on every node to avoid
-    // repeated borrows of ctx.map inside the loop body.
-    let saved_cursor: u32 = ctx.map.as_ref().map_or(0, |m| m.cursor);
+    out: &mut String,
+) -> Result<(), MdsError> {
+    let start_len = out.len();
+    // The cursor is absolute even when a function body uses a separate buffer.
+    let saved_cursor = ctx.map.as_ref().map_or(0, |map| map.cursor);
 
     for node in nodes {
-        // Each arm yields the text its node renders; the one capped append after the
-        // match lands it, so every node's output passes the cap check before it is
-        // appended (#415). One append site also keeps this recursive frame small: in
-        // a debug build each `?` site reserves its own error temporaries.
-        let piece: Cow<'_, str> = match node {
+        let abs_out = saved_cursor + (out.len() - start_len) as u32;
+        let rendered;
+        let included;
+        // Child bodies append to `out` directly. Leaf text uses one capped append.
+        let piece = match node {
             Node::Text(t) => {
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 {
-                        let abs_out = saved_cursor + output.len() as u32;
                         // Enforced in release builds too (#220): `cursor` is the absolute
                         // output position every following segment is computed from, so a
                         // desynchronised cursor mis-attributes the whole rest of the map
@@ -297,12 +299,11 @@ fn evaluate_nodes(
                         map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
                     }
                 }
-                Cow::Borrowed(t.text.as_str())
+                Some(t.text.as_str())
             }
             Node::EscapedBrace { offset } => {
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 {
-                        let abs_out = saved_cursor + output.len() as u32;
                         // Enforced in release too (#220); see the Text arm above.
                         assert_eq!(
                             map.cursor, abs_out,
@@ -314,7 +315,7 @@ fn evaluate_nodes(
                         map.push_segment(abs_out, *offset as u32, 3);
                     }
                 }
-                Cow::Borrowed("{{")
+                Some("{{")
             }
             Node::Interpolation(interp) => {
                 // S8: reset ownership flag before each call so arg-evaluation
@@ -325,7 +326,6 @@ fn evaluate_nodes(
                         // Assert cursor invariant before anchoring.  On the S8 path,
                         // invoke_function will read this anchor as the body's base
                         // output position.
-                        let abs_out = saved_cursor + output.len() as u32;
                         // Enforced in release too (#220); see the Text arm above.
                         assert_eq!(
                             map.cursor, abs_out,
@@ -337,31 +337,32 @@ fn evaluate_nodes(
                     // Always anchor cursor so inner evaluate_nodes invocations
                     // (invoke_function / S8 body descent) start from the correct
                     // absolute position.
-                    map.cursor = saved_cursor + output.len() as u32;
+                    map.cursor = abs_out;
                 }
-                let rendered = render_expr(&interp.expr, scope, ctx)?;
+                rendered = render_expr(&interp.expr, scope, ctx)?;
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 && !ctx.fn_body_owned {
                         // S3 path: body was suppressed; record the call-site span.
                         // On the S8 path, invoke_function already pushed fine-grained
                         // body segments attributed to the definition file — skip here.
-                        let abs_out = saved_cursor + output.len() as u32;
                         map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
                     }
                 }
-                Cow::Owned(rendered)
+                Some(rendered.as_str())
             }
             Node::If(block) => {
                 if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
+                    map.cursor = abs_out;
                 }
-                Cow::Owned(evaluate_if(block, scope, ctx)?)
+                evaluate_if(block, scope, ctx, out)?;
+                None
             }
             Node::For(block) => {
                 if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
+                    map.cursor = abs_out;
                 }
-                Cow::Owned(evaluate_for(block, scope, ctx)?)
+                evaluate_for(block, scope, ctx, out)?;
+                None
             }
             Node::Define(_) => {
                 // Handled by resolver with full lexical capture; no output.
@@ -373,18 +374,20 @@ fn evaluate_nodes(
             }
             Node::Include(inc) => {
                 if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
+                    map.cursor = abs_out;
                 }
-                Cow::Owned(evaluate_include(inc, scope, ctx)?)
+                included = evaluate_include(inc, scope, ctx)?;
+                included.as_deref()
             }
             Node::Message(block) => {
                 // Text mode: render the body inline, ignoring the role marker.
                 // This maintains full backward compatibility — @message blocks are
                 // transparent when compiling to plain text.
                 if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
+                    map.cursor = abs_out;
                 }
-                Cow::Owned(evaluate_nodes(&block.body, scope, ctx)?)
+                evaluate_nodes(&block.body, scope, ctx, out)?;
+                None
             }
             Node::Block(block) => {
                 // Standalone mode: render the block's default body inline.
@@ -393,21 +396,22 @@ fn evaluate_nodes(
                 // never reaches this arm: the resolver evaluates each block's
                 // effective body (base default or child override) as its own region.
                 if let Some(ref mut map) = ctx.map {
-                    map.cursor = saved_cursor + output.len() as u32;
+                    map.cursor = abs_out;
                 }
-                Cow::Owned(evaluate_block(block, scope, ctx)?)
+                evaluate_block(block, scope, ctx, out)?;
+                None
             }
         };
-        push_capped(&mut output, &piece)?;
-        // Re-anchor the cursor to the output length after the append. For an S8
-        // interpolation, invoke_function already set it to start_cursor +
-        // trimmed_len, the same value.
+        if let Some(piece) = piece {
+            push_capped(out, piece)?;
+        }
+        // Re-anchor after the node, including after an empty child body.
         if let Some(ref mut map) = ctx.map {
-            map.cursor = saved_cursor + output.len() as u32;
+            map.cursor = saved_cursor + (out.len() - start_len) as u32;
         }
     }
 
-    Ok(output)
+    Ok(())
 }
 
 /// Append `add` to the output buffer `out`, or fail with the output-cap error and
@@ -419,8 +423,8 @@ fn evaluate_nodes(
 /// `push_str`, but never reserves past the cap, so capacity is bounded too — plain
 /// doubling would take a buffer to about twice the cap.
 ///
-/// The cap bounds each buffer, not a compile's total memory: nested blocks, function
-/// results and imported modules each hold a buffer of their own (#420).
+/// The cap bounds each buffer, not a compile's total memory. Function bodies,
+/// message content and imported modules use separate buffers.
 pub(crate) fn push_capped(out: &mut String, add: &str) -> Result<(), MdsError> {
     let needed = out
         .len()
@@ -448,8 +452,9 @@ fn evaluate_block(
     block: &BlockNode,
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
-    evaluate_nodes(&block.body, scope, ctx)
+    out: &mut String,
+) -> Result<(), MdsError> {
+    evaluate_nodes(&block.body, scope, ctx, out)
 }
 
 /// Return the bound slot only if its projection still refers to a value.
@@ -714,6 +719,7 @@ fn evaluate_function_body(
     // (LIFO-correct for nested cross-file define chains: A calls B calls C →
     // C's origin is innermost, A's is restored when C's call returns, etc.).
     let prev_body_origin = std::mem::replace(&mut ctx.body_origin, func.origin.clone());
+    let mut raw_body = String::new();
 
     // S8 path: fine-grained function body source attribution.
     //
@@ -760,7 +766,7 @@ fn evaluate_function_body(
             };
 
         ctx.call_stack.push(call_key.to_string());
-        let body_result = evaluate_nodes(&func.body, scope, ctx);
+        let body_result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body);
         let popped = ctx.call_stack.pop();
 
         // Restore source attribution for the outer scope.
@@ -778,7 +784,7 @@ fn evaluate_function_body(
                  expected '{call_key}', got {popped:?}"
             )))
         };
-        let raw_body = prefer_first_error(body_result, lifo_result)?;
+        prefer_first_error(body_result, lifo_result)?;
 
         // Compute lead/trail byte counts for rebase_trim.
         // Use try_from + unwrap_or(u32::MAX) for safety: body is bounded by
@@ -801,8 +807,8 @@ fn evaluate_function_body(
                 untrimmed_len,
                 trail,
             );
-            // Advance cursor to the trimmed body end so the outer Interpolation
-            // arm's final cursor correction (`saved_cursor + output.len()`) agrees.
+            // Advance to the trimmed body end, where the enclosing node also sets
+            // the cursor after the append.
             map.cursor = start_cursor.saturating_add(trimmed_len);
         }
 
@@ -818,7 +824,8 @@ fn evaluate_function_body(
             map.suppress += 1;
         }
         ctx.call_stack.push(call_key.to_string());
-        let result = evaluate_nodes(&func.body, scope, ctx).map(|s| s.trim().to_string());
+        let result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body)
+            .map(|()| raw_body.trim().to_string());
         // Safety-critical LIFO invariant: call_stack tracks recursion detection.
         // A mismatched pop would silently corrupt recursion state and allow
         // stack overflows. Return a structured error rather than panicking so
@@ -1055,10 +1062,11 @@ fn evaluate_if(
     block: &IfBlock,
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
+    out: &mut String,
+) -> Result<(), MdsError> {
     // Evaluate the primary condition; anchor span on the @if directive line.
     if evaluate_condition(&block.condition, scope, ctx, Some(block.offset))? {
-        return evaluate_nodes(&block.then_body, scope, ctx);
+        return evaluate_nodes(&block.then_body, scope, ctx, out);
     }
 
     // Evaluate @elseif branches in order (short-circuit: first true branch wins).
@@ -1074,15 +1082,15 @@ fn evaluate_if(
     );
     for branch in &block.elseif_branches {
         if evaluate_condition(&branch.condition, scope, ctx, Some(branch.offset))? {
-            return evaluate_nodes(&branch.body, scope, ctx);
+            return evaluate_nodes(&branch.body, scope, ctx, out);
         }
     }
 
     // Fall through to @else body if present
     if let Some(else_body) = &block.else_body {
-        evaluate_nodes(else_body, scope, ctx)
+        evaluate_nodes(else_body, scope, ctx, out)
     } else {
-        Ok(String::new())
+        Ok(())
     }
 }
 
@@ -1194,27 +1202,23 @@ fn evaluate_for(
     block: &ForBlock,
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
-    let mut output = String::new();
-    // A pass that would take the loop's output past the cap fails inside the body, so
-    // `drive_for` still pops that pass's scope and no later pass runs (#415).
+    out: &mut String,
+) -> Result<(), MdsError> {
     drive_for(block, scope, ctx, |scope, ctx| {
-        let rendered = evaluate_nodes(&block.body, scope, ctx)?;
-        push_capped(&mut output, &rendered)
-    })?;
-    Ok(output)
+        evaluate_nodes(&block.body, scope, ctx, out)
+    })
 }
 
 fn evaluate_include(
     inc: &IncludeDirective,
     scope: &Scope,
     ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
+) -> Result<Option<PromptText>, MdsError> {
     let ns = scope
         .get_namespace(&inc.alias)
         .ok_or_else(|| MdsError::undefined_var(&inc.alias))?;
 
-    let prompt_body = match ns.prompt_body.as_deref() {
+    let prompt_body = match &ns.prompt_body {
         Some(body) => body,
         None => {
             if ctx.warnings.len() < MAX_WARNINGS {
@@ -1238,7 +1242,7 @@ fn evaluate_include(
                 };
                 ctx.warnings.push(msg);
             }
-            return Ok(String::new());
+            return Ok(None);
         }
     };
 
@@ -1252,7 +1256,7 @@ fn evaluate_include(
         map.splice_fragment(fragment, base);
     }
 
-    Ok(prompt_body.to_owned())
+    Ok(Some(prompt_body.clone()))
 }
 
 /// A single structured message produced by `evaluate_messages_intrinsic`.
@@ -1416,7 +1420,10 @@ fn collect_single_message(
     // R1 (`\r` strip) and R3 (blank-line-run cap) from silently changing compiled
     // output. Adding a `clean_output` call here would break the formatter's
     // safety model without any corresponding formatter change.
-    let content = evaluate_nodes(&block.body, scope, ctx)?.trim().to_string();
+    let mut raw_content = String::new();
+    evaluate_nodes(&block.body, scope, ctx, &mut raw_content)?;
+    let content = raw_content.trim().to_string();
+    drop(raw_content);
 
     // Skip empty messages.
     if content.is_empty() {
@@ -2154,6 +2161,33 @@ mod tests {
         assert_output_cap_error(result, "two text nodes past MAX_OUTPUT_SIZE");
     }
 
+    #[test]
+    fn output_cap_precedes_a_later_error_in_an_if_body() {
+        let nodes = vec![
+            text(&"x".repeat(MAX_OUTPUT_SIZE - 1)),
+            Node::If(IfBlock {
+                condition: Condition::Truthy(Expr::Var("flag".into())),
+                elseif_branches: vec![],
+                then_body: vec![
+                    text("yz"),
+                    Node::Interpolation(Interpolation {
+                        expr: Expr::Var("unknown".into()),
+                        offset: 0,
+                        len: 0,
+                    }),
+                ],
+                else_body: None,
+                offset: 0,
+                else_offset: None,
+                end_offset: 0,
+            }),
+        ];
+        let mut scope = Scope::new();
+        scope.set_var("flag", Value::Boolean(true));
+        let result = evaluate(&nodes, &mut scope, &mut Vec::new(), "", "");
+        assert_output_cap_error(result, "the first child append crosses the cap");
+    }
+
     // ── #415: the output cap stops a loop at the pass that crosses it ─────────
     //
     // The error text is the same whether the cap is checked before each append or
@@ -2226,8 +2260,17 @@ mod tests {
         let nodes = parse_into(src, &mut scope);
         let mut budget = seed;
         let mut warnings = vec![];
-        let result = evaluate_seeded(&nodes, &mut scope, &mut warnings, "", "", &mut budget);
-        (result, budget)
+        let mut out = String::new();
+        let result = evaluate_seeded(
+            &nodes,
+            &mut scope,
+            &mut warnings,
+            "",
+            "",
+            &mut budget,
+            &mut out,
+        );
+        (result.map(|()| out), budget)
     }
 
     /// #415: a `@for` whose output crosses the cap stops on the crossing pass.
@@ -3264,13 +3307,15 @@ mod tests {
 
         // Control: a zero seed runs the loop and records the one iteration it spent.
         let mut budget = EvalBudget::default();
-        let out = evaluate_seeded(
+        let mut out = String::new();
+        evaluate_seeded(
             &body,
             &mut one_item_scope(),
             &mut warnings,
             "",
             "",
             &mut budget,
+            &mut out,
         )
         .expect("a fresh budget must admit one iteration");
         assert_eq!(out, ".\n");
@@ -3288,6 +3333,7 @@ mod tests {
             "",
             "",
             &mut budget,
+            &mut String::new(),
         )
         .expect("the last iteration under the cap must run");
         assert_eq!(budget.iterations, MAX_TOTAL_ITERATIONS);
@@ -3301,6 +3347,7 @@ mod tests {
                 "",
                 "",
                 &mut budget,
+                &mut String::new(),
             ),
             ITERATION_LIMIT_MSG,
         );
@@ -3321,12 +3368,14 @@ mod tests {
 
         // Control: a zero seed runs the loop, records it, and counts one iteration.
         let mut budget = EvalBudget::default();
-        let (out, map) = evaluate_with_map_seeded(
+        let mut out = String::new();
+        let map = evaluate_with_map_seeded(
             &body,
             &mut one_item_scope(),
             &mut warnings,
             builder(),
             &mut budget,
+            &mut out,
         )
         .expect("a fresh budget must admit one iteration");
         assert_eq!(out, ".\n");
@@ -3343,6 +3392,7 @@ mod tests {
             &mut warnings,
             builder(),
             &mut budget,
+            &mut String::new(),
         )
         .expect("the last iteration under the cap must run");
         assert_eq!(budget.iterations, MAX_TOTAL_ITERATIONS);
@@ -3354,6 +3404,7 @@ mod tests {
                 &mut warnings,
                 builder(),
                 &mut budget,
+                &mut String::new(),
             ),
             ITERATION_LIMIT_MSG,
         );
