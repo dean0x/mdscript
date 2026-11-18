@@ -431,11 +431,7 @@ fn evaluate_block(
     evaluate_nodes(&block.body, scope, ctx)
 }
 
-/// Resolve a dot-separated path against the current scope.
-///
-/// `root` is the root variable name; `fields` are the field names to traverse into the
-/// resolved root value. Passing an empty `fields` slice returns the root variable itself.
-/// Returns `Ok(Value)` with the resolved value, or an error if the path is invalid.
+/// Return the bound slot only if its projection still refers to a value.
 fn resolve_var(name: &str, scope: &Scope) -> Result<Slot, MdsError> {
     scope
         .get_slot(name)
@@ -448,6 +444,7 @@ fn invalid_projection() -> MdsError {
     MdsError::syntax("internal error: an evaluated value has an invalid projection")
 }
 
+/// Resolve each field against the root slot. An empty path returns the slot itself.
 fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot, MdsError> {
     if fields.len() > MAX_DOT_SEGMENTS {
         return Err(MdsError::syntax(format!(

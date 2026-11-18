@@ -1846,15 +1846,15 @@ impl ModuleCache {
         let mut block_count: usize = 0;
         let mut define_count: usize = 0;
         for node in body {
+            count_module_defines(node, &mut define_count)?;
             match node {
                 Node::Define(def) => {
-                    define_count += 1;
                     let origin = module_origin.get_or_insert_with(|| Origin {
                         file: Arc::from(ctx.key),
                         display: Arc::from(ctx.file_str),
                         source: Arc::from(ctx.source),
                     });
-                    collect_define(def, &mut defs, define_count, scope, ctx, Some(origin))?
+                    collect_define(def, &mut defs, scope, ctx, Some(origin))?
                 }
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
@@ -2488,6 +2488,44 @@ fn has_message_block(nodes: &[Node]) -> bool {
     })
 }
 
+/// Count declarations in every body, even when a branch does not run.
+/// The parser bounds the depth of these bodies before collection.
+fn count_module_defines(node: &Node, count: &mut usize) -> Result<(), MdsError> {
+    let body = match node {
+        Node::Define(def) => {
+            if *count == MAX_DEFINES_PER_MODULE {
+                return Err(MdsError::resource_limit(format!(
+                    "module has more than {MAX_DEFINES_PER_MODULE} @define declarations"
+                )));
+            }
+            *count += 1;
+            &def.body
+        }
+        Node::If(block) => {
+            for child in block
+                .then_body
+                .iter()
+                .chain(block.elseif_branches.iter().flat_map(|branch| &branch.body))
+                .chain(block.else_body.iter().flatten())
+            {
+                count_module_defines(child, count)?;
+            }
+            return Ok(());
+        }
+        Node::For(block) => &block.body,
+        Node::Block(block) => &block.body,
+        Node::Message(block) => &block.body,
+        Node::Text(_)
+        | Node::Interpolation(_)
+        | Node::EscapedBrace { .. }
+        | Node::Import(_)
+        | Node::Export(_)
+        | Node::Include(_) => return Ok(()),
+    };
+    body.iter()
+        .try_for_each(|child| count_module_defines(child, count))
+}
+
 /// Process a single `@define` directive, updating `defs` and `scope` in place.
 ///
 /// Captures the definition-site scope for lexical closure semantics so the
@@ -2496,16 +2534,10 @@ fn has_message_block(nodes: &[Node]) -> bool {
 fn collect_define(
     def: &DefineBlock,
     defs: &mut CollectedDefs,
-    count: usize,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
     origin: Option<&Origin>,
 ) -> Result<(), MdsError> {
-    if count > MAX_DEFINES_PER_MODULE {
-        return Err(MdsError::resource_limit(format!(
-            "module has more than {MAX_DEFINES_PER_MODULE} @define declarations"
-        )));
-    }
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
             &def.name,
@@ -2573,17 +2605,7 @@ fn collect_block(
     Ok(())
 }
 
-/// Build a scope from optional frontmatter and runtime variable overrides.
-///
-/// Parses frontmatter YAML (if present), populates scope with variables,
-/// then applies runtime_vars to override any frontmatter keys.
-/// The `type` key is skipped for `.md` files (it is a file-type marker, not a template var).
-///
-/// For MDS files (`.mds` or `.md` with `type: mds`), the `imports` key is extracted
-/// and returned as a `Vec<FrontmatterImport>` rather than being set as a variable.
-/// For plain `.md` files, `imports` is treated as a regular variable.
-///
-/// Returns `(scope, fm_imports)`.
+/// Make one runtime layer to share across the modules in a resolution call.
 fn runtime_layer(vars: &HashMap<String, Value>) -> Arc<VarLayer> {
     Arc::new(
         vars.iter()
@@ -2592,6 +2614,9 @@ fn runtime_layer(vars: &HashMap<String, Value>) -> Arc<VarLayer> {
     )
 }
 
+/// Build a scope with runtime variables above frontmatter variables.
+/// A Markdown file uses `type` as a file marker, not a variable.
+/// Return `imports` separately for MDS files. Plain Markdown keeps it as a variable.
 fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
     is_md: bool,

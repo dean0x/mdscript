@@ -530,6 +530,26 @@ fn define_cap_refuses_257_declarations() {
 }
 
 #[test]
+fn define_cap_counts_declarations_in_nested_bodies() {
+    for (open, outer_defines) in [
+        ("@if enabled:", 0),
+        ("@if disabled:\n@elseif enabled:", 0),
+        ("@if enabled:\n@else:", 0),
+        ("@for item in items:", 0),
+        ("@block section:", 0),
+        ("@message user:", 0),
+        ("@define outer():", 1),
+    ] {
+        let prefix = define_source(255 - outer_defines, "f");
+        let source = format!(
+            "---\nenabled: true\ndisabled: false\nitems: []\n---\n{prefix}{open}\n@define inner():\nbody\n@end\ntext\n@end\n"
+        );
+        crate::compile_str(&source).unwrap();
+        assert_define_limit(&format!("{source}@define last():\nbody\n@end"));
+    }
+}
+
+#[test]
 fn define_cap_error_precedes_a_name_collision() {
     let mut source = define_source(256, "f");
     source.push_str("@define f1():\nother\n@end");
