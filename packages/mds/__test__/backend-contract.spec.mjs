@@ -28,20 +28,23 @@ test('native and WASM conversion errors share their code and field prefix', asyn
   const native = createNativeBackend(require('../../../crates/mds-napi/mds-napi.node'));
   const wasm = createWasmBackend(await initWasmNode());
   const prefix = 'invalid options.vars: ';
-  const summarize = (backend) => {
+  const summarize = (backend, bad) => {
     let error;
     try {
-      backend.compile('ok', { vars: { bad: Symbol('unsupported') } });
+      backend.compile('ok', { vars: { bad } });
     } catch (caught) {
       error = caught;
     }
     assert.ok(error instanceof Error, 'the unsupported value must reach the converter');
     return [error.code, error.message.slice(0, prefix.length)];
   };
-  assert.deepEqual(
-    [summarize(native), summarize(wasm)],
-    Array.from({ length: 2 }, () => ['mds::invalid_options', prefix]),
-  );
+  // #479: a BigInt outside the i64/u64 range is refused by both backends.
+  for (const bad of [Symbol('unsupported'), 2n ** 70n]) {
+    assert.deepEqual(
+      [summarize(native, bad), summarize(wasm, bad)],
+      Array.from({ length: 2 }, () => ['mds::invalid_options', prefix]),
+    );
+  }
   const assertClean = (backend) => assert.equal(
     backend.compile('{{value}}', { vars: { value: 'ok' } }).output,
     'ok\n',
