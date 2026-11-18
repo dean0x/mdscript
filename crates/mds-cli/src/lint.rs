@@ -547,7 +547,17 @@ fn read_canonical_source(
         None => NativeFs::new(),
     };
     fs.anchor_base_dir(&effective_parent(canonical).display().to_string())?;
-    let key = fs.resolve_entry(path_str)?;
+    let key = fs.resolve_entry(path_str).map_err(|mut error| {
+        let shown = safe_path(path);
+        match &mut error {
+            MdsError::FileNotFound { path, .. } => *path = shown,
+            MdsError::ImportError { message, .. } | MdsError::Io { message } => {
+                *message = message.replace(path_str, &shown);
+            }
+            _ => {}
+        }
+        error
+    })?;
     fs.read(&key)
 }
 
@@ -2008,10 +2018,14 @@ fn lint_dir_entry<'a>(
     };
 
     let pin = || walked_pin(walk, path, root, canonical_dir);
+    let source_pin = match pin() {
+        Ok(pin) => pin,
+        Err(e) => return failed(e, FileTally::Error),
+    };
     let source = if ctx.flags.format == LintFormat::Json {
-        SourceText::Unread(path, Some(pin()))
+        SourceText::Unread(path, Some(source_pin))
     } else {
-        match read_source_file(path, Some(pin())) {
+        match read_source_file(path, Some(source_pin)) {
             Ok(text) => SourceText::Read(text),
             Err(e) => {
                 let tally = failure_tally(&e);
@@ -2021,7 +2035,10 @@ fn lint_dir_entry<'a>(
     };
     // A panic in the analysis fails this entry alone, and the rest of the tree goes on
     // (#389).
-    let fs = NativeFs::new().with_entry_pin(pin());
+    let fs = match pin() {
+        Ok(pin) => NativeFs::new().with_entry_pin(pin),
+        Err(e) => return failed(e, FileTally::Error),
+    };
     let linted = catch_compile(
         path,
         AssertUnwindSafe(|| mds::lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config)),
@@ -3937,6 +3954,48 @@ mod tests {
             "relative_display must emit forward-slash separator on Windows; \
              got {display:?} — native backslash must not appear in the wire key"
         );
+    }
+
+    #[test]
+    fn read_canonical_source_names_a_deleted_file_as_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        let canonical = mds::NativeFs::check_symlink(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let typed = Path::new("src").join("a.mds");
+        let error = super::read_canonical_source(&canonical, &typed, None).unwrap_err();
+        assert!(matches!(error, MdsError::FileNotFound { .. }), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            format!("file not found: {}", safe_path(&typed))
+        );
+        assert!(!error.to_string().contains(&safe_path(&canonical)));
+    }
+
+    /// Unix-only: the fixture replaces the checked file with a Unix symlink.
+    #[cfg(unix)]
+    #[test]
+    fn read_canonical_source_names_a_symlink_refusal_as_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        let victim = dir.path().join("victim.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        std::fs::write(&victim, "Victim\n").unwrap();
+        let canonical = mds::NativeFs::check_symlink(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&victim, &file).unwrap();
+        let typed = Path::new("src").join("a.mds");
+        let error = super::read_canonical_source(&canonical, &typed, None).unwrap_err();
+        assert!(matches!(error, MdsError::ImportError { .. }), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "import error: symlinks are not allowed in imports: {}",
+                safe_path(&typed)
+            )
+        );
+        assert!(!error.to_string().contains(&safe_path(&canonical)));
     }
 
     /// PF-004: a failure to anchor the display root is reported, not swallowed.

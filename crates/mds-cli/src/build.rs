@@ -2207,7 +2207,14 @@ fn run_build_directory(
 
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
         // A panic in it fails this file alone, and the batch goes on (#389).
-        let pin = crate::output::walked_pin(&walk, file, dir, &canonical_dir);
+        let pin = match crate::output::walked_pin(&walk, file, dir, &canonical_dir) {
+            Ok(pin) => pin,
+            Err(e) => {
+                crate::output::eprint_file_failure(e.into());
+                fail_count += 1;
+                continue;
+            }
+        };
         let fs = mds::NativeFs::new().with_entry_pin(pin);
         let compiled = crate::output::catch_compile(
             file,

@@ -255,10 +255,15 @@ enum FileOutcome {
 /// error frames and of its `--diff` header, as a file argument typed that way is named
 /// (#390). Its rewrite is anchored at `root`, the directory argument, so a directory
 /// between the two that turned into a symlink after the walk is refused (#160).
-fn format_one_file(root: &Path, file: &Path, pin: mds::EntryPin, flags: FmtFlags) -> FileOutcome {
+fn format_one_file(
+    root: &Path,
+    file: &Path,
+    pin: Result<mds::EntryPin>,
+    flags: FmtFlags,
+) -> FileOutcome {
     let FmtFlags { check, diff, .. } = flags;
     let file_name = safe_path(file);
-    let source = match read_source_file(file, Some(pin)) {
+    let source = match pin.and_then(|pin| read_source_file(file, Some(pin))) {
         Ok(s) => s,
         Err(e) => {
             // File path is embedded in the miette report; sanitize for ESC injection safety
@@ -377,7 +382,7 @@ fn run_fmt_directory(dir: &Path, canonical_dir: &Path, flags: FmtFlags) -> Resul
     // in it, and only then are its rewrites' `Formatted:` lines shown (#160).
     let mut syncs = DirectorySyncs::new(files.iter().map(PathBuf::as_path));
     for (place, file) in files.iter().enumerate() {
-        let pin = walked_pin(&walk, file, dir, canonical_dir);
+        let pin = walked_pin(&walk, file, dir, canonical_dir).map_err(miette::Error::from);
         let landed = match format_one_file(dir, file, pin, flags) {
             FileOutcome::Formatted(renamed) => {
                 changed_count += 1;

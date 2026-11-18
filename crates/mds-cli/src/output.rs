@@ -1600,11 +1600,16 @@ pub(crate) fn walked_pin(
     file: &Path,
     typed_dir: &Path,
     canonical_dir: &Path,
-) -> mds::EntryPin {
-    let relative = file
-        .strip_prefix(typed_dir)
-        .expect("a walked file must be below its typed root");
-    mds::EntryPin::key(canonical_dir.join(relative)).with_walked(&walk.metadata[file])
+) -> std::result::Result<mds::EntryPin, mds::MdsError> {
+    let invalid = || mds::MdsError::Io {
+        message: format!(
+            "cannot read {}: missing or invalid walk metadata",
+            safe_path(file)
+        ),
+    };
+    let relative = file.strip_prefix(typed_dir).map_err(|_| invalid())?;
+    let metadata = walk.metadata.get(file).ok_or_else(invalid)?;
+    Ok(mds::EntryPin::key(canonical_dir.join(relative)).with_walked(metadata))
 }
 
 #[cfg(debug_assertions)]
@@ -2923,6 +2928,35 @@ pub(crate) mod child_process {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn walked_pin_reports_missing_metadata_without_a_panic() {
+        let file = Path::new("src").join("a.mds");
+        let walk = WalkResult {
+            files: vec![file.clone()],
+            metadata: std::collections::HashMap::new(),
+            excluded_by_default: 0,
+        };
+        let error = walked_pin(&walk, &file, Path::new("src"), Path::new("canonical")).unwrap_err();
+        assert!(matches!(error, mds::MdsError::Io { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cannot read {}: missing or invalid walk metadata",
+                safe_path(&file)
+            )
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.mds");
+        std::fs::write(&source, "Hello\n").unwrap();
+        let mut complete = walk;
+        complete
+            .metadata
+            .insert(file.clone(), std::fs::symlink_metadata(source).unwrap());
+        assert!(walked_pin(&complete, &file, Path::new("src"), dir.path()).is_ok());
+        assert!(walked_pin(&complete, &file, Path::new("other"), dir.path()).is_err());
+    }
 
     /// An out-dir written at `/out` and typed as `out`, so every assertion tells the two
     /// forms apart.

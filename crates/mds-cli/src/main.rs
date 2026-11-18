@@ -425,7 +425,14 @@ fn run_check_directory(
             continue;
         }
         // A panic in the check fails this file alone, and the batch goes on (#389).
-        let pin = output::walked_pin(&walk, file, dir, canonical_dir);
+        let pin = match output::walked_pin(&walk, file, dir, canonical_dir) {
+            Ok(pin) => pin,
+            Err(e) => {
+                output::eprint_file_failure(e.into());
+                fail_count += 1;
+                continue;
+            }
+        };
         let fs = mds::NativeFs::new().with_entry_pin(pin);
         let checked = output::catch_compile(
             file,
