@@ -49,7 +49,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
 use mds::{json_type_name, parse_json_vars, Value, VarsError};
@@ -1117,7 +1117,7 @@ enum Outcome<T> {
 /// Run a fallible core closure, trapping panics. Call this **inside**
 /// `Python::detach` so the GIL is released for the duration.
 fn guard<T>(f: impl FnOnce() -> Result<T, mds::MdsError>) -> Outcome<T> {
-    match catch_unwind(AssertUnwindSafe(f)) {
+    match mds::host_panic::catching(AssertUnwindSafe(f)) {
         Ok(Ok(v)) => Outcome::Ok(v),
         Ok(Err(e)) => Outcome::Mds(e),
         Err(payload) => Outcome::Panic(panic_detail(&*payload)),

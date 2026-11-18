@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::ptr;
 
@@ -297,7 +297,7 @@ fn run_catching<F, T>(env: &Env, f: F) -> napi::Result<T>
 where
     F: FnOnce() -> std::result::Result<T, mds::MdsError> + std::panic::UnwindSafe,
 {
-    match catch_unwind(f) {
+    match mds::host_panic::catching(f) {
         Ok(Ok(val)) => Ok(val),
         Ok(Err(mds_err)) => Err(throw_mds_error(env, mds_err)),
         Err(payload) => {

@@ -269,6 +269,23 @@ binding boundary; in the CLI it prints the panic's message and location after th
 internal-compiler-error text below. Both exist to help diagnose unexpected panics
 during local development.
 
+**Native host panic boundaries (#436).** The napi and Python bindings use the shared
+`mds::host_panic::catching` helper around core calls. It installs one hook per library
+and silences the previous hook only inside the current thread's catch boundary.
+Outside that boundary, the previous hook receives the original panic information.
+The previous hook is Rust's default hook unless the host replaced it first.
+Nested calls restore the prior boundary state. Other threads keep their own state.
+The error remains `mds::internal` with message `internal compiler error`.
+The off-by-default `debug-panics` feature still adds the payload as error detail.
+
+A later host `set_hook` call replaces this hook. The library does not reinstall it
+per call, because that would race with the host. With `panic = "abort"`, a panic
+cannot return through the catch boundary. A Python panic outside `guard` can still
+become a `PanicException` with the payload.
+
+WASM installs no hook: on wasm32-unknown-unknown, the default hook has no output channel.
+A panic traps on that target.
+
 **The CLI's panic output (#389).** A panic in `mds` is reported with these two lines on
 stderr, and the run exits 101:
 
@@ -361,10 +378,11 @@ published artifacts — `napi build --release` in `release.yml` for the addon, t
 `@mdscript/mds-wasm` build script (`wasm-pack build ../../crates/mds-wasm --target
 nodejs …` and `--target web …`) for the WASM package, and `maturin` with
 `pyproject.toml`'s `features = ["pyo3/abi3-py311"]` for the wheels — pass no
-`--features debug-panics`. For `mds-cli` alone, `crates/mds-cli/tests/panic_hook.rs`
-fails when a line of its manifest names the feature in quotes outside a comment — how a
-`default` feature or any other feature turns it on, on one line or several — or when the
-manifest declares it as anything but `debug-panics = []`; the build sites are checked by
-reading them. `mds-cli` is published to crates.io, so
+`--features debug-panics`. `crates/mds-cli/tests/panic_hook.rs` checks all four
+manifests. It rejects a quoted feature value outside a comment, or a declaration
+other than `debug-panics = []`. It also checks the maturin features, napi package
+scripts and `release.yml` for feature selection. Each input has a planted control.
+The same test file checks both native catch funnels and the WASM hook policy.
+`mds-cli` is published to crates.io, so
 `cargo install mds-cli --features debug-panics` builds a CLI that prints panic
 messages: build one only for your own debugging.

@@ -2130,34 +2130,39 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
     );
 }
 
-/// `debug-panics` is declared, enables nothing, and is off unless asked for: nothing in
-/// `mds-cli`'s manifest names it as a value, so no `default` feature and no other feature
-/// turns it on, however the list is written.
+/// Each native or WASM host manifest declares `debug-panics` but never enables it
+/// through a default or another feature. Each manifest gets the same controls.
 ///
 /// Controls ([`assert_never_on_by_default`]): each way of turning it on, a declaration
 /// that enables something, and a manifest that does not declare it are reported; a mention
 /// in a comment is not.
 #[test]
 fn debug_panics_is_never_on_by_default() {
-    assert_never_on_by_default("debug-panics", "startup-race-probe");
+    for (manifest, other) in [
+        ("Cargo.toml", "startup-race-probe"),
+        ("../mds-napi/Cargo.toml", "verbose"),
+        ("../mds-python/Cargo.toml", "extension-module"),
+        ("../mds-wasm/Cargo.toml", "verbose"),
+    ] {
+        assert_never_on_by_default(manifest, "debug-panics", other);
+    }
 }
 
 /// `startup-race-probe`, which delays `mds watch`'s startup on purpose, must never ship
 /// enabled either, and is held to the same rule as `debug-panics`, with the same controls.
 #[test]
 fn startup_race_probe_is_never_on_by_default() {
-    assert_never_on_by_default("startup-race-probe", "debug-panics");
+    assert_never_on_by_default("Cargo.toml", "startup-race-probe", "debug-panics");
 }
 
-/// `feature` has no finding in `mds-cli`'s manifest ([`feature_findings`]), and every
-/// planted way of turning it on — `other` is another feature the manifest declares — is
-/// reported, while a mention in a comment is not.
-fn assert_never_on_by_default(feature: &str, other: &str) {
-    let manifest = read_source("Cargo.toml");
+/// `feature` has no finding in the manifest, and each planted way to enable it is
+/// reported. `other` names a companion feature. A comment enables nothing.
+fn assert_never_on_by_default(path: &str, feature: &str, other: &str) {
+    let manifest = read_source(path);
     let found = feature_findings(&manifest, feature);
     assert!(
         found.is_empty(),
-        "mds-cli's `{feature}` feature must stay off by default:\n{}",
+        "{path}'s `{feature}` feature must stay off by default:\n{}",
         found.join("\n")
     );
     let declared = format!("{feature} = []");
@@ -2217,6 +2222,153 @@ fn assert_never_on_by_default(feature: &str, other: &str) {
         Vec::<String>::new(),
         "a mention of `{feature}` in a comment turns nothing on"
     );
+}
+
+/// Both native host funnels enter the shared boundary. A helper name in a
+/// comment, literal, or different function must not satisfy the scan.
+#[test]
+fn native_host_funnels_use_the_shared_panic_boundary() {
+    let mut found = Vec::new();
+    for (path, funnel) in [
+        ("../mds-napi/src/lib.rs", "run_catching"),
+        ("../mds-python/src/lib.rs", "guard"),
+    ] {
+        let source = read_source(path);
+        let planted = format!(
+            "fn {funnel}() {{\n\
+             // mds::host_panic::catching(f);\n\
+             let text = \"mds::host_panic::catching(f)\";\n\
+             std::panic::catch_unwind(f);\n\
+             }}\nfn decoy() {{ mds::host_panic::catching(f); }}"
+        );
+        assert_eq!(
+            host_boundary_findings(&planted, funnel),
+            [format!("{funnel} must call mds::host_panic::catching once")],
+            "{path}: a planted funnel without the call must fail the scan"
+        );
+        found.extend(
+            host_boundary_findings(&source, funnel)
+                .into_iter()
+                .map(|finding| format!("{path}: {finding}")),
+        );
+    }
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "native funnels must use the shared boundary"
+    );
+}
+
+fn host_boundary_findings(source: &str, funnel: &str) -> Vec<String> {
+    let code = blank(source, true);
+    let bodies: Vec<_> = fn_bodies(&code)
+        .into_iter()
+        .filter(|(name, _)| name == funnel)
+        .collect();
+    if bodies.len() != 1
+        || calls_ending_with(&code[bodies[0].1.clone()], "mds::host_panic::catching").len() != 1
+    {
+        return vec![format!("{funnel} must call mds::host_panic::catching once")];
+    }
+    Vec::new()
+}
+
+/// Build inputs must not select the local-only panic feature. Each input gets a
+/// planted selection in memory. Commands also get an all-features control.
+#[test]
+fn build_entry_points_leave_debug_panics_off() {
+    for (path, anchor) in [
+        (
+            "../mds-python/pyproject.toml",
+            "features = [\"pyo3/abi3-py311\"]",
+        ),
+        ("../mds-napi/package.json", "napi build --release --no-js"),
+        (
+            "../../.github/workflows/release.yml",
+            "napi build --platform --release",
+        ),
+    ] {
+        let source = read_source(path);
+        assert!(
+            source.contains(anchor),
+            "{path}: the build input must exist"
+        );
+        let replacements = if anchor.starts_with("features =") {
+            vec!["features = [\"pyo3/abi3-py311\", \"debug-panics\"]".to_string()]
+        } else {
+            vec![
+                format!("{anchor} --features debug-panics"),
+                format!("{anchor} --all-features"),
+            ]
+        };
+        for replacement in replacements {
+            let planted = source.replacen(anchor, &replacement, 1);
+            assert_ne!(planted, source, "{path}: the control must change the input");
+            assert_eq!(
+                build_feature_findings(&planted).len(),
+                1,
+                "{path}: the planted {replacement} must fail the scan"
+            );
+        }
+        assert_eq!(
+            build_feature_findings(&source),
+            Vec::<String>::new(),
+            "{path}: build entry points must not enable panic details"
+        );
+        assert!(
+            build_feature_findings(&format!("{source}\n# debug-panics --all-features")).is_empty()
+        );
+    }
+}
+
+/// Conservatively refuse either spelling anywhere outside a line comment.
+fn build_feature_findings(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let code = toml_code(line);
+            code.contains("debug-panics") || code.contains("--all-features")
+        })
+        .map(|(line, _)| format!("line {} enables panic details", line + 1))
+        .collect()
+}
+
+#[test]
+fn wasm_installs_no_panic_hook_and_the_policy_states_why() {
+    let sources = rust_sources("../mds-wasm/src", "lib.rs", 1);
+    for needle in [
+        "set_hook",
+        "take_hook",
+        "mds::host_panic::install",
+        "mds::host_panic::catching",
+    ] {
+        let planted = plant_in(&sources, "lib.rs", |source| {
+            source.push_str(&format!("\nfn planted() {{ {needle}(f); }}\n"));
+        });
+        assert_eq!(
+            wasm_hook_findings(&planted).len(),
+            1,
+            "the WASM scan must reject a planted {needle}"
+        );
+    }
+    assert_eq!(wasm_hook_findings(&sources), Vec::<String>::new());
+    let policy = read_source("../../SECURITY.md");
+    assert!(policy.contains("on wasm32-unknown-unknown, the default hook has no output channel"));
+}
+
+fn wasm_hook_findings(sources: &[(String, String)]) -> Vec<String> {
+    sources
+        .iter()
+        .flat_map(|(path, source)| {
+            let code = blank(source, true);
+            ["set_hook", "take_hook", "host_panic"]
+                .into_iter()
+                .filter(|needle| !ident_positions(&code, needle).is_empty())
+                .map(|needle| format!("{path} must not name {needle}"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 // ── Lexical helpers ───────────────────────────────────────────────────────────

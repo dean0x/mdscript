@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The napi and Python bindings no longer print internal error details to the host's standard error (#436).
 - A compile accepts the entry plus at most 256 distinct modules, including modules still being resolved (#427). A nested graph of 258 modules now fails with `mds::resource_limit` and `resource limit exceeded: module count exceeds maximum of 256 modules besides the entry`. The public Rust constructor `mds::module_count_exceeded()` supplies this error.
 - The napi, WASM and Python virtual module maps now accept 257 entries: the entry plus 256 other modules (#427). A map with 258 entries fails with `mds::resource_limit` and its own module-map message.
 - Python reports an argument's type error before an unknown keyword when both occur in one call (#421).
