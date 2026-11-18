@@ -25,6 +25,68 @@ pub(crate) struct CaptureLink {
     depth: usize,
 }
 
+enum CaptureEdge {
+    Link(Arc<CaptureLink>),
+    Function(Arc<FunctionDef>),
+    Namespace(Arc<NamespaceScope>),
+}
+
+impl CaptureLink {
+    fn take_edges(&mut self, pending: &mut Vec<CaptureEdge>) {
+        pending.extend(self.prev.take().map(CaptureEdge::Link));
+        pending.extend(
+            std::mem::take(&mut self.functions)
+                .into_values()
+                .map(CaptureEdge::Function),
+        );
+        pending.extend(
+            std::mem::take(&mut self.namespaces)
+                .into_values()
+                .map(CaptureEdge::Namespace),
+        );
+    }
+}
+
+fn drop_capture_edges(mut pending: Vec<CaptureEdge>) {
+    // Each pass consumes one edge. Only the last owner can add a node's edges,
+    // so the number of reachable edges bounds the work.
+    while let Some(edge) = pending.pop() {
+        match edge {
+            CaptureEdge::Link(link) => {
+                if let Some(mut link) = Arc::into_inner(link) {
+                    link.take_edges(&mut pending);
+                }
+            }
+            CaptureEdge::Function(function) => {
+                if let Some(mut function) = Arc::into_inner(function) {
+                    pending.extend(function.captured.head.take().map(CaptureEdge::Link));
+                }
+            }
+            CaptureEdge::Namespace(namespace) => {
+                if let Some(namespace) = Arc::into_inner(namespace) {
+                    pending.extend(namespace.functions.into_values().map(CaptureEdge::Function));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CapturedScope {
+    fn drop(&mut self) {
+        if let Some(head) = self.head.take() {
+            drop_capture_edges(vec![CaptureEdge::Link(head)]);
+        }
+    }
+}
+
+impl Drop for CaptureLink {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.take_edges(&mut pending);
+        drop_capture_edges(pending);
+    }
+}
+
 impl std::fmt::Debug for CapturedScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CapturedScope")
@@ -50,6 +112,18 @@ impl std::fmt::Debug for CaptureLink {
 }
 
 impl CapturedScope {
+    #[cfg(test)]
+    pub(crate) fn weak_head(&self) -> Option<std::sync::Weak<CaptureLink>> {
+        self.head.as_ref().map(Arc::downgrade)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn weak_namespace(&self, alias: &str) -> Option<std::sync::Weak<NamespaceScope>> {
+        self.links()
+            .find_map(|link| link.namespaces.get(alias))
+            .map(Arc::downgrade)
+    }
+
     fn links(&self) -> impl Iterator<Item = &CaptureLink> {
         let head = self.head.as_deref();
         std::iter::successors(head, |link| link.prev.as_deref())
@@ -132,10 +206,8 @@ pub(crate) fn captured_function_nodes(root: &FunctionDef) -> usize {
 
 #[cfg(test)]
 pub(crate) fn captured_entry_count(scope: &Scope) -> usize {
-    let capture = CapturedScope {
-        head: scope.head.clone(),
-        ..CapturedScope::default()
-    };
+    let mut capture = CapturedScope::default();
+    capture.head = scope.head.clone();
     let frozen: usize = capture
         .links()
         .map(|link| link.functions.len() + link.namespaces.len())

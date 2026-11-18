@@ -656,6 +656,42 @@ fn captures_keep_each_imported_prompt_write() {
 }
 
 #[test]
+fn captured_import_graph_drops_after_the_last_owner() {
+    let (keep, imported, link, namespace) = {
+        let mut cache = virtual_cache(&[
+            ("merge.mds", "@define merged():\nmerge\n@end"),
+            ("alias.mds", "@define aliased():\nalias\n@end"),
+            ("prompt.mds", "prompt"),
+        ]);
+        let source = concat!(
+            "@import \"./merge.mds\"\n@import \"./alias.mds\" as lib\n",
+            "@import { prompt } from \"./prompt.mds\"\n",
+            "@define local():\n{{merged()}}/{{lib.aliased()}}/{{prompt}}\n@end\n{{local()}}",
+        );
+        let module = cache
+            .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref(), Some("merge/alias/prompt"));
+        let keep = Arc::clone(&module.functions["local"]);
+        let imported = Arc::downgrade(&cache.modules["merge.mds"].functions["merged"]);
+        let link = keep.captured.weak_head().unwrap();
+        let namespace = keep.captured.weak_namespace("lib").unwrap();
+        (keep, imported, link, namespace)
+    };
+    let local = Arc::downgrade(&keep);
+    assert!(local.upgrade().is_some());
+    assert!(imported.upgrade().is_some());
+    assert!(link.upgrade().is_some());
+    assert!(namespace.upgrade().is_some());
+
+    drop(keep);
+    assert!(local.upgrade().is_none());
+    assert!(imported.upgrade().is_none());
+    assert!(link.upgrade().is_none());
+    assert!(namespace.upgrade().is_none());
+}
+
+#[test]
 fn imported_defines_share_the_runtime_layer_of_their_call() {
     let mut cache = virtual_cache(&[
         ("first.mds", "@define first():\n{{x}}\n@end"),
