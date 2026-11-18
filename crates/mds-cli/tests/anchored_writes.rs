@@ -975,6 +975,69 @@ fn rewrite_paused(root: &Path, args: &[&str], meanwhile: impl FnOnce()) -> (Opti
     (code, tap.finish_text(&mut child))
 }
 
+/// A directory rewrite keeps the directory held before the replace pause. Its no-swap
+/// control rewrites the same source. A test-side edit must change the victim snapshot.
+#[cfg(all(unix, debug_assertions))]
+fn directory_rewrite_uses_its_held_directory(args: &[&str], source: &Source) {
+    const VICTIM: &str = "Victim\r\n";
+    for swapped in [true, false] {
+        let dir = scratch();
+        let root = dir.path();
+        put(root, "src/sub/a.mds", source.written);
+        let victim = put(root, "victim/a.mds", VICTIM);
+        let (code, stderr) = rewrite_paused(root, args, || {
+            if swapped {
+                std::fs::rename(root.join("src/sub"), root.join("src/sub.moved")).unwrap();
+                std::os::unix::fs::symlink("../victim", root.join("src/sub")).unwrap();
+            }
+        });
+        assert_eq!(
+            code,
+            Some(0),
+            "{args:?}, swapped {swapped}; stderr: {stderr}"
+        );
+        let rewritten = if swapped {
+            "src/sub.moved/a.mds"
+        } else {
+            "src/sub/a.mds"
+        };
+        assert_eq!(
+            read(&root.join(rewritten)),
+            source.rewritten,
+            "{args:?}, swapped {swapped}: the held source gets the rewrite"
+        );
+        let victim_state = || (read(&victim), entries(&root.join("victim")));
+        let expected = (VICTIM.to_owned(), vec!["a.mds".to_owned()]);
+        assert_eq!(
+            victim_state(),
+            expected,
+            "{args:?}, swapped {swapped}: the victim keeps its bytes and entries"
+        );
+
+        // The same snapshot detects a test-side change after the product checks pass.
+        std::fs::write(&victim, "Changed by the test\n").unwrap();
+        assert_ne!(
+            victim_state(),
+            expected,
+            "the victim check must detect an edit"
+        );
+    }
+}
+
+/// Unix-only: the fixture uses a Unix symlink. The pause hook needs debug assertions.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn fmt_rewrites_the_held_directory_when_it_is_swapped_for_a_symlink_before_the_replace() {
+    directory_rewrite_uses_its_held_directory(&["fmt", "src"], &UNFORMATTED);
+}
+
+/// Unix-only: the fixture uses a Unix symlink. The pause hook needs debug assertions.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn lint_fix_rewrites_the_held_directory_when_it_is_swapped_for_a_symlink_before_the_replace() {
+    directory_rewrite_uses_its_held_directory(&["lint", "--fix", "src"], &UNFIXED);
+}
+
 /// The refusal of a rewrite whose file changed after it was read, the file as typed:
 /// `cannot write <file>: changed since it was read; not written`.
 fn changed(file: &str) -> String {
