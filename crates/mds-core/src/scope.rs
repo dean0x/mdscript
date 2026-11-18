@@ -56,26 +56,13 @@ impl CapturedScope {
             .take(head.map_or(0, |link| link.depth))
     }
 
-    pub(crate) fn restore_into(&self, scope: &mut Scope) {
-        let links: Vec<_> = self.links().collect();
-        for link in links.into_iter().rev() {
-            for (name, function) in &link.functions {
-                scope.set_function(name, Arc::clone(function));
-            }
-            for (name, namespace) in &link.namespaces {
-                scope.set_namespace(name, Arc::clone(namespace));
-            }
-        }
-        for layer in self.frontmatter.iter().chain(self.runtime.iter()) {
-            for (name, root) in layer.iter() {
-                scope.set_var_shared(name, Arc::clone(root));
-            }
-        }
-        if let Some(vars) = &self.own_vars {
-            for (name, slot) in vars.iter() {
-                scope.set_var_shared(name, Arc::clone(&slot.root));
-            }
-        }
+    fn get_slot(&self, name: &str) -> Option<&Arc<Value>> {
+        self.own_vars
+            .as_ref()
+            .and_then(|vars| vars.get(name))
+            .map(|slot| &slot.root)
+            .or_else(|| self.runtime.as_ref()?.get(name))
+            .or_else(|| self.frontmatter.as_ref()?.get(name))
     }
 }
 
@@ -189,6 +176,13 @@ struct Frame {
     /// Functions stored as `Arc` so cloning out of scope is O(1).
     functions: HashMap<String, Arc<FunctionDef>>,
     namespaces: HashMap<String, Arc<NamespaceScope>>,
+    callee: Option<Arc<FunctionDef>>,
+}
+
+impl Frame {
+    fn capture(&self) -> Option<&CapturedScope> {
+        self.callee.as_deref().map(|function| &function.captured)
+    }
 }
 
 /// A namespace scope for aliased imports.
@@ -244,9 +238,16 @@ impl Scope {
         }
     }
 
-    /// Push a new scope frame (for blocks, function calls).
+    /// Push a new scope frame for a block.
     pub fn push(&mut self) {
         self.frames.push(Frame::default());
+    }
+
+    pub(crate) fn push_call(&mut self, callee: &Arc<FunctionDef>) {
+        self.frames.push(Frame {
+            callee: Some(Arc::clone(callee)),
+            ..Frame::default()
+        });
     }
 
     /// Pop the innermost scope frame.
@@ -295,7 +296,13 @@ impl Scope {
         self.frames
             .iter()
             .rev()
-            .find_map(|f| f.vars.get(name).map(|slot| &slot.root))
+            .find_map(|frame| {
+                frame
+                    .vars
+                    .get(name)
+                    .map(|slot| &slot.root)
+                    .or_else(|| frame.capture()?.get_slot(name))
+            })
             .or_else(|| self.runtime.as_ref()?.get(name))
             .or_else(|| self.frontmatter.as_ref()?.get(name))
     }
@@ -315,7 +322,14 @@ impl Scope {
 
     /// Look up a function by walking the scope chain.
     pub fn get_function(&self, name: &str) -> Option<&Arc<FunctionDef>> {
-        self.frames.iter().rev().find_map(|f| f.functions.get(name))
+        self.frames.iter().rev().find_map(|frame| {
+            frame.functions.get(name).or_else(|| {
+                frame
+                    .capture()?
+                    .links()
+                    .find_map(|link| link.functions.get(name))
+            })
+        })
     }
 
     /// Register a namespace (for aliased imports).
@@ -337,7 +351,15 @@ impl Scope {
         self.frames
             .iter()
             .rev()
-            .find_map(|f| f.namespaces.get(alias).map(Arc::as_ref))
+            .find_map(|frame| {
+                frame.namespaces.get(alias).or_else(|| {
+                    frame
+                        .capture()?
+                        .links()
+                        .find_map(|link| link.namespaces.get(alias))
+                })
+            })
+            .map(Arc::as_ref)
     }
 
     /// Freeze the frame-zero writes since the last capture.
@@ -512,13 +534,57 @@ mod tests {
             ])),
         );
         scope.set_var("c", Value::Number(3.0));
-        let capture = scope.capture().unwrap();
+        let callee = define(&mut scope, "callee");
         let mut call = Scope::new();
-        call.push();
-        capture.restore_into(&mut call);
+        call.push_call(&callee);
         assert_eq!(call.get_var("a"), Some(&Value::Number(1.0)));
         assert_eq!(call.get_var("b"), Some(&Value::Number(2.0)));
         assert_eq!(call.get_var("c"), Some(&Value::Number(3.0)));
+    }
+
+    #[test]
+    fn call_frame_looks_up_captures_without_copying_entries() {
+        let mut definition = Scope::new();
+        definition.set_var("param", Value::Number(1.0));
+        definition.set_var("shadowed", Value::Number(2.0));
+        let captured_fn = define(&mut definition, "sibling");
+        let namespace = Arc::new(make_ns());
+        definition.set_namespace("lib", Arc::clone(&namespace));
+        let callee = define(&mut definition, "callee");
+
+        let mut call = Scope::new();
+        call.set_var("shadowed", Value::Number(3.0));
+        call.set_var("fallback", Value::Number(4.0));
+        let caller_fn = define(&mut call, "sibling");
+        call.push_call(&callee);
+        call.set_var("param", Value::Number(5.0));
+
+        assert_eq!(call.get_var("param"), Some(&Value::Number(5.0)));
+        assert_eq!(call.get_var("shadowed"), Some(&Value::Number(2.0)));
+        assert_eq!(call.get_var("fallback"), Some(&Value::Number(4.0)));
+        assert!(Arc::ptr_eq(
+            call.get_function("sibling").unwrap(),
+            &captured_fn
+        ));
+        assert!(std::ptr::eq(
+            call.get_namespace("lib").unwrap(),
+            namespace.as_ref()
+        ));
+        let frame = call.frames.last().unwrap();
+        assert_eq!(
+            frame.vars.len(),
+            1,
+            "only the parameter belongs in the call frame"
+        );
+        assert!(frame.functions.is_empty());
+        assert!(frame.namespaces.is_empty());
+
+        call.pop().unwrap();
+        assert_eq!(call.get_var("shadowed"), Some(&Value::Number(3.0)));
+        assert!(Arc::ptr_eq(
+            call.get_function("sibling").unwrap(),
+            &caller_fn
+        ));
     }
 
     #[test]
@@ -530,9 +596,9 @@ mod tests {
         scope.set_namespace("b", Arc::clone(&old));
         scope.capture().unwrap();
         scope.set_namespace("b", Arc::clone(&new));
+        let callee = define(&mut scope, "callee");
         let mut call = Scope::new();
-        call.push();
-        scope.capture().unwrap().restore_into(&mut call);
+        call.push_call(&callee);
         assert!(std::ptr::eq(call.get_namespace("a").unwrap(), old.as_ref()));
         assert!(std::ptr::eq(call.get_namespace("b").unwrap(), new.as_ref()));
     }

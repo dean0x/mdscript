@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::arity::check_arity;
 use crate::ast::{
@@ -614,18 +615,8 @@ pub(crate) fn literal_expr_to_value(expr: &Expr) -> Result<Value, MdsError> {
     }
 }
 
-/// Restore the closure captures recorded at function-definition time into the
-/// current scope frame.
-///
-/// Namespaces, sibling functions, and variables captured from the definition
-/// site are written into `scope` before parameter binding so that params shadow
-/// captured vars correctly (params take precedence over closure variables).
-fn restore_captured_scope(func: &FunctionDef, scope: &mut Scope) {
-    func.captured.restore_into(scope);
-}
-
 fn invoke_function(
-    func: &FunctionDef,
+    func: &Arc<FunctionDef>,
     call_key: &str,
     args: &[Value],
     scope: &mut Scope,
@@ -654,11 +645,18 @@ fn invoke_function(
             Some(render_signature(call_key, &func.params)),
         ));
     }
-    scope.push();
-    // Restore captured lexical scope from definition site so the function body
-    // can resolve alias imports, sibling functions, and frontmatter variables
-    // from its defining module.
-    restore_captured_scope(func, scope);
+    scope.push_call(func);
+    let result = evaluate_function_body(func, call_key, args, scope, ctx);
+    prefer_first_error(result, scope.pop())
+}
+
+fn evaluate_function_body(
+    func: &FunctionDef,
+    call_key: &str,
+    args: &[Value],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<String, MdsError> {
     // Bind params index-by-index; fill missing optional params with their defaults.
     for (i, param) in func.params.iter().enumerate() {
         let value = if i < args.len() {
@@ -747,8 +745,7 @@ fn invoke_function(
                  expected '{call_key}', got {popped:?}"
             )))
         };
-        let pop_result = scope.pop();
-        let raw_body = prefer_first_error(body_result, lifo_result.and(pop_result))?;
+        let raw_body = prefer_first_error(body_result, lifo_result)?;
 
         // Compute lead/trail byte counts for rebase_trim.
         // Use try_from + unwrap_or(u32::MAX) for safety: body is bounded by
@@ -805,14 +802,8 @@ fn invoke_function(
                  expected '{call_key}', got {popped:?}"
             )))
         };
-        let pop_result = scope.pop();
-        // B1: restore body_origin before returning so LIFO is correct even on error
-        // paths (prefer_first_error returns the render error, not a panic).
         ctx.body_origin = prev_body_origin;
-        // On double-fault, preserve the render error — it carries the actionable
-        // source-span diagnostic for the user. LIFO/pop failures are compiler
-        // bugs and surface as secondary errors.
-        prefer_first_error(result, lifo_result.and(pop_result))
+        prefer_first_error(result, lifo_result)
     }
 }
 
@@ -2450,6 +2441,40 @@ mod tests {
             }
             other => panic!("expected ArityMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn call_frame_pops_when_a_parameter_default_fails() {
+        use crate::ast::Param;
+        use crate::scope::CapturedScope;
+
+        let mut scope = Scope::new();
+        let function = Arc::new(FunctionDef {
+            params: vec![
+                Param::required("local"),
+                Param {
+                    name: "bad_default".into(),
+                    default: Some(Expr::Var("missing".into())),
+                },
+            ],
+            body: vec![],
+            captured: CapturedScope::default(),
+            origin: None,
+        });
+        scope.set_function("f", function);
+        let nodes = vec![Node::Interpolation(crate::ast::Interpolation {
+            expr: Expr::Call {
+                name: "f".into(),
+                args: vec![Arg::NumberLiteral(1.0)],
+            },
+            offset: 0,
+            len: 0,
+        })];
+
+        let error = evaluate(&nodes, &mut scope, &mut vec![], "", "").unwrap_err();
+        assert!(error.to_string().contains("non-literal expression"));
+        assert!(scope.get_var("local").is_none());
+        assert!(scope.pop().is_err());
     }
 
     #[test]
