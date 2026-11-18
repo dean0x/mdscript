@@ -111,7 +111,7 @@ fn dir_fmt_refuses_a_parent_redirected_after_walk() {
 fn dir_fmt_accepts_an_unchanged_tree_after_walk() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("sub")).unwrap();
-    let page = dir.path().join("sub/page.mds");
+    let page = dir.path().join("sub").join("page.mds");
     fs::write(&page, "Original   \n").unwrap();
     let out = common::run_after_walk(mds_bin().arg("fmt").arg(dir.path()).arg("--diff"), || {});
     let stderr = String::from_utf8_lossy(&out.stderr);
