@@ -622,7 +622,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **`.devflow/features/*/KNOWLEDGE.md` is TRACKED, not gitignored**: `.gitignore` ignores `.devflow/*` but re-includes `!.devflow/features/*/KNOWLEDGE.md` (lines 64-70). A doc sweep that excludes `.devflow` wholesale will miss this file, and the source-hygiene gate does scan it.
 
-**D2 mechanical ripple in resolver.rs**: The `..` in the three `ExportDirective` match arms in `resolver.rs` is intentional — it acknowledges the new `offset` field without reading it.
+**Re-export error locations**: The resolver uses each re-export directive's `offset` to attach its importer span. An error that already has a span keeps its original source.
 
 **Frontmatter key span is approximate**: `FmVarFact.approx_offset` is `Option<usize>` — it can be `None` when substring search fails.
 
@@ -648,7 +648,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **Core lint uses the check gate's entry text**: `mds::lint()` delegates to `lint_native_fs`. Its `ModuleCache::resolve_path_intrinsic_source` call returns the entry text that the gate read. Rules use that same text; there is no entry re-read. Directory reports pass a walked `EntryPin` through `NativeFs::with_entry_pin`.
 
-**CLI source reads resolve before the verified read**: lint fix/preview and fmt pass an optional walked pin through `read_source_file` to `read_canonical_source`. That helper anchors the display root, resolves the entry, then reads its key through the same `NativeFs`. Unix compares device and inode with the no-follow lookup; Windows compares the opened handle's final path. An absent record or a different result returns a fixed `mds::io` message with the escaped root-relative display.
+**CLI source reads resolve before the verified read**: lint fix/preview and fmt pass an optional walked pin through `read_source_file` to `read_canonical_source`. That helper anchors the display root, resolves the entry, then reads its key through the same `NativeFs`. Unix compares device and inode with the no-follow lookup; Windows compares the opened handle's final path. An absent record or a different result returns a fixed `mds::io` message with the escaped root-relative display. For a pinned directory entry, the CLI reader prefixes I/O errors with the escaped walked path. This identifies the source when the core display contains only its basename.
 
 **Vars reads share the verified capped reader**: `load_vars_file_reporting_duplicates` uses `VarsFile::resolve` and `VarsFile::read`. Regular files receive the opened-file comparison. A FIFO at lookup and open skips its identity comparison but keeps the 10 MiB cap. Other types and type mismatches are refused. Process substitution remains valid on macOS.
 
