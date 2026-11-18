@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::MdsError;
 use crate::limits::{
@@ -433,20 +433,39 @@ fn file_too_large(size: u64, display: &str) -> MdsError {
 /// is read is read to one byte past the cap and refused. A module that is not a regular
 /// file — a directory, a FIFO, a device, a socket — is refused before it is opened, as
 /// `cannot read <display>: not a regular file`, the refusal `@mdscript/mds`'s WASM
-/// backend makes: opening a FIFO nobody writes to blocks. [`NativeFs::read`] and
-/// `mds::lint`'s re-read of its entry read a module through it.
+/// backend makes: a FIFO can wait for a writer. `mds::lint` uses this for its entry re-read.
 pub(crate) fn read_module_file(path: &Path, display: &str) -> Result<String, MdsError> {
-    let bytes = match read_regular_capped(path, MAX_FILE_SIZE) {
-        Ok(Capped::Bytes(bytes)) => bytes,
-        Ok(Capped::TooLarge(size)) => return Err(file_too_large(size, display)),
-        Err(e) => {
-            return Err(MdsError::io(format!(
-                "cannot read {}: {e}",
-                crate::lint::escape_path_for_message(display)
-            )));
-        }
-    };
-    check_module_bytes(bytes, display)
+    let read = read_regular_capped(path, MAX_FILE_SIZE).map_err(|e| read_error(display, e))?;
+    module_text(read, display)
+}
+
+fn module_text(read: Capped, display: &str) -> Result<String, MdsError> {
+    match read {
+        Capped::Bytes(bytes) => check_module_bytes(bytes, display),
+        Capped::TooLarge(size) => Err(file_too_large(size, display)),
+    }
+}
+
+fn read_error(display: &str, error: std::io::Error) -> MdsError {
+    MdsError::io(format!(
+        "cannot read {}: {error}",
+        crate::lint::escape_path_for_message(display)
+    ))
+}
+
+#[cfg(any(unix, windows))]
+fn file_changed(display: &str) -> MdsError {
+    MdsError::io(format!(
+        "cannot read {}: the file changed while it was opened",
+        crate::lint::escape_path_for_message(display)
+    ))
+}
+
+fn not_resolved(display: &str) -> MdsError {
+    MdsError::io(format!(
+        "cannot read {}: it was not resolved first",
+        crate::lint::escape_path_for_message(display)
+    ))
 }
 
 /// A file read under a size cap (see [`read_capped`]).
@@ -481,6 +500,66 @@ fn read_regular_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
         return Err(not_a_regular_file());
     }
     read_opened_capped(file, metadata.len(), cap)
+}
+
+/// Compare the opened file with the resolve record before the first byte is read.
+#[cfg(any(unix, windows))]
+fn read_verified_capped(
+    path: &Path,
+    display: &str,
+    expected: &FileId,
+    cap: u64,
+    accepts_type: fn(&std::fs::Metadata) -> bool,
+) -> Result<Capped, MdsError> {
+    let io_error = |e| read_error(display, e);
+    let before = std::fs::metadata(path).map_err(io_error)?;
+    if !accepts_type(&before) {
+        return Err(io_error(not_a_regular_file()));
+    }
+    let file = std::fs::File::open(path).map_err(io_error)?;
+    let opened = file.metadata().map_err(io_error)?;
+    if !accepts_type(&opened) {
+        return Err(file_changed(display));
+    }
+    verify_opened_file(&file, &opened, expected, display)?;
+    read_opened_capped(file, opened.len(), cap).map_err(io_error)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_verified_capped(
+    _path: &Path,
+    display: &str,
+    _expected: &FileId,
+    _cap: u64,
+    _accepts_type: fn(&std::fs::Metadata) -> bool,
+) -> Result<Capped, MdsError> {
+    Err(not_resolved(display))
+}
+
+#[cfg(unix)]
+fn verify_opened_file(
+    _file: &std::fs::File,
+    opened: &std::fs::Metadata,
+    expected: &FileId,
+    display: &str,
+) -> Result<(), MdsError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if (opened.dev(), opened.ino()) != *expected {
+        return Err(file_changed(display));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_opened_file(
+    _file: &std::fs::File,
+    _opened: &std::fs::Metadata,
+    _expected: &FileId,
+    _display: &str,
+) -> Result<(), MdsError> {
+    // The Windows follow-up will compare the opened handle's final path here.
+    Ok(())
 }
 
 /// Read the opened `file`, whose size taken from it is `size`, as [`read_capped`] reads.
@@ -891,13 +970,37 @@ impl FileSystem for VirtualFs {
 
 // ── NativeFs ─────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
+type FileId = (u64, u64);
+#[cfg(windows)]
+type FileId = PathBuf;
+#[cfg(not(any(unix, windows)))]
+type FileId = ();
+
+#[cfg(unix)]
+fn lookup_file_id(metadata: &std::fs::Metadata, _canonical: &Path) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn lookup_file_id(_metadata: &std::fs::Metadata, canonical: &Path) -> FileId {
+    canonical.to_path_buf()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lookup_file_id(_metadata: &std::fs::Metadata, _canonical: &Path) -> FileId {}
+
 /// Native OS filesystem implementation.
 ///
 /// Enforces symlink rejection, path traversal prevention,
 /// file size limits, and UTF-8 validation.
+/// Reads require a key from this instance's entry or import resolution.
 #[derive(Debug)]
 pub struct NativeFs {
     root_dir: OnceLock<PathBuf>,
+    ids: Mutex<HashMap<String, FileId>>,
 }
 
 /// Return the effective parent directory of `path`, always resolving to
@@ -934,6 +1037,7 @@ impl NativeFs {
     pub fn new() -> Self {
         Self {
             root_dir: OnceLock::new(),
+            ids: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1147,6 +1251,11 @@ impl NativeFs {
     /// forbidden path character (#265): a parent directory followed through a
     /// symlink can have a hostile name the caller never typed.
     fn check_symlink_named(path: &Path, shown: &str) -> Result<PathBuf, MdsError> {
+        Self::check_symlink_named_id(path, shown).map(|(canonical, _)| canonical)
+    }
+
+    /// Keep the identity from the same lookup that checks the final component's type.
+    fn check_symlink_named_id(path: &Path, shown: &str) -> Result<(PathBuf, FileId), MdsError> {
         let file_name = path
             .file_name()
             .ok_or_else(|| MdsError::file_not_found(shown.to_string()))?;
@@ -1159,10 +1268,9 @@ impl NativeFs {
         let symlink_error =
             || MdsError::import_error(format!("symlinks are not allowed in imports: {shown}"));
 
-        let file_type = std::fs::symlink_metadata(&joined)
-            .map_err(|_| MdsError::file_not_found(shown.to_string()))?
-            .file_type();
-        if file_type.is_symlink() {
+        let metadata = std::fs::symlink_metadata(&joined)
+            .map_err(|_| MdsError::file_not_found(shown.to_string()))?;
+        if metadata.file_type().is_symlink() {
             return Err(symlink_error());
         }
 
@@ -1173,7 +1281,8 @@ impl NativeFs {
             return Err(symlink_error());
         }
         reject_forbidden_in_path(&canonical, shown)?;
-        Ok(canonical)
+        let id = lookup_file_id(&metadata, &canonical);
+        Ok((canonical, id))
     }
 
     /// Resolve `relative` within `dir` (given as a `&Path`) using the established
@@ -1200,11 +1309,14 @@ impl NativeFs {
             return Err(MdsError::file_not_found(relative));
         }
         let path = dir.join(relative);
-        // Use check_symlink_named so the error message shows the relative import
-        // string (what the user typed) rather than the absolute joined path (R3 / CWE-209).
-        let canonical = Self::check_symlink_named(&path, relative)?;
+        let (canonical, id) = Self::check_symlink_named_id(&path, relative)?;
         self.check_path_traversal(&canonical, relative)?;
-        key_of(&canonical, relative)
+        let key = key_of(&canonical, relative)?;
+        self.ids
+            .lock()
+            .map_err(|_| not_resolved(&self.display_of(&canonical)))?
+            .insert(key.clone(), id);
+        Ok(key)
     }
 
     /// Initialize root_dir from a canonical entry-point directory.
@@ -1229,10 +1341,7 @@ impl FileSystem for NativeFs {
     fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
         validate_entry_path(path)?;
         check_segment_count(path)?;
-        // Use check_symlink (shows path.display()) here — `path` is the
-        // caller-supplied entry path and path.display() == path, so there is no
-        // leakage risk.
-        let canonical = Self::check_symlink(Path::new(path))?;
+        let (canonical, id) = Self::check_symlink_named_id(Path::new(path), path)?;
         // Before the root is anchored: a path refused here must not anchor it.
         let key = key_of(&canonical, path)?;
         // Anchor the security root on first entry-point resolution.
@@ -1240,6 +1349,10 @@ impl FileSystem for NativeFs {
         let entry_dir = effective_parent(&canonical);
         self.init_root(entry_dir);
         self.check_path_traversal(&canonical, path)?;
+        self.ids
+            .lock()
+            .map_err(|_| not_resolved(&self.display_of(&canonical)))?
+            .insert(key.clone(), id);
         Ok(key)
     }
 
@@ -1257,14 +1370,22 @@ impl FileSystem for NativeFs {
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
         let path = Path::new(normalized);
-        // Compute a display-safe (root-relative) path before any IO so errors
-        // always show a relative path rather than the canonical absolute key (R3 / CWE-209).
         let display = self.display_of(path);
-        // A module that is not a regular file is refused before it is opened; the size
-        // is taken from the opened file, and the read itself stops one byte past the
-        // cap, so neither a file swapped nor one grown after the check is held in
-        // memory whole (#428).
-        read_module_file(path, &display)
+        let id = self
+            .ids
+            .lock()
+            .map_err(|_| not_resolved(&display))?
+            .get(normalized)
+            .cloned()
+            .ok_or_else(|| not_resolved(&display))?;
+        let read = read_verified_capped(
+            path,
+            &display,
+            &id,
+            MAX_FILE_SIZE,
+            std::fs::Metadata::is_file,
+        )?;
+        module_text(read, &display)
     }
 
     fn is_markdown(&self, normalized: &str) -> bool {
@@ -2008,8 +2129,108 @@ mod tests {
     #[test]
     fn native_read_nonexistent_errors() {
         let fs = NativeFs::new();
+        // The key has no resolve record, so the read must fail.
         let result = fs.read("/nonexistent/path/that/does/not/exist.mds");
-        assert!(result.is_err(), "expected Err for missing file");
+        assert!(result.is_err(), "expected Err for an unresolved key");
+    }
+
+    #[test]
+    fn native_read_requires_a_resolve_record_for_an_existing_file() {
+        let (_guard, root, fs) = r3_read_display_project();
+        let path = root.join("sub").join("unresolved.mds");
+        std::fs::write(&path, "Hello\n").unwrap();
+        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert_eq!(
+            err.to_string(),
+            "cannot read sub/unresolved.mds: it was not resolved first"
+        );
+
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
+        assert_eq!(fs.read(&key).unwrap(), "Hello\n");
+    }
+
+    #[test]
+    fn native_read_unresolved_message_escapes_the_relative_path() {
+        let (_guard, root, fs) = r3_read_display_project();
+        let name = format!("unresolved{}.mds", char::from_u32(0x202e).unwrap());
+        let path = root.join("sub").join(&name);
+        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "cannot read sub/{}: it was not resolved first",
+                crate::escape_path_for_message(&name)
+            )
+        );
+        assert!(!crate::escape_path_for_message(&name).contains(char::from_u32(0x202e).unwrap()));
+    }
+
+    #[test]
+    fn native_read_refuses_an_unavailable_resolve_record_without_a_panic() {
+        let (_guard, root, fs) = r3_read_display_project();
+        let path = root.join("sub").join("record.mds");
+        std::fs::write(&path, "Hello\n").unwrap();
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
+        assert_eq!(fs.read(&key).unwrap(), "Hello\n");
+
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = fs.ids.lock().unwrap();
+                    panic!("test: the resolve record is unavailable");
+                })
+                .join()
+        });
+        assert!(poisoned.is_err());
+        for result in [
+            fs.read(&key),
+            fs.resolve_entry(path.to_str().unwrap()),
+            fs.normalize_in_dir(root.to_str().unwrap(), "./sub/record.mds"),
+        ] {
+            let err = result.unwrap_err();
+            assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+            assert_eq!(
+                err.to_string(),
+                "cannot read sub/record.mds: it was not resolved first"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_read_reports_a_changed_file_before_its_size_or_bytes() {
+        let (_guard, root, fs) = r3_read_display_project();
+        let path = root.join("sub").join("changed.mds");
+        std::fs::write(&path, "Hello\n").unwrap();
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
+        std::fs::rename(&path, path.with_extension("saved")).unwrap();
+        std::fs::write(&path, [0xff]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_FILE_SIZE + 1)
+            .unwrap();
+        let err = fs.read(&key).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert_eq!(
+            err.to_string(),
+            "cannot read sub/changed.mds: the file changed while it was opened"
+        );
+
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            code_of(&fs.read(&key).unwrap_err()).as_deref(),
+            Some("mds::resource_limit")
+        );
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(fs
+            .read(&key)
+            .unwrap_err()
+            .to_string()
+            .starts_with("invalid UTF-8 in sub/changed.mds"));
     }
 
     #[test]
@@ -2369,18 +2590,15 @@ mod tests {
         }
     }
 
-    // ── NativeFs::read size check (TOCTOU-safe post-read) ────────────────────
+    // ── NativeFs::read size check ──────────────────────────────────────────
 
     #[test]
     fn native_read_rejects_large_file() {
         let dir = TempDir::new().unwrap();
-        // Write a file just over the limit.
-        let big_content = "x".repeat((MAX_FILE_SIZE + 1) as usize);
-        let path = dir.path().join("big.mds");
-        std::fs::write(&path, big_content.as_bytes()).unwrap();
-
+        let path = make_temp_file(&dir, "big.mds", "Hello\n");
         let fs = NativeFs::new();
-        let key = path.display().to_string();
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
+        std::fs::write(&path, "x".repeat((MAX_FILE_SIZE + 1) as usize)).unwrap();
         let err = fs.read(&key).unwrap_err();
         assert!(
             matches!(err, MdsError::ResourceLimit { .. }),
@@ -3810,8 +4028,13 @@ mod tests {
     fn native_read_missing_file_error_shows_root_relative_display() {
         let (_guard, root, fs) = r3_read_display_project();
         let path = root.join("sub").join("missing.mds");
+        std::fs::write(&path, "Hello\n").unwrap();
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
 
-        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        let err = fs.read(&key).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
+        assert!(!err.to_string().contains("it was not resolved first"));
         let msg = err.to_string();
 
         let root_str = root.to_str().unwrap();
@@ -3836,9 +4059,12 @@ mod tests {
     fn native_read_oversize_error_shows_root_relative_display() {
         let (_guard, root, fs) = r3_read_display_project();
         let path = root.join("sub").join("big.mds");
+        std::fs::write(&path, "Hello\n").unwrap();
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
         std::fs::write(&path, "x".repeat((MAX_FILE_SIZE + 1) as usize)).unwrap();
 
-        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        let err = fs.read(&key).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::resource_limit"));
         assert!(
             matches!(err, MdsError::ResourceLimit { .. }),
             "expected ResourceLimit, got {err:?}"
@@ -3866,9 +4092,12 @@ mod tests {
     fn native_read_invalid_utf8_error_shows_root_relative_display() {
         let (_guard, root, fs) = r3_read_display_project();
         let path = root.join("sub").join("bad.mds");
+        std::fs::write(&path, "Hello\n").unwrap();
+        let key = fs.resolve_entry(path.to_str().unwrap()).unwrap();
         std::fs::write(&path, b"Hello \xFF\xFE world\n").unwrap();
 
-        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        let err = fs.read(&key).unwrap_err();
+        assert_eq!(code_of(&err).as_deref(), Some("mds::io"));
         let msg = err.to_string();
 
         let root_str = root.to_str().unwrap();
