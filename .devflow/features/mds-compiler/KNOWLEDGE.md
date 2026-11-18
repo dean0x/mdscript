@@ -1,7 +1,7 @@
 ---
 feature: mds-compiler
 name: MDS Compiler Core (mds-core)
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, working with @message blocks, the intrinsic output format, CompiledOutput, CompileResult, mixed-content errors, the FileSystem trait / path security (entry and import resolution, base-directory anchoring, forbidden path characters, Windows verbatim paths, bounded reads, module identity in error messages, virtual-filesystem module aliases), the output-size cap on evaluator buffers and replace(), lint severity parsing, or @extends region-by-region evaluation, its budgets and its source-map fragment sharing. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, include, define, for, if, message, @message, CompiledOutput, CompileResult, into_markdown, into_messages, intrinsic, mixed_content, MixedContent, has_message_block, process_module_intrinsic, collect_messages_strict, evaluate_messages_intrinsic, TextNode.offset, FileSystem, NativeFs, VirtualFs, resolve_entry, normalize_in_dir, anchor_base_dir, parent_dir, source_root, validate_entry_path, validate_relative_import, validate_import_path, import_path_violation, resolve_entry_key, anchor_base, check_segment_count, MAX_PATH_SEGMENTS, check_symlink, check_symlink_named, check_directory, canonical_dir, init_root, resolve_base_dir, compile_source_in_dir, key_of, is_forbidden_path_char, escape_path_for_message, reject_forbidden_in_path, reject_forbidden_path, with_fs, display_native_path, native_dependencies, simplify_verbatim, verbatim.rs, EvalBudget, evaluate_seeded, evaluate_with_map_seeded, evaluate_messages_seeded, evaluate_regions_with_map, evaluate_message_regions, process_module_extends, validate_extends_components, spliced_regions, Origin, SourceTable, MapBuilder, FragmentMap, splice_fragment, into_fragment, fragment_map_from, prompt_body_and_map, is_visible_export, check_module_bytes, check_module_type, ModuleRef, ModuleKey, NotMdsFile, read_at_most, read_capped, read_regular_capped, read_opened_capped, Capped, read_module_file, scan_import_records, ImportRecord, ImportKind, ResolveAs, VirtualFs::with_aliases, ModuleAliasError, MAX_MODULE_ALIASES, push_capped, replace_result_len, replace_pieces, Severity, FromStr, ParseSeverityError, SeveritySpellings, parse_rule_severities."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, working with @message blocks, the intrinsic output format, CompiledOutput, CompileResult, mixed-content errors, the FileSystem trait / path security (entry and import resolution, base-directory anchoring, forbidden path characters, Windows verbatim paths, bounded reads, module identity in error messages, virtual-filesystem module aliases), the output-size cap on evaluator buffers and replace(), lint severity parsing, or @extends region-by-region evaluation, its budgets and its source-map fragment sharing. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, include, define, for, if, message, @message, CompiledOutput, CompileResult, into_markdown, into_messages, intrinsic, mixed_content, MixedContent, has_message_block, process_module_intrinsic, collect_messages_strict, evaluate_messages_intrinsic, TextNode.offset, FileSystem, NativeFs, VirtualFs, resolve_entry, normalize_in_dir, anchor_base_dir, parent_dir, source_root, validate_entry_path, validate_relative_import, validate_import_path, import_path_violation, resolve_entry_key, anchor_base, check_segment_count, MAX_PATH_SEGMENTS, check_symlink, check_symlink_named, check_directory, canonical_dir, init_root, resolve_base_dir, compile_source_in_dir, key_of, is_forbidden_path_char, escape_path_for_message, reject_forbidden_in_path, reject_forbidden_path, with_fs, display_native_path, native_dependencies, simplify_verbatim, verbatim.rs, EvalBudget, evaluate_seeded, evaluate_with_map_seeded, evaluate_messages_seeded, evaluate_regions_with_map, evaluate_message_regions, process_module_extends, validate_extends_components, spliced_regions, Origin, SourceTable, MapBuilder, FragmentMap, splice_fragment, into_fragment, fragment_map_from, prompt_body_and_map, is_visible_export, check_module_bytes, check_module_type, ModuleRef, ModuleKey, NotMdsFile, read_at_most, read_verified_capped, read_opened_capped, Capped, module_text, VarsFile, EntryPin, with_entry_pin, compile_native_fs, check_native_fs, lint_native_fs, scan_import_records, ImportRecord, ImportKind, ResolveAs, VirtualFs::with_aliases, ModuleAliasError, MAX_MODULE_ALIASES, push_capped, replace_result_len, replace_pieces, Severity, FromStr, ParseSeverityError, SeveritySpellings, parse_rule_severities."
 category: domain-knowledge
 directories: ["crates/mds-core/"]
 referencedFiles:
@@ -28,7 +28,7 @@ referencedFiles:
   - crates/mds-core/tests/output_cap_funnel.rs
   - crates/mds-core/tests/read_bounds.rs
 created: 2026-06-26
-updated: 2026-09-28
+updated: 2026-11-18
 ---
 
 # MDS Compiler Core (mds-core)
@@ -174,7 +174,7 @@ pub fn resolve_source_intrinsic(&mut self, source, base_dir, vars, warnings) -> 
 pub fn resolve_key_intrinsic(&mut self, key, vars, warnings) -> Result<CompiledOutput, MdsError>
 ```
 
-`resolve_path_intrinsic_keyed` additionally returns the entry's resolved key (on `NativeFs`, the canonical path). `mds::lint` uses it so its own re-read of the entry (see below) opens the key the gate already checked, never the caller-typed path again (#428). These are what the `compile_*` lib.rs functions call internally.
+`resolve_path_intrinsic_source` returns the compiled output and exact entry text from the check gate. `resolve_path_intrinsic` discards the text result. `mds::lint` delegates to `lint_native_fs`, which applies rules to that same entry text without another read.
 
 ## Filesystem Boundary (v0.5.0 Wave 1 + 1.5: #155, #265, #371, #408, #409, #413, #414, #415, #417, #428)
 
@@ -205,8 +205,35 @@ Normative rules, codes and pinning tests: `spec.md` §4.6 "Filesystem constraint
 
 ### Module bytes, bounded reads, and module identity (#417, #428)
 
-- `mds::check_module_bytes(bytes: Vec<u8>, display: &str) -> Result<String, MdsError>` is the ONE implementation of the checks every module read runs: over `MAX_FILE_SIZE` (10 MiB) is `mds::resource_limit` (`file too large (<n> bytes, max <max> bytes): <display>`), not valid UTF-8 is `mds::io` (`invalid UTF-8 in <display>: <reason>`), a leading BOM is kept. `NativeFs::read` (via `read_module_file`) calls it, `mds::lint`'s re-read of its entry calls it, and `@mdscript/mds`'s WASM pre-scanner calls the exported `preflightModule(bytes, display, typed)` wrapper, so both backends refuse the same bytes with the same error (#414).
-- Bounded reads (#428): `mds::read_at_most(reader, limit, size_hint) -> std::io::Result<Vec<u8>>` reads to EOF or to `limit` bytes, whichever comes first, into a buffer whose capacity never exceeds `limit` — starts at `size_hint + 1` (room to detect "exactly at the cap" without growing), grows by doubling capped at `limit`; tolerates up to `MAX_INTERRUPTED_READS` (64) consecutive `Interrupted` reads before giving up. mds-core's own module reads pass `cap + 1` as `limit` so one byte over the cap is distinguishable from a source of exactly the cap. `fs::read_capped`/`read_regular_capped` open the file and take its size from the OPENED handle (never a separate `stat`, so no file can swap in between), refusing a file over the cap UNREAD (`Capped::TooLarge(size)`) and returning `Capped::Bytes(..)` (at most one byte over the cap) otherwise; `read_regular_capped` additionally refuses (`not_a_regular_file`, `cannot read <display>: not a regular file`) a path that is a directory, FIFO, device or socket — checked BEFORE opening (a FIFO nobody writes to would otherwise block) and again on the opened handle (a race). `read_module_file` composes `read_regular_capped` + `check_module_bytes`; it backs `NativeFs::read` and `mds::lint`'s entry re-read.
+- `mds::check_module_bytes(bytes: Vec<u8>, display: &str) -> Result<String, MdsError>` applies the shared size and UTF-8 checks. A leading BOM stays intact.
+- `NativeFs::read` passes its verified capped result through `module_text` to `check_module_bytes`. The WASM pre-scanner calls the exported `preflightModule` wrapper.
+- `mds::read_at_most(reader, limit, size_hint)` returns bytes through EOF or `limit`, whichever comes first. Capacity stays within `limit`; 64 consecutive Interrupted reads end the attempt.
+- `read_opened_capped` uses the opened handle's size. It returns `Capped::TooLarge(size)` unread when that size exceeds the cap; otherwise it reads at most `cap + 1` bytes.
+- `NativeFs` stores resolve records in `Mutex<HashMap<String, FileId>>`. Entry and import resolution record the identity from the final component's no-follow type lookup.
+- `NativeFs::read` requires a record from the same instance. An absent record or poisoned record lock returns `mds::io`: `cannot read <display>: it was not resolved first`.
+- `read_verified_capped` checks the path's type before open, then compares the opened handle before any byte read. Module sources must be regular files.
+- Unix compares device and inode with the no-follow record. Windows compares `GetFinalPathNameByHandleW` with the recorded canonical path; other native targets refuse reads.
+- A mismatch returns `mds::io`: `cannot read <display>: the file changed while it was opened`. Both fixed messages use the escaped root-relative display.
+- `VarsFile::resolve` retains the canonical path, lookup identity and lookup type. `load_vars_file_reporting_duplicates` reads it through the same verified capped reader.
+- Vars regular files receive the opened-file comparison. A FIFO at lookup and open skips the identity comparison, with the same 10 MiB cap.
+- Other vars types and type mismatches return the fixed changed-file error. Process substitution remains valid on macOS; Linux refuses `/dev/fd` links.
+- Limits: imported-module reads can still select a same-named file from another directory. Windows accepts a replacement regular file at the same path.
+- Some overlay or network filesystems report different lookup and handle identities and refuse reads. A source open can still wait indefinitely for a FIFO.
+- A watch vars path can still read a same-named file from another directory.
+
+### Native entry pins
+
+- `EntryPin` is `#[non_exhaustive]`, with private state. `EntryPin::key` requires the canonical key; `with_walked` adds device and inode from walk metadata on Unix.
+- `EntryPin::parent_dir` requires only the canonical parent. Watch uses this form so a save by rename or case-only name change can pass.
+- `NativeFs::with_entry_pin` applies the pin only at entry resolution, before root setup. Imports use their own resolve records, not the entry pin.
+- `compile_native_fs(fs, entry, vars, opts)`, `check_native_fs(fs, entry, vars)` and `lint_native_fs(fs, entry, vars, config)` accept a caller-built `NativeFs`.
+- The path entry APIs delegate to these functions with `NativeFs::new()`. `CompileOptions` has no pin field; `ModuleCache::native()` keeps its signature.
+- `lint_native_fs` applies its rules to the check gate's exact entry text. It does not re-read the entry.
+- A walked file must match its canonical key and, on Unix, the walked identity. A watch entry must match its canonical parent.
+- These pins do not freeze file content. A directory command can refuse a save by rename; a later run can accept it.
+
+### Module identity in errors
+
 - Module identity in errors, `mds::ModuleRef<'a> { key, typed }` (#417): built ONLY via the two-step `ModuleRef::keyed(key).typed(typed)` (`ModuleKey` is the `#[must_use]` intermediate) so a key and a caller-typed path can never be swapped by position. `key` is what every check/cache/read uses (on `NativeFs`, the canonical on-disk-cased path); `typed` only ever names the module in a message, escaped with `escape_path_for_message`. `mds::check_module_type(module: ModuleRef, source: &str)` judges the extension on `module.key` (so `Doc.MDS` typed for `doc.mds` still passes, #408) but on refusal names `module.typed` in `MdsError::NotMdsFile { path }` — which used to hold the resolved key (an absolute path on `NativeFs`, a host-path leak, CWE-209) and now holds only the escaped typed text. `check_module_type` is the resolver's not-an-MDS-file check, run after a module is read and before it is parsed; `@mdscript/mds`'s WASM pre-scanner runs the same check through `preflightModule` in the same place, so a non-MDS file is refused identically on both backends before any import-like line in it is followed.
 
 ### Import records and virtual module aliases (#414)
@@ -312,7 +339,7 @@ Mixed-content errors surface as `mds::mixed_content` from both `compile*` and `c
 - `crates/mds-core/src/evaluator.rs` — `evaluate_messages_intrinsic`, `EvalMessage`, `EvalBudget`, `push_capped`
 - `crates/mds-core/src/builtins.rs` — `builtin_replace`, `replace_result_len`, `replace_pieces` (output-cap pre-sizing, #415)
 - `crates/mds-core/src/ast.rs` — `TextNode` with `offset: usize` field
-- `crates/mds-core/src/fs.rs` — `FileSystem` trait (Security Contract rustdoc), `NativeFs`, `VirtualFs` (+ `with_aliases`, `ModuleAliasError`), `check_module_bytes`, `read_at_most`/`read_capped`, `check_directory`, `reject_forbidden_path`, shared path guards
+- `crates/mds-core/src/fs.rs` — `FileSystem` trait (Security Contract rustdoc), `NativeFs`, `VirtualFs` (+ `with_aliases`, `ModuleAliasError`), `EntryPin`, `VarsFile`, `check_module_bytes`, `read_at_most`/`read_verified_capped`, `check_directory`, `reject_forbidden_path`, shared path guards
 - `crates/mds-core/src/options.rs` — `parse_rule_severities`, `json_type_name`, `format_unknown_keys_error`
 - `crates/mds-core/src/sourcemap.rs` — `SourceTable`, `MapBuilder`, `FragmentMap`, `Origin`
 - `crates/mds-core/src/lint/diagnostic.rs` — `Severity`, `ParseSeverityError`, `SeveritySpellings`, `is_forbidden_path_char`, `escape_path_for_message`
