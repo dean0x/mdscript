@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A directory build, watch, check, lint or fmt now reads only the files it found in the project.
+- On a rebuild, `mds watch` reports a path lookup error and keeps the session active.
 - `--vars` reads a regular file or a named pipe; other file types are refused.
 - **BREAKING (Rust API): `NativeFs::read` refuses a key that this instance did not resolve first.** It returns `mds::io` with `cannot read <display>: it was not resolved first`.
 - The napi and Python bindings no longer print internal error details to the host's standard error (#436).

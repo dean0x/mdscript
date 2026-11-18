@@ -50,10 +50,30 @@ input. The compiler enforces several defense-in-depth controls:
   checks the directory argument of `mds build`, `mds check`, `mds fmt`, `mds lint`
   and `mds watch` by the same rule before it is walked, however it is typed (`link/`
   and `link/.` included), and refuses a symlinked one, or the filesystem root, as
-  `mds::io`, exit 2 (#413). `mds watch` re-checks the path it watches before every
-  rebuild — the entry in file mode, the directory argument and each source below
-  it in directory mode — and refuses the rebuild once a symbolic link on that path
-  has been retargeted (#417, #413).
+  `mds::io`, exit 2 (#413).
+- **Native source reads**: `NativeFs::read` accepts only a key that the same instance
+  resolved as an entry or import. Before it reads bytes, it compares the opened file
+  with that resolve record: device and inode on Unix, the handle's final path on Windows.
+  A mismatch returns `mds::io`: `cannot read <display>: the file changed while it was opened`.
+  An absent or unreadable record returns `mds::io`: `cannot read <display>: it was not resolved first`.
+  Other targets refuse native source reads. `mds::lint` applies its rules to the entry text
+  that the check gate read. Imported-module reads can still select a same-named file from
+  another directory. On Windows, a replacement regular file at the same path is still read.
+  Some overlay or network filesystems report different identities and refuse the read.
+  A source open can still wait indefinitely for a named pipe.
+- **Directory and watch entries**: a directory build, check, lint or fmt compares each
+  entry with its walked canonical path, plus the walk's device and inode on Unix.
+  `mds watch` compares the directory argument with its watched canonical directory before each rebuild.
+  It compares each entry or source's canonical parent with its watched parent before the compile
+  and again during entry resolution. A case-only file-name change within that parent is not a move.
+  A path lookup error, a different root or a different parent refuses the compile.
+  Watch reports the rebuild error and keeps the session active.
+  Watch uses the parent path, not a stored file identity; same-parent replacements remain possible.
+- **Vars file reads**: `--vars` accepts a regular file or a named pipe, with the same 10 MiB cap.
+  Regular files use the opened-file comparison above. Named pipes must have that type at lookup and open;
+  their device and inode are not compared. Other types and type mismatches return `mds::io`.
+  Process substitution works on macOS; Linux refuses `/dev/fd` links.
+  A watch vars path can still read a same-named file from another directory.
 - **Null-byte rejection**: paths containing NUL bytes are rejected at the API
   boundary rather than being passed to the OS.
 - **Forbidden path characters are refused at input, not only escaped on output**
@@ -353,18 +373,18 @@ A release build therefore does not contain it — the variable is never read —
 profile turns debug assertions on. Build with debug assertions for development, not for
 anything you ship.
 
-Five more test-only hooks are compiled in the same way. Four of them stop the run at one
-point until a test lets it go, so that the test can change a file in the window that point
-opens. `MDS_TEST_PAUSE_BEFORE_REPLACE` stops a rewrite between its read and its replace,
-and a write of a new file between its look at the name and its commit.
-`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` stops a directory `mds watch` rebuild after it has told
-the sources still there from the sources gone, and before it compiles them.
-`MDS_TEST_PAUSE_AFTER_LOOK` stops a rebuild, in either watch mode, after it has looked for
-emptied files and before it reads any. `MDS_TEST_PAUSE_AFTER_READ` stops a file-mode
-rebuild after its compile has read every file, before it takes its baseline. Each variable
-names a file: the run writes `<file>.paused` when it stops, and goes on once `<file>`
-exists, or after ten seconds. The fifth, `MDS_TEST_READY`, has `mds watch` create the file
-the variable names once it is watching — by path, outside the write primitive's checks.
+Seven more test-only hooks use the same compile condition. Six pause the run at one point until a test releases it.
+`MDS_TEST_PAUSE_BEFORE_REPLACE` pauses a rewrite between its read and its replace.
+For a new file, it pauses the write between its name lookup and its commit.
+`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` pauses a directory `mds watch` rebuild after its source-presence check, before the compile.
+`MDS_TEST_PAUSE_AFTER_LOOK` pauses a rebuild, in either watch mode, after its empty-file check, before any source read.
+`MDS_TEST_PAUSE_AFTER_READ` pauses a file-mode rebuild after the compile reads its files, before its baseline snapshot.
+`MDS_TEST_PAUSE_AFTER_WALK` pauses a directory command after its file walk.
+`MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` pauses a watch compile after its path check, before entry resolution.
+Each pause variable names a file. The run writes `<file>.paused` at the pause point.
+It resumes once `<file>` exists, or after ten seconds.
+`MDS_TEST_READY` has `mds watch` create the file the variable names once the watch is active.
+It creates that file by path, outside the write primitive's checks.
 A release build contains none of them: each has an empty stub there, so it never reads the
 variable and never writes the file, unless its profile turns debug assertions on.
 `panic_hook.rs` pins this for each hook, as it does for `MDS_TEST_PANIC`.
