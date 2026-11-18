@@ -4035,7 +4035,7 @@ mod tests {
         let mut cache = crate::resolver::ModuleCache::native();
         cache
             .resolve_key(key.to_str().unwrap(), &HashMap::new(), &mut vec![])
-            .map(|m| m.prompt_body.clone())
+            .map(|m| m.prompt_body.as_deref().map(str::to_owned))
     }
 
     #[test]

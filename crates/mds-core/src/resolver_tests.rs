@@ -707,8 +707,88 @@ fn captures_keep_each_imported_prompt_write() {
 }
 
 #[test]
+fn prompt_imports_and_captures_share_the_module_text() {
+    let mut cache = virtual_cache(&[("lib.mds", "library")]);
+    let mut shared = Vec::new();
+    for names in ["", "    names: [prompt]\n"] {
+        let source = format!(
+            "---\nimports:\n  - path: ./lib.mds\n{names}---\n{}",
+            concat!(
+                "@define fm():\n{{prompt}}\n@end\n",
+                "@import \"./lib.mds\"\n@define first():\n{{prompt}}\n@end\n",
+                "@import \"./lib.mds\"\n@define second():\n{{prompt}}\n@end\n",
+                "@import { prompt } from \"./lib.mds\"\n@define pick():\n{{prompt}}\n@end\n",
+                "{{fm()}}/{{first()}}/{{second()}}/{{pick()}}"
+            )
+        );
+        let module = cache
+            .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            module.prompt_body.as_deref(),
+            Some("library/library/library/library")
+        );
+        let library = &cache.modules["lib.mds"];
+        let body = library.prompt_body.as_deref().unwrap();
+        let value = library.shared_prompt_value().unwrap();
+        let mut scope = Scope::new();
+        for name in ["fm", "first", "second", "pick"] {
+            scope.push_call(&module.functions[name]);
+            let slot = scope.get_slot("prompt").unwrap();
+            let Value::String(text) = slot.get().unwrap() else {
+                panic!("{name} must capture prompt text");
+            };
+            assert!(
+                Arc::ptr_eq(slot.root(), &value),
+                "{name} must share the prompt value"
+            );
+            shared.push((name, text.as_ptr() == body.as_ptr()));
+            scope.pop().unwrap();
+        }
+    }
+    assert_eq!(
+        shared,
+        [
+            ("fm", true),
+            ("first", true),
+            ("second", true),
+            ("pick", true)
+        ]
+        .repeat(2)
+    );
+}
+
+#[test]
+fn alias_imports_share_the_module_namespace_and_text() {
+    let source = concat!(
+        "---\nimports:\n  - path: ./lib.mds\n    as: front\n---\n",
+        "@import \"./lib.mds\" as body\n@define f():\n{{front.g()}}/{{body.g()}}\n@end\n{{f()}}"
+    );
+    let mut cache = virtual_cache(&[("lib.mds", "@define g():\nresult\n@end\nlibrary")]);
+    let module = cache
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("result/result"));
+    let capture = &module.functions["f"].captured;
+    let front = capture.weak_namespace("front").unwrap();
+    let body = capture.weak_namespace("body").unwrap();
+    let library = &cache.modules["lib.mds"];
+    let text = library.prompt_body.as_deref().unwrap();
+    let namespace = front.upgrade().unwrap();
+    let namespace_text = namespace.prompt_body.as_deref().unwrap();
+    assert_eq!(
+        (
+            front.ptr_eq(&body),
+            Arc::ptr_eq(&namespace, &library.shared_namespace()),
+            text.as_ptr() == namespace_text.as_ptr(),
+        ),
+        (true, true, true)
+    );
+}
+
+#[test]
 fn captured_import_graph_drops_after_the_last_owner() {
-    let (keep, imported, link, namespace) = {
+    let (keep, imported, link, namespace, prompt) = {
         let mut cache = virtual_cache(&[
             ("merge.mds", "@define merged():\nmerge\n@end"),
             ("alias.mds", "@define aliased():\nalias\n@end"),
@@ -727,19 +807,201 @@ fn captured_import_graph_drops_after_the_last_owner() {
         let imported = Arc::downgrade(&cache.modules["merge.mds"].functions["merged"]);
         let link = keep.captured.weak_head().unwrap();
         let namespace = keep.captured.weak_namespace("lib").unwrap();
-        (keep, imported, link, namespace)
+        let prompt = Arc::downgrade(&cache.modules["prompt.mds"].shared_prompt_value().unwrap());
+        (keep, imported, link, namespace, prompt)
     };
     let local = Arc::downgrade(&keep);
     assert!(local.upgrade().is_some());
     assert!(imported.upgrade().is_some());
     assert!(link.upgrade().is_some());
     assert!(namespace.upgrade().is_some());
+    assert!(prompt.upgrade().is_some());
 
     drop(keep);
     assert!(local.upgrade().is_none());
     assert!(imported.upgrade().is_none());
     assert!(link.upgrade().is_none());
     assert!(namespace.upgrade().is_none());
+    assert!(prompt.upgrade().is_none());
+}
+
+mod prompt_source_scan {
+    #[test]
+    fn internal_prompt_producers_use_shared_accessors() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src];
+        let mut files = 0;
+        let mut hits = Vec::new();
+        for _ in 0..1024 {
+            let Some(dir) = dirs.pop() else { break };
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    dirs.push(path);
+                } else if kind.is_file()
+                    && path.extension().is_some_and(|ext| ext == "rs")
+                    && !entry.file_name().to_string_lossy().ends_with("_tests.rs")
+                {
+                    files += 1;
+                    let count = forbidden_producers(&std::fs::read_to_string(&path).unwrap());
+                    if count != 0 {
+                        hits.push((path, count));
+                    }
+                }
+            }
+        }
+        assert!(dirs.is_empty(), "must visit every source directory");
+        assert!(
+            files >= 10,
+            "expected at least ten source files, saw {files}"
+        );
+        assert!(
+            hits.is_empty(),
+            "use the shared accessors instead: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_source_scan_detects_each_planted_producer() {
+        let ignored = r##"
+            pub fn get_prompt_value(&self) -> Option<Value> { None }
+            // m.get_prompt_value();
+            /* outer /* nested */ m.to_namespace(); */
+            const TEXT: &str = r#"m.to_namespace();"#;
+            #[cfg(test)] fn sample() { m.get_prompt_value(); }
+            #[cfg(test)] mod extra;
+        "##;
+        assert_eq!(forbidden_producers(ignored), 0);
+        for planted in ["m.get_prompt_value();", "m.to_namespace();"] {
+            assert_eq!(forbidden_producers(&format!("{ignored}{planted}")), 1);
+        }
+    }
+
+    fn forbidden_producers(source: &str) -> usize {
+        let tokens = source_tokens(source);
+        let mut rest = tokens.as_slice();
+        let mut prev = "";
+        let mut hits = 0;
+        for _ in 0..tokens.len() {
+            if let Some(item) = rest.strip_prefix(&["#", "[", "cfg", "(", "test", ")", "]"]) {
+                rest = after_test_item(item);
+                prev = "";
+            } else if let Some((&token, tail)) = rest.split_first() {
+                hits += usize::from(
+                    token == "to_namespace" || (token == "get_prompt_value" && prev != "fn"),
+                );
+                rest = tail;
+                prev = token;
+            } else {
+                break;
+            }
+        }
+        hits
+    }
+
+    fn after_test_item<'a>(item: &'a [&'a str]) -> &'a [&'a str] {
+        let mut nested = 0;
+        for (i, &token) in item.iter().enumerate() {
+            match token {
+                "[" | "(" | "{" => nested += 1,
+                "]" | ")" | "}" => {
+                    nested -= 1;
+                    if nested == 0 && token == "}" {
+                        return &item[i + 1..];
+                    }
+                }
+                ";" if nested == 0 => return &item[i + 1..],
+                _ => {}
+            }
+        }
+        panic!("expected an end to the test item");
+    }
+
+    // Ignore comments and literals before the scan considers names or test attributes.
+    fn source_tokens(mut rest: &str) -> Vec<&str> {
+        let mut tokens = Vec::new();
+        for _ in 0..rest.len() {
+            rest = rest.trim_start();
+            let Some(first) = rest.chars().next() else {
+                break;
+            };
+            if let Some(line) = rest.strip_prefix("//") {
+                rest = line.split_once('\n').map_or("", |(_, tail)| tail);
+            } else if let Some(block) = rest.strip_prefix("/*") {
+                rest = after_block_comment(block);
+            } else if let Some(tail) = after_literal(rest) {
+                rest = tail;
+            } else {
+                let len = if first.is_alphanumeric() || first == '_' {
+                    rest.find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len())
+                } else {
+                    first.len_utf8()
+                };
+                let (token, tail) = rest.split_at(len);
+                tokens.push(token);
+                rest = tail;
+            }
+        }
+        tokens
+    }
+
+    fn after_block_comment(mut rest: &str) -> &str {
+        let mut depth = 1;
+        for _ in 0..rest.len() {
+            let at = rest.find(['/', '*']).expect("must close block comment");
+            rest = &rest[at..];
+            if rest.starts_with("/*") {
+                depth += 1;
+                rest = &rest[2..];
+            } else if rest.starts_with("*/") {
+                depth -= 1;
+                rest = &rest[2..];
+                if depth == 0 {
+                    return rest;
+                }
+            } else {
+                rest = &rest[1..];
+            }
+        }
+        panic!("must close block comment");
+    }
+
+    fn after_literal(source: &str) -> Option<&str> {
+        let source = source
+            .strip_prefix('b')
+            .or_else(|| source.strip_prefix('c'))
+            .unwrap_or(source);
+        if let Some(raw) = source.strip_prefix('r') {
+            let quote = raw.find(|c| c != '#')?;
+            let body = raw[quote..].strip_prefix('"')?;
+            let end = format!("\"{}", &raw[..quote]);
+            return body.split_once(&end).map(|(_, tail)| tail);
+        }
+        if let Some(body) = source.strip_prefix('"') {
+            let mut escaped = false;
+            for (i, c) in body.char_indices() {
+                if !escaped && c == '"' {
+                    return Some(&body[i + 1..]);
+                }
+                escaped = !escaped && c == '\\';
+            }
+            return None;
+        }
+        let body = source.strip_prefix('\'')?;
+        let len = if let Some(escape) = body.strip_prefix('\\') {
+            match escape.as_bytes().first()? {
+                b'x' => 4,
+                b'u' => escape.find('}')? + 2,
+                _ => 2,
+            }
+        } else {
+            body.chars().next()?.len_utf8()
+        };
+        body.get(len..)?.strip_prefix('\'')
+    }
 }
 
 #[test]
@@ -1251,7 +1513,8 @@ fn f5_diamond_inheritance_cache_not_polluted() {
         "F5: B should compile: {:?}",
         b_resolved.err()
     );
-    let b_body = b_resolved.unwrap().prompt_body.clone().unwrap_or_default();
+    let b_resolved = b_resolved.unwrap();
+    let b_body = b_resolved.prompt_body.as_deref().unwrap_or_default();
     assert!(
         b_body.contains("From B."),
         "F5: B should contain its override: {b_body}"
@@ -1264,7 +1527,8 @@ fn f5_diamond_inheritance_cache_not_polluted() {
         "F5: C should compile: {:?}",
         c_resolved.err()
     );
-    let c_body = c_resolved.unwrap().prompt_body.clone().unwrap_or_default();
+    let c_resolved = c_resolved.unwrap();
+    let c_body = c_resolved.prompt_body.as_deref().unwrap_or_default();
     assert!(
         c_body.contains("From A."),
         "F5: C should use A's default (not B's override): {c_body}"

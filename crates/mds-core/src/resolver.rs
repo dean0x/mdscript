@@ -22,7 +22,7 @@ use crate::limits::{
     MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT,
 };
 use crate::parser::parse_with_ctx;
-use crate::scope::{FunctionDef, NamespaceScope, Scope, VarLayer};
+use crate::scope::{FunctionDef, NamespaceScope, PromptText, Scope, VarLayer};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
 pub(crate) use crate::sourcemap::Origin;
 use crate::sourcemap::SourceIndex;
@@ -74,9 +74,7 @@ impl Clone for EffectiveBlock {
 
 /// A resolved module with its AST, exports, and prompt body.
 ///
-/// Fields are `pub(crate)` — all external access must go through the methods
-/// (`get_export`, `get_all_exports`, `get_prompt_value`, `to_namespace`) which
-/// enforce export-visibility logic. Direct field access bypasses that logic.
+/// Use the accessors for imports. They respect the module's export list.
 ///
 /// # Template Inheritance Fields
 ///
@@ -122,7 +120,8 @@ impl Clone for EffectiveBlock {
 ///   descendants that already `Arc::clone`'d them keep pointer-identity.
 pub struct ResolvedModule {
     pub(crate) functions: HashMap<String, Arc<FunctionDef>>,
-    pub(crate) prompt_body: Option<String>,
+    pub(crate) prompt_body: Option<PromptText>,
+    namespace: Arc<NamespaceScope>,
     /// Pre-computed source-map fragment for this module's `prompt` output.
     ///
     /// Populated by `process_module` — and, for an extending module, by
@@ -183,6 +182,7 @@ impl Clone for ResolvedModule {
         Self {
             functions: self.functions.clone(),
             prompt_body: self.prompt_body.clone(),
+            namespace: Arc::clone(&self.namespace),
             prompt_map: self.prompt_map.clone(),
             raw_frontmatter: self.raw_frontmatter.clone(),
             has_explicit_exports: self.has_explicit_exports,
@@ -1234,11 +1234,9 @@ impl ModuleCache {
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
         // When source-map mode is active and the module exports "prompt", run a
-        // single evaluate_with_map pass to collect both the body string and the
-        // segment records in one traversal (no double-evaluation).  The resulting
-        // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
-        // that imports this module, enabling @include splice attribution (S6). The body
-        // is evaluated either way: WARN-B needs it when `prompt` is not exported.
+        // single evaluate_with_map pass to collect both the text and its segment records.
+        // The module and its namespace share the fragment map for @include attribution.
+        // Evaluate the body even if it is not exported, to distinguish the two include warnings.
         let (body_raw, builder) = if self.source_map_mode && prompt_exported {
             let builder = crate::sourcemap::MapBuilder::new(origin.clone());
             // evaluate_with_map derives file/source from the builder's current source
@@ -1259,9 +1257,17 @@ impl ModuleCache {
         // Move module.body into Arc<[Node]> (reuses the Vec allocation, no element clones, P1).
         let effective_skeleton: Arc<[Node]> = Arc::from(module.body);
 
+        let namespace = ResolvedModule::build_namespace(
+            &functions,
+            has_explicit_exports,
+            &explicit_exports,
+            prompt_body.as_ref(),
+            prompt_map.as_ref(),
+        );
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            namespace,
             prompt_map,
             raw_frontmatter,
             has_explicit_exports,
@@ -1559,9 +1565,17 @@ impl ModuleCache {
         let (prompt_body, prompt_map) =
             prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
+        let namespace = ResolvedModule::build_namespace(
+            &functions,
+            has_explicit_exports,
+            &explicit_exports,
+            prompt_body.as_ref(),
+            prompt_map.as_ref(),
+        );
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            namespace,
             prompt_map,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.
@@ -1773,20 +1787,23 @@ impl ModuleCache {
                 (eff_skeleton, eff_blocks, root_origin, own_fm_values)
             };
 
-        // A1 invariant: is_skeleton=true implies prompt_body=None (evaluate was never called).
-        // Pinned with debug_assert so a future refactor that accidentally adds evaluate on this path
-        // is caught immediately in debug builds. (Full enum split is tech debt.)
-        let prompt_body: Option<String> = None;
+        // Skeleton entries have no evaluated text or fragment map.
+        let prompt_body: Option<PromptText> = None;
         debug_assert!(
             prompt_body.is_none(),
             "A1 invariant: skeleton entry (is_skeleton=true) must have prompt_body=None"
         );
-
+        let namespace = ResolvedModule::build_namespace(
+            &functions,
+            has_explicit_exports,
+            &explicit_exports,
+            prompt_body.as_ref(),
+            None,
+        );
         Ok(ResolvedModule {
             functions,
+            namespace,
             prompt_body,
-            // Skeleton entries are never evaluated — no fragment map is built.
-            // A1 invariant: prompt_body=None and prompt_map=None for skeleton entries.
             prompt_map: None,
             raw_frontmatter,
             has_explicit_exports,
@@ -1962,7 +1979,7 @@ impl ModuleCache {
                 warnings,
             )
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
-        scope.set_namespace(alias, Arc::new(resolved.to_namespace()));
+        scope.set_namespace(alias, resolved.shared_namespace());
         Ok(())
     }
 
@@ -1984,7 +2001,7 @@ impl ModuleCache {
                     let resolved = self
                         .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
-                    scope.set_namespace(alias, Arc::new(resolved.to_namespace()));
+                    scope.set_namespace(alias, resolved.shared_namespace());
                 }
                 FrontmatterImport::Merge { path } => {
                     let resolved = self
@@ -1996,8 +2013,8 @@ impl ModuleCache {
                         }
                         scope.set_function(&name, func);
                     }
-                    if let Some(val) = resolved.get_prompt_value() {
-                        scope.set_var("prompt", val);
+                    if let Some(val) = resolved.shared_prompt_value() {
+                        scope.set_var_shared("prompt", val);
                     }
                 }
                 FrontmatterImport::Selective { path, names } => {
@@ -2011,10 +2028,10 @@ impl ModuleCache {
                     };
                     for name in names {
                         if name == "prompt" {
-                            scope.set_var(
+                            scope.set_var_shared(
                                 "prompt",
                                 resolved
-                                    .get_prompt_value()
+                                    .shared_prompt_value()
                                     .ok_or_else(|| not_exported(name))?,
                             );
                         } else {
@@ -2064,8 +2081,8 @@ impl ModuleCache {
             }
             scope.set_function(&name, func);
         }
-        if let Some(val) = resolved.get_prompt_value() {
-            scope.set_var("prompt", val);
+        if let Some(val) = resolved.shared_prompt_value() {
+            scope.set_var_shared("prompt", val);
         }
         Ok(())
     }
@@ -2100,10 +2117,10 @@ impl ModuleCache {
         };
         for name in names {
             if name == "prompt" {
-                scope.set_var(
+                scope.set_var_shared(
                     "prompt",
                     resolved
-                        .get_prompt_value()
+                        .shared_prompt_value()
                         .ok_or_else(|| not_exported(name))?,
                 );
             } else {
@@ -2180,44 +2197,49 @@ impl ResolvedModule {
             .collect()
     }
 
-    /// Get the prompt body as a Value, if it is an available export.
+    /// Get the prompt body as an owned Value, if it is an available export.
     pub fn get_prompt_value(&self) -> Option<Value> {
+        self.shared_prompt_value().as_deref().cloned()
+    }
+
+    pub(crate) fn shared_prompt_value(&self) -> Option<Arc<Value>> {
         if self.is_exported("prompt") {
-            self.prompt_body.clone().map(Value::String)
+            self.prompt_body.as_ref().map(PromptText::shared_value)
         } else {
             None
         }
     }
 
-    /// Convert this resolved module into a namespace scope for aliased imports.
-    fn to_namespace(&self) -> NamespaceScope {
-        // Build the HashMap in one pass, avoiding the intermediate Vec that
-        // get_all_exports() would allocate.
-        let functions = self
-            .functions
+    pub(crate) fn shared_namespace(&self) -> Arc<NamespaceScope> {
+        Arc::clone(&self.namespace)
+    }
+
+    fn build_namespace(
+        functions: &HashMap<String, Arc<FunctionDef>>,
+        has_explicit_exports: bool,
+        explicit_exports: &HashSet<String>,
+        prompt_body: Option<&PromptText>,
+        prompt_map: Option<&Arc<crate::sourcemap::FragmentMap>>,
+    ) -> Arc<NamespaceScope> {
+        let is_exported = |name| is_visible_export(has_explicit_exports, explicit_exports, name);
+        let functions = functions
             .iter()
-            .filter(|(name, _)| self.is_exported(name))
+            .filter(|(name, _)| is_exported(name.as_str()))
             .map(|(name, func)| (name.clone(), Arc::clone(func)))
             .collect();
-        // Respect export visibility: prompt_body and prompt_map are only included
-        // in the namespace when "prompt" is an available export (same rule as
-        // get_prompt_value).  Arc::clone is O(1) — no segment data is copied.
-        let prompt_exported = self.is_exported("prompt");
+        let prompt_exported = is_exported("prompt");
+        let prompt_suppressed_by_exports = !prompt_exported && prompt_body.is_some();
         let (prompt_body, prompt_map) = if prompt_exported {
-            (self.prompt_body.clone(), self.prompt_map.clone())
+            (prompt_body.cloned(), prompt_map.cloned())
         } else {
             (None, None)
         };
-        // True when the module has body text but its @export list explicitly
-        // excludes "prompt" — the caller's @include will produce empty output
-        // and WARN-B should fire instead of WARN-A.
-        let prompt_suppressed_by_exports = !prompt_exported && self.prompt_body.is_some();
-        NamespaceScope {
+        Arc::new(NamespaceScope {
             functions,
             prompt_body,
             prompt_map,
             prompt_suppressed_by_exports,
-        }
+        })
     }
 }
 
@@ -2385,8 +2407,11 @@ fn prompt_body_and_map(
     builder: Option<crate::sourcemap::MapBuilder>,
     display: &str,
     warnings: &mut Vec<String>,
-) -> (Option<String>, Option<Arc<crate::sourcemap::FragmentMap>>) {
-    let prompt_body = (!body_raw.trim().is_empty()).then_some(body_raw);
+) -> (
+    Option<PromptText>,
+    Option<Arc<crate::sourcemap::FragmentMap>>,
+) {
+    let prompt_body = (!body_raw.trim().is_empty()).then(|| PromptText::from(body_raw));
     let prompt_map =
         builder.and_then(|b| fragment_map_from(b, prompt_body.as_deref(), display, warnings));
     (prompt_body, prompt_map)

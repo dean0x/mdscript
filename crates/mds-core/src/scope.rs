@@ -367,13 +367,48 @@ impl Frame {
     }
 }
 
+/// A module's prompt text, shared with its namespace and imported variables.
+#[derive(Clone)]
+pub(crate) struct PromptText(Arc<Value>);
+
+impl From<String> for PromptText {
+    fn from(text: String) -> Self {
+        Self(Arc::new(Value::String(text)))
+    }
+}
+
+impl PromptText {
+    pub(crate) fn shared_value(&self) -> Arc<Value> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl std::ops::Deref for PromptText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self.0.as_ref() {
+            Value::String(text) => text,
+            _ => unreachable!("PromptText contains only a string"),
+        }
+    }
+}
+
+impl std::fmt::Debug for PromptText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromptText")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
 /// A namespace scope for aliased imports.
 #[derive(Debug)]
 pub struct NamespaceScope {
     /// Functions stored as `Arc` so cloning out of scope is O(1).
     pub functions: HashMap<String, Arc<FunctionDef>>,
     /// The compiled prompt body of the imported module.
-    pub prompt_body: Option<String>,
+    pub(crate) prompt_body: Option<PromptText>,
     /// Pre-computed source-map fragment for the module's `prompt` body.
     ///
     /// Populated when the parent compilation runs in source-map mode and the
@@ -678,7 +713,7 @@ mod tests {
             "lib",
             NamespaceScope {
                 functions: HashMap::new(),
-                prompt_body: Some("outer".into()),
+                prompt_body: Some("outer".to_owned().into()),
                 prompt_map: None,
                 prompt_suppressed_by_exports: false,
             },
@@ -688,7 +723,7 @@ mod tests {
             "lib",
             NamespaceScope {
                 functions: HashMap::new(),
-                prompt_body: Some("inner".into()),
+                prompt_body: Some("inner".to_owned().into()),
                 prompt_map: None,
                 prompt_suppressed_by_exports: false,
             },

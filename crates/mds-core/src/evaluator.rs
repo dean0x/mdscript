@@ -1194,8 +1194,8 @@ fn evaluate_include(
         .get_namespace(&inc.alias)
         .ok_or_else(|| MdsError::undefined_var(&inc.alias))?;
 
-    let prompt_body = match &ns.prompt_body {
-        Some(body) => body.clone(),
+    let prompt_body = match ns.prompt_body.as_deref() {
+        Some(body) => body,
         None => {
             if ctx.warnings.len() < MAX_WARNINGS {
                 // Untrusted identifier from template source — WIRE (spec 7.5).
@@ -1232,7 +1232,7 @@ fn evaluate_include(
         map.splice_fragment(fragment, base);
     }
 
-    Ok(prompt_body)
+    Ok(prompt_body.to_owned())
 }
 
 /// A single structured message produced by `evaluate_messages_intrinsic`.
@@ -3384,7 +3384,7 @@ mod tests {
         b.push_segment(5, 0, 4);
         crate::scope::NamespaceScope {
             functions: std::collections::HashMap::new(),
-            prompt_body: Some("mmmm hhhh\n".to_string()),
+            prompt_body: Some("mmmm hhhh\n".to_owned().into()),
             prompt_map: Some(Arc::new(b.into_fragment())),
             prompt_suppressed_by_exports: false,
         }
