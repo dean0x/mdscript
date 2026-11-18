@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mds::EntryPin`, `mds::NativeFs::with_entry_pin`, `mds::compile_native_fs`, `mds::check_native_fs`, and `mds::lint_native_fs`: native entry APIs with an optional expected key, walked identity, or parent directory.
 - `mds::is_forbidden_path_char` and `mds::escape_path_for_message`: the forbidden-path-character predicate (`is_control_char`'s 78-codepoint class plus `\n` and `\t` — 80 total) and its message-escaping helper, whose output carries none of the 80 (#265). The predicate is what the resolver, the built-in backends and the CLI now enforce (see **Changed**), and what a custom `FileSystem` backend must apply to the paths it produces itself.
 - `mds::display_native_path`: the user-visible form of a filesystem path — strips a Windows verbatim `\\?\` prefix wherever that is lossless, a no-op off Windows. The entry point for displaying a path to a user (the CLI's status lines and error messages go through it); internal comparisons keep the canonical/verbatim form unchanged (#409).
 - `impl FromStr for mds::Severity` and `mds::ParseSeverityError`: the one parser for a severity spelling — exactly `off`, `info`, `warn` or `error`, with no case folding, trimming or escape decoding — which the napi, WASM and Python bindings now use for every `rules` value, and through which `Severity`'s serde form now deserializes. `ParseSeverityError` is `#[non_exhaustive]`, implements `Display` and `Error`, and carries no copy of the rejected input; its message is `unknown severity; expected "off", "info", "warn", or "error"` (#175).
@@ -23,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `--vars` reads a regular file or a named pipe; other file types are refused.
+- **BREAKING (Rust API): `NativeFs::read` refuses a key that this instance did not resolve first.** It returns `mds::io` with `cannot read <display>: it was not resolved first`.
 - The napi and Python bindings no longer print internal error details to the host's standard error (#436).
 - A compile accepts the entry plus at most 256 distinct modules, including modules still being resolved (#427). A nested graph of 258 modules now fails with `mds::resource_limit` and `resource limit exceeded: module count exceeds maximum of 256 modules besides the entry`. The public Rust constructor `mds::module_count_exceeded()` supplies this error.
 - The napi, WASM and Python virtual module maps now accept 257 entries: the entry plus 256 other modules (#427). A map with 258 entries fails with `mds::resource_limit` and its own module-map message.

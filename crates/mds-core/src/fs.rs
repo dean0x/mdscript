@@ -426,19 +426,6 @@ fn file_too_large(size: u64, display: &str) -> MdsError {
     ))
 }
 
-/// Read the module file at `path` and check it as [`check_module_bytes`] does, naming
-/// it by `display`, escaped in every refusal, without ever holding more than one byte
-/// over [`crate::MAX_FILE_SIZE`] of it (#428): a file over the cap when it is opened is
-/// refused before a byte is read, with its size; one that grows past the cap while it
-/// is read is read to one byte past the cap and refused. A module that is not a regular
-/// file — a directory, a FIFO, a device, a socket — is refused before it is opened, as
-/// `cannot read <display>: not a regular file`, the refusal `@mdscript/mds`'s WASM
-/// backend makes: a FIFO can wait for a writer. `mds::lint` uses this for its entry re-read.
-pub(crate) fn read_module_file(path: &Path, display: &str) -> Result<String, MdsError> {
-    let read = read_regular_capped(path, MAX_FILE_SIZE).map_err(|e| read_error(display, e))?;
-    module_text(read, display)
-}
-
 fn module_text(read: Capped, display: &str) -> Result<String, MdsError> {
     match read {
         Capped::Bytes(bytes) => check_module_bytes(bytes, display),
@@ -453,7 +440,6 @@ fn read_error(display: &str, error: std::io::Error) -> MdsError {
     ))
 }
 
-#[cfg(any(unix, windows))]
 fn file_changed(display: &str) -> MdsError {
     MdsError::io(format!(
         "cannot read {}: the file changed while it was opened",
@@ -468,7 +454,7 @@ fn not_resolved(display: &str) -> MdsError {
     ))
 }
 
-/// A file read under a size cap (see [`read_capped`]).
+/// A file read under a size cap.
 pub(crate) enum Capped {
     /// Its bytes: at most one more than the cap, and one more means it is over it.
     Bytes(Vec<u8>),
@@ -476,63 +462,124 @@ pub(crate) enum Capped {
     TooLarge(u64),
 }
 
-/// Open `path` and read it, holding no more than one byte over `cap` of it: a file
-/// over `cap` when it is opened is reported by its size, unread; any other is read to
-/// its end or to one byte past `cap`, whichever comes first. The size is taken from
-/// the opened file, so no other file can take its place between the two.
-pub(crate) fn read_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
-    let file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    read_opened_capped(file, size, cap)
+#[derive(Clone, Copy)]
+enum ReadRule<'a> {
+    Module,
+    Vars {
+        lookup_type: std::fs::FileType,
+        typed: &'a str,
+    },
 }
 
-/// [`read_capped`] for a regular file only: anything else fails with
-/// [`not_a_regular_file`], judged on `path` before it is opened — opening a FIFO nobody
-/// writes to blocks — and again on the opened file, which may have taken its place in
-/// between.
-fn read_regular_capped(path: &Path, cap: u64) -> std::io::Result<Capped> {
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(not_a_regular_file());
+impl ReadRule<'_> {
+    fn io_error(self, display: &str, error: std::io::Error) -> MdsError {
+        match self {
+            Self::Module => read_error(display, error),
+            Self::Vars { typed, .. } => MdsError::io(format!(
+                "cannot read vars file {}: {error}",
+                crate::lint::escape_path_for_message(typed)
+            )),
+        }
     }
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(not_a_regular_file());
+
+    fn check_before(self, before: &std::fs::Metadata, display: &str) -> Result<(), MdsError> {
+        match self {
+            Self::Module if !before.is_file() => Err(self.io_error(display, not_a_regular_file())),
+            Self::Vars { lookup_type, .. } if !lookup_type.is_file() && !is_fifo(lookup_type) => {
+                Err(file_changed(display))
+            }
+            _ => Ok(()),
+        }
     }
-    read_opened_capped(file, metadata.len(), cap)
+
+    fn skip_identity(self, opened: &std::fs::Metadata, display: &str) -> Result<bool, MdsError> {
+        match self {
+            Self::Vars { lookup_type, .. }
+                if is_fifo(lookup_type) && is_fifo(opened.file_type()) =>
+            {
+                Ok(true)
+            }
+            Self::Vars { lookup_type, .. } if !lookup_type.is_file() => Err(file_changed(display)),
+            _ if !opened.is_file() => Err(file_changed(display)),
+            _ => Ok(false),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_fifo(file_type: std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_fifo()
+}
+
+#[cfg(not(unix))]
+fn is_fifo(_file_type: std::fs::FileType) -> bool {
+    false
+}
+
+/// A vars path and the no-follow lookup used to accept it.
+pub(crate) struct VarsFile<'a> {
+    canonical: PathBuf,
+    id: FileId,
+    rule: ReadRule<'a>,
+}
+
+impl<'a> VarsFile<'a> {
+    pub(crate) fn resolve(path: &Path, typed: &'a str) -> Result<Self, MdsError> {
+        reject_forbidden_path_chars("path", typed)?;
+        let (canonical, metadata) =
+            NativeFs::check_symlink_named_metadata(path, typed).map_err(|e| match e {
+                MdsError::ImportError { .. } => MdsError::import_error(format!(
+                    "symlinks are not allowed in vars file path: {typed}"
+                )),
+                other => other,
+            })?;
+        let id = lookup_file_id(&metadata, &canonical);
+        Ok(Self {
+            canonical,
+            id,
+            rule: ReadRule::Vars {
+                lookup_type: metadata.file_type(),
+                typed,
+            },
+        })
+    }
+
+    pub(crate) fn read(self, cap: u64) -> Result<Capped, MdsError> {
+        let display = NativeFs::new().display_of(&self.canonical);
+        read_verified_capped(&self.canonical, &display, &self.id, cap, self.rule)
+    }
 }
 
 /// Compare the opened file with the resolve record before the first byte is read.
-#[cfg(any(unix, windows))]
 fn read_verified_capped(
     path: &Path,
     display: &str,
     expected: &FileId,
     cap: u64,
-    accepts_type: fn(&std::fs::Metadata) -> bool,
+    rule: ReadRule<'_>,
 ) -> Result<Capped, MdsError> {
-    let io_error = |e| read_error(display, e);
-    let before = std::fs::metadata(path).map_err(io_error)?;
-    if !accepts_type(&before) {
-        return Err(io_error(not_a_regular_file()));
+    if cfg!(not(any(unix, windows))) {
+        return Err(not_resolved(display));
     }
+    let io_error = |e| rule.io_error(display, e);
+    let before = std::fs::metadata(path).map_err(io_error)?;
+    rule.check_before(&before, display)?;
     let file = std::fs::File::open(path).map_err(io_error)?;
     let opened = file.metadata().map_err(io_error)?;
-    if !accepts_type(&opened) {
-        return Err(file_changed(display));
+    if !rule.skip_identity(&opened, display)? {
+        verify_opened_file(&file, &opened, expected, display)?;
     }
-    verify_opened_file(&file, &opened, expected, display)?;
     read_opened_capped(file, opened.len(), cap).map_err(io_error)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_verified_capped(
-    _path: &Path,
-    display: &str,
+fn verify_opened_file(
+    _file: &std::fs::File,
+    _opened: &std::fs::Metadata,
     _expected: &FileId,
-    _cap: u64,
-    _accepts_type: fn(&std::fs::Metadata) -> bool,
-) -> Result<Capped, MdsError> {
+    display: &str,
+) -> Result<(), MdsError> {
     Err(not_resolved(display))
 }
 
@@ -612,7 +659,7 @@ fn query_final_path(mut query: impl FnMut(&mut [u16]) -> u32) -> Option<Vec<u16>
     None
 }
 
-/// Read the opened `file`, whose size taken from it is `size`, as [`read_capped`] reads.
+/// Read at most one byte past `cap`, with the size from the opened handle.
 fn read_opened_capped(mut file: std::fs::File, size: u64, cap: u64) -> std::io::Result<Capped> {
     if size > cap {
         return Ok(Capped::TooLarge(size));
@@ -1042,6 +1089,77 @@ fn lookup_file_id(_metadata: &std::fs::Metadata, canonical: &Path) -> FileId {
 #[cfg(not(any(unix, windows)))]
 fn lookup_file_id(_metadata: &std::fs::Metadata, _canonical: &Path) -> FileId {}
 
+/// The expected canonical entry key or its canonical parent directory.
+///
+/// Obtain a pin with [`EntryPin::key`] or [`EntryPin::parent_dir`].
+/// A pin applies only to entry resolution, not to imports.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct EntryPin {
+    expected: EntryLocation,
+    #[cfg(unix)]
+    walked: Option<FileId>,
+}
+
+#[derive(Debug)]
+enum EntryLocation {
+    Key(PathBuf),
+    ParentDir(PathBuf),
+}
+
+impl EntryPin {
+    /// Require the resolved entry key to equal `expected_canonical_key`.
+    #[must_use]
+    pub fn key(expected_canonical_key: impl AsRef<Path>) -> Self {
+        Self {
+            expected: EntryLocation::Key(expected_canonical_key.as_ref().to_path_buf()),
+            #[cfg(unix)]
+            walked: None,
+        }
+    }
+
+    /// Also require the Unix device and inode from the walk's no-follow metadata.
+    /// On other targets this leaves the pin unchanged.
+    #[must_use]
+    pub fn with_walked(self, metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                walked: Some(lookup_file_id(metadata, Path::new(""))),
+                ..self
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            self
+        }
+    }
+
+    /// Require the resolved entry's parent to equal `expected_canonical_dir`.
+    /// The file name can change within that directory.
+    #[must_use]
+    pub fn parent_dir(expected_canonical_dir: impl AsRef<Path>) -> Self {
+        Self {
+            expected: EntryLocation::ParentDir(expected_canonical_dir.as_ref().to_path_buf()),
+            #[cfg(unix)]
+            walked: None,
+        }
+    }
+
+    fn accepts(&self, canonical: &Path, _id: &FileId) -> bool {
+        let location_matches = match &self.expected {
+            EntryLocation::Key(key) => canonical == key,
+            EntryLocation::ParentDir(dir) => canonical.parent() == Some(dir.as_path()),
+        };
+        #[cfg(unix)]
+        let identity_matches = self.walked.is_none_or(|walked| walked == *_id);
+        #[cfg(not(unix))]
+        let identity_matches = true;
+        location_matches && identity_matches
+    }
+}
+
 /// Native OS filesystem implementation.
 ///
 /// Enforces symlink rejection, path traversal prevention,
@@ -1051,6 +1169,7 @@ fn lookup_file_id(_metadata: &std::fs::Metadata, _canonical: &Path) -> FileId {}
 pub struct NativeFs {
     root_dir: OnceLock<PathBuf>,
     ids: Mutex<HashMap<String, FileId>>,
+    entry_pin: Option<EntryPin>,
 }
 
 /// Return the effective parent directory of `path`, always resolving to
@@ -1088,6 +1207,16 @@ impl NativeFs {
         Self {
             root_dir: OnceLock::new(),
             ids: Mutex::new(HashMap::new()),
+            entry_pin: None,
+        }
+    }
+
+    /// Require subsequent entry resolution to satisfy `pin`.
+    #[must_use]
+    pub fn with_entry_pin(self, pin: EntryPin) -> Self {
+        Self {
+            entry_pin: Some(pin),
+            ..self
         }
     }
 
@@ -1306,6 +1435,15 @@ impl NativeFs {
 
     /// Keep the identity from the same lookup that checks the final component's type.
     fn check_symlink_named_id(path: &Path, shown: &str) -> Result<(PathBuf, FileId), MdsError> {
+        let (canonical, metadata) = Self::check_symlink_named_metadata(path, shown)?;
+        let id = lookup_file_id(&metadata, &canonical);
+        Ok((canonical, id))
+    }
+
+    fn check_symlink_named_metadata(
+        path: &Path,
+        shown: &str,
+    ) -> Result<(PathBuf, std::fs::Metadata), MdsError> {
         let file_name = path
             .file_name()
             .ok_or_else(|| MdsError::file_not_found(shown.to_string()))?;
@@ -1331,8 +1469,7 @@ impl NativeFs {
             return Err(symlink_error());
         }
         reject_forbidden_in_path(&canonical, shown)?;
-        let id = lookup_file_id(&metadata, &canonical);
-        Ok((canonical, id))
+        Ok((canonical, metadata))
     }
 
     /// Resolve `relative` within `dir` (given as a `&Path`) using the established
@@ -1394,6 +1531,13 @@ impl FileSystem for NativeFs {
         let (canonical, id) = Self::check_symlink_named_id(Path::new(path), path)?;
         // Before the root is anchored: a path refused here must not anchor it.
         let key = key_of(&canonical, path)?;
+        if self
+            .entry_pin
+            .as_ref()
+            .is_some_and(|pin| !pin.accepts(&canonical, &id))
+        {
+            return Err(file_changed(&self.display_of(&canonical)));
+        }
         // Anchor the security root on first entry-point resolution.
         // effective_parent is safe even if canonical is somehow relative — avoids PF-006.
         let entry_dir = effective_parent(&canonical);
@@ -1428,13 +1572,7 @@ impl FileSystem for NativeFs {
             .get(normalized)
             .cloned()
             .ok_or_else(|| not_resolved(&display))?;
-        let read = read_verified_capped(
-            path,
-            &display,
-            &id,
-            MAX_FILE_SIZE,
-            std::fs::Metadata::is_file,
-        )?;
+        let read = read_verified_capped(path, &display, &id, MAX_FILE_SIZE, ReadRule::Module)?;
         module_text(read, &display)
     }
 
@@ -2815,10 +2953,59 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn vars_after_replacement(pipe: bool) -> Result<Capped, MdsError> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vars.json");
+        if pipe {
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+        } else {
+            std::fs::write(&path, "{}").unwrap();
+        }
+        let snapshot = VarsFile::resolve(&path, "vars.json").unwrap();
+        std::fs::rename(&path, dir.path().join("saved")).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        assert!(VarsFile::resolve(&path, "vars.json")
+            .unwrap()
+            .read(MAX_FILE_SIZE)
+            .is_ok());
+        snapshot.read(MAX_FILE_SIZE)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vars_snapshot_refuses_a_replaced_regular_file() {
+        let error = vars_after_replacement(false)
+            .err()
+            .expect("changed vars refused");
+        assert_eq!(code_of(&error).as_deref(), Some("mds::io"));
+        assert_eq!(
+            error.to_string(),
+            "cannot read vars.json: the file changed while it was opened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vars_snapshot_refuses_a_pipe_replaced_by_a_regular_file() {
+        let error = vars_after_replacement(true)
+            .err()
+            .expect("changed vars refused");
+        assert_eq!(code_of(&error).as_deref(), Some("mds::io"));
+        assert_eq!(
+            error.to_string(),
+            "cannot read vars.json: the file changed while it was opened"
+        );
+    }
+
     /// `cannot read` escapes the display it names, as the size and UTF-8 refusals do,
     /// whether the file is missing or not a regular file; a clean one is unchanged.
     #[test]
-    fn read_module_file_escapes_the_display_in_cannot_read() {
+    fn read_error_escapes_the_display_in_cannot_read() {
         let dir = TempDir::new().unwrap();
         let esc = char::from_u32(0x1b).unwrap();
         let hostile = format!("a{esc}b.mds");
@@ -2833,8 +3020,11 @@ mod tests {
                 (hostile.as_str(), format!("a{}u001Bb.mds", '\\')),
                 ("clean.mds", "clean.mds".to_string()),
             ] {
-                let got = read_module_file(&path, display).map_err(|e| e.to_string());
-                if got != Err(format!("cannot read {named}: {reason}")) {
+                let error = std::fs::metadata(&path)
+                    .err()
+                    .unwrap_or_else(not_a_regular_file);
+                let got = read_error(display, error).to_string();
+                if got != format!("cannot read {named}: {reason}") {
                     mismatches.push(format!("{display:?} at {}: {got:?}", path.display()));
                 }
             }

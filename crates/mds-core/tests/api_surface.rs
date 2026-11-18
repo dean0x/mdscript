@@ -629,6 +629,30 @@ fn filesystem_trait_importable() {
 }
 
 #[test]
+fn native_entry_pin_and_entry_points_are_public() {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<mds::EntryPin>();
+    send_sync::<NativeFs>();
+    let dir = tempfile::TempDir::new().unwrap();
+    let entry = dir.path().join("main.mds");
+    std::fs::write(&entry, "Hello\n").unwrap();
+    let key = entry.canonicalize().unwrap();
+    let walked = std::fs::symlink_metadata(&entry).unwrap();
+    let pin = mds::EntryPin::key(&key).with_walked(&walked);
+    let _ = format!("{pin:?}");
+    let fs = NativeFs::new().with_entry_pin(pin);
+    let result: Result<CompileResult, MdsError> =
+        mds::compile_native_fs(fs, &entry, None, mds::CompileOptions::default());
+    assert!(result.is_ok());
+    let fs = NativeFs::new().with_entry_pin(mds::EntryPin::parent_dir(key.parent().unwrap()));
+    let result: Result<Vec<String>, MdsError> = mds::check_native_fs(fs, &entry, None);
+    assert!(result.is_ok());
+    let result: Result<mds::LintResult, MdsError> =
+        mds::lint_native_fs(NativeFs::new(), &entry, None, &mds::LintConfig::default());
+    assert!(result.is_ok());
+}
+
+#[test]
 fn native_fs_new_exists() {
     let _fs = NativeFs::new();
 }

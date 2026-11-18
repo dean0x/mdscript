@@ -7,6 +7,232 @@ use mds::{CompiledOutput, FileSystem, MdsError, ModuleCache, NativeFs};
 use miette::Diagnostic;
 use tempfile::TempDir;
 
+fn lint_reads_gate_text(source: &str) -> bool {
+    let body = source
+        .split("pub fn lint_native_fs(")
+        .nth(1)
+        .unwrap_or("")
+        .split("\n}")
+        .next()
+        .unwrap_or("");
+    body.contains("let (_, source) = cache.resolve_path_intrinsic_source(")
+        && body.contains("lint::lint_source(&source, filename, config)")
+        && !body.contains("read_module_file")
+        && !body.contains(".read(")
+}
+
+#[test]
+fn lint_uses_the_gate_text_without_a_second_read() {
+    let source = include_str!("../src/lib.rs");
+    assert!(lint_reads_gate_text(source));
+    let reread = source.replace(
+        "let (_, source) = cache.resolve_path_intrinsic_source(",
+        "let source = fs.read(",
+    );
+    assert!(!lint_reads_gate_text(&reread));
+}
+
+#[cfg(unix)]
+#[test]
+fn vars_refuses_a_character_device_with_the_changed_file_message() {
+    let error = mds::load_vars_file(Path::new("/dev/null")).unwrap_err();
+    assert_eq!(error.code().unwrap().to_string(), "mds::io");
+    assert_eq!(
+        error.to_string(),
+        "cannot read null: the file changed while it was opened"
+    );
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("vars.json");
+    std::fs::write(&path, r#"{"name":"pipe"}"#).unwrap();
+    assert_eq!(
+        mds::load_vars_file(&path).unwrap()["name"],
+        mds::Value::String("pipe".into())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn vars_from_a_named_pipe_still_compiles() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("vars.json");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        std::fs::File::create(writer_path)
+            .unwrap()
+            .write_all(br#"{"name":"pipe"}"#)
+            .unwrap();
+    });
+    let (tx, rx) = mpsc::channel();
+    let reader_path = path.clone();
+    let reader = std::thread::spawn(move || {
+        tx.send(mds::load_vars_file(&reader_path)).unwrap();
+    });
+    let result = rx.recv_timeout(Duration::from_secs(10));
+    if !matches!(result, Ok(Ok(_))) {
+        // Release a writer if the reader refused before it opened the pipe.
+        let _release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+    }
+    writer.join().unwrap();
+    let vars = result.expect("the pipe read completes").unwrap();
+    reader.join().unwrap();
+    assert_eq!(
+        mds::compile_str_with("Hello {{name}}!", None, Some(vars))
+            .unwrap()
+            .output,
+        CompiledOutput::Markdown("Hello pipe!\n".into())
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn vars_reads_a_pipe_through_dev_fd() {
+    use std::os::fd::AsRawFd;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("printf")
+        .arg(r#"{"name":"pipe"}"#)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let path = PathBuf::from(format!("/dev/fd/{}", stdout.as_raw_fd()));
+    let vars = mds::load_vars_file(&path).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(vars["name"], mds::Value::String("pipe".into()));
+}
+
+#[test]
+fn native_entry_points_match_path_entry_points() {
+    let dir = TempDir::new().unwrap();
+    let entry = dir.path().join("main.mds");
+    std::fs::write(dir.path().join("_part.mds"), "").unwrap();
+    std::fs::write(
+        &entry,
+        "@import \"./_part.mds\" as part\n@include part\n{{name}}\n",
+    )
+    .unwrap();
+    let vars = HashMap::from([("name".into(), mds::Value::String("Hello".into()))]);
+    let opts = mds::CompileOptions::default().with_source_map(true);
+    let pin = || {
+        NativeFs::new().with_entry_pin(
+            mds::EntryPin::key(entry.canonicalize().unwrap())
+                .with_walked(&std::fs::symlink_metadata(&entry).unwrap()),
+        )
+    };
+    let path = mds::compile_with_deps_opts(&entry, Some(vars.clone()), opts.clone()).unwrap();
+    let native = mds::compile_native_fs(pin(), &entry, Some(vars.clone()), opts).unwrap();
+    assert_eq!(native, path);
+    assert_eq!(native.dependencies.len(), 1);
+    assert!(!native.warnings.is_empty());
+    let (_, warnings) = mds::check_collecting_warnings(&entry, Some(vars.clone())).unwrap();
+    assert_eq!(
+        mds::check_native_fs(pin(), &entry, Some(vars.clone())).unwrap(),
+        warnings
+    );
+    let config = mds::LintConfig::default();
+    assert_eq!(
+        mds::lint_native_fs(pin(), &entry, Some(vars.clone()), &config)
+            .unwrap()
+            .to_canonical_json(),
+        mds::lint(&entry, Some(vars), &config)
+            .unwrap()
+            .to_canonical_json()
+    );
+}
+
+#[test]
+fn native_entry_points_refuse_a_different_key_and_accept_the_control() {
+    let dir = TempDir::new().unwrap();
+    let entry = dir.path().join("main.mds");
+    let other = dir.path().join("other.mds");
+    std::fs::write(&entry, "Hello\n").unwrap();
+    std::fs::write(&other, "Other\n").unwrap();
+    for expected in [&other, &entry] {
+        let fs =
+            || NativeFs::new().with_entry_pin(mds::EntryPin::key(expected.canonicalize().unwrap()));
+        let results = [
+            mds::compile_native_fs(fs(), &entry, None, mds::CompileOptions::default()).map(|_| ()),
+            mds::check_native_fs(fs(), &entry, None).map(|_| ()),
+            mds::lint_native_fs(fs(), &entry, None, &mds::LintConfig::default()).map(|_| ()),
+        ];
+        for result in results {
+            if expected == &other {
+                let error = result.unwrap_err();
+                assert_eq!(error.code().unwrap().to_string(), "mds::io");
+                assert_eq!(
+                    error.to_string(),
+                    "cannot read main.mds: the file changed while it was opened"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn walked_entry_identity_refuses_a_replaced_file_and_accepts_the_control() {
+    let dir = TempDir::new().unwrap();
+    let entry = dir.path().join("main.mds");
+    std::fs::write(&entry, "Hello\n").unwrap();
+    let canonical = entry.canonicalize().unwrap();
+    let walked = std::fs::symlink_metadata(&entry).unwrap();
+    std::fs::rename(&entry, dir.path().join("saved.mds")).unwrap();
+    std::fs::write(&entry, "Other\n").unwrap();
+    for metadata in [walked, std::fs::symlink_metadata(&entry).unwrap()] {
+        let pin = mds::EntryPin::key(&canonical).with_walked(&metadata);
+        let result = NativeFs::new()
+            .with_entry_pin(pin)
+            .resolve_entry(entry.to_str().unwrap());
+        use std::os::unix::fs::MetadataExt;
+        if metadata.ino() != std::fs::symlink_metadata(&entry).unwrap().ino() {
+            let error = result.unwrap_err();
+            assert_eq!(error.code().unwrap().to_string(), "mds::io");
+            assert_eq!(
+                error.to_string(),
+                "cannot read main.mds: the file changed while it was opened"
+            );
+        } else {
+            assert_eq!(result.unwrap(), canonical.to_str().unwrap());
+        }
+    }
+}
+
+#[test]
+fn parent_pin_accepts_a_new_name_in_the_same_directory_only() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("other")).unwrap();
+    let entry = root.join("MAIN.mds");
+    std::fs::write(&entry, "Hello\n").unwrap();
+    for parent in [root.join("other"), root.clone()] {
+        let fs = NativeFs::new().with_entry_pin(mds::EntryPin::parent_dir(&parent));
+        let result = fs.resolve_entry(entry.to_str().unwrap());
+        if parent == root {
+            assert_eq!(fs.read(&result.unwrap()).unwrap(), "Hello\n");
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "cannot read MAIN.mds: the file changed while it was opened"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Change {
     Keep,

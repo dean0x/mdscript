@@ -430,14 +430,12 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
-        self.resolve_path_intrinsic_keyed(path, runtime_vars, warnings)
+        self.resolve_path_intrinsic_source(path, runtime_vars, warnings)
             .map(|(output, _)| output)
     }
 
-    /// [`Self::resolve_path_intrinsic`], also returning the entry's key — on [`NativeFs`]
-    /// its canonical path — for a caller that reads the entry again itself, so that it
-    /// re-reads the file this resolved and checked, never the path as typed (#428).
-    pub(crate) fn resolve_path_intrinsic_keyed(
+    /// Resolve the entry and return the exact source text read by its check gate.
+    pub(crate) fn resolve_path_intrinsic_source(
         &mut self,
         path: &str,
         runtime_vars: &HashMap<String, Value>,
@@ -448,8 +446,13 @@ impl ModuleCache {
             key: &key,
             typed: path,
         };
-        let output = self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)?;
-        Ok((output, key))
+        let ((output, _), source) = self.resolve_intrinsic_by_key_opts_source(
+            entry,
+            runtime_vars,
+            &Default::default(),
+            warnings,
+        )?;
+        Ok((output, source))
     }
 
     /// Like [`Self::resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -713,6 +716,17 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        self.resolve_intrinsic_by_key_opts_source(entry, runtime_vars, opts, warnings)
+            .map(|(result, _)| result)
+    }
+
+    fn resolve_intrinsic_by_key_opts_source(
+        &mut self,
+        entry: ModuleRef<'_>,
+        runtime_vars: &HashMap<String, Value>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<((crate::CompiledOutput, Option<crate::SourceMap>), String), MdsError> {
         let key = entry.key;
         // Cycle detection: if this key is already on the resolving stack it forms
         // a circular import that must be rejected.
@@ -742,7 +756,7 @@ impl ModuleCache {
         let result = self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings);
 
         let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, key)
+        Self::check_lifo_pop(result, popped, key).map(|result| (result, source))
     }
 
     /// Resolve a module from an in-memory source string, dispatching on output shape.

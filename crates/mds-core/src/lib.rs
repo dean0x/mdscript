@@ -65,8 +65,8 @@ pub(crate) mod verbatim;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{
-    check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, FileSystem,
-    ModuleAliasError, NativeFs, VirtualFs,
+    check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, EntryPin,
+    FileSystem, ModuleAliasError, NativeFs, VirtualFs,
 };
 pub use lint::{
     escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
@@ -817,15 +817,29 @@ pub fn check_collecting_warnings(
     path: impl AsRef<Path>,
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<((), Vec<String>), MdsError> {
-    let path = path.as_ref();
+    check_native_fs(NativeFs::new(), path, runtime_vars).map(|warnings| ((), warnings))
+}
+
+/// Check a native entry with a caller-built filesystem and return its warnings.
+/// Use [`NativeFs::with_entry_pin`] to require a known entry key or parent directory.
+///
+/// # Errors
+/// Returns the same read, resolve, and template errors as [`check_collecting_warnings`].
+#[must_use = "warnings should be used"]
+pub fn check_native_fs(
+    fs: NativeFs,
+    entry: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<Vec<String>, MdsError> {
+    let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
     let mut warnings = vec![];
     // Dispatch on output shape so a messages template's mixed-content check runs
     // during validation; the CompiledOutput itself is discarded.
     cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
-    Ok(((), warnings))
+    Ok(warnings)
 }
 
 /// Check (validate) MDS source from a string and return any collected warnings without rendering output.
@@ -1169,10 +1183,25 @@ pub fn compile_with_deps_opts(
     runtime_vars: Option<HashMap<String, Value>>,
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
-    let path = path.as_ref();
+    compile_native_fs(NativeFs::new(), path, runtime_vars, opts)
+}
+
+/// Compile a native entry with a caller-built filesystem.
+/// Use [`NativeFs::with_entry_pin`] to require a known entry key or parent directory.
+///
+/// # Errors
+/// Returns the same read, resolve, and template errors as [`compile_with_deps_opts`].
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_native_fs(
+    fs: NativeFs,
+    entry: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
+    let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_path_intrinsic_opts(path_str, &vars, &opts, &mut warnings)?;
@@ -1537,18 +1566,28 @@ pub fn lint(
     runtime_vars: Option<HashMap<String, Value>>,
     config: &LintConfig,
 ) -> Result<LintResult, MdsError> {
+    lint_native_fs(NativeFs::new(), path, runtime_vars, config)
+}
+
+/// Lint a native entry with a caller-built filesystem.
+/// The lint rules use the exact entry text read by the check gate.
+/// Use [`NativeFs::with_entry_pin`] to require a known entry key or parent directory.
+///
+/// # Errors
+/// Returns the same read, resolve, and template errors as [`lint`].
+#[must_use = "lint findings should be used"]
+pub fn lint_native_fs(
+    fs: NativeFs,
+    entry: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    config: &LintConfig,
+) -> Result<LintResult, MdsError> {
+    let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
-    let (_, key) = {
-        let mut cache = ModuleCache::new();
-        let mut warnings = vec![];
-        cache.resolve_path_intrinsic_keyed(path_str, &vars, &mut warnings)?
-    };
-    // Read source for lint re-parse as NativeFs::read reads a module: at most one byte
-    // past the cap (#428), then its own post-read checks. It re-reads the key the gate
-    // checked — the canonical path — never the path as typed; messages name the latter.
-    let source = fs::read_module_file(Path::new(&key), path_str)?;
+    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let mut warnings = vec![];
+    let (_, source) = cache.resolve_path_intrinsic_source(path_str, &vars, &mut warnings)?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1997,22 +2036,7 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 #[must_use = "the loaded variables and duplicate keys should be used"]
 pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsError> {
     let path_str = path_to_str(path)?;
-    // PF-004: guard the vars-file path through the same symlink check that the
-    // resolver applies to every imported file — avoids a raw read that bypasses
-    // the security gate. check_symlink returns the canonical path, and that is the
-    // file read — the one checked, never the path as typed again (#428); we use the
-    // original path for error messages (it names what the caller passed).
-    let canonical = NativeFs::check_symlink(path).map_err(|e| match e {
-        MdsError::ImportError { .. } => MdsError::import_error(format!(
-            "symlinks are not allowed in vars file path: {path_str}"
-        )),
-        other => other,
-    })?;
-    // Read at most one byte past the cap (#428): a file over it when it is opened is
-    // never read, and one that grows past it while it is read is read no further.
-    let bytes = match fs::read_capped(&canonical, MAX_FILE_SIZE)
-        .map_err(|e| MdsError::io(format!("cannot read vars file {path_str}: {e}")))?
-    {
+    let bytes = match fs::VarsFile::resolve(path, path_str)?.read(MAX_FILE_SIZE)? {
         fs::Capped::Bytes(bytes) if bytes.len() as u64 <= MAX_FILE_SIZE => bytes,
         fs::Capped::Bytes(_) | fs::Capped::TooLarge(_) => {
             return Err(MdsError::resource_limit(format!(
@@ -2130,6 +2154,45 @@ pub fn load_vars_str_reporting_duplicates(json: &str) -> Result<VarsLoad, MdsErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lint_gate_returns_the_text_from_its_only_entry_read() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct CountReads(Arc<AtomicUsize>);
+        impl FileSystem for CountReads {
+            fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+                Ok(path.into())
+            }
+            fn normalize_in_dir(&self, _dir: &str, relative: &str) -> Result<String, MdsError> {
+                Ok(relative.into())
+            }
+            fn parent_dir(&self, _key: &str) -> String {
+                String::new()
+            }
+            fn is_markdown(&self, _key: &str) -> bool {
+                false
+            }
+            fn read(&self, _key: &str) -> Result<String, MdsError> {
+                Ok(if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "Hello\n"
+                } else {
+                    "different\n"
+                }
+                .into())
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut cache = ModuleCache::with_fs(Box::new(CountReads(Arc::clone(&reads))));
+        let (output, source) = cache
+            .resolve_path_intrinsic_source("main.mds", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(source, "Hello\n");
+        assert_eq!(output, CompiledOutput::Markdown(source));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn clean_output_preserves_interior_blank_runs() {
