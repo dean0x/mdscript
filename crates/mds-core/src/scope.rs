@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ast::{DefineBlock, Param};
+use crate::limits::MAX_DEFINES_PER_MODULE;
 use crate::sourcemap::Origin;
 use crate::value::Value;
 
@@ -442,12 +443,17 @@ impl Scope {
             ));
         };
         if !self.pending_functions.is_empty() || !self.pending_namespaces.is_empty() {
-            let depth = self.head.as_ref().map_or(1, |link| link.depth + 1);
+            let depth = self.head.as_ref().map_or(0, |link| link.depth);
+            if depth >= MAX_DEFINES_PER_MODULE {
+                return Err(crate::error::MdsError::syntax(format!(
+                    "internal error: cannot create more than {MAX_DEFINES_PER_MODULE} capture links — this is a compiler bug, please report it"
+                )));
+            }
             self.head = Some(Arc::new(CaptureLink {
                 functions: std::mem::take(&mut self.pending_functions),
                 namespaces: std::mem::take(&mut self.pending_namespaces),
                 prev: self.head.take(),
-                depth,
+                depth: depth + 1,
             }));
         }
         let own_vars = match &self.own_vars_snapshot {
@@ -685,6 +691,29 @@ mod tests {
             .contains("cannot capture outside the global scope frame"));
         scope.pop().unwrap();
         assert!(scope.capture().is_ok());
+    }
+
+    #[test]
+    fn capture_link_cap_refuses_link_257_and_keeps_pending_writes() {
+        let mut scope = Scope::new();
+        let function = capture_function(&mut Scope::new());
+        for _ in 0..256 {
+            scope.set_function("f", Arc::clone(&function));
+            scope.capture().unwrap();
+        }
+        let at_cap = scope.capture().unwrap();
+        assert_eq!(at_cap.links().count(), 256);
+
+        scope.set_function("pending", function);
+        let error = scope.capture().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot create more than 256 capture links"));
+        assert!(scope.pending_functions.contains_key("pending"));
+        assert!(Arc::ptr_eq(
+            scope.head.as_ref().unwrap(),
+            at_cap.head.as_ref().unwrap()
+        ));
     }
 
     fn capture_function(scope: &mut Scope) -> Arc<FunctionDef> {

@@ -498,6 +498,57 @@ fn block_exactly_at_max_allowed() {
     );
 }
 
+fn define_source(count: usize, prefix: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut source = String::new();
+    for i in 1..=count {
+        writeln!(source, "@define {prefix}{i}():\nbody\n@end").unwrap();
+    }
+    source
+}
+
+fn assert_define_limit(source: &str) {
+    let error = crate::compile_str_md(source).unwrap_err().serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: module has more than 256 @define declarations"
+    );
+}
+
+#[test]
+fn define_cap_accepts_256_declarations() {
+    let mut source = define_source(256, "f");
+    source.push_str("{{f256()}}");
+    assert_eq!(crate::compile_str_md(&source).unwrap(), "body\n");
+}
+
+#[test]
+fn define_cap_refuses_257_declarations() {
+    assert_define_limit(&define_source(257, "f"));
+}
+
+#[test]
+fn define_cap_error_precedes_a_name_collision() {
+    let mut source = define_source(256, "f");
+    source.push_str("@define f1():\nother\n@end");
+    assert_define_limit(&source);
+}
+
+#[test]
+fn define_cap_does_not_count_reexports() {
+    let library = define_source(10, "lib");
+    let mut source = String::from("@export * from \"./lib.mds\"\n");
+    source.push_str(&define_source(256, "f"));
+    source.push_str("@export prompt\n{{f256()}}");
+    let module = virtual_cache(&[("lib.mds", &library)])
+        .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("body"));
+    assert!(module.explicit_exports.contains("lib10"));
+}
+
 #[test]
 fn define_capture_holds_one_function_node_per_define() {
     use std::fmt::Write as _;

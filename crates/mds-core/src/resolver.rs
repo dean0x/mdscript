@@ -18,7 +18,9 @@ use crate::evaluator::push_capped;
 use crate::evaluator::EvalBudget;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
-use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT};
+use crate::limits::{
+    MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT,
+};
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope, VarLayer};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
@@ -1825,15 +1827,17 @@ impl ModuleCache {
         let mut module_origin: Option<Origin> = None;
 
         let mut block_count: usize = 0;
+        let mut define_count: usize = 0;
         for node in body {
             match node {
                 Node::Define(def) => {
+                    define_count += 1;
                     let origin = module_origin.get_or_insert_with(|| Origin {
                         file: Arc::from(ctx.key),
                         display: Arc::from(ctx.file_str),
                         source: Arc::from(ctx.source),
                     });
-                    collect_define(def, &mut defs, scope, ctx, Some(origin))?
+                    collect_define(def, &mut defs, define_count, scope, ctx, Some(origin))?
                 }
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
@@ -2467,10 +2471,16 @@ fn has_message_block(nodes: &[Node]) -> bool {
 fn collect_define(
     def: &DefineBlock,
     defs: &mut CollectedDefs,
+    count: usize,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
     origin: Option<&Origin>,
 ) -> Result<(), MdsError> {
+    if count > MAX_DEFINES_PER_MODULE {
+        return Err(MdsError::resource_limit(format!(
+            "module has more than {MAX_DEFINES_PER_MODULE} @define declarations"
+        )));
+    }
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
             &def.name,

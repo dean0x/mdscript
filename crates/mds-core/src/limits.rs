@@ -122,6 +122,12 @@ pub(crate) const MAX_MESSAGE_COUNT: usize = 10_000;
 /// for any real template.
 pub(crate) const MAX_BLOCKS_PER_MODULE: usize = 256;
 
+/// Maximum number of `@define` declarations per module.
+///
+/// This also bounds the number of capture links per module.
+/// A module above the limit returns `mds::resource_limit`.
+pub(crate) const MAX_DEFINES_PER_MODULE: usize = 256;
+
 /// Maximum recursion depth for `deep_merge_yaml` when merging frontmatter
 /// Mappings across template inheritance chains.
 ///
