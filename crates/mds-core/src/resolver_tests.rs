@@ -537,6 +537,86 @@ fn virtual_cache(files: &[(&str, &str)]) -> ModuleCache {
     )
 }
 
+#[test]
+fn scope_layer_precedence_keeps_runtime_above_frontmatter() {
+    let mut cache = virtual_cache(&[
+        (
+            "base.mds",
+            "---\nx: base\ny: base\n---\n@block content:\n{{x}}/{{y}}\n@end",
+        ),
+        ("standalone.mds", "---\nx: local\n---\n{{x}}"),
+        ("child.mds", "---\ny: child\n---\n@extends \"./base.mds\"\n"),
+    ]);
+    let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
+    for (key, expected) in [
+        ("standalone.mds", "runtime"),
+        ("child.mds", "runtime/child"),
+    ] {
+        let module = cache.resolve_key(key, &vars, &mut Vec::new()).unwrap();
+        assert_eq!(module.prompt_body.as_deref().map(str::trim), Some(expected));
+    }
+}
+
+#[test]
+fn scope_layer_precedence_keeps_imported_prompt_above_both_layers() {
+    let vars = HashMap::from([("prompt".into(), Value::String("runtime".into()))]);
+    for source in [
+        "---\nprompt: local\n---\n@import \"./lib.mds\"\n{{prompt}}",
+        "---\nprompt: local\n---\n@import { prompt } from \"./lib.mds\"\n{{prompt}}",
+        "---\nprompt: local\nimports:\n  - path: ./lib.mds\n---\n{{prompt}}",
+    ] {
+        let module = virtual_cache(&[("entry.mds", source), ("lib.mds", "imported")])
+            .resolve_key("entry.mds", &vars, &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            module.prompt_body.as_deref().map(str::trim),
+            Some("imported")
+        );
+    }
+}
+
+#[test]
+fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
+    let vars = HashMap::from([("imports".into(), Value::String("runtime".into()))]);
+    let mut cache = virtual_cache(&[
+        ("entry.mds", "{{imports}}"),
+        ("invalid.mds", "---\nimports: invalid\n---\n{{imports}}"),
+    ]);
+    let err = cache
+        .resolve_key("entry.mds", &vars, &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(
+        miette::Diagnostic::code(&err).unwrap().to_string(),
+        "mds::import"
+    );
+    assert!(err.to_string().ends_with(
+        "'imports' is a reserved frontmatter key for MDS files and cannot be set via --set"
+    ));
+    let source = "{{imports}}";
+    let tokens = tokenize(source, "plain.md").unwrap();
+    let module = parse_with_ctx(&tokens, "plain.md", source).unwrap();
+    let (mut plain, _) = build_scope_from_frontmatter(None, true, &vars).unwrap();
+    assert_eq!(
+        evaluate(
+            &module.body,
+            &mut plain,
+            &mut Vec::new(),
+            "plain.md",
+            source
+        )
+        .unwrap(),
+        "runtime"
+    );
+    let invalid = cache
+        .resolve_key("invalid.mds", &vars, &mut Vec::new())
+        .unwrap_err();
+    let no_runtime = cache
+        .resolve_key("invalid.mds", &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(invalid.to_string(), no_runtime.to_string());
+    assert_ne!(invalid.to_string(), err.to_string());
+}
+
 /// Helper: compile a VirtualFs entry and return the Markdown output string.
 fn compile_virtual(files: &[(&str, &str)], entry: &str) -> Result<String, MdsError> {
     let map: std::collections::HashMap<String, String> = files

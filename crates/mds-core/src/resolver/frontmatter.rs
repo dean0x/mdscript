@@ -438,22 +438,18 @@ pub(super) fn build_scope_from_merged_mapping(
     mapping: &serde_yaml_ng::Mapping,
     runtime_vars: &HashMap<String, Value>,
 ) -> Result<Scope, MdsError> {
-    let mut scope = Scope::new();
-
+    let mut frontmatter = crate::scope::VarLayer::new();
     for (key, val) in mapping {
         let serde_yaml_ng::Value::String(key_str) = key else {
             continue;
         };
         let value = Value::from_yaml(val.clone())?;
-        scope.set_var(key_str, value);
+        frontmatter.insert(key_str.clone(), std::sync::Arc::new(value));
     }
-
-    // Runtime vars override everything (base < child < runtime, F7, decision #3).
-    for (key, value) in runtime_vars {
-        scope.set_var(key, value.clone());
-    }
-
-    Ok(scope)
+    Ok(Scope::with_layers(
+        super::runtime_layer(runtime_vars),
+        std::sync::Arc::new(frontmatter),
+    ))
 }
 
 /// Parse the `imports` key from an already-parsed YAML value.

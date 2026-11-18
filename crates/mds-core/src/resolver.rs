@@ -20,7 +20,7 @@ use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT};
 use crate::parser::parse_with_ctx;
-use crate::scope::{FunctionDef, NamespaceScope, Scope};
+use crate::scope::{FunctionDef, NamespaceScope, Scope, VarLayer};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
 pub(crate) use crate::sourcemap::Origin;
 use crate::sourcemap::SourceIndex;
@@ -2557,12 +2557,20 @@ fn collect_block(
 /// For plain `.md` files, `imports` is treated as a regular variable.
 ///
 /// Returns `(scope, fm_imports)`.
+fn runtime_layer(vars: &HashMap<String, Value>) -> Arc<VarLayer> {
+    Arc::new(
+        vars.iter()
+            .map(|(name, value)| (name.clone(), Arc::new(value.clone())))
+            .collect(),
+    )
+}
+
 fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
     is_md: bool,
     runtime_vars: &HashMap<String, Value>,
 ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
-    let mut scope = Scope::new();
+    let mut frontmatter_vars = VarLayer::new();
     let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
 
     // A .mds file is always MDS; a .md file is MDS only when its frontmatter
@@ -2590,30 +2598,27 @@ fn build_scope_from_frontmatter(
                     } else {
                         // Plain .md: treat `imports` as a regular variable
                         let value = Value::from_yaml(val)?;
-                        scope.set_var(&key_str, value);
+                        frontmatter_vars.insert(key_str, Arc::new(value));
                     }
                     continue;
                 }
                 let value = Value::from_yaml(val)?;
-                scope.set_var(&key_str, value);
+                frontmatter_vars.insert(key_str, Arc::new(value));
             }
         }
     }
 
-    // Apply runtime vars (override frontmatter)
-    for (key, value) in runtime_vars {
-        if key == "imports" && is_mds {
-            // MDS files (.mds or .md with type:mds) treat `imports` as a reserved
-            // key; block --set imports=... for them.
-            return Err(MdsError::import_error(
-                "'imports' is a reserved frontmatter key for MDS files and cannot be set \
-                 via --set",
-            ));
-        }
-        scope.set_var(key, value.clone());
+    if is_mds && runtime_vars.contains_key("imports") {
+        return Err(MdsError::import_error(
+            "'imports' is a reserved frontmatter key for MDS files and cannot be set \
+             via --set",
+        ));
     }
 
-    Ok((scope, fm_imports))
+    Ok((
+        Scope::with_layers(runtime_layer(runtime_vars), Arc::new(frontmatter_vars)),
+        fm_imports,
+    ))
 }
 
 /// Deep-merge two YAML `Mapping`s for template inheritance frontmatter.

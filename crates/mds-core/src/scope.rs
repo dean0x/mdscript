@@ -68,16 +68,25 @@ pub(crate) fn captured_function_nodes(root: &FunctionDef) -> usize {
     panic!("capture count exceeds the test limit of {MAX_NODES} nodes");
 }
 
+pub(crate) type VarLayer = HashMap<String, Arc<Value>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct Slot {
+    root: Arc<Value>,
+}
+
 /// A scope chain supporting variable and function lookup with shadowing.
 #[derive(Debug, Clone)]
 pub struct Scope {
     /// Stack of frames, last is innermost.
     frames: Vec<Frame>,
+    runtime: Option<Arc<VarLayer>>,
+    frontmatter: Option<Arc<VarLayer>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Frame {
-    vars: HashMap<String, Value>,
+    vars: HashMap<String, Slot>,
     /// Functions stored as `Arc` so cloning out of scope is O(1).
     functions: HashMap<String, Arc<FunctionDef>>,
     /// Namespace imports: alias -> (functions, vars)
@@ -119,6 +128,16 @@ impl Scope {
     pub fn new() -> Self {
         Scope {
             frames: vec![Frame::default()],
+            runtime: None,
+            frontmatter: None,
+        }
+    }
+
+    pub(crate) fn with_layers(runtime: Arc<VarLayer>, frontmatter: Arc<VarLayer>) -> Self {
+        Self {
+            runtime: Some(runtime),
+            frontmatter: Some(frontmatter),
+            ..Self::new()
         }
     }
 
@@ -147,16 +166,29 @@ impl Scope {
     /// never empty. Converting to `Result` would add unwrap noise at every call site
     /// for an invariant that is structurally guaranteed by private fields.
     pub fn set_var(&mut self, name: &str, value: Value) {
+        self.set_var_shared(name, Arc::new(value));
+    }
+
+    pub(crate) fn set_var_shared(&mut self, name: &str, root: Arc<Value>) {
         self.frames
             .last_mut()
             .expect("BUG: scope has no frames")
             .vars
-            .insert(name.to_string(), value);
+            .insert(name.to_string(), Slot { root });
     }
 
     /// Look up a variable by walking the scope chain (innermost first).
     pub fn get_var(&self, name: &str) -> Option<&Value> {
-        self.frames.iter().rev().find_map(|f| f.vars.get(name))
+        self.get_slot(name).map(Arc::as_ref)
+    }
+
+    pub(crate) fn get_slot(&self, name: &str) -> Option<&Arc<Value>> {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| f.vars.get(name).map(|slot| &slot.root))
+            .or_else(|| self.runtime.as_ref()?.get(name))
+            .or_else(|| self.frontmatter.as_ref()?.get(name))
     }
 
     /// Define a function in the current frame.
@@ -210,7 +242,17 @@ impl Scope {
     /// Iterates outer→inner so duplicate keys are overwritten by inner frames,
     /// preserving correct shadowing semantics.
     pub fn get_all_vars(&self) -> HashMap<String, Value> {
-        self.collect_all(|f| &f.vars)
+        self.frontmatter
+            .iter()
+            .chain(self.runtime.iter())
+            .flat_map(|layer| layer.iter())
+            .chain(
+                self.frames
+                    .iter()
+                    .flat_map(|frame| frame.vars.iter().map(|(name, slot)| (name, &slot.root))),
+            )
+            .map(|(name, root)| (name.clone(), root.as_ref().clone()))
+            .collect()
     }
 
     /// Flatten all scope frames outer→inner into a single map.
