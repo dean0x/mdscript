@@ -22,6 +22,12 @@ updated: 2026-11-18
 
 # MDS CLI (mds-cli)
 
+## Rules
+
+- **KB-AP-1** Never `expect`/index the walk result for a walked file's pin: a missing entry must fail only that file through `walked_pin`'s `Result` (see Walked entries and source readers).
+- **KB-AP-2** Never name the canonical absolute path in a `read_canonical_source` refusal: it can leak a hostile ancestor name; use the typed path via `safe_path`.
+- **KB-INV-1** A directory rewrite (`fmt`, `lint --fix`) lands in the directory held before the replace, whatever the path leads to by then (see Gotchas).
+
 ## Overview
 
 `crates/mds-cli/` implements the `mds` binary with six subcommands: `build`, `check`, `fmt`, `lint`, `watch`, and `init`. The CLI delegates all compilation to `mds-core`; its job is input resolution, output routing, config loading, and process lifecycle. The output extension is derived from the compiled result's kind — there is no `--format` flag. Markdown templates produce `.md` files; messages templates produce `.json` files.
@@ -181,11 +187,11 @@ File-mode build uses `mds::compile_with_deps`; stdin uses `mds::compile_str_with
 ### Walked entries and source readers
 
 - `collect_mds_files_detailed` returns `WalkResult`: file paths, their no-follow metadata, and the default-exclusion count.
-- `output::walked_pin(walk, file, typed_dir, canonical_dir)` derives the expected canonical key from the same walk. It adds the walked device and inode on Unix.
+- `output::walked_pin(walk, file, typed_dir, canonical_dir)` derives the expected canonical key from the same walk. It adds the walked device and inode on Unix. It returns `Result`: a file outside the typed root, or without walk metadata, gives `mds::io` ("missing or invalid walk metadata"), never a panic. Build, check, fmt and lint each fail only that file (per-file failure path, `fail_count`/`FileTally::Error`); the compile-only catch boundaries are unchanged.
 - Directory build and check pass `NativeFs::with_entry_pin(walked_pin(...))` to `compile_native_fs` and `check_native_fs`, respectively.
 - Directory lint reports use `lint_native_fs` with that pin. Core lint applies its rules to the check gate's entry text; it performs no entry re-read.
 - Directory fmt and lint fix/preview paths pass the pin through `lint::read_source_file` to `read_canonical_source`.
-- `read_canonical_source` anchors the display root, resolves the entry, then reads its key through the same `NativeFs`. It returns any anchor or resolve error.
+- `read_canonical_source` anchors the display root, resolves the entry, then reads its key through the same `NativeFs`. It returns any anchor error. A resolve refusal (`FileNotFound`, `ImportError`, `Io`) names the **typed** path via `safe_path`, never the canonical absolute path; variants and exit codes are unchanged. It serves fmt and lint JSON output too.
 - A walked entry must match its expected key and, on Unix, its walked device and inode. A different result returns `mds::io`.
 - A save by rename during a directory command can fail that file; the next run can accept it. Windows accepts same-path regular-file replacements.
 - Watch uses `EntryPin::parent_dir`, not the walk's full-key or identity pin, so saves by rename remain valid.
@@ -230,6 +236,9 @@ Exit codes:
 - Status-line and error-message paths go through `output::safe_path`/`safe_file_display`, which apply `mds::display_native_path` (strips a lossless Windows `\\?\` prefix, #409) then `mds::escape_path_for_message` (WIRE plus `\t`). `output::safe_inline` (general single-line-value escaper) stays WIRE-only, no TAB addition.
 - Debounce is a quiet period, not a fixed window (#379, `watch.rs`): the first relevant content event opens a `--debounce` window and every further content event restarts it; bounded by `debounce_cap = max(10 × window, 1s)`, `--debounce` clamped to `MAX_DEBOUNCE_MS = 60_000`, plus `MAX_DEBOUNCE_MESSAGES = 10_000`.
 - Every write funnels through `atomic_write_file` (`output.rs`, #227): temp-file + rename, refusing a symlink at the target. `Durability::Fsync` for source rewrites (`fmt`, `lint --fix`); `Durability::RenameOnly` for reproducible derived artifacts (`build`/`watch`/`init`, #386). `tests/write_funnel.rs` is a lexical guard against a new raw `fs::write`/`File::create` site. An empty directory, or one whose only `.mds` files are partials, is a hard failure (not silent success) for `build`/`check`/`fmt`/`lint` (#204, #387).
+- KB-INV-1: rewrite writer contract (`write.rs` `read_stamped`/`replace_if_unchanged`): a rewrite lands in the directory the writer holds, whatever its path leads to by the replace. `tests/anchored_writes.rs` covers `fmt <dir>` and `lint --fix <dir>` with a folder swapped for a symlink between read and replace (debug-assertions pause hook, Unix only): the held file gets the rewrite, the victim keeps its bytes and entries, and a test-side edit must change the victim snapshot (control). The separate "swapped before its read" tests expect a refusal.
+- `tests/panic_hook.rs` `build_entry_points_leave_debug_panics_off` scans the python, napi, wasm (`packages/mds-wasm/package.json`) and release-workflow build inputs, and asserts the wasm input is present so the gate cannot omit it.
+- Walk-handshake waits in `tests/common/mod.rs` (`run_after_walk`) derive their poll bounds from `READY_TIMEOUT` (`WALK_POLL`, `WALK_MAX_POLLS`); `after_walk_wait_covers_the_readiness_timeout` pins that.
 - File-mode build holds the typed entry path; watch holds both typed and canonical forms in `WatchedPath`. `file_identity` canonicalizes the entry for output comparison. Directory sources use `.mds`; compiled outputs use `.md` or `.json`.
 
 ## Key Files
