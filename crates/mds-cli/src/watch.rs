@@ -8894,13 +8894,24 @@ mod tests {
             };
             let expected = match what {
                 Watched::Root => {
+                    // A path through a file is not a directory on Unix, and not found on
+                    // Windows: each kind keeps its own refusal.
                     let cause = blocked.canonicalize().unwrap_err();
-                    MdsError::Io {
-                        message: format!(
-                            "cannot resolve path {}: {}",
-                            mds::escape_path_for_message(&blocked.to_string_lossy()),
-                            crate::output::safe_inline(crate::output::io_cause(&cause))
-                        ),
+                    let shown =
+                        mds::escape_path_for_message(&blocked.to_string_lossy()).into_owned();
+                    if cause.kind() == std::io::ErrorKind::NotFound {
+                        MdsError::FileNotFound {
+                            path: shown,
+                            span: None,
+                            src: None,
+                        }
+                    } else {
+                        MdsError::Io {
+                            message: format!(
+                                "cannot resolve path {shown}: {}",
+                                crate::output::safe_inline(crate::output::io_cause(&cause))
+                            ),
+                        }
                     }
                 }
                 Watched::Entry | Watched::Source => {
