@@ -131,11 +131,10 @@ impl CapturedScope {
             .take(head.map_or(0, |link| link.depth))
     }
 
-    fn get_slot(&self, name: &str) -> Option<&Arc<Value>> {
+    fn get_slot(&self, name: &str) -> Option<&Slot> {
         self.own_vars
             .as_ref()
             .and_then(|vars| vars.get(name))
-            .map(|slot| &slot.root)
             .or_else(|| self.runtime.as_ref()?.get(name))
             .or_else(|| self.frontmatter.as_ref()?.get(name))
     }
@@ -216,11 +215,121 @@ pub(crate) fn captured_entry_count(scope: &Scope) -> usize {
     frozen + scope.pending_functions.len() + scope.pending_namespaces.len()
 }
 
-pub(crate) type VarLayer = HashMap<String, Arc<Value>>;
+#[derive(Debug, Default)]
+pub(crate) struct VarLayer(HashMap<String, Slot>);
+
+impl VarLayer {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(&mut self, name: String, root: Arc<Value>) {
+        self.0.insert(name, Slot::from_root(root));
+    }
+
+    pub(crate) fn contains_key(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    fn get(&self, name: &str) -> Option<&Slot> {
+        self.0.get(name)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl FromIterator<(String, Arc<Value>)> for VarLayer {
+    fn from_iter<T: IntoIterator<Item = (String, Arc<Value>)>>(iter: T) -> Self {
+        Self(
+            iter.into_iter()
+                .map(|(name, root)| (name, Slot::from_root(root)))
+                .collect(),
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Slot {
     root: Arc<Value>,
+    path: Option<Arc<PathNode>>,
+}
+
+pub(crate) enum PathStep {
+    Index(usize),
+    Key(String),
+}
+
+struct PathNode {
+    step: PathStep,
+    depth: usize,
+    parent: Option<Arc<Self>>,
+}
+
+impl std::fmt::Debug for PathNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathNode")
+            .field("depth", &self.depth)
+            .finish()
+    }
+}
+
+impl From<Value> for Slot {
+    fn from(value: Value) -> Self {
+        Self::from_root(Arc::new(value))
+    }
+}
+
+impl Slot {
+    fn from_root(root: Arc<Value>) -> Self {
+        Self { root, path: None }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> &Arc<Value> {
+        &self.root
+    }
+
+    // The caller checks that the step reaches a child of the current value.
+    // Each node then consumes one level of the root, which bounds drop depth.
+    pub(crate) fn project(&self, step: PathStep) -> Self {
+        Self {
+            root: Arc::clone(&self.root),
+            path: Some(Arc::new(PathNode {
+                step,
+                depth: self.path.as_ref().map_or(1, |node| node.depth + 1),
+                parent: self.path.clone(),
+            })),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<&Value> {
+        let Some(head) = self.path.as_deref() else {
+            return Some(&self.root);
+        };
+        let mut steps = Vec::with_capacity(head.depth);
+        steps.extend(
+            std::iter::successors(Some(head), |node| node.parent.as_deref())
+                .take(head.depth)
+                .map(|node| &node.step),
+        );
+        steps
+            .into_iter()
+            .rev()
+            .try_fold(self.root.as_ref(), |value, step| match (value, step) {
+                (Value::Array(items), PathStep::Index(i)) => items.get(*i),
+                (Value::Object(fields), PathStep::Key(key)) => fields.get(key),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn into_value(self) -> Option<Value> {
+        if self.path.is_none() {
+            return Some(Arc::unwrap_or_clone(self.root));
+        }
+        self.get().cloned()
+    }
 }
 
 /// A scope chain supporting variable and function lookup with shadowing.
@@ -347,6 +456,10 @@ impl Scope {
     }
 
     pub(crate) fn set_var_shared(&mut self, name: &str, root: Arc<Value>) {
+        self.set_slot(name, Slot::from_root(root));
+    }
+
+    pub(crate) fn set_slot(&mut self, name: &str, slot: Slot) {
         if self.frames.len() == 1 {
             self.vars_generation = self.vars_generation.wrapping_add(1);
             if self.vars_generation == 0 {
@@ -357,15 +470,15 @@ impl Scope {
             .last_mut()
             .expect("BUG: scope has no frames")
             .vars
-            .insert(name.to_string(), Slot { root });
+            .insert(name.to_string(), slot);
     }
 
     /// Look up a variable by walking the scope chain (innermost first).
     pub fn get_var(&self, name: &str) -> Option<&Value> {
-        self.get_slot(name).map(Arc::as_ref)
+        self.get_slot(name).and_then(Slot::get)
     }
 
-    pub(crate) fn get_slot(&self, name: &str) -> Option<&Arc<Value>> {
+    pub(crate) fn get_slot(&self, name: &str) -> Option<&Slot> {
         self.frames
             .iter()
             .rev()
@@ -373,7 +486,6 @@ impl Scope {
                 frame
                     .vars
                     .get(name)
-                    .map(|slot| &slot.root)
                     .or_else(|| frame.capture()?.get_slot(name))
             })
             .or_else(|| self.runtime.as_ref()?.get(name))
@@ -601,15 +713,23 @@ mod tests {
     #[test]
     fn capture_restores_vars_in_layer_order() {
         let mut scope = Scope::with_layers(
-            Arc::new(HashMap::from([
-                ("b".into(), Arc::new(Value::Number(2.0))),
-                ("c".into(), Arc::new(Value::Number(2.0))),
-            ])),
-            Arc::new(HashMap::from([
-                ("a".into(), Arc::new(Value::Number(1.0))),
-                ("b".into(), Arc::new(Value::Number(1.0))),
-                ("c".into(), Arc::new(Value::Number(1.0))),
-            ])),
+            Arc::new(
+                [
+                    ("b".into(), Arc::new(Value::Number(2.0))),
+                    ("c".into(), Arc::new(Value::Number(2.0))),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            Arc::new(
+                [
+                    ("a".into(), Arc::new(Value::Number(1.0))),
+                    ("b".into(), Arc::new(Value::Number(1.0))),
+                    ("c".into(), Arc::new(Value::Number(1.0))),
+                ]
+                .into_iter()
+                .collect(),
+            ),
         );
         scope.set_var("c", Value::Number(3.0));
         let callee = define(&mut scope, "callee");

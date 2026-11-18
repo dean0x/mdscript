@@ -675,8 +675,8 @@ fn runtime_layer_is_shared_by_module_scopes() {
     let (first, _) = build_scope_from_frontmatter(None, false, &vars).unwrap();
     let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
     assert!(Arc::ptr_eq(
-        first.get_slot("x").unwrap(),
-        inherited.get_slot("x").unwrap()
+        first.get_slot("x").unwrap().root(),
+        inherited.get_slot("x").unwrap().root()
     ));
 }
 
