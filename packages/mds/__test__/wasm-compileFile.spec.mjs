@@ -335,7 +335,13 @@ describe('WASM backend — compileFile/checkFile', () => {
         assert.deepEqual(wasm[i], native[i], entry);
       });
       const i = notMds.length;
-      assert.deepEqual(native[i], { code: 'mds::not_mds', message: 'not an MDS file: ./sub/../lure.txt', help, span: null });
+      // The import error points at the importer's directive; entry errors stay spanless.
+      assert.deepEqual(native[i], {
+        code: 'mds::not_mds',
+        message: 'not an MDS file: ./sub/../lure.txt',
+        help,
+        span: { offset: 0, length: 32, line: 1, column: 1 },
+      });
       assert.deepEqual(wasm[i], native[i], 'import');
       // Control: the same forms naming a `type: mds` file compile on both.
       controls.forEach((entry, j) => {
