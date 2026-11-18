@@ -537,7 +537,8 @@ fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<S
     })?;
     let fs = NativeFs::new();
     fs.anchor_base_dir(&effective_parent(canonical).display().to_string())?;
-    fs.read(path_str)
+    let key = fs.resolve_entry(path_str)?;
+    fs.read(&key)
 }
 
 // ── Exit code helpers ─────────────────────────────────────────────────────────
