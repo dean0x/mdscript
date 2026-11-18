@@ -106,6 +106,37 @@ test('native and WASM import refusals share code, message, span and importer sou
         assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected], label);
       });
     }
+    await t.test('intermediate extends: mds::not_mds', async () => {
+      const base = path.join(root, 'sub', 'c.mds');
+      const importerSource = '@extends "./c.mds"\n';
+      const directive = '@extends "./d.txt"';
+      const prefix = '\n'.repeat(23);
+      const source = `${prefix}${directive}\n`;
+      await writeFile(importer, importerSource);
+      await writeFile(path.join(root, 'sub', 'd.txt'), targetSource);
+      await writeFile(path.join(root, 'sub', 'd.mds'), 'Body\n');
+      await writeFile(base, source.replace('d.txt', 'd.mds'));
+      const cleanNative = await compileFileOutcomes('native', [entry]);
+      const cleanWasm = await compileFileOutcomes('wasm', [entry]);
+      assert.ok(Object.hasOwn(cleanNative[0], 'output'), 'the intermediate-base control must compile');
+      assert.deepEqual(cleanWasm, cleanNative, 'the intermediate-base control must match on both backends');
+      await writeFile(base, source);
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      const sources = {
+        'a.mds': entrySource, 'sub/b.mds': importerSource,
+        'sub/c.mds': source, 'sub/d.txt': targetSource,
+      };
+      const summarize = (err) => {
+        const files = Object.entries(sources).filter(([, text]) => err.span != null &&
+          Buffer.from(text).subarray(err.span.offset, err.span.offset + err.span.length).toString() === directive,
+        ).map(([file]) => file);
+        return [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null, files];
+      };
+      const expected = ['mds::not_mds', 'not an MDS file: ./d.txt', Buffer.byteLength(prefix), Buffer.byteLength(directive), ['sub/c.mds']];
+      assert.deepEqual(wasm, native, 'the complete intermediate-base errors must match');
+      assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected]);
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

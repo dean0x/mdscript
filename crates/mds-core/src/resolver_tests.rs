@@ -4599,6 +4599,38 @@ fn not_mds_extends_keeps_inner_importer_span() {
 }
 
 #[test]
+fn not_mds_intermediate_extends_keeps_the_base_importer_span() {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub/c.mds");
+    let directive = "@extends \"./d.txt\"";
+    let source = format!("\n\n{directive}\n");
+    std::fs::write(&entry, "@import \"./sub/b.mds\" as b\nEntry\n").unwrap();
+    std::fs::write(root.join("sub/b.mds"), "@extends \"./c.mds\"\n").unwrap();
+    std::fs::write(root.join("sub/d.txt"), "@import \"./never.mds\"\n").unwrap();
+    std::fs::write(root.join("sub/d.mds"), "Body\n").unwrap();
+    std::fs::write(&importer, source.replace("d.txt", "d.mds")).unwrap();
+    crate::compile(&entry, None).expect("control: the intermediate base reaches an MDS target");
+    std::fs::write(&importer, &source).unwrap();
+
+    let intrinsic = crate::compile(&entry, None).unwrap_err();
+    let cached = ModuleCache::native()
+        .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    for err in [intrinsic, cached] {
+        let serialized = err.serialize();
+        assert_eq!(serialized.code, "mds::not_mds");
+        assert_eq!(serialized.message, "not an MDS file: ./d.txt");
+        assert_eq!(err.source_name(), Some("sub/c.mds"));
+        let span = serialized
+            .span
+            .expect("the intermediate extends must carry a span");
+        assert_eq!((span.offset, span.length), (2, directive.len()));
+        assert_eq!((span.line, span.column), (Some(3), Some(1)));
+    }
+}
+
+#[test]
 fn not_mds_include_uses_its_namespace_import_span() {
     assert_not_mds_directive_span("@import \"./c.txt\" as c\n@include c");
 }
