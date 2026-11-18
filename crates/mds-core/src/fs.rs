@@ -1632,6 +1632,19 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    #[test]
+    fn entry_pin_parent_dir_accepts_a_respelled_name_but_not_another_parent() {
+        let watched = Path::new("project").join("Page.mds");
+        let respelled = watched.with_file_name("page.mds");
+        let elsewhere = Path::new("other").join("page.mds");
+        let pin = EntryPin::parent_dir(watched.parent().unwrap());
+        let id = FileId::default();
+
+        assert!(pin.accepts(&watched, &id), "unchanged key control");
+        assert!(pin.accepts(&respelled, &id), "only the file name changed");
+        assert!(!pin.accepts(&elsewhere, &id), "the parent must match");
+    }
+
     // ── VirtualFs::resolve_entry ──────────────────────────────────────────────
 
     fn vfs() -> VirtualFs {

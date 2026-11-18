@@ -1848,6 +1848,7 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     let stub = "fn pause_after_batch_split() {}";
     let look_stub = "fn pause_after_look() {}";
     let read_stub = "fn pause_after_read() {}";
+    let compile_stub = "fn pause_before_compile() {}";
     for (planted, what) in [
         (
             with(
@@ -1887,6 +1888,22 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
             "the read pause's variable outside its module",
         ),
         (with(read_stub, ""), "a read pause without a release stub"),
+        (
+            with(
+                compile_stub,
+                "fn pause_before_compile() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE\");\n}",
+            ),
+            "the compile pause's variable outside its module",
+        ),
+        (
+            with(compile_stub, "fn pause_before_compile() { let _ = 1; }"),
+            "a compile release stub that does something",
+        ),
+        (
+            with(compile_stub, ""),
+            "a compile pause without a release stub",
+        ),
     ] {
         assert!(
             !gate_findings(&planted, &BATCH_PAUSE_TRIGGER).is_empty(),
@@ -3063,17 +3080,20 @@ const PAUSE_TRIGGER: DebugGate = DebugGate {
 /// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, the pause between a watch rebuild's look and its
 /// reads (#380), `MDS_TEST_PAUSE_AFTER_LOOK`, and the pause between a file rebuild's reads
 /// and its baseline (#380), `MDS_TEST_PAUSE_AFTER_READ`, all in `mod batch_pause_trigger`.
+/// The same module holds `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` before entry resolution.
 const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
     module: "batch_pause_trigger",
     needles: &[
         ("MDS_TEST_PAUSE_AFTER_BATCH_SPLIT", true),
         ("MDS_TEST_PAUSE_AFTER_LOOK", true),
         ("MDS_TEST_PAUSE_AFTER_READ", true),
+        ("MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE", true),
     ],
     fns: &[
         "pause_after_batch_split",
         "pause_after_look",
         "pause_after_read",
+        "pause_before_compile",
     ],
 };
 

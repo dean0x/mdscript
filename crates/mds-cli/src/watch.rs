@@ -72,7 +72,7 @@
 //!   against an absolute deadline, the debounce window against an absolute cap
 //!   (window <= cap) and a message bound (<= 10 000 per window), and a rebuild held
 //!   while a watched file is empty against an absolute deadline (#380).
-//! - All `.mds` reads go through `compile_to_content` (PF-004).
+//! - All `.mds` reads go through `compile_native_to_content`.
 //! - **Freshness rule** (design decision of 2026-06; kept in git history as legacy
 //!   decision 016 in `88ddbcc~1:.devflow/decisions/decisions.md`): the dependency set
 //!   and the `--vars` file are re-derived from fresh compile output / from disk on
@@ -95,9 +95,10 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use mds::MdsError;
 
 use crate::build::{
-    admit_output, auto_detect_mds_file, build_runtime_vars, compile_inputs, compile_to_content,
-    resolve_dir_as_created, resolve_output_path_for_kind, source_inputs, write_output,
-    CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs, RuntimeVars,
+    admit_output, auto_detect_mds_file, build_runtime_vars, compile_inputs,
+    compile_native_to_content, resolve_dir_as_created, resolve_output_path_for_kind, source_inputs,
+    write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
+    RuntimeVars,
 };
 use crate::output::{
     collect_mds_files, eprint_error, eprint_warning, is_partial, is_within_default_excluded_dir,
@@ -1798,30 +1799,37 @@ impl WatchedPath {
         }
     }
 
-    /// Refuse to compile once `typed` leads somewhere other than `canonical` — the one
-    /// rule for the entry, the root and each source ([`Watched::moved`]).
-    ///
-    /// Every compile resolves `typed` afresh, while notify keeps watching `canonical`.
-    /// Once a symlink on the typed path is retargeted — `link/..` is the directory above
-    /// the link's target — or a directory on it is replaced, a symlink included, the two
-    /// name different files: the compile would read one while the watched directories,
-    /// graph keys, output path and change detection follow the other. So the directory
-    /// `typed` now leads into must be the one `canonical` names: the root's own canonical
-    /// form, and the canonical parent of the entry or a source — the directories, not
-    /// the files, so a file name the volume respells (its case, on a case-insensitive
-    /// volume) is not a move (#408). A typed path that no longer resolves — deleted,
-    /// before it is recreated — and a file whose final component is a symlink are left
-    /// to the compile, which reports the first as typed and refuses the second. A
-    /// retarget racing the compile itself is the check-then-open window every
-    /// path-based read has.
+    /// Refuse a path whose lookup fails, with that lookup's error and the typed path.
+    /// Refuse a root that resolves to another directory with [`Watched::moved`].
+    /// For an entry or source, compare its resolved parent with the watched canonical parent.
+    /// A file name with different case in the same canonical directory is not a move.
+    /// Each compile also pins that canonical parent during entry resolution.
     fn ensure_unmoved(&self) -> Result<(), MdsError> {
         let moved = match self.what {
-            Watched::Root => self
-                .typed
-                .canonicalize()
-                .is_ok_and(|now| now != self.canonical),
-            Watched::Entry | Watched::Source => mds::NativeFs::check_symlink(&self.typed)
-                .is_ok_and(|now| now.parent() != self.canonical.parent()),
+            Watched::Root => {
+                let now = self.typed.canonicalize().map_err(|e| {
+                    let shown =
+                        mds::escape_path_for_message(&self.typed.to_string_lossy()).into_owned();
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        MdsError::FileNotFound {
+                            path: shown,
+                            span: None,
+                            src: None,
+                        }
+                    } else {
+                        MdsError::Io {
+                            message: format!(
+                                "cannot resolve path {shown}: {}",
+                                safe_inline(crate::output::io_cause(&e))
+                            ),
+                        }
+                    }
+                })?;
+                now != self.canonical
+            }
+            Watched::Entry | Watched::Source => {
+                mds::NativeFs::check_symlink(&self.typed)?.parent() != self.canonical.parent()
+            }
         };
         if moved {
             Err(self.what.moved(&self.typed))
@@ -1840,7 +1848,7 @@ impl WatchedPath {
         quiet: bool,
     ) -> std::result::Result<CompileOutput, CompileFailure> {
         self.ensure_unmoved().map_err(miette::Error::from)?;
-        compile_caught(&self.typed, runtime_vars, quiet)
+        compile_caught(&self.typed, &self.canonical, runtime_vars, quiet)
     }
 
     /// The root in the two forms an output below it is resolved and named by: walked
@@ -1888,7 +1896,7 @@ impl WatchedPath {
         quiet: bool,
     ) -> std::result::Result<CompileOutput, CompileFailure> {
         if !src.starts_with(&self.canonical) {
-            return compile_caught(src, runtime_vars, quiet);
+            return compile_caught(src, src, runtime_vars, quiet);
         }
         self.ensure_unmoved().map_err(miette::Error::from)?;
         WatchedPath {
@@ -1933,13 +1941,23 @@ impl From<miette::Report> for CompileFailure {
 /// and the session goes on (#389).
 fn compile_caught(
     path: &Path,
+    canonical: &Path,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> std::result::Result<CompileOutput, CompileFailure> {
+    let fs = mds::NativeFs::new()
+        .with_entry_pin(mds::EntryPin::parent_dir(mds::effective_parent(canonical)));
+    pause_before_compile();
     let compiled = crate::output::catch_compile(
         path,
         AssertUnwindSafe(|| {
-            compile_to_content(path, runtime_vars, quiet, mds::CompileOptions::default())
+            compile_native_to_content(
+                fs,
+                path,
+                runtime_vars,
+                quiet,
+                mds::CompileOptions::default(),
+            )
         }),
     );
     compiled
@@ -2385,10 +2403,8 @@ fn announce_recompiled(shown: &Path, dep_count: usize, since: Instant, emptied: 
 /// file the compile read — the entry, a module it imported, or one of `reads`, the
 /// `--vars` file and the `mds.json` in force (#425); such a write fails as any other.
 ///
-/// # PF-004 compliance
-/// All file reads go through `compile_to_content` → `mds::compile_with_deps_opts`
-/// (which uses the resolver that enforces MAX_FILE_SIZE). There is no bare
-/// `std::fs::read_to_string` path here.
+/// All source reads use `compile_native_to_content` and `mds::compile_native_fs`,
+/// which applies the resolver's file size cap.
 fn compile_and_write(
     entry: &WatchedPath,
     output: &Option<String>,
@@ -2754,7 +2770,7 @@ fn handle_fs_event_file(
 /// # Invariants preserved
 /// - Freshness rule: `foi` and `watched_dirs` always recomputed from fresh dep output, by
 ///   every compile that succeeds — its output refused or not written included (#257).
-/// - PF-004: all reads go through `compile_to_content`.
+/// - All source reads go through `compile_native_to_content`.
 /// - Error-settle: every failure — the vars file, the compile, the output route or its
 ///   #425 refusal, the write — goes through [`settle`], except a repeated stdout failure,
 ///   which was reported already. A compile that panicked is settled the same way; the
@@ -3054,7 +3070,7 @@ fn load_and_compile(
         set_string_vars: ctx.static_set_string_vars.clone(),
     })
     .map_err(|e| (Some(e), Settle::Rebaseline))?;
-    // Move the map out instead of cloning it: `compile_to_content` takes
+    // Move the map out instead of cloning it: `compile_native_to_content` takes
     // `runtime_vars` by value, and the emitter in `run_file_rebuild` only ever reads
     // `resolved.vars_file` / `duplicate_vars_file_keys` /
     // `duplicate_vars_file_keys_omitted` — none of which need `.vars`.
@@ -4119,7 +4135,7 @@ impl DirWatchState {
     /// never as a substitute for recompiling. It therefore only ever widens what may
     /// trigger a rebuild, and the cost of a stale edge is one recompile whose output
     /// the `last_written` dedup then suppresses. The freshness rule is about the
-    /// dep set a *rebuild* records, and that still comes from fresh `compile_to_content`
+    /// dep set a *rebuild* records, and that still comes from fresh `compile_native_to_content`
     /// output on every success; a failed compile produces no fresh set to record.
     fn record_error(&mut self, src: &Path) {
         self.errored.insert(src.to_path_buf());
@@ -4436,8 +4452,8 @@ struct BatchCtx<'a> {
 /// the batch reported them ([`BatchVars`], #326).
 ///
 /// # Invariants preserved
-/// - Freshness rule: dep set recomputed from fresh `compile_to_content` output.
-/// - PF-004: all reads go through `compile_to_content`.
+/// - Freshness rule: dep set recomputed from fresh `compile_native_to_content` output.
+/// - All source reads go through `compile_native_to_content`.
 ///
 /// Does **not** touch `state.last_mtimes`: the content backstop's baseline is settled
 /// once per batch by `process_dir_batch`, over the whole watched set (#321).
@@ -6234,8 +6250,9 @@ fn process_dir_batch_incremental(
 /// (`tests/cli_watch_truncate.rs`, #380). `MDS_TEST_PAUSE_AFTER_READ`: how it is made to
 /// stop a file-mode rebuild once its compile has read every file and none was found
 /// emptied, before the rebuild takes its baseline — so that a test can truncate a file the
-/// rebuild has read whole (`tests/cli_watch_truncate.rs`, #380). A release build has none
-/// of it.
+/// rebuild has read whole (`tests/cli_watch_truncate.rs`, #380).
+/// The compile pause stops after the watched-path check and before entry resolution.
+/// A release build has none of these pauses.
 #[cfg(debug_assertions)]
 mod batch_pause_trigger {
     use std::path::PathBuf;
@@ -6258,6 +6275,9 @@ mod batch_pause_trigger {
     /// says it has stopped in the same way.
     const READ_VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_READ";
 
+    /// The file that ends the pause after the watched-path check, before entry resolution.
+    const COMPILE_VARIABLE: &str = "MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE";
+
     /// How long the pause waits between two looks for the file that ends it.
     const POLL: Duration = Duration::from_millis(5);
 
@@ -6277,6 +6297,11 @@ mod batch_pause_trigger {
     /// Stop here when `MDS_TEST_PAUSE_AFTER_READ` names a file ([`pause_on`]).
     pub(super) fn pause_after_read() {
         pause_on(READ_VARIABLE);
+    }
+
+    /// Stop before entry resolution when the compile pause names a file ([`pause_on`]).
+    pub(super) fn pause_before_compile() {
+        pause_on(COMPILE_VARIABLE);
     }
 
     /// Stop here when `variable` names a file: say so by writing `<file>.paused`, then wait
@@ -6305,7 +6330,9 @@ mod batch_pause_trigger {
 }
 
 #[cfg(debug_assertions)]
-use batch_pause_trigger::{pause_after_batch_split, pause_after_look, pause_after_read};
+use batch_pause_trigger::{
+    pause_after_batch_split, pause_after_look, pause_after_read, pause_before_compile,
+};
 
 /// A release build's pause between a directory batch's split and its compile: none.
 #[cfg(not(debug_assertions))]
@@ -6318,6 +6345,10 @@ fn pause_after_look() {}
 /// A release build's pause between a file rebuild's reads and its baseline: none.
 #[cfg(not(debug_assertions))]
 fn pause_after_read() {}
+
+/// A release build has no pause before entry resolution.
+#[cfg(not(debug_assertions))]
+fn pause_before_compile() {}
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -6424,7 +6455,7 @@ mod tests {
 
     /// #409: watch keys a compile's dependencies by [`graph_key`] — the canonical form
     /// notify event paths are compared in — from the list the compiler reports, which
-    /// `compile_to_content` passes on as it is. On Windows the key is verbatim while the
+    /// `compile_native_to_content` passes on as it is. On Windows the key is verbatim while the
     /// reported path is not: the mismatch the mapping exists for.
     #[test]
     fn a_compile_s_dependencies_are_keyed_as_notify_reports_them() {
@@ -6437,8 +6468,7 @@ mod tests {
         std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
         let main = dir.path().join("main.mds");
 
-        let compiled =
-            compile_to_content(&main, None, true, mds::CompileOptions::default()).unwrap();
+        let compiled = compile_caught(&main, &main.canonicalize().unwrap(), None, true).unwrap();
         let reported = mds::compile_with_deps(&main, None).unwrap().dependencies;
         assert_eq!(
             compiled.dependencies, reported,
@@ -8711,10 +8741,9 @@ mod tests {
         }
     }
 
-    /// #417: the watched entry is compiled by the typed path while that path leads to the
-    /// canonical entry's directory, and refused — naming the path as typed, never the
-    /// canonical one — once it leads into another directory. A typed path that no longer
-    /// resolves is left to the compile's own error, `file not found`, naming it as typed.
+    /// The watched entry uses its typed path within its canonical directory.
+    /// A different canonical parent is refused with the typed path.
+    /// A missing entry is refused with the lookup's own error and the typed path.
     #[test]
     fn watched_entry_refuses_a_typed_path_that_leads_elsewhere() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -8766,15 +8795,13 @@ mod tests {
         assert_eq!(
             missing,
             format!("file not found: {}", typed.display()),
-            "a missing entry is the compile's own error, naming the path as typed"
+            "the check refuses a missing entry with the lookup's own error and typed path"
         );
     }
 
-    /// #413: the root and a source below it are checked by the entry's rule — the
-    /// directory the typed path leads into against the one the canonical path names —
-    /// and each refusal names its own kind and the path as typed. Controls: each kind
-    /// whose typed path still leads to its canonical form, and each whose typed path no
-    /// longer resolves, which is left to the compile.
+    /// The root and each source use the entry's directory rule and their own typed path.
+    /// Controls keep each typed path at its canonical form.
+    /// A path that no longer resolves is refused with its own not-found error and typed path.
     #[test]
     fn watched_root_and_source_share_the_entry_rule() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -8830,12 +8857,18 @@ mod tests {
             (
                 "root, gone",
                 check(dir.path().join("gone"), root_b, Watched::Root),
-                Ok(()),
+                Err(format!(
+                    "file not found: {}",
+                    dir.path().join("gone").display()
+                )),
             ),
             (
                 "source, gone",
                 check(root.join("gone.mds"), source_b, Watched::Source),
-                Ok(()),
+                Err(format!(
+                    "file not found: {}",
+                    root.join("gone.mds").display()
+                )),
             ),
         ];
         for (label, got, want) in rows {
@@ -8844,6 +8877,48 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[test]
+    fn watched_paths_return_the_lookup_error_before_a_compile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("page.mds");
+        std::fs::write(&file, "Hi\n").unwrap();
+        let canonical = file.canonicalize().unwrap();
+        let blocked = file.join("blocked.mds");
+        for what in [Watched::Root, Watched::Entry, Watched::Source] {
+            let path = WatchedPath {
+                typed: blocked.clone(),
+                canonical: canonical.clone(),
+                what,
+            };
+            let expected = match what {
+                Watched::Root => {
+                    let cause = blocked.canonicalize().unwrap_err();
+                    MdsError::Io {
+                        message: format!(
+                            "cannot resolve path {}: {}",
+                            mds::escape_path_for_message(&blocked.to_string_lossy()),
+                            crate::output::safe_inline(crate::output::io_cause(&cause))
+                        ),
+                    }
+                }
+                Watched::Entry | Watched::Source => {
+                    mds::NativeFs::check_symlink(&blocked).unwrap_err()
+                }
+            };
+            assert_eq!(
+                path.ensure_unmoved().map_err(|error| error.to_string()),
+                Err(expected.to_string()),
+                "the lookup error must not become a moved error"
+            );
+            let control = WatchedPath {
+                typed: file.clone(),
+                canonical: canonical.clone(),
+                what,
+            };
+            assert!(control.ensure_unmoved().is_ok());
+        }
     }
 
     /// A session reads each `-o -` outcome itself (#157): a closed pipe stops it, a new

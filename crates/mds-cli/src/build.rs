@@ -1150,7 +1150,7 @@ pub(crate) fn compile_to_content(
 }
 
 /// Compile a native entry through the caller's filesystem and entry pin.
-fn compile_native_to_content(
+pub(crate) fn compile_native_to_content(
     fs: mds::NativeFs,
     input: &Path,
     runtime_vars: Option<HashMap<String, mds::Value>>,
