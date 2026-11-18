@@ -110,6 +110,51 @@ fn nested_if_source(depth: usize) -> String {
     source
 }
 
+fn assert_message_edge_trim_peak() {
+    let payload = format!("\u{2003}{}\r\nb  ", "a".repeat(8 * MIB));
+    let payload_len = payload.len();
+    // Keep room for one runtime variable copy and the two passages in the output.
+    // A nonempty prefix leaves room for the final newline after the buffer doubles.
+    let bound = 3 * payload_len + MIB;
+    let expected = format!("{payload}{payload}");
+    let cases = [
+        (false, "@message system:\n\u{2003}{{payload}}{{payload}}\n@end\n"),
+        (true, "@define role():\n\u{2003}{{payload}}{{payload}}\n@end\n@message {{role()}}:\nok\n@end\n"),
+    ];
+    let peaks = cases.map(|(check_role, source)| {
+        let vars = HashMap::from([("payload".to_owned(), Value::String(payload.clone()))]);
+        let (result, peak) = peak_growth(|| mds::compile_str_with(source, None, Some(vars)));
+        let messages = result.unwrap().into_messages().unwrap();
+        assert_eq!(messages.len(), 1);
+        let actual = if check_role {
+            &messages[0].role
+        } else {
+            &messages[0].content
+        };
+        assert!(
+            actual == expected.trim(),
+            "check_role={check_role}, length {}, first bytes {:?}, last bytes {:?}",
+            actual.len(),
+            actual.as_bytes().get(..8),
+            actual.as_bytes().get(actual.len().saturating_sub(8)..)
+        );
+        assert!(peak >= payload_len, "one-buffer control: {peak} B");
+        peak
+    });
+    eprintln!("message content and function role peaks: {peaks:?} B; limit: {bound} B");
+    assert!(peaks.iter().all(|&peak| peak <= bound));
+}
+
+fn assert_small_messages_do_not_keep_padding() {
+    let vars = HashMap::from([("pad".to_owned(), Value::String(" ".repeat(4 * MIB)))]);
+    let source = "@message system:\n{{pad}}ok\n@end\n".repeat(6);
+    let (result, peak) = peak_growth(|| mds::compile_str_with(&source, None, Some(vars)));
+    let messages = result.unwrap().into_messages().unwrap();
+    assert_eq!(messages.len(), 6);
+    assert!(messages.iter().all(|message| message.content == "ok"));
+    assert!(peak <= 17 * MIB, "padded messages kept {peak} B at peak");
+}
+
 #[test]
 fn nested_if_output_does_not_raise_the_peak_heap() {
     let source = include_str!("memory_bound.rs");
@@ -147,4 +192,7 @@ fn nested_if_output_does_not_raise_the_peak_heap() {
         "D=4 adds {growth} B to the peak (limit: {} B)",
         CAP_PASS + SLACK
     );
+
+    assert_message_edge_trim_peak();
+    assert_small_messages_do_not_keep_padding();
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::arity::check_arity;
@@ -275,6 +276,7 @@ fn evaluate_nodes(
 
     for node in nodes {
         let abs_out = saved_cursor + (out.len() - start_len) as u32;
+        let slot;
         let rendered;
         let included;
         // Child bodies append to `out` directly. Leaf text uses one capped append.
@@ -339,7 +341,8 @@ fn evaluate_nodes(
                     // absolute position.
                     map.cursor = abs_out;
                 }
-                rendered = render_expr(&interp.expr, scope, ctx)?;
+                slot = evaluate_expr(&interp.expr, scope, ctx)?;
+                rendered = render_expr(&interp.expr, &slot)?;
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 && !ctx.fn_body_owned {
                         // S3 path: body was suppressed; record the call-site span.
@@ -348,7 +351,7 @@ fn evaluate_nodes(
                         map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
                     }
                 }
-                Some(rendered.as_str())
+                Some(rendered.as_ref())
             }
             Node::If(block) => {
                 if let Some(ref mut map) = ctx.map {
@@ -510,8 +513,7 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot
 
 /// Evaluate an expression to a slot that holds or projects a runtime value.
 ///
-/// This is the core expression evaluator used by both interpolation (via `render_expr`)
-/// and directive conditions/iterables (via `evaluate_condition` and `evaluate_for`).
+/// This is the core expression evaluator used by interpolation and directive expressions.
 fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<Slot, MdsError> {
     match expr {
         Expr::Var(name) => resolve_var(name, scope),
@@ -538,14 +540,11 @@ fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Resul
     }
 }
 
-/// Render an expression to a string for interpolation output.
-///
-/// Thin wrapper around `evaluate_expr` that enforces the rule that objects
-/// cannot be directly interpolated — the user must access a specific field.
-fn render_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<String, MdsError> {
-    let slot = evaluate_expr(expr, scope, ctx)?;
+/// Render an evaluated expression. Borrow strings and reject direct object interpolation.
+fn render_expr<'a>(expr: &Expr, slot: &'a Slot) -> Result<Cow<'a, str>, MdsError> {
     let value = slot.get().ok_or_else(invalid_projection)?;
     match value {
+        Value::String(text) => Ok(Cow::Borrowed(text)),
         Value::Object(_) => {
             // Build a descriptive error depending on the expression type
             let hint = match expr {
@@ -560,7 +559,7 @@ fn render_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<
             };
             Err(MdsError::syntax(hint))
         }
-        _ => Ok(value.to_string()),
+        _ => Ok(Cow::Owned(value.to_string())),
     }
 }
 
@@ -790,12 +789,11 @@ fn evaluate_function_body(
         // Use try_from + unwrap_or(u32::MAX) for safety: body is bounded by
         // MAX_OUTPUT_SIZE (50 MB) so try_from always succeeds in practice;
         // u32::MAX fallback causes rebase_trim to drop all segments (safe degradation).
-        let lead = u32::try_from(raw_body.len() - raw_body.trim_start().len()).unwrap_or(u32::MAX);
-        let trail = u32::try_from(raw_body.len() - raw_body.trim_end().len()).unwrap_or(u32::MAX);
         let untrimmed_len = u32::try_from(raw_body.len()).unwrap_or(u32::MAX);
-
-        let trimmed = raw_body.trim();
-        let trimmed_len = u32::try_from(trimmed.len()).unwrap_or(u32::MAX);
+        let (lead, trail) = trim_body(&mut raw_body);
+        let lead = u32::try_from(lead).unwrap_or(u32::MAX);
+        let trail = u32::try_from(trail).unwrap_or(u32::MAX);
+        let trimmed_len = u32::try_from(raw_body.len()).unwrap_or(u32::MAX);
 
         // Drop segments in trimmed-away regions; shift surviving out-values by -lead.
         if let Some(ref mut map) = ctx.map {
@@ -815,7 +813,7 @@ fn evaluate_function_body(
         // Signal to the Interpolation arm: body owns the segments.
         ctx.fn_body_owned = true;
 
-        Ok(trimmed.to_string())
+        Ok(raw_body)
     } else {
         // S3 path: suppress source-map recording inside function bodies.
         // The call site (the Interpolation node) is recorded as a single point
@@ -824,8 +822,10 @@ fn evaluate_function_body(
             map.suppress += 1;
         }
         ctx.call_stack.push(call_key.to_string());
-        let result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body)
-            .map(|()| raw_body.trim().to_string());
+        let result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body).map(|()| {
+            trim_body(&mut raw_body);
+            raw_body
+        });
         // Safety-critical LIFO invariant: call_stack tracks recursion detection.
         // A mismatched pop would silently corrupt recursion state and allow
         // stack overflows. Return a structured error rather than panicking so
@@ -845,6 +845,21 @@ fn evaluate_function_body(
         ctx.body_origin = prev_body_origin;
         prefer_first_error(result, lifo_result)
     }
+}
+
+/// Trim the buffer and return the original leading and trailing byte counts.
+fn trim_body(body: &mut String) -> (usize, usize) {
+    let lead = body.len() - body.trim_start().len();
+    let end = body.trim_end().len();
+    let trail = body.len() - end;
+    body.truncate(end);
+    // The two edges overlap if the entire body is whitespace.
+    drop(body.drain(..lead.min(end)));
+    // Do not keep a large allocation for a small result after the trim.
+    if body.capacity() > 2 * body.len() {
+        body.shrink_to_fit();
+    }
+    (lead, trail)
 }
 
 fn call_function(
@@ -1420,10 +1435,9 @@ fn collect_single_message(
     // R1 (`\r` strip) and R3 (blank-line-run cap) from silently changing compiled
     // output. Adding a `clean_output` call here would break the formatter's
     // safety model without any corresponding formatter change.
-    let mut raw_content = String::new();
-    evaluate_nodes(&block.body, scope, ctx, &mut raw_content)?;
-    let content = raw_content.trim().to_string();
-    drop(raw_content);
+    let mut content = String::new();
+    evaluate_nodes(&block.body, scope, ctx, &mut content)?;
+    trim_body(&mut content);
 
     // Skip empty messages.
     if content.is_empty() {
@@ -1684,7 +1698,8 @@ mod tests {
         let expected = MdsError::undefined_var("broken").to_string();
         for expr in [Expr::Var("broken".into()), member("broken", "field")] {
             assert_eq!(
-                render_expr(&expr, &mut scope, &mut ctx)
+                evaluate_expr(&expr, &mut scope, &mut ctx)
+                    .and_then(|slot| render_expr(&expr, &slot).map(drop))
                     .unwrap_err()
                     .to_string(),
                 expected
