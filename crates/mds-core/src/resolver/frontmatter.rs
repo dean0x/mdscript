@@ -5,8 +5,8 @@
 //! from YAML frontmatter.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 
@@ -16,7 +16,7 @@ use crate::limits::{
     MAX_FRONTMATTER_NODES, MAX_FRONTMATTER_SIZE,
 };
 use crate::parser::is_valid_identifier;
-use crate::scope::Scope;
+use crate::scope::{Scope, VarLayer};
 use crate::value::Value;
 
 use super::import_path_violation;
@@ -436,24 +436,20 @@ fn duplicate_key_message(key: &serde_yaml_ng::Value) -> String {
 /// Runtime vars are applied LAST so precedence is: base < child < runtime (F7).
 pub(super) fn build_scope_from_merged_mapping(
     mapping: &serde_yaml_ng::Mapping,
-    runtime_vars: &HashMap<String, Value>,
+    runtime_vars: &Arc<VarLayer>,
 ) -> Result<Scope, MdsError> {
-    let mut scope = Scope::new();
-
+    let mut frontmatter = VarLayer::new();
     for (key, val) in mapping {
         let serde_yaml_ng::Value::String(key_str) = key else {
             continue;
         };
         let value = Value::from_yaml(val.clone())?;
-        scope.set_var(key_str, value);
+        frontmatter.insert(key_str.clone(), Arc::new(value));
     }
-
-    // Runtime vars override everything (base < child < runtime, F7, decision #3).
-    for (key, value) in runtime_vars {
-        scope.set_var(key, value.clone());
-    }
-
-    Ok(scope)
+    Ok(Scope::with_layers(
+        Arc::clone(runtime_vars),
+        Arc::new(frontmatter),
+    ))
 }
 
 /// Parse the `imports` key from an already-parsed YAML value.

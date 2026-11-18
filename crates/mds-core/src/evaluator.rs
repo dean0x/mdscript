@@ -9,9 +9,9 @@ use crate::ast::{
 use crate::error::MdsError;
 use crate::limits::{
     MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGES_TOTAL_SIZE, MAX_MESSAGE_COUNT,
-    MAX_OUTPUT_SIZE,
+    MAX_OUTPUT_SIZE, MAX_TOTAL_FUNCTION_CALLS,
 };
-use crate::scope::{FunctionDef, Scope};
+use crate::scope::{FunctionDef, PathStep, Scope, Slot};
 use crate::value::Value;
 
 /// Maximum call depth to prevent stack overflow from deeply nested calls.
@@ -20,21 +20,17 @@ const MAX_CALL_DEPTH: usize = 128;
 /// Maximum number of iterations allowed in a single @for loop.
 const MAX_LOOP_ITERATIONS: usize = 100_000;
 
-/// Maximum total iterations across all loops in a single compilation.
+/// Maximum total iterations across all loops in a single module evaluation.
 /// This prevents nested loops from multiplying iterations into the billions.
 const MAX_TOTAL_ITERATIONS: usize = 1_000_000;
 
 /// Maximum number of accumulated warnings before further warnings are silently dropped.
 const MAX_WARNINGS: usize = 1_000;
 
-/// Cumulative resource budgets spent by one module evaluation.
+/// Cumulative resource budgets for evaluation.
 ///
-/// A module body is usually evaluated in one call, but an `@extends` chain is
-/// evaluated one spliced region at a time. The seeded entry points
-/// ([`evaluate_seeded`], [`evaluate_with_map_seeded`], [`evaluate_messages_seeded`])
-/// take the budget by `&mut`, so every region spends from the same totals: a budget
-/// seeded afresh per region would multiply each cap by the region count (applies
-/// PF-004).
+/// Each module starts a new loop and message budget. All regions of a module share
+/// those budgets. All modules and regions in a compile share the function call budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct EvalBudget {
     /// Loop iterations across all `@for` loops (capped at `MAX_TOTAL_ITERATIONS`).
@@ -43,6 +39,30 @@ pub(crate) struct EvalBudget {
     /// `MAX_MESSAGES_TOTAL_SIZE`). Checked as each message is collected, so runaway
     /// growth is caught before a giant `Vec` is built.
     message_bytes: usize,
+    function_calls: usize,
+}
+
+impl EvalBudget {
+    pub(crate) fn start_module(&mut self) -> &mut Self {
+        self.iterations = 0;
+        self.message_bytes = 0;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_function_calls(&mut self, spent: usize) {
+        self.function_calls = spent;
+    }
+
+    fn charge_function_call(&mut self) -> Result<(), MdsError> {
+        if self.function_calls >= MAX_TOTAL_FUNCTION_CALLS {
+            return Err(MdsError::resource_limit(format!(
+                "compile exceeds {MAX_TOTAL_FUNCTION_CALLS} function calls"
+            )));
+        }
+        self.function_calls += 1;
+        Ok(())
+    }
 }
 
 /// Transient state threaded through the evaluator for a single compilation.
@@ -105,6 +125,7 @@ pub(crate) struct EvalContext<'a> {
 /// evaluated; they are threaded into `EvalContext` so that diagnostics raised
 /// during condition evaluation (e.g. `mds::type_mismatch`) can carry source spans.
 /// Pass `""` for both when no source context is available (e.g. in unit tests).
+#[cfg(test)]
 pub fn evaluate(
     nodes: &[Node],
     scope: &mut Scope,
@@ -122,7 +143,7 @@ pub fn evaluate(
     )
 }
 
-/// Like [`evaluate`], but spends from the caller's `budget` instead of a fresh one.
+/// Evaluate a module body with the caller's cumulative budget.
 ///
 /// Used to evaluate several node slices that make up ONE module (the spliced regions
 /// of an `@extends` chain) under one set of caps. `budget` holds the running totals
@@ -164,7 +185,8 @@ pub(crate) fn evaluate_seeded(
 /// Delegates to [`evaluate_with_map_seeded`] with a fresh [`EvalBudget`].
 /// Use [`evaluate_with_map_seeded`] directly when you need to carry cumulative
 /// resource budgets across multiple invocations (e.g. `@extends` regions).
-pub(crate) fn evaluate_with_map(
+#[cfg(test)]
+fn evaluate_with_map(
     nodes: &[Node],
     scope: &mut Scope,
     warnings: &mut Vec<String>,
@@ -175,9 +197,8 @@ pub(crate) fn evaluate_with_map(
 
 /// Evaluate nodes with source-map recording, spending from the caller's `budget`.
 ///
-/// Like [`evaluate_with_map`], but continues cumulative budgets from prior work
-/// (e.g. earlier `@extends` regions); `budget` holds the running totals when this
-/// returns, on success and on error alike.
+/// The budget includes prior work, such as earlier `@extends` regions.
+/// It holds the running totals on success and on error alike.
 ///
 /// `file` and `source` for `EvalContext` diagnostic spans are derived from the
 /// builder's current source — the single source of truth.  Callers must switch
@@ -431,21 +452,27 @@ fn evaluate_block(
     evaluate_nodes(&block.body, scope, ctx)
 }
 
-/// Resolve a dot-separated path against the current scope.
-///
-/// `root` is the root variable name; `fields` are the field names to traverse into the
-/// resolved root value. Passing an empty `fields` slice returns the root variable itself.
-/// Returns `Ok(Value)` with the resolved value, or an error if the path is invalid.
-fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError> {
+/// Return the bound slot only if its projection still refers to a value.
+fn resolve_var(name: &str, scope: &Scope) -> Result<Slot, MdsError> {
+    scope
+        .get_slot(name)
+        .filter(|slot| slot.get().is_some())
+        .cloned()
+        .ok_or_else(|| MdsError::undefined_var(name))
+}
+
+fn invalid_projection() -> MdsError {
+    MdsError::syntax("internal error: an evaluated value has an invalid projection")
+}
+
+/// Resolve each field against the root slot. An empty path returns the slot itself.
+fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot, MdsError> {
     if fields.len() > MAX_DOT_SEGMENTS {
         return Err(MdsError::syntax(format!(
             "dot path exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
         )));
     }
-    let mut current = scope
-        .get_var(root)
-        .cloned()
-        .ok_or_else(|| MdsError::undefined_var(root))?;
+    let mut current = resolve_var(root, scope)?;
     for (i, field) in fields.iter().enumerate() {
         // Build the traversed path for error messages (e.g. "a.b" when failing at "c").
         let traversed_path = || {
@@ -454,19 +481,20 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Valu
                 .collect::<Vec<_>>()
                 .join(".")
         };
-        match current {
-            Value::Object(ref map) => {
-                current = map.get(field).cloned().ok_or_else(|| {
-                    MdsError::syntax(format!(
-                        "field '{field}' not found on '{}'",
-                        traversed_path()
-                    ))
-                })?;
+        match current.get().ok_or_else(invalid_projection)? {
+            Value::Object(map) if map.contains_key(field) => {
+                current = current.project(PathStep::Key(field.clone()));
             }
-            _ => {
+            Value::Object(_) => {
+                return Err(MdsError::syntax(format!(
+                    "field '{field}' not found on '{}'",
+                    traversed_path()
+                )));
+            }
+            value => {
                 return Err(MdsError::syntax(format!(
                     "cannot access field '{field}' on {} '{}'",
-                    current.type_name(),
+                    value.type_name(),
                     traversed_path()
                 )));
             }
@@ -475,42 +503,33 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Valu
     Ok(current)
 }
 
-/// Evaluate an expression to its runtime `Value`.
+/// Evaluate an expression to a slot that holds or projects a runtime value.
 ///
 /// This is the core expression evaluator used by both interpolation (via `render_expr`)
 /// and directive conditions/iterables (via `evaluate_condition` and `evaluate_for`).
-fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<Value, MdsError> {
+fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<Slot, MdsError> {
     match expr {
-        Expr::Var(name) => scope
-            .get_var(name)
-            .cloned()
-            .ok_or_else(|| MdsError::undefined_var(name)),
-        Expr::Call { name, args } => {
-            let resolved_args = resolve_args(args, scope, ctx, 0)?;
-            call_function(name, &resolved_args, scope, ctx)
-        }
+        Expr::Var(name) => resolve_var(name, scope),
+        Expr::Call { name, args } => call_function(name, args, scope, ctx, 0),
         Expr::QualifiedCall {
             namespace,
             name,
             args,
-        } => {
-            let resolved_args = resolve_args(args, scope, ctx, 0)?;
-            call_qualified_function(namespace, name, &resolved_args, scope, ctx)
-        }
+        } => call_qualified_function(namespace, name, args, scope, ctx),
         Expr::MemberAccess { object, fields } => {
             // Give a targeted error when the name refers to an imported namespace rather
             // than a variable — before delegating to resolve_dot_path which only looks up vars.
-            if scope.get_var(object).is_none() && scope.get_namespace(object).is_some() {
+            if scope.get_slot(object).is_none() && scope.get_namespace(object).is_some() {
                 return Err(MdsError::syntax(format!(
                     "'{object}' is an imported module, not a variable — to call a function use {{{object}.func()}}"
                 )));
             }
             resolve_dot_path(object, fields, scope)
         }
-        Expr::StringLiteral(s) => Ok(Value::String(s.clone())),
-        Expr::NumberLiteral(n) => Ok(Value::Number(*n)),
-        Expr::BooleanLiteral(b) => Ok(Value::Boolean(*b)),
-        Expr::NullLiteral => Ok(Value::Null),
+        Expr::StringLiteral(s) => Ok(Value::String(s.clone()).into()),
+        Expr::NumberLiteral(n) => Ok(Value::Number(*n).into()),
+        Expr::BooleanLiteral(b) => Ok(Value::Boolean(*b).into()),
+        Expr::NullLiteral => Ok(Value::Null.into()),
     }
 }
 
@@ -519,8 +538,9 @@ fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Resul
 /// Thin wrapper around `evaluate_expr` that enforces the rule that objects
 /// cannot be directly interpolated — the user must access a specific field.
 fn render_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<String, MdsError> {
-    let value = evaluate_expr(expr, scope, ctx)?;
-    match &value {
+    let slot = evaluate_expr(expr, scope, ctx)?;
+    let value = slot.get().ok_or_else(invalid_projection)?;
+    match value {
         Value::Object(_) => {
             // Build a descriptive error depending on the expression type
             let hint = match expr {
@@ -544,7 +564,7 @@ fn resolve_args(
     scope: &mut Scope,
     ctx: &mut EvalContext,
     depth: usize,
-) -> Result<Vec<Value>, MdsError> {
+) -> Result<Vec<Slot>, MdsError> {
     if depth > MAX_CALL_DEPTH {
         return Err(MdsError::recursion(format!(
             "argument expression depth exceeds {MAX_CALL_DEPTH}"
@@ -552,21 +572,15 @@ fn resolve_args(
     }
     args.iter()
         .map(|arg| match arg {
-            Arg::StringLiteral(s) => Ok(Value::String(s.clone())),
-            Arg::NumberLiteral(n) => Ok(Value::Number(*n)),
-            Arg::BooleanLiteral(b) => Ok(Value::Boolean(*b)),
-            Arg::NullLiteral => Ok(Value::Null),
-            Arg::Var(name) => scope
-                .get_var(name)
-                .cloned()
-                .ok_or_else(|| MdsError::undefined_var(name)),
+            Arg::StringLiteral(s) => Ok(Value::String(s.clone()).into()),
+            Arg::NumberLiteral(n) => Ok(Value::Number(*n).into()),
+            Arg::BooleanLiteral(b) => Ok(Value::Boolean(*b).into()),
+            Arg::NullLiteral => Ok(Value::Null.into()),
+            Arg::Var(name) => resolve_var(name, scope),
             Arg::Call {
                 name,
                 args: inner_args,
-            } => {
-                let resolved = resolve_args(inner_args, scope, ctx, depth + 1)?;
-                call_function(name, &resolved, scope, ctx)
-            }
+            } => call_function(name, inner_args, scope, ctx, depth + 1),
             Arg::MemberAccess { object, fields } => resolve_dot_path(object, fields, scope),
         })
         .collect()
@@ -615,29 +629,29 @@ pub(crate) fn literal_expr_to_value(expr: &Expr) -> Result<Value, MdsError> {
     }
 }
 
-/// Restore the closure captures recorded at function-definition time into the
-/// current scope frame.
-///
-/// Namespaces, sibling functions, and variables captured from the definition
-/// site are written into `scope` before parameter binding so that params shadow
-/// captured vars correctly (params take precedence over closure variables).
-fn restore_captured_scope(func: &FunctionDef, scope: &mut Scope) {
-    for (alias, ns) in &func.captured.namespaces {
-        scope.set_namespace(alias, ns.clone());
+fn check_function_arity(
+    func: &FunctionDef,
+    call_key: &str,
+    arg_count: usize,
+) -> Result<(), MdsError> {
+    let required = required_param_count(&func.params);
+    let total = func.params.len();
+    if !check_arity(arg_count, required, total) {
+        return Err(MdsError::arity(
+            call_key,
+            required,
+            total,
+            arg_count,
+            Some(render_signature(call_key, &func.params)),
+        ));
     }
-    // captured.functions are owned FunctionDef (not Arc) — wrap in Arc for scope insertion.
-    for (name, f) in &func.captured.functions {
-        scope.set_function(name, Arc::new(f.clone()));
-    }
-    for (name, val) in &func.captured.vars {
-        scope.set_var(name, val.clone());
-    }
+    Ok(())
 }
 
 fn invoke_function(
-    func: &FunctionDef,
+    func: &Arc<FunctionDef>,
     call_key: &str,
-    args: &[Value],
+    args: &[Slot],
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
@@ -653,26 +667,22 @@ fn invoke_function(
             "{call_key} (call depth exceeds {MAX_CALL_DEPTH})"
         )));
     }
-    let required = required_param_count(&func.params);
-    let total = func.params.len();
-    if !check_arity(args.len(), required, total) {
-        return Err(MdsError::arity(
-            call_key,
-            required,
-            total,
-            args.len(),
-            Some(render_signature(call_key, &func.params)),
-        ));
-    }
-    scope.push();
-    // Restore captured lexical scope from definition site so the function body
-    // can resolve alias imports, sibling functions, and frontmatter variables
-    // from its defining module.
-    restore_captured_scope(func, scope);
+    check_function_arity(func, call_key, args.len())?;
+    ctx.budget.charge_function_call()?;
+    scope.push_call(func);
+    let result = evaluate_function_body(func, call_key, args, scope, ctx);
+    prefer_first_error(result, scope.pop())
+}
+
+fn bind_call_params(
+    params: &[crate::ast::Param],
+    args: &[Slot],
+    scope: &mut Scope,
+) -> Result<(), MdsError> {
     // Bind params index-by-index; fill missing optional params with their defaults.
-    for (i, param) in func.params.iter().enumerate() {
-        let value = if i < args.len() {
-            args[i].clone()
+    for (i, param) in params.iter().enumerate() {
+        let slot = if let Some(arg) = args.get(i) {
+            arg.clone()
         } else {
             // Required params were already checked above; this arm only fires for
             // optional params not supplied by the caller.
@@ -682,10 +692,21 @@ fn invoke_function(
                     param.name
                 ))
             })?;
-            literal_expr_to_value(default)?
+            literal_expr_to_value(default)?.into()
         };
-        scope.set_var(&param.name, value);
+        scope.set_slot(&param.name, slot);
     }
+    Ok(())
+}
+
+fn evaluate_function_body(
+    func: &FunctionDef,
+    call_key: &str,
+    args: &[Slot],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<String, MdsError> {
+    bind_call_params(&func.params, args, scope)?;
 
     // B1 (applies PF-012): swap body_origin to the function's defining file so
     // build_type_mismatch inside the body attributes spans to the correct source.
@@ -757,8 +778,7 @@ fn invoke_function(
                  expected '{call_key}', got {popped:?}"
             )))
         };
-        let pop_result = scope.pop();
-        let raw_body = prefer_first_error(body_result, lifo_result.and(pop_result))?;
+        let raw_body = prefer_first_error(body_result, lifo_result)?;
 
         // Compute lead/trail byte counts for rebase_trim.
         // Use try_from + unwrap_or(u32::MAX) for safety: body is bounded by
@@ -815,26 +835,23 @@ fn invoke_function(
                  expected '{call_key}', got {popped:?}"
             )))
         };
-        let pop_result = scope.pop();
-        // B1: restore body_origin before returning so LIFO is correct even on error
-        // paths (prefer_first_error returns the render error, not a panic).
         ctx.body_origin = prev_body_origin;
-        // On double-fault, preserve the render error — it carries the actionable
-        // source-span diagnostic for the user. LIFO/pop failures are compiler
-        // bugs and surface as secondary errors.
-        prefer_first_error(result, lifo_result.and(pop_result))
+        prefer_first_error(result, lifo_result)
     }
 }
 
 fn call_function(
     name: &str,
-    args: &[Value],
+    args: &[Arg],
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<Value, MdsError> {
+    depth: usize,
+) -> Result<Slot, MdsError> {
     // User-defined functions take priority (shadowing built-ins).
     if let Some(func) = scope.get_function(name).cloned() {
-        return invoke_function(&func, name, args, scope, ctx).map(Value::String);
+        check_function_arity(&func, name, args.len())?;
+        let args = resolve_args(args, scope, ctx, depth)?;
+        return invoke_function(&func, name, &args, scope, ctx).map(|s| Value::String(s).into());
     }
     // Fall back to built-ins.
     if let Some(meta) = crate::builtins::get_builtin(name) {
@@ -853,31 +870,41 @@ fn call_function(
         // Call the handler directly using the meta reference we already hold,
         // avoiding a second linear scan through BUILTINS that call_builtin
         // would perform internally.
-        return (meta.handler)(args);
+        let values = resolve_args(args, scope, ctx, depth)?
+            .into_iter()
+            .map(|slot| slot.into_value().ok_or_else(invalid_projection))
+            .collect::<Result<Vec<_>, _>>()?;
+        ctx.budget.charge_function_call()?;
+        return (meta.handler)(&values).map(Slot::from);
     }
+    // An argument error still takes priority when the callee does not exist.
+    resolve_args(args, scope, ctx, depth)?;
     Err(MdsError::undefined_fn(name))
 }
 
 fn call_qualified_function(
     namespace: &str,
     name: &str,
-    args: &[Value],
+    args: &[Arg],
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<Value, MdsError> {
+) -> Result<Slot, MdsError> {
     let qualified_name = format!("{namespace}.{name}");
-
-    let ns = scope
+    let callee = scope
         .get_namespace(namespace)
-        .ok_or_else(|| MdsError::undefined_var(namespace))?;
-
-    let func = ns
-        .functions
-        .get(name)
-        .ok_or_else(|| MdsError::undefined_fn(&qualified_name))?
-        .clone();
-
-    invoke_function(&func, &qualified_name, args, scope, ctx).map(Value::String)
+        .ok_or_else(|| MdsError::undefined_var(namespace))
+        .and_then(|ns| {
+            ns.functions
+                .get(name)
+                .cloned()
+                .ok_or_else(|| MdsError::undefined_fn(&qualified_name))
+        });
+    if let Ok(func) = &callee {
+        check_function_arity(func, &qualified_name, args.len())?;
+    }
+    // Defer a lookup error until after the arguments have been evaluated.
+    let args = resolve_args(args, scope, ctx, 0)?;
+    invoke_function(&callee?, &qualified_name, &args, scope, ctx).map(|s| Value::String(s).into())
 }
 
 /// Compare two runtime `Value` instances for strict same-type equality.
@@ -970,23 +997,20 @@ fn evaluate_condition(
     anchor: Option<usize>,
 ) -> Result<bool, MdsError> {
     match condition {
-        Condition::Truthy(expr) => Ok(evaluate_expr(expr, scope, ctx)?.is_truthy()),
-        Condition::Not(expr) => Ok(!evaluate_expr(expr, scope, ctx)?.is_truthy()),
-        Condition::Eq(lhs, rhs) => {
-            let lhs_val = evaluate_expr(lhs, scope, ctx)?;
-            let rhs_val = evaluate_expr(rhs, scope, ctx)?;
-            values_equal_same_type(&lhs_val, &rhs_val).ok_or_else(|| {
-                build_type_mismatch(ctx, anchor, lhs_val.type_name(), rhs_val.type_name())
-            })
+        Condition::Truthy(expr) | Condition::Not(expr) => {
+            let slot = evaluate_expr(expr, scope, ctx)?;
+            let truthy = slot.get().ok_or_else(invalid_projection)?.is_truthy();
+            Ok(truthy != matches!(condition, Condition::Not(_)))
         }
-        Condition::NotEq(lhs, rhs) => {
-            let lhs_val = evaluate_expr(lhs, scope, ctx)?;
-            let rhs_val = evaluate_expr(rhs, scope, ctx)?;
-            values_equal_same_type(&lhs_val, &rhs_val)
-                .map(|eq| !eq)
-                .ok_or_else(|| {
-                    build_type_mismatch(ctx, anchor, lhs_val.type_name(), rhs_val.type_name())
-                })
+        Condition::Eq(lhs, rhs) | Condition::NotEq(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, scope, ctx)?;
+            let rhs = evaluate_expr(rhs, scope, ctx)?;
+            let lhs = lhs.get().ok_or_else(invalid_projection)?;
+            let rhs = rhs.get().ok_or_else(invalid_projection)?;
+            let eq = values_equal_same_type(lhs, rhs).ok_or_else(|| {
+                build_type_mismatch(ctx, anchor, lhs.type_name(), rhs.type_name())
+            })?;
+            Ok(eq != matches!(condition, Condition::NotEq(..)))
         }
         // Short-circuit And: return false on first false operand.
         // Parser invariant: And operands are always leaf conditions (parse_and_level calls
@@ -1083,7 +1107,8 @@ fn drive_for<F>(
 where
     F: FnMut(&mut Scope, &mut EvalContext) -> Result<(), MdsError>,
 {
-    let iterable = evaluate_expr(&block.iterable, scope, ctx)?;
+    let slot = evaluate_expr(&block.iterable, scope, ctx)?;
+    let iterable = slot.get().ok_or_else(invalid_projection)?;
 
     if let Some(ref key_var) = block.key_var {
         // Key-value iteration: @for key, value in obj:
@@ -1108,10 +1133,10 @@ where
         // Sort keys alphabetically for deterministic output.
         // SAFE to use unstable sort: `map` comes from `Value::Object` (a HashMap) —
         // keys are unique by construction so no two elements compare equal (tie-free).
-        let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        let mut keys: Vec<_> = map.keys().collect();
+        keys.sort_unstable();
 
-        for (key, val) in entries {
+        for key in keys {
             ctx.budget.iterations += 1;
             if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
                 return Err(MdsError::resource_limit(format!(
@@ -1120,8 +1145,8 @@ where
                 )));
             }
             scope.push();
-            scope.set_var(key_var, Value::String(key));
-            scope.set_var(&block.var, val);
+            scope.set_var(key_var, Value::String(key.clone()));
+            scope.set_slot(&block.var, slot.project(PathStep::Key(key.clone())));
             let result = body(scope, ctx);
             prefer_first_error(result, scope.pop())?;
         }
@@ -1130,7 +1155,7 @@ where
 
     // Standard array iteration: @for item in iterable:
     // Objects are rejected here with a hint to use key-value syntax.
-    if let Value::Object(_) = &iterable {
+    if let Value::Object(_) = iterable {
         return Err(MdsError::syntax(
             "to iterate over an object's entries, use `@for key, value in obj:` syntax",
         ));
@@ -1140,8 +1165,7 @@ where
         .as_array()
         .ok_or_else(|| MdsError::type_error(iterable.type_name()))?;
 
-    // Check length before cloning to avoid allocating the full Vec only to
-    // immediately return a resource-limit error for oversized arrays.
+    // Check length before any pass creates a projection.
     if array.len() > MAX_LOOP_ITERATIONS {
         return Err(MdsError::resource_limit(format!(
             "array has {} elements, exceeding maximum loop iteration limit of {}",
@@ -1150,10 +1174,7 @@ where
         )));
     }
 
-    // Clone items to release the borrow on scope before iterating.
-    let items = array.to_vec();
-
-    for item in items {
+    for i in 0..array.len() {
         ctx.budget.iterations += 1;
         if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
             return Err(MdsError::resource_limit(format!(
@@ -1162,7 +1183,7 @@ where
             )));
         }
         scope.push();
-        scope.set_var(&block.var, item);
+        scope.set_slot(&block.var, slot.project(PathStep::Index(i)));
         let result = body(scope, ctx);
         prefer_first_error(result, scope.pop())?;
     }
@@ -1193,8 +1214,8 @@ fn evaluate_include(
         .get_namespace(&inc.alias)
         .ok_or_else(|| MdsError::undefined_var(&inc.alias))?;
 
-    let prompt_body = match &ns.prompt_body {
-        Some(body) => body.clone(),
+    let prompt_body = match ns.prompt_body.as_deref() {
+        Some(body) => body,
         None => {
             if ctx.warnings.len() < MAX_WARNINGS {
                 // Untrusted identifier from template source — WIRE (spec 7.5).
@@ -1231,7 +1252,7 @@ fn evaluate_include(
         map.splice_fragment(fragment, base);
     }
 
-    Ok(prompt_body)
+    Ok(prompt_body.to_owned())
 }
 
 /// A single structured message produced by `evaluate_messages_intrinsic`.
@@ -1255,31 +1276,9 @@ pub struct EvalMessage {
 /// span: when orphan content is found, the offending node's byte offset (already
 /// captured by the parser on every `TextNode`/`Interpolation`) is paired with
 /// `source` so the error underlines the prose (origin rides along the data, not a
-/// path→source lookup). Every node's offsets must therefore index into `source`: an
-/// `@extends` chain, whose regions come from different files, is collected region by
-/// region through [`evaluate_messages_seeded`] instead.
-pub fn evaluate_messages_intrinsic(
-    nodes: &[Node],
-    scope: &mut Scope,
-    warnings: &mut Vec<String>,
-    file: &str,
-    source: &str,
-) -> Result<Vec<EvalMessage>, MdsError> {
-    let mut messages = Vec::new();
-    evaluate_messages_seeded(
-        nodes,
-        scope,
-        warnings,
-        file,
-        source,
-        &mut EvalBudget::default(),
-        &mut messages,
-    )?;
-    Ok(messages)
-}
-
-/// Like [`evaluate_messages_intrinsic`], but appends to the caller's `out` and spends
-/// from the caller's `budget` instead of fresh ones.
+/// path→source lookup). Every node's offsets must therefore index into `source`.
+///
+/// Append to the caller's `out` and spend from the caller's `budget`.
 ///
 /// Used to collect several node slices that make up ONE module (the spliced regions
 /// of an `@extends` chain) under one set of caps. Sharing `out` shares the
@@ -1393,15 +1392,13 @@ fn collect_single_message(
     out: &mut Vec<EvalMessage>,
 ) -> Result<(), MdsError> {
     // Evaluate the role expression to a string.
-    let role_value = evaluate_expr(&block.role, scope, ctx)?;
-    let role = match role_value {
-        Value::String(s) => s,
-        other => {
-            return Err(MdsError::type_error(format!(
-                "@message role must evaluate to a string, but got {}",
-                other.type_name()
-            )));
-        }
+    let role_slot = evaluate_expr(&block.role, scope, ctx)?;
+    let role_value = role_slot.get().ok_or_else(invalid_projection)?;
+    let Value::String(role) = role_value else {
+        return Err(MdsError::type_error(format!(
+            "@message role must evaluate to a string, but got {}",
+            role_value.type_name()
+        )));
     };
     // Mirror the parse-time empty-role rejection on the dynamic path: a variable
     // or expression that evaluates to "" or whitespace-only must also be rejected.
@@ -1444,6 +1441,9 @@ fn collect_single_message(
         )));
     }
 
+    let Some(Value::String(role)) = role_slot.into_value() else {
+        return Err(invalid_projection());
+    };
     out.push(EvalMessage { role, content });
     Ok(())
 }
@@ -1503,6 +1503,219 @@ mod tests {
             text: s.to_string(),
             offset: 0,
         })
+    }
+
+    fn test_context(warnings: &mut Vec<String>) -> EvalContext<'_> {
+        EvalContext {
+            call_stack: Vec::new(),
+            budget: EvalBudget::default(),
+            warnings,
+            map: None,
+            fn_body_owned: false,
+            file: "",
+            source: "",
+            body_origin: None,
+        }
+    }
+
+    fn test_loop(iterable: Expr) -> ForBlock {
+        ForBlock {
+            var: "item".into(),
+            key_var: None,
+            iterable,
+            body: Vec::new(),
+            offset: 0,
+            end_offset: 0,
+        }
+    }
+
+    fn member(object: &str, field: &str) -> Expr {
+        Expr::MemberAccess {
+            object: object.into(),
+            fields: vec![field.into()],
+        }
+    }
+
+    #[test]
+    fn shared_reads_nested_loop_binds_the_original_elements() {
+        let items = Arc::new(Value::Array(vec![Value::Array(vec![Value::Null])]));
+        let frontmatter = [("items".into(), Arc::clone(&items))].into_iter().collect();
+        let mut scope = Scope::with_layers(Arc::default(), Arc::new(frontmatter));
+        let outer = test_loop(Expr::Var("items".into()));
+        let mut inner = test_loop(Expr::Var("item".into()));
+        inner.var = "leaf".into();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let mut shared = Vec::new();
+        drive_for(&outer, &mut scope, &mut ctx, |scope, ctx| {
+            let item = &scope.get_var("items").unwrap().as_array().unwrap()[0];
+            let leaf = std::ptr::from_ref(&item.as_array().unwrap()[0]);
+            let root = scope.get_slot("items").unwrap().root();
+            let outer_slot = scope.get_slot("item").unwrap();
+            assert!(Arc::ptr_eq(root, outer_slot.root()));
+            shared.push(std::ptr::eq(outer_slot.get().unwrap(), item));
+            drive_for(&inner, scope, ctx, |scope, _| {
+                let root = scope.get_slot("items").unwrap().root();
+                let leaf_slot = scope.get_slot("leaf").unwrap();
+                assert!(Arc::ptr_eq(root, leaf_slot.root()));
+                shared.push(std::ptr::eq(leaf_slot.get().unwrap(), leaf));
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert_eq!(shared, [true, true]);
+    }
+
+    #[test]
+    fn shared_reads_dot_loop_binds_the_original_elements() {
+        let items = Value::Array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let config = Arc::new(Value::Object(std::collections::HashMap::from([(
+            "items".into(),
+            items,
+        )])));
+        let frontmatter = [("cfg".into(), Arc::clone(&config))].into_iter().collect();
+        let mut scope = Scope::with_layers(Arc::default(), Arc::new(frontmatter));
+        let block = test_loop(member("cfg", "items"));
+        let Value::Object(fields) = config.as_ref() else {
+            panic!("expected object");
+        };
+        let items = &fields["items"];
+        let elements = items.as_array().unwrap();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let iterable = evaluate_expr(&block.iterable, &mut scope, &mut ctx).unwrap();
+        assert!(Arc::ptr_eq(iterable.root(), &config));
+        let mut shared = vec![std::ptr::eq(iterable.get().unwrap(), items)];
+        drive_for(&block, &mut scope, &mut ctx, |scope, _| {
+            let slot = scope.get_slot("item").unwrap();
+            assert!(Arc::ptr_eq(slot.root(), &config));
+            shared.push(std::ptr::eq(
+                slot.get().unwrap(),
+                &elements[shared.len() - 1],
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(shared, [true, true, true]);
+    }
+
+    #[test]
+    fn shared_reads_function_arguments_refer_to_the_caller_values() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "cfg",
+            Value::Object(std::collections::HashMap::from([(
+                "item".into(),
+                Value::Null,
+            )])),
+        );
+        let args = [
+            Arg::Var("cfg".into()),
+            Arg::MemberAccess {
+                object: "cfg".into(),
+                fields: vec!["item".into()],
+            },
+        ];
+        let resolved =
+            resolve_args(&args, &mut scope, &mut test_context(&mut Vec::new()), 0).unwrap();
+        scope.push();
+        bind_call_params(
+            &[Param::required("whole"), Param::required("part")],
+            &resolved,
+            &mut scope,
+        )
+        .unwrap();
+        let config = scope.get_slot("cfg").unwrap();
+        let Value::Object(fields) = config.get().unwrap() else {
+            panic!("expected object");
+        };
+        let whole = scope.get_slot("whole").unwrap();
+        let part = scope.get_slot("part").unwrap();
+        assert!(Arc::ptr_eq(whole.root(), config.root()));
+        assert!(Arc::ptr_eq(part.root(), config.root()));
+        assert!(std::ptr::eq(part.get().unwrap(), &fields["item"]));
+    }
+
+    #[test]
+    fn shared_reads_key_value_loop_shares_values_in_key_order() {
+        let entries = std::collections::HashMap::from([
+            ("z".into(), Value::Number(2.0)),
+            ("a".into(), Value::Number(1.0)),
+        ]);
+        let mut scope = Scope::new();
+        scope.set_var("entries", Value::Object(entries));
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.key_var = Some("key".into());
+        let mut seen = Vec::new();
+        drive_for(
+            &block,
+            &mut scope,
+            &mut test_context(&mut Vec::new()),
+            |scope, _| {
+                let key = scope.get_var("key").unwrap().to_string();
+                let Value::Object(entries) = scope.get_var("entries").unwrap() else {
+                    panic!("expected object");
+                };
+                let shared = std::ptr::eq(scope.get_var("item").unwrap(), &entries[&key]);
+                seen.push((key, shared));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, [(String::from("a"), true), (String::from("z"), true)]);
+    }
+
+    #[test]
+    fn shared_reads_broken_projection_is_undefined_not_null() {
+        let root = Slot::from(Value::Array(vec![Value::Null]));
+        let mut scope = Scope::new();
+        scope.set_slot("broken", root.project(PathStep::Index(1)));
+        scope.set_slot("valid", root.project(PathStep::Index(0)));
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        assert_eq!(scope.get_var("broken"), None);
+        let expected = MdsError::undefined_var("broken").to_string();
+        for expr in [Expr::Var("broken".into()), member("broken", "field")] {
+            assert_eq!(
+                render_expr(&expr, &mut scope, &mut ctx)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            resolve_args(&[Arg::Var("broken".into())], &mut scope, &mut ctx, 0)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(scope.get_var("valid"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn shared_reads_large_array_refused_before_first_pass() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "items",
+            Value::Array(vec![Value::Null; MAX_LOOP_ITERATIONS + 1]),
+        );
+        let block = test_loop(Expr::Var("items".into()));
+        let mut passes = 0;
+        let err = drive_for(
+            &block,
+            &mut scope,
+            &mut test_context(&mut Vec::new()),
+            |_, _| {
+                passes += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(passes, 0);
+        assert_eq!(
+            err.to_string(),
+            format!("resource limit exceeded: array has {} elements, exceeding maximum loop iteration limit of {MAX_LOOP_ITERATIONS}", MAX_LOOP_ITERATIONS + 1),
+        );
     }
 
     #[test]
@@ -2090,7 +2303,7 @@ mod tests {
         let src = "@for i in items:\n{{x}}\n@end\n";
         let seeded = |left: usize| EvalBudget {
             iterations: MAX_TOTAL_ITERATIONS - left,
-            message_bytes: 0,
+            ..EvalBudget::default()
         };
 
         let (result, budget) = eval_capped(src, seeded(CAP_CROSSING_PASS));
@@ -2419,6 +2632,112 @@ mod tests {
     // context available at runtime); validator errors HAVE a span (source text
     // is present at compile time).
 
+    fn arity_scope() -> Scope {
+        let mut scope = Scope::new();
+        let function = Arc::new(FunctionDef {
+            params: vec![Param::required("x")],
+            body: vec![text("ok")],
+            captured: crate::scope::CapturedScope::default(),
+            origin: None,
+        });
+        scope.set_function("f", Arc::clone(&function));
+        scope.set_namespace(
+            "ns",
+            Arc::new(crate::scope::NamespaceScope {
+                functions: [("f".into(), function)].into_iter().collect(),
+                prompt_body: None,
+                prompt_map: None,
+                prompt_suppressed_by_exports: false,
+            }),
+        );
+        scope
+    }
+
+    fn direct_call(namespace: Option<&str>, name: &str, args: Vec<Arg>) -> Expr {
+        match namespace {
+            Some(namespace) => Expr::QualifiedCall {
+                namespace: namespace.into(),
+                name: name.into(),
+                args,
+            },
+            None => Expr::Call {
+                name: name.into(),
+                args,
+            },
+        }
+    }
+
+    #[test]
+    fn known_callee_reports_arity_before_an_undefined_argument() {
+        let mut scope = arity_scope();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let missing = Arg::Var("missing_arg".into());
+        let wrong = vec![missing.clone(), Arg::NullLiteral];
+        let nested = direct_call(
+            None,
+            "upper",
+            vec![Arg::Call {
+                name: "f".into(),
+                args: wrong.clone(),
+            }],
+        );
+        let calls = [
+            (direct_call(None, "f", wrong.clone()), "f", Some("f(x)")),
+            (
+                direct_call(Some("ns"), "f", wrong.clone()),
+                "ns.f",
+                Some("ns.f(x)"),
+            ),
+            (direct_call(None, "upper", wrong), "upper", None),
+            (nested, "f", Some("f(x)")),
+        ];
+        let mismatches: Vec<_> = calls
+            .into_iter()
+            .filter_map(|(expr, name, signature)| {
+                let actual = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+                let expected = MdsError::arity(name, 1, 1, 2, signature.map(str::to_owned));
+                let actual = format!("{actual:?}");
+                let expected = format!("{expected:?}");
+                (actual != expected).then_some((actual, expected))
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "actual and expected errors: {mismatches:?}"
+        );
+        for (namespace, name) in [(None, "f"), (Some("ns"), "f"), (None, "upper")] {
+            let expr = direct_call(namespace, name, vec![missing.clone()]);
+            let err = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                MdsError::undefined_var("missing_arg").to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_callee_reports_argument_error_before_lookup_error() {
+        let mut scope = arity_scope();
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        for (namespace, name, expected) in [
+            (None, "gone", MdsError::undefined_fn("gone")),
+            (Some("gone"), "f", MdsError::undefined_var("gone")),
+            (Some("ns"), "gone", MdsError::undefined_fn("ns.gone")),
+        ] {
+            let expr = direct_call(namespace, name, vec![Arg::Var("missing_arg".into())]);
+            let err = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                MdsError::undefined_var("missing_arg").to_string()
+            );
+            let expr = direct_call(namespace, name, vec![Arg::NullLiteral]);
+            let err = evaluate_expr(&expr, &mut scope, &mut ctx).unwrap_err();
+            assert_eq!(err.to_string(), expected.to_string());
+        }
+    }
+
     #[test]
     fn arity_error_evaluator_has_no_span() {
         // Bypass the validator so only the evaluator's arity check fires.
@@ -2437,7 +2756,7 @@ mod tests {
         let mut scope = Scope::new();
         scope.set_function("requires_one", Arc::new(FunctionDef::from(&define)));
 
-        // Call with 0 args → arity error from invoke_function (evaluator path).
+        // Call with 0 args → arity error before the function body runs.
         let nodes = vec![Node::Interpolation(Interpolation {
             expr: Expr::Call {
                 name: "requires_one".to_string(),
@@ -2460,6 +2779,40 @@ mod tests {
             }
             other => panic!("expected ArityMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn call_frame_pops_when_a_parameter_default_fails() {
+        use crate::ast::Param;
+        use crate::scope::CapturedScope;
+
+        let mut scope = Scope::new();
+        let function = Arc::new(FunctionDef {
+            params: vec![
+                Param::required("local"),
+                Param {
+                    name: "bad_default".into(),
+                    default: Some(Expr::Var("missing".into())),
+                },
+            ],
+            body: vec![],
+            captured: CapturedScope::default(),
+            origin: None,
+        });
+        scope.set_function("f", function);
+        let nodes = vec![Node::Interpolation(crate::ast::Interpolation {
+            expr: Expr::Call {
+                name: "f".into(),
+                args: vec![Arg::NumberLiteral(1.0)],
+            },
+            offset: 0,
+            len: 0,
+        })];
+
+        let error = evaluate(&nodes, &mut scope, &mut vec![], "", "").unwrap_err();
+        assert!(error.to_string().contains("non-literal expression"));
+        assert!(scope.get_var("local").is_none());
+        assert!(scope.pop().is_err());
     }
 
     #[test]
@@ -3029,7 +3382,7 @@ mod tests {
         b.push_segment(5, 0, 4);
         crate::scope::NamespaceScope {
             functions: std::collections::HashMap::new(),
-            prompt_body: Some("mmmm hhhh\n".to_string()),
+            prompt_body: Some("mmmm hhhh\n".to_owned().into()),
             prompt_map: Some(Arc::new(b.into_fragment())),
             prompt_suppressed_by_exports: false,
         }
@@ -3139,7 +3492,8 @@ mod tests {
             budget,
             EvalBudget {
                 iterations: 1,
-                message_bytes: 2
+                message_bytes: 2,
+                ..EvalBudget::default()
             }
         );
 

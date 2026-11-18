@@ -8,19 +8,16 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
-use crate::evaluator::evaluate;
-use crate::evaluator::evaluate_messages_intrinsic;
-use crate::evaluator::evaluate_messages_seeded;
-use crate::evaluator::evaluate_seeded;
-use crate::evaluator::evaluate_with_map;
-use crate::evaluator::evaluate_with_map_seeded;
-use crate::evaluator::push_capped;
-use crate::evaluator::EvalBudget;
+use crate::evaluator::{
+    evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, push_capped, EvalBudget,
+};
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
-use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT};
+use crate::limits::{
+    MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT,
+};
 use crate::parser::parse_with_ctx;
-use crate::scope::{FunctionDef, NamespaceScope, Scope};
+use crate::scope::{FunctionDef, NamespaceScope, PromptText, Scope, VarLayer};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
 pub(crate) use crate::sourcemap::Origin;
 use crate::sourcemap::SourceIndex;
@@ -72,9 +69,7 @@ impl Clone for EffectiveBlock {
 
 /// A resolved module with its AST, exports, and prompt body.
 ///
-/// Fields are `pub(crate)` — all external access must go through the methods
-/// (`get_export`, `get_all_exports`, `get_prompt_value`, `to_namespace`) which
-/// enforce export-visibility logic. Direct field access bypasses that logic.
+/// Use the accessors for imports. They respect the module's export list.
 ///
 /// # Template Inheritance Fields
 ///
@@ -120,7 +115,8 @@ impl Clone for EffectiveBlock {
 ///   descendants that already `Arc::clone`'d them keep pointer-identity.
 pub struct ResolvedModule {
     pub(crate) functions: HashMap<String, Arc<FunctionDef>>,
-    pub(crate) prompt_body: Option<String>,
+    pub(crate) prompt_body: Option<PromptText>,
+    namespace: Arc<NamespaceScope>,
     /// Pre-computed source-map fragment for this module's `prompt` output.
     ///
     /// Populated by `process_module` — and, for an extending module, by
@@ -181,6 +177,7 @@ impl Clone for ResolvedModule {
         Self {
             functions: self.functions.clone(),
             prompt_body: self.prompt_body.clone(),
+            namespace: Arc::clone(&self.namespace),
             prompt_map: self.prompt_map.clone(),
             raw_frontmatter: self.raw_frontmatter.clone(),
             has_explicit_exports: self.has_explicit_exports,
@@ -225,6 +222,7 @@ const MSG_MODE_SOURCE_MAP_WARNING: &str =
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
 /// Supports multiple filesystem backends via the [`FileSystem`] trait.
+#[non_exhaustive]
 pub struct ModuleCache {
     fs: Box<dyn FileSystem>,
     /// Stores resolved modules in first-resolution (depth-first) order.
@@ -244,6 +242,9 @@ pub struct ModuleCache {
     /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
     /// for sub-modules (AC-PERF-01).
     source_map_mode: bool,
+    budget: EvalBudget,
+    #[cfg(test)]
+    function_call_seed: usize,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -270,6 +271,9 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            budget: EvalBudget::default(),
+            #[cfg(test)]
+            function_call_seed: 0,
         }
     }
 
@@ -283,6 +287,9 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            budget: EvalBudget::default(),
+            #[cfg(test)]
+            function_call_seed: 0,
         }
     }
 
@@ -293,6 +300,9 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            budget: EvalBudget::default(),
+            #[cfg(test)]
+            function_call_seed: 0,
         }
     }
 
@@ -323,6 +333,16 @@ impl ModuleCache {
             )));
         }
         Ok(())
+    }
+
+    /// Start a new compile budget only at the root of resolution.
+    fn start_resolution(&mut self, key: &str) {
+        if self.resolving.is_empty() {
+            self.budget = EvalBudget::default();
+            #[cfg(test)]
+            self.budget.seed_function_calls(self.function_call_seed);
+        }
+        self.resolving.insert(key.to_string());
     }
 
     /// Guard against excessively deep import chains.
@@ -414,7 +434,7 @@ impl ModuleCache {
             key: &key,
             typed: path,
         };
-        self.resolve_by_key(entry, runtime_vars, None, warnings)
+        self.resolve_by_key(entry, &runtime_layer(runtime_vars), None, warnings)
     }
 
     /// Resolve a module from a filesystem path string, dispatching on output shape.
@@ -448,7 +468,7 @@ impl ModuleCache {
         };
         let ((output, _), source) = self.resolve_intrinsic_by_key_opts_source(
             entry,
-            runtime_vars,
+            &runtime_layer(runtime_vars),
             &Default::default(),
             warnings,
         )?;
@@ -469,7 +489,7 @@ impl ModuleCache {
             key: &key,
             typed: path,
         };
-        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
+        self.resolve_intrinsic_by_key_opts(entry, &runtime_layer(runtime_vars), opts, warnings)
     }
 
     /// Resolve a module by its normalized key.
@@ -480,7 +500,7 @@ impl ModuleCache {
     fn resolve_by_key(
         &mut self,
         module: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         import_site: Option<ImportSite<'_>>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
@@ -525,7 +545,7 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
-        self.resolving.insert(key.to_string());
+        self.start_resolution(key);
 
         let base_dir_owned = self.fs.parent_dir(key);
         let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -574,7 +594,7 @@ impl ModuleCache {
         &mut self,
         base_dir: &str,
         relative: &str,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         import_site: Option<ImportSite<'_>>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
@@ -606,7 +626,7 @@ impl ModuleCache {
             key: &resolved,
             typed: key,
         };
-        self.resolve_by_key(entry, runtime_vars, None, warnings)
+        self.resolve_by_key(entry, &runtime_layer(runtime_vars), None, warnings)
     }
 
     /// Resolve a module from an in-memory source string.
@@ -636,14 +656,14 @@ impl ModuleCache {
         // root module as well.
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.resolving.insert(SOURCE_LABEL.into());
+        self.start_resolution(SOURCE_LABEL);
 
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars,
+            runtime_vars: &runtime_layer(runtime_vars),
         };
         let resolved = self.process_module(&ctx, false, warnings);
 
@@ -670,7 +690,7 @@ impl ModuleCache {
             key: &key,
             typed: entry,
         };
-        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
+        self.resolve_intrinsic_by_key(entry, &runtime_layer(runtime_vars), warnings)
     }
 
     /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -687,7 +707,7 @@ impl ModuleCache {
             key: &key,
             typed: entry,
         };
-        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
+        self.resolve_intrinsic_by_key_opts(entry, &runtime_layer(runtime_vars), opts, warnings)
     }
 
     /// Resolve a module by its normalized key, dispatching on output shape.
@@ -700,7 +720,7 @@ impl ModuleCache {
     fn resolve_intrinsic_by_key(
         &mut self,
         entry: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         self.resolve_intrinsic_by_key_opts(entry, runtime_vars, &Default::default(), warnings)
@@ -712,7 +732,7 @@ impl ModuleCache {
     fn resolve_intrinsic_by_key_opts(
         &mut self,
         entry: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
@@ -723,7 +743,7 @@ impl ModuleCache {
     fn resolve_intrinsic_by_key_opts_source(
         &mut self,
         entry: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<((crate::CompiledOutput, Option<crate::SourceMap>), String), MdsError> {
@@ -742,7 +762,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(entry, &source)?;
 
-        self.resolving.insert(key.to_string());
+        self.start_resolution(key);
 
         let base_dir_owned = self.fs.parent_dir(key);
         let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -774,13 +794,13 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.resolving.insert(SOURCE_LABEL.into());
+        self.start_resolution(SOURCE_LABEL);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars,
+            runtime_vars: &runtime_layer(runtime_vars),
         };
         let result = self.process_module_intrinsic(&ctx, false, warnings);
         let popped = self.resolving.pop();
@@ -801,13 +821,13 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.resolving.insert(SOURCE_LABEL.into());
+        self.start_resolution(SOURCE_LABEL);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars,
+            runtime_vars: &runtime_layer(runtime_vars),
         };
         let result = self.process_module_intrinsic_opts(&ctx, false, opts, warnings);
         let popped = self.resolving.pop();
@@ -833,14 +853,10 @@ impl ModuleCache {
         scope: &mut crate::scope::Scope,
         warnings: &mut Vec<String>,
         map: Option<crate::sourcemap::MapBuilder>,
+        budget: &mut EvalBudget,
     ) -> Result<(String, Option<crate::sourcemap::MapBuilder>), MdsError> {
         let mut output = String::new();
         let mut current_map = map;
-
-        // REL-1 / applies PF-004: single cumulative iteration and message-byte budget
-        // across ALL regions.  A fresh budget per region would give K regions an
-        // independent 1 M budget each — CPU/DoS amplification ∝ region count.
-        let mut budget = EvalBudget::default();
         // The previous region's origin and source index: consecutive regions from one
         // file (every between-block skeleton node) reuse the index without a lookup.
         let mut previous: Option<(&Origin, SourceIndex)> = None;
@@ -865,7 +881,7 @@ impl ModuleCache {
                 // The builder's current source was switched to origin's above;
                 // evaluate_with_map_seeded derives file/source from it (issue #58).
                 let (region_out, returned_builder) =
-                    evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut budget)?;
+                    evaluate_with_map_seeded(nodes, scope, warnings, builder, budget)?;
                 current_map = Some(returned_builder);
                 region_out
             } else {
@@ -875,7 +891,7 @@ impl ModuleCache {
                     warnings,
                     &origin.display,
                     &origin.source,
-                    &mut budget,
+                    budget,
                 )?
             };
 
@@ -901,9 +917,10 @@ impl ModuleCache {
         seed: Option<&Origin>,
         scope: &mut crate::scope::Scope,
         warnings: &mut Vec<String>,
+        budget: &mut EvalBudget,
     ) -> Result<(String, Option<crate::sourcemap::MapBuilder>), MdsError> {
         let builder = seed.map(|origin| crate::sourcemap::MapBuilder::new(origin.clone()));
-        Self::evaluate_regions_with_map(regions, scope, warnings, builder)
+        Self::evaluate_regions_with_map(regions, scope, warnings, builder, budget)
     }
 
     /// Messages-mode twin of [`Self::evaluate_regions_with_map`]: collect the
@@ -919,8 +936,8 @@ impl ModuleCache {
         regions: &[(&[crate::ast::Node], &Origin)],
         scope: &mut crate::scope::Scope,
         warnings: &mut Vec<String>,
+        budget: &mut EvalBudget,
     ) -> Result<Vec<crate::evaluator::EvalMessage>, MdsError> {
-        let mut budget = EvalBudget::default();
         let mut messages = Vec::new();
         for (nodes, origin) in regions {
             evaluate_messages_seeded(
@@ -929,7 +946,7 @@ impl ModuleCache {
                 warnings,
                 &origin.display,
                 &origin.source,
-                &mut budget,
+                budget,
                 &mut messages,
             )?;
         }
@@ -941,8 +958,8 @@ impl ModuleCache {
     ///
     /// Shares setup with `process_module` but dispatches on `has_message_block` at the
     /// end: a body containing any `@message` block evaluates to
-    /// [`crate::CompiledOutput::Messages`] (via `evaluate_messages_intrinsic`), otherwise
-    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate`, then `clean_output` +
+    /// [`crate::CompiledOutput::Messages`] (via `evaluate_messages_seeded`), otherwise
+    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate_seeded`, then `clean_output` +
     /// `prepend_frontmatter`).
     ///
     /// When the parsed module has an `@extends` directive the shared extends pipeline
@@ -968,7 +985,7 @@ impl ModuleCache {
     /// For Markdown output the source map is built by threading a
     /// [`crate::sourcemap::MapBuilder`] through the evaluator:
     ///
-    /// - Standalone path: [`evaluate_with_map`] on `module.body`.
+    /// - Standalone path: [`evaluate_with_map_seeded`] on `module.body`.
     /// - `@extends` path: [`Self::evaluate_extends_regions`] over
     ///   `spliced_regions(skeleton, effective_blocks, skeleton_origin)` so each
     ///   region's segments are attributed to the correct source file.
@@ -1028,7 +1045,12 @@ impl ModuleCache {
                 if opts.source_map {
                     warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
                 }
-                let messages = Self::evaluate_message_regions(&regions, &mut scope, warnings)?;
+                let messages = Self::evaluate_message_regions(
+                    &regions,
+                    &mut scope,
+                    warnings,
+                    self.budget.start_module(),
+                )?;
                 return Ok((
                     crate::CompiledOutput::Messages(
                         messages.into_iter().map(crate::Message::from).collect(),
@@ -1039,8 +1061,13 @@ impl ModuleCache {
 
             // Seed the builder with the skeleton's root file (source maps only).
             let seed = opts.source_map.then_some(&skeleton_origin);
-            let (body_raw, builder) =
-                Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
+            let (body_raw, builder) = Self::evaluate_extends_regions(
+                &regions,
+                seed,
+                &mut scope,
+                warnings,
+                self.budget.start_module(),
+            )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
 
@@ -1087,12 +1114,15 @@ impl ModuleCache {
             if opts.source_map {
                 warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
             }
-            let messages = evaluate_messages_intrinsic(
+            let mut messages = Vec::new();
+            evaluate_messages_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 ctx.file_str,
                 ctx.source,
+                self.budget.start_module(),
+                &mut messages,
             )?;
             return Ok((
                 crate::CompiledOutput::Messages(
@@ -1110,12 +1140,25 @@ impl ModuleCache {
                 display: Arc::from(ctx.file_str),
                 source: Arc::from(ctx.source),
             });
-            let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let (raw, returned) = evaluate_with_map_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                builder,
+                self.budget.start_module(),
+            )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             (raw, apply_map_degradation(returned, opts, warnings))
         } else {
             (
-                evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?,
+                evaluate_seeded(
+                    &module.body,
+                    &mut scope,
+                    warnings,
+                    ctx.file_str,
+                    ctx.source,
+                    self.budget.start_module(),
+                )?,
                 None,
             )
         };
@@ -1232,20 +1275,30 @@ impl ModuleCache {
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
         // When source-map mode is active and the module exports "prompt", run a
-        // single evaluate_with_map pass to collect both the body string and the
-        // segment records in one traversal (no double-evaluation).  The resulting
-        // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
-        // that imports this module, enabling @include splice attribution (S6). The body
-        // is evaluated either way: WARN-B needs it when `prompt` is not exported.
+        // single evaluate_with_map pass to collect both the text and its segment records.
+        // The module and its namespace share the fragment map for @include attribution.
+        // Evaluate the body even if it is not exported, to distinguish the two include warnings.
         let (body_raw, builder) = if self.source_map_mode && prompt_exported {
             let builder = crate::sourcemap::MapBuilder::new(origin.clone());
             // evaluate_with_map derives file/source from the builder's current source
             // (issue #58).
-            let (body_raw, returned) =
-                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let (body_raw, returned) = evaluate_with_map_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                builder,
+                self.budget.start_module(),
+            )?;
             (body_raw, Some(returned))
         } else {
-            let body_raw = evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?;
+            let body_raw = evaluate_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                ctx.file_str,
+                ctx.source,
+                self.budget.start_module(),
+            )?;
             (body_raw, None)
         };
         let (prompt_body, prompt_map) =
@@ -1257,9 +1310,17 @@ impl ModuleCache {
         // Move module.body into Arc<[Node]> (reuses the Vec allocation, no element clones, P1).
         let effective_skeleton: Arc<[Node]> = Arc::from(module.body);
 
+        let namespace = ResolvedModule::build_namespace(
+            &functions,
+            has_explicit_exports,
+            &explicit_exports,
+            prompt_body.as_ref(),
+            prompt_map.as_ref(),
+        );
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            namespace,
             prompt_map,
             raw_frontmatter,
             has_explicit_exports,
@@ -1552,14 +1613,27 @@ impl ModuleCache {
         let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
         let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
         let seed = (self.source_map_mode && prompt_exported).then_some(&skeleton_origin);
-        let (body_raw, builder) =
-            Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
+        let (body_raw, builder) = Self::evaluate_extends_regions(
+            &regions,
+            seed,
+            &mut scope,
+            warnings,
+            self.budget.start_module(),
+        )?;
         let (prompt_body, prompt_map) =
             prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
+        let namespace = ResolvedModule::build_namespace(
+            &functions,
+            has_explicit_exports,
+            &explicit_exports,
+            prompt_body.as_ref(),
+            prompt_map.as_ref(),
+        );
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            namespace,
             prompt_map,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.
@@ -1585,7 +1659,7 @@ impl ModuleCache {
     fn resolve_by_key_skeleton(
         &mut self,
         module: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         import_site: ImportSite<'_>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
@@ -1612,7 +1686,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
-        self.resolving.insert(key.to_string());
+        self.start_resolution(key);
 
         let base_dir_owned = self.fs.parent_dir(key);
         let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -1771,20 +1845,23 @@ impl ModuleCache {
                 (eff_skeleton, eff_blocks, root_origin, own_fm_values)
             };
 
-        // A1 invariant: is_skeleton=true implies prompt_body=None (evaluate was never called).
-        // Pinned with debug_assert so a future refactor that accidentally adds evaluate on this path
-        // is caught immediately in debug builds. (Full enum split is tech debt.)
-        let prompt_body: Option<String> = None;
+        // Skeleton entries have no evaluated text or fragment map.
+        let prompt_body: Option<PromptText> = None;
         debug_assert!(
             prompt_body.is_none(),
             "A1 invariant: skeleton entry (is_skeleton=true) must have prompt_body=None"
         );
-
+        let namespace = ResolvedModule::build_namespace(
+            &functions,
+            has_explicit_exports,
+            &explicit_exports,
+            prompt_body.as_ref(),
+            None,
+        );
         Ok(ResolvedModule {
             functions,
+            namespace,
             prompt_body,
-            // Skeleton entries are never evaluated — no fragment map is built.
-            // A1 invariant: prompt_body=None and prompt_map=None for skeleton entries.
             prompt_map: None,
             raw_frontmatter,
             has_explicit_exports,
@@ -1825,7 +1902,9 @@ impl ModuleCache {
         let mut module_origin: Option<Origin> = None;
 
         let mut block_count: usize = 0;
+        let mut define_count: usize = 0;
         for node in body {
+            count_module_defines(node, &mut define_count)?;
             match node {
                 Node::Define(def) => {
                     let origin = module_origin.get_or_insert_with(|| Origin {
@@ -1958,7 +2037,7 @@ impl ModuleCache {
                 warnings,
             )
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
-        scope.set_namespace(alias, resolved.to_namespace());
+        scope.set_namespace(alias, resolved.shared_namespace());
         Ok(())
     }
 
@@ -1980,7 +2059,7 @@ impl ModuleCache {
                     let resolved = self
                         .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
-                    scope.set_namespace(alias, resolved.to_namespace());
+                    scope.set_namespace(alias, resolved.shared_namespace());
                 }
                 FrontmatterImport::Merge { path } => {
                     let resolved = self
@@ -1992,8 +2071,8 @@ impl ModuleCache {
                         }
                         scope.set_function(&name, func);
                     }
-                    if let Some(val) = resolved.get_prompt_value() {
-                        scope.set_var("prompt", val);
+                    if let Some(val) = resolved.shared_prompt_value() {
+                        scope.set_var_shared("prompt", val);
                     }
                 }
                 FrontmatterImport::Selective { path, names } => {
@@ -2007,10 +2086,10 @@ impl ModuleCache {
                     };
                     for name in names {
                         if name == "prompt" {
-                            scope.set_var(
+                            scope.set_var_shared(
                                 "prompt",
                                 resolved
-                                    .get_prompt_value()
+                                    .shared_prompt_value()
                                     .ok_or_else(|| not_exported(name))?,
                             );
                         } else {
@@ -2060,8 +2139,8 @@ impl ModuleCache {
             }
             scope.set_function(&name, func);
         }
-        if let Some(val) = resolved.get_prompt_value() {
-            scope.set_var("prompt", val);
+        if let Some(val) = resolved.shared_prompt_value() {
+            scope.set_var_shared("prompt", val);
         }
         Ok(())
     }
@@ -2096,10 +2175,10 @@ impl ModuleCache {
         };
         for name in names {
             if name == "prompt" {
-                scope.set_var(
+                scope.set_var_shared(
                     "prompt",
                     resolved
-                        .get_prompt_value()
+                        .shared_prompt_value()
                         .ok_or_else(|| not_exported(name))?,
                 );
             } else {
@@ -2176,44 +2255,49 @@ impl ResolvedModule {
             .collect()
     }
 
-    /// Get the prompt body as a Value, if it is an available export.
+    /// Get the prompt body as an owned Value, if it is an available export.
     pub fn get_prompt_value(&self) -> Option<Value> {
+        self.shared_prompt_value().as_deref().cloned()
+    }
+
+    pub(crate) fn shared_prompt_value(&self) -> Option<Arc<Value>> {
         if self.is_exported("prompt") {
-            self.prompt_body.clone().map(Value::String)
+            self.prompt_body.as_ref().map(PromptText::shared_value)
         } else {
             None
         }
     }
 
-    /// Convert this resolved module into a namespace scope for aliased imports.
-    fn to_namespace(&self) -> NamespaceScope {
-        // Build the HashMap in one pass, avoiding the intermediate Vec that
-        // get_all_exports() would allocate.
-        let functions = self
-            .functions
+    pub(crate) fn shared_namespace(&self) -> Arc<NamespaceScope> {
+        Arc::clone(&self.namespace)
+    }
+
+    fn build_namespace(
+        functions: &HashMap<String, Arc<FunctionDef>>,
+        has_explicit_exports: bool,
+        explicit_exports: &HashSet<String>,
+        prompt_body: Option<&PromptText>,
+        prompt_map: Option<&Arc<crate::sourcemap::FragmentMap>>,
+    ) -> Arc<NamespaceScope> {
+        let is_exported = |name| is_visible_export(has_explicit_exports, explicit_exports, name);
+        let functions = functions
             .iter()
-            .filter(|(name, _)| self.is_exported(name))
+            .filter(|(name, _)| is_exported(name.as_str()))
             .map(|(name, func)| (name.clone(), Arc::clone(func)))
             .collect();
-        // Respect export visibility: prompt_body and prompt_map are only included
-        // in the namespace when "prompt" is an available export (same rule as
-        // get_prompt_value).  Arc::clone is O(1) — no segment data is copied.
-        let prompt_exported = self.is_exported("prompt");
+        let prompt_exported = is_exported("prompt");
+        let prompt_suppressed_by_exports = !prompt_exported && prompt_body.is_some();
         let (prompt_body, prompt_map) = if prompt_exported {
-            (self.prompt_body.clone(), self.prompt_map.clone())
+            (prompt_body.cloned(), prompt_map.cloned())
         } else {
             (None, None)
         };
-        // True when the module has body text but its @export list explicitly
-        // excludes "prompt" — the caller's @include will produce empty output
-        // and WARN-B should fire instead of WARN-A.
-        let prompt_suppressed_by_exports = !prompt_exported && self.prompt_body.is_some();
-        NamespaceScope {
+        Arc::new(NamespaceScope {
             functions,
             prompt_body,
             prompt_map,
             prompt_suppressed_by_exports,
-        }
+        })
     }
 }
 
@@ -2320,7 +2404,7 @@ struct ModuleCtx<'a> {
     /// canonicalized `base_dir` supplied by the caller.
     base_dir: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
-    runtime_vars: &'a HashMap<String, Value>,
+    runtime_vars: &'a Arc<VarLayer>,
 }
 
 /// Whether `name` is an available export of a module: every name when the module
@@ -2381,8 +2465,11 @@ fn prompt_body_and_map(
     builder: Option<crate::sourcemap::MapBuilder>,
     display: &str,
     warnings: &mut Vec<String>,
-) -> (Option<String>, Option<Arc<crate::sourcemap::FragmentMap>>) {
-    let prompt_body = (!body_raw.trim().is_empty()).then_some(body_raw);
+) -> (
+    Option<PromptText>,
+    Option<Arc<crate::sourcemap::FragmentMap>>,
+) {
+    let prompt_body = (!body_raw.trim().is_empty()).then(|| PromptText::from(body_raw));
     let prompt_map =
         builder.and_then(|b| fragment_map_from(b, prompt_body.as_deref(), display, warnings));
     (prompt_body, prompt_map)
@@ -2459,6 +2546,44 @@ fn has_message_block(nodes: &[Node]) -> bool {
     })
 }
 
+/// Count declarations in every body, even when a branch does not run.
+/// The parser bounds the depth of these bodies before collection.
+fn count_module_defines(node: &Node, count: &mut usize) -> Result<(), MdsError> {
+    let body = match node {
+        Node::Define(def) => {
+            if *count == MAX_DEFINES_PER_MODULE {
+                return Err(MdsError::resource_limit(format!(
+                    "module has more than {MAX_DEFINES_PER_MODULE} @define declarations"
+                )));
+            }
+            *count += 1;
+            &def.body
+        }
+        Node::If(block) => {
+            for child in block
+                .then_body
+                .iter()
+                .chain(block.elseif_branches.iter().flat_map(|branch| &branch.body))
+                .chain(block.else_body.iter().flatten())
+            {
+                count_module_defines(child, count)?;
+            }
+            return Ok(());
+        }
+        Node::For(block) => &block.body,
+        Node::Block(block) => &block.body,
+        Node::Message(block) => &block.body,
+        Node::Text(_)
+        | Node::Interpolation(_)
+        | Node::EscapedBrace { .. }
+        | Node::Import(_)
+        | Node::Export(_)
+        | Node::Include(_) => return Ok(()),
+    };
+    body.iter()
+        .try_for_each(|child| count_module_defines(child, count))
+}
+
 /// Process a single `@define` directive, updating `defs` and `scope` in place.
 ///
 /// Captures the definition-site scope for lexical closure semantics so the
@@ -2481,16 +2606,8 @@ fn collect_define(
         ));
     }
     let mut func = FunctionDef::from(def);
-    // Capture definition-site scope for lexical closure semantics.
-    func.captured.namespaces = scope.get_all_namespaces();
-    // Convert Arc<FunctionDef> → owned FunctionDef for captured.functions.
-    // Owned captures break potential reference cycles (A captures B captures A).
-    func.captured.functions = scope
-        .get_all_functions()
-        .into_iter()
-        .map(|(k, v)| (k, (*v).clone()))
-        .collect();
-    func.captured.vars = scope.get_all_vars();
+    // Freeze the definition site before inserting this function into scope.
+    func.captured = scope.capture()?;
     // S7: stamp provenance — two Arc refcount bumps, no allocation.
     func.origin = origin.cloned();
     // Wrap in Arc for cheap storage and O(1) scope insertion.
@@ -2546,23 +2663,24 @@ fn collect_block(
     Ok(())
 }
 
-/// Build a scope from optional frontmatter and runtime variable overrides.
-///
-/// Parses frontmatter YAML (if present), populates scope with variables,
-/// then applies runtime_vars to override any frontmatter keys.
-/// The `type` key is skipped for `.md` files (it is a file-type marker, not a template var).
-///
-/// For MDS files (`.mds` or `.md` with `type: mds`), the `imports` key is extracted
-/// and returned as a `Vec<FrontmatterImport>` rather than being set as a variable.
-/// For plain `.md` files, `imports` is treated as a regular variable.
-///
-/// Returns `(scope, fm_imports)`.
+/// Make one runtime layer to share across the modules in a resolution call.
+fn runtime_layer(vars: &HashMap<String, Value>) -> Arc<VarLayer> {
+    Arc::new(
+        vars.iter()
+            .map(|(name, value)| (name.clone(), Arc::new(value.clone())))
+            .collect(),
+    )
+}
+
+/// Build a scope with runtime variables above frontmatter variables.
+/// A Markdown file uses `type` as a file marker, not a variable.
+/// Return `imports` separately for MDS files. Plain Markdown keeps it as a variable.
 fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
     is_md: bool,
-    runtime_vars: &HashMap<String, Value>,
+    runtime_vars: &Arc<VarLayer>,
 ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
-    let mut scope = Scope::new();
+    let mut frontmatter_vars = VarLayer::new();
     let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
 
     // A .mds file is always MDS; a .md file is MDS only when its frontmatter
@@ -2590,30 +2708,27 @@ fn build_scope_from_frontmatter(
                     } else {
                         // Plain .md: treat `imports` as a regular variable
                         let value = Value::from_yaml(val)?;
-                        scope.set_var(&key_str, value);
+                        frontmatter_vars.insert(key_str, Arc::new(value));
                     }
                     continue;
                 }
                 let value = Value::from_yaml(val)?;
-                scope.set_var(&key_str, value);
+                frontmatter_vars.insert(key_str, Arc::new(value));
             }
         }
     }
 
-    // Apply runtime vars (override frontmatter)
-    for (key, value) in runtime_vars {
-        if key == "imports" && is_mds {
-            // MDS files (.mds or .md with type:mds) treat `imports` as a reserved
-            // key; block --set imports=... for them.
-            return Err(MdsError::import_error(
-                "'imports' is a reserved frontmatter key for MDS files and cannot be set \
-                 via --set",
-            ));
-        }
-        scope.set_var(key, value.clone());
+    if is_mds && runtime_vars.contains_key("imports") {
+        return Err(MdsError::import_error(
+            "'imports' is a reserved frontmatter key for MDS files and cannot be set \
+             via --set",
+        ));
     }
 
-    Ok((scope, fm_imports))
+    Ok((
+        Scope::with_layers(Arc::clone(runtime_vars), Arc::new(frontmatter_vars)),
+        fm_imports,
+    ))
 }
 
 /// Deep-merge two YAML `Mapping`s for template inheritance frontmatter.

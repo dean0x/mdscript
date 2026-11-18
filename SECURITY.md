@@ -263,20 +263,22 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | YAML parser nesting depth | 128 | serde_yaml_ng (reported as `mds::yaml`) |
 | Max `mds.json` size | 1 MiB (1,048,576 bytes), read no more than one byte past it | `mds-cli/src/build.rs` (`MAX_CONFIG_SIZE`) |
 | Max call depth | 128 | `evaluator.rs` (`MAX_CALL_DEPTH`) |
+| Max total function calls | 16,000,000 per compile, across all evaluated modules | `limits.rs` (`MAX_TOTAL_FUNCTION_CALLS`) |
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
-| Max total iterations | 1,000,000 | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
+| Max total iterations | 1,000,000 per module evaluation | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
 | Max output size | 50 MiB (52,428,800 bytes) per output buffer, checked before every append; it does not bound a compile's total memory, since nested blocks, function results and imported modules each hold a buffer of their own ([#420](https://github.com/dean0x/mdscript/issues/420)) | `limits.rs` (`MAX_OUTPUT_SIZE`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
 | Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver.rs` |
 | Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
 | Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
+| Max `@define` declarations per module | 256 | `limits.rs` (`MAX_DEFINES_PER_MODULE`) |
 | Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |
 | Max value (YAML/JSON) nesting depth | 64 | `value.rs` (`MAX_VALUE_DEPTH`) |
 | Max dot-path segments | 32 | `limits.rs` (`MAX_DOT_SEGMENTS`) |
 
-These guard against adversarial input causing stack overflow, unbounded memory
-growth, or non-termination.
+These limits apply to the quantities and scopes in the table. They do not bound
+total compilation memory or elapsed time.
 
 ## ⚠️ The `debug-panics` feature must never ship enabled
 

@@ -46,6 +46,10 @@ pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
 /// buffer, not a compile's total memory (#420).
 pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 
+/// Maximum total function calls per compile, across all evaluated modules.
+/// Allows sixteen calls per pass in a million-pass loop budget.
+pub(crate) const MAX_TOTAL_FUNCTION_CALLS: usize = 16_000_000;
+
 /// Maximum number of elements that `split()` may produce in a single call.
 ///
 /// Prevents adversarial inputs from producing arrays with hundreds of thousands
@@ -121,6 +125,12 @@ pub(crate) const MAX_MESSAGE_COUNT: usize = 10_000;
 /// unbounded name-collision checks in `collect_block`. 256 blocks is generous
 /// for any real template.
 pub(crate) const MAX_BLOCKS_PER_MODULE: usize = 256;
+
+/// Maximum number of `@define` declarations per module.
+///
+/// This also bounds the number of capture links per module.
+/// A module above the limit returns `mds::resource_limit`.
+pub(crate) const MAX_DEFINES_PER_MODULE: usize = 256;
 
 /// Maximum recursion depth for `deep_merge_yaml` when merging frontmatter
 /// Mappings across template inheritance chains.

@@ -2,6 +2,7 @@
 
 use super::frontmatter::deep_merge_yaml;
 use super::*;
+use crate::evaluator::evaluate;
 use crate::limits::{MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH};
 
 // Helper to build a YAML Value from inline YAML text
@@ -498,6 +499,104 @@ fn block_exactly_at_max_allowed() {
     );
 }
 
+fn define_source(count: usize, prefix: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut source = String::new();
+    for i in 1..=count {
+        writeln!(source, "@define {prefix}{i}():\nbody\n@end").unwrap();
+    }
+    source
+}
+
+fn assert_define_limit(source: &str) {
+    let error = crate::compile_str_md(source).unwrap_err().serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: module has more than 256 @define declarations"
+    );
+}
+
+#[test]
+fn define_cap_accepts_256_declarations() {
+    let mut source = define_source(256, "f");
+    source.push_str("{{f256()}}");
+    assert_eq!(crate::compile_str_md(&source).unwrap(), "body\n");
+}
+
+#[test]
+fn define_cap_refuses_257_declarations() {
+    assert_define_limit(&define_source(257, "f"));
+}
+
+#[test]
+fn define_cap_counts_declarations_in_nested_bodies() {
+    for (open, outer_defines) in [
+        ("@if enabled:", 0),
+        ("@if disabled:\n@elseif enabled:", 0),
+        ("@if enabled:\n@else:", 0),
+        ("@for item in items:", 0),
+        ("@block section:", 0),
+        ("@message user:", 0),
+        ("@define outer():", 1),
+    ] {
+        let prefix = define_source(255 - outer_defines, "f");
+        let source = format!(
+            "---\nenabled: true\ndisabled: false\nitems: []\n---\n{prefix}{open}\n@define inner():\nbody\n@end\ntext\n@end\n"
+        );
+        crate::compile_str(&source).unwrap();
+        assert_define_limit(&format!("{source}@define last():\nbody\n@end"));
+    }
+}
+
+#[test]
+fn define_cap_error_precedes_a_name_collision() {
+    let mut source = define_source(256, "f");
+    source.push_str("@define f1():\nother\n@end");
+    assert_define_limit(&source);
+}
+
+#[test]
+fn define_cap_does_not_count_reexports() {
+    let library = define_source(10, "lib");
+    let mut source = String::from("@export * from \"./lib.mds\"\n");
+    source.push_str(&define_source(256, "f"));
+    source.push_str("@export prompt\n{{f256()}}");
+    let module = virtual_cache(&[("lib.mds", &library)])
+        .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("body"));
+    assert!(module.explicit_exports.contains("lib10"));
+}
+
+#[test]
+fn define_capture_holds_one_function_node_per_define() {
+    use std::fmt::Write as _;
+
+    let defines = [1, 2, 3, 12, 13];
+    let counts = defines.map(|k| {
+        let mut source = String::new();
+        for i in 1..=k {
+            writeln!(source, "@define f{i}(x):\nv{{{{x}}}}\n@end").unwrap();
+        }
+        let name = format!("f{k}");
+        write!(source, "{{{{{name}(\"a\")}}}}").unwrap();
+
+        let module = virtual_cache(&[("main.mds", &source)])
+            .resolve_key("main.mds", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref(), Some("va"), "K={k}");
+        crate::scope::captured_function_nodes(&module.functions[&name])
+    });
+    let delta = counts[4].checked_sub(counts[3]);
+    assert_eq!(
+        (&counts[..4], delta),
+        (&[1, 2, 3, 12][..], Some(1)),
+        "FunctionDef counts for K={defines:?}: {counts:?}; change from K=12 to K=13: {delta:?}"
+    );
+}
+
 // ── Phase 2: Template inheritance ─────────────────────────────────────────
 
 /// Helper: create a VirtualFs-backed ModuleCache from a &[(&str, &str)] slice.
@@ -508,6 +607,635 @@ fn virtual_cache(files: &[(&str, &str)]) -> ModuleCache {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
     )
+}
+
+#[test]
+fn function_call_limit_counts_each_kind_across_modules() {
+    use crate::limits::MAX_TOTAL_FUNCTION_CALLS;
+
+    let lib = "@define word():\nb\n@end\n{{upper(\"a\")}}";
+    let entry = concat!(
+        "@import \"./lib.mds\" as lib\n",
+        "@define local():\nc\n@end\n"
+    );
+    for (body, source_map) in [
+        ("@include lib\n{{lib.word()}}{{local()}}", false),
+        ("@include lib\n{{lib.word()}}{{local()}}", true),
+        (
+            "@message user:\n@include lib\n{{lib.word()}}{{local()}}\n@end",
+            false,
+        ),
+    ] {
+        let source = format!("{entry}{body}");
+        let compile = |calls_left| {
+            let mut cache = virtual_cache(&[("entry.mds", &source), ("lib.mds", lib)]);
+            cache.function_call_seed = MAX_TOTAL_FUNCTION_CALLS - calls_left;
+            let opts = crate::CompileOptions {
+                source_map,
+                ..Default::default()
+            };
+            cache.resolve_virtual_intrinsic_opts(
+                "entry.mds",
+                &HashMap::new(),
+                &opts,
+                &mut Vec::new(),
+            )
+        };
+        let (output, _) = compile(3).unwrap();
+        let text = match output {
+            crate::CompiledOutput::Markdown(text) => text,
+            crate::CompiledOutput::Messages(messages) => messages[0].content.clone(),
+        };
+        assert_eq!(text.lines().collect::<String>(), "Abc");
+        assert_eq!(
+            compile(2).unwrap_err().serialize().code,
+            "mds::resource_limit"
+        );
+    }
+}
+
+#[test]
+fn function_call_limit_counts_across_extends_regions() {
+    use crate::limits::MAX_TOTAL_FUNCTION_CALLS;
+
+    let compile = |calls_left| {
+        let mut cache = virtual_cache(&[
+            ("base.mds", "{{upper(\"a\")}}\n@block content:\nx\n@end"),
+            (
+                "entry.mds",
+                "@extends \"./base.mds\"\n@block content:\n{{upper(\"b\")}}\n@end",
+            ),
+        ]);
+        cache.function_call_seed = MAX_TOTAL_FUNCTION_CALLS - calls_left;
+        cache.resolve_virtual_intrinsic("entry.mds", &HashMap::new(), &mut Vec::new())
+    };
+    let crate::CompiledOutput::Markdown(text) = compile(2).unwrap() else {
+        panic!("expected Markdown output");
+    };
+    assert_eq!(text.lines().collect::<String>(), "AB");
+    assert_eq!(
+        compile(1).unwrap_err().serialize().code,
+        "mds::resource_limit"
+    );
+}
+
+#[test]
+fn scope_layer_precedence_keeps_runtime_above_frontmatter() {
+    let mut cache = virtual_cache(&[
+        (
+            "base.mds",
+            "---\nx: base\ny: base\n---\n@block content:\n{{x}}/{{y}}\n@end",
+        ),
+        ("standalone.mds", "---\nx: local\n---\n{{x}}"),
+        ("child.mds", "---\ny: child\n---\n@extends \"./base.mds\"\n"),
+    ]);
+    let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
+    for (key, expected) in [
+        ("standalone.mds", "runtime"),
+        ("child.mds", "runtime/child"),
+    ] {
+        let module = cache.resolve_key(key, &vars, &mut Vec::new()).unwrap();
+        assert_eq!(module.prompt_body.as_deref().map(str::trim), Some(expected));
+    }
+}
+
+#[test]
+fn scope_layer_precedence_keeps_imported_prompt_above_both_layers() {
+    let vars = HashMap::from([("prompt".into(), Value::String("runtime".into()))]);
+    for source in [
+        "---\nprompt: local\n---\n@import \"./lib.mds\"\n{{prompt}}",
+        "---\nprompt: local\n---\n@import { prompt } from \"./lib.mds\"\n{{prompt}}",
+        "---\nprompt: local\nimports:\n  - path: ./lib.mds\n---\n{{prompt}}",
+    ] {
+        let module = virtual_cache(&[("entry.mds", source), ("lib.mds", "imported")])
+            .resolve_key("entry.mds", &vars, &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            module.prompt_body.as_deref().map(str::trim),
+            Some("imported")
+        );
+    }
+}
+
+#[test]
+fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
+    let vars = HashMap::from([("imports".into(), Value::String("runtime".into()))]);
+    let mut cache = virtual_cache(&[
+        ("entry.mds", "{{imports}}"),
+        ("invalid.mds", "---\nimports: invalid\n---\n{{imports}}"),
+    ]);
+    let err = cache
+        .resolve_key("entry.mds", &vars, &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(
+        miette::Diagnostic::code(&err).unwrap().to_string(),
+        "mds::import"
+    );
+    assert!(err.to_string().ends_with(
+        "'imports' is a reserved frontmatter key for MDS files and cannot be set via --set"
+    ));
+    let source = "{{imports}}";
+    let tokens = tokenize(source, "plain.md").unwrap();
+    let module = parse_with_ctx(&tokens, "plain.md", source).unwrap();
+    let (mut plain, _) = build_scope_from_frontmatter(None, true, &runtime_layer(&vars)).unwrap();
+    assert_eq!(
+        evaluate(
+            &module.body,
+            &mut plain,
+            &mut Vec::new(),
+            "plain.md",
+            source
+        )
+        .unwrap(),
+        "runtime"
+    );
+    let invalid = cache
+        .resolve_key("invalid.mds", &vars, &mut Vec::new())
+        .unwrap_err();
+    let no_runtime = cache
+        .resolve_key("invalid.mds", &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(invalid.to_string(), no_runtime.to_string());
+    assert_ne!(invalid.to_string(), err.to_string());
+}
+
+#[test]
+fn runtime_layer_is_shared_by_module_scopes() {
+    let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
+    let vars = runtime_layer(&vars);
+    let (first, _) = build_scope_from_frontmatter(None, false, &vars).unwrap();
+    let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
+    assert!(Arc::ptr_eq(
+        first.get_slot("x").unwrap().root(),
+        inherited.get_slot("x").unwrap().root()
+    ));
+}
+
+#[test]
+fn runtime_layer_cache_reuse_preserves_import_values() {
+    let mut cache = virtual_cache(&[("lib.mds", "@define from_lib():\n{{x}}\n@end")]);
+    let source = "@import \"./lib.mds\"\n{{from_lib()}}/{{x}}";
+    for (runtime, expected) in [("first", "first/first"), ("second", "first/second")] {
+        let vars = HashMap::from([("x".into(), Value::String(runtime.into()))]);
+        let module = cache
+            .resolve_source(source, "", &vars, &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref().map(str::trim), Some(expected));
+    }
+}
+
+#[test]
+fn captures_keep_each_imported_prompt_write() {
+    let source = concat!(
+        "@import \"./first.mds\"\n@define before():\n{{prompt}}\n@end\n",
+        "@import \"./second.mds\"\n@define after():\n{{prompt}}\n@end\n",
+        "{{before()}}/{{after()}}",
+    );
+    let module = virtual_cache(&[("first.mds", "one"), ("second.mds", "two")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("one/two"));
+}
+
+#[test]
+fn prompt_imports_and_captures_share_the_module_text() {
+    let mut cache = virtual_cache(&[("lib.mds", "library")]);
+    let mut shared = Vec::new();
+    for names in ["", "    names: [prompt]\n"] {
+        let source = format!(
+            "---\nimports:\n  - path: ./lib.mds\n{names}---\n{}",
+            concat!(
+                "@define fm():\n{{prompt}}\n@end\n",
+                "@import \"./lib.mds\"\n@define first():\n{{prompt}}\n@end\n",
+                "@import \"./lib.mds\"\n@define second():\n{{prompt}}\n@end\n",
+                "@import { prompt } from \"./lib.mds\"\n@define pick():\n{{prompt}}\n@end\n",
+                "{{fm()}}/{{first()}}/{{second()}}/{{pick()}}"
+            )
+        );
+        let module = cache
+            .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            module.prompt_body.as_deref(),
+            Some("library/library/library/library")
+        );
+        let library = &cache.modules["lib.mds"];
+        let body = library.prompt_body.as_deref().unwrap();
+        let value = library.shared_prompt_value().unwrap();
+        let mut scope = Scope::new();
+        for name in ["fm", "first", "second", "pick"] {
+            scope.push_call(&module.functions[name]);
+            let slot = scope.get_slot("prompt").unwrap();
+            let Value::String(text) = slot.get().unwrap() else {
+                panic!("{name} must capture prompt text");
+            };
+            assert!(
+                Arc::ptr_eq(slot.root(), &value),
+                "{name} must share the prompt value"
+            );
+            shared.push((name, text.as_ptr() == body.as_ptr()));
+            scope.pop().unwrap();
+        }
+    }
+    assert_eq!(
+        shared,
+        [
+            ("fm", true),
+            ("first", true),
+            ("second", true),
+            ("pick", true)
+        ]
+        .repeat(2)
+    );
+}
+
+#[test]
+fn alias_imports_share_the_module_namespace_and_text() {
+    let source = concat!(
+        "---\nimports:\n  - path: ./lib.mds\n    as: front\n---\n",
+        "@import \"./lib.mds\" as body\n@define f():\n{{front.g()}}/{{body.g()}}\n@end\n{{f()}}"
+    );
+    let mut cache = virtual_cache(&[("lib.mds", "@define g():\nresult\n@end\nlibrary")]);
+    let module = cache
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("result/result"));
+    let capture = &module.functions["f"].captured;
+    let front = capture.weak_namespace("front").unwrap();
+    let body = capture.weak_namespace("body").unwrap();
+    let library = &cache.modules["lib.mds"];
+    let text = library.prompt_body.as_deref().unwrap();
+    let namespace = front.upgrade().unwrap();
+    let namespace_text = namespace.prompt_body.as_deref().unwrap();
+    assert_eq!(
+        (
+            front.ptr_eq(&body),
+            Arc::ptr_eq(&namespace, &library.shared_namespace()),
+            text.as_ptr() == namespace_text.as_ptr(),
+        ),
+        (true, true, true)
+    );
+}
+
+#[test]
+fn captured_import_graph_drops_after_the_last_owner() {
+    let (keep, imported, link, namespace, prompt) = {
+        let mut cache = virtual_cache(&[
+            ("merge.mds", "@define merged():\nmerge\n@end"),
+            ("alias.mds", "@define aliased():\nalias\n@end"),
+            ("prompt.mds", "prompt"),
+        ]);
+        let source = concat!(
+            "@import \"./merge.mds\"\n@import \"./alias.mds\" as lib\n",
+            "@import { prompt } from \"./prompt.mds\"\n",
+            "@define local():\n{{merged()}}/{{lib.aliased()}}/{{prompt}}\n@end\n{{local()}}",
+        );
+        let module = cache
+            .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref(), Some("merge/alias/prompt"));
+        let keep = Arc::clone(&module.functions["local"]);
+        let imported = Arc::downgrade(&cache.modules["merge.mds"].functions["merged"]);
+        let link = keep.captured.weak_head().unwrap();
+        let namespace = keep.captured.weak_namespace("lib").unwrap();
+        let prompt = Arc::downgrade(&cache.modules["prompt.mds"].shared_prompt_value().unwrap());
+        (keep, imported, link, namespace, prompt)
+    };
+    let local = Arc::downgrade(&keep);
+    assert!(local.upgrade().is_some());
+    assert!(imported.upgrade().is_some());
+    assert!(link.upgrade().is_some());
+    assert!(namespace.upgrade().is_some());
+    assert!(prompt.upgrade().is_some());
+
+    drop(keep);
+    assert!(local.upgrade().is_none());
+    assert!(imported.upgrade().is_none());
+    assert!(link.upgrade().is_none());
+    assert!(namespace.upgrade().is_none());
+    assert!(prompt.upgrade().is_none());
+}
+
+mod prompt_source_scan {
+    #[test]
+    fn internal_prompt_producers_use_shared_accessors() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src];
+        let mut files = 0;
+        let mut hits = Vec::new();
+        for _ in 0..1024 {
+            let Some(dir) = dirs.pop() else { break };
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    dirs.push(path);
+                } else if kind.is_file()
+                    && path.extension().is_some_and(|ext| ext == "rs")
+                    && !entry.file_name().to_string_lossy().ends_with("_tests.rs")
+                {
+                    files += 1;
+                    let count = forbidden_producers(&std::fs::read_to_string(&path).unwrap());
+                    if count != 0 {
+                        hits.push((path, count));
+                    }
+                }
+            }
+        }
+        assert!(dirs.is_empty(), "must visit every source directory");
+        assert!(
+            files >= 10,
+            "expected at least ten source files, saw {files}"
+        );
+        assert!(
+            hits.is_empty(),
+            "use the shared accessors instead: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_source_scan_detects_each_planted_producer() {
+        let ignored = r##"
+            pub fn get_prompt_value(&self) -> Option<Value> { None }
+            // m.get_prompt_value();
+            /* outer /* nested */ m.to_namespace(); */
+            const TEXT: &str = r#"m.to_namespace();"#;
+            #[cfg(test)] fn sample() { m.get_prompt_value(); }
+            #[cfg(test)] mod extra;
+        "##;
+        assert_eq!(forbidden_producers(ignored), 0);
+        for planted in ["m.get_prompt_value();", "m.to_namespace();"] {
+            assert_eq!(forbidden_producers(&format!("{ignored}{planted}")), 1);
+        }
+
+        let field = r"
+            struct Sample { #[cfg(test)] test_field: bool }
+            fn production(m: ResolvedModule) { m.to_namespace(); }
+        ";
+        let initializer = r"
+            fn production(m: ResolvedModule) {
+                Sample {
+                    #[cfg(test)] test_field: false,
+                    namespace: { m.to_namespace() },
+                };
+            }
+        ";
+        assert_eq!(
+            [field, initializer].map(forbidden_producers),
+            [1, 1],
+            "scan must count each producer after a test-only field"
+        );
+    }
+
+    fn forbidden_producers(source: &str) -> usize {
+        let tokens = source_tokens(source);
+        let mut rest = tokens.as_slice();
+        let mut prev = "";
+        let mut hits = 0;
+        for _ in 0..tokens.len() {
+            if let Some(tail) = rest.strip_prefix(&["#", "[", "cfg", "(", "test", ")", "]"]) {
+                // Scan the tail if the attribute has no clear item boundary.
+                rest = after_test_item(tail).unwrap_or(tail);
+                prev = "";
+            } else if let Some((&token, tail)) = rest.split_first() {
+                hits += usize::from(
+                    token == "to_namespace" || (token == "get_prompt_value" && prev != "fn"),
+                );
+                rest = tail;
+                prev = token;
+            } else {
+                break;
+            }
+        }
+        hits
+    }
+
+    fn after_test_item<'a>(item: &'a [&'a str]) -> Option<&'a [&'a str]> {
+        let mut nested = 0_usize;
+        for (i, &token) in item.iter().enumerate() {
+            match token {
+                "[" | "(" | "{" => nested += 1,
+                "]" | ")" | "}" => {
+                    nested = nested.checked_sub(1)?;
+                    if nested == 0 && token == "}" {
+                        return Some(&item[i + 1..]);
+                    }
+                }
+                ";" if nested == 0 => return Some(&item[i + 1..]),
+                // A comma can end a field or arm, but does not prove an item end.
+                "," if nested == 0 => return None,
+                _ => {}
+            }
+        }
+        panic!("expected an end to the #[cfg(test)] item");
+    }
+
+    // Ignore comments and literals before the scan considers names or test attributes.
+    fn source_tokens(mut rest: &str) -> Vec<&str> {
+        let mut tokens = Vec::new();
+        for _ in 0..rest.len() {
+            rest = rest.trim_start();
+            let Some(first) = rest.chars().next() else {
+                break;
+            };
+            if let Some(line) = rest.strip_prefix("//") {
+                rest = line.split_once('\n').map_or("", |(_, tail)| tail);
+            } else if let Some(block) = rest.strip_prefix("/*") {
+                rest = after_block_comment(block);
+            } else if let Some(tail) = after_literal(rest) {
+                rest = tail;
+            } else {
+                let len = if first.is_alphanumeric() || first == '_' {
+                    rest.find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len())
+                } else {
+                    first.len_utf8()
+                };
+                let (token, tail) = rest.split_at(len);
+                tokens.push(token);
+                rest = tail;
+            }
+        }
+        tokens
+    }
+
+    fn after_block_comment(mut rest: &str) -> &str {
+        let mut depth = 1;
+        for _ in 0..rest.len() {
+            let at = rest.find(['/', '*']).expect("must close block comment");
+            rest = &rest[at..];
+            if rest.starts_with("/*") {
+                depth += 1;
+                rest = &rest[2..];
+            } else if rest.starts_with("*/") {
+                depth -= 1;
+                rest = &rest[2..];
+                if depth == 0 {
+                    return rest;
+                }
+            } else {
+                rest = &rest[1..];
+            }
+        }
+        panic!("must close block comment");
+    }
+
+    fn after_literal(source: &str) -> Option<&str> {
+        let source = source
+            .strip_prefix('b')
+            .or_else(|| source.strip_prefix('c'))
+            .unwrap_or(source);
+        if let Some(raw) = source.strip_prefix('r') {
+            let quote = raw.find(|c| c != '#')?;
+            let body = raw[quote..].strip_prefix('"')?;
+            let end = format!("\"{}", &raw[..quote]);
+            return body.split_once(&end).map(|(_, tail)| tail);
+        }
+        if let Some(body) = source.strip_prefix('"') {
+            let mut escaped = false;
+            for (i, c) in body.char_indices() {
+                if !escaped && c == '"' {
+                    return Some(&body[i + 1..]);
+                }
+                escaped = !escaped && c == '\\';
+            }
+            return None;
+        }
+        let body = source.strip_prefix('\'')?;
+        let len = if let Some(escape) = body.strip_prefix('\\') {
+            match escape.as_bytes().first()? {
+                b'x' => 4,
+                b'u' => escape.find('}')? + 2,
+                _ => 2,
+            }
+        } else {
+            body.chars().next()?.len_utf8()
+        };
+        body.get(len..)?.strip_prefix('\'')
+    }
+}
+
+#[test]
+fn imported_defines_share_the_runtime_layer_of_their_call() {
+    let mut cache = virtual_cache(&[
+        ("first.mds", "@define first():\n{{x}}\n@end"),
+        ("second.mds", "@define second():\n{{x}}\n@end"),
+    ]);
+    let source = concat!(
+        "@import \"./first.mds\"\n@import \"./second.mds\"\n",
+        "@define local():\n{{x}}\n@end\n{{first()}}/{{second()}}/{{local()}}",
+    );
+    let first_vars = HashMap::from([("x".into(), Value::String("one".into()))]);
+    let second_vars = HashMap::from([("x".into(), Value::String("two".into()))]);
+    let first = cache
+        .resolve_source(source, "", &first_vars, &mut Vec::new())
+        .unwrap();
+    let second = cache
+        .resolve_source(source, "", &second_vars, &mut Vec::new())
+        .unwrap();
+    assert_eq!(first.prompt_body.as_deref(), Some("one/one/one"));
+    assert_eq!(second.prompt_body.as_deref(), Some("one/one/two"));
+    fn runtime<'a>(module: &'a ResolvedModule, function: &str) -> &'a Arc<VarLayer> {
+        module.functions[function]
+            .captured
+            .runtime
+            .as_ref()
+            .unwrap()
+    }
+    let imported = runtime(&cache.modules["first.mds"], "first");
+    assert!(Arc::ptr_eq(
+        imported,
+        runtime(&cache.modules["second.mds"], "second")
+    ));
+    assert!(Arc::ptr_eq(imported, runtime(&first, "local")));
+    assert!(!Arc::ptr_eq(
+        runtime(&first, "local"),
+        runtime(&second, "local")
+    ));
+}
+
+#[test]
+fn selective_import_shadows_a_define_in_the_next_capture() {
+    let source = concat!(
+        "@define same():\nlocal\n@end\n@define earlier():\n{{same()}}\n@end\n",
+        "@import { same } from \"./lib.mds\"\n",
+        "@define captured():\n{{same()}}\n@end\n{{earlier()}}/{{same()}}/{{captured()}}",
+    );
+    let module = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(
+        module.prompt_body.as_deref(),
+        Some("local/imported/imported")
+    );
+}
+
+#[test]
+fn define_shadows_an_earlier_merge_import_in_the_next_capture() {
+    let source = concat!(
+        "@import \"./lib.mds\"\n@define same():\nlocal\n@end\n",
+        "@define captured():\n{{same()}}\n@end\n{{same()}}/{{captured()}}",
+    );
+    let module = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("local/local"));
+}
+
+#[test]
+fn merge_import_refuses_a_name_that_a_define_already_uses() {
+    let source = "@define same():\nlocal\n@end\n@import \"./lib.mds\"";
+    let err = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(
+        miette::Diagnostic::code(&err).unwrap().to_string(),
+        "mds::name_collision"
+    );
+}
+
+#[test]
+fn interleaved_imports_and_defines_keep_one_capture_entry_per_write() {
+    use std::fmt::Write as _;
+
+    let mut library = String::new();
+    let mut source = String::new();
+    for i in 1..=128 {
+        writeln!(library, "@define i{i}():\nimported\n@end").unwrap();
+        writeln!(
+            source,
+            "@import {{ i{i} }} from \"./lib.mds\"\n@define f{i}():\n{{{{i{i}()}}}}\n@end"
+        )
+        .unwrap();
+    }
+    source.push_str("{{f128()}}");
+    let tokens = tokenize(&source, "entry.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "entry.mds", &source).unwrap();
+    let ctx = ModuleCtx {
+        key: "entry.mds",
+        file_str: "entry.mds",
+        source: &source,
+        base_dir: "",
+        runtime_vars: &Arc::default(),
+    };
+    let mut scope = Scope::new();
+    let defs = virtual_cache(&[("lib.mds", &library)])
+        .collect_definitions_and_imports(&module.body, &mut scope, &ctx, &mut Vec::new())
+        .unwrap();
+    assert_eq!(defs.functions.len(), 128);
+    assert_eq!(
+        evaluate(
+            &module.body,
+            &mut scope,
+            &mut Vec::new(),
+            ctx.file_str,
+            &source
+        )
+        .unwrap(),
+        "imported"
+    );
+    assert_eq!(crate::scope::captured_entry_count(&scope), 256);
 }
 
 /// Helper: compile a VirtualFs entry and return the Markdown output string.
@@ -897,7 +1625,8 @@ fn f5_diamond_inheritance_cache_not_polluted() {
         "F5: B should compile: {:?}",
         b_resolved.err()
     );
-    let b_body = b_resolved.unwrap().prompt_body.clone().unwrap_or_default();
+    let b_resolved = b_resolved.unwrap();
+    let b_body = b_resolved.prompt_body.as_deref().unwrap_or_default();
     assert!(
         b_body.contains("From B."),
         "F5: B should contain its override: {b_body}"
@@ -910,7 +1639,8 @@ fn f5_diamond_inheritance_cache_not_polluted() {
         "F5: C should compile: {:?}",
         c_resolved.err()
     );
-    let c_body = c_resolved.unwrap().prompt_body.clone().unwrap_or_default();
+    let c_resolved = c_resolved.unwrap();
+    let c_body = c_resolved.prompt_body.as_deref().unwrap_or_default();
     assert!(
         c_body.contains("From A."),
         "F5: C should use A's default (not B's override): {c_body}"
@@ -3588,7 +4318,7 @@ fn attach_import_span_valid_offset_spans_whole_directive_and_passes_other_errors
 }
 
 /// Build the borrowed module context the `@extends` helpers take.
-fn extends_ctx<'a>(source: &'a str, vars: &'a HashMap<String, Value>) -> ModuleCtx<'a> {
+fn extends_ctx<'a>(source: &'a str, vars: &'a Arc<VarLayer>) -> ModuleCtx<'a> {
     ModuleCtx {
         key: "<child>",
         file_str: "<child>",
@@ -3602,7 +4332,7 @@ fn extends_ctx<'a>(source: &'a str, vars: &'a HashMap<String, Value>) -> ModuleC
 fn check_child_only_blocks_non_boundary_offset_degrades() {
     // Same shape as `attach_import_span`: offset 1 is inside the 2-byte "é".
     let caught = std::panic::catch_unwind(|| {
-        let vars = HashMap::new();
+        let vars = Arc::default();
         let ctx = extends_ctx("é\n", &vars);
         let body = vec![Node::EscapedBrace { offset: 1 }];
         check_child_only_blocks(&body, &ctx)
@@ -3641,7 +4371,7 @@ fn check_child_only_blocks_non_boundary_offset_degrades() {
 
 #[test]
 fn check_child_only_blocks_out_of_range_offset_on_empty_source_degrades() {
-    let vars = HashMap::new();
+    let vars = Arc::default();
     let ctx = extends_ctx("", &vars);
     let body = vec![Node::EscapedBrace { offset: 1 }];
     match check_child_only_blocks(&body, &ctx) {
@@ -3660,7 +4390,7 @@ fn check_child_only_blocks_valid_offset_spans_stray_line_and_accepts_blocks() {
     // Positive control: a trustworthy offset still underlines the stray line and still
     // carries the snippet; and a well-formed child body is still accepted.
     let source = "@block a:\n@end\n\\{{ x\n";
-    let vars = HashMap::new();
+    let vars = Arc::default();
     let ctx = extends_ctx(source, &vars);
 
     let stray = vec![
@@ -4038,6 +4768,7 @@ fn map_builder_shares_origin_arc_across_regions() {
         &mut scope,
         &mut vec![],
         Some(crate::sourcemap::MapBuilder::new(base.clone())),
+        &mut EvalBudget::default(),
     )
     .expect("regions must evaluate");
     let map = map.expect("the builder must be handed back");
@@ -4197,7 +4928,13 @@ fn region_first_registered_by_a_splice_names_its_display_path() {
     let [off, on] = [None, Some(importer)].map(|map| {
         let mut scope = Scope::new();
         scope.set_var("n", Value::String("hi".to_string()));
-        match ModuleCache::evaluate_regions_with_map(&regions, &mut scope, &mut vec![], map) {
+        match ModuleCache::evaluate_regions_with_map(
+            &regions,
+            &mut scope,
+            &mut vec![],
+            map,
+            &mut EvalBudget::default(),
+        ) {
             Ok(_) => panic!("a cross-type comparison must fail"),
             Err(err) => err,
         }
