@@ -968,6 +968,24 @@ mod prompt_source_scan {
         for planted in ["m.get_prompt_value();", "m.to_namespace();"] {
             assert_eq!(forbidden_producers(&format!("{ignored}{planted}")), 1);
         }
+
+        let field = r"
+            struct Sample { #[cfg(test)] test_field: bool }
+            fn production(m: ResolvedModule) { m.to_namespace(); }
+        ";
+        let initializer = r"
+            fn production(m: ResolvedModule) {
+                Sample {
+                    #[cfg(test)] test_field: false,
+                    namespace: { m.to_namespace() },
+                };
+            }
+        ";
+        assert_eq!(
+            [field, initializer].map(forbidden_producers),
+            [1, 1],
+            "scan must count each producer after a test-only field"
+        );
     }
 
     fn forbidden_producers(source: &str) -> usize {
@@ -976,8 +994,9 @@ mod prompt_source_scan {
         let mut prev = "";
         let mut hits = 0;
         for _ in 0..tokens.len() {
-            if let Some(item) = rest.strip_prefix(&["#", "[", "cfg", "(", "test", ")", "]"]) {
-                rest = after_test_item(item);
+            if let Some(tail) = rest.strip_prefix(&["#", "[", "cfg", "(", "test", ")", "]"]) {
+                // Scan the tail if the attribute has no clear item boundary.
+                rest = after_test_item(tail).unwrap_or(tail);
                 prev = "";
             } else if let Some((&token, tail)) = rest.split_first() {
                 hits += usize::from(
@@ -992,22 +1011,24 @@ mod prompt_source_scan {
         hits
     }
 
-    fn after_test_item<'a>(item: &'a [&'a str]) -> &'a [&'a str] {
-        let mut nested = 0;
+    fn after_test_item<'a>(item: &'a [&'a str]) -> Option<&'a [&'a str]> {
+        let mut nested = 0_usize;
         for (i, &token) in item.iter().enumerate() {
             match token {
                 "[" | "(" | "{" => nested += 1,
                 "]" | ")" | "}" => {
-                    nested -= 1;
+                    nested = nested.checked_sub(1)?;
                     if nested == 0 && token == "}" {
-                        return &item[i + 1..];
+                        return Some(&item[i + 1..]);
                     }
                 }
-                ";" if nested == 0 => return &item[i + 1..],
+                ";" if nested == 0 => return Some(&item[i + 1..]),
+                // A comma can end a field or arm, but does not prove an item end.
+                "," if nested == 0 => return None,
                 _ => {}
             }
         }
-        panic!("expected an end to the test item");
+        panic!("expected an end to the #[cfg(test)] item");
     }
 
     // Ignore comments and literals before the scan considers names or test attributes.
