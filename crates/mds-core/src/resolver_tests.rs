@@ -595,7 +595,7 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
     let source = "{{imports}}";
     let tokens = tokenize(source, "plain.md").unwrap();
     let module = parse_with_ctx(&tokens, "plain.md", source).unwrap();
-    let (mut plain, _) = build_scope_from_frontmatter(None, true, &vars).unwrap();
+    let (mut plain, _) = build_scope_from_frontmatter(None, true, &runtime_layer(&vars)).unwrap();
     assert_eq!(
         evaluate(
             &module.body,
@@ -615,6 +615,31 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
         .unwrap_err();
     assert_eq!(invalid.to_string(), no_runtime.to_string());
     assert_ne!(invalid.to_string(), err.to_string());
+}
+
+#[test]
+fn runtime_layer_is_shared_by_module_scopes() {
+    let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
+    let vars = runtime_layer(&vars);
+    let (first, _) = build_scope_from_frontmatter(None, false, &vars).unwrap();
+    let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
+    assert!(Arc::ptr_eq(
+        first.get_slot("x").unwrap(),
+        inherited.get_slot("x").unwrap()
+    ));
+}
+
+#[test]
+fn runtime_layer_cache_reuse_preserves_import_values() {
+    let mut cache = virtual_cache(&[("lib.mds", "@define from_lib():\n{{x}}\n@end")]);
+    let source = "@import \"./lib.mds\"\n{{from_lib()}}/{{x}}";
+    for (runtime, expected) in [("first", "first/first"), ("second", "first/second")] {
+        let vars = HashMap::from([("x".into(), Value::String(runtime.into()))]);
+        let module = cache
+            .resolve_source(source, "", &vars, &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref().map(str::trim), Some(expected));
+    }
 }
 
 /// Helper: compile a VirtualFs entry and return the Markdown output string.
@@ -3695,7 +3720,7 @@ fn attach_import_span_valid_offset_spans_whole_directive_and_passes_other_errors
 }
 
 /// Build the borrowed module context the `@extends` helpers take.
-fn extends_ctx<'a>(source: &'a str, vars: &'a HashMap<String, Value>) -> ModuleCtx<'a> {
+fn extends_ctx<'a>(source: &'a str, vars: &'a Arc<VarLayer>) -> ModuleCtx<'a> {
     ModuleCtx {
         key: "<child>",
         file_str: "<child>",
@@ -3709,7 +3734,7 @@ fn extends_ctx<'a>(source: &'a str, vars: &'a HashMap<String, Value>) -> ModuleC
 fn check_child_only_blocks_non_boundary_offset_degrades() {
     // Same shape as `attach_import_span`: offset 1 is inside the 2-byte "é".
     let caught = std::panic::catch_unwind(|| {
-        let vars = HashMap::new();
+        let vars = Arc::default();
         let ctx = extends_ctx("é\n", &vars);
         let body = vec![Node::EscapedBrace { offset: 1 }];
         check_child_only_blocks(&body, &ctx)
@@ -3748,7 +3773,7 @@ fn check_child_only_blocks_non_boundary_offset_degrades() {
 
 #[test]
 fn check_child_only_blocks_out_of_range_offset_on_empty_source_degrades() {
-    let vars = HashMap::new();
+    let vars = Arc::default();
     let ctx = extends_ctx("", &vars);
     let body = vec![Node::EscapedBrace { offset: 1 }];
     match check_child_only_blocks(&body, &ctx) {
@@ -3767,7 +3792,7 @@ fn check_child_only_blocks_valid_offset_spans_stray_line_and_accepts_blocks() {
     // Positive control: a trustworthy offset still underlines the stray line and still
     // carries the snippet; and a well-formed child body is still accepted.
     let source = "@block a:\n@end\n\\{{ x\n";
-    let vars = HashMap::new();
+    let vars = Arc::default();
     let ctx = extends_ctx(source, &vars);
 
     let stray = vec![

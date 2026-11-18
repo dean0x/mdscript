@@ -414,7 +414,7 @@ impl ModuleCache {
             key: &key,
             typed: path,
         };
-        self.resolve_by_key(entry, runtime_vars, None, warnings)
+        self.resolve_by_key(entry, &runtime_layer(runtime_vars), None, warnings)
     }
 
     /// Resolve a module from a filesystem path string, dispatching on output shape.
@@ -448,7 +448,7 @@ impl ModuleCache {
         };
         let ((output, _), source) = self.resolve_intrinsic_by_key_opts_source(
             entry,
-            runtime_vars,
+            &runtime_layer(runtime_vars),
             &Default::default(),
             warnings,
         )?;
@@ -469,7 +469,7 @@ impl ModuleCache {
             key: &key,
             typed: path,
         };
-        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
+        self.resolve_intrinsic_by_key_opts(entry, &runtime_layer(runtime_vars), opts, warnings)
     }
 
     /// Resolve a module by its normalized key.
@@ -480,7 +480,7 @@ impl ModuleCache {
     fn resolve_by_key(
         &mut self,
         module: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         import_site: Option<ImportSite<'_>>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
@@ -574,7 +574,7 @@ impl ModuleCache {
         &mut self,
         base_dir: &str,
         relative: &str,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         import_site: Option<ImportSite<'_>>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
@@ -606,7 +606,7 @@ impl ModuleCache {
             key: &resolved,
             typed: key,
         };
-        self.resolve_by_key(entry, runtime_vars, None, warnings)
+        self.resolve_by_key(entry, &runtime_layer(runtime_vars), None, warnings)
     }
 
     /// Resolve a module from an in-memory source string.
@@ -643,7 +643,7 @@ impl ModuleCache {
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars,
+            runtime_vars: &runtime_layer(runtime_vars),
         };
         let resolved = self.process_module(&ctx, false, warnings);
 
@@ -670,7 +670,7 @@ impl ModuleCache {
             key: &key,
             typed: entry,
         };
-        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
+        self.resolve_intrinsic_by_key(entry, &runtime_layer(runtime_vars), warnings)
     }
 
     /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -687,7 +687,7 @@ impl ModuleCache {
             key: &key,
             typed: entry,
         };
-        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
+        self.resolve_intrinsic_by_key_opts(entry, &runtime_layer(runtime_vars), opts, warnings)
     }
 
     /// Resolve a module by its normalized key, dispatching on output shape.
@@ -700,7 +700,7 @@ impl ModuleCache {
     fn resolve_intrinsic_by_key(
         &mut self,
         entry: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
         self.resolve_intrinsic_by_key_opts(entry, runtime_vars, &Default::default(), warnings)
@@ -712,7 +712,7 @@ impl ModuleCache {
     fn resolve_intrinsic_by_key_opts(
         &mut self,
         entry: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
@@ -723,7 +723,7 @@ impl ModuleCache {
     fn resolve_intrinsic_by_key_opts_source(
         &mut self,
         entry: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<((crate::CompiledOutput, Option<crate::SourceMap>), String), MdsError> {
@@ -780,7 +780,7 @@ impl ModuleCache {
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars,
+            runtime_vars: &runtime_layer(runtime_vars),
         };
         let result = self.process_module_intrinsic(&ctx, false, warnings);
         let popped = self.resolving.pop();
@@ -807,7 +807,7 @@ impl ModuleCache {
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars,
+            runtime_vars: &runtime_layer(runtime_vars),
         };
         let result = self.process_module_intrinsic_opts(&ctx, false, opts, warnings);
         let popped = self.resolving.pop();
@@ -1585,7 +1585,7 @@ impl ModuleCache {
     fn resolve_by_key_skeleton(
         &mut self,
         module: ModuleRef<'_>,
-        runtime_vars: &HashMap<String, Value>,
+        runtime_vars: &Arc<VarLayer>,
         import_site: ImportSite<'_>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
@@ -2320,7 +2320,7 @@ struct ModuleCtx<'a> {
     /// canonicalized `base_dir` supplied by the caller.
     base_dir: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
-    runtime_vars: &'a HashMap<String, Value>,
+    runtime_vars: &'a Arc<VarLayer>,
 }
 
 /// Whether `name` is an available export of a module: every name when the module
@@ -2568,7 +2568,7 @@ fn runtime_layer(vars: &HashMap<String, Value>) -> Arc<VarLayer> {
 fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
     is_md: bool,
-    runtime_vars: &HashMap<String, Value>,
+    runtime_vars: &Arc<VarLayer>,
 ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
     let mut frontmatter_vars = VarLayer::new();
     let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
@@ -2616,7 +2616,7 @@ fn build_scope_from_frontmatter(
     }
 
     Ok((
-        Scope::with_layers(runtime_layer(runtime_vars), Arc::new(frontmatter_vars)),
+        Scope::with_layers(Arc::clone(runtime_vars), Arc::new(frontmatter_vars)),
         fm_imports,
     ))
 }
