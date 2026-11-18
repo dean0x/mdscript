@@ -182,11 +182,10 @@ fn directive_line_offsets(tokens: &[Token]) -> BTreeSet<usize> {
 
 /// Compute the byte offset where the compiled "body" begins.
 ///
-/// `clean_output` (see `lib.rs`) only ever runs on the body — the raw
-/// frontmatter is stripped off before it and reattached verbatim afterward via
-/// `prepend_frontmatter`. A leading frontmatter block is always exactly three
-/// consecutive tokens (`FrontmatterFence(0)`, `FrontmatterContent`,
-/// `FrontmatterFence`), so the body starts at the fourth token when present.
+/// Output cleanup applies only to the body. The compiler adds the frontmatter
+/// prefix after cleanup. A leading frontmatter block has exactly three tokens
+/// (`FrontmatterFence(0)`, `FrontmatterContent`, `FrontmatterFence`), so the
+/// body starts at the fourth token.
 /// Returns `0` when there is no leading frontmatter (a leading code fence, if
 /// any, is ordinary body content subject to R1 only).
 fn body_start_offset(tokens: &[Token], src: &str) -> usize {

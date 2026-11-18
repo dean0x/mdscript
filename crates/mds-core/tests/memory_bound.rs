@@ -180,7 +180,8 @@ fn assert_mapped_output_peak() {
     assert!(output.ends_with("ab\n"));
     assert!(!output.contains('\r'));
     assert!(peak >= 8 * MIB, "output control: {peak} B");
-    let bound = 48 * MIB;
+    // Allow the runtime value, one output buffer, and 4 MiB of other data.
+    let bound = 20 * MIB;
     eprintln!("mapped output peak: {peak} B; limit: {bound} B");
     assert!(peak <= bound, "mapped output exceeds peak limit");
 }

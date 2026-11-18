@@ -960,8 +960,8 @@ impl ModuleCache {
     /// Shares setup with `process_module` but dispatches on `has_message_block` at the
     /// end: a body containing any `@message` block evaluates to
     /// [`crate::CompiledOutput::Messages`] (via `evaluate_messages_seeded`), otherwise
-    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate_seeded`, then `clean_output` +
-    /// `prepend_frontmatter`).
+    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate_seeded` or mapped evaluation,
+    /// then `finalize_markdown`).
     ///
     /// When the parsed module has an `@extends` directive the shared extends pipeline
     /// (`resolve_extends_components`) builds the effective blocks and `scope`
@@ -1070,29 +1070,14 @@ impl ModuleCache {
                 self.budget.start_module(),
             )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            let pending_map = builder
-                .and_then(|b| apply_map_degradation(b, opts, warnings))
-                .map(|b| b.finalize_points(&body_raw));
-
-            let body_clean = crate::clean_output(&body_raw);
-            let body_clean_len = body_clean.len();
-            let final_str = crate::prepend_frontmatter(merged_frontmatter.as_deref(), body_clean);
-            let fm_prefix_len = final_str.len() - body_clean_len;
-            let source_map = pending_map.map(|map| map.finish(&final_str, fm_prefix_len, None));
-            // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
-            // relativize ALL sources[] entries so no absolute path can leak into
-            // the published map.  Unconditional — never opt-in, never debug_assert.
-            self.anchor_root_for_source_map(ctx.base_dir);
-            let source_map = source_map.map(|mut sm| {
-                let root_str = self.fs.source_root();
-                let root = root_str.as_deref().map(std::path::Path::new);
-                let base = opts.source_map_base.as_deref();
-                for src in &mut sm.sources {
-                    *src = crate::source_path::relativize_source(src, base, root);
-                }
-                sm
-            });
-            return Ok((crate::CompiledOutput::Markdown(final_str), source_map));
+            let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
+            return Ok(self.finalize_markdown(
+                body_raw,
+                merged_frontmatter.as_deref(),
+                map_out,
+                ctx.base_dir,
+                opts,
+            ));
         }
 
         // ── Standalone path ───────────────────────────────────────────────────
@@ -1162,16 +1147,38 @@ impl ModuleCache {
             None
         };
 
+        Ok(self.finalize_markdown(
+            body_raw,
+            raw_frontmatter.as_deref(),
+            map_out,
+            ctx.base_dir,
+            opts,
+        ))
+    }
+
+    fn finalize_markdown(
+        &self,
+        body_raw: String,
+        frontmatter: Option<&str>,
+        map_out: Option<crate::sourcemap::MapBuilder>,
+        base_dir: &str,
+        opts: &crate::sourcemap::CompileOptions,
+    ) -> (crate::CompiledOutput, Option<crate::sourcemap::SourceMap>) {
         let pending_map = map_out.map(|b| b.finalize_points(&body_raw));
-        let body_clean = crate::clean_output(&body_raw);
-        let body_clean_len = body_clean.len();
-        let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
-        let fm_prefix_len = final_str.len() - body_clean_len;
-        let source_map = pending_map.map(|map| map.finish(&final_str, fm_prefix_len, None));
-        // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
-        // relativize ALL sources[] entries so no absolute path can leak into
-        // the published map.  Unconditional — never opt-in, never debug_assert.
-        self.anchor_root_for_source_map(ctx.base_dir);
+        let prefix = crate::frontmatter_prefix(frontmatter);
+        let fm_prefix_len = prefix.as_ref().map_or(0, String::len);
+        let mut body = crate::clean_output_owned(body_raw, fm_prefix_len);
+        if let Some(prefix) = prefix {
+            if body.is_empty() {
+                body = prefix;
+            } else {
+                body.insert_str(0, &prefix);
+            }
+        }
+
+        let source_map = pending_map.map(|map| map.finish(&body, fm_prefix_len, None));
+        self.anchor_root_for_source_map(base_dir);
+        // Relativize every source label before the caller receives the map.
         let source_map = source_map.map(|mut sm| {
             let root_str = self.fs.source_root();
             let root = root_str.as_deref().map(std::path::Path::new);
@@ -1181,7 +1188,7 @@ impl ModuleCache {
             }
             sm
         });
-        Ok((crate::CompiledOutput::Markdown(final_str), source_map))
+        (crate::CompiledOutput::Markdown(body), source_map)
     }
 
     /// Assert the LIFO pop invariant after `process_module`.
@@ -3044,13 +3051,10 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
 
 // ── Template inheritance helpers ──────────────────────────────────────────────
 
-/// Serialize a deep-merged frontmatter `Mapping` into a YAML string suitable for
-/// `prepend_frontmatter`.
+/// Serialize a deep-merged frontmatter `Mapping` for `frontmatter_prefix`.
 ///
-/// Returns `Ok(None)` when `mapping` is empty (no non-reserved keys on either side — no
-/// frontmatter block should be emitted). Otherwise returns `Ok(Some(yaml_string))` where
-/// `yaml_string` is the canonical YAML representation of `mapping` with a trailing
-/// newline, ready to be wrapped in `---…---` fences by `prepend_frontmatter`.
+/// Return `Ok(None)` for an empty mapping. Otherwise return the canonical YAML
+/// representation with a final newline and no fences.
 ///
 /// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
 ///
