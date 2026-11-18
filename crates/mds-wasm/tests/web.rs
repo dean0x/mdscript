@@ -43,6 +43,81 @@ fn filename_opts(filename: &str) -> JsValue {
     to_js_object(&serde_json::json!({ "filename": filename }))
 }
 
+// ── Virtual map and resolved graph limits ─────────────────────────────────────
+
+#[wasm_bindgen_test]
+fn virtual_map_accepts_257_entries_and_refuses_258() {
+    for imported in [false, true] {
+        let mut modules: serde_json::Map<String, serde_json::Value> = (0..257)
+            .map(|i| (format!("m{i}.mds"), "Body\n".into()))
+            .collect();
+        let imports: String = (1..257)
+            .map(|i| format!("@import \"./m{i}.mds\" as m{i}\n"))
+            .collect();
+        let source = if imported {
+            imports + "OK\n"
+        } else {
+            "OK\n".into()
+        };
+        modules.insert("m0.mds".into(), source.into());
+        let result = mds_wasm::lint_virtual(to_js_object(&modules), "m0.mds", JsValue::NULL)
+            .expect("the entry plus 256 modules must pass");
+        assert!(js_sys::Array::is_array(&get_prop(&result, "files")));
+        modules.insert("unused.mds".into(), "Body\n".into());
+        let err =
+            mds_wasm::lint_virtual(to_js_object(&modules), "m0.mds", JsValue::NULL).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+        assert_eq!(
+            get_str(&err, "message"),
+            "modules exceeds maximum module count of 257 (258 provided)"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn options_modules_map_accepts_257_entries_and_refuses_258() {
+    let mut modules: serde_json::Map<String, serde_json::Value> = (0..257)
+        .map(|i| (format!("m{i}.mds"), "Body\n".into()))
+        .collect();
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        call("OK\n", modules_opts(&modules.clone().into()))
+            .expect("unused entries must not consume resolved graph slots");
+    }
+    modules.insert("unused.mds".into(), "Body\n".into());
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        let err = call("OK\n", modules_opts(&modules.clone().into())).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+        assert_eq!(
+            get_str(&err, "message"),
+            "options.modules exceeds maximum module count of 257 (258 provided)"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn options_modules_graph_uses_the_shared_module_count_refusal() {
+    let mut modules: serde_json::Map<String, serde_json::Value> = (0..256)
+        .map(|i| (format!("m{i}.mds"), "Body\n".into()))
+        .collect();
+    let mut source: String = (0..256)
+        .map(|i| format!("@import \"./m{i}.mds\" as m{i}\n"))
+        .collect();
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        call(&source, modules_opts(&modules.clone().into()))
+            .expect("the source entry plus 256 modules must pass");
+    }
+    modules.insert("m256.mds".into(), "Body\n".into());
+    source.push_str("@import \"./m256.mds\" as m256\n");
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        let err = call(&source, modules_opts(&modules.clone().into())).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+        assert_eq!(
+            get_str(&err, "message"),
+            mds::module_count_exceeded().to_string()
+        );
+    }
+}
+
 // ── compile tests ─────────────────────────────────────────────────────────────
 
 #[wasm_bindgen_test]

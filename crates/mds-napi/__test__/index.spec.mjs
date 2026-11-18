@@ -2063,6 +2063,27 @@ describe('unknown rule name warning (AC-224 D8)', () => {
 // fast, without materialising the tree. Deep flow-nesting is the second axis, rejected
 // by the pre-parse flow-depth guard. Every rejection throws with `err.code ===
 // 'mds::resource_limit'` and never echoes the raw hostile bytes (`*a`, the sentinel).
+describe('virtual map entry limit', () => {
+  for (const imported of [false, true]) {
+    test(`lintVirtual accepts 257 entries and refuses 258 (${imported ? 'imported' : 'unused'})`, () => {
+      const modules = Object.fromEntries(
+        Array.from({ length: 257 }, (_, i) => [`m${i}.mds`, 'Body\n']),
+      );
+      const imports = Array.from({ length: 256 }, (_, i) =>
+        `@import "./m${i + 1}.mds" as m${i + 1}\n`,
+      ).join('');
+      modules['m0.mds'] = (imported ? imports : '') + 'OK\n';
+      assert.ok(Array.isArray(lintVirtual(modules, 'm0.mds').files));
+      modules['unused.mds'] = 'Body\n';
+      assert.throws(() => lintVirtual(modules, 'm0.mds'), (err) => {
+        assert.equal(err.code, 'mds::resource_limit');
+        assert.equal(err.message, 'modules exceeds maximum module count of 257 (258 provided)');
+        return true;
+      });
+    });
+  }
+});
+
 describe('resource limits', () => {
   const MAX_FRONTMATTER_SIZE = 1 << 20; // 1 MiB
   const wrapFm = (y) => `---\n${y}---\nHi\n`;

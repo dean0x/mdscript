@@ -68,10 +68,12 @@ use pythonize::{depythonize, pythonize};
 /// included.
 const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
-/// Maximum number of entries in a `compile_virtual` / `check_virtual` `modules` map.
+/// Maximum number of entries in a virtual `modules` map.
 ///
-/// Mirrors the WASM binding. 256 modules is well above any realistic template graph.
-const MAX_MODULE_COUNT: usize = 256;
+/// Mirrors the WASM and napi bindings: the entry plus 256 other modules.
+/// This input-size bound counts unused entries too. The core separately bounds
+/// the resolved graph, including modules still being resolved.
+const MAX_MODULE_COUNT: usize = 256 + 1;
 
 /// Maximum aggregate byte size of all module values combined (same ceiling as a
 /// single source input).
