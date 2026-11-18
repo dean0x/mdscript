@@ -520,19 +520,12 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
 /// than a compiled result. Returns `MdsError` (not `miette::Error`) so callers can
 /// show the error as an analysis failure — the JSON envelope under `--format json` —
 /// without downcasting. A directory entry carries its walk pin through the read.
-/// Its I/O errors also name the walked path, even when the core display is a basename.
 pub(crate) fn read_source_file(
     path: &Path,
     pin: Option<mds::EntryPin>,
 ) -> std::result::Result<String, MdsError> {
     let canonical = NativeFs::check_symlink(path)?;
-    let directory_entry = pin.is_some();
-    read_canonical_source(&canonical, path, pin).map_err(|error| match error {
-        MdsError::Io { message } if directory_entry => MdsError::Io {
-            message: format!("{}: {message}", safe_path(path)),
-        },
-        other => other,
-    })
+    read_canonical_source(&canonical, path, pin)
 }
 
 /// Read the already symlink-checked `canonical` path of `path` through `NativeFs`.
