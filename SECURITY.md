@@ -248,6 +248,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max output size | 50 MiB (52,428,800 bytes) per output buffer, checked before every append; it does not bound a compile's total memory, since nested blocks, function results and imported modules each hold a buffer of their own ([#420](https://github.com/dean0x/mdscript/issues/420)) | `limits.rs` (`MAX_OUTPUT_SIZE`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
+| Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver.rs` |
 | Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
 | Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
 | Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |

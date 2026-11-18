@@ -12,7 +12,7 @@ referencedFiles:
   - crates/mds-napi/__test__/fixtures/messages.mds
   - crates/mds-napi/__test__/fixtures/mixed.mds
 created: 2026-06-26
-updated: 2026-09-28
+updated: 2026-11-18
 ---
 
 # MDS Native Node.js Bindings (mds-napi)
@@ -28,7 +28,7 @@ updated: 2026-09-28
 - Expose `compile`, `compileFile`, `check`, `checkFile`, `lint`, `lintFile`, `lintVirtual` to Node.js as native functions
 - Delegate wire-format construction to `mds::CompileResult::to_canonical_json` / `mds::LintResult::to_canonical_json` — never build the JSON object by hand at this layer
 - Marshal Rust errors into JS errors with `.code`, `.help`, `.span` properties
-- Enforce the 10 MiB source size limit at the napi boundary (before calling mds-core), plus `lintVirtual`'s own module-count (256) and aggregate-size caps
+- Enforce the 10 MiB source size limit before mds-core, plus `lintVirtual`'s 257-entry module-map bound and aggregate-size cap
 - Validate and parse the optional `opts` object per export (`basePath`, `vars` for `compile`/`check`; `vars` only for the `*File` variants; `vars` + `rules` for the lint exports)
 - Parse every `rules` severity value through mds-core's shared `parse_rule_severities`/`Severity::from_str` — never re-implement severity parsing locally
 - Does NOT implement any compilation or lint logic itself
@@ -161,15 +161,15 @@ Options parsing uses direct napi property access (`obj.get_named_property_unchec
 - **Local rebuild trap (PF-035).** `npx napi build --platform` writes a *platform-suffixed* addon (`mds-napi.<triple>.node`); the node `--test` harness `require()`s the base `mds-napi.node` by name and will silently keep exercising a stale binary if you build with `--platform`. Rebuild with `npm run build:native -w @mdscript/mds-napi` (`napi build --release --no-js`, no `--platform`) after any Rust change before trusting a local JS test run.
 - `basePath` option is accepted by `compile`/`check` but rejected by `compileFile`/`checkFile`/`lintFile`/`lintVirtual` (base directory is derived from the file path, or is meaningless for virtual modules). The relevant `parse_*_opts` function explicitly checks for and rejects `basePath`.
 - Empty `basePath` string is rejected (`throw_options_error`).
-- The `MAX_SOURCE_SIZE` constant at the napi boundary mirrors `mds::MAX_FILE_SIZE` because string-based `compile`/`lint` calls bypass the file layer. `lintVirtual` additionally enforces its own `MAX_MODULE_COUNT` (256) and `MAX_MODULES_AGGREGATE_SIZE` (same 10 MiB ceiling) per-key and cumulatively, since the virtual-FS path bypasses the file layer's size guard entirely — these bounds are binding-local (mirrored on WASM/Python), not enforced in `mds-core`.
+- `MAX_SOURCE_SIZE` mirrors `mds::MAX_FILE_SIZE` because string APIs bypass the file layer. `lintVirtual` also checks each module's size, `MAX_MODULES_AGGREGATE_SIZE` (10 MiB), and the binding-local `MAX_MODULE_COUNT` (257 entries). The map bound includes unused entries and permits the entry plus 256 other modules (#427). A map with 258 entries throws `mds::resource_limit`: `modules exceeds maximum module count of 257 (258 provided)`. WASM and Python apply the same map bound. This input bound is separate from the core graph limit, which counts distinct non-entry modules even before resolution completes.
 - **A severity spelling that decodes to a valid word via an escaped-unicode letter is no longer accepted (#175, #418) — this is a breaking behavior change.** Only the exact plain-ASCII spellings `off`/`info`/`warn`/`error` parse; anything else, including a spelling that would have decoded to one of those words under the old JSON-string-quoting validation, is `mds::invalid_options` now.
-- **`#422` (open, not yet fixed as of v0.5.0 Wave 1.5): three call sites propagate `env.from_js_value(...)?` directly** — `reject_unknown_napi_keys`'s property-name enumeration, `extract_vars_direct`'s `vars` conversion, and `extract_rules_direct`'s `rules` conversion. If the underlying JS-to-JSON conversion itself fails (e.g. a value napi/serde cannot represent, such as a `Symbol`), the resulting `napi::Error` propagates via `?` uncoded — it carries no `.code`/`.help`/`.span` the way every other options-validation error in this file does (those all go through `throw_options_error`/`throw_mds_error`). Don't assume every thrown error from this crate has a `.code` property until #422 lands.
+- **Option conversion errors use `conversion_error` (#422).** All three `from_js_value` sites call it: property-name enumeration, `vars`, and `rules`. Returned failures throw `mds::invalid_options` with prefix `invalid options: `, `invalid options.vars: ` or `invalid options.rules: `, respectively. The helper wire-escapes converter details through `sanitize_control_chars_wire` and delegates to `throw_options_error`. A pending JS exception passes through unchanged, with no second throw. napi-rs typed-argument conversion remains outside this helper and can return uncoded errors.
 
 ## Key Files
 
 - `crates/mds-napi/src/lib.rs` — the entire napi implementation; `build_canonical_result`, all seven `#[napi]` exports, error helpers, `extract_rules_direct`/`parse_rule_severities` call site
 - `crates/mds-napi/Cargo.toml` — the `serde-json` napi feature is enabled at the workspace level, not here
-- `crates/mds-napi/__test__/index.spec.mjs` — 126 JS tests; "intrinsic output shape" group (K-MD-*, K-MSG-*, K-MIXED-*, K-VARS-*); AC-API-05 deletion assertions; `F-CF8` (not-MDS path-typed-vs-canonical regression, #417); `L-N-RULES-ESC` (rules-error escaping, #418)
+- `crates/mds-napi/__test__/index.spec.mjs` — intrinsic output shape (K-MD-*, K-MSG-*, K-MIXED-*, K-VARS-*); deleted-export assertions; `F-CF8` (typed not-MDS path); `L-N-RULES-ESC` (rules-error escapes); conversion-error and 257/258-entry map controls
 
 ## Related
 
