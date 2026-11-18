@@ -873,6 +873,7 @@ For the base skeleton:
 | Limit | Value |
 |-------|-------|
 | `MAX_BLOCKS_PER_MODULE` | 256 blocks per module |
+| `MAX_DEFINES_PER_MODULE` | 256 `@define` declarations per module |
 | `MAX_FRONTMATTER_MERGE_DEPTH` | 64 levels of nested YAML merging |
 
 ---

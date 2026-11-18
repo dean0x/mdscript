@@ -271,6 +271,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver.rs` |
 | Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
 | Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
+| Max `@define` declarations per module | 256 | `limits.rs` (`MAX_DEFINES_PER_MODULE`) |
 | Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |
 | Max value (YAML/JSON) nesting depth | 64 | `value.rs` (`MAX_VALUE_DEPTH`) |
 | Max dot-path segments | 32 | `limits.rs` (`MAX_DOT_SEGMENTS`) |

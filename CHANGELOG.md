@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: A module with more than 256 `@define` declarations now fails with `mds::resource_limit`.** The message is `resource limit exceeded: module has more than 256 @define declarations`.
+- A call to a known function now reports an invalid argument count before it evaluates the arguments.
 - A directory build, watch, check, lint or fmt now reads only the files it found in the project.
 - On a rebuild, `mds watch` reports a path lookup error and keeps the session active.
 - `--vars` reads a regular file or a named pipe; other file types are refused.
@@ -73,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Memory for `@define` captures now grows linearly with the number of declarations in a module.
 - Python function errors escape unknown keyword names with the shared wire escaper. A lone surrogate appears as U+FFFD characters (#421).
 - napi option-conversion failures now throw `mds::invalid_options`, with prefix `invalid options: `, `invalid options.vars: ` or `invalid options.rules: ` (#422). Converter details use the shared wire escaper; a pending JS exception passes through unchanged.
 - A BigInt in napi `vars` or `rules` stopped the Node.js process. It now throws `mds::invalid_options`, `invalid options.vars: InvalidArg, typeof BigInt value could not be deserialized` (`options.rules` likewise). A value nested deeper than 1024 levels, or with more than 1,000,000 entries, is refused with the same code and prefix (#479).
