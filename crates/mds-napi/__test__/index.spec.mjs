@@ -648,13 +648,20 @@ describe('options conversion errors', () => {
     const source = fs.readFileSync(new URL('../src/lib.rs', import.meta.url), 'utf8');
     const assertBoundary = (text) => {
       const calls = [...text.matchAll(
-        /\.from_js_value\(\w+\)\s*\.map_err\(\|e\| conversion_error\(env, "([^"]+)", e\)\)\?/g,
+        /option_json\(env, \w+\)\s*\.map_err\(\|e\| conversion_error\(env, "([^"]+)", e\)\)\?/g,
       )].map((match) => match[1]);
       assert.deepEqual(calls, ['invalid options: ', 'invalid options.vars: ', 'invalid options.rules: ']);
-      assert.equal([...text.matchAll(/\.from_js_value\(/g)].length, calls.length);
+      assert.equal([...text.matchAll(/option_json\(env, /g)].length, calls.length);
       const helper = text.slice(text.indexOf('fn conversion_error('), text.indexOf('fn throw_resource_limit('));
       assert.match(helper, /throw_options_error\(env, &conversion_error_message\(prefix, &error\.to_string\(\)\)\)/);
       assert.match(helper, /mds::sanitize_control_chars_wire\(detail\)/);
+      // #479: the one from_js_value call runs after the walk, inside the panic boundary.
+      assert.equal([...text.matchAll(/\.from_js_value\(/g)].length, 1);
+      const converter = text.slice(text.indexOf('fn option_json<'), text.indexOf('fn reject_unreadable_values<'));
+      assert.match(
+        converter,
+        /reject_unreadable_values\(env, value\)\?;\s*mds::host_panic::catching\(AssertUnwindSafe\(\|\| env\.from_js_value\(value\)\)\)/,
+      );
     };
     assertBoundary(source);
     assert.throws(
@@ -672,7 +679,96 @@ describe('options conversion errors', () => {
       )),
       assert.AssertionError,
     );
+    assert.throws(
+      () => assertBoundary(source.replace('reject_unreadable_values(env, value)?;', '')),
+      assert.AssertionError,
+    );
+    assert.throws(
+      () => assertBoundary(source.replace(
+        'let vars_json = option_json(env, val)',
+        'let vars_json: serde_json::Value = env.from_js_value(val)',
+      )),
+      assert.AssertionError,
+    );
   });
+
+  // #479: under napi3, napi-rs reads a BigInt as an unknown type and
+  // `from_js_value` aborts the process. Each case runs in a child process,
+  // so a regression fails this test and does not stop the test runner.
+  const runChild = (field, valueSource) => {
+    const call = field === 'vars'
+      ? `addon.compile('ok', { vars: value })`
+      : `addon.lint('ok', { rules: value })`;
+    const script =
+      `const addon = require(${JSON.stringify(ADDON_PATH)});` +
+      `const value = (${valueSource});` +
+      `let report;` +
+      `try { ${call}; report = { ok: true }; }` +
+      `catch (err) { report = { code: err.code, message: err.message }; }` +
+      `process.stdout.write(JSON.stringify(report));`;
+    const proc = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    assert.equal(proc.status, 0, `child must exit 0; signal ${proc.signal}; stderr: ${proc.stderr}`);
+    return JSON.parse(proc.stdout);
+  };
+  const refusal = (field, detail) => ({
+    code: 'mds::invalid_options',
+    message: `invalid options.${field}: InvalidArg, ${detail}`,
+  });
+  const bigintDetail = 'typeof BigInt value could not be deserialized';
+  const bigintCases = [
+    ['a BigInt value', '{ bad: 1n }'],
+    ['a BigInt in an array', '{ bad: [1, [2n]] }'],
+    ['a large BigInt in a nested object', '{ bad: { inner: { deep: 2n ** 70n } } }'],
+  ];
+  for (const field of ['vars', 'rules']) {
+    for (const [label, valueSource] of bigintCases) {
+      test(`#479: ${field} refuses ${label} with mds::invalid_options`, () => {
+        assert.deepEqual(runChild(field, valueSource), refusal(field, bigintDetail));
+      });
+    }
+
+    test(`#479: ${field} refuses a getter that gives a BigInt on the second read`, () => {
+      const valueSource =
+        `(() => { let reads = 0; return { get bad() { reads += 1; return reads === 1 ? 'off' : 1n; } }; })()`;
+      assert.deepEqual(
+        runChild(field, valueSource),
+        refusal(field, 'a value changed while it was read and could not be deserialized'),
+      );
+    });
+
+    test(`#479: ${field} accepts a clean value in the child process`, () => {
+      const clean = field === 'vars' ? `{ value: 'ok' }` : `{ 'unused-variable': 'off' }`;
+      assert.deepEqual(runChild(field, clean), { ok: true });
+      assert.throws(
+        () => assert.deepEqual(runChild(field, '{ bad: 1n }'), { ok: true }),
+        assert.AssertionError,
+      );
+    });
+
+    test(`#479: ${field} refuses nesting past 1024 levels and more than 1000000 values`, () => {
+      const invoke = (value) => {
+        try {
+          if (field === 'vars') compile('ok', { vars: value });
+          else addon.lint('ok', { rules: value });
+        } catch (err) {
+          return { code: err.code, message: err.message };
+        }
+        return { ok: true };
+      };
+      const nested = (levels) => {
+        let value = 0;
+        for (let level = 0; level < levels; level += 1) value = { value };
+        return value;
+      };
+      const depthRefusal = refusal(field, 'value nesting exceeds maximum depth of 1024');
+      assert.deepEqual(invoke(nested(1025)), depthRefusal);
+      // At the limit the walk admits the value; core gives its own refusal.
+      assert.notDeepEqual(invoke(nested(1024)), depthRefusal);
+      const countRefusal = refusal(field, 'value has more than 1000000 entries');
+      assert.deepEqual(invoke({ bad: new Array(1_000_001).fill(0) }), countRefusal);
+      assert.notDeepEqual(invoke({ bad: new Array(999_998).fill(0) }), countRefusal);
+    });
+  }
 
   test('clean vars and rules still compile and lint', () => {
     const assertClean = (result) => assert.equal(result.output, 'ok\n');

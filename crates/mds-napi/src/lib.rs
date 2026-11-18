@@ -266,6 +266,84 @@ fn conversion_error_message(prefix: &str, detail: &str) -> String {
     format!("{prefix}{}", mds::sanitize_control_chars_wire(detail))
 }
 
+/// Most nesting levels the options walk follows before it refuses a value.
+const MAX_OPTION_DEPTH: usize = 1024;
+
+/// Most values the options walk admits from one option before it refuses it.
+const MAX_OPTION_VALUES: usize = 1_000_000;
+
+/// Convert one options value to JSON, the only `from_js_value` call (#479).
+///
+/// Without the `napi6` feature, napi-rs reads a BigInt as `ValueType::Unknown`
+/// and `from_js_value` reaches `unreachable!()`. That panic cannot leave the
+/// napi callback, so the process aborts. [`reject_unreadable_values`] refuses
+/// such a value first. A getter or Proxy can give a different value on the
+/// second read, so the conversion also runs inside the panic boundary.
+fn option_json<'v>(env: &Env, value: impl JsValue<'v> + Copy) -> napi::Result<serde_json::Value> {
+    reject_unreadable_values(env, value)?;
+    mds::host_panic::catching(AssertUnwindSafe(|| env.from_js_value(value))).unwrap_or_else(|_| {
+        Err(napi::Error::new(
+            Status::InvalidArg,
+            "a value changed while it was read and could not be deserialized",
+        ))
+    })
+}
+
+/// Refuse a value that `from_js_value` cannot read under `napi3` (#479).
+///
+/// The walk reads the same array elements, property names and properties as
+/// the napi-rs deserializer, in a bounded loop. It refuses a BigInt, a nesting
+/// deeper than [`MAX_OPTION_DEPTH`] and more than [`MAX_OPTION_VALUES`] values.
+/// The deserializer returns its own error for every other value it cannot read.
+fn reject_unreadable_values<'v>(env: &Env, value: impl JsValue<'v>) -> napi::Result<()> {
+    let refuse = |detail: String| Err(napi::Error::new(Status::InvalidArg, detail));
+    // SAFETY: the value handle comes from this napi callback and stays alive in
+    // its handle scope for the whole walk.
+    let root: Unknown<'v> = unsafe { Unknown::from_napi_value(env.raw(), value.raw())? };
+    let mut pending: Vec<(Unknown<'v>, usize)> = vec![(root, 0)];
+    let mut admitted = 1_usize;
+    while let Some((item, depth)) = pending.pop() {
+        match item.get_type()? {
+            ValueType::Unknown => {
+                return refuse("typeof BigInt value could not be deserialized".to_owned())
+            }
+            ValueType::Object => {}
+            _ => continue,
+        }
+        let object = Object::from_raw(env.raw(), item.raw());
+        if object.is_typedarray()? || object.is_buffer()? || object.is_arraybuffer()? {
+            continue;
+        }
+        if depth >= MAX_OPTION_DEPTH {
+            return refuse(format!(
+                "value nesting exceeds maximum depth of {MAX_OPTION_DEPTH}"
+            ));
+        }
+        let (names, len) = if object.is_array()? {
+            (None, object.get_array_length_unchecked()?)
+        } else {
+            let names: Object = object.get_property_names()?;
+            let len = names.get_array_length_unchecked()?;
+            (Some(names), len)
+        };
+        admitted = admitted.saturating_add(len as usize);
+        if admitted > MAX_OPTION_VALUES {
+            return refuse(format!("value has more than {MAX_OPTION_VALUES} entries"));
+        }
+        for index in 0..len {
+            let child: Unknown<'v> = match &names {
+                None => object.get_element(index)?,
+                Some(names) => {
+                    let name: String = names.get_element(index)?;
+                    object.get_named_property_unchecked(&name)?
+                }
+            };
+            pending.push((child, depth + 1));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod conversion_error_tests {
     use super::conversion_error_message;
@@ -429,9 +507,8 @@ fn napi_type_name(vt: ValueType) -> &'static str {
 fn reject_unknown_napi_keys(env: &Env, obj: &Object, known: &[&str]) -> napi::Result<()> {
     let names_obj: Object = obj.get_property_names()?;
     // Deserialize the property-names Array into a JSON array of strings.
-    let names_json: serde_json::Value = env
-        .from_js_value(names_obj)
-        .map_err(|e| conversion_error(env, "invalid options: ", e))?;
+    let names_json =
+        option_json(env, names_obj).map_err(|e| conversion_error(env, "invalid options: ", e))?;
     let keys: Vec<String> = match names_json {
         serde_json::Value::Array(arr) => arr
             .into_iter()
@@ -505,8 +582,7 @@ fn extract_vars_direct(env: &Env, obj: &Object) -> napi::Result<Option<HashMap<S
         ValueType::Undefined | ValueType::Null => Ok(None),
         ValueType::Object => {
             // Deserialize only the vars sub-value.
-            let vars_json: serde_json::Value = env
-                .from_js_value(val)
+            let vars_json = option_json(env, val)
                 .map_err(|e| conversion_error(env, "invalid options.vars: ", e))?;
             // Note: ValueType::Object includes JS arrays, which serde deserializes
             // as Value::Array. The `let Value::Object(map) else` guard inside
@@ -857,8 +933,7 @@ fn extract_rules_direct(
         ValueType::Object => {
             // Deserialize the rules sub-object; js arrays also satisfy Object so
             // we guard against that in the JSON shape check below.
-            let rules_json: serde_json::Value = env
-                .from_js_value(val)
+            let rules_json = option_json(env, val)
                 .map_err(|e| conversion_error(env, "invalid options.rules: ", e))?;
             let serde_json::Value::Object(rules_map) = rules_json else {
                 return Err(throw_options_error(
