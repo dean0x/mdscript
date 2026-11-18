@@ -611,10 +611,10 @@ describe('options conversion errors', () => {
       test(`${field} conversion rejects ${type} with a coded field prefix`, () => {
         assert.throws(() => invoke(makeValue()), (err) => {
           assert.equal(err.code, 'mds::invalid_options');
-          assert.ok(err.message.startsWith(`invalid options.${field}: `), err.message);
-          assert.ok(err.message.includes(`typeof ${type} value could not be deserialized`), err.message);
-          assert.ok(!err.message.includes(String.fromCharCode(0x1b)), err.message);
-          assert.ok(!err.message.includes(String.fromCharCode(0x202e)), err.message);
+          assert.equal(
+            err.message,
+            `invalid options.${field}: InvalidArg, typeof ${type} value could not be deserialized`,
+          );
           return true;
         });
       });
@@ -643,8 +643,8 @@ describe('options conversion errors', () => {
   }
 
   test('all JSON conversion sites use the coded, wire-escaped error boundary', () => {
-    // napi-rs currently returns fixed text for Symbol and Function values. Inspect
-    // the boundary too, so those messages cannot hide a missing wire escaper.
+    // napi-rs returns fixed text for Symbol and Function values. Rust unit tests
+    // cover caller text; this scan checks that every site uses the tested formatter.
     const source = fs.readFileSync(new URL('../src/lib.rs', import.meta.url), 'utf8');
     const assertBoundary = (text) => {
       const calls = [...text.matchAll(
@@ -653,15 +653,23 @@ describe('options conversion errors', () => {
       assert.deepEqual(calls, ['invalid options: ', 'invalid options.vars: ', 'invalid options.rules: ']);
       assert.equal([...text.matchAll(/\.from_js_value\(/g)].length, calls.length);
       const helper = text.slice(text.indexOf('fn conversion_error('), text.indexOf('fn throw_resource_limit('));
-      assert.match(helper, /mds::sanitize_control_chars_wire\(&error\.to_string\(\)\)/);
+      assert.match(helper, /throw_options_error\(env, &conversion_error_message\(prefix, &error\.to_string\(\)\)\)/);
+      assert.match(helper, /mds::sanitize_control_chars_wire\(detail\)/);
     };
     assertBoundary(source);
     assert.throws(
-      () => assertBoundary(source.replace('mds::sanitize_control_chars_wire(&error.to_string())', 'error.to_string()')),
+      () => assertBoundary(source.replace('mds::sanitize_control_chars_wire(detail)', 'detail')),
       assert.AssertionError,
     );
     assert.throws(
-      () => assertBoundary(source.replace('invalid options: ', 'wrong prefix: ')),
+      () => assertBoundary(source.replace('conversion_error_message(prefix, &error.to_string())', 'error.to_string()')),
+      assert.AssertionError,
+    );
+    assert.throws(
+      () => assertBoundary(source.replace(
+        'conversion_error(env, "invalid options: ", e)',
+        'conversion_error(env, "wrong prefix: ", e)',
+      )),
       assert.AssertionError,
     );
   });

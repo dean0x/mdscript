@@ -259,13 +259,45 @@ fn conversion_error(env: &Env, prefix: &str, error: napi::Error) -> napi::Error 
     if error.status == Status::PendingException {
         return error;
     }
-    throw_options_error(
-        env,
-        &format!(
-            "{prefix}{}",
-            mds::sanitize_control_chars_wire(&error.to_string())
-        ),
-    )
+    throw_options_error(env, &conversion_error_message(prefix, &error.to_string()))
+}
+
+fn conversion_error_message(prefix: &str, detail: &str) -> String {
+    format!("{prefix}{}", mds::sanitize_control_chars_wire(detail))
+}
+
+#[cfg(test)]
+mod conversion_error_tests {
+    use super::conversion_error_message;
+
+    fn assert_escaped_message(format_message: fn(&str, &str) -> String) {
+        let detail = format!(
+            "InvalidArg, value{}[31m{}",
+            char::from(0x1b),
+            char::from_u32(0x202e).unwrap()
+        );
+        for prefix in [
+            "invalid options: ",
+            "invalid options.vars: ",
+            "invalid options.rules: ",
+        ] {
+            let expected = format!("{prefix}InvalidArg, value{}u001B[31m{}u202E", '\\', '\\');
+            assert_eq!(format_message(prefix, &detail), expected);
+            assert_eq!(
+                format_message(prefix, "InvalidArg, plain detail"),
+                format!("{prefix}InvalidArg, plain detail")
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_messages_escape_caller_text_and_keep_the_prefix() {
+        assert_escaped_message(conversion_error_message);
+        assert!(std::panic::catch_unwind(|| {
+            assert_escaped_message(|prefix, detail| format!("{prefix}{detail}"));
+        })
+        .is_err());
+    }
 }
 
 /// Create a `mds::resource_limit` JS exception and return `PendingException`.

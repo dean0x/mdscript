@@ -1,6 +1,7 @@
 //! This binary has exactly one test because the panic hook is process-wide.
 //! Run all scenarios in order so no other test can replace the hook.
 
+use std::cell::Cell;
 use std::panic::{catch_unwind, panic_any};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
@@ -28,6 +29,45 @@ fn test_count(source: &str) -> usize {
         .lines()
         .filter(|line| line.trim() == "#[test]")
         .count()
+}
+
+thread_local! {
+    static CONTROL_INSIDE: Cell<bool> = const { Cell::new(false) };
+}
+
+// This test-only copy models a second hook install without the once guard.
+fn install_without_guard() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !CONTROL_INSIDE.with(Cell::get) {
+            previous(info);
+        }
+    }));
+}
+
+fn assert_second_install(install_again: fn()) {
+    let records: Records = Arc::new(Mutex::new(Vec::with_capacity(1)));
+    let recorder = Arc::clone(&records);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |_| {
+        if let Ok(mut records) = recorder.lock() {
+            records.push((thread::current().id(), "sentinel"));
+        }
+    }));
+    install_again();
+    let result = catching(|| {
+        CONTROL_INSIDE.set(true);
+        panic_any("inside-after-install");
+    });
+    CONTROL_INSIDE.set(false);
+    // Restore the earlier chain before any assertion can unwind.
+    std::panic::set_hook(previous);
+    assert_payload(result, "inside-after-install");
+    assert_eq!(
+        records_for(&records, thread::current().id()),
+        ["sentinel"],
+        "a second install must leave the host hook in place"
+    );
 }
 
 #[test]
@@ -121,6 +161,11 @@ fn the_hook_is_silent_only_within_this_threads_catch_boundary() {
         ["outside", "outside-after-nested"]
     );
 
+    assert_second_install(install);
+    assert!(
+        catching(|| assert_second_install(install_without_guard)).is_err(),
+        "the sentinel check must reject an unguarded second install"
+    );
     install();
     assert_payload(
         catching(|| panic_any("inside-after-install")),
