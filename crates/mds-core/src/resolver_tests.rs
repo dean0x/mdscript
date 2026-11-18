@@ -2,6 +2,7 @@
 
 use super::frontmatter::deep_merge_yaml;
 use super::*;
+use crate::evaluator::evaluate;
 use crate::limits::{MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH};
 
 // Helper to build a YAML Value from inline YAML text
@@ -606,6 +607,76 @@ fn virtual_cache(files: &[(&str, &str)]) -> ModuleCache {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
     )
+}
+
+#[test]
+fn function_call_limit_counts_each_kind_across_modules() {
+    use crate::limits::MAX_TOTAL_FUNCTION_CALLS;
+
+    let lib = "@define word():\nb\n@end\n{{upper(\"a\")}}";
+    let entry = concat!(
+        "@import \"./lib.mds\" as lib\n",
+        "@define local():\nc\n@end\n"
+    );
+    for (body, source_map) in [
+        ("@include lib\n{{lib.word()}}{{local()}}", false),
+        ("@include lib\n{{lib.word()}}{{local()}}", true),
+        (
+            "@message user:\n@include lib\n{{lib.word()}}{{local()}}\n@end",
+            false,
+        ),
+    ] {
+        let source = format!("{entry}{body}");
+        let compile = |calls_left| {
+            let mut cache = virtual_cache(&[("entry.mds", &source), ("lib.mds", lib)]);
+            cache.function_call_seed = MAX_TOTAL_FUNCTION_CALLS - calls_left;
+            let opts = crate::CompileOptions {
+                source_map,
+                ..Default::default()
+            };
+            cache.resolve_virtual_intrinsic_opts(
+                "entry.mds",
+                &HashMap::new(),
+                &opts,
+                &mut Vec::new(),
+            )
+        };
+        let (output, _) = compile(3).unwrap();
+        let text = match output {
+            crate::CompiledOutput::Markdown(text) => text,
+            crate::CompiledOutput::Messages(messages) => messages[0].content.clone(),
+        };
+        assert_eq!(text.lines().collect::<String>(), "Abc");
+        assert_eq!(
+            compile(2).unwrap_err().serialize().code,
+            "mds::resource_limit"
+        );
+    }
+}
+
+#[test]
+fn function_call_limit_counts_across_extends_regions() {
+    use crate::limits::MAX_TOTAL_FUNCTION_CALLS;
+
+    let compile = |calls_left| {
+        let mut cache = virtual_cache(&[
+            ("base.mds", "{{upper(\"a\")}}\n@block content:\nx\n@end"),
+            (
+                "entry.mds",
+                "@extends \"./base.mds\"\n@block content:\n{{upper(\"b\")}}\n@end",
+            ),
+        ]);
+        cache.function_call_seed = MAX_TOTAL_FUNCTION_CALLS - calls_left;
+        cache.resolve_virtual_intrinsic("entry.mds", &HashMap::new(), &mut Vec::new())
+    };
+    let crate::CompiledOutput::Markdown(text) = compile(2).unwrap() else {
+        panic!("expected Markdown output");
+    };
+    assert_eq!(text.lines().collect::<String>(), "AB");
+    assert_eq!(
+        compile(1).unwrap_err().serialize().code,
+        "mds::resource_limit"
+    );
 }
 
 #[test]
@@ -4676,6 +4747,7 @@ fn map_builder_shares_origin_arc_across_regions() {
         &mut scope,
         &mut vec![],
         Some(crate::sourcemap::MapBuilder::new(base.clone())),
+        &mut EvalBudget::default(),
     )
     .expect("regions must evaluate");
     let map = map.expect("the builder must be handed back");
@@ -4835,7 +4907,13 @@ fn region_first_registered_by_a_splice_names_its_display_path() {
     let [off, on] = [None, Some(importer)].map(|map| {
         let mut scope = Scope::new();
         scope.set_var("n", Value::String("hi".to_string()));
-        match ModuleCache::evaluate_regions_with_map(&regions, &mut scope, &mut vec![], map) {
+        match ModuleCache::evaluate_regions_with_map(
+            &regions,
+            &mut scope,
+            &mut vec![],
+            map,
+            &mut EvalBudget::default(),
+        ) {
             Ok(_) => panic!("a cross-type comparison must fail"),
             Err(err) => err,
         }

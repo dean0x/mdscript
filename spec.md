@@ -885,8 +885,12 @@ For the base skeleton:
 | 1. Parse | Tokenize → AST (frontmatter, directives, text nodes) | Syntax errors (unexpected token, unclosed block) |
 | 2. Resolve | Recursively load imports, build dependency graph | File not found, circular import |
 | 3. Validate | Check all references, types, arity | Undefined var/function, type mismatch, wrong arg count |
-| 4. Evaluate | Execute directives (expand loops, resolve conditions, call functions) | Iterate non-array, recursion detected |
+| 4. Evaluate | Execute directives (expand loops, resolve conditions, call functions) | Iterate non-array, recursion detected, resource limit |
 | 5. Render | Flatten evaluated tree → final Markdown string | (none expected) |
+
+A compile permits at most 16,000,000 function calls across all evaluated modules
+and `@extends` regions. This limit includes built-ins and calls through an alias.
+The next call fails with `mds::resource_limit`. The limit applies to all output modes.
 
 ### Project Root
 

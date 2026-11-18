@@ -46,6 +46,10 @@ pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
 /// buffer, not a compile's total memory (#420).
 pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 
+/// Maximum total function calls per compile, across all evaluated modules.
+/// Allows sixteen calls per pass in a million-pass loop budget.
+pub(crate) const MAX_TOTAL_FUNCTION_CALLS: usize = 16_000_000;
+
 /// Maximum number of elements that `split()` may produce in a single call.
 ///
 /// Prevents adversarial inputs from producing arrays with hundreds of thousands

@@ -8,14 +8,9 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
-use crate::evaluator::evaluate;
-use crate::evaluator::evaluate_messages_intrinsic;
-use crate::evaluator::evaluate_messages_seeded;
-use crate::evaluator::evaluate_seeded;
-use crate::evaluator::evaluate_with_map;
-use crate::evaluator::evaluate_with_map_seeded;
-use crate::evaluator::push_capped;
-use crate::evaluator::EvalBudget;
+use crate::evaluator::{
+    evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, push_capped, EvalBudget,
+};
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::{
@@ -227,6 +222,7 @@ const MSG_MODE_SOURCE_MAP_WARNING: &str =
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
 /// Supports multiple filesystem backends via the [`FileSystem`] trait.
+#[non_exhaustive]
 pub struct ModuleCache {
     fs: Box<dyn FileSystem>,
     /// Stores resolved modules in first-resolution (depth-first) order.
@@ -246,6 +242,9 @@ pub struct ModuleCache {
     /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
     /// for sub-modules (AC-PERF-01).
     source_map_mode: bool,
+    budget: EvalBudget,
+    #[cfg(test)]
+    function_call_seed: usize,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -272,6 +271,9 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            budget: EvalBudget::default(),
+            #[cfg(test)]
+            function_call_seed: 0,
         }
     }
 
@@ -285,6 +287,9 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            budget: EvalBudget::default(),
+            #[cfg(test)]
+            function_call_seed: 0,
         }
     }
 
@@ -295,6 +300,9 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            budget: EvalBudget::default(),
+            #[cfg(test)]
+            function_call_seed: 0,
         }
     }
 
@@ -325,6 +333,16 @@ impl ModuleCache {
             )));
         }
         Ok(())
+    }
+
+    /// Start a new compile budget only at the root of resolution.
+    fn start_resolution(&mut self, key: &str) {
+        if self.resolving.is_empty() {
+            self.budget = EvalBudget::default();
+            #[cfg(test)]
+            self.budget.seed_function_calls(self.function_call_seed);
+        }
+        self.resolving.insert(key.to_string());
     }
 
     /// Guard against excessively deep import chains.
@@ -527,7 +545,7 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
-        self.resolving.insert(key.to_string());
+        self.start_resolution(key);
 
         let base_dir_owned = self.fs.parent_dir(key);
         let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -638,7 +656,7 @@ impl ModuleCache {
         // root module as well.
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.resolving.insert(SOURCE_LABEL.into());
+        self.start_resolution(SOURCE_LABEL);
 
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -744,7 +762,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(entry, &source)?;
 
-        self.resolving.insert(key.to_string());
+        self.start_resolution(key);
 
         let base_dir_owned = self.fs.parent_dir(key);
         let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -776,7 +794,7 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.resolving.insert(SOURCE_LABEL.into());
+        self.start_resolution(SOURCE_LABEL);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -803,7 +821,7 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.resolving.insert(SOURCE_LABEL.into());
+        self.start_resolution(SOURCE_LABEL);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -835,14 +853,10 @@ impl ModuleCache {
         scope: &mut crate::scope::Scope,
         warnings: &mut Vec<String>,
         map: Option<crate::sourcemap::MapBuilder>,
+        budget: &mut EvalBudget,
     ) -> Result<(String, Option<crate::sourcemap::MapBuilder>), MdsError> {
         let mut output = String::new();
         let mut current_map = map;
-
-        // REL-1 / applies PF-004: single cumulative iteration and message-byte budget
-        // across ALL regions.  A fresh budget per region would give K regions an
-        // independent 1 M budget each — CPU/DoS amplification ∝ region count.
-        let mut budget = EvalBudget::default();
         // The previous region's origin and source index: consecutive regions from one
         // file (every between-block skeleton node) reuse the index without a lookup.
         let mut previous: Option<(&Origin, SourceIndex)> = None;
@@ -867,7 +881,7 @@ impl ModuleCache {
                 // The builder's current source was switched to origin's above;
                 // evaluate_with_map_seeded derives file/source from it (issue #58).
                 let (region_out, returned_builder) =
-                    evaluate_with_map_seeded(nodes, scope, warnings, builder, &mut budget)?;
+                    evaluate_with_map_seeded(nodes, scope, warnings, builder, budget)?;
                 current_map = Some(returned_builder);
                 region_out
             } else {
@@ -877,7 +891,7 @@ impl ModuleCache {
                     warnings,
                     &origin.display,
                     &origin.source,
-                    &mut budget,
+                    budget,
                 )?
             };
 
@@ -903,9 +917,10 @@ impl ModuleCache {
         seed: Option<&Origin>,
         scope: &mut crate::scope::Scope,
         warnings: &mut Vec<String>,
+        budget: &mut EvalBudget,
     ) -> Result<(String, Option<crate::sourcemap::MapBuilder>), MdsError> {
         let builder = seed.map(|origin| crate::sourcemap::MapBuilder::new(origin.clone()));
-        Self::evaluate_regions_with_map(regions, scope, warnings, builder)
+        Self::evaluate_regions_with_map(regions, scope, warnings, builder, budget)
     }
 
     /// Messages-mode twin of [`Self::evaluate_regions_with_map`]: collect the
@@ -921,8 +936,8 @@ impl ModuleCache {
         regions: &[(&[crate::ast::Node], &Origin)],
         scope: &mut crate::scope::Scope,
         warnings: &mut Vec<String>,
+        budget: &mut EvalBudget,
     ) -> Result<Vec<crate::evaluator::EvalMessage>, MdsError> {
-        let mut budget = EvalBudget::default();
         let mut messages = Vec::new();
         for (nodes, origin) in regions {
             evaluate_messages_seeded(
@@ -931,7 +946,7 @@ impl ModuleCache {
                 warnings,
                 &origin.display,
                 &origin.source,
-                &mut budget,
+                budget,
                 &mut messages,
             )?;
         }
@@ -943,8 +958,8 @@ impl ModuleCache {
     ///
     /// Shares setup with `process_module` but dispatches on `has_message_block` at the
     /// end: a body containing any `@message` block evaluates to
-    /// [`crate::CompiledOutput::Messages`] (via `evaluate_messages_intrinsic`), otherwise
-    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate`, then `clean_output` +
+    /// [`crate::CompiledOutput::Messages`] (via `evaluate_messages_seeded`), otherwise
+    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate_seeded`, then `clean_output` +
     /// `prepend_frontmatter`).
     ///
     /// When the parsed module has an `@extends` directive the shared extends pipeline
@@ -970,7 +985,7 @@ impl ModuleCache {
     /// For Markdown output the source map is built by threading a
     /// [`crate::sourcemap::MapBuilder`] through the evaluator:
     ///
-    /// - Standalone path: [`evaluate_with_map`] on `module.body`.
+    /// - Standalone path: [`evaluate_with_map_seeded`] on `module.body`.
     /// - `@extends` path: [`Self::evaluate_extends_regions`] over
     ///   `spliced_regions(skeleton, effective_blocks, skeleton_origin)` so each
     ///   region's segments are attributed to the correct source file.
@@ -1030,7 +1045,12 @@ impl ModuleCache {
                 if opts.source_map {
                     warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
                 }
-                let messages = Self::evaluate_message_regions(&regions, &mut scope, warnings)?;
+                let messages = Self::evaluate_message_regions(
+                    &regions,
+                    &mut scope,
+                    warnings,
+                    self.budget.start_module(),
+                )?;
                 return Ok((
                     crate::CompiledOutput::Messages(
                         messages.into_iter().map(crate::Message::from).collect(),
@@ -1041,8 +1061,13 @@ impl ModuleCache {
 
             // Seed the builder with the skeleton's root file (source maps only).
             let seed = opts.source_map.then_some(&skeleton_origin);
-            let (body_raw, builder) =
-                Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
+            let (body_raw, builder) = Self::evaluate_extends_regions(
+                &regions,
+                seed,
+                &mut scope,
+                warnings,
+                self.budget.start_module(),
+            )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
 
@@ -1089,12 +1114,15 @@ impl ModuleCache {
             if opts.source_map {
                 warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
             }
-            let messages = evaluate_messages_intrinsic(
+            let mut messages = Vec::new();
+            evaluate_messages_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 ctx.file_str,
                 ctx.source,
+                self.budget.start_module(),
+                &mut messages,
             )?;
             return Ok((
                 crate::CompiledOutput::Messages(
@@ -1112,12 +1140,25 @@ impl ModuleCache {
                 display: Arc::from(ctx.file_str),
                 source: Arc::from(ctx.source),
             });
-            let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let (raw, returned) = evaluate_with_map_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                builder,
+                self.budget.start_module(),
+            )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             (raw, apply_map_degradation(returned, opts, warnings))
         } else {
             (
-                evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?,
+                evaluate_seeded(
+                    &module.body,
+                    &mut scope,
+                    warnings,
+                    ctx.file_str,
+                    ctx.source,
+                    self.budget.start_module(),
+                )?,
                 None,
             )
         };
@@ -1241,11 +1282,23 @@ impl ModuleCache {
             let builder = crate::sourcemap::MapBuilder::new(origin.clone());
             // evaluate_with_map derives file/source from the builder's current source
             // (issue #58).
-            let (body_raw, returned) =
-                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let (body_raw, returned) = evaluate_with_map_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                builder,
+                self.budget.start_module(),
+            )?;
             (body_raw, Some(returned))
         } else {
-            let body_raw = evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?;
+            let body_raw = evaluate_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                ctx.file_str,
+                ctx.source,
+                self.budget.start_module(),
+            )?;
             (body_raw, None)
         };
         let (prompt_body, prompt_map) =
@@ -1560,8 +1613,13 @@ impl ModuleCache {
         let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
         let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
         let seed = (self.source_map_mode && prompt_exported).then_some(&skeleton_origin);
-        let (body_raw, builder) =
-            Self::evaluate_extends_regions(&regions, seed, &mut scope, warnings)?;
+        let (body_raw, builder) = Self::evaluate_extends_regions(
+            &regions,
+            seed,
+            &mut scope,
+            warnings,
+            self.budget.start_module(),
+        )?;
         let (prompt_body, prompt_map) =
             prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
@@ -1628,7 +1686,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
-        self.resolving.insert(key.to_string());
+        self.start_resolution(key);
 
         let base_dir_owned = self.fs.parent_dir(key);
         let display_owned = crate::source_path::display_path_for(&*self.fs, key);

@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A compile that exceeds 16,000,000 function calls now fails with `mds::resource_limit`. The limit covers all evaluated modules and output modes.
 - **BREAKING: A module with more than 256 `@define` declarations now fails with `mds::resource_limit`.** The message is `resource limit exceeded: module has more than 256 @define declarations`.
 - A directory build, watch, check, lint or fmt now reads only the files it found in the project.
 - On a rebuild, `mds watch` reports a path lookup error and keeps the session active.

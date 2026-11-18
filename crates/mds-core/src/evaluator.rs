@@ -9,7 +9,7 @@ use crate::ast::{
 use crate::error::MdsError;
 use crate::limits::{
     MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGES_TOTAL_SIZE, MAX_MESSAGE_COUNT,
-    MAX_OUTPUT_SIZE,
+    MAX_OUTPUT_SIZE, MAX_TOTAL_FUNCTION_CALLS,
 };
 use crate::scope::{FunctionDef, PathStep, Scope, Slot};
 use crate::value::Value;
@@ -20,21 +20,17 @@ const MAX_CALL_DEPTH: usize = 128;
 /// Maximum number of iterations allowed in a single @for loop.
 const MAX_LOOP_ITERATIONS: usize = 100_000;
 
-/// Maximum total iterations across all loops in a single compilation.
+/// Maximum total iterations across all loops in a single module evaluation.
 /// This prevents nested loops from multiplying iterations into the billions.
 const MAX_TOTAL_ITERATIONS: usize = 1_000_000;
 
 /// Maximum number of accumulated warnings before further warnings are silently dropped.
 const MAX_WARNINGS: usize = 1_000;
 
-/// Cumulative resource budgets spent by one module evaluation.
+/// Cumulative resource budgets for evaluation.
 ///
-/// A module body is usually evaluated in one call, but an `@extends` chain is
-/// evaluated one spliced region at a time. The seeded entry points
-/// ([`evaluate_seeded`], [`evaluate_with_map_seeded`], [`evaluate_messages_seeded`])
-/// take the budget by `&mut`, so every region spends from the same totals: a budget
-/// seeded afresh per region would multiply each cap by the region count (applies
-/// PF-004).
+/// Each module starts a new loop and message budget. All regions of a module share
+/// those budgets. All modules and regions in a compile share the function call budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct EvalBudget {
     /// Loop iterations across all `@for` loops (capped at `MAX_TOTAL_ITERATIONS`).
@@ -43,6 +39,30 @@ pub(crate) struct EvalBudget {
     /// `MAX_MESSAGES_TOTAL_SIZE`). Checked as each message is collected, so runaway
     /// growth is caught before a giant `Vec` is built.
     message_bytes: usize,
+    function_calls: usize,
+}
+
+impl EvalBudget {
+    pub(crate) fn start_module(&mut self) -> &mut Self {
+        self.iterations = 0;
+        self.message_bytes = 0;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_function_calls(&mut self, spent: usize) {
+        self.function_calls = spent;
+    }
+
+    fn charge_function_call(&mut self) -> Result<(), MdsError> {
+        if self.function_calls >= MAX_TOTAL_FUNCTION_CALLS {
+            return Err(MdsError::resource_limit(format!(
+                "compile exceeds {MAX_TOTAL_FUNCTION_CALLS} function calls"
+            )));
+        }
+        self.function_calls += 1;
+        Ok(())
+    }
 }
 
 /// Transient state threaded through the evaluator for a single compilation.
@@ -105,6 +125,7 @@ pub(crate) struct EvalContext<'a> {
 /// evaluated; they are threaded into `EvalContext` so that diagnostics raised
 /// during condition evaluation (e.g. `mds::type_mismatch`) can carry source spans.
 /// Pass `""` for both when no source context is available (e.g. in unit tests).
+#[cfg(test)]
 pub fn evaluate(
     nodes: &[Node],
     scope: &mut Scope,
@@ -122,7 +143,7 @@ pub fn evaluate(
     )
 }
 
-/// Like [`evaluate`], but spends from the caller's `budget` instead of a fresh one.
+/// Evaluate a module body with the caller's cumulative budget.
 ///
 /// Used to evaluate several node slices that make up ONE module (the spliced regions
 /// of an `@extends` chain) under one set of caps. `budget` holds the running totals
@@ -164,7 +185,8 @@ pub(crate) fn evaluate_seeded(
 /// Delegates to [`evaluate_with_map_seeded`] with a fresh [`EvalBudget`].
 /// Use [`evaluate_with_map_seeded`] directly when you need to carry cumulative
 /// resource budgets across multiple invocations (e.g. `@extends` regions).
-pub(crate) fn evaluate_with_map(
+#[cfg(test)]
+fn evaluate_with_map(
     nodes: &[Node],
     scope: &mut Scope,
     warnings: &mut Vec<String>,
@@ -175,9 +197,8 @@ pub(crate) fn evaluate_with_map(
 
 /// Evaluate nodes with source-map recording, spending from the caller's `budget`.
 ///
-/// Like [`evaluate_with_map`], but continues cumulative budgets from prior work
-/// (e.g. earlier `@extends` regions); `budget` holds the running totals when this
-/// returns, on success and on error alike.
+/// The budget includes prior work, such as earlier `@extends` regions.
+/// It holds the running totals on success and on error alike.
 ///
 /// `file` and `source` for `EvalContext` diagnostic spans are derived from the
 /// builder's current source — the single source of truth.  Callers must switch
@@ -647,6 +668,7 @@ fn invoke_function(
         )));
     }
     check_function_arity(func, call_key, args.len())?;
+    ctx.budget.charge_function_call()?;
     scope.push_call(func);
     let result = evaluate_function_body(func, call_key, args, scope, ctx);
     prefer_first_error(result, scope.pop())
@@ -852,6 +874,7 @@ fn call_function(
             .into_iter()
             .map(|slot| slot.into_value().ok_or_else(invalid_projection))
             .collect::<Result<Vec<_>, _>>()?;
+        ctx.budget.charge_function_call()?;
         return (meta.handler)(&values).map(Slot::from);
     }
     // An argument error still takes priority when the callee does not exist.
@@ -1253,31 +1276,9 @@ pub struct EvalMessage {
 /// span: when orphan content is found, the offending node's byte offset (already
 /// captured by the parser on every `TextNode`/`Interpolation`) is paired with
 /// `source` so the error underlines the prose (origin rides along the data, not a
-/// path→source lookup). Every node's offsets must therefore index into `source`: an
-/// `@extends` chain, whose regions come from different files, is collected region by
-/// region through [`evaluate_messages_seeded`] instead.
-pub fn evaluate_messages_intrinsic(
-    nodes: &[Node],
-    scope: &mut Scope,
-    warnings: &mut Vec<String>,
-    file: &str,
-    source: &str,
-) -> Result<Vec<EvalMessage>, MdsError> {
-    let mut messages = Vec::new();
-    evaluate_messages_seeded(
-        nodes,
-        scope,
-        warnings,
-        file,
-        source,
-        &mut EvalBudget::default(),
-        &mut messages,
-    )?;
-    Ok(messages)
-}
-
-/// Like [`evaluate_messages_intrinsic`], but appends to the caller's `out` and spends
-/// from the caller's `budget` instead of fresh ones.
+/// path→source lookup). Every node's offsets must therefore index into `source`.
+///
+/// Append to the caller's `out` and spend from the caller's `budget`.
 ///
 /// Used to collect several node slices that make up ONE module (the spliced regions
 /// of an `@extends` chain) under one set of caps. Sharing `out` shares the
@@ -2302,7 +2303,7 @@ mod tests {
         let src = "@for i in items:\n{{x}}\n@end\n";
         let seeded = |left: usize| EvalBudget {
             iterations: MAX_TOTAL_ITERATIONS - left,
-            message_bytes: 0,
+            ..EvalBudget::default()
         };
 
         let (result, budget) = eval_capped(src, seeded(CAP_CROSSING_PASS));
@@ -3491,7 +3492,8 @@ mod tests {
             budget,
             EvalBudget {
                 iterations: 1,
-                message_bytes: 2
+                message_bytes: 2,
+                ..EvalBudget::default()
             }
         );
 

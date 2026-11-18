@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::ast::{DefineBlock, Param};
@@ -542,14 +542,16 @@ impl Scope {
 
     /// Look up a function by walking the scope chain.
     pub fn get_function(&self, name: &str) -> Option<&Arc<FunctionDef>> {
-        self.frames.iter().rev().find_map(|frame| {
-            frame.functions.get(name).or_else(|| {
-                frame
-                    .capture()?
-                    .links()
-                    .find_map(|link| link.functions.get(name))
-            })
-        })
+        self.find_binding(
+            |frame| frame.functions.get(name),
+            |link| {
+                #[cfg(test)]
+                if name == "upper" {
+                    tests::note_builtin_probe();
+                }
+                link.functions.get(name)
+            },
+        )
     }
 
     /// Register a namespace (for aliased imports).
@@ -568,18 +570,50 @@ impl Scope {
 
     /// Look up a namespace by alias.
     pub fn get_namespace(&self, alias: &str) -> Option<&NamespaceScope> {
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|frame| {
-                frame.namespaces.get(alias).or_else(|| {
-                    frame
-                        .capture()?
-                        .links()
-                        .find_map(|link| link.namespaces.get(alias))
-                })
-            })
-            .map(Arc::as_ref)
+        self.find_binding(
+            |frame| frame.namespaces.get(alias),
+            |link| link.namespaces.get(alias),
+        )
+        .map(Arc::as_ref)
+    }
+
+    fn find_binding<'a, T>(
+        &'a self,
+        in_frame: impl Fn(&'a Frame) -> Option<&'a T>,
+        in_link: impl Fn(&'a CaptureLink) -> Option<&'a T>,
+    ) -> Option<&'a T> {
+        // The first link at each depth fits in a fixed table. Other chains can
+        // have different links at the same depth, so compare by identity.
+        let mut first = [std::ptr::null::<CaptureLink>(); MAX_DEFINES_PER_MODULE + 1];
+        let mut other = HashSet::new();
+        for frame in self.frames.iter().rev() {
+            if let Some(found) = in_frame(frame) {
+                return Some(found);
+            }
+            if let Some(capture) = frame.capture() {
+                for link in capture.links() {
+                    let ptr = std::ptr::from_ref(link);
+                    let fresh = match first.get_mut(link.depth) {
+                        Some(slot) if slot.is_null() => {
+                            *slot = ptr;
+                            true
+                        }
+                        Some(slot) if *slot == ptr => false,
+                        _ => other.insert(ptr),
+                    };
+                    // A previous miss at this link also covered its older suffix.
+                    if !fresh {
+                        break;
+                    }
+                    #[cfg(test)]
+                    tests::note_capture_probe();
+                    if let Some(found) = in_link(link) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Freeze the frame-zero writes since the last capture.
@@ -629,6 +663,76 @@ impl Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CAPTURE_PROBES: Cell<usize> = const { Cell::new(0) };
+        static BUILTIN_PROBES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_capture_probe() {
+        CAPTURE_PROBES.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn note_builtin_probe() {
+        BUILTIN_PROBES.with(|count| count.set(count.get() + 1));
+    }
+
+    #[test]
+    fn capture_lookup_builtin_miss_probes_only_distinct_links() {
+        use std::fmt::Write;
+
+        const CALL_DEPTH: usize = 120;
+        const DEFINES: usize = 240;
+        let mut source = String::new();
+        for i in 0..(DEFINES - CALL_DEPTH) {
+            writeln!(source, "@define unused{i}():\n@end").unwrap();
+        }
+        source.push_str("@define first():\n{{upper(\"a\")}}\n@end\n");
+        for i in 1..CALL_DEPTH {
+            let previous = if i == 1 {
+                "first".into()
+            } else {
+                format!("f{}", i - 1)
+            };
+            writeln!(source, "@define f{i}():\n{{{{{previous}()}}}}\n@end").unwrap();
+        }
+        writeln!(source, "{{{{f{}()}}}}", CALL_DEPTH - 1).unwrap();
+
+        BUILTIN_PROBES.set(0);
+        let result = crate::compile_str(&source).unwrap();
+        let probes = BUILTIN_PROBES.replace(0);
+        let crate::CompiledOutput::Markdown(text) = result.output else {
+            panic!("expected Markdown output");
+        };
+        assert_eq!(text.trim(), "A");
+        assert_eq!(probes, DEFINES - 1);
+    }
+
+    #[test]
+    fn capture_lookup_probes_each_distinct_link_once() {
+        let mut left = Scope::new();
+        define(&mut left, "common");
+        left.capture().unwrap();
+        let mut right = left.clone();
+        define(&mut left, "left");
+        let left_call = define(&mut left, "left_call");
+        let right_fn = define(&mut right, "right");
+        let right_call = define(&mut right, "right_call");
+
+        let mut call = Scope::new();
+        call.push_call(&left_call);
+        call.push_call(&right_call);
+        call.push_call(&left_call);
+
+        CAPTURE_PROBES.set(0);
+        assert!(call.get_function("missing").is_none());
+        let function_probes = CAPTURE_PROBES.replace(0);
+        assert!(call.get_namespace("missing").is_none());
+        let namespace_probes = CAPTURE_PROBES.replace(0);
+        assert_eq!((function_probes, namespace_probes), (3, 3));
+        assert!(Arc::ptr_eq(call.get_function("right").unwrap(), &right_fn));
+    }
 
     #[test]
     fn scope_var_shadowing() {
