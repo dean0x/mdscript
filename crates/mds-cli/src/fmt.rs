@@ -38,7 +38,7 @@ use miette::Result;
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::{
     catch_compile, collect_mds_files_detailed, render_unified_diff, safe_path, stdout_failure,
-    write_stdout, Panicked, RootPaths, StdoutOutcome, WriteTarget,
+    walked_pin, write_stdout, Panicked, RootPaths, StdoutOutcome, WriteTarget,
 };
 use crate::write::{
     read_stamped, replace_if_unchanged, replace_owing_sync, DirectorySyncs, Durability, Renamed,
@@ -83,8 +83,9 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
     if input.is_dir() {
         // #413: the one directory-argument check every directory-mode subcommand makes
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
-        crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
-        return run_fmt_directory(&input, flags);
+        let canonical =
+            crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
+        return run_fmt_directory(&input, &canonical, flags);
     }
 
     ensure_existing_mds_file(&input).map_err(miette::Error::from)?;
@@ -98,8 +99,8 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
 /// can't go through `mds::compile*`. It shares `mds lint`'s reader, so the two
 /// subcommands report an unreadable, symlinked or undecodable path identically —
 /// as an `MdsError`, which `exit_code` maps to exit 2 (#217).
-fn read_source_file(path: &Path) -> Result<String> {
-    crate::lint::read_source_file(path).map_err(miette::Error::from)
+fn read_source_file(path: &Path, pin: Option<mds::EntryPin>) -> Result<String> {
+    crate::lint::read_source_file(path, pin).map_err(miette::Error::from)
 }
 
 /// The result of formatting one file's content: whether it changed, and the
@@ -159,7 +160,7 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
 
 fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let FmtFlags { check, diff, quiet } = flags;
-    let source = read_source_file(path)?;
+    let source = read_source_file(path, None)?;
     // effective_parent maps "" (bare filename) to "." so that resolve_base_dir
     // (called by format_str_named → assert_equivalent) receives a canonicalisable
     // path and does not silently fall through to the structural_equivalent fallback
@@ -254,10 +255,10 @@ enum FileOutcome {
 /// error frames and of its `--diff` header, as a file argument typed that way is named
 /// (#390). Its rewrite is anchored at `root`, the directory argument, so a directory
 /// between the two that turned into a symlink after the walk is refused (#160).
-fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
+fn format_one_file(root: &Path, file: &Path, pin: mds::EntryPin, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, .. } = flags;
     let file_name = safe_path(file);
-    let source = match read_source_file(file) {
+    let source = match read_source_file(file, Some(pin)) {
         Ok(s) => s,
         Err(e) => {
             // File path is embedded in the miette report; sanitize for ESC injection safety
@@ -333,7 +334,7 @@ fn format_one_file(root: &Path, file: &Path, flags: FmtFlags) -> FileOutcome {
 /// Continue-on-error: a per-file failure does not abort the run. Non-zero
 /// exit when any file failed, or (under `--check`) when any file would change; 2 when an
 /// I/O or file-system failure was recorded (#157).
-fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
+fn run_fmt_directory(dir: &Path, canonical_dir: &Path, flags: FmtFlags) -> Result<()> {
     // Directory recursion depth cap, matching `run_build_directory` /
     // `run_check_directory` which also declare MAX_DEPTH as a function-local
     // constant.
@@ -345,7 +346,7 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     let _ = load_config(dir)?;
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
-    let files = walk.files;
+    let files = &walk.files;
 
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
@@ -376,7 +377,8 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     // in it, and only then are its rewrites' `Formatted:` lines shown (#160).
     let mut syncs = DirectorySyncs::new(files.iter().map(PathBuf::as_path));
     for (place, file) in files.iter().enumerate() {
-        let landed = match format_one_file(dir, file, flags) {
+        let pin = walked_pin(&walk, file, dir, canonical_dir);
+        let landed = match format_one_file(dir, file, pin, flags) {
             FileOutcome::Formatted(renamed) => {
                 changed_count += 1;
                 syncs.landed(place, renamed, file.as_path())
@@ -540,7 +542,7 @@ mod tests {
 
         unformatted();
         let before = directory_syncs();
-        run_fmt_directory(&src, flags).unwrap();
+        run_fmt_directory(&src, &src, flags).unwrap();
         assert_eq!(
             directory_syncs() - before,
             2,

@@ -88,7 +88,7 @@ use crate::build::{
 use crate::lint_sink::{HumanSink, JsonSink, ResultSink};
 use crate::output::{
     catch_compile, collect_mds_files_detailed, eprint_warning, render_unified_diff, safe_inline,
-    safe_path, Panicked, RootPaths, WriteTarget, STDIN_DISPLAY_LABEL,
+    safe_path, walked_pin, Panicked, RootPaths, WalkResult, WriteTarget, STDIN_DISPLAY_LABEL,
 };
 use crate::write::{
     read_stamped, replace_if_unchanged, replace_owing_sync, DirectorySyncs, Durability, Flushed,
@@ -329,7 +329,7 @@ fn do_lint(args: LintArgs, sink: &mut impl ResultSink) -> Result<i32> {
         // (a symlink, the filesystem root, a forbidden character — all `mds::io`). A
         // refusal is an analysis failure: the JSON envelope in --format json mode, exit 2.
         return Ok(match crate::input::resolve_directory_argument(&input) {
-            Ok(_) => run_lint_directory(&input, flags, runtime_vars, sink),
+            Ok(canonical) => run_lint_directory(&input, &canonical, flags, runtime_vars, sink),
             Err(mds_err) => {
                 sink.analysis_failed(&mds_err, None);
                 2
@@ -519,10 +519,13 @@ fn relative_display(path: &Path, root: &Path) -> std::result::Result<String, Mds
 /// Shared by `mds lint` and `mds fmt`, which both need the RAW source text rather
 /// than a compiled result. Returns `MdsError` (not `miette::Error`) so callers can
 /// show the error as an analysis failure — the JSON envelope under `--format json` —
-/// without downcasting.
-pub(crate) fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
+/// without downcasting. A directory entry carries its walk pin through the read.
+pub(crate) fn read_source_file(
+    path: &Path,
+    pin: Option<mds::EntryPin>,
+) -> std::result::Result<String, MdsError> {
     let canonical = NativeFs::check_symlink(path)?;
-    read_canonical_source(&canonical, path)
+    read_canonical_source(&canonical, path, pin)
 }
 
 /// Read the already symlink-checked `canonical` path of `path` through `NativeFs`.
@@ -531,11 +534,18 @@ pub(crate) fn read_source_file(path: &Path) -> std::result::Result<String, MdsEr
 /// directory) is anchored BEFORE `read()`, so read-error messages show a
 /// project-root-relative path instead of the bare basename. A failure to anchor
 /// it is reported, not swallowed (PF-004) — `mds::io`, exit 2.
-fn read_canonical_source(canonical: &Path, path: &Path) -> std::result::Result<String, MdsError> {
+fn read_canonical_source(
+    canonical: &Path,
+    path: &Path,
+    pin: Option<mds::EntryPin>,
+) -> std::result::Result<String, MdsError> {
     let path_str = canonical.to_str().ok_or_else(|| MdsError::Io {
         message: format!("path is not valid UTF-8: {}", safe_path(path)),
     })?;
-    let fs = NativeFs::new();
+    let fs = match pin {
+        Some(pin) => NativeFs::new().with_entry_pin(pin),
+        None => NativeFs::new(),
+    };
     fs.anchor_base_dir(&effective_parent(canonical).display().to_string())?;
     let key = fs.resolve_entry(path_str)?;
     fs.read(&key)
@@ -795,9 +805,9 @@ struct Linted<'a> {
 /// An input's source text, or the file to read it from once it is needed.
 enum SourceText<'a> {
     Read(String),
-    /// An entry of a directory under `--format json`. `mds::lint` reads the file itself,
-    /// so the text is read only to fix it (see [`lint_input`]).
-    Unread(&'a Path),
+    /// An entry of a directory under `--format json`. The core linter reads the file,
+    /// so the CLI reads it only to fix it, with the same walk pin (see [`lint_input`]).
+    Unread(&'a Path, Option<mds::EntryPin>),
 }
 
 impl SourceText<'_> {
@@ -805,7 +815,7 @@ impl SourceText<'_> {
     fn into_text(self) -> Option<String> {
         match self {
             Self::Read(text) => Some(text),
-            Self::Unread(_) => None,
+            Self::Unread(_, _) => None,
         }
     }
 
@@ -813,7 +823,7 @@ impl SourceText<'_> {
     fn read(self) -> std::result::Result<String, MdsError> {
         match self {
             Self::Read(text) => Ok(text),
-            Self::Unread(path) => read_source_file(path),
+            Self::Unread(path, pin) => read_source_file(path, pin),
         }
     }
 }
@@ -1619,7 +1629,7 @@ fn run_lint_file(
         }
     };
     // File read failure (not found, symlink, I/O) → the JSON envelope in --format json mode.
-    let source = match read_source_file(path) {
+    let source = match read_source_file(path, None) {
         Ok(s) => s,
         Err(e) => return analysis_failed(sink, &e, None),
     };
@@ -1817,6 +1827,7 @@ impl<'a> LintDirCtx<'a> {
 /// before the JSON envelope and is incompatible with JSON-consumer pipelines.
 fn run_lint_directory(
     dir: &Path,
+    canonical_dir: &Path,
     flags: LintFlags,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     sink: &mut impl ResultSink,
@@ -1838,7 +1849,7 @@ fn run_lint_directory(
         sink.nothing_to_lint(dir, &walk);
         return 2;
     }
-    let files = walk.files;
+    let files = &walk.files;
 
     // #217: compute every display key BEFORE the sort, so a path that cannot be
     // named relative to `dir` fails the whole run instead of contributing a lossy
@@ -1849,9 +1860,9 @@ fn run_lint_directory(
     //     carry a key that names no file under `dir`.
     // The failure is shown as an analysis failure, so `--format json` consumers get the
     // JSON envelope they parse.  Same shape as the directory-argument refusal in `do_lint`.
-    let mut keyed: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
+    let mut keyed: Vec<(&PathBuf, String)> = Vec::with_capacity(files.len());
     for p in files {
-        match relative_display(&p, dir) {
+        match relative_display(p, dir) {
             Ok(display) => keyed.push((p, display)),
             Err(e) => return analysis_failed(sink, &e, None),
         }
@@ -1909,7 +1920,10 @@ fn run_lint_directory(
         .iter()
         .enumerate()
         .map(|(place, (path, key))| {
-            let Shown { verdict, owed } = render(lint_dir_entry(dir, path, key, &ctx), sink);
+            let Shown { verdict, owed } = render(
+                lint_dir_entry(dir, path, key, &walk, canonical_dir, &ctx),
+                sink,
+            );
             if let Some(OwedFix { renamed, partial }) = owed {
                 let fixed = FixedEntry {
                     entry: LintSource::DirEntry {
@@ -1973,6 +1987,8 @@ fn lint_dir_entry<'a>(
     root: &'a Path,
     path: &'a Path,
     key: &'a str,
+    walk: &WalkResult,
+    canonical_dir: &Path,
     ctx: &LintDirCtx<'_>,
 ) -> FileReport<'a> {
     let entry = move || LintSource::DirEntry { root, path, key };
@@ -1991,10 +2007,11 @@ fn lint_dir_entry<'a>(
         Err(e) => return failed(e, FileTally::Error),
     };
 
+    let pin = || walked_pin(walk, path, root, canonical_dir);
     let source = if ctx.flags.format == LintFormat::Json {
-        SourceText::Unread(path)
+        SourceText::Unread(path, Some(pin()))
     } else {
-        match read_source_file(path) {
+        match read_source_file(path, Some(pin())) {
             Ok(text) => SourceText::Read(text),
             Err(e) => {
                 let tally = failure_tally(&e);
@@ -2004,9 +2021,10 @@ fn lint_dir_entry<'a>(
     };
     // A panic in the analysis fails this entry alone, and the rest of the tree goes on
     // (#389).
+    let fs = NativeFs::new().with_entry_pin(pin());
     let linted = catch_compile(
         path,
-        AssertUnwindSafe(|| mds::lint(path, ctx.runtime_vars.clone(), &config)),
+        AssertUnwindSafe(|| mds::lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config)),
     );
     let result = match linted {
         Ok(Ok(result)) => result,
@@ -2581,7 +2599,7 @@ mod tests {
                 },
                 base_dir: &root,
                 config: Rc::clone(&config),
-                source: SourceText::Unread(path),
+                source: SourceText::Unread(path, None),
                 result: LintResult::new(vec![]).truncated(),
             };
             let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
@@ -2607,7 +2625,7 @@ mod tests {
         );
 
         let missing = root.join("gone.mds");
-        let expected = super::read_source_file(&missing)
+        let expected = super::read_source_file(&missing, None)
             .expect_err("precondition: the file must not read")
             .serialize();
         let (verdict, document) = fix(&missing, "gone.mds");
@@ -2652,7 +2670,7 @@ mod tests {
                 },
                 base_dir: &root,
                 config: Rc::clone(&config),
-                source: SourceText::Unread(&path),
+                source: SourceText::Unread(&path, None),
                 result: LintResult::new(vec![]),
             };
             let mut sink = JsonSink::new(DIR_JSON_FIX.quiet);
@@ -2882,7 +2900,7 @@ mod tests {
                 },
                 base_dir: &root,
                 config: Rc::clone(&config),
-                source: SourceText::Unread(path),
+                source: SourceText::Unread(path, None),
                 result,
             };
             let mut sink = Recorder::default();
@@ -2893,7 +2911,8 @@ mod tests {
 
         let missing = root.join("gone.mds");
         let read_failure = code_of(
-            &super::read_source_file(&missing).expect_err("precondition: the file must not read"),
+            &super::read_source_file(&missing, None)
+                .expect_err("precondition: the file must not read"),
         );
         assert_eq!(
             calls(&missing, "gone.mds", LintResult::new(vec![]).truncated()),
@@ -3189,7 +3208,7 @@ mod tests {
             }
             let mut sink = Recorder::default();
             let before = directory_syncs();
-            let code = super::run_lint_directory(&src, DIR_JSON_FIX, None, &mut sink);
+            let code = super::run_lint_directory(&src, &src, DIR_JSON_FIX, None, &mut sink);
             for file in &files {
                 assert_eq!(
                     std::fs::read_to_string(file).unwrap(),
@@ -3640,7 +3659,7 @@ mod tests {
             let walked = relative_display(&hostile, root)
                 .expect_err("a non-UTF-8 entry name must not produce a display key")
                 .to_string();
-            let read = read_canonical_source(&hostile, &hostile)
+            let read = read_canonical_source(&hostile, &hostile, None)
                 .expect_err("a non-UTF-8 path must not be read")
                 .to_string();
             for message in [walked, read] {
@@ -3934,7 +3953,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let missing = root.join("gone").join("x.mds");
 
-        let err = super::read_canonical_source(&missing, &missing).unwrap_err();
+        let err = super::read_canonical_source(&missing, &missing, None).unwrap_err();
         assert!(
             matches!(err, mds::MdsError::Io { .. }),
             "expected mds::io, got {err:?}"
@@ -3949,7 +3968,7 @@ mod tests {
         let file = root.join("ok.mds");
         std::fs::write(&file, "Hello!\n").unwrap();
         assert_eq!(
-            super::read_canonical_source(&file, &file).unwrap(),
+            super::read_canonical_source(&file, &file, None).unwrap(),
             "Hello!\n"
         );
     }

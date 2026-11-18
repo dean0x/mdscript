@@ -833,9 +833,7 @@ fn rewrite_with_sub_swapped(
     (dir, code, stderr)
 }
 
-/// What a rewrite with `src/sub` swapped for a link must come to: refused by the path the
-/// user knows the link by, nothing written through it, and nothing written into the
-/// directory it replaced either.
+/// A changed source is refused before its rewrite. Both files keep their original bytes.
 ///
 /// Unix-only: so are the tests that call it.
 #[cfg(unix)]
@@ -848,8 +846,10 @@ fn assert_refused_after_the_swap(dir: &Path, code: Option<i32>, stderr: &str, fi
     assert_eq!(code, Some(2), "stderr: {stderr}");
     assert!(
         stderr.contains("mds::io")
-            && squash(stderr).contains(&squash(&refused("src/sub/b.mds", "src/sub"))),
-        "the refusal names the file and the link as typed; stderr: {stderr}"
+            && squash(stderr).contains(&squash(
+                "cannot read b.mds: the file changed while it was opened",
+            )),
+        "the reader refuses the changed source; stderr: {stderr}"
     );
     assert_eq!(
         read(&dir.join("src/sub.moved/b.mds")),

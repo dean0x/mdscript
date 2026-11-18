@@ -2035,8 +2035,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "lint.rs",
-                "mds::lint(path, ctx.runtime_vars.clone(), &config)",
-                "mds::lint(path, ctx.base_dir_cache.borrow_mut().remove(path), &config)",
+                "mds::lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config)",
+                "mds::lint_native_fs(fs, path, ctx.base_dir_cache.borrow_mut().remove(path), &config)",
             ),
             "changes state",
             "an argument that changes state",
@@ -2090,8 +2090,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "lint.rs",
-                "AssertUnwindSafe(|| mds::lint(path, ctx.runtime_vars.clone(), &config))",
-                "AssertUnwindSafe(|| lint(path, ctx.runtime_vars.clone(), &config))",
+                "AssertUnwindSafe(|| mds::lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config))",
+                "AssertUnwindSafe(|| lint_native_fs(fs, path, ctx.runtime_vars.clone(), &config))",
             ),
             "not a compile",
             "a helper named like the compile in its place",
@@ -2572,7 +2572,7 @@ const COMPILE_CALLS: &[(&str, Option<&str>)] = &[
     ("compile_native_to_content", Some("build.rs")),
     ("mds::check_native_fs", None),
     ("format_source_named", Some("fmt.rs")),
-    ("mds::lint", None),
+    ("mds::lint_native_fs", None),
     ("run_fix_pipeline", Some("lint.rs")),
 ];
 
