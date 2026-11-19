@@ -6722,37 +6722,47 @@ mod tests {
                 .collect();
             assert!(
                 names.iter().any(|n| n == "main.mds") && !names.iter().any(|n| n == "Main.mds"),
-                "the rename must change the stored name, or the event below names the \
-                 old spelling and never reaches the case-only path: {names:?}"
-            );
-            eprintln!(
-                "arm: case-insensitive volume; the old spelling now resolves to {}",
-                watched_path.canonicalize().unwrap().display()
+                "arm: case-insensitive volume. The rename must change the stored name, or \
+                 the event below names the old spelling and never reaches the case-only \
+                 path: {names:?}"
             );
             assert!(
                 event_is_relevant(&event(&other_case), &watched),
-                "an event for the new spelling must match the watched old spelling"
+                "arm: case-insensitive volume. An event for the new spelling must match the \
+                 watched old spelling"
             );
         } else {
-            eprintln!("arm: case-sensitive volume");
             std::fs::write(&other_case, "another file").unwrap();
             assert_eq!(
                 std::fs::read_to_string(&watched_path).unwrap(),
                 "watched",
-                "Main.mds and main.mds must be two files on this volume"
+                "arm: case-sensitive volume. Main.mds and main.mds must be two files on this \
+                 volume"
             );
             assert!(
                 !event_is_relevant(&event(&other_case), &watched),
-                "an event for another file whose name differs only in case must not match"
+                "arm: case-sensitive volume. An event for another file whose name differs \
+                 only in case must not match"
             );
             assert!(
                 event_is_relevant(&event(&watched_path), &watched),
-                "an event for the watched file must match"
+                "arm: case-sensitive volume. An event for the watched file must match"
             );
         }
         // Both arms: another file and the output beside the watched file never match.
-        assert!(!event_is_relevant(&event(&unrelated), &watched));
-        assert!(!event_is_relevant(&event(&output), &watched));
+        let arm = if case_insensitive {
+            "case-insensitive"
+        } else {
+            "case-sensitive"
+        };
+        assert!(
+            !event_is_relevant(&event(&unrelated), &watched),
+            "arm: {arm} volume. An event for an unrelated file must not match"
+        );
+        assert!(
+            !event_is_relevant(&event(&output), &watched),
+            "arm: {arm} volume. An event for the output beside the watched file must not match"
+        );
     }
 
     // T-U4: collect_mds_files recurses and is depth-bounded.
