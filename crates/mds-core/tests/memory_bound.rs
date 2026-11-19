@@ -13,9 +13,10 @@ const SLACK: usize = 8 * MIB;
 /// Live heap bytes, and the high-water mark since `peak_growth` last reset it.
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static LARGEST_REQUEST: AtomicUsize = AtomicUsize::new(0);
 
-/// The system allocator, counting live bytes. A `realloc` counts as its net change
-/// (`new - old`), not as a fresh allocation plus a free.
+/// The system allocator. A `realloc` counts its net change toward the peak
+/// and its full new size as a request.
 struct Counting;
 
 fn grow(bytes: usize) {
@@ -34,6 +35,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: forwarded unchanged; the caller upholds `alloc`'s contract.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
+            LARGEST_REQUEST.fetch_max(layout.size(), Ordering::SeqCst);
             grow(layout.size());
         }
         ptr
@@ -43,6 +45,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: forwarded unchanged; the caller upholds `alloc_zeroed`'s contract.
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
+            LARGEST_REQUEST.fetch_max(layout.size(), Ordering::SeqCst);
             grow(layout.size());
         }
         ptr
@@ -58,6 +61,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: forwarded unchanged; the caller upholds `realloc`'s contract.
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
+            LARGEST_REQUEST.fetch_max(new_size, Ordering::SeqCst);
             if new_size >= layout.size() {
                 grow(new_size - layout.size());
             } else {
@@ -204,6 +208,35 @@ fn assert_over_cap_upper_does_not_build_its_result() {
         .ends_with("upper() output exceeds maximum size of 52428800 bytes"));
 }
 
+fn assert_over_cap_lower_with_sigma_does_not_build_its_result() {
+    let cap = 50 * MIB;
+    // Each İ maps to three bytes. Σa adds three more bytes for cap + 1.
+    let mut payload = "İ".repeat(cap / 3);
+    payload.push_str("Σa");
+    LARGEST_REQUEST.store(0, Ordering::SeqCst);
+    let eager = payload.to_lowercase();
+    let eager_request = LARGEST_REQUEST.load(Ordering::SeqCst);
+    assert_eq!(eager.len(), cap + 1);
+    assert!(
+        eager_request > cap,
+        "eager lower control: {eager_request} B"
+    );
+    drop(eager);
+
+    let vars = HashMap::from([("payload".to_owned(), Value::String(payload))]);
+    LARGEST_REQUEST.store(0, Ordering::SeqCst);
+    let result = mds::compile_str_with("{{lower(payload)}}", None, Some(vars));
+    let request = LARGEST_REQUEST.load(Ordering::SeqCst);
+    eprintln!("over-cap lower largest request: {request} B; eager control: {eager_request} B");
+    assert!(request < cap, "over-cap lower requested {request} B");
+    let error = result.expect_err("lower output cap error").serialize();
+    assert_eq!(error.code, "mds::builtin");
+    assert_eq!(
+        error.message,
+        "lower() output exceeds maximum size of 52428800 bytes"
+    );
+}
+
 #[test]
 fn nested_if_output_does_not_raise_the_peak_heap() {
     let source = include_str!("memory_bound.rs");
@@ -246,4 +279,5 @@ fn nested_if_output_does_not_raise_the_peak_heap() {
     assert_small_messages_do_not_keep_padding();
     assert_mapped_output_peak();
     assert_over_cap_upper_does_not_build_its_result();
+    assert_over_cap_lower_with_sigma_does_not_build_its_result();
 }

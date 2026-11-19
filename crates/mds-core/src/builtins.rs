@@ -226,17 +226,21 @@ fn builtin_upper(args: &[Value]) -> Result<Value, MdsError> {
 
 fn builtin_lower(args: &[Value]) -> Result<Value, MdsError> {
     let s = require_string(args, "lower")?;
-    let mut out = case_output(lower_result_len(args), "lower")?;
-    if s.is_ascii() {
+    let len = case_output_len(lower_result_len(args), "lower")?;
+    let ascii = s.is_ascii();
+    if !ascii && s.contains('Σ') {
+        // A string with capital sigma uses the standard library mapping.
+        // Its capacity can exceed its length.
+        return Ok(Value::String(s.to_lowercase()));
+    }
+
+    let mut out = String::with_capacity(len);
+    if ascii {
         out.push_str(s);
         out.make_ascii_lowercase();
     } else {
-        for (i, c) in s.char_indices() {
-            if c == 'Σ' && final_sigma(s, i) {
-                out.push('ς');
-            } else {
-                out.extend(c.to_lowercase());
-            }
+        for c in s.chars() {
+            out.extend(c.to_lowercase());
         }
     }
     Ok(Value::String(out))
@@ -267,8 +271,11 @@ fn case_result_len<I: Iterator<Item = char>>(
 }
 
 fn case_output(len: Option<usize>, name: &str) -> Result<String, MdsError> {
+    case_output_len(len, name).map(String::with_capacity)
+}
+
+fn case_output_len(len: Option<usize>, name: &str) -> Result<usize, MdsError> {
     len.filter(|&len| len <= MAX_OUTPUT_SIZE)
-        .map(String::with_capacity)
         .ok_or_else(|| builtin_output_too_large(name))
 }
 
@@ -278,29 +285,6 @@ fn builtin_output_too_large(name: &str) -> MdsError {
     MdsError::builtin_error(format!(
         "{name}() output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"
     ))
-}
-
-fn final_sigma(s: &str, i: usize) -> bool {
-    // Other sigmas stop each search, so each gap is scanned at most twice.
-    s[..i].chars().rev().find_map(cased).unwrap_or(false)
-        && !s[i + 'Σ'.len_utf8()..]
-            .chars()
-            .find_map(cased)
-            .unwrap_or(false)
-}
-
-fn cased(c: char) -> Option<bool> {
-    // The build script records the start of each class. Each entry holds 21
-    // code point bits and two class bits. The first entry covers U+0000.
-    const TABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/case_context.bin"));
-    let (entries, _) = TABLE.as_chunks::<3>();
-    let next = entries
-        .partition_point(|&[a, b, c_byte]| u32::from_le_bytes([a, b, c_byte, 0]) >> 2 <= c as u32);
-    match entries[next - 1][0] & 3 {
-        0 => Some(false),
-        1 => Some(true),
-        _ => None, // Skip an ignorable code point.
-    }
 }
 
 fn builtin_trim(args: &[Value]) -> Result<Value, MdsError> {
@@ -810,9 +794,40 @@ mod tests {
                     panic!("{name} must return a string");
                 };
                 assert_eq!(result, expected, "{name}({input:?})");
-                assert_eq!(result.capacity(), result.len(), "{name}({input:?})");
+                if !input.contains('Σ') {
+                    assert_eq!(result.capacity(), result.len(), "{name}({input:?})");
+                }
             }
         }
+    }
+
+    #[test]
+    fn lower_with_sigma_caps_the_result_not_the_input() {
+        let input = "AΣ AΣB";
+        assert_eq!(
+            call_builtin("lower", &[s(input)]).unwrap(),
+            Value::String(input.to_lowercase())
+        );
+
+        let mut input = "İ".repeat(MAX_OUTPUT_SIZE / 3);
+        input.push('Σ');
+        let mut args = [Value::String(input)];
+        let Value::String(result) = call_builtin("lower", &args).unwrap() else {
+            panic!("lower must return a string");
+        };
+        assert_eq!(result.len(), MAX_OUTPUT_SIZE);
+        assert!(result.ends_with("i\u{0307}ς"));
+        drop(result);
+
+        if let Value::String(input) = &mut args[0] {
+            input.push('a');
+        }
+        let error = call_builtin("lower", &args).unwrap_err().serialize();
+        assert_eq!(error.code, "mds::builtin");
+        assert_eq!(
+            error.message,
+            "lower() output exceeds maximum size of 52428800 bytes"
+        );
     }
 
     #[test]
