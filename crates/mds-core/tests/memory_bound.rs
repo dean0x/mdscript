@@ -428,6 +428,35 @@ fn assert_value_peaks() {
     }
 }
 
+fn assert_message_role_peak() {
+    const COUNT: usize = 300;
+    let text = "A".repeat(MIB - 64);
+    let frontmatter = format!("---\nx: {text}\nsmall: A\n---\n");
+    let source = |name| {
+        let body = format!("@message {{{{lower({name})}}}}:\nb\n@end\n");
+        format!("{frontmatter}{}", body.repeat(COUNT))
+    };
+    let (control, baseline) = compile_measured(source("small"));
+    let messages = control.unwrap().into_messages().unwrap();
+    assert_eq!(messages.len(), COUNT);
+    assert!(messages.iter().all(|m| m.role == "a" && m.content == "b"));
+
+    let (result, peak) = compile_measured(source("x"));
+    let growth = peak.saturating_sub(baseline);
+    eprintln!("message role heap (B): control={baseline}, peak={peak}, growth={growth}");
+    let limit = 200 * MIB + SLACK;
+    assert!(
+        growth <= limit,
+        "message roles add {growth} B (limit: {limit} B)"
+    );
+    let error = result.expect_err("message role budget").serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+}
+
 #[test]
 fn compile_peak_heap_stays_within_each_bound() {
     let source = include_str!("memory_bound.rs");
@@ -475,4 +504,5 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_over_cap_upper_does_not_build_its_result();
     assert_over_cap_lower_with_sigma_does_not_build_its_result();
     assert_value_peaks();
+    assert_message_role_peak();
 }
