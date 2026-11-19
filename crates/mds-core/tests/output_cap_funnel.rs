@@ -9,8 +9,8 @@
 //! * the output-cap message — a string literal STARTING `output exceeds maximum size`
 //!   — appears in production code only in `error.rs`, inside
 //!   `MdsError::output_size_exceeded`. The match is anchored at the literal's opening
-//!   quote, so the `mds::builtin` messages of `replace()` and `join()` in `builtins.rs`
-//!   (`"replace() output exceeds …"`) are not the output cap and do not count;
+//!   quote, so it excludes the `replace()` message and the shared
+//!   `upper()`/`lower()`/`join()` message from `builtin_output_too_large` in `builtins.rs`;
 //! * `push_capped` is defined once, and every output accumulator calls it the expected
 //!   number of times with no raw append (`push_str`, `push`, `+=`, …) left in its body.
 //!
@@ -122,8 +122,9 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
     );
     assert!(
         unanchored_elsewhere >= 2,
-        "non-vacuity: the `replace()` and `join()` messages must still be seen unanchored \
-         (found {unanchored_elsewhere}), or the anchored match proves nothing"
+        "non-vacuity: the unanchored match must find the `replace()` message and the shared \
+         `upper()`/`lower()`/`join()` message from `builtin_output_too_large` in `builtins.rs` \
+         (found {unanchored_elsewhere})"
     );
     assert!(
         violations.is_empty(),

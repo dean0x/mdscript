@@ -282,7 +282,7 @@ fn assert_join_refusal_precedes_result_allocation() {
 }
 
 #[test]
-fn nested_if_output_does_not_raise_the_peak_heap() {
+fn compile_peak_heap_stays_within_each_bound() {
     let source = include_str!("memory_bound.rs");
     assert_eq!(test_count(source), 1);
     assert_eq!(
