@@ -343,6 +343,91 @@ fn assert_join_refusal_precedes_result_allocation() {
     assert!(largest < 4 * MIB, "refused join requested {largest} B");
 }
 
+fn argument_source(frontmatter: &str, term: &str, count: usize) -> String {
+    let params = (0..count).map(|i| format!("p{i}")).collect::<Vec<_>>();
+    let args = vec![term; count].join(", ");
+    format!(
+        "{frontmatter}@define sink({}):\nok\n@end\n{{{{sink({args})}}}}\n",
+        params.join(", ")
+    )
+}
+
+fn iterable_source(frontmatter: &str, iterable: &str) -> String {
+    let mut source = frontmatter.to_owned();
+    for i in 0..6 {
+        source.push_str(&format!("@define f{i}():\n@for item in {iterable}:\n"));
+        if i == 5 {
+            source.push_str("ok\n");
+        } else {
+            source.push_str(&format!("{{{{f{}()}}}}\n", i + 1));
+        }
+        source.push_str("@end\n@end\n");
+    }
+    source.push_str("{{f0()}}\n");
+    source
+}
+
+fn assert_value_peaks() {
+    let text = "a".repeat(MIB - 64);
+    let chunk = format!(
+        "---\nsmall: [a]\nfirst_item: {text}\n---\n@define chunk():\n{}@end\n",
+        "{{first_item}}\n".repeat(48)
+    );
+    let copying_frontmatter = format!(
+        "---\nitem: &part {}\nitems: [{}]\n---\n",
+        "a".repeat(MIB / 2),
+        vec!["*part"; 16].join(", ")
+    );
+    let expanded = format!(
+        "replace(first_item, '{}', '{}')",
+        "a".repeat(64),
+        "b".repeat(3072)
+    );
+    let cases = [
+        (
+            "computed arguments",
+            argument_source(&chunk, &expanded, 6),
+            argument_source(&chunk, "first_item", 6),
+        ),
+        (
+            "computed iterables",
+            iterable_source(&chunk, "split(chunk(), '|')"),
+            iterable_source(&chunk, "small"),
+        ),
+        (
+            "array copies",
+            argument_source(&copying_frontmatter, "reverse(items)", 34),
+            argument_source(&copying_frontmatter, "items", 34),
+        ),
+    ];
+    let outcomes = cases.map(|(label, source, control)| {
+        let (control, baseline) = compile_measured(control);
+        let (result, peak) = compile_measured(source);
+        let growth = peak.saturating_sub(baseline);
+        eprintln!("{label} heap (B): control={baseline}, peak={peak}, growth={growth}");
+        (label, control, result, growth)
+    });
+    for (label, control, result, growth) in outcomes {
+        assert!(control
+            .unwrap()
+            .into_markdown()
+            .unwrap()
+            .ends_with("\nok\n"));
+        let limit = 200 * MIB + SLACK;
+        assert!(
+            growth <= limit,
+            "{label} adds {growth} B (limit: {limit} B)"
+        );
+        let error = result.expect_err(label).serialize();
+        assert_eq!(error.code, "mds::resource_limit", "{label}");
+        assert_eq!(
+            error.message,
+            "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes",
+            "{label}"
+        );
+    }
+}
+
 #[test]
 fn compile_peak_heap_stays_within_each_bound() {
     let source = include_str!("memory_bound.rs");
@@ -389,4 +474,5 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_join_refusal_precedes_result_allocation();
     assert_over_cap_upper_does_not_build_its_result();
     assert_over_cap_lower_with_sigma_does_not_build_its_result();
+    assert_value_peaks();
 }
