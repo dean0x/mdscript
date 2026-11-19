@@ -491,6 +491,47 @@ fn assert_imported_prompts_share_one_limit() {
     );
 }
 
+/// Four imported modules whose frontmatter repeats one scalar of `len` bytes through
+/// 63 aliases, so a small source parses into a large tree. Each module defines a
+/// function, which can capture the scope, so the module keeps its parsed tree and
+/// its converted scope layer.
+fn alias_frontmatter_peak(len: usize) -> (Result<CompileResult, MdsError>, usize) {
+    let refs = vec!["*a"; 63].join(", ");
+    let frontmatter = format!("---\na: &a {}\nb: [{refs}]\n---\n", "x".repeat(len));
+    let mut root = String::new();
+    let mut modules = HashMap::new();
+    for i in 0..4 {
+        root.push_str(&format!("@import \"./part{i}.mds\" as part{i}\n"));
+        modules.insert(
+            format!("part{i}.mds"),
+            format!("{frontmatter}@define f():\nok\n@end\n"),
+        );
+    }
+    modules.insert("main.mds".to_owned(), root + "root");
+    peak_growth(|| mds::compile_virtual(modules, "main.mds", None))
+}
+
+fn assert_alias_frontmatter_shares_one_limit() {
+    let (control, baseline) = alias_frontmatter_peak(1);
+    assert_eq!(control.unwrap().into_markdown().unwrap(), "root\n");
+
+    // Each module parses 64 copies of the scalar: 40 MiB from a 640 KiB source.
+    let (result, peak) = alias_frontmatter_peak(5 * MIB / 8);
+    let growth = peak.saturating_sub(baseline);
+    eprintln!("alias frontmatter heap (B): control={baseline}, peak={peak}, growth={growth}");
+    let limit = 200 * MIB + SLACK;
+    assert!(
+        growth <= limit,
+        "alias frontmatter adds {growth} B (limit: {limit} B)"
+    );
+    let error = result.expect_err("alias frontmatter budget").serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+}
+
 fn mapped_corner(extra: usize) -> (Result<CompileResult, MdsError>, usize) {
     let raw = format!("label: {}\n", "a".repeat(MIB - "label: \n".len()));
     let mut root = format!("---\n{raw}---\n");
@@ -594,4 +635,5 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_message_role_peak();
     assert_mapped_max_output_with_frontmatter();
     assert_imported_prompts_share_one_limit();
+    assert_alias_frontmatter_shares_one_limit();
 }
