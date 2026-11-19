@@ -265,9 +265,10 @@ fn case_result_len<I: Iterator<Item = char>>(
     if s.is_ascii() {
         return Some(s.len());
     }
-    s.chars()
-        .flat_map(map)
-        .try_fold(0usize, |len, c| len.checked_add(c.len_utf8()))
+    s.chars().flat_map(map).try_fold(0usize, |len, c| {
+        len.checked_add(c.len_utf8())
+            .filter(|&len| len <= MAX_OUTPUT_SIZE)
+    })
 }
 
 fn case_output(len: Option<usize>, name: &str) -> Result<String, MdsError> {
@@ -863,6 +864,29 @@ mod tests {
     }
 
     #[test]
+    fn case_mapping_stops_at_the_first_output_byte_over_the_cap() {
+        let mapped_width: usize = 'ΐ'.to_uppercase().map(char::len_utf8).sum();
+        let mut input = "ΐ".repeat(MAX_OUTPUT_SIZE / mapped_width + 1);
+        input.push('!');
+        let reached_suffix = std::cell::Cell::new(false);
+        let len = case_result_len(&[Value::String(input)], |c| {
+            if c == '!' {
+                reached_suffix.set(true);
+            }
+            c.to_uppercase()
+        });
+        let error = case_output_len(len, "upper").unwrap_err().serialize();
+        assert_eq!(
+            error.message,
+            "upper() output exceeds maximum size of 52428800 bytes"
+        );
+        assert!(
+            !reached_suffix.get(),
+            "must not map the suffix past the cap"
+        );
+    }
+
+    #[test]
     fn trim_removes_whitespace() {
         let result = call_builtin("trim", &[s("  hello  ")]).unwrap();
         assert_eq!(result, s("hello"));
@@ -1085,6 +1109,26 @@ mod tests {
         // Start beyond end → empty
         let result = call_builtin("slice", &[s("hi"), Value::Number(100.0)]).unwrap();
         assert_eq!(result, s(""));
+    }
+
+    #[test]
+    fn slice_string_clamps_the_end_and_empties_a_reversed_range() {
+        for (start, end, expected) in [
+            (1.0, 100.0, "éllo"),
+            (0.0, 5.0, "héllo"),
+            (0.0, 4.0, "héll"),
+            (3.0, 1.0, ""),
+            (2.0, 2.0, ""),
+            (5.0, 9.0, ""),
+            (6.0, 9.0, ""),
+        ] {
+            let args = [s("héllo"), Value::Number(start), Value::Number(end)];
+            let Value::String(result) = call_builtin("slice", &args).unwrap() else {
+                panic!("slice must return a string");
+            };
+            assert_eq!(result, expected, "slice with start {start} and end {end}");
+            assert_eq!(result.capacity(), result.len(), "start {start}, end {end}");
+        }
     }
 
     #[test]
