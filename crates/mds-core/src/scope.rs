@@ -689,6 +689,22 @@ mod tests {
     }
 
     #[test]
+    fn a_path_as_deep_as_the_value_depth_cap_reaches_its_leaf() {
+        // A path into a value from YAML or JSON conversion has at most
+        // `MAX_VALUE_DEPTH` steps. Path lookup uses a fixed table of that size.
+        let leaf = Value::String("leaf".into());
+        let mut value = leaf.clone();
+        for _ in 0..crate::value::MAX_VALUE_DEPTH {
+            value = Value::Array(vec![value]);
+        }
+        let mut slot = Slot::from(value);
+        for _ in 0..crate::value::MAX_VALUE_DEPTH {
+            slot = slot.project(PathStep::Index(0));
+        }
+        assert_eq!(slot.get(), Some(&leaf));
+    }
+
+    #[test]
     fn capture_lookup_builtin_miss_probes_only_distinct_links() {
         use std::fmt::Write;
 
