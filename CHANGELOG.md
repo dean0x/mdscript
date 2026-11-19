@@ -82,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A nested `@for` over the variable of an outer loop failed validation with `mds::type_error`, `expected array for @for loop, got null`. Examples are `@for cell in row:` inside `@for row in rows:`, and `@for x in v:` inside `@for k, v in obj:`, also in a `@define` body. These templates now compile, check and lint. An inner loop over the key of `@for k, v in obj:` still fails before evaluation, now with `got string`. If an item is not an array at run time, the evaluation fails as before. The error is `mds::type_error` (for example `got number`), or `mds::syntax` with the key-value hint for an object. This error has no span, as for a `@define` parameter (#489).
 - Memory for `@define` captures now grows linearly with the number of declarations in a module.
 - Python function errors escape unknown keyword names with the shared wire escaper. A lone surrogate appears as U+FFFD characters (#421).
 - napi option-conversion failures now throw `mds::invalid_options`, with prefix `invalid options: `, `invalid options.vars: ` or `invalid options.rules: ` (#422). Converter details use the shared wire escaper; a pending JS exception passes through unchanged.

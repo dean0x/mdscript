@@ -185,10 +185,14 @@ fn validate_for_node(
     }
 
     scope.push();
+    // The placeholders follow the `@define` parameter rule: the loop variable is
+    // an empty array, so that a nested `@for item in var:` passes the type check.
+    // The evaluator enforces the actual type of each item. The key of
+    // `@for key, value in obj:` is always a string, so `@for c in key:` still fails here.
     if let Some(ref key_var) = block.key_var {
-        scope.set_var(key_var, Value::Null);
+        scope.set_var(key_var, Value::String(String::new()));
     }
-    scope.set_var(&block.var, Value::Null);
+    scope.set_var(&block.var, Value::Array(vec![]));
     let result = validate(&block.body, scope, file, source);
     let _ = scope.pop(); // Cannot fail — we just pushed
     result
@@ -588,5 +592,119 @@ mod tests {
             }
             other => panic!("expected ArityMismatch, got {other:?}"),
         }
+    }
+
+    // ── Nested @for over a loop variable (#489) ───────────────────────────────
+
+    /// Parse `source` into its top-level nodes, with the file name and the
+    /// source kept so that a validation error gets a span.
+    fn parse_body(source: &str) -> Vec<Node> {
+        let tokens = crate::lexer::tokenize(source, "test.mds").expect("fixture must tokenize");
+        crate::parser::parse_with_ctx(&tokens, "test.mds", source)
+            .expect("fixture must parse")
+            .body
+    }
+
+    #[test]
+    fn nested_for_over_outer_loop_variable_passes_validation() {
+        let source = "@for row in rows:\n@for cell in row:\n{{cell}}\n@end\n@end\n";
+        let mut scope = Scope::new();
+        scope.set_var(
+            "rows",
+            Value::Array(vec![Value::Array(vec![Value::Number(1.0)])]),
+        );
+        let result = validate(&parse_body(source), &mut scope, "test.mds", source);
+        assert!(
+            result.is_ok(),
+            "an inner @for over the outer loop variable must pass validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn nested_for_over_define_parameter_passes_validation() {
+        // The parameter is iterated by the outer loop, and the outer loop
+        // variable is iterated by the inner loop.
+        let source = "@define grid(rows):\n@for row in rows:\n@for cell in row:\n{{cell}}\n@end\n@end\n@end\n";
+        let mut scope = Scope::new();
+        let result = validate(&parse_body(source), &mut scope, "test.mds", source);
+        assert!(
+            result.is_ok(),
+            "a nested @for over a @define parameter must pass validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn nested_for_over_value_variable_of_key_value_loop_passes_validation() {
+        let source = "@for k, v in obj:\n@for x in v:\n{{x}}\n@end\n@end\n";
+        let mut scope = Scope::new();
+        scope.set_var(
+            "obj",
+            Value::Object(std::collections::HashMap::from([(
+                "a".to_string(),
+                Value::Array(vec![Value::Number(1.0)]),
+            )])),
+        );
+        let result = validate(&parse_body(source), &mut scope, "test.mds", source);
+        assert!(
+            result.is_ok(),
+            "an inner @for over the value variable must pass validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn for_over_key_variable_fails_validation_with_got_string_and_span() {
+        // The key of a key-value loop is always a string, so a loop over it
+        // must still fail before evaluation.
+        let source = "@for k, v in obj:\n@for c in k:\n{{c}}\n@end\n@end\n";
+        let mut scope = Scope::new();
+        scope.set_var(
+            "obj",
+            Value::Object(std::collections::HashMap::from([(
+                "a".to_string(),
+                Value::Array(vec![]),
+            )])),
+        );
+        let err = validate(&parse_body(source), &mut scope, "test.mds", source)
+            .expect_err("an inner @for over the key variable must fail validation")
+            .serialize();
+        assert_eq!(err.code, "mds::type_error");
+        assert_eq!(
+            err.message,
+            "type error: expected array for @for loop, got string"
+        );
+        let span = err.span.expect("the type error must carry a span");
+        assert_eq!(
+            span.offset,
+            source
+                .find("@for c in k:")
+                .expect("fixture holds the inner loop"),
+            "the span must point at the inner @for directive"
+        );
+    }
+
+    #[test]
+    fn for_over_object_with_single_variable_fails_validation_with_span() {
+        // Control: an object from the caller or the frontmatter, used directly as
+        // a single-variable iterable, still fails before evaluation.
+        let source = "@for x in obj:\n{{x}}\n@end\n";
+        let mut scope = Scope::new();
+        scope.set_var(
+            "obj",
+            Value::Object(std::collections::HashMap::from([(
+                "a".to_string(),
+                Value::Number(1.0),
+            )])),
+        );
+        let err = validate(&parse_body(source), &mut scope, "test.mds", source)
+            .expect_err("a single-variable @for over an object must fail validation")
+            .serialize();
+        assert_eq!(err.code, "mds::syntax");
+        assert_eq!(
+            err.message,
+            "syntax error: cannot iterate over object 'obj' with a single variable — \
+             use @for key, value in obj: to iterate over an object's entries"
+        );
+        let span = err.span.expect("the syntax error must carry a span");
+        assert_eq!(span.offset, 0, "the span must point at the @for directive");
     }
 }
