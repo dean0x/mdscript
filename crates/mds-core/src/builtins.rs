@@ -33,11 +33,21 @@ pub(crate) struct BuiltinMeta {
     pub bound: Bound,
 }
 
+/// The memory a built-in call can make, which the compile budget charges before
+/// the call (`invoke_builtin` in `evaluator.rs`).
 #[derive(Clone, Copy)]
 pub(crate) enum Bound {
+    /// A result of one fixed-size value.
     Scalar,
+    /// A string result with a capacity of at most the count. `None` charges
+    /// nothing: the result does not fit or an argument has the wrong type, and
+    /// the handler refuses the call before it allocates.
     Exact(fn(&[Value]) -> Option<usize>),
+    /// A result built from the first argument. Before the call: twice its bytes
+    /// plus 32 bytes per element (`unique` also counts its keys). After the call:
+    /// the bytes of the result.
     Input,
+    /// The parts of a split string and the array that holds them.
     Split,
 }
 
