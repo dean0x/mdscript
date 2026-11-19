@@ -3249,6 +3249,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exit_code_maps_internal_failures_to_101() {
+        let error = MdsError::Internal;
+        for report in [
+            miette::Report::new(error.clone()),
+            crate::output::relabel_stdin_error(&error, ""),
+        ] {
+            assert_eq!(exit_code(&report), 101);
+        }
+    }
+
     /// #428: stdin is read into a buffer that never holds more than the per-file cap
     /// plus one byte — a buffer only grows, so its final capacity is the most it ever
     /// held — and never past that byte: exactly the cap is accepted, one byte more is

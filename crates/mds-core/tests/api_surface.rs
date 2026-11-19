@@ -464,6 +464,21 @@ fn mds_error_variants_exist() {
 }
 
 #[test]
+fn internal_error_matches_the_binding_record() {
+    let err = MdsError::Internal;
+    assert!(matches!(err, MdsError::Internal));
+    assert_eq!(
+        miette::Diagnostic::code(&err).unwrap().to_string(),
+        "mds::internal"
+    );
+    let record = serde_json::to_vec(&err.serialize()).unwrap();
+    assert_eq!(
+        record,
+        br#"{"code":"mds::internal","message":"internal compiler error","help":null,"span":null}"#
+    );
+}
+
+#[test]
 fn formatter_invariant_has_diagnostic_code() {
     let err = MdsError::FormatterInvariant {
         message: "test detail".to_string(),
@@ -632,6 +647,7 @@ fn filesystem_trait_importable() {
 fn native_entry_pin_and_entry_points_are_public() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<mds::EntryPin>();
+    send_sync::<ModuleCache>();
     send_sync::<NativeFs>();
     let dir = tempfile::TempDir::new().unwrap();
     let entry = dir.path().join("main.mds");

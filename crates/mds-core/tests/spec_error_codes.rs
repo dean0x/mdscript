@@ -154,6 +154,20 @@ fn core_codes_are_documented_in_spec() {
 }
 
 #[test]
+fn core_codes_are_not_binding_only() {
+    let core = extract_codes(&read_error_rs());
+    assert!(core.iter().any(|code| code == "mds::internal"));
+    let overlap: Vec<_> = core
+        .iter()
+        .filter(|code| BINDING_ONLY_CODES.contains(&code.as_str()))
+        .collect();
+    assert!(
+        overlap.is_empty(),
+        "core codes listed as binding-only: {overlap:?}"
+    );
+}
+
+#[test]
 fn binding_only_codes_are_documented_in_spec() {
     let spec = read_spec_md();
     let section =

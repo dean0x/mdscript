@@ -2778,6 +2778,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lint_analysis_failure_exits_101_for_an_internal_error() {
+        let mut sink = Recorder::default();
+        assert_eq!(
+            super::analysis_failed(&mut sink, &MdsError::Internal, None),
+            101
+        );
+        assert_eq!(sink.calls, ["analysis failure"]);
+    }
+
+    #[test]
+    fn lint_batch_keeps_the_internal_exit_code_after_the_next_file() {
+        let root = Path::new("templates");
+        let first = root.join("a.mds");
+        let next = root.join("b.mds");
+        let error = MdsError::Internal;
+        let reports = [
+            (
+                &first,
+                "a.mds",
+                Outcome::Failed {
+                    tally: super::failure_tally(&error),
+                    error,
+                },
+            ),
+            (
+                &next,
+                "b.mds",
+                Outcome::Reported {
+                    findings: LintResult::new(vec![]),
+                    text: None,
+                },
+            ),
+        ];
+        let mut sink = Recorder::default();
+        let summary =
+            reports
+                .into_iter()
+                .fold(DirSummary::default(), |summary, (path, key, outcome)| {
+                    let report = FileReport {
+                        input: LintSource::DirEntry { root, path, key },
+                        capped: None,
+                        outcome,
+                    };
+                    summary.count(render(report, &mut sink).verdict)
+                });
+        assert_eq!(
+            sink.calls,
+            [
+                "failed (mds::internal) a.mds",
+                "findings (0) b.mds",
+                "clean b.mds"
+            ]
+        );
+        assert_eq!(
+            (
+                summary.error_file_count,
+                summary.clean_count,
+                summary.exit_code()
+            ),
+            (1, 1, 101)
+        );
+    }
+
     /// `error`'s diagnostic code, such as `mds::io`.
     fn code_of(error: &MdsError) -> String {
         miette::Diagnostic::code(error)

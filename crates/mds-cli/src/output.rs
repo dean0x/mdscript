@@ -5379,6 +5379,17 @@ mod tests {
                 c.policy
             );
         }
+        // An internal error is a file failure, not a panic. Watch keeps its verdict.
+        let report = miette::Report::new(mds::MdsError::Internal);
+        for (verdict, policy, want) in [(1, Batch, 101), (0, WatchSession, 0), (1, WatchSession, 1)]
+        {
+            let state = OutputState::new();
+            state.note_io_failure();
+            state.note_resource_limited();
+            note_file_failure(&state, &report);
+            assert!(!state.panicked());
+            assert_eq!(final_exit_code(verdict, &state, policy), want, "{policy:?}");
+        }
     }
 
     /// A run exits under the batch rule until a watch session goes live, and under the
