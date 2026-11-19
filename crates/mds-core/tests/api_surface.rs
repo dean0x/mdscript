@@ -1580,6 +1580,85 @@ fn value_from_json_depth_limit() {
     assert!(msg.contains("nesting exceeds maximum depth"), "got: {msg}");
 }
 
+/// `levels` objects, each with the one key `a`, around `inner`.
+fn nest_under_a(levels: usize, inner: Value) -> Value {
+    (0..levels).fold(inner, |value, _| {
+        Value::Object(HashMap::from([("a".to_string(), value)]))
+    })
+}
+
+/// Compile `tail` inside two loops over a runtime `Value` built in Rust. A dot path
+/// has at most 31 fields, so the loops carry a longer path: `x` is 31 fields and one
+/// index into the value, and `y` is `fields` more fields and one more index, at
+/// `inner`. `y` is thus `33 + fields` steps deep.
+fn compile_in_loops_over_runtime_value(
+    fields: usize,
+    inner: Value,
+    tail: &str,
+) -> Result<String, MdsError> {
+    let value = nest_under_a(
+        31,
+        Value::Array(vec![nest_under_a(fields, Value::Array(vec![inner]))]),
+    );
+    let source = format!(
+        "@for x in v{}:\n@for y in x{}:\n{tail}\n@end\n@end\n",
+        ".a".repeat(31),
+        ".a".repeat(fields)
+    );
+    mds::compile_str_with(
+        &source,
+        None,
+        Some(HashMap::from([("v".to_string(), value)])),
+    )
+    .and_then(CompileResult::into_markdown)
+}
+
+fn error_code(error: &MdsError) -> Option<String> {
+    miette::Diagnostic::code(error).map(|code| code.to_string())
+}
+
+#[test]
+fn runtime_value_path_of_64_steps_reaches_its_leaf() {
+    // `y` is 64 steps deep.
+    let leaf = Value::String("leaf".into());
+    assert_eq!(
+        compile_in_loops_over_runtime_value(31, leaf, "{{y}}").unwrap(),
+        "leaf\n"
+    );
+}
+
+#[test]
+fn runtime_value_dot_path_past_64_steps_fails_with_a_syntax_error() {
+    // `y` is 64 steps deep, so `y.a` is 65 steps deep.
+    let leaf = Value::String("leaf".into());
+    let error =
+        compile_in_loops_over_runtime_value(31, nest_under_a(1, leaf), "{{y.a}}").unwrap_err();
+    assert_eq!(
+        error_code(&error).as_deref(),
+        Some("mds::syntax"),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "syntax error: internal error: an evaluated value has an invalid projection"
+    );
+}
+
+#[test]
+fn runtime_value_loop_variable_past_64_steps_is_undefined() {
+    // `y` is 63 steps deep and `y.a` is 64, so the loop variable `z` is 65 steps deep.
+    let leaf = Value::String("leaf".into());
+    let inner = nest_under_a(1, Value::Array(vec![leaf]));
+    let error =
+        compile_in_loops_over_runtime_value(30, inner, "@for z in y.a:\n{{z}}\n@end").unwrap_err();
+    assert_eq!(
+        error_code(&error).as_deref(),
+        Some("mds::undefined_var"),
+        "{error}"
+    );
+    assert_eq!(error.to_string(), "undefined variable 'z'");
+}
+
 #[test]
 fn load_vars_str_valid_object() {
     let vars = mds::load_vars_str(r#"{"name": "World", "count": 42}"#).unwrap();

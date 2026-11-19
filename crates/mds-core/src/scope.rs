@@ -688,20 +688,35 @@ mod tests {
         BUILTIN_PROBES.with(|count| count.set(count.get() + 1));
     }
 
+    /// A path of `levels` steps into a value that holds `leaf` under `levels` arrays.
+    fn path_to_leaf(levels: usize, leaf: &Value) -> Slot {
+        let mut value = leaf.clone();
+        for _ in 0..levels {
+            value = Value::Array(vec![value]);
+        }
+        let mut slot = Slot::from(value);
+        for _ in 0..levels {
+            slot = slot.project(PathStep::Index(0));
+        }
+        slot
+    }
+
     #[test]
     fn a_path_as_deep_as_the_value_depth_cap_reaches_its_leaf() {
         // A path into a value from YAML or JSON conversion has at most
         // `MAX_VALUE_DEPTH` steps. Path lookup uses a fixed table of that size.
         let leaf = Value::String("leaf".into());
-        let mut value = leaf.clone();
-        for _ in 0..crate::value::MAX_VALUE_DEPTH {
-            value = Value::Array(vec![value]);
-        }
-        let mut slot = Slot::from(value);
-        for _ in 0..crate::value::MAX_VALUE_DEPTH {
-            slot = slot.project(PathStep::Index(0));
-        }
+        let slot = path_to_leaf(crate::value::MAX_VALUE_DEPTH, &leaf);
         assert_eq!(slot.get(), Some(&leaf));
+    }
+
+    #[test]
+    fn a_path_one_step_past_the_value_depth_cap_finds_no_value() {
+        // A value built in Rust can nest deeper than YAML or JSON conversion allows.
+        // The leaf exists, but the fixed table has no room for the extra step.
+        let leaf = Value::String("leaf".into());
+        let slot = path_to_leaf(crate::value::MAX_VALUE_DEPTH + 1, &leaf);
+        assert_eq!(slot.get(), None);
     }
 
     #[test]
