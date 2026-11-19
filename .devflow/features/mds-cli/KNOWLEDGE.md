@@ -128,6 +128,7 @@ struct WatchedPath {
 - A missing root returns FileNotFound with the escaped typed root. Other root lookup errors return `mds::io` with that root and escaped cause.
 - A successful lookup with a different root or parent returns `watched {entry|directory|file} now resolves to a different {file|directory}: "<typed>"; restart mds watch to follow it`.
 - A case-only file-name change within the same canonical parent is not a move. A save by rename can supply another file identity.
+- File mode's `event_is_relevant` also matches an event after a case-only rename (#481). After the canonical lookup, it takes the watched paths in the event's canonical parent and compares `w.canonicalize()` with the event's canonical path, canonical with canonical. It never folds case or compares text. It is a trigger only: `WatchedPath.canonical`, `foi`, the graph keys and the baselines keep the startup spelling. A case-only rename of the parent directory is still refused as a move.
 - `compile()` calls `ensure_unmoved()`, then forwards both path forms to `compile_caught`. Errors name the typed path.
 - `compile_caught` creates a fresh `NativeFs` with `EntryPin::parent_dir(effective_parent(canonical))`. It calls `build::compile_native_to_content` inside one compile catch.
 - `walked(src)` derives the typed source path below the root. An out-of-root dependency keeps its canonical path.

@@ -6066,6 +6066,259 @@ fn watch_dir_mode_write_atomic_temp_file_is_never_compiled() {
     );
 }
 
+// ── A case-only rename of a watched file (#481) ─────────────────────────────
+//
+// On a case-insensitive volume (the macOS and Windows default) a rename that changes
+// only the case of a name keeps the file, and the events that follow name the file by
+// its new spelling. The watch set holds the spelling the file had at startup. On a
+// case-sensitive volume the two spellings are two files, and an edit of the other one
+// is not an edit of the watched file. A probe of the volume picks the arm, not the OS.
+// Each test prints the arm it ran, and each arm asserts. `--poll-interval 0` turns the
+// idle tick off: with the default, the tick rebuilds the edit one tick late and hides
+// an event the watcher did not match.
+
+/// The diagnostic of a compile that reads `{{probe}}` with no `probe` variable, once per
+/// compile. The negative arms count it to find a rebuild that changes no output.
+const CASE_PROBE_LINE: &str = "undefined variable 'probe'";
+
+/// Is the volume that holds `dir` case-insensitive? The probe is a file of its own in
+/// `dir`, looked up by its name in upper case.
+fn case_insensitive_volume(dir: &Path) -> bool {
+    std::fs::write(dir.join("probe"), "").unwrap();
+    dir.join("PROBE").exists()
+}
+
+/// The file names in `dir`, as stored.
+fn stored_names(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Rename `from` to `to`, a name that differs only in case, and check that the volume
+/// stores the new name. Else the events after it name the old spelling and never reach
+/// the case-only path.
+#[track_caller]
+fn rename_case_only(from: &Path, to: &Path) {
+    std::fs::rename(from, to).unwrap();
+    let names = stored_names(from.parent().unwrap());
+    let stored = |p: &Path| {
+        let name = p.file_name().unwrap().to_string_lossy();
+        names.iter().any(|n| *n == name)
+    };
+    assert!(
+        stored(to) && !stored(from),
+        "the rename must change the stored name: {names:?}"
+    );
+}
+
+/// #481: an edit of the entry after a case-only rename rebuilds through its event, and
+/// the rename is not refused as a move. On a case-sensitive volume an edit of the other
+/// file gives no rebuild, and an edit of the entry gives exactly one.
+#[test]
+fn watch_file_mode_edit_after_a_case_only_rename_of_the_entry_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("Main.mds");
+    let other_case = dir.path().join("main.mds");
+    let part = dir.path().join("part.mds");
+    let out = dir.path().join("Main.md");
+    let case_insensitive = case_insensitive_volume(dir.path());
+    if case_insensitive {
+        std::fs::write(&part, "part one\n").unwrap();
+        std::fs::write(
+            &entry,
+            "@import \"./part.mds\" as p\nversion 1\n@include p\n",
+        )
+        .unwrap();
+    } else {
+        std::fs::write(&entry, "Main {{probe}}\n").unwrap();
+        std::fs::write(&other_case, "main one\n").unwrap();
+    }
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&entry)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+
+    if case_insensitive {
+        assert!(
+            wait_for_file_contains(&out, "version 1", TIMEOUT),
+            "the startup compile writes Main.md; stderr: {}",
+            tap.text()
+        );
+        rename_case_only(&entry, &other_case);
+        eprintln!(
+            "arm: case-insensitive volume; Main.mds now resolves to {}",
+            entry.canonicalize().unwrap().display()
+        );
+        // Every event of the rename is handled before the edit below: the partial makes
+        // the entry's compile fail with a diagnostic of its own.
+        settle_queued_events(&tap, &part, "renamed");
+
+        write_atomic(&other_case, "version 2\n");
+        assert!(
+            wait_for_file_contains(&out, "version 2", TIMEOUT),
+            "an edit after a case-only rename of the entry must rebuild through its \
+             event; Main.md: {:?}; stderr: {}",
+            std::fs::read_to_string(&out).ok(),
+            tap.text()
+        );
+        write_atomic(&other_case, "version 3\n");
+        assert!(
+            wait_for_file_contains(&out, "version 3", TIMEOUT),
+            "each later edit rebuilds too; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&other_case, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        assert!(
+            !stderr.contains("now resolves to a different"),
+            "a case-only rename of the entry is not a move; stderr:\n{stderr}"
+        );
+    } else {
+        eprintln!("arm: case-sensitive volume");
+        wait_for_tap(&tap, CASE_PROBE_LINE, TIMEOUT);
+        assert_eq!(
+            std::fs::read_to_string(&other_case).unwrap(),
+            "main one\n",
+            "Main.mds and main.mds must be two files on this volume"
+        );
+
+        write_atomic(&other_case, "main two\n");
+        // NEGATIVE WINDOW, deliberately a fixed sleep: 500ms is far beyond the
+        // debounce-0 rebuild latency, so a rebuild the edit of main.mds caused has
+        // compiled the entry as it is now and reported the probe again.
+        std::thread::sleep(Duration::from_millis(500));
+
+        write_atomic(&entry, "version 2\n");
+        assert!(
+            wait_for_file_contains(&out, "version 2", TIMEOUT),
+            "positive control: an edit of the entry rebuilds; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&entry, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        assert_eq!(
+            count_occurrences(&stderr, CASE_PROBE_LINE),
+            1,
+            "only the startup compile reads the probe: an edit of main.mds must not \
+             rebuild Main.mds; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            count_occurrences(&stderr, "Recompiled"),
+            1,
+            "the edit of Main.mds gives exactly one rebuild; stderr:\n{stderr}"
+        );
+    }
+}
+
+/// #481: an edit of the `--vars` file after a case-only rename rebuilds through its
+/// event. On a case-sensitive volume an edit of the other file gives no rebuild, and an
+/// edit of the vars file gives exactly one.
+#[test]
+fn watch_file_mode_edit_after_a_case_only_rename_of_the_vars_file_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("t.mds");
+    let vars = dir.path().join("Vars.json");
+    let other_case = dir.path().join("vars.json");
+    let out = dir.path().join("t.md");
+    let case_insensitive = case_insensitive_volume(dir.path());
+    if case_insensitive {
+        std::fs::write(&entry, "V {{v}}\n").unwrap();
+        std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    } else {
+        std::fs::write(&entry, "V {{probe}}\n").unwrap();
+        std::fs::write(&vars, "{}").unwrap();
+        std::fs::write(&other_case, r#"{"probe": "other one"}"#).unwrap();
+    }
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&entry)
+            .arg("--vars")
+            .arg(&vars)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .stdout(Stdio::null()),
+    );
+
+    if case_insensitive {
+        assert!(
+            wait_for_file_contains(&out, "V one", TIMEOUT),
+            "the startup compile writes t.md; stderr: {}",
+            tap.text()
+        );
+        rename_case_only(&vars, &other_case);
+        eprintln!(
+            "arm: case-insensitive volume; Vars.json now resolves to {}",
+            vars.canonicalize().unwrap().display()
+        );
+        // Every event of the rename is handled before the edits below: the barrier
+        // makes the entry's compile fail, and the edit after it makes it pass again.
+        settle_queued_events(&tap, &entry, "renamed");
+        write_atomic(&entry, "W {{v}}\n");
+        assert!(
+            wait_for_file_contains(&out, "W one", TIMEOUT),
+            "the entry rebuilds after the barrier; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&other_case, r#"{"v": "two"}"#);
+        assert!(
+            wait_for_file_contains(&out, "W two", TIMEOUT),
+            "an edit after a case-only rename of the vars file must rebuild through its \
+             event; t.md: {:?}; stderr: {}",
+            std::fs::read_to_string(&out).ok(),
+            tap.text()
+        );
+        drop(child);
+    } else {
+        eprintln!("arm: case-sensitive volume");
+        wait_for_tap(&tap, CASE_PROBE_LINE, TIMEOUT);
+        assert_eq!(
+            std::fs::read_to_string(&vars).unwrap(),
+            "{}",
+            "Vars.json and vars.json must be two files on this volume"
+        );
+
+        write_atomic(&other_case, r#"{"probe": "other two"}"#);
+        // NEGATIVE WINDOW, deliberately a fixed sleep: 500ms is far beyond the
+        // debounce-0 rebuild latency, so a rebuild the edit of vars.json caused has
+        // compiled the entry with Vars.json as it is now and reported the probe again.
+        std::thread::sleep(Duration::from_millis(500));
+
+        write_atomic(&vars, r#"{"probe": "two"}"#);
+        assert!(
+            wait_for_file_contains(&out, "V two", TIMEOUT),
+            "positive control: an edit of the vars file rebuilds; stderr: {}",
+            tap.text()
+        );
+
+        write_atomic(&entry, ORDER_MARKER_SOURCE);
+        wait_for_tap(&tap, ORDER_MARKER_LINE, TIMEOUT);
+        let stderr = tap.finish_text(&mut child);
+        assert_eq!(
+            count_occurrences(&stderr, CASE_PROBE_LINE),
+            1,
+            "only the startup compile reads the probe: an edit of vars.json must not \
+             rebuild t.mds; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            count_occurrences(&stderr, "Recompiled"),
+            1,
+            "the edit of Vars.json gives exactly one rebuild; stderr:\n{stderr}"
+        );
+    }
+}
+
 // ── Stderr capture completeness (#320) ──────────────────────────────────────
 
 /// The tap must hand back every byte the child wrote, not a prefix of it.
