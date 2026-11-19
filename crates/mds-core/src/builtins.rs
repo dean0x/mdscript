@@ -275,12 +275,13 @@ fn builtin_lower(args: &[Value]) -> Result<Value, MdsError> {
 }
 
 fn upper_result_len(args: &[Value]) -> Option<usize> {
-    case_result_len(args, char::to_uppercase).filter(|&len| len <= MAX_OUTPUT_SIZE)
+    case_result_len(args, |c| c.to_uppercase().map(char::len_utf8).sum())
+        .filter(|&len| len <= MAX_OUTPUT_SIZE)
 }
 
 fn lower_result_len(args: &[Value]) -> Option<usize> {
     // Both forms of lowercase sigma use the same two bytes as uppercase sigma.
-    case_result_len(args, char::to_lowercase)
+    case_result_len(args, |c| c.to_lowercase().map(char::len_utf8).sum())
 }
 
 fn lower_capacity(args: &[Value]) -> Option<usize> {
@@ -302,18 +303,18 @@ fn lower_capacity(args: &[Value]) -> Option<usize> {
     Some(len)
 }
 
-fn case_result_len<I: Iterator<Item = char>>(
-    args: &[Value],
-    map: impl Fn(char) -> I,
-) -> Option<usize> {
+/// Count the bytes of a case mapping. `width` is the byte width of the mapping
+/// of one char. The count stops at the first char past `MAX_OUTPUT_SIZE`.
+#[inline(never)]
+fn case_result_len(args: &[Value], width: fn(char) -> usize) -> Option<usize> {
     let Value::String(s) = args.first()? else {
         return None;
     };
     if s.is_ascii() {
         return Some(s.len());
     }
-    s.chars().flat_map(map).try_fold(0usize, |len, c| {
-        len.checked_add(c.len_utf8())
+    s.chars().try_fold(0usize, |len, c| {
+        len.checked_add(width(c))
             .filter(|&len| len <= MAX_OUTPUT_SIZE)
     })
 }
@@ -336,11 +337,10 @@ fn builtin_output_too_large(name: &str) -> MdsError {
 }
 
 fn builtin_trim(args: &[Value]) -> Result<Value, MdsError> {
-    let s = require_string(args, "trim")?;
-    let len = trim_result_len(args).ok_or_else(MdsError::compile_memory_exceeded)?;
-    let mut out = String::with_capacity(len);
-    out.push_str(s.trim());
-    Ok(Value::String(out))
+    // `to_string` allocates exactly the trimmed length, which the charge counted.
+    Ok(Value::String(
+        require_string(args, "trim")?.trim().to_string(),
+    ))
 }
 
 fn trim_result_len(args: &[Value]) -> Option<usize> {
@@ -559,6 +559,8 @@ fn builtin_join(args: &[Value]) -> Result<Value, MdsError> {
     Ok(Value::String(out))
 }
 
+// One copy serves the charge and the handler.
+#[inline(never)]
 fn join_result_len(args: &[Value]) -> Option<usize> {
     let [Value::Array(arr), Value::String(sep)] = args else {
         return None;
@@ -782,6 +784,8 @@ fn builtin_string(args: &[Value]) -> Result<Value, MdsError> {
     render_value(&args[0], len).map(Value::String)
 }
 
+// One copy serves the charge and the handler.
+#[inline(never)]
 fn string_result_len(args: &[Value]) -> Option<usize> {
     display_len(args.first()?)
 }
@@ -944,25 +948,18 @@ mod tests {
     }
 
     #[test]
-    fn case_mapping_stops_at_the_first_output_byte_over_the_cap() {
+    fn case_mapping_stops_at_the_first_char_over_the_cap() {
         let mapped_width: usize = 'ΐ'.to_uppercase().map(char::len_utf8).sum();
         let mut input = "ΐ".repeat(MAX_OUTPUT_SIZE / mapped_width + 1);
         input.push('!');
-        let reached_suffix = std::cell::Cell::new(false);
         let len = case_result_len(&[Value::String(input)], |c| {
-            if c == '!' {
-                reached_suffix.set(true);
-            }
-            c.to_uppercase()
+            assert_ne!(c, '!', "must not map the suffix past the cap");
+            c.to_uppercase().map(char::len_utf8).sum()
         });
         let error = case_output_len(len, "upper").unwrap_err().serialize();
         assert_eq!(
             error.message,
             "upper() output exceeds maximum size of 52428800 bytes"
-        );
-        assert!(
-            !reached_suffix.get(),
-            "must not map the suffix past the cap"
         );
     }
 
@@ -970,6 +967,15 @@ mod tests {
     fn trim_removes_whitespace() {
         let result = call_builtin("trim", &[s("  hello  ")]).unwrap();
         assert_eq!(result, s("hello"));
+    }
+
+    #[test]
+    fn trim_allocates_exactly_the_charged_length() {
+        let args = [s(" \t hello \n ")];
+        let Value::String(result) = call_builtin("trim", &args).unwrap() else {
+            panic!("trim must return a string");
+        };
+        assert_eq!(Some(result.capacity()), trim_result_len(&args));
     }
 
     #[test]

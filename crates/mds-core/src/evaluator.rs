@@ -1134,23 +1134,15 @@ fn call_qualified_function(
 /// for cross-type comparisons (caller must surface a `TypeMismatch` error).
 /// `NaN == NaN` is `Some(false)` (IEEE 754 via Rust's `f64 ==`).
 ///
-/// Arrays and objects use structural (deep) equality: `Value` derives `PartialEq`,
-/// so this is a recursive element-wise comparison. Note that the condition grammar
-/// currently cannot express container literals on the RHS, so same-type container
-/// comparisons are only reachable at the unit-test level today — these arms guard
-/// future grammar extensions and ensure the contract is correct: same-type always
-/// compares structurally, only cross-type is an error.
+/// Same-type values compare through the derived `PartialEq` of `Value`, the one
+/// equality path. Arrays and objects use structural (deep) equality: a recursive
+/// element-wise comparison. Note that the condition grammar currently cannot
+/// express container literals on the RHS, so same-type container comparisons are
+/// only reachable at the unit-test level today. The contract still holds for
+/// them: same-type always compares structurally, only cross-type is an error.
 fn values_equal_same_type(lhs: &Value, rhs: &Value) -> Option<bool> {
-    match (lhs, rhs) {
-        (Value::String(a), Value::String(b)) => Some(a == b),
-        (Value::Number(a), Value::Number(b)) => Some(a == b),
-        (Value::Boolean(a), Value::Boolean(b)) => Some(a == b),
-        (Value::Null, Value::Null) => Some(true),
-        (Value::Array(a), Value::Array(b)) => Some(a == b),
-        (Value::Object(a), Value::Object(b)) => Some(a == b),
-        // Cross-type: signal TypeMismatch to the caller.
-        _ => None,
-    }
+    // Cross-type: `None` signals TypeMismatch to the caller.
+    (std::mem::discriminant(lhs) == std::mem::discriminant(rhs)).then(|| lhs == rhs)
 }
 
 /// Build a `TypeMismatch` error, with or without a source span.
