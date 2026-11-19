@@ -2246,6 +2246,29 @@ mod tests {
         assert_eq!(result.into_markdown().unwrap(), "---\nlabel: value\n---\n");
     }
 
+    #[test]
+    fn crlf_body_maps_after_frontmatter() {
+        // The first value puts a CR in the first 64-byte block of the raw body.
+        // The second interpolation starts in the next block.
+        let pad = "0123456789abcdef".repeat(4);
+        let source =
+            format!("---\ntype: mds\nlabel: value\n---\n{{{{text}}}}{pad}{{{{text}}}}  \r\n\r\n");
+        let vars = HashMap::from([("text".to_owned(), Value::String("a\r\nb".to_owned()))]);
+        let opts = CompileOptions::default().with_source_map(true);
+        let result = compile_str_with_deps_opts(&source, None, Some(vars), opts).unwrap();
+        assert_eq!(
+            result.source_map.as_ref().unwrap().mappings,
+            ";;;AAIA;CAAQ,gEAAgE;CAAQ"
+        );
+        assert_eq!(
+            result.into_markdown().unwrap(),
+            concat!(
+                "---\nlabel: value\n---\na\n",
+                "b0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefa\nb\n"
+            )
+        );
+    }
+
     // ── strip_reserved_keys: type: mds variants ───────────────────────────────
 
     #[test]
