@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use crate::error::MdsError;
-use crate::evaluator::budget::{display_len, render_prefixed_value, render_value};
+use crate::evaluator::budget::{display_len, format_exact, render_prefixed_value, render_value};
 use crate::limits::{MAX_ARRAY_ELEMENTS, MAX_OUTPUT_SIZE};
 use crate::value::Value;
 
@@ -750,12 +750,7 @@ fn unique_key(v: &Value) -> Result<String, MdsError> {
 }
 
 fn render_number_key(n: f64) -> Result<String, MdsError> {
-    use std::fmt::Write;
-
-    let mut text =
-        String::with_capacity(number_key_len(n).ok_or_else(MdsError::compile_memory_exceeded)?);
-    write!(text, "n:{n}").map_err(|_| MdsError::compile_memory_exceeded())?;
-    Ok(text)
+    format_exact(number_key_len(n), format_args!("n:{n}"))
 }
 
 pub(crate) fn number_key_len(n: f64) -> Option<usize> {

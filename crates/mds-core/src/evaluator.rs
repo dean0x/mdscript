@@ -1,11 +1,11 @@
 use std::borrow::Cow;
-use std::fmt::{self, Write};
+use std::fmt;
 use std::sync::Arc;
 
 pub(crate) mod budget;
 use budget::{
-    bytes, display_len, format_len, render_value, table_bytes, value_bytes, MemBudget, Part, NODE,
-    VALUE_ROOT,
+    bytes, display_len, format_exact, format_len, render_value, table_bytes, value_bytes,
+    MemBudget, Part, NODE, VALUE_ROOT,
 };
 
 use crate::arity::check_arity;
@@ -1467,11 +1467,7 @@ fn evaluate_for(
 // Warning text is formatted first. Its capacity is at most one allocation
 // proportional to the capped alias, plus the fixed diagnostic text.
 fn push_warning(ctx: &mut EvalContext, args: fmt::Arguments<'_>) -> Result<(), MdsError> {
-    let len = format_len(args).ok_or_else(MdsError::compile_memory_exceeded)?;
-    let mut message = String::with_capacity(len);
-    message
-        .write_fmt(args)
-        .map_err(|_| MdsError::compile_memory_exceeded())?;
+    let message = format_exact(format_len(args), args)?;
     ctx.budget.mem.charge(Part::Buffers, message.capacity())?;
     ctx.warnings.push(message);
     Ok(())

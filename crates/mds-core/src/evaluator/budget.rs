@@ -13,12 +13,14 @@ pub(crate) fn bytes(count: usize, unit: usize) -> Option<usize> {
     count.checked_mul(unit)
 }
 
+/// Count the Display length of a value. The count is the Display output itself,
+/// so it cannot drift from the rendered text.
+#[inline(never)]
 pub(crate) fn display_len(value: &Value) -> Option<usize> {
-    walk(value, Mode::Display)
-}
-
-pub(super) fn value_bytes(value: &Value) -> Option<usize> {
-    walk(value, Mode::Bytes)
+    // The byte walk refuses a value past the depth or step bound before
+    // the recursive Display runs.
+    value_bytes(value)?;
+    format_len(format_args!("{value}"))
 }
 
 pub(crate) fn render_value(value: &Value, len: usize) -> Result<String, MdsError> {
@@ -30,19 +32,23 @@ pub(crate) fn render_prefixed_value(
     len: usize,
     prefix: &str,
 ) -> Result<String, MdsError> {
-    let mut text = String::with_capacity(
-        len.checked_add(prefix.len())
-            .ok_or_else(MdsError::compile_memory_exceeded)?,
-    );
-    text.push_str(prefix);
-    write!(text, "{value}").map_err(|_| MdsError::compile_memory_exceeded())?;
-    Ok(text)
+    format_exact(
+        len.checked_add(prefix.len()),
+        format_args!("{prefix}{value}"),
+    )
 }
 
-#[derive(Clone, Copy)]
-enum Mode {
-    Bytes,
-    Display,
+/// Format into one allocation of the counted length. `None` is a count past
+/// the address space.
+#[inline(never)]
+pub(crate) fn format_exact(
+    len: Option<usize>,
+    args: fmt::Arguments<'_>,
+) -> Result<String, MdsError> {
+    let mut text = String::with_capacity(len.ok_or_else(MdsError::compile_memory_exceeded)?);
+    text.write_fmt(args)
+        .map_err(|_| MdsError::compile_memory_exceeded())?;
+    Ok(text)
 }
 
 enum Children<'a> {
@@ -62,35 +68,23 @@ pub(super) fn table_bytes(capacity: usize, entry: usize) -> Option<usize> {
     bytes(buckets, entry.checked_add(1)?)?.checked_add(16)
 }
 
-fn walk(mut value: &Value, mode: Mode) -> Option<usize> {
-    let mut total = match mode {
-        Mode::Bytes => VALUE_ROOT,
-        Mode::Display => 0,
-    };
-    let mut stack: [Option<Children<'_>>; MAX_VALUE_DEPTH] = std::array::from_fn(|_| None);
+/// Count the bytes of a value tree. `None` is a value past the depth or step
+/// bound, or a count past the address space.
+pub(super) fn value_bytes(mut value: &Value) -> Option<usize> {
+    let mut total = VALUE_ROOT;
+    let mut stack = [const { None }; MAX_VALUE_DEPTH];
     let mut depth = 0;
     for _ in 0..MAX_COMPILE_MEMORY {
-        let (n, children) = match (mode, value) {
-            (Mode::Bytes, Value::String(s)) => (s.capacity(), None),
-            (Mode::Display, Value::String(s)) => (s.len(), None),
-            (Mode::Bytes, Value::Array(items)) => (
+        let (n, children) = match value {
+            Value::String(s) => (s.capacity(), None),
+            Value::Array(items) => (
                 bytes(items.capacity(), NODE)?,
                 Some(Children::Array(items.iter())),
             ),
-            (Mode::Display, Value::Array(items)) => (
-                bytes(items.len().saturating_sub(1), 2)?,
-                Some(Children::Array(items.iter())),
-            ),
-            (Mode::Bytes, Value::Object(fields)) => (
+            Value::Object(fields) => (
                 table_bytes(fields.capacity(), size_of::<(String, Value)>())?,
                 Some(Children::Object(fields.iter())),
             ),
-            (Mode::Display, Value::Object(fields)) => (
-                bytes(fields.len().saturating_sub(1), 2)?,
-                Some(Children::Object(fields.iter())),
-            ),
-            (Mode::Display, Value::Number(_)) => (format_len(format_args!("{value}"))?, None),
-            (Mode::Display, Value::Boolean(b)) => (if *b { 4 } else { 5 }, None),
             _ => (0, None),
         };
         total = total.checked_add(n)?;
@@ -105,16 +99,12 @@ fn walk(mut value: &Value, mode: Mode) -> Option<usize> {
             }
         }
         let mut next = None;
-        for entry in stack[..depth].iter_mut().rev() {
+        for entry in stack.get_mut(..depth)?.iter_mut().rev() {
             next = match entry.as_mut()? {
                 Children::Array(items) => items.next(),
                 Children::Object(fields) => match fields.next() {
                     Some((key, value)) => {
-                        let key_bytes = match mode {
-                            Mode::Bytes => key.capacity(),
-                            Mode::Display => key.len().checked_add(2)?,
-                        };
-                        total = total.checked_add(key_bytes)?;
+                        total = total.checked_add(key.capacity())?;
                         Some(value)
                     }
                     None => None,
