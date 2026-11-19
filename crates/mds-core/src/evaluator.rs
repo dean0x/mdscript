@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+mod budget;
+use budget::{MemBudget, Part};
+
 use crate::arity::check_arity;
 use crate::ast::{
     render_signature, required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock,
@@ -40,6 +43,7 @@ pub(crate) struct EvalBudget {
     /// growth is caught before a giant `Vec` is built.
     message_bytes: usize,
     function_calls: usize,
+    mem: MemBudget,
 }
 
 impl EvalBudget {
@@ -275,150 +279,151 @@ fn evaluate_nodes(
     let saved_cursor = ctx.map.as_ref().map_or(0, |map| map.cursor);
 
     for node in nodes {
-        let abs_out = saved_cursor + (out.len() - start_len) as u32;
-        let slot;
-        let rendered;
-        let included;
-        // Child bodies append to `out` directly. Leaf text uses one capped append.
-        let piece = match node {
-            Node::Text(t) => {
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 {
-                        // Enforced in release builds too (#220): `cursor` is the absolute
-                        // output position every following segment is computed from, so a
-                        // desynchronised cursor mis-attributes the whole rest of the map
-                        // in silence — a source map that points at the wrong bytes is
-                        // worse than no source map. Only a defect in the arms that
-                        // re-anchor the cursor can trip it; no template input can.
-                        // Cost: one u32 compare per node, only while a source map is
-                        // being recorded.
-                        assert_eq!(
-                            map.cursor, abs_out,
-                            "source-map cursor desynchronised from the output length at \
+        let mark = ctx.budget.mem.mark();
+        let result = (|| -> Result<(), MdsError> {
+            let abs_out = saved_cursor + (out.len() - start_len) as u32;
+            let slot;
+            let rendered;
+            let included;
+            // Child bodies append to `out` directly. Leaf text uses one capped append.
+            let piece = match node {
+                Node::Text(t) => {
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 {
+                            // Enforced in release builds too (#220): `cursor` is the absolute
+                            // output position every following segment is computed from, so a
+                            // desynchronised cursor mis-attributes the whole rest of the map
+                            // in silence — a source map that points at the wrong bytes is
+                            // worse than no source map. Only a defect in the arms that
+                            // re-anchor the cursor can trip it; no template input can.
+                            // Cost: one u32 compare per node, only while a source map is
+                            // being recorded.
+                            assert_eq!(
+                                map.cursor, abs_out,
+                                "source-map cursor desynchronised from the output length at \
                              a Text node: every following segment would map to the wrong \
                              output offset"
-                        );
-                        map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
+                            );
+                            map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
+                        }
                     }
+                    Some(t.text.as_str())
                 }
-                Some(t.text.as_str())
-            }
-            Node::EscapedBrace { offset } => {
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 {
-                        // Enforced in release too (#220); see the Text arm above.
-                        assert_eq!(
-                            map.cursor, abs_out,
-                            "source-map cursor desynchronised from the output length at \
+                Node::EscapedBrace { offset } => {
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 {
+                            // Enforced in release too (#220); see the Text arm above.
+                            assert_eq!(
+                                map.cursor, abs_out,
+                                "source-map cursor desynchronised from the output length at \
                              an EscapedBrace node: every following segment would map to \
                              the wrong output offset"
-                        );
-                        // Source span: `\{{` is 3 source bytes (backslash + two braces).
-                        map.push_segment(abs_out, *offset as u32, 3);
+                            );
+                            // Source span: `\{{` is 3 source bytes (backslash + two braces).
+                            map.push_segment(abs_out, *offset as u32, 3);
+                        }
                     }
+                    Some("{{")
                 }
-                Some("{{")
-            }
-            Node::Interpolation(interp) => {
-                // S8: reset ownership flag before each call so arg-evaluation
-                // side-effects from nested S8 calls don't corrupt the outer arm.
-                ctx.fn_body_owned = false;
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 {
-                        // Assert cursor invariant before anchoring.  On the S8 path,
-                        // invoke_function will read this anchor as the body's base
-                        // output position.
-                        // Enforced in release too (#220); see the Text arm above.
-                        assert_eq!(
-                            map.cursor, abs_out,
-                            "source-map cursor desynchronised from the output length at \
+                Node::Interpolation(interp) => {
+                    // S8: reset ownership flag before each call so arg-evaluation
+                    // side-effects from nested S8 calls don't corrupt the outer arm.
+                    ctx.fn_body_owned = false;
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 {
+                            // Assert cursor invariant before anchoring.  On the S8 path,
+                            // invoke_function will read this anchor as the body's base
+                            // output position.
+                            // Enforced in release too (#220); see the Text arm above.
+                            assert_eq!(
+                                map.cursor, abs_out,
+                                "source-map cursor desynchronised from the output length at \
                              an Interpolation node: every following segment would map to \
                              the wrong output offset"
-                        );
+                            );
+                        }
+                        // Always anchor cursor so inner evaluate_nodes invocations
+                        // (invoke_function / S8 body descent) start from the correct
+                        // absolute position.
+                        map.cursor = abs_out;
                     }
-                    // Always anchor cursor so inner evaluate_nodes invocations
-                    // (invoke_function / S8 body descent) start from the correct
-                    // absolute position.
-                    map.cursor = abs_out;
-                }
-                slot = evaluate_expr(&interp.expr, scope, ctx)?;
-                rendered = render_expr(&interp.expr, &slot)?;
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 && !ctx.fn_body_owned {
-                        // S3 path: body was suppressed; record the call-site span.
-                        // On the S8 path, invoke_function already pushed fine-grained
-                        // body segments attributed to the definition file — skip here.
-                        map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
+                    slot = evaluate_expr(&interp.expr, scope, ctx)?;
+                    rendered = render_expr(&interp.expr, &slot)?;
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 && !ctx.fn_body_owned {
+                            // S3 path: body was suppressed; record the call-site span.
+                            // On the S8 path, invoke_function already pushed fine-grained
+                            // body segments attributed to the definition file — skip here.
+                            map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
+                        }
                     }
+                    Some(rendered.as_ref())
                 }
-                Some(rendered.as_ref())
-            }
-            Node::If(block) => {
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::If(block) => {
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_if(block, scope, ctx, out)?;
+                    None
                 }
-                evaluate_if(block, scope, ctx, out)?;
-                None
-            }
-            Node::For(block) => {
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::For(block) => {
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_for(block, scope, ctx, out)?;
+                    None
                 }
-                evaluate_for(block, scope, ctx, out)?;
-                None
-            }
-            Node::Define(_) => {
-                // Handled by resolver with full lexical capture; no output.
-                continue;
-            }
-            Node::Import(_) | Node::Export(_) => {
-                // Handled by resolver, skip during evaluation.
-                continue;
-            }
-            Node::Include(inc) => {
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::Define(_) | Node::Import(_) | Node::Export(_) => {
+                    // The resolver handles these directives.
+                    return Ok(());
                 }
-                included = evaluate_include(inc, scope, ctx)?;
-                included.as_deref()
-            }
-            Node::Message(block) => {
-                // Text mode: render the body inline, ignoring the role marker.
-                // This maintains full backward compatibility — @message blocks are
-                // transparent when compiling to plain text.
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::Include(inc) => {
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    included = evaluate_include(inc, scope, ctx)?;
+                    included.as_deref()
                 }
-                evaluate_nodes(&block.body, scope, ctx, out)?;
-                None
-            }
-            Node::Block(block) => {
-                // Standalone mode: render the block's default body inline.
-                // The block markers are invisible in text output — @block is a
-                // transparent wrapper in non-extending files. An `@extends` chain
-                // never reaches this arm: the resolver evaluates each block's
-                // effective body (base default or child override) as its own region.
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::Message(block) => {
+                    // Text mode: render the body inline, ignoring the role marker.
+                    // This maintains full backward compatibility — @message blocks are
+                    // transparent when compiling to plain text.
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_nodes(&block.body, scope, ctx, out)?;
+                    None
                 }
-                evaluate_block(block, scope, ctx, out)?;
-                None
+                Node::Block(block) => {
+                    // Standalone mode: render the block's default body inline.
+                    // The block markers are invisible in text output — @block is a
+                    // transparent wrapper in non-extending files. An `@extends` chain
+                    // never reaches this arm: the resolver evaluates each block's
+                    // effective body (base default or child override) as its own region.
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_block(block, scope, ctx, out)?;
+                    None
+                }
+            };
+            if let Some(piece) = piece {
+                push_capped(out, piece, &mut ctx.budget.mem)?;
             }
-        };
-        if let Some(piece) = piece {
-            push_capped(out, piece)?;
-        }
-        // Re-anchor after the node, including after an empty child body.
-        if let Some(ref mut map) = ctx.map {
-            map.cursor = saved_cursor + (out.len() - start_len) as u32;
-        }
+            // Re-anchor after the node, including after an empty child body.
+            if let Some(ref mut map) = ctx.map {
+                map.cursor = saved_cursor + (out.len() - start_len) as u32;
+            }
+            Ok(())
+        })();
+        ctx.budget.mem.release_to(mark);
+        result?;
     }
 
     Ok(())
 }
 
-/// Append `add` to the output buffer `out`, or fail with the output-cap error and
-/// leave `out` unchanged.
+/// Append `add` to `out` after the size and memory checks pass.
 ///
 /// Every output accumulator appends through this (#415), so `MAX_OUTPUT_SIZE` is
 /// checked before the bytes land: a loop crossing the cap stops on the crossing pass
@@ -426,9 +431,8 @@ fn evaluate_nodes(
 /// `push_str`, but never reserves past the cap, so capacity is bounded too — plain
 /// doubling would take a buffer to about twice the cap.
 ///
-/// The cap bounds each buffer, not a compile's total memory. Function bodies,
-/// message content and imported modules use separate buffers.
-pub(crate) fn push_capped(out: &mut String, add: &str) -> Result<(), MdsError> {
+/// The memory budget also counts the capacity of each live output buffer.
+fn push_capped(out: &mut String, add: &str, mem: &mut MemBudget) -> Result<(), MdsError> {
     let needed = out
         .len()
         .checked_add(add.len())
@@ -441,7 +445,11 @@ pub(crate) fn push_capped(out: &mut String, add: &str) -> Result<(), MdsError> {
             .saturating_mul(2)
             .max(needed)
             .min(MAX_OUTPUT_SIZE);
+        mem.charge(Part::Buffers, target - out.capacity())?;
         out.reserve_exact(target - out.len());
+        if out.capacity() > target {
+            mem.charge(Part::Buffers, out.capacity() - target)?;
+        }
     }
     out.push_str(add);
     Ok(())
@@ -673,9 +681,20 @@ fn invoke_function(
     }
     check_function_arity(func, call_key, args.len())?;
     ctx.budget.charge_function_call()?;
+    let mark = ctx.budget.mem.mark();
+    let mut body = String::new();
     scope.push_call(func);
-    let result = evaluate_function_body(func, call_key, args, scope, ctx);
-    prefer_first_error(result, scope.pop())
+    let result = evaluate_function_body(func, call_key, args, scope, ctx, &mut body);
+    let result = prefer_first_error(result, scope.pop());
+    ctx.budget.mem.release_to(mark);
+    if result.is_ok() {
+        ctx.budget
+            .mem
+            .transfer(Part::Buffers, Part::Temp, body.capacity());
+    } else {
+        ctx.budget.mem.release_buffers(body.capacity());
+    }
+    result.map(|()| body)
 }
 
 fn bind_call_params(
@@ -709,7 +728,8 @@ fn evaluate_function_body(
     args: &[Slot],
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
+    raw_body: &mut String,
+) -> Result<(), MdsError> {
     bind_call_params(&func.params, args, scope)?;
 
     // B1 (applies PF-012): swap body_origin to the function's defining file so
@@ -718,7 +738,6 @@ fn evaluate_function_body(
     // (LIFO-correct for nested cross-file define chains: A calls B calls C →
     // C's origin is innermost, A's is restored when C's call returns, etc.).
     let prev_body_origin = std::mem::replace(&mut ctx.body_origin, func.origin.clone());
-    let mut raw_body = String::new();
 
     // S8 path: fine-grained function body source attribution.
     //
@@ -765,7 +784,7 @@ fn evaluate_function_body(
             };
 
         ctx.call_stack.push(call_key.to_string());
-        let body_result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body);
+        let body_result = evaluate_nodes(&func.body, scope, ctx, raw_body);
         let popped = ctx.call_stack.pop();
 
         // Restore source attribution for the outer scope.
@@ -790,7 +809,7 @@ fn evaluate_function_body(
         // MAX_OUTPUT_SIZE (50 MB) so try_from always succeeds in practice;
         // u32::MAX fallback causes rebase_trim to drop all segments (safe degradation).
         let untrimmed_len = u32::try_from(raw_body.len()).unwrap_or(u32::MAX);
-        let (lead, trail) = trim_body(&mut raw_body);
+        let (lead, trail) = trim_body(raw_body, &mut ctx.budget.mem);
         let lead = u32::try_from(lead).unwrap_or(u32::MAX);
         let trail = u32::try_from(trail).unwrap_or(u32::MAX);
         let trimmed_len = u32::try_from(raw_body.len()).unwrap_or(u32::MAX);
@@ -813,7 +832,7 @@ fn evaluate_function_body(
         // Signal to the Interpolation arm: body owns the segments.
         ctx.fn_body_owned = true;
 
-        Ok(raw_body)
+        Ok(())
     } else {
         // S3 path: suppress source-map recording inside function bodies.
         // The call site (the Interpolation node) is recorded as a single point
@@ -822,9 +841,8 @@ fn evaluate_function_body(
             map.suppress += 1;
         }
         ctx.call_stack.push(call_key.to_string());
-        let result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body).map(|()| {
-            trim_body(&mut raw_body);
-            raw_body
+        let result = evaluate_nodes(&func.body, scope, ctx, raw_body).map(|()| {
+            trim_body(raw_body, &mut ctx.budget.mem);
         });
         // Safety-critical LIFO invariant: call_stack tracks recursion detection.
         // A mismatched pop would silently corrupt recursion state and allow
@@ -848,7 +866,7 @@ fn evaluate_function_body(
 }
 
 /// Trim the buffer and return the original leading and trailing byte counts.
-fn trim_body(body: &mut String) -> (usize, usize) {
+fn trim_body(body: &mut String, mem: &mut MemBudget) -> (usize, usize) {
     let lead = body.len() - body.trim_start().len();
     let end = body.trim_end().len();
     let trail = body.len() - end;
@@ -856,8 +874,10 @@ fn trim_body(body: &mut String) -> (usize, usize) {
     // The two edges overlap if the entire body is whitespace.
     drop(body.drain(..lead.min(end)));
     // Do not keep a large allocation for a small result after the trim.
-    if body.capacity() > 2 * body.len() {
+    let capacity = body.capacity();
+    if capacity > 2 * body.len() {
         body.shrink_to_fit();
+        mem.release_buffers(capacity - body.capacity());
     }
     (lead, trail)
 }
@@ -1018,7 +1038,8 @@ fn evaluate_condition(
     ctx: &mut EvalContext,
     anchor: Option<usize>,
 ) -> Result<bool, MdsError> {
-    match condition {
+    let mark = ctx.budget.mem.mark();
+    let result = (|| match condition {
         Condition::Truthy(expr) | Condition::Not(expr) => {
             let slot = evaluate_expr(expr, scope, ctx)?;
             let truthy = slot.get().ok_or_else(invalid_projection)?.is_truthy();
@@ -1070,7 +1091,9 @@ fn evaluate_condition(
             }
             Ok(false)
         }
-    }
+    })();
+    ctx.budget.mem.release_to(mark);
+    result
 }
 
 fn evaluate_if(
@@ -1130,87 +1153,98 @@ fn drive_for<F>(
 where
     F: FnMut(&mut Scope, &mut EvalContext) -> Result<(), MdsError>,
 {
-    let slot = evaluate_expr(&block.iterable, scope, ctx)?;
-    let iterable = slot.get().ok_or_else(invalid_projection)?;
+    let mark = ctx.budget.mem.mark();
+    let result = (|| {
+        let slot = evaluate_expr(&block.iterable, scope, ctx)?;
+        let iterable = slot.get().ok_or_else(invalid_projection)?;
 
-    if let Some(ref key_var) = block.key_var {
-        // Key-value iteration: @for key, value in obj:
-        let map = match iterable {
-            Value::Object(m) => m,
-            _ => {
-                return Err(MdsError::syntax(format!(
-                    "key-value iteration requires an object, but got {}",
-                    iterable.type_name()
+        if let Some(ref key_var) = block.key_var {
+            // Key-value iteration: @for key, value in obj:
+            let map = match iterable {
+                Value::Object(m) => m,
+                _ => {
+                    return Err(MdsError::syntax(format!(
+                        "key-value iteration requires an object, but got {}",
+                        iterable.type_name()
+                    )));
+                }
+            };
+
+            if map.len() > MAX_LOOP_ITERATIONS {
+                return Err(MdsError::resource_limit(format!(
+                    "object has {} entries, exceeding maximum loop iteration limit of {}",
+                    map.len(),
+                    MAX_LOOP_ITERATIONS
                 )));
             }
-        };
 
-        if map.len() > MAX_LOOP_ITERATIONS {
+            // Sort keys alphabetically for deterministic output.
+            // SAFE to use unstable sort: `map` comes from `Value::Object` (a HashMap) —
+            // keys are unique by construction so no two elements compare equal (tie-free).
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort_unstable();
+
+            for key in keys {
+                ctx.budget.iterations += 1;
+                if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
+                    return Err(MdsError::resource_limit(format!(
+                    "total loop iterations exceeded maximum of {} across all loops in this compilation",
+                    MAX_TOTAL_ITERATIONS
+                )));
+                }
+                let pass = ctx.budget.mem.mark();
+                scope.push();
+                scope.set_var(key_var, Value::String(key.clone()));
+                scope.set_slot(&block.var, slot.project(PathStep::Key(key.clone())));
+                let result = body(scope, ctx);
+                let result = prefer_first_error(result, scope.pop());
+                ctx.budget.mem.release_to(pass);
+                result?;
+            }
+            return Ok(());
+        }
+
+        // Standard array iteration: @for item in iterable:
+        // Objects are rejected here with a hint to use key-value syntax.
+        if let Value::Object(_) = iterable {
+            return Err(MdsError::syntax(
+                "to iterate over an object's entries, use `@for key, value in obj:` syntax",
+            ));
+        }
+
+        let array = iterable
+            .as_array()
+            .ok_or_else(|| MdsError::type_error(iterable.type_name()))?;
+
+        // Check length before any pass creates a projection.
+        if array.len() > MAX_LOOP_ITERATIONS {
             return Err(MdsError::resource_limit(format!(
-                "object has {} entries, exceeding maximum loop iteration limit of {}",
-                map.len(),
+                "array has {} elements, exceeding maximum loop iteration limit of {}",
+                array.len(),
                 MAX_LOOP_ITERATIONS
             )));
         }
 
-        // Sort keys alphabetically for deterministic output.
-        // SAFE to use unstable sort: `map` comes from `Value::Object` (a HashMap) —
-        // keys are unique by construction so no two elements compare equal (tie-free).
-        let mut keys: Vec<_> = map.keys().collect();
-        keys.sort_unstable();
-
-        for key in keys {
+        for i in 0..array.len() {
             ctx.budget.iterations += 1;
             if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
                 return Err(MdsError::resource_limit(format!(
-                    "total loop iterations exceeded maximum of {} across all loops in this compilation",
-                    MAX_TOTAL_ITERATIONS
-                )));
-            }
-            scope.push();
-            scope.set_var(key_var, Value::String(key.clone()));
-            scope.set_slot(&block.var, slot.project(PathStep::Key(key.clone())));
-            let result = body(scope, ctx);
-            prefer_first_error(result, scope.pop())?;
-        }
-        return Ok(());
-    }
-
-    // Standard array iteration: @for item in iterable:
-    // Objects are rejected here with a hint to use key-value syntax.
-    if let Value::Object(_) = iterable {
-        return Err(MdsError::syntax(
-            "to iterate over an object's entries, use `@for key, value in obj:` syntax",
-        ));
-    }
-
-    let array = iterable
-        .as_array()
-        .ok_or_else(|| MdsError::type_error(iterable.type_name()))?;
-
-    // Check length before any pass creates a projection.
-    if array.len() > MAX_LOOP_ITERATIONS {
-        return Err(MdsError::resource_limit(format!(
-            "array has {} elements, exceeding maximum loop iteration limit of {}",
-            array.len(),
-            MAX_LOOP_ITERATIONS
-        )));
-    }
-
-    for i in 0..array.len() {
-        ctx.budget.iterations += 1;
-        if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
-            return Err(MdsError::resource_limit(format!(
                 "total loop iterations exceeded maximum of {} across all loops in this compilation",
                 MAX_TOTAL_ITERATIONS
             )));
+            }
+            let pass = ctx.budget.mem.mark();
+            scope.push();
+            scope.set_slot(&block.var, slot.project(PathStep::Index(i)));
+            let result = body(scope, ctx);
+            let result = prefer_first_error(result, scope.pop());
+            ctx.budget.mem.release_to(pass);
+            result?;
         }
-        scope.push();
-        scope.set_slot(&block.var, slot.project(PathStep::Index(i)));
-        let result = body(scope, ctx);
-        prefer_first_error(result, scope.pop())?;
-    }
-    Ok(())
+        Ok(())
+    })();
+    ctx.budget.mem.release_to(mark);
+    result
 }
 
 fn evaluate_for(
@@ -1410,63 +1444,77 @@ fn collect_single_message(
     ctx: &mut EvalContext,
     out: &mut Vec<EvalMessage>,
 ) -> Result<(), MdsError> {
-    // Evaluate the role expression to a string.
-    let role_slot = evaluate_expr(&block.role, scope, ctx)?;
-    let role_value = role_slot.get().ok_or_else(invalid_projection)?;
-    let Value::String(role) = role_value else {
-        return Err(MdsError::type_error(format!(
-            "@message role must evaluate to a string, but got {}",
-            role_value.type_name()
-        )));
-    };
-    // Mirror the parse-time empty-role rejection on the dynamic path: a variable
-    // or expression that evaluates to "" or whitespace-only must also be rejected.
-    if role.trim().is_empty() {
-        return Err(MdsError::type_error(
-            "@message role must evaluate to a non-empty string",
-        ));
-    }
+    let mark = ctx.budget.mem.mark();
+    let result = (|| {
+        // Evaluate the role expression to a string.
+        let role_slot = evaluate_expr(&block.role, scope, ctx)?;
+        let role_value = role_slot.get().ok_or_else(invalid_projection)?;
+        let Value::String(role) = role_value else {
+            return Err(MdsError::type_error(format!(
+                "@message role must evaluate to a string, but got {}",
+                role_value.type_name()
+            )));
+        };
+        // Mirror the parse-time empty-role rejection on the dynamic path: a variable
+        // or expression that evaluates to "" or whitespace-only must also be rejected.
+        if role.trim().is_empty() {
+            return Err(MdsError::type_error(
+                "@message role must evaluate to a non-empty string",
+            ));
+        }
 
-    // Evaluate the body as plain text and trim surrounding whitespace.
-    // NOTE: this path uses only `.trim()`, NOT `clean_output` — `\r` characters
-    // and blank-line runs inside a @message body survive verbatim into the
-    // compiled JSON output. `mds fmt` relies on this: `raw_content_spans` in
-    // `formatter.rs` marks @message and @define bodies as raw content to prevent
-    // R1 (`\r` strip) and R3 (blank-line-run cap) from silently changing compiled
-    // output. Adding a `clean_output` call here would break the formatter's
-    // safety model without any corresponding formatter change.
-    let mut content = String::new();
-    evaluate_nodes(&block.body, scope, ctx, &mut content)?;
-    trim_body(&mut content);
+        // Evaluate the body as plain text and trim surrounding whitespace.
+        // NOTE: this path uses only `.trim()`, NOT `clean_output` — `\r` characters
+        // and blank-line runs inside a @message body survive verbatim into the
+        // compiled JSON output. `mds fmt` relies on this: `raw_content_spans` in
+        // `formatter.rs` marks @message and @define bodies as raw content to prevent
+        // R1 (`\r` strip) and R3 (blank-line-run cap) from silently changing compiled
+        // output. Adding a `clean_output` call here would break the formatter's
+        // safety model without any corresponding formatter change.
+        let mut content = String::new();
+        if let Err(error) = evaluate_nodes(&block.body, scope, ctx, &mut content) {
+            ctx.budget.mem.release_buffers(content.capacity());
+            return Err(error);
+        }
+        trim_body(&mut content, &mut ctx.budget.mem);
+        ctx.budget
+            .mem
+            .transfer(Part::Buffers, Part::Temp, content.capacity());
 
-    // Skip empty messages.
-    if content.is_empty() {
-        return Ok(());
-    }
+        // Skip empty messages.
+        if content.is_empty() {
+            return Ok(());
+        }
 
-    if out.len() >= MAX_MESSAGE_COUNT {
-        return Err(MdsError::resource_limit(format!(
-            "message count exceeded maximum of {}",
-            MAX_MESSAGE_COUNT
-        )));
-    }
+        if out.len() >= MAX_MESSAGE_COUNT {
+            return Err(MdsError::resource_limit(format!(
+                "message count exceeded maximum of {}",
+                MAX_MESSAGE_COUNT
+            )));
+        }
 
-    // Incremental cumulative-size check (AC-6.3): cap the aggregate content bytes
-    // across all messages at MAX_MESSAGES_TOTAL_SIZE (50 MB) — the same ceiling a
-    // single text-mode output has.  Checked before pushing so a runaway is caught early.
-    ctx.budget.message_bytes = ctx.budget.message_bytes.saturating_add(content.len());
-    if ctx.budget.message_bytes > MAX_MESSAGES_TOTAL_SIZE {
-        return Err(MdsError::resource_limit(format!(
-            "total message content exceeds maximum cumulative size of {} bytes",
-            MAX_MESSAGES_TOTAL_SIZE
-        )));
-    }
+        // Incremental cumulative-size check (AC-6.3): cap the aggregate content bytes
+        // across all messages at MAX_MESSAGES_TOTAL_SIZE (50 MB) — the same ceiling a
+        // single text-mode output has.  Checked before pushing so a runaway is caught early.
+        ctx.budget.message_bytes = ctx.budget.message_bytes.saturating_add(content.len());
+        if ctx.budget.message_bytes > MAX_MESSAGES_TOTAL_SIZE {
+            return Err(MdsError::resource_limit(format!(
+                "total message content exceeds maximum cumulative size of {} bytes",
+                MAX_MESSAGES_TOTAL_SIZE
+            )));
+        }
 
-    let Some(Value::String(role)) = role_slot.into_value() else {
-        return Err(invalid_projection());
-    };
-    out.push(EvalMessage { role, content });
-    Ok(())
+        let Some(Value::String(role)) = role_slot.into_value() else {
+            return Err(invalid_projection());
+        };
+        ctx.budget
+            .mem
+            .transfer(Part::Temp, Part::Buffers, content.capacity());
+        out.push(EvalMessage { role, content });
+        Ok(())
+    })();
+    ctx.budget.mem.release_to(mark);
+    result
 }
 
 fn collect_messages_from_if(
@@ -2388,9 +2436,10 @@ mod tests {
     #[test]
     fn push_capped_growth_never_reserves_past_the_cap() {
         let mut out = String::new();
+        let mut mem = MemBudget::default();
         let chunk = "a".repeat(1024 * 1024);
         for pass in 1..=MAX_OUTPUT_SIZE / chunk.len() {
-            push_capped(&mut out, &chunk).expect("appends up to the cap must succeed");
+            push_capped(&mut out, &chunk, &mut mem).expect("appends up to the cap must succeed");
             assert!(
                 out.capacity() >= out.len() && out.capacity() <= MAX_OUTPUT_SIZE,
                 "pass {pass}: capacity {} must lie between the length {} and the cap",
@@ -2408,12 +2457,13 @@ mod tests {
     #[test]
     fn push_capped_refuses_past_the_cap_and_leaves_the_buffer_unchanged() {
         let mut out = String::new();
-        push_capped(&mut out, &"a".repeat(MAX_OUTPUT_SIZE - 1)).expect("under the cap");
-        push_capped(&mut out, "b").expect("exactly the cap is allowed");
-        push_capped(&mut out, "").expect("an empty append at the cap is allowed");
+        let mut mem = MemBudget::default();
+        push_capped(&mut out, &"a".repeat(MAX_OUTPUT_SIZE - 1), &mut mem).expect("under the cap");
+        push_capped(&mut out, "b", &mut mem).expect("exactly the cap is allowed");
+        push_capped(&mut out, "", &mut mem).expect("an empty append at the cap is allowed");
         assert_eq!(out.len(), MAX_OUTPUT_SIZE);
 
-        let err = push_capped(&mut out, "c").expect_err("one byte past the cap");
+        let err = push_capped(&mut out, "c", &mut mem).expect_err("one byte past the cap");
         assert_eq!(err.to_string(), output_cap_message());
         assert!(
             out.len() == MAX_OUTPUT_SIZE && out.ends_with('b'),
@@ -3530,7 +3580,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_messages_seeded_threads_both_budgets_across_calls() {
+    fn evaluate_messages_seeded_threads_budgets_across_calls() {
         let body = parse_body("@for i in items:\n@message user:\nhi\n@end\n@end\n");
         let mut warnings = vec![];
 
@@ -3554,11 +3604,15 @@ mod tests {
                 content: "hi".to_string()
             }]
         );
+        let mut mem = MemBudget::default();
+        mem.charge(Part::Buffers, out[0].content.capacity())
+            .unwrap();
         assert_eq!(
             budget,
             EvalBudget {
                 iterations: 1,
                 message_bytes: 2,
+                mem,
                 ..EvalBudget::default()
             }
         );
@@ -3581,6 +3635,7 @@ mod tests {
         )
         .expect("the last message under the cap must be collected");
         assert_eq!(budget.message_bytes, MAX_MESSAGES_TOTAL_SIZE);
+        let spent = budget.mem;
         assert_limit(
             evaluate_messages_seeded(
                 &body,
@@ -3594,6 +3649,10 @@ mod tests {
             MESSAGE_BYTES_LIMIT_MSG,
         );
         assert_eq!(out.len(), 1, "the tripping message is never collected");
+        assert_eq!(
+            budget.mem, spent,
+            "the refused message releases its capacity"
+        );
 
         // Iterations: the messages path spends from the same iteration budget.
         let mut budget = EvalBudget {

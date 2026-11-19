@@ -3,7 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
-use crate::limits::MAX_OUTPUT_SIZE;
+use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE};
 use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
 
 // ── Serializable error types ──────────────────────────────────────────────────
@@ -950,6 +950,14 @@ impl MdsError {
     pub(crate) fn output_size_exceeded() -> Self {
         Self::resource_limit(format!(
             "output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn compile_memory_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "compile memory exceeds maximum of {MAX_COMPILE_MEMORY} bytes"
         ))
     }
 
