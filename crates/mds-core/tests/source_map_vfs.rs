@@ -2860,3 +2860,343 @@ fn extends_string_compile_names_the_base_first() {
     let sm = result.source_map.expect("source_map must be present");
     assert_eq!(sm.sources, vec!["base.mds", "input.mds"]);
 }
+
+// ── A `@define` call in a condition or an iterable (#486) ─────────────────────
+//
+// A condition or an iterable discards the text of the call it evaluates. Its call
+// must leave no segment and no `sources[]` entry, and must not move the cursor:
+// the map of each template equals the map of the same-length template that reads a
+// plain variable. The tests decode each point, because the release cursor assert
+// compares the cursor with itself and cannot see a shifted body.
+
+/// The define of the #486 templates, in a second file. Its body is the text `a,b`.
+const DEFINE_LIB: &str = "@define yes():\na,b\n@end\n";
+/// The same define, with a body that is an `@include` of `part.mds`.
+const DEFINE_INCLUDE_LIB: &str = "@import \"./part.mds\" as p\n@define yes():\n@include p\n@end\n";
+/// The partial that `DEFINE_INCLUDE_LIB` includes. Its text is `a,b` too.
+const PART: &str = "a,b\n";
+/// The import line of every #486 entry.
+const DEFINE_IMPORT: &str = "@import { yes } from \"./lib.mds\"\n";
+/// The call that the templates put at `SLOT`.
+const DEFINE_CALL: &str = "yes()";
+/// The plain variable of the control templates: same length, same value `a,b`.
+const PLAIN_VAR: &str = "plain";
+
+/// `@if` with the call as the whole condition.
+const IF_CASE: (&str, &str) = (
+    "@if SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// `@elseif` with the call as the whole condition.
+const ELSEIF_CASE: (&str, &str) = (
+    "@if off:\nSKIP\n@elseif SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// An equality condition with the call on the left side.
+const EQ_CASE: (&str, &str) = (
+    "@if SLOT == \"a,b\":\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// The call as the second operand of `&&`.
+const AND_CASE: (&str, &str) = (
+    "@if on && SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// The call as the second operand of `||`, after a false first operand.
+const OR_CASE: (&str, &str) = (
+    "@if off || SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// A `@for` over the call result, split on a comma.
+const FOR_CASE: (&str, &str) = (
+    "@for x in split(SLOT, \",\"):\n- {{x}} {{v}}\n@end\nTAIL {{v}}\n",
+    "- a V\n- b V\nTAIL V\n",
+);
+/// Every condition and iterable template.
+const DEFINE_CASES: [(&str, &str); 6] =
+    [IF_CASE, ELSEIF_CASE, EQ_CASE, AND_CASE, OR_CASE, FOR_CASE];
+
+/// The modules of a #486 compile: `entry.mds` is the import line, then `body` with
+/// `SLOT` replaced by `slot`; `lib` is the text of `lib.mds`.
+fn define_modules(lib: &str, body: &str, slot: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("lib.mds".to_string(), lib.to_string()),
+        ("part.mds".to_string(), PART.to_string()),
+        (
+            "entry.mds".to_string(),
+            format!("{DEFINE_IMPORT}{}", body.replace("SLOT", slot)),
+        ),
+    ])
+}
+
+/// Compile `modules` with the #486 variables, with or without a source map.
+fn compile_define(modules: HashMap<String, String>, source_map: bool) -> CompileResult {
+    let vars = HashMap::from([
+        ("v".to_string(), Value::String("V".to_string())),
+        ("plain".to_string(), Value::String("a,b".to_string())),
+        ("on".to_string(), Value::Boolean(true)),
+        ("off".to_string(), Value::Boolean(false)),
+    ]);
+    let opts = CompileOptions::default()
+        .with_source_map(source_map)
+        .with_include_sources_content(true);
+    mds::compile_virtual_with_deps_opts(modules, "entry.mds", Some(vars), opts)
+        .unwrap_or_else(|err| panic!("the #486 template must compile: {err}"))
+}
+
+/// The output text and the source map of `body` with `slot`.
+fn define_map(lib: &str, body: &str, slot: &str) -> (String, mds::SourceMap) {
+    let modules = define_modules(lib, body, slot);
+    let mut result = compile_define(modules.clone(), true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    // sourcesContent is one entry per source, and each entry is that module's text.
+    let contents: Vec<String> = sm.sources.iter().map(|s| modules[s].clone()).collect();
+    assert_eq!(
+        sm.sources_content.as_ref(),
+        Some(&contents),
+        "{body:?} with {slot}: sourcesContent must pair with sources"
+    );
+    (output_text(result.output), sm)
+}
+
+/// The map of `case` with the define call equals the map of the plain-variable
+/// template: the same points, the same mappings and the same sources.
+fn assert_define_map_matches_plain(lib: &str, case: (&str, &str)) {
+    let (body, expected) = case;
+    assert_eq!(
+        DEFINE_CALL.len(),
+        PLAIN_VAR.len(),
+        "the control must have the same length"
+    );
+    let (called_text, called) = define_map(lib, body, DEFINE_CALL);
+    let (plain_text, plain) = define_map(lib, body, PLAIN_VAR);
+    assert_eq!(called_text, expected, "{body:?}: output with the call");
+    assert_eq!(
+        plain_text, expected,
+        "{body:?}: output with the plain variable"
+    );
+    // Non-vacuity: the control maps the body and the tail.
+    assert!(
+        mapped_points(&plain).len() >= 4,
+        "{body:?}: the control map must hold the body points; got {:?}",
+        mapped_points(&plain)
+    );
+    assert_eq!(
+        mapped_points(&called),
+        mapped_points(&plain),
+        "{body:?}: every point must keep its plain-template output offset and source"
+    );
+    assert_eq!(called.mappings, plain.mappings, "{body:?}: mappings");
+    assert_eq!(called.sources, plain.sources, "{body:?}: sources");
+    assert_eq!(called.sources, vec!["entry.mds"], "{body:?}: sources");
+}
+
+/// TP-9 (#486): an `@if` that calls an imported define maps as the plain template.
+#[test]
+fn if_condition_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, IF_CASE);
+}
+
+/// TP-10 (#486): an `@elseif` that calls an imported define maps as the plain template.
+#[test]
+fn elseif_condition_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, ELSEIF_CASE);
+}
+
+/// TP-11 (#486): an equality condition with the call on the left side.
+#[test]
+fn equality_condition_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, EQ_CASE);
+}
+
+/// TP-12 (#486): the call as the second operand of `&&`, and of `||` after a false
+/// first operand.
+#[test]
+fn and_or_operand_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, AND_CASE);
+    assert_define_map_matches_plain(DEFINE_LIB, OR_CASE);
+}
+
+/// TP-13 (#486): a `@for` iterable that splits the call result on a comma.
+#[test]
+fn for_iterable_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, FOR_CASE);
+}
+
+/// TP-14 (#486): after a condition call, each body point keeps its own output offset
+/// and maps to the entry file, at the source position of its own text.
+#[test]
+fn condition_define_call_leaves_each_body_point_at_its_output_offset() {
+    let (text, sm) = define_map(DEFINE_LIB, IF_CASE.0, DEFINE_CALL);
+    assert_eq!(text, "THEN V\nTAIL V\n");
+    let entry = |line: usize, col: i64, src_line: i64, src_col: i64| {
+        (line, col, "entry.mds".to_string(), src_line, src_col)
+    };
+    // Entry lines: 0 import, 1 `@if yes():`, 2 `THEN {{v}}`, 3 `@end`, 4 `TAIL {{v}}`.
+    let points = mapped_points(&sm);
+    for expected in [
+        entry(0, 0, 2, 0),
+        entry(0, 5, 2, 5),
+        entry(1, 0, 4, 0),
+        entry(1, 5, 4, 5),
+    ] {
+        assert!(
+            points.contains(&expected),
+            "the point {expected:?} must be in the map; got {points:?}"
+        );
+    }
+    assert!(
+        points.iter().all(|point| point.2 == "entry.mds"),
+        "every point must map to the entry file; got {points:?}"
+    );
+}
+
+/// TP-15 (#486): a define whose body includes a partial, called only in a condition,
+/// leaves no `sources[]` entry and no segment from the partial.
+#[test]
+fn condition_define_call_with_include_registers_no_partial_source() {
+    // Positive control: the same call in a body interpolation does map the partial,
+    // so the vector reaches the include splice.
+    let modules = HashMap::from([
+        ("lib.mds".to_string(), DEFINE_INCLUDE_LIB.to_string()),
+        ("part.mds".to_string(), PART.to_string()),
+        (
+            "entry.mds".to_string(),
+            format!("{DEFINE_IMPORT}A {{{{yes()}}}} B\n"),
+        ),
+    ]);
+    let sm = compile_define(modules, true)
+        .source_map
+        .expect("source_map must be present");
+    assert!(
+        referenced_sources(&sm).contains("part.mds"),
+        "control: a body call must map the included partial; got {:?}",
+        sm.sources
+    );
+
+    assert_define_map_matches_plain(DEFINE_INCLUDE_LIB, IF_CASE);
+    assert_define_map_matches_plain(DEFINE_INCLUDE_LIB, FOR_CASE);
+}
+
+/// TP-16 (#486): the output text of every condition and iterable template is the
+/// same with and without a source map, and messages mode output is unchanged.
+#[test]
+fn condition_define_call_output_is_the_same_with_and_without_a_source_map() {
+    for lib in [DEFINE_LIB, DEFINE_INCLUDE_LIB] {
+        for (body, expected) in DEFINE_CASES {
+            for source_map in [true, false] {
+                let result = compile_define(define_modules(lib, body, DEFINE_CALL), source_map);
+                assert_eq!(
+                    result.source_map.is_some(),
+                    source_map,
+                    "{body:?}: the map must follow the option"
+                );
+                assert_eq!(
+                    output_text(result.output),
+                    expected,
+                    "{body:?}: output with source_map = {source_map}"
+                );
+            }
+        }
+    }
+    let messages = "@message user:\n@if yes():\nTHEN {{v}}\n@end\n\
+                    @for x in split(yes(), \",\"):\n- {{x}}\n@end\n@end\n";
+    for source_map in [true, false] {
+        let result = compile_define(define_modules(DEFINE_LIB, messages, ""), source_map);
+        assert!(
+            result.source_map.is_none(),
+            "messages mode has no source map"
+        );
+        assert_eq!(
+            output_text(result.output),
+            "user: THEN V\n- a\n- b\n",
+            "messages mode output with source_map = {source_map}"
+        );
+    }
+}
+
+/// TP-17 (#486 control): a define call in a body interpolation still maps its body to
+/// the definition file, at the call's output offset.
+#[test]
+fn body_interpolation_define_call_still_maps_its_body_to_the_definition_file() {
+    let modules = define_modules(DEFINE_LIB, "A {{SLOT}} B\n", DEFINE_CALL);
+    let mut result = compile_define(modules, true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    assert_eq!(output_text(result.output), "A a,b B\n");
+    assert_eq!(sm.sources, vec!["entry.mds", "lib.mds"]);
+    // Entry line 1 is `A {{yes()}} B`; lib line 1 is the body text `a,b`.
+    assert_eq!(
+        mapped_points(&sm),
+        vec![
+            (0, 0, "entry.mds".to_string(), 1, 0),
+            (0, 2, "lib.mds".to_string(), 1, 0),
+            (0, 5, "entry.mds".to_string(), 1, 11),
+        ]
+    );
+}
+
+/// The two defines of the nested-call tests: `f` wraps its argument, `g` is `gee`.
+const NESTED_LIB: &str = "@define f(x):\nF{{x}}\n@end\n@define g():\ngee\n@end\n";
+
+/// TP-19 (#486): a define call in the argument of another define call maps the outer
+/// body at the interpolation offset, with no segment from the inner body.
+#[test]
+fn define_call_in_a_define_argument_maps_the_outer_body_at_the_call_offset() {
+    let modules = HashMap::from([
+        ("lib.mds".to_string(), NESTED_LIB.to_string()),
+        (
+            "entry.mds".to_string(),
+            "@import { f, g } from \"./lib.mds\"\nA {{f(g())}} B\n".to_string(),
+        ),
+    ]);
+    let mut result = compile_define(modules, true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    assert_eq!(output_text(result.output), "A Fgee B\n");
+    // Lib line 1 is `F{{x}}`, the body of f; lib line 4 is `gee`, the body of g.
+    let points = mapped_points(&sm);
+    assert_eq!(
+        points,
+        vec![
+            (0, 0, "entry.mds".to_string(), 1, 0),
+            (0, 2, "lib.mds".to_string(), 1, 0),
+            (0, 3, "lib.mds".to_string(), 1, 1),
+            (0, 6, "entry.mds".to_string(), 1, 12),
+        ]
+    );
+    assert!(
+        !points.iter().any(|p| p.2 == "lib.mds" && p.3 == 4),
+        "no point may map to the body of the inner call; got {points:?}"
+    );
+}
+
+/// TP-20 (#486): a builtin that wraps a define call maps its result to one call-site
+/// segment in the entry, as for any builtin.
+#[test]
+fn builtin_around_a_define_call_maps_to_one_call_site_segment() {
+    let modules = define_modules(DEFINE_LIB, "A {{upper(SLOT)}} B\n", DEFINE_CALL);
+    let mut result = compile_define(modules, true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    assert_eq!(output_text(result.output), "A A,B B\n");
+    assert_eq!(sm.sources, vec!["entry.mds"]);
+    // Entry line 1 is `A {{upper(yes())}} B`.
+    assert_eq!(
+        mapped_points(&sm),
+        vec![
+            (0, 0, "entry.mds".to_string(), 1, 0),
+            (0, 2, "entry.mds".to_string(), 1, 2),
+            (0, 5, "entry.mds".to_string(), 1, 18),
+        ]
+    );
+}
