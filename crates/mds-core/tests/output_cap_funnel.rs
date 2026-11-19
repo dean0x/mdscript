@@ -15,9 +15,14 @@
 //!   number of times with no raw append (`push_str`, `push`, `+=`, …) left in its body.
 //! * The compile-memory message and the frontmatter allowance message each appear
 //!   only in their constructors.
-//! * The budget checks do not depend on the target: the listed files use no cfg key
-//!   that can select a wasm32 target. The budget module returns errors instead of
-//!   panics and does not use `RefCell`.
+//! * The listed files do not contain the four cfg key names `target_arch`,
+//!   `target_family`, `target_os` and `target_pointer_width`. Other cfg forms stay
+//!   allowed: `cfg(unix)`, `cfg(windows)`, `cfg(not(windows))` and the other target
+//!   keys, such as `target_env`. `cfg(not(windows))` is true on wasm32, so this check
+//!   does not prove that the listed code is the same on each target.
+//! * The budget module code does not use `RefCell` or these panic tokens: `panic`,
+//!   `unreachable`, `todo`, `unimplemented`, `unwrap`, `expect` and the assert macros.
+//!   The check does not find other code that can panic, such as an index.
 //!
 //! The message and append checks scan `crates/mds-core/src/**`. They skip `*_tests.rs`,
 //! `#[cfg(test)]` items, and comments. Only the message checks scan string literals.
@@ -54,13 +59,16 @@ const ARCH_INDEPENDENT: &[&str] = &[
     "lib.rs",
     "scope.rs",
     "value.rs",
+    "limits.rs",
     "resolver/frontmatter.rs",
     "resolver/inheritance.rs",
     BUDGET_SOURCE,
 ];
 
-/// The cfg keys that can select a wasm32 target. Plain `cfg(unix)` and `cfg(windows)`
-/// stay allowed: `lib.rs` uses them for host paths.
+/// The four cfg key names that the listed files must not contain. `cfg(unix)`,
+/// `cfg(windows)` and `cfg(not(windows))` stay allowed. `lib.rs` uses `cfg(windows)`
+/// and `cfg(not(windows))` for host paths, and `cfg(not(windows))` is true on wasm32.
+/// The other target keys, such as `target_env` and `target_vendor`, also stay allowed.
 const TARGET_KEYS: &[&str] = &[
     "target_arch",
     "target_family",
@@ -219,6 +227,9 @@ fn check_budget_source(name: &str, raw: &str) -> Result<(), String> {
                         | "expect"
                         | "unwrap"
                         | "panic"
+                        | "unreachable"
+                        | "todo"
+                        | "unimplemented"
                         | "RefCell"
                 )
             });
@@ -229,13 +240,20 @@ fn check_budget_source(name: &str, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Check each listed file, with its text from `read`.
+fn check_listed_sources(read: impl Fn(&str) -> String) -> Result<(), String> {
+    ARCH_INDEPENDENT
+        .iter()
+        .try_for_each(|name| check_budget_source(name, &read(name)))
+}
+
 #[test]
 fn budget_rules_apply_to_each_source_file() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for name in ARCH_INDEPENDENT {
-        let raw = std::fs::read_to_string(src_dir.join(name)).expect("source must be readable");
-        check_budget_source(name, &raw).unwrap_or_else(|error| panic!("{error}"));
-    }
+    check_listed_sources(|name| {
+        std::fs::read_to_string(src_dir.join(name)).expect("source must be readable")
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 #[test]
@@ -277,10 +295,32 @@ fn budget_gates_reject_planted_text() {
             Err(format!("evaluator.rs: do not use `{key}`"))
         );
     }
+    // Control: the host-path cfg forms stay allowed. `cfg(not(windows))` is true on
+    // wasm32.
+    for form in ["unix", "windows", "not(windows)"] {
+        assert_eq!(
+            check_budget_source("lib.rs", &format!("#[cfg({form})] fn native() {{}}")),
+            Ok(())
+        );
+    }
+    // The file list reaches `limits.rs`.
+    let planted = |name: &str| {
+        if name == "limits.rs" {
+            "#[cfg(target_pointer_width = \"32\")] pub(crate) const MAX: usize = 1;".into()
+        } else {
+            String::new()
+        }
+    };
     assert_eq!(
-        check_budget_source(BUDGET_SOURCE, "fn charge() { assert!(false); }"),
-        Err("evaluator/budget.rs: do not use `assert`".into())
+        check_listed_sources(planted),
+        Err("limits.rs: do not use `target_pointer_width`".into())
     );
+    for token in ["assert", "unreachable", "todo", "unimplemented"] {
+        assert_eq!(
+            check_budget_source(BUDGET_SOURCE, &format!("fn charge() {{ {token}!(); }}")),
+            Err(format!("evaluator/budget.rs: do not use `{token}`"))
+        );
+    }
 }
 
 #[test]
