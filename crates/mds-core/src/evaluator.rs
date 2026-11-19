@@ -1886,6 +1886,391 @@ mod tests {
         assert_eq!(*ctx.warnings, ["warning: a"]);
     }
 
+    /// Run `run` with one byte less than `need` of headroom, then with exactly `need`.
+    /// The short run must refuse with the budget error and leave the budget as it
+    /// was, so every scope mark on its path is released on the error path. Return the
+    /// result of the exact run, and the temporaries and buffers it left charged.
+    fn charge_boundary<T>(
+        need: usize,
+        mut run: impl FnMut(&mut EvalContext<'_>) -> Result<T, MdsError>,
+    ) -> (Result<T, MdsError>, [usize; 2]) {
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, need - 1);
+        let before = ctx.budget.mem;
+        let short = run(&mut ctx).err().map(|error| error.serialize());
+        assert_eq!(short, Some(MdsError::compile_memory_exceeded().serialize()));
+        assert_eq!(ctx.budget.mem, before, "the refusal must release its marks");
+        drop(ctx);
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, need);
+        let before = ctx.budget.mem;
+        let result = run(&mut ctx);
+        let held = [
+            ctx.budget.mem.mark() - before.mark(),
+            ctx.budget.mem.buffers - before.buffers,
+        ];
+        (result, held)
+    }
+
+    fn interpolation(expr: Expr) -> Node {
+        Node::Interpolation(Interpolation {
+            expr,
+            offset: 0,
+            len: 0,
+        })
+    }
+
+    fn function(params: Vec<Param>, body: Vec<Node>) -> Arc<FunctionDef> {
+        Arc::new(FunctionDef {
+            params,
+            body,
+            captured: crate::scope::CapturedScope::default(),
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn a_call_frame_entry_charges_its_parameter_name() {
+        let name = "p".repeat(4096);
+        let func = function(vec![Param::required(name.as_str())], Vec::new());
+        // The call key, then the entry: its name and the slot pair.
+        let need = "f".len() + name.len() + FRAME_ENTRY;
+        let (result, held) = charge_boundary(need, |ctx| {
+            invoke_function(&func, "f", &[Value::Null.into()], &mut Scope::new(), ctx)
+        });
+        assert_eq!(result.unwrap(), "");
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_call_frame_entry_charges_its_default_literal() {
+        let default = "d".repeat(4096);
+        let param = Param {
+            name: "p".into(),
+            default: Some(Expr::StringLiteral(default.clone())),
+        };
+        let func = function(vec![param], Vec::new());
+        // The call key, then the entry: its name, the slot pair and the default value.
+        let need = "f".len() + "p".len() + FRAME_ENTRY + VALUE_ROOT + default.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            invoke_function(&func, "f", &[], &mut Scope::new(), ctx)
+        });
+        assert_eq!(result.unwrap(), "");
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_loop_frame_entry_charges_its_variable_name() {
+        let mut block = test_loop(Expr::Var("items".into()));
+        block.var = "v".repeat(4096);
+        // One pass entry at a time: its name, the slot pair and the projection.
+        let need = block.var.len() + FRAME_ENTRY + Slot::PROJECTION_BYTES;
+        let mut passes = 0;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("items", Value::Array(vec![Value::Null; 2]));
+            drive_for(&block, &mut scope, ctx, |_, _| {
+                passes += 1;
+                Ok(())
+            })
+        });
+        result.unwrap();
+        assert_eq!(passes, 2);
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_key_value_frame_charges_the_key_and_both_names() {
+        let key = "k".repeat(4096);
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.var = "v".repeat(1024);
+        block.key_var = Some("n".repeat(2048));
+        // The sorted key list, then the key entry (with its key copy) and the value
+        // entry (with the key in its projection).
+        let key_entry = 2048 + FRAME_ENTRY + VALUE_ROOT + key.len();
+        let value_entry = block.var.len() + FRAME_ENTRY + Slot::PROJECTION_BYTES + key.len();
+        let need = size_of::<&String>() + key_entry + value_entry;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            let entries = std::collections::HashMap::from([(key.clone(), Value::Null)]);
+            scope.set_var("entries", Value::Object(entries));
+            drive_for(&block, &mut scope, ctx, |_, _| Ok(()))
+        });
+        result.unwrap();
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_shared_builtin_argument_is_charged_before_its_copy() {
+        let items = Value::Array(vec![Value::String("x".repeat(64)); 1000]);
+        let copy = value_bytes(&items).unwrap();
+        // The argument slot, the value list, the copy and the scalar bound.
+        let need = size_of::<Slot>() + NODE + copy + VALUE_ROOT;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("items", items.clone());
+            call_function("length", &[Arg::Var("items".into())], &mut scope, ctx, 0)
+        });
+        assert_eq!(result.unwrap().get(), Some(&Value::Number(1000.0)));
+        // Only the scalar result stays charged.
+        assert_eq!(held, [VALUE_ROOT, 0]);
+    }
+
+    #[test]
+    fn a_builtin_argument_held_once_moves_without_a_charge() {
+        let body = "t".repeat(4096);
+        let func = function(Vec::new(), vec![text(&body)]);
+        let call = Arg::Call {
+            name: "f".into(),
+            args: Vec::new(),
+        };
+        // The argument slot, the result of `f()` (its value and its buffer), the value
+        // list and the scalar bound. A copy of the result would add its bytes again.
+        let need = size_of::<Slot>() + VALUE_ROOT + body.len() + NODE + VALUE_ROOT;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_function("f", Arc::clone(&func));
+            call_function("length", std::slice::from_ref(&call), &mut scope, ctx, 0)
+        });
+        assert_eq!(result.unwrap().get(), Some(&Value::Number(4096.0)));
+        // The moved argument is released with the call; only the scalar result stays.
+        assert_eq!(held, [VALUE_ROOT, 0]);
+    }
+
+    #[test]
+    fn a_message_role_is_charged_before_it_is_kept() {
+        let role = "r".repeat(4096);
+        let block = MessageBlock {
+            role: Expr::Var("role".into()),
+            body: vec![text("b")],
+            offset: 0,
+        };
+        // The one-byte content, then the kept role.
+        let need = 1 + role.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("role", Value::String(role.clone()));
+            let mut out = Vec::new();
+            collect_single_message(&block, &mut scope, ctx, &mut out).map(|()| out)
+        });
+        let message = EvalMessage {
+            role: role.clone(),
+            content: "b".into(),
+        };
+        assert_eq!(result.unwrap(), [message]);
+        assert_eq!(held, [0, need]);
+    }
+
+    #[test]
+    fn an_argument_list_is_charged_before_it_is_built() {
+        let node = interpolation(Expr::Call {
+            name: "missing".into(),
+            args: vec![Arg::Var("x".into()); 64],
+        });
+        let need = 64 * size_of::<Slot>();
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("x", Value::Null);
+            evaluate_nodes(
+                std::slice::from_ref(&node),
+                &mut scope,
+                ctx,
+                &mut String::new(),
+            )
+        });
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::undefined_fn("missing").serialize()
+        );
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_literal_is_charged_before_its_value_is_built() {
+        let literal = "l".repeat(4096);
+        // An argument literal: the argument slot, then the literal value.
+        let node = interpolation(Expr::Call {
+            name: "missing".into(),
+            args: vec![Arg::StringLiteral(literal.clone())],
+        });
+        let need = size_of::<Slot>() + VALUE_ROOT + literal.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            evaluate_nodes(
+                std::slice::from_ref(&node),
+                &mut Scope::new(),
+                ctx,
+                &mut String::new(),
+            )
+        });
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::undefined_fn("missing").serialize()
+        );
+        assert_eq!(held, [0, 0]);
+        // An expression literal in a condition.
+        let condition = Condition::Truthy(Expr::StringLiteral(literal.clone()));
+        let (result, held) = charge_boundary(VALUE_ROOT + literal.len(), |ctx| {
+            evaluate_condition(&condition, &mut Scope::new(), ctx, None)
+        });
+        assert!(result.unwrap());
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_call_key_is_charged_before_the_call() {
+        let name = "f".repeat(4096);
+        let func = function(Vec::new(), Vec::new());
+        let node = interpolation(Expr::Call {
+            name: name.clone(),
+            args: Vec::new(),
+        });
+        // The result value, then the call key.
+        let need = VALUE_ROOT + name.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_function(&name, Arc::clone(&func));
+            let mut out = String::new();
+            evaluate_nodes(std::slice::from_ref(&node), &mut scope, ctx, &mut out).map(|()| out)
+        });
+        assert_eq!(result.unwrap(), "");
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_qualified_name_is_charged_before_it_is_built() {
+        let namespace = "n".repeat(4096);
+        let node = interpolation(Expr::QualifiedCall {
+            namespace: namespace.clone(),
+            name: "f".into(),
+            args: Vec::new(),
+        });
+        let need = namespace.len() + ".f".len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            evaluate_nodes(
+                std::slice::from_ref(&node),
+                &mut Scope::new(),
+                ctx,
+                &mut String::new(),
+            )
+        });
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::undefined_var(&namespace).serialize()
+        );
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn sorted_loop_keys_are_charged_before_they_are_collected() {
+        const KEYS: usize = 1000;
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.key_var = Some("k".into());
+        // The key list, then one pass: its key entry and its value entry, each with
+        // a four-byte key.
+        let pass = ("k".len() + FRAME_ENTRY + VALUE_ROOT + 4)
+            + ("item".len() + FRAME_ENTRY + Slot::PROJECTION_BYTES + 4);
+        let need = KEYS * size_of::<&String>() + pass;
+        let mut passes = 0;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            let entries = (0..KEYS).map(|i| (format!("{i:04}"), Value::Null));
+            scope.set_var("entries", Value::Object(entries.collect()));
+            drive_for(&block, &mut scope, ctx, |_, _| {
+                passes += 1;
+                Ok(())
+            })
+        });
+        result.unwrap();
+        assert_eq!(passes, KEYS);
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_non_string_interpolation_is_charged_before_it_is_rendered() {
+        let value = Value::Array(vec![Value::Number(0.5); 500]);
+        let rendered = value.to_string();
+        let node = interpolation(Expr::Var("value".into()));
+        let (result, held) = charge_boundary(rendered.len(), |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("value", value.clone());
+            // The output buffer already has room, so only the rendered text is charged.
+            let mut out = String::with_capacity(rendered.len());
+            evaluate_nodes(std::slice::from_ref(&node), &mut scope, ctx, &mut out).map(|()| out)
+        });
+        assert_eq!(result.unwrap(), rendered);
+        assert_eq!(held, [0, 0]);
+    }
+
+    /// Evaluate `@include` of an alias with no prompt in a loop of three passes, with
+    /// `available` bytes of headroom. Return the result, the warnings and the bytes
+    /// the warnings left charged as buffers.
+    fn include_warnings_in_a_loop(
+        alias: &str,
+        available: usize,
+    ) -> (Result<(), MdsError>, Vec<String>, usize) {
+        let mut scope = Scope::new();
+        scope.set_var("items", Value::Array(vec![Value::Null; 3]));
+        scope.set_namespace(
+            alias,
+            crate::scope::NamespaceScope {
+                functions: std::collections::HashMap::new(),
+                prompt_body: None,
+                prompt_map: None,
+                prompt_suppressed_by_exports: false,
+            },
+        );
+        let mut block = test_loop(Expr::Var("items".into()));
+        block.body = vec![Node::Include(IncludeDirective {
+            alias: alias.into(),
+            offset: 0,
+        })];
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, available);
+        let before = ctx.budget.mem;
+        let result = evaluate_nodes(
+            &[Node::For(block)],
+            &mut scope,
+            &mut ctx,
+            &mut String::new(),
+        );
+        assert_eq!(ctx.budget.mem.mark(), before.mark());
+        let charged = ctx.budget.mem.buffers - before.buffers;
+        drop(ctx);
+        (result, warnings, charged)
+    }
+
+    #[test]
+    fn include_warnings_in_a_loop_are_charged_as_they_are_kept() {
+        let long = "a".repeat(8192);
+        let (result, full, charged) =
+            include_warnings_in_a_loop(&long, crate::limits::MAX_COMPILE_MEMORY);
+        result.unwrap();
+        assert_eq!(full.len(), 3);
+        assert_eq!(charged, full.iter().map(String::capacity).sum::<usize>());
+        let warning = full[0].capacity();
+        assert!(warning > 2 * long.len());
+        // Room for three long warnings and one pass entry, less one byte: the third
+        // warning is refused, and the two before it stay.
+        let pass = "item".len() + FRAME_ENTRY + Slot::PROJECTION_BYTES;
+        let available = 3 * warning + pass - 1;
+        let (result, kept, charged) = include_warnings_in_a_loop(&long, available);
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+        assert_eq!(kept, full[..2]);
+        assert_eq!(charged, 2 * warning);
+        // Control: short-alias warnings fit in the same room and keep their text.
+        let (result, short, _) = include_warnings_in_a_loop("b", available);
+        result.unwrap();
+        let text = "warning: @include of 'b' produced empty output — module has no body \
+                    text; to use the module's functions, call them directly: {{b.fn()}}";
+        assert_eq!(short, [text; 3]);
+    }
+
     fn test_loop(iterable: Expr) -> ForBlock {
         ForBlock {
             var: "item".into(),
