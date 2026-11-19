@@ -9,6 +9,15 @@ use mds::{CompileOptions, CompileResult, MdsError, Value};
 const MIB: usize = 1024 * 1024;
 const CAP_PASS: usize = MIB + 1;
 const SLACK: usize = 8 * MIB;
+/// Peak heap bytes per source byte on a 64-bit host while one module with dense syntax
+/// resolves: its tokens, its syntax tree and the copy of a function or block body. The
+/// compile memory budget does not count them; spec.md and SECURITY.md give this number.
+const TREE_PEAK_PER_BYTE: usize = 432;
+/// The peak while the lexer runs: its tokens and its arrays of characters and offsets.
+const LEXER_PEAK_PER_BYTE: usize = 56;
+/// Heap bytes per source byte that a cached module with a dense function body keeps
+/// until the compile returns.
+const TREE_KEPT_PER_BYTE: usize = 388;
 
 /// Live heap bytes, and the high-water mark since `peak_growth` last reset it.
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -627,6 +636,94 @@ fn assert_mapped_max_output_with_frontmatter() {
     );
 }
 
+fn imports_measured(part: &str, count: usize) -> (Result<CompileResult, MdsError>, usize) {
+    let mut root = String::new();
+    let mut modules = HashMap::new();
+    for i in 0..count {
+        root.push_str(&format!("@import \"./part{i}.mds\" as part{i}\n"));
+        modules.insert(format!("part{i}.mds"), part.to_owned());
+    }
+    modules.insert("main.mds".to_owned(), root + "root");
+    peak_growth(|| mds::compile_virtual(modules, "main.mds", None))
+}
+
+/// The densest syntax: each four bytes `\{{a` make two nodes. The node and token counts
+/// sit just past a power of two, where a growing vector holds almost twice its length.
+fn assert_syntax_tree_peaks() {
+    let dense = "\\{{a".repeat((1 << 14) + 1);
+    let function = format!("@define f():\n{dense}\n@end\n");
+    let block = format!("@block b:\n{dense}\n@end\n");
+    let levels = format!("{}{}", "@if a:\n".repeat(63), "@end\n".repeat(63));
+    let nested = format!("---\na: ''\n---\n{}", levels.repeat(87));
+
+    let (root_result, root_peak) = compile_measured(dense.clone());
+    assert!(root_result
+        .unwrap()
+        .into_markdown()
+        .unwrap()
+        .starts_with("{{a{{a"));
+    let (function_result, function_peak) = compile_measured(function.clone());
+    // The copy of the function body is part of the measure.
+    assert!(
+        function_peak > root_peak,
+        "function body {function_peak} B, root text {root_peak} B"
+    );
+    let cases = [
+        (
+            "uncalled function body",
+            (function_result, function_peak),
+            function.len(),
+        ),
+        ("imported text", imports_measured(&dense, 1), dense.len()),
+        (
+            "imported block default",
+            imports_measured(&block, 1),
+            block.len(),
+        ),
+        (
+            "nested @if blocks",
+            compile_measured(nested.clone()),
+            nested.len(),
+        ),
+    ];
+    for (label, (result, peak), len) in cases {
+        let per_byte = peak.div_ceil(len);
+        eprintln!("syntax tree heap (B): {label}: source={len}, peak={peak}, per byte={per_byte}");
+        assert!(result.is_ok(), "{label}");
+        assert!(
+            peak <= TREE_PEAK_PER_BYTE * len,
+            "{label}: {peak} B for {len} B of source"
+        );
+    }
+
+    // The parser refuses the first directive, so the lexer finishes and no tree is built.
+    let lexed = format!("@x\n{dense}");
+    let (result, lexer_peak) = peak_growth(|| mds::scan_imports(&lexed));
+    eprintln!("lexer heap (B): source={}, peak={lexer_peak}", lexed.len());
+    let error = result.expect_err("unknown directive").serialize();
+    assert_eq!(error.code, "mds::syntax");
+    assert!(
+        lexer_peak <= LEXER_PEAK_PER_BYTE * lexed.len(),
+        "lexer: {lexer_peak} B"
+    );
+
+    // Each further import adds one cached module, which keeps its tree.
+    let peaks = [1, 2, 3].map(|count| {
+        let (result, peak) = imports_measured(&function, count);
+        assert!(result.is_ok(), "{count} imports");
+        peak
+    });
+    let kept = peaks[2] - peaks[1];
+    eprintln!(
+        "cached module heap (B): source={}, peaks={peaks:?}, kept={kept}",
+        function.len()
+    );
+    assert!(
+        kept <= TREE_KEPT_PER_BYTE * function.len(),
+        "a cached module keeps {kept} B"
+    );
+}
+
 #[test]
 fn compile_peak_heap_stays_within_each_bound() {
     let source = include_str!("memory_bound.rs");
@@ -679,4 +776,5 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_imported_prompts_share_one_limit();
     assert_alias_frontmatter_shares_one_limit();
     assert_extends_chain_trees_share_one_limit();
+    assert_syntax_tree_peaks();
 }
