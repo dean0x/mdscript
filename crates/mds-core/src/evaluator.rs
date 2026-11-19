@@ -1888,8 +1888,9 @@ mod tests {
 
     /// Run `run` with one byte less than `need` of headroom, then with exactly `need`.
     /// The short run must refuse with the budget error and leave the budget as it
-    /// was, so every scope mark on its path is released on the error path. Return the
-    /// result of the exact run, and the temporaries and buffers it left charged.
+    /// was, so every scope mark on its path is released on the error path. The exact
+    /// run must not release more than it charged. Return the result of the exact run,
+    /// and the temporaries and buffers it left charged.
     fn charge_boundary<T>(
         need: usize,
         mut run: impl FnMut(&mut EvalContext<'_>) -> Result<T, MdsError>,
@@ -1907,6 +1908,11 @@ mod tests {
         seed_headroom(&mut ctx, need);
         let before = ctx.budget.mem;
         let result = run(&mut ctx);
+        // A release of more than the charge keeps the counters, so only the latch shows it.
+        assert!(
+            !ctx.budget.mem.underflow,
+            "the exact run must not underflow a counter"
+        );
         let held = [
             ctx.budget.mem.mark() - before.mark(),
             ctx.budget.mem.buffers - before.buffers,
@@ -2003,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_builtin_argument_is_charged_before_its_copy() {
+    fn a_shared_builtin_argument_is_charged_the_size_of_its_copy() {
         let items = Value::Array(vec![Value::String("x".repeat(64)); 1000]);
         let copy = value_bytes(&items).unwrap();
         // The argument slot, the value list, the copy and the scalar bound.
@@ -2235,6 +2241,10 @@ mod tests {
             &mut scope,
             &mut ctx,
             &mut String::new(),
+        );
+        assert!(
+            !ctx.budget.mem.underflow,
+            "the loop must not underflow a counter"
         );
         assert_eq!(ctx.budget.mem.mark(), before.mark());
         let charged = ctx.budget.mem.buffers - before.buffers;
