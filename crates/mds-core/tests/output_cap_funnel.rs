@@ -15,8 +15,9 @@
 //!   number of times with no raw append (`push_str`, `push`, `+=`, …) left in its body.
 //! * The compile-memory message and the frontmatter allowance message each appear
 //!   only in their constructors.
-//! * The budget checks do not depend on the target architecture. The budget module
-//!   returns errors instead of panics and does not use `RefCell`.
+//! * The budget checks do not depend on the target: the listed files use no cfg key
+//!   that can select a wasm32 target. The budget module returns errors instead of
+//!   panics and does not use `RefCell`.
 //!
 //! The message and append checks scan `crates/mds-core/src/**`. They skip `*_tests.rs`,
 //! `#[cfg(test)]` items, and comments. Only the message checks scan string literals.
@@ -54,7 +55,17 @@ const ARCH_INDEPENDENT: &[&str] = &[
     "scope.rs",
     "value.rs",
     "resolver/frontmatter.rs",
+    "resolver/inheritance.rs",
     BUDGET_SOURCE,
+];
+
+/// The cfg keys that can select a wasm32 target. Plain `cfg(unix)` and `cfg(windows)`
+/// stay allowed: `lib.rs` uses them for host paths.
+const TARGET_KEYS: &[&str] = &[
+    "target_arch",
+    "target_family",
+    "target_os",
+    "target_pointer_width",
 ];
 
 /// The capped append helper.
@@ -189,8 +200,8 @@ fn message_hits(
 }
 
 fn check_budget_source(name: &str, raw: &str) -> Result<(), String> {
-    if raw.contains("target_arch") {
-        return Err(format!("{name}: do not use `target_arch`"));
+    if let Some(key) = TARGET_KEYS.iter().find(|key| raw.contains(**key)) {
+        return Err(format!("{name}: do not use `{key}`"));
     }
     if name == BUDGET_SOURCE {
         let code = mask(raw, true);
@@ -257,13 +268,15 @@ fn budget_gates_reject_planted_text() {
             );
         }
     }
-    assert_eq!(
-        check_budget_source(
-            "evaluator.rs",
-            "#[cfg(target_arch = \"wasm32\")] fn charge() {}"
-        ),
-        Err("evaluator.rs: do not use `target_arch`".into())
-    );
+    for (key, value) in TARGET_KEYS.iter().zip(["wasm32", "wasm", "unknown", "32"]) {
+        assert_eq!(
+            check_budget_source(
+                "evaluator.rs",
+                &format!("#[cfg({key} = \"{value}\")] fn charge() {{}}")
+            ),
+            Err(format!("evaluator.rs: do not use `{key}`"))
+        );
+    }
     assert_eq!(
         check_budget_source(BUDGET_SOURCE, "fn charge() { assert!(false); }"),
         Err("evaluator/budget.rs: do not use `assert`".into())
