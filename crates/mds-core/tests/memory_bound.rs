@@ -532,6 +532,48 @@ fn assert_alias_frontmatter_shares_one_limit() {
     );
 }
 
+/// An `@extends` chain of 24 files. Each file adds a distinct key with a scalar of
+/// `len` bytes, so each base keeps the merged tree of itself and every file above it.
+fn extends_chain_peak(len: usize) -> (Result<CompileResult, MdsError>, usize) {
+    let value = "a".repeat(len);
+    let mut modules = HashMap::from([(
+        "f0.mds".to_owned(),
+        format!("---\nk0: {value}\n---\n@block main:\nok\n@end\n"),
+    )]);
+    for i in 1..24 {
+        modules.insert(
+            format!("f{i}.mds"),
+            format!("---\nk{i}: {value}\n---\n@extends \"./f{}.mds\"\n", i - 1),
+        );
+    }
+    peak_growth(|| mds::compile_virtual(modules, "f23.mds", None))
+}
+
+fn assert_extends_chain_trees_share_one_limit() {
+    let (control, baseline) = extends_chain_peak(1);
+    let output = control.unwrap().into_markdown().unwrap();
+    assert!(output.starts_with("---\nk0: a\nk1: a\n"), "{output}");
+    assert!(output.ends_with("k23: a\n---\nok\n"), "{output}");
+
+    // The merged trees of the bases take about 276 MiB.
+    let (result, peak) = extends_chain_peak(MIB - 8);
+    let growth = peak.saturating_sub(baseline);
+    eprintln!("extends chain heap (B): control={baseline}, peak={peak}, growth={growth}");
+    // Each file still open holds two uncharged copies of its frontmatter text: its
+    // tokens and its syntax tree, which are excluded stages.
+    let limit = 200 * MIB + 24 * 2 * MIB + SLACK;
+    assert!(
+        growth <= limit,
+        "extends chain adds {growth} B (limit: {limit} B)"
+    );
+    let error = result.expect_err("extends chain budget").serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+}
+
 fn mapped_corner(extra: usize) -> (Result<CompileResult, MdsError>, usize) {
     let raw = format!("label: {}\n", "a".repeat(MIB - "label: \n".len()));
     let mut root = format!("---\n{raw}---\n");
@@ -636,4 +678,5 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_mapped_max_output_with_frontmatter();
     assert_imported_prompts_share_one_limit();
     assert_alias_frontmatter_shares_one_limit();
+    assert_extends_chain_trees_share_one_limit();
 }
