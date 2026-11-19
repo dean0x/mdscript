@@ -114,6 +114,68 @@ fn nested_if_source(depth: usize) -> String {
     source
 }
 
+fn nested_function_source(frontmatter: &str, depth: usize) -> String {
+    let mut source = frontmatter.to_owned();
+    let body = "{{x}}\n".repeat(49);
+    for i in 1..=depth {
+        source.push_str(&format!("@define f{i}():\n"));
+        source.push_str(&body);
+        if i < depth {
+            source.push_str(&format!("{{{{length(f{}())}}}}\n", i + 1));
+        }
+        source.push_str("@end\n");
+    }
+    if depth == 0 {
+        source.push_str("{{length(x)}}\n");
+    } else {
+        source.push_str("{{length(f1())}}\n");
+    }
+    source
+}
+
+fn assert_nested_function_peak() {
+    let x = "a".repeat(MIB - "x: \n".len());
+    let frontmatter = format!("---\nx: {x}\n---\n");
+    let (flat_result, flat) = compile_measured(nested_function_source(&frontmatter, 0));
+    let cases = [2, 4, 5, 8].map(|depth| {
+        let (result, peak) = compile_measured(nested_function_source(&frontmatter, depth));
+        (depth, result, peak, peak.saturating_sub(flat))
+    });
+    let bound = 4 * 50 * MIB + CAP_PASS + SLACK;
+    eprintln!("function peak heap (B): D=0={flat}; growth limit={bound}");
+    for (depth, _, peak, growth) in &cases {
+        eprintln!("function peak heap (B): D={depth} peak={peak} growth={growth}");
+    }
+
+    let flat_output = flat_result.unwrap().into_markdown().unwrap();
+    assert!(flat_output == format!("{frontmatter}{}\n", x.len()));
+    for (depth, result, _, growth) in cases {
+        if depth == 2 {
+            let lines_len = 49 * (x.len() + 1);
+            let inner_len = lines_len - 1;
+            let outer_len = lines_len + inner_len.to_string().len();
+            let output = result.unwrap().into_markdown().unwrap();
+            assert!(output == format!("{frontmatter}{outer_len}\n"));
+            continue;
+        }
+        assert!(
+            growth <= bound,
+            "D={depth} adds {growth} B (limit: {bound} B)"
+        );
+        if depth > 4 {
+            let error = result.expect_err("compile memory limit error").serialize();
+            assert_eq!(error.code, "mds::resource_limit", "D={depth}");
+            assert_eq!(
+                error.message,
+                "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes",
+                "D={depth}"
+            );
+            assert!(error.help.is_none(), "D={depth}");
+            assert!(error.span.is_none(), "D={depth}");
+        }
+    }
+}
+
 fn assert_message_edge_trim_peak() {
     let payload = format!("\u{2003}{}\r\nb  ", "a".repeat(8 * MIB));
     let payload_len = payload.len();
@@ -319,6 +381,7 @@ fn compile_peak_heap_stays_within_each_bound() {
         CAP_PASS + SLACK
     );
 
+    assert_nested_function_peak();
     assert_message_edge_trim_peak();
     assert_small_messages_do_not_keep_padding();
     assert_small_markdown_does_not_keep_padding();
