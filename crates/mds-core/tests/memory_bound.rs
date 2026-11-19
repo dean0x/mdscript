@@ -437,6 +437,63 @@ fn assert_value_peaks() {
     }
 }
 
+/// Frontmatter whose `items` holds `[a]`, `[a, a]` and so on, up to `count` copies of
+/// one `len`-byte scalar, then `{{length(call)}}`. Each item displays differently, so
+/// `unique()` keeps every item, and a small source expands into a large array.
+fn distinct_items_source(len: usize, count: usize, call: &str) -> String {
+    let items = (1..=count)
+        .map(|n| format!("[{}]", vec!["*a"; n].join(", ")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "---\na: &a {}\nitems: [{items}]\n---\n{{{{length({call})}}}}\n",
+        "x".repeat(len)
+    )
+}
+
+fn assert_unique_is_charged_before_it_copies() {
+    const COUNT: usize = 26;
+    // The array holds the scalar 351 times.
+    let copies = COUNT * (COUNT + 1) / 2;
+    let measured = |len, call| compile_measured(distinct_items_source(len, COUNT, call));
+    let counts_items = |result: Result<CompileResult, MdsError>| {
+        result.unwrap().into_markdown().unwrap().ends_with("\n26\n")
+    };
+
+    // It fits: unique() builds its keys and its result, within its bound of twice
+    // the bytes of the array.
+    let len = 64 * 1024;
+    let text = copies * len;
+    let (control, baseline) = measured(len, "items");
+    let (fits, peak) = measured(len, "unique(items)");
+    let growth = peak.saturating_sub(baseline);
+    eprintln!("unique heap (B): control={baseline}, peak={peak}, growth={growth}, text={text}");
+    assert!(counts_items(control));
+    assert!(counts_items(fits));
+    assert!(growth >= text, "unique() copies: {growth} B");
+    assert!(growth <= 2 * text + MIB, "unique() grows {growth} B");
+
+    // The array copy fits, but the bound does not: unique() fails before it copies.
+    let len = 128 * 1024;
+    let text = copies * len;
+    let (control, baseline) = measured(len, "items");
+    let (refused, peak) = measured(len, "unique(items)");
+    let growth = peak.saturating_sub(baseline);
+    eprintln!("refused unique heap (B): control={baseline}, peak={peak}, growth={growth}");
+    assert!(counts_items(control));
+    // A success is not printed: its output is large.
+    let Err(error) = refused else {
+        panic!("unique() must fail with the compile memory error");
+    };
+    let error = error.serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+    assert!(growth < text / 2, "refused unique() grows {growth} B");
+}
+
 fn assert_message_role_peak() {
     const COUNT: usize = 300;
     let text = "A".repeat(MIB - 64);
@@ -771,6 +828,7 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_over_cap_upper_does_not_build_its_result();
     assert_over_cap_lower_with_sigma_does_not_build_its_result();
     assert_value_peaks();
+    assert_unique_is_charged_before_it_copies();
     assert_message_role_peak();
     assert_mapped_max_output_with_frontmatter();
     assert_imported_prompts_share_one_limit();
