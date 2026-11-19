@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 
 use crate::error::MdsError;
+use crate::evaluator::budget::{display_len, render_prefixed_value, render_value};
 use crate::limits::{MAX_ARRAY_ELEMENTS, MAX_OUTPUT_SIZE};
 use crate::value::Value;
 
@@ -29,6 +30,15 @@ pub(crate) struct BuiltinMeta {
     pub min_args: usize,
     pub max_args: usize,
     pub handler: fn(&[Value]) -> Result<Value, MdsError>,
+    pub bound: Bound,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Bound {
+    Scalar,
+    Exact(fn(&[Value]) -> Option<usize>),
+    Input,
+    Split,
 }
 
 /// All built-in function definitions.
@@ -47,54 +57,63 @@ static BUILTINS: &[BuiltinMeta] = &[
         min_args: 1,
         max_args: 1,
         handler: builtin_upper,
+        bound: Bound::Exact(upper_result_len),
     },
     BuiltinMeta {
         name: "lower",
         min_args: 1,
         max_args: 1,
         handler: builtin_lower,
+        bound: Bound::Exact(lower_capacity),
     },
     BuiltinMeta {
         name: "trim",
         min_args: 1,
         max_args: 1,
         handler: builtin_trim,
+        bound: Bound::Exact(trim_result_len),
     },
     BuiltinMeta {
         name: "replace",
         min_args: 3,
         max_args: 3,
         handler: builtin_replace,
+        bound: Bound::Exact(replace_output_len),
     },
     BuiltinMeta {
         name: "split",
         min_args: 2,
         max_args: 2,
         handler: builtin_split,
+        bound: Bound::Split,
     },
     BuiltinMeta {
         name: "starts_with",
         min_args: 2,
         max_args: 2,
         handler: builtin_starts_with,
+        bound: Bound::Scalar,
     },
     BuiltinMeta {
         name: "ends_with",
         min_args: 2,
         max_args: 2,
         handler: builtin_ends_with,
+        bound: Bound::Scalar,
     },
     BuiltinMeta {
         name: "slice",
         min_args: 2,
         max_args: 3,
         handler: builtin_slice,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "contains",
         min_args: 2,
         max_args: 2,
         handler: builtin_contains,
+        bound: Bound::Scalar,
     },
     // Array operations
     BuiltinMeta {
@@ -102,42 +121,49 @@ static BUILTINS: &[BuiltinMeta] = &[
         min_args: 2,
         max_args: 2,
         handler: builtin_join,
+        bound: Bound::Exact(join_result_len),
     },
     BuiltinMeta {
         name: "length",
         min_args: 1,
         max_args: 1,
         handler: builtin_length,
+        bound: Bound::Scalar,
     },
     BuiltinMeta {
         name: "first",
         min_args: 1,
         max_args: 1,
         handler: builtin_first,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "last",
         min_args: 1,
         max_args: 1,
         handler: builtin_last,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "reverse",
         min_args: 1,
         max_args: 1,
         handler: builtin_reverse,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "sort",
         min_args: 1,
         max_args: 1,
         handler: builtin_sort,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "unique",
         min_args: 1,
         max_args: 1,
         handler: builtin_unique,
+        bound: Bound::Input,
     },
     // Type conversion
     BuiltinMeta {
@@ -145,12 +171,14 @@ static BUILTINS: &[BuiltinMeta] = &[
         min_args: 1,
         max_args: 1,
         handler: builtin_string,
+        bound: Bound::Exact(string_result_len),
     },
     BuiltinMeta {
         name: "number",
         min_args: 1,
         max_args: 1,
         handler: builtin_number,
+        bound: Bound::Scalar,
     },
 ];
 
@@ -247,12 +275,31 @@ fn builtin_lower(args: &[Value]) -> Result<Value, MdsError> {
 }
 
 fn upper_result_len(args: &[Value]) -> Option<usize> {
-    case_result_len(args, char::to_uppercase)
+    case_result_len(args, char::to_uppercase).filter(|&len| len <= MAX_OUTPUT_SIZE)
 }
 
 fn lower_result_len(args: &[Value]) -> Option<usize> {
     // Both forms of lowercase sigma use the same two bytes as uppercase sigma.
     case_result_len(args, char::to_lowercase)
+}
+
+fn lower_capacity(args: &[Value]) -> Option<usize> {
+    let len = lower_result_len(args).filter(|&len| len <= MAX_OUTPUT_SIZE)?;
+    let Value::String(s) = args.first()? else {
+        return None;
+    };
+    // For sigma, std starts at the input byte length. If that space is too
+    // small, it can grow to about twice the result length. Charge for the
+    // larger capacity in advance, for at most one capped result allocation.
+    if s.contains('Σ') {
+        let input = s.len();
+        return if len <= input {
+            Some(input)
+        } else {
+            input.checked_mul(2).map(|grown| grown.max(len))
+        };
+    }
+    Some(len)
 }
 
 fn case_result_len<I: Iterator<Item = char>>(
@@ -290,7 +337,27 @@ fn builtin_output_too_large(name: &str) -> MdsError {
 
 fn builtin_trim(args: &[Value]) -> Result<Value, MdsError> {
     let s = require_string(args, "trim")?;
-    Ok(Value::String(s.trim().to_string()))
+    let len = trim_result_len(args).ok_or_else(MdsError::compile_memory_exceeded)?;
+    let mut out = String::with_capacity(len);
+    out.push_str(s.trim());
+    Ok(Value::String(out))
+}
+
+fn trim_result_len(args: &[Value]) -> Option<usize> {
+    let Value::String(s) = args.first()? else {
+        return None;
+    };
+    Some(s.trim().len())
+}
+
+fn replace_output_len(args: &[Value]) -> Option<usize> {
+    let [Value::String(s), Value::String(from), Value::String(to)] = args else {
+        return None;
+    };
+    if from.is_empty() {
+        return None;
+    }
+    replace_result_len(s, from, to).filter(|&len| len <= MAX_OUTPUT_SIZE)
 }
 
 fn builtin_replace(args: &[Value]) -> Result<Value, MdsError> {
@@ -306,7 +373,7 @@ fn builtin_replace(args: &[Value]) -> Result<Value, MdsError> {
     // replaced by a long string on large input asks for a result far exceeding
     // MAX_OUTPUT_SIZE, so the result's length is computed first and an over-cap result
     // is never built. A fitting result is built at exactly that length.
-    match replace_result_len(s, from, to).filter(|&len| len <= MAX_OUTPUT_SIZE) {
+    match replace_output_len(args) {
         Some(len) => {
             let mut result = String::with_capacity(len);
             replace_pieces(s, from, to, &mut |piece| result.push_str(piece));
@@ -667,19 +734,32 @@ fn sort_numbers(arr: &[Value]) -> Result<Value, MdsError> {
 /// element count. The total cost for an array of n nested values is therefore
 /// O(n*m). This is bounded in practice by `MAX_FILE_SIZE` (10 MB), so no
 /// additional guard is needed here.
-fn unique_key(v: &Value) -> String {
-    match v {
-        Value::String(s) => format!("s:{s}"),
-        Value::Number(n) => format!("n:{n}"),
-        Value::Boolean(b) => format!("b:{b}"),
-        Value::Null => "null:".to_string(),
-        // Arrays and objects are stringified with their type prefix. Two
-        // structurally identical nested values will collide only if they
-        // produce the same Display output, which is the correct semantic for
-        // equality-based deduplication of these types.
-        Value::Array(_) => format!("a:{v}"),
-        Value::Object(_) => format!("o:{v}"),
-    }
+fn unique_key(v: &Value) -> Result<String, MdsError> {
+    let prefix = match v {
+        Value::String(_) => "s:",
+        // Match the ordinary f64 display used for numeric keys, which differs
+        // from Value's display at the i64 boundary and for negative zero.
+        Value::Number(n) => return render_number_key(*n),
+        Value::Boolean(_) => "b:",
+        Value::Null => "null:",
+        Value::Array(_) => "a:",
+        Value::Object(_) => "o:",
+    };
+    let len = display_len(v).ok_or_else(MdsError::compile_memory_exceeded)?;
+    render_prefixed_value(v, len, prefix)
+}
+
+fn render_number_key(n: f64) -> Result<String, MdsError> {
+    use std::fmt::Write;
+
+    let mut text =
+        String::with_capacity(number_key_len(n).ok_or_else(MdsError::compile_memory_exceeded)?);
+    write!(text, "n:{n}").map_err(|_| MdsError::compile_memory_exceeded())?;
+    Ok(text)
+}
+
+pub(crate) fn number_key_len(n: f64) -> Option<usize> {
+    crate::evaluator::budget::format_len(format_args!("n:{n}"))
 }
 
 fn builtin_unique(args: &[Value]) -> Result<Value, MdsError> {
@@ -690,10 +770,10 @@ fn builtin_unique(args: &[Value]) -> Result<Value, MdsError> {
     // Order-preserving deduplication in O(n) time.
     // Value does not implement Hash, so we use a type-discriminated string key
     // derived from each element's display representation.
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::with_capacity(arr.len());
     let mut result: Vec<Value> = Vec::with_capacity(arr.len());
     for item in arr {
-        if seen.insert(unique_key(item)) {
+        if seen.insert(unique_key(item)?) {
             result.push(item.clone());
         }
     }
@@ -703,7 +783,12 @@ fn builtin_unique(args: &[Value]) -> Result<Value, MdsError> {
 // ── Type conversion ───────────────────────────────────────────────────────────
 
 fn builtin_string(args: &[Value]) -> Result<Value, MdsError> {
-    Ok(Value::String(args[0].to_string()))
+    let len = string_result_len(args).ok_or_else(MdsError::compile_memory_exceeded)?;
+    render_value(&args[0], len).map(Value::String)
+}
+
+fn string_result_len(args: &[Value]) -> Option<usize> {
+    display_len(args.first()?)
 }
 
 fn builtin_number(args: &[Value]) -> Result<Value, MdsError> {

@@ -1,18 +1,23 @@
 use std::borrow::Cow;
+use std::fmt::{self, Write};
 use std::sync::Arc;
 
-mod budget;
-use budget::{MemBudget, Part};
+pub(crate) mod budget;
+use budget::{
+    bytes, display_len, format_len, render_value, table_bytes, value_bytes, MemBudget, Part, NODE,
+    VALUE_ROOT,
+};
 
 use crate::arity::check_arity;
 use crate::ast::{
     render_signature, required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock,
     IncludeDirective, MessageBlock, Node,
 };
+use crate::builtins::{Bound, BuiltinMeta};
 use crate::error::MdsError;
 use crate::limits::{
-    MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGES_TOTAL_SIZE, MAX_MESSAGE_COUNT,
-    MAX_OUTPUT_SIZE, MAX_TOTAL_FUNCTION_CALLS,
+    MAX_ARRAY_ELEMENTS, MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGES_TOTAL_SIZE,
+    MAX_MESSAGE_COUNT, MAX_OUTPUT_SIZE, MAX_TOTAL_FUNCTION_CALLS,
 };
 use crate::scope::{FunctionDef, PathStep, PromptText, Scope, Slot};
 use crate::value::Value;
@@ -29,6 +34,32 @@ const MAX_TOTAL_ITERATIONS: usize = 1_000_000;
 
 /// Maximum number of accumulated warnings before further warnings are silently dropped.
 const MAX_WARNINGS: usize = 1_000;
+const FRAME_ENTRY: usize = 2 * size_of::<(String, Slot)>() + 2;
+const _: () = assert!(FRAME_ENTRY >= 2 * size_of::<(String, Slot)>() + 2);
+
+fn charge_temp(mem: &mut MemBudget, count: Option<usize>) -> Result<(), MdsError> {
+    mem.charge(
+        Part::Temp,
+        count.ok_or_else(MdsError::compile_memory_exceeded)?,
+    )
+}
+
+fn charge_entry(
+    mem: &mut MemBudget,
+    name: &str,
+    bound_value: Option<usize>,
+) -> Result<(), MdsError> {
+    charge_temp(
+        mem,
+        name.len()
+            .checked_add(FRAME_ENTRY)
+            .and_then(|n| n.checked_add(bound_value?)),
+    )
+}
+
+fn charge_literal(mem: &mut MemBudget, len: usize) -> Result<(), MdsError> {
+    charge_temp(mem, VALUE_ROOT.checked_add(len))
+}
 
 /// Cumulative resource budgets for evaluation.
 ///
@@ -348,7 +379,7 @@ fn evaluate_nodes(
                         map.cursor = abs_out;
                     }
                     slot = evaluate_expr(&interp.expr, scope, ctx)?;
-                    rendered = render_expr(&interp.expr, &slot)?;
+                    rendered = render_expr(&interp.expr, &slot, &mut ctx.budget.mem)?;
                     if let Some(ref mut map) = ctx.map {
                         if map.suppress == 0 && !ctx.fn_body_owned {
                             // S3 path: body was suppressed; record the call-site span.
@@ -482,7 +513,12 @@ fn invalid_projection() -> MdsError {
 }
 
 /// Resolve each field against the root slot. An empty path returns the slot itself.
-fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot, MdsError> {
+fn resolve_dot_path(
+    root: &str,
+    fields: &[String],
+    scope: &Scope,
+    mem: &mut MemBudget,
+) -> Result<Slot, MdsError> {
     if fields.len() > MAX_DOT_SEGMENTS {
         return Err(MdsError::syntax(format!(
             "dot path exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
@@ -499,6 +535,7 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot
         };
         match current.get().ok_or_else(invalid_projection)? {
             Value::Object(map) if map.contains_key(field) => {
+                charge_temp(mem, Slot::PROJECTION_BYTES.checked_add(field.len()))?;
                 current = current.project(PathStep::Key(field.clone()));
             }
             Value::Object(_) => {
@@ -539,17 +576,21 @@ fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Resul
                     "'{object}' is an imported module, not a variable — to call a function use {{{object}.func()}}"
                 )));
             }
-            resolve_dot_path(object, fields, scope)
+            resolve_dot_path(object, fields, scope, &mut ctx.budget.mem)
         }
-        Expr::StringLiteral(s) => Ok(Value::String(s.clone()).into()),
-        Expr::NumberLiteral(n) => Ok(Value::Number(*n).into()),
-        Expr::BooleanLiteral(b) => Ok(Value::Boolean(*b).into()),
-        Expr::NullLiteral => Ok(Value::Null.into()),
+        literal => {
+            charge_literal(&mut ctx.budget.mem, literal_text_len(literal))?;
+            literal_expr_to_value(literal).map(Slot::from)
+        }
     }
 }
 
 /// Render an evaluated expression. Borrow strings and reject direct object interpolation.
-fn render_expr<'a>(expr: &Expr, slot: &'a Slot) -> Result<Cow<'a, str>, MdsError> {
+fn render_expr<'a>(
+    expr: &Expr,
+    slot: &'a Slot,
+    mem: &mut MemBudget,
+) -> Result<Cow<'a, str>, MdsError> {
     let value = slot.get().ok_or_else(invalid_projection)?;
     match value {
         Value::String(text) => Ok(Cow::Borrowed(text)),
@@ -567,7 +608,11 @@ fn render_expr<'a>(expr: &Expr, slot: &'a Slot) -> Result<Cow<'a, str>, MdsError
             };
             Err(MdsError::syntax(hint))
         }
-        _ => Ok(Cow::Owned(value.to_string())),
+        _ => {
+            let len = display_len(value).ok_or_else(MdsError::compile_memory_exceeded)?;
+            mem.charge(Part::Temp, len)?;
+            render_value(value, len).map(Cow::Owned)
+        }
     }
 }
 
@@ -582,18 +627,33 @@ fn resolve_args(
             "argument expression depth exceeds {MAX_CALL_DEPTH}"
         )));
     }
+    charge_temp(&mut ctx.budget.mem, bytes(args.len(), size_of::<Slot>()))?;
     args.iter()
         .map(|arg| match arg {
-            Arg::StringLiteral(s) => Ok(Value::String(s.clone()).into()),
-            Arg::NumberLiteral(n) => Ok(Value::Number(*n).into()),
-            Arg::BooleanLiteral(b) => Ok(Value::Boolean(*b).into()),
-            Arg::NullLiteral => Ok(Value::Null.into()),
+            Arg::StringLiteral(s) => {
+                charge_literal(&mut ctx.budget.mem, s.len())?;
+                Ok(Value::String(s.clone()).into())
+            }
+            Arg::NumberLiteral(n) => {
+                charge_literal(&mut ctx.budget.mem, 0)?;
+                Ok(Value::Number(*n).into())
+            }
+            Arg::BooleanLiteral(b) => {
+                charge_literal(&mut ctx.budget.mem, 0)?;
+                Ok(Value::Boolean(*b).into())
+            }
+            Arg::NullLiteral => {
+                charge_literal(&mut ctx.budget.mem, 0)?;
+                Ok(Value::Null.into())
+            }
             Arg::Var(name) => resolve_var(name, scope),
             Arg::Call {
                 name,
                 args: inner_args,
             } => call_function(name, inner_args, scope, ctx, depth + 1),
-            Arg::MemberAccess { object, fields } => resolve_dot_path(object, fields, scope),
+            Arg::MemberAccess { object, fields } => {
+                resolve_dot_path(object, fields, scope, &mut ctx.budget.mem)
+            }
         })
         .collect()
 }
@@ -641,6 +701,13 @@ pub(crate) fn literal_expr_to_value(expr: &Expr) -> Result<Value, MdsError> {
     }
 }
 
+fn literal_text_len(expr: &Expr) -> usize {
+    match expr {
+        Expr::StringLiteral(s) => s.len(),
+        _ => 0,
+    }
+}
+
 fn check_function_arity(
     func: &FunctionDef,
     call_key: &str,
@@ -682,6 +749,7 @@ fn invoke_function(
     check_function_arity(func, call_key, args.len())?;
     ctx.budget.charge_function_call()?;
     let mark = ctx.budget.mem.mark();
+    ctx.budget.mem.charge(Part::Temp, call_key.len())?;
     let mut body = String::new();
     scope.push_call(func);
     let result = evaluate_function_body(func, call_key, args, scope, ctx, &mut body);
@@ -701,10 +769,13 @@ fn bind_call_params(
     params: &[crate::ast::Param],
     args: &[Slot],
     scope: &mut Scope,
+    mem: &mut MemBudget,
 ) -> Result<(), MdsError> {
     // Bind params index-by-index; fill missing optional params with their defaults.
     for (i, param) in params.iter().enumerate() {
         let slot = if let Some(arg) = args.get(i) {
+            // The slot shares the argument already live in the caller's mark.
+            charge_entry(mem, &param.name, Some(0))?;
             arg.clone()
         } else {
             // Required params were already checked above; this arm only fires for
@@ -715,6 +786,11 @@ fn bind_call_params(
                     param.name
                 ))
             })?;
+            charge_entry(
+                mem,
+                &param.name,
+                VALUE_ROOT.checked_add(literal_text_len(default)),
+            )?;
             literal_expr_to_value(default)?.into()
         };
         scope.set_slot(&param.name, slot);
@@ -730,7 +806,7 @@ fn evaluate_function_body(
     ctx: &mut EvalContext,
     raw_body: &mut String,
 ) -> Result<(), MdsError> {
-    bind_call_params(&func.params, args, scope)?;
+    bind_call_params(&func.params, args, scope, &mut ctx.budget.mem)?;
 
     // B1 (applies PF-012): swap body_origin to the function's defining file so
     // build_type_mismatch inside the body attributes spans to the correct source.
@@ -893,7 +969,7 @@ fn call_function(
     if let Some(func) = scope.get_function(name).cloned() {
         check_function_arity(&func, name, args.len())?;
         let args = resolve_args(args, scope, ctx, depth)?;
-        return invoke_function(&func, name, &args, scope, ctx).map(|s| Value::String(s).into());
+        return invoke_with_args(&func, name, &args, scope, ctx);
     }
     // Fall back to built-ins.
     if let Some(meta) = crate::builtins::get_builtin(name) {
@@ -909,19 +985,124 @@ fn call_function(
                 None, // built-in signatures live in docs, not the error message
             ));
         }
-        // Call the handler directly using the meta reference we already hold,
-        // avoiding a second linear scan through BUILTINS that call_builtin
-        // would perform internally.
-        let values = resolve_args(args, scope, ctx, depth)?
-            .into_iter()
-            .map(|slot| slot.into_value().ok_or_else(invalid_projection))
-            .collect::<Result<Vec<_>, _>>()?;
-        ctx.budget.charge_function_call()?;
-        return (meta.handler)(&values).map(Slot::from);
+        return invoke_builtin(meta, args, scope, ctx, depth);
     }
     // An argument error still takes priority when the callee does not exist.
     resolve_args(args, scope, ctx, depth)?;
     Err(MdsError::undefined_fn(name))
+}
+
+fn invoke_with_args(
+    func: &Arc<FunctionDef>,
+    call_key: &str,
+    args: &[Slot],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<Slot, MdsError> {
+    ctx.budget.mem.charge(Part::Temp, VALUE_ROOT)?;
+    invoke_function(func, call_key, args, scope, ctx).map(|s| Value::String(s).into())
+}
+
+fn invoke_builtin(
+    meta: &BuiltinMeta,
+    args: &[Arg],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+    depth: usize,
+) -> Result<Slot, MdsError> {
+    let mark = ctx.budget.mem.mark();
+    let result = (|| {
+        let slots = resolve_args(args, scope, ctx, depth)?;
+        charge_temp(&mut ctx.budget.mem, bytes(slots.len(), NODE))?;
+        let mut values = Vec::with_capacity(slots.len());
+        let mut input_bytes = 0;
+        for slot in slots {
+            let copies = slot.copies_on_take();
+            if copies || (values.is_empty() && matches!(meta.bound, Bound::Input)) {
+                let value = slot.get().ok_or_else(invalid_projection)?;
+                let size = value_bytes(value).ok_or_else(MdsError::compile_memory_exceeded)?;
+                if values.is_empty() {
+                    input_bytes = size;
+                }
+                if copies {
+                    ctx.budget.mem.charge(Part::Temp, size)?;
+                }
+            }
+            values.push(slot.into_value().ok_or_else(invalid_projection)?);
+        }
+        ctx.budget.charge_function_call()?;
+        let bound = builtin_bound(meta, &values, input_bytes)?;
+        if let Some(n) = bound {
+            ctx.budget.mem.charge(Part::Temp, n)?;
+        }
+        (meta.handler)(&values).map(|value| (value, bound))
+    })();
+    ctx.budget.mem.release_to(mark);
+    let (value, bound) = result?;
+    let size = if matches!(meta.bound, Bound::Input) {
+        value_bytes(&value)
+    } else {
+        bound
+    };
+    charge_temp(&mut ctx.budget.mem, size)?;
+    Ok(value.into())
+}
+
+fn builtin_bound(
+    meta: &BuiltinMeta,
+    values: &[Value],
+    input_bytes: usize,
+) -> Result<Option<usize>, MdsError> {
+    let n = match meta.bound {
+        Bound::Scalar => Some(VALUE_ROOT),
+        // Capped counts return None above their cap. Invalid arguments keep the
+        // handler's diagnostic; no result buffer is allocated on that path.
+        Bound::Exact(count) => match count(values) {
+            Some(n) => n.checked_add(VALUE_ROOT),
+            None => return Ok(None),
+        },
+        Bound::Input => input_builtin_bound(meta.name, values.first(), input_bytes),
+        Bound::Split => split_bound(values),
+    };
+    n.map(Some).ok_or_else(MdsError::compile_memory_exceeded)
+}
+
+fn input_builtin_bound(name: &str, value: Option<&Value>, input_bytes: usize) -> Option<usize> {
+    let array = value.and_then(Value::as_array);
+    let count = array.map_or(0, |items| items.len());
+    let bound = bytes(input_bytes, 2)?.checked_add(bytes(count, 32)?)?;
+    if name == "unique" {
+        if let Some(items) = array {
+            // Numeric formatting can be longer than the in-memory value. Count
+            // each key's bytes plus the entire seen table before it is built.
+            let keys = items.iter().try_fold(0usize, |sum, item| {
+                let key_len = match item {
+                    Value::Number(n) => crate::builtins::number_key_len(*n)?,
+                    _ => display_len(item)?.checked_add(5)?,
+                };
+                sum.checked_add(key_len)
+            })?;
+            let table = table_bytes(count, size_of::<String>())?;
+            return Some(bound.max(input_bytes.checked_add(keys)?.checked_add(table)?));
+        }
+    }
+    Some(bound)
+}
+
+fn split_bound(values: &[Value]) -> Option<usize> {
+    let [Value::String(s), Value::String(sep)] = values else {
+        return Some(0);
+    };
+    let Some(parts) = s.len().checked_div(sep.len()) else {
+        return Some(0);
+    };
+    let capacity = parts
+        .saturating_add(1)
+        .clamp(64, MAX_ARRAY_ELEMENTS)
+        .next_power_of_two();
+    VALUE_ROOT
+        .checked_add(s.len())?
+        .checked_add(bytes(capacity, NODE)?)
 }
 
 fn call_qualified_function(
@@ -931,7 +1112,16 @@ fn call_qualified_function(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<Slot, MdsError> {
-    let qualified_name = format!("{namespace}.{name}");
+    let len = namespace
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_add(name.len()))
+        .ok_or_else(MdsError::compile_memory_exceeded)?;
+    ctx.budget.mem.charge(Part::Temp, len)?;
+    let mut qualified_name = String::with_capacity(len);
+    qualified_name.push_str(namespace);
+    qualified_name.push('.');
+    qualified_name.push_str(name);
     let callee = scope
         .get_namespace(namespace)
         .ok_or_else(|| MdsError::undefined_var(namespace))
@@ -946,7 +1136,7 @@ fn call_qualified_function(
     }
     // Defer a lookup error until after the arguments have been evaluated.
     let args = resolve_args(args, scope, ctx, 0)?;
-    invoke_function(&callee?, &qualified_name, &args, scope, ctx).map(|s| Value::String(s).into())
+    invoke_with_args(&callee?, &qualified_name, &args, scope, ctx)
 }
 
 /// Compare two runtime `Value` instances for strict same-type equality.
@@ -1181,6 +1371,7 @@ where
             // Sort keys alphabetically for deterministic output.
             // SAFE to use unstable sort: `map` comes from `Value::Object` (a HashMap) —
             // keys are unique by construction so no two elements compare equal (tie-free).
+            charge_temp(&mut ctx.budget.mem, bytes(map.len(), size_of::<&String>()))?;
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort_unstable();
 
@@ -1193,6 +1384,16 @@ where
                 )));
                 }
                 let pass = ctx.budget.mem.mark();
+                charge_entry(
+                    &mut ctx.budget.mem,
+                    key_var,
+                    VALUE_ROOT.checked_add(key.len()),
+                )?;
+                charge_entry(
+                    &mut ctx.budget.mem,
+                    &block.var,
+                    Slot::PROJECTION_BYTES.checked_add(key.len()),
+                )?;
                 scope.push();
                 scope.set_var(key_var, Value::String(key.clone()));
                 scope.set_slot(&block.var, slot.project(PathStep::Key(key.clone())));
@@ -1234,6 +1435,11 @@ where
             )));
             }
             let pass = ctx.budget.mem.mark();
+            charge_entry(
+                &mut ctx.budget.mem,
+                &block.var,
+                Some(Slot::PROJECTION_BYTES),
+            )?;
             scope.push();
             scope.set_slot(&block.var, slot.project(PathStep::Index(i)));
             let result = body(scope, ctx);
@@ -1258,6 +1464,19 @@ fn evaluate_for(
     })
 }
 
+// Warning text is formatted first. Its capacity is at most one allocation
+// proportional to the capped alias, plus the fixed diagnostic text.
+fn push_warning(ctx: &mut EvalContext, args: fmt::Arguments<'_>) -> Result<(), MdsError> {
+    let len = format_len(args).ok_or_else(MdsError::compile_memory_exceeded)?;
+    let mut message = String::with_capacity(len);
+    message
+        .write_fmt(args)
+        .map_err(|_| MdsError::compile_memory_exceeded())?;
+    ctx.budget.mem.charge(Part::Buffers, message.capacity())?;
+    ctx.warnings.push(message);
+    Ok(())
+}
+
 fn evaluate_include(
     inc: &IncludeDirective,
     scope: &Scope,
@@ -1273,23 +1492,28 @@ fn evaluate_include(
             if ctx.warnings.len() < MAX_WARNINGS {
                 // Untrusted identifier from template source — WIRE (spec 7.5).
                 let safe_alias = crate::lint::sanitize_control_chars_wire(&inc.alias);
-                let msg = if ns.prompt_suppressed_by_exports {
+                if ns.prompt_suppressed_by_exports {
                     // WARN-B: module has body text but @export list excludes "prompt".
-                    format!(
-                        "warning: @include of '{safe_alias}' produced empty output \
+                    push_warning(
+                        ctx,
+                        format_args!(
+                            "warning: @include of '{safe_alias}' produced empty output \
                          — module has body text, but its explicit @export list does not export \
                          'prompt'; add `@export prompt` to the module, or call its functions \
                          directly: {{{{{safe_alias}.fn()}}}}"
-                    )
+                        ),
+                    )?;
                 } else {
                     // WARN-A: module has no body text at all.
-                    format!(
-                        "warning: @include of '{safe_alias}' produced empty output \
+                    push_warning(
+                        ctx,
+                        format_args!(
+                            "warning: @include of '{safe_alias}' produced empty output \
                          — module has no body text; to use the module's functions, call them \
                          directly: {{{{{safe_alias}.fn()}}}}"
-                    )
-                };
-                ctx.warnings.push(msg);
+                        ),
+                    )?;
+                }
             }
             return Ok(None);
         }
@@ -1420,10 +1644,13 @@ fn collect_messages_strict(
                 // @include in messages mode is not meaningful — warn.
                 if ctx.warnings.len() < MAX_WARNINGS {
                     // Untrusted identifier from template source — WIRE (spec 7.5).
-                    ctx.warnings.push(format!(
-                        "warning: @include '{}' inside messages mode is ignored",
-                        crate::lint::sanitize_control_chars_wire(&inc.alias)
-                    ));
+                    push_warning(
+                        ctx,
+                        format_args!(
+                            "warning: @include '{}' inside messages mode is ignored",
+                            crate::lint::sanitize_control_chars_wire(&inc.alias)
+                        ),
+                    )?;
                 }
             }
             Node::Block(block) => {
@@ -1587,6 +1814,92 @@ mod tests {
         }
     }
 
+    fn seed_headroom(ctx: &mut EvalContext<'_>, available: usize) {
+        ctx.budget
+            .mem
+            .charge(Part::Buffers, crate::limits::MAX_COMPILE_MEMORY - available)
+            .unwrap();
+    }
+
+    #[test]
+    fn join_keeps_its_type_error_when_the_result_would_not_fit() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "items",
+            Value::Array(vec![Value::String("x".repeat(256)), Value::Number(1.0)]),
+        );
+        let args = [
+            Arg::Var("items".into()),
+            Arg::StringLiteral("/".repeat(2048)),
+        ];
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, 4096);
+        let before = ctx.budget.mem;
+        let err = call_function("join", &args, &mut scope, &mut ctx, 0).unwrap_err();
+        assert_eq!(err.serialize().code, "mds::builtin");
+        assert!(err.to_string().contains("found number in array"));
+        assert_eq!(ctx.budget.mem, before);
+        scope.set_var(
+            "items",
+            Value::Array(vec![
+                Value::String("x".repeat(256)),
+                Value::String("ok".into()),
+            ]),
+        );
+        let err = call_function("join", &args, &mut scope, &mut ctx, 0).unwrap_err();
+        assert_eq!(
+            err.serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+        assert_eq!(ctx.budget.mem, before);
+    }
+
+    #[test]
+    fn loop_frames_release_each_key_copy() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "entries",
+            Value::Object(
+                (0..MAX_LOOP_ITERATIONS)
+                    .map(|i| (i.to_string(), Value::Null))
+                    .collect(),
+            ),
+        );
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.key_var = Some("key".into());
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, MAX_LOOP_ITERATIONS * size_of::<&String>() + 512);
+        let before = ctx.budget.mem;
+        let mut passes = 0;
+        drive_for(&block, &mut scope, &mut ctx, |_, _| {
+            passes += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(passes, MAX_LOOP_ITERATIONS);
+        assert_eq!(ctx.budget.mem, before);
+    }
+
+    #[test]
+    fn warning_charge_keeps_only_text_that_fits() {
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let long = "a".repeat(256);
+        seed_headroom(&mut ctx, 128);
+        let before = ctx.budget.mem;
+        let err = push_warning(&mut ctx, format_args!("warning: {long}")).unwrap_err();
+        assert_eq!(
+            err.serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+        assert!(ctx.warnings.is_empty());
+        assert_eq!(ctx.budget.mem, before);
+        push_warning(&mut ctx, format_args!("warning: a")).unwrap();
+        assert_eq!(*ctx.warnings, ["warning: a"]);
+    }
+
     fn test_loop(iterable: Expr) -> ForBlock {
         ForBlock {
             var: "item".into(),
@@ -1692,6 +2005,7 @@ mod tests {
             &[Param::required("whole"), Param::required("part")],
             &resolved,
             &mut scope,
+            &mut MemBudget::default(),
         )
         .unwrap();
         let config = scope.get_slot("cfg").unwrap();
@@ -1747,7 +2061,7 @@ mod tests {
         for expr in [Expr::Var("broken".into()), member("broken", "field")] {
             assert_eq!(
                 evaluate_expr(&expr, &mut scope, &mut ctx)
-                    .and_then(|slot| render_expr(&expr, &slot).map(drop))
+                    .and_then(|slot| render_expr(&expr, &slot, &mut ctx.budget.mem).map(drop))
                     .unwrap_err()
                     .to_string(),
                 expected

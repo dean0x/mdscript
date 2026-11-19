@@ -1,5 +1,9 @@
-use super::{MemBudget, Part};
-use crate::{error::MdsError, limits::MAX_COMPILE_MEMORY};
+use super::{bytes, display_len, render_value, value_bytes, MemBudget, Part, NODE, VALUE_ROOT};
+use crate::{
+    error::MdsError,
+    limits::MAX_COMPILE_MEMORY,
+    value::{Value, MAX_VALUE_DEPTH},
+};
 
 #[test]
 fn charges_allow_exactly_the_limit() {
@@ -60,4 +64,48 @@ fn refused_growth_leaves_the_buffer_unchanged() {
     );
     assert_eq!(out, "abc");
     assert_eq!(out.capacity(), capacity);
+}
+
+#[test]
+fn byte_size_does_not_wrap() {
+    let count = usize::MAX / NODE;
+    assert_eq!(bytes(count, NODE), Some(count * NODE));
+    assert_eq!(bytes(count + 1, NODE), None);
+}
+
+#[test]
+fn display_count_matches_nested_values_and_number_formats() {
+    let value = Value::Array(vec![
+        Value::Object(std::collections::HashMap::from([
+            ("z".into(), Value::Boolean(false)),
+            (
+                "a".into(),
+                Value::Array(vec![Value::Null, Value::Number(f64::MAX)]),
+            ),
+        ])),
+        Value::Number(-0.0),
+        Value::String("é".into()),
+    ]);
+    let len = display_len(&value).unwrap();
+    let text = render_value(&value, len).unwrap();
+    assert_eq!(text, value.to_string());
+    assert_eq!(text.capacity(), text.len());
+}
+
+#[test]
+fn value_count_checks_depth_and_charges_spare_array_capacity() {
+    let mut items = Vec::with_capacity(16);
+    items.push(Value::Null);
+    assert_eq!(
+        value_bytes(&Value::Array(items)),
+        Some(VALUE_ROOT + 16 * NODE)
+    );
+    let mut value = Value::Null;
+    for _ in 0..MAX_VALUE_DEPTH {
+        value = Value::Array(vec![value]);
+    }
+    assert!(value_bytes(&value).is_some());
+    let too_deep = Value::Array(vec![value]);
+    assert_eq!(value_bytes(&too_deep), None);
+    assert_eq!(display_len(&too_deep), None);
 }

@@ -4,7 +4,7 @@ use std::fmt;
 use crate::error::MdsError;
 
 /// Maximum nesting depth for YAML and JSON value trees.
-const MAX_VALUE_DEPTH: usize = 64;
+pub(crate) const MAX_VALUE_DEPTH: usize = 64;
 
 /// Return a human-readable type name for a YAML value, used in error diagnostics.
 fn yaml_type_name(v: &serde_yaml_ng::Value) -> &'static str {

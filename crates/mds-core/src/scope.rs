@@ -282,6 +282,8 @@ impl From<Value> for Slot {
 }
 
 impl Slot {
+    pub(crate) const PROJECTION_BYTES: usize = size_of::<PathNode>() + 2 * size_of::<usize>();
+
     fn from_root(root: Arc<Value>) -> Self {
         Self { root, path: None }
     }
@@ -308,20 +310,28 @@ impl Slot {
         let Some(head) = self.path.as_deref() else {
             return Some(&self.root);
         };
-        let mut steps = Vec::with_capacity(head.depth);
-        steps.extend(
-            std::iter::successors(Some(head), |node| node.parent.as_deref())
-                .take(head.depth)
-                .map(|node| &node.step),
-        );
+        let mut steps = [None; crate::value::MAX_VALUE_DEPTH];
+        let steps = steps.get_mut(..head.depth)?;
+        for (entry, node) in steps
+            .iter_mut()
+            .zip(std::iter::successors(Some(head), |node| {
+                node.parent.as_deref()
+            }))
+        {
+            *entry = Some(&node.step);
+        }
         steps
-            .into_iter()
+            .iter()
             .rev()
-            .try_fold(self.root.as_ref(), |value, step| match (value, step) {
-                (Value::Array(items), PathStep::Index(i)) => items.get(*i),
-                (Value::Object(fields), PathStep::Key(key)) => fields.get(key),
+            .try_fold(self.root.as_ref(), |value, step| match (value, *step) {
+                (Value::Array(items), Some(PathStep::Index(i))) => items.get(*i),
+                (Value::Object(fields), Some(PathStep::Key(key))) => fields.get(key),
                 _ => None,
             })
+    }
+
+    pub(crate) fn copies_on_take(&self) -> bool {
+        self.path.is_some() || Arc::strong_count(&self.root) > 1
     }
 
     pub(crate) fn into_value(self) -> Option<Value> {
