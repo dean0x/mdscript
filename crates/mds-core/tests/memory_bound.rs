@@ -186,6 +186,24 @@ fn assert_mapped_output_peak() {
     assert!(peak <= bound, "mapped output exceeds peak limit");
 }
 
+fn assert_over_cap_upper_does_not_build_its_result() {
+    let cap = 50 * MIB;
+    // Each U+0390 uses two bytes and uppercases to six bytes.
+    let payload = "\u{0390}".repeat(cap / 6 + 1);
+    let args_bytes = 2 * payload.len();
+    let vars = HashMap::from([("payload".to_owned(), Value::String(payload))]);
+    let (result, peak) =
+        peak_growth(|| mds::compile_str_with("{{upper(payload)}}", None, Some(vars)));
+    eprintln!("over-cap upper peak: {peak} B; limit: {cap} B");
+    assert!(peak >= args_bytes, "argument copies: {peak} B");
+    assert!(peak < cap, "over-cap upper grew peak heap by {peak} B");
+    let error = result.expect_err("upper output cap error");
+    assert_eq!(error.serialize().code, "mds::builtin");
+    assert!(error
+        .to_string()
+        .ends_with("upper() output exceeds maximum size of 52428800 bytes"));
+}
+
 #[test]
 fn nested_if_output_does_not_raise_the_peak_heap() {
     let source = include_str!("memory_bound.rs");
@@ -227,4 +245,5 @@ fn nested_if_output_does_not_raise_the_peak_heap() {
     assert_message_edge_trim_peak();
     assert_small_messages_do_not_keep_padding();
     assert_mapped_output_peak();
+    assert_over_cap_upper_does_not_build_its_result();
 }
