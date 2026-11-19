@@ -62,6 +62,8 @@ config:
 | `MAX_FRONTMATTER_FLOW_DEPTH` | 1024 levels of flow-collection (`[`/`{`) nesting, checked before the parser scans (bounds libyaml's O(depth²) flow scan) |
 | `MAX_FILE_SIZE` | 10 MiB per source, including strings passed to the string APIs |
 | `MAX_OUTPUT_SIZE` | 50 MiB per evaluation output buffer. The compiler reports the output limit at the first byte that crosses it. |
+| `MAX_COMPILE_MEMORY` | 209,715,200 bytes (four times `MAX_OUTPUT_SIZE`) per compile. One budget counts output buffers by capacity, values that evaluation makes, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes. Above it the compile fails with `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. §5 "Compile memory budget" names what the budget does not count. |
+| Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. Past 50 MiB the parse fails with `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`; past a smaller rest of the budget, with the compile memory message. Lint and the import scans parse with the 50 MiB allowance. |
 | `MAX_MODULE_COUNT` | 256; counts every distinct module besides the entry, even before its resolution completes. Binding virtual module maps accept at most 257 entries and use their own message above that bound. |
 
 Exceeding one of these returns `mds::resource_limit` (exit 3). YAML the parser
@@ -893,6 +895,56 @@ A compile permits at most 16,000,000 function calls across all evaluated modules
 and `@extends` regions. This limit includes built-ins and calls through an alias.
 The next call fails with `mds::resource_limit`. The limit applies to all output modes.
 
+**Compile memory budget (#420).** A compile has one memory budget of 209,715,200 bytes
+(`MAX_COMPILE_MEMORY`, four times the 50 MiB output limit). The budget counts these parts:
+
+- output buffers, by capacity;
+- values that evaluation makes: call and built-in results, argument copies, computed
+  loop iterables, loop and call frames, and rendered interpolations;
+- the text of each module that the compile reads, while that module resolves;
+- the parts that a cached module keeps: its source text, its prompt text, its frontmatter
+  text and tree, its captured scope layers and its source-map fragments. The merged
+  frontmatter tree of an `@extends` base is one of these parts;
+- kept source-map segments, warnings, messages and the finalize output.
+
+A part that modules share is counted once, for the module that makes it. The compiler
+counts a part before it allocates it. A few allocations are counted directly after they
+are made; each of them is one allocation that an existing cap bounds. Exactly the budget
+passes. The next charge fails with `mds::resource_limit` and the message
+`resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`, with no
+help and no span. The message does not name the part. The budget applies to every output
+mode and every surface. Each compile starts a new count, but a reused `ModuleCache`
+(Rust API) keeps the count of its cached modules until it is dropped, so a cache that
+lives long eventually refuses calls. Each frontmatter parse in a compile spends its own
+byte allowance from the budget (§4.1).
+
+At the end of a compile, the compiler checks its memory count: no evaluation value stays
+counted, and no counter went below zero. When the check fails, the compile returns
+`mds::internal` with the message `internal compiler error` instead of a result, and the
+module is not cached. A failed check is a compiler defect. The CLI exits 101 for it
+(§7.9). In a directory batch, the file counts as failed, and the run goes on with the
+next file.
+
+The budget does not count these stages:
+
+- the tokens and the syntax tree of each source, and the copy of a `@define` body that a
+  function keeps. They grow with the source text, which is at most 10 MiB per source;
+- the runtime variables that the caller supplies;
+- the line table of a source map;
+- the YAML event buffer of one frontmatter parse, whose input is at most 1 MiB;
+- the conversion of a result into the host types of a binding (napi, WASM, Python);
+- the old buffer that a reallocation holds for one instant when it moves a buffer;
+- resolver warnings, the message and warning lists, and the call stack, which their
+  count caps bound.
+
+A host thus needs memory for the budget, plus these stages, plus the largest allocation
+that is counted after it is made. On napi, WASM and Python, add the conversion of the
+result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compiles that
+reach the budget. It allows each of them at most 8 MiB above the budget, plus one 1 MiB
+output pass for a compile that writes output. For an `@extends` chain of 24 files, each
+with 1 MiB of frontmatter, it also allows 2 MiB per file for the tokens and syntax tree
+of that frontmatter.
+
 ### Project Root
 
 The compiler establishes a project root once per compilation. The root is used for two purposes: enforcing import containment (a resolved path that escapes it is a compilation error) and computing relative paths in Source Map v3 `sources[]` entries (see §7.5).
@@ -951,9 +1003,9 @@ breaking change.
 
 "Exit" is the CLI exit class (§7.9) for `mds build`, `mds check`, `mds fmt` and
 `mds watch` startup — 1 template or content error, 2 I/O or file-system error,
-3 resource limit — followed by the `mds lint` code, which reports analysis failures
-as 2 except for the two carve-outs shown. The CLI's own stream and I/O failures are
-described below the table.
+3 resource limit, 101 internal compiler error — followed by the `mds lint` code, which
+reports analysis failures as 2 except for the two carve-outs shown. The CLI's own stream
+and I/O failures are described below the table.
 
 | Code | Meaning | Raised by | Exit | Surfaces |
 |---|---|---|---|---|
@@ -983,7 +1035,7 @@ described below the table.
 | `mds::expected_markdown` | Rust API only: `CompileResult::into_markdown()` on a messages result | `mds-core` API | n/a | Rust |
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
-| `mds::internal` | A panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | napi, WASM, Python; `mds lint` | n/a / 101 | napi, WASM, Python, CLI (`lint --format json`) |
+| `mds::internal` | A failed memory-counter check at the end of a compile (§5 "Compile memory budget"), with the message `internal compiler error`, no help and no span; a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
 | `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`) | napi, WASM, Python, `@mdscript/mds` | n/a | napi, WASM, Python, `@mdscript/mds` |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
@@ -1393,7 +1445,7 @@ lines with the tests that pin each.
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Any error-severity finding, analysis failure (parse/resolve/IO/config), or usage error |
 | `3` | Resource limit exceeded |
-| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
 
 With `--fix`, residual post-fix findings determine the exit code.
 
@@ -1710,8 +1762,8 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 | `0` | Success |
 | `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials), and a run in which files failed but none with an error of the `2` or `3` row below — template errors, say (§7.2 continue-on-error) |
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8, a path carrying a forbidden path character — §4.6); also an output location (`-o`, `--out-dir`, `build.output_dir`) or `mds init` filename carrying one, a `-o`/`--out-dir` value that is not valid UTF-8, a relative `-o`/`--out-dir` when the working directory cannot be determined, and a working directory that auto-detection cannot list (§7.2, §7.7, #390), a `build.output_dir` that is absolute or contains `..`, a directory argument that is a symlink or the filesystem root (§7.2), an output that is the entry file itself, and one that would replace an MDS module or a file the run reads (§7.2). The CLI's I/O failures listed in §5 "Streams and I/O failures" are `mds::io`, exit 2: an output, `.map` sidecar or starter file that cannot be written (a symlink at the destination included), an output directory that cannot be created, a stale sidecar, or a stale `.json` output shown to be mds's, that cannot be removed or whose removal is refused (§7.2), a stale sidecar or `.json` output that cannot be read, a stdout write that fails other than by a closed pipe, and stdin that cannot be read or is not valid UTF-8 (#157). In directory mode a failure of this row — one of these, or a file's own, such as a source that cannot be read — makes the run exit 2 while the other files are still processed (§7.2 continue-on-error). (Changed in v0.5.0: these exited 1, a directory run whose failed files included one of this row's errors exited 1, and a stale sibling or sidecar that could not be removed, or a stale sidecar that could not be read, only warned.) |
-| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels, or stdin over 10 MiB — changed in v0.5.0; previously exit 1). In directory mode a run in which any file fails with one of these exits 3, whatever else failed, as `mds lint <dir>` does (§7.2 continue-on-error; changed in v0.5.0, previously exit 1) |
-| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
+| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, frontmatter over 1 MiB, over 200,000 YAML nodes, deeper than 1024 flow-nesting levels or past its byte allowance, compile memory over its budget, or stdin over 10 MiB — changed in v0.5.0; previously exit 1). In directory mode a run in which any file fails with one of these exits 3, whatever else failed, as `mds lint <dir>` does (§7.2 continue-on-error; changed in v0.5.0, previously exit 1) |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
 
 A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").
 
@@ -1723,7 +1775,7 @@ A closed stdout or stderr pipe never changes any of these codes (§5 "Streams an
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, stdin under `--fix --format json`, or a directory entry whose path is not valid UTF-8); also an I/O failure (#157): a `--fix` rewrite that fails, a stdout write that fails other than by a closed pipe — which lifts a clean or warning-only run to 2 — stdin that cannot be read or is not valid UTF-8, and a working directory that cannot be determined for stdin, each `mds::io` (a rewrite failure in the one wording of §7.5). Under `--format json` each is reported in the run's one JSON document (§7.5), except a usage error the argument parser reports and a stdout write that fails, which are reported on stderr |
 | `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2); a source file over 10 MiB in every mode and format, a directory's entry included, unless its `mds.json` cannot load (§7.5) (changed in v0.5.0 for a directory under `--format human`; previously exit 2, #309); a `--vars` file over 10 MiB (changed in v0.5.0; previously exit 2, #309) |
-| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
 
 The code-by-code classification behind these tables is the "Error Codes" registry in §5.
 
