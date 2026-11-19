@@ -407,6 +407,14 @@ impl ModuleCache {
         std::mem::replace(&mut self.kept, mark.outer_kept)
     }
 
+    /// Steps 1 to 3 of the module order: the root reset, the module mark and
+    /// the read charge. One out-of-line copy serves every resolve function.
+    #[inline(never)]
+    fn begin_module(&mut self, key: &str, read_bytes: usize) -> (ModuleMark, Result<(), MdsError>) {
+        self.start_resolution(key);
+        self.open_module(read_bytes)
+    }
+
     fn charge_kept(&mut self, n: usize) -> Result<(), MdsError> {
         self.budget.mem.charge(Part::Buffers, Some(n))?;
         // The kept sum is part of buffers, which charge already checked.
@@ -649,8 +657,7 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
-        self.start_resolution(key);
-        let (mark, read) = self.open_module(source.capacity());
+        let (mark, read) = self.begin_module(key, source.capacity());
         let resolved = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -768,8 +775,7 @@ impl ModuleCache {
         // root module as well.
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.start_resolution(SOURCE_LABEL);
-        let (mark, read) = self.open_module(0);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
 
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -880,8 +886,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(entry, &source)?;
 
-        self.start_resolution(key);
-        let (mark, read) = self.open_module(source.capacity());
+        let (mark, read) = self.begin_module(key, source.capacity());
         let result = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -919,8 +924,7 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.start_resolution(SOURCE_LABEL);
-        let (mark, read) = self.open_module(0);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -952,8 +956,7 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.start_resolution(SOURCE_LABEL);
-        let (mark, read) = self.open_module(0);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -1880,8 +1883,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
-        self.start_resolution(key);
-        let (mark, read) = self.open_module(source.capacity());
+        let (mark, read) = self.begin_module(key, source.capacity());
         let resolved = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -2554,6 +2556,7 @@ impl ImportSite<'_> {
 }
 
 impl ModuleCtx<'_> {
+    #[inline(never)]
     fn origin(&self, cache: &mut ModuleCache) -> Result<&Origin, MdsError> {
         if self.origin.get().is_none() {
             cache.charge_kept(self.origin_bytes())?;
