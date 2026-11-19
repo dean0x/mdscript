@@ -13,9 +13,13 @@
 //!   `upper()`/`lower()`/`join()` message from `builtin_output_too_large` in `builtins.rs`;
 //! * `push_capped` is defined once, and every output accumulator calls it the expected
 //!   number of times with no raw append (`push_str`, `push`, `+=`, …) left in its body.
+//! * The compile-memory message appears only in its constructor.
+//! * The budget checks do not depend on the target architecture. The budget module
+//!   returns errors instead of panics and does not use `RefCell`.
 //!
-//! Scope: `crates/mds-core/src/**`, excluding `*_tests.rs` files and `#[cfg(test)]`
-//! items. Comments never count; string literals count only for the message check.
+//! The message and append checks scan `crates/mds-core/src/**`. They skip `*_tests.rs`,
+//! `#[cfg(test)]` items, and comments. Only the message checks scan string literals.
+//! The architecture check scans the listed files as text. The budget module check scans code.
 
 use std::path::{Path, PathBuf};
 
@@ -25,9 +29,28 @@ const MESSAGE: &str = "\"output exceeds maximum size";
 /// The same text unanchored: the `builtins.rs` messages carry it mid-literal.
 const MESSAGE_UNANCHORED: &str = "output exceeds maximum size";
 
-/// The one file allowed to hold the message, and the constructor that must hold it.
+const BUDGET_MESSAGE: &str = "\"compile memory exceeds maximum of ";
+const BUDGET_CONSTRUCTOR: &str = "fn compile_memory_exceeded(";
+
+/// The file and constructors that build the messages.
 const CHOKE_POINT: &str = "error.rs";
-const CONSTRUCTOR: &str = "fn output_size_exceeded(";
+const MESSAGES: &[(&str, &str)] = &[
+    (MESSAGE, "fn output_size_exceeded("),
+    (BUDGET_MESSAGE, BUDGET_CONSTRUCTOR),
+];
+
+const BUDGET_SOURCE: &str = "evaluator/budget.rs";
+const ARCH_INDEPENDENT: &[&str] = &[
+    "evaluator.rs",
+    "resolver.rs",
+    "builtins.rs",
+    "sourcemap.rs",
+    "lib.rs",
+    "scope.rs",
+    "value.rs",
+    "resolver/frontmatter.rs",
+    BUDGET_SOURCE,
+];
 
 /// The capped append helper.
 const HELPER_DEF: &str = "fn push_capped(";
@@ -67,8 +90,7 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
         files.len()
     );
 
-    let mut violations: Vec<String> = Vec::new();
-    let mut choke_point_hits = 0usize;
+    let mut message_totals = [0; MESSAGES.len()];
     let mut unanchored_elsewhere = 0usize;
     let mut helper_defs = 0usize;
 
@@ -88,27 +110,11 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
 
         helper_defs += code.matches(HELPER_DEF).count();
 
-        let hits: Vec<usize> = code_and_strings
-            .match_indices(MESSAGE)
-            .map(|(at, _)| at)
-            .collect();
-        if name == CHOKE_POINT {
-            choke_point_hits += hits.len();
-            if hits.is_empty() {
-                continue;
-            }
-            let body = function_range(&code, CONSTRUCTOR, &name);
-            for at in &hits {
-                assert!(
-                    body.contains(at),
-                    "{name}: the output-cap message must be built inside \
-                     `MdsError::output_size_exceeded`, found one outside it"
-                );
-            }
-        } else {
-            for _ in &hits {
-                violations.push(format!("  {name}: contains the output-cap message"));
-            }
+        for ((message, constructor), total) in MESSAGES.iter().zip(&mut message_totals) {
+            *total += message_hits(&name, &code, &code_and_strings, message, constructor)
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        if name != CHOKE_POINT {
             unanchored_elsewhere += code_and_strings.matches(MESSAGE_UNANCHORED).count();
         }
     }
@@ -116,24 +122,18 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
     // Non-vacuity: the scanner finds the message where it must live, and the anchor —
     // not a blind matcher — is what excludes the built-in messages, which carry the
     // same words mid-literal.
-    assert_eq!(
-        choke_point_hits, 1,
-        "non-vacuity: `{CHOKE_POINT}` must build the output-cap message exactly once"
-    );
+    for ((message, constructor), total) in MESSAGES.iter().zip(message_totals) {
+        assert_eq!(
+            total, 1,
+            "`{CHOKE_POINT}` must build `{message}` exactly once in `{constructor}`"
+        );
+    }
     assert!(
         unanchored_elsewhere >= 2,
         "non-vacuity: the unanchored match must find the `replace()` message and the shared \
          `upper()`/`lower()`/`join()` message from `builtin_output_too_large` in `builtins.rs` \
          (found {unanchored_elsewhere})"
     );
-    assert!(
-        violations.is_empty(),
-        "output-cap message outside `MdsError::output_size_exceeded` ({} found):\n{}\n\n\
-         Build the error with `MdsError::output_size_exceeded()` instead.",
-        violations.len(),
-        violations.join("\n")
-    );
-
     assert_eq!(helper_defs, 1, "`push_capped` must be defined exactly once");
 
     for (file, anchor, calls) in ACCUMULATORS {
@@ -156,6 +156,105 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
             );
         }
     }
+}
+
+fn message_hits(
+    name: &str,
+    code: &str,
+    code_and_strings: &str,
+    message: &str,
+    constructor: &str,
+) -> Result<usize, String> {
+    let mut hits = code_and_strings.match_indices(message).peekable();
+    if hits.peek().is_none() {
+        return Ok(0);
+    }
+    let misplaced = || format!("{name}: build `{message}` only in `{constructor}`");
+    if name != CHOKE_POINT {
+        return Err(misplaced());
+    }
+    let body = function_range(code, constructor, name);
+    hits.try_fold(0, |total, (at, _)| {
+        if body.contains(&at) {
+            Ok(total + 1)
+        } else {
+            Err(misplaced())
+        }
+    })
+}
+
+fn check_budget_source(name: &str, raw: &str) -> Result<(), String> {
+    if raw.contains("target_arch") {
+        return Err(format!("{name}: do not use `target_arch`"));
+    }
+    if name == BUDGET_SOURCE {
+        let code = mask(raw, true);
+        let forbidden = code
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .find(|token| {
+                matches!(
+                    *token,
+                    "assert"
+                        | "assert_eq"
+                        | "assert_ne"
+                        | "debug_assert"
+                        | "debug_assert_eq"
+                        | "debug_assert_ne"
+                        | "expect"
+                        | "unwrap"
+                        | "panic"
+                        | "RefCell"
+                )
+            });
+        if let Some(token) = forbidden {
+            return Err(format!("{name}: do not use `{token}`"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn budget_rules_apply_to_each_source_file() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for name in ARCH_INDEPENDENT {
+        let raw = std::fs::read_to_string(src_dir.join(name)).expect("source must be readable");
+        check_budget_source(name, &raw).unwrap_or_else(|error| panic!("{error}"));
+    }
+}
+
+#[test]
+fn budget_gates_reject_planted_text() {
+    let literal = format!("{BUDGET_MESSAGE}209715200 bytes\"");
+    let valid = format!("{BUDGET_CONSTRUCTOR}) -> &'static str {{ {literal} }}");
+    let extra = format!("fn other() -> &'static str {{ {literal} }}");
+    for (name, raw) in [
+        ("evaluator.rs", extra.clone()),
+        (CHOKE_POINT, format!("{valid}\n{extra}")),
+    ] {
+        assert_eq!(
+            message_hits(
+                name,
+                &mask(&raw, true),
+                &mask(&raw, false),
+                BUDGET_MESSAGE,
+                BUDGET_CONSTRUCTOR,
+            ),
+            Err(format!(
+                "{name}: build `{BUDGET_MESSAGE}` only in `{BUDGET_CONSTRUCTOR}`"
+            ))
+        );
+    }
+    assert_eq!(
+        check_budget_source(
+            "evaluator.rs",
+            "#[cfg(target_arch = \"wasm32\")] fn charge() {}"
+        ),
+        Err("evaluator.rs: do not use `target_arch`".into())
+    );
+    assert_eq!(
+        check_budget_source(BUDGET_SOURCE, "fn charge() { assert!(false); }"),
+        Err("evaluator/budget.rs: do not use `assert`".into())
+    );
 }
 
 #[test]
