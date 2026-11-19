@@ -927,8 +927,11 @@ next file.
 
 The budget does not count these stages:
 
-- the tokens and the syntax tree of each source, and the copy of a `@define` body that a
-  function keeps. They grow with the source text, which is at most 10 MiB per source;
+- the tokens and the syntax tree of each source, and the copy of a `@define` or `@block`
+  body that the compiler keeps. They grow with the source text, which is at most 10 MiB
+  per source. On a 64-bit host they take at most 432 bytes per source byte while a module
+  resolves (the lexer alone at most 56), and a cached module keeps at most 388 bytes per
+  byte of its source until the compile returns;
 - the runtime variables that the caller supplies;
 - the line table of a source map;
 - the YAML event buffer of one frontmatter parse, whose input is at most 1 MiB;
@@ -943,7 +946,8 @@ result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compil
 reach the budget. It allows each of them at most 8 MiB above the budget, plus one 1 MiB
 output pass for a compile that writes output. For an `@extends` chain of 24 files, each
 with 1 MiB of frontmatter, it also allows 2 MiB per file for the tokens and syntax tree
-of that frontmatter.
+of that frontmatter. Its `assert_syntax_tree_peaks` measures the three syntax-tree
+numbers above for the densest syntax, two nodes for each four source bytes.
 
 ### Project Root
 

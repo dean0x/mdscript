@@ -282,8 +282,11 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 These limits apply to the quantities and scopes in the table. They do not bound
 elapsed time. The compile memory budget does not count these stages:
 
-- the tokens and the syntax tree of each source, and the copy of a `@define` body that
-  a function keeps. They grow with the source text, which the 10 MiB file cap bounds;
+- the tokens and the syntax tree of each source, and the copy of a `@define` or
+  `@block` body that the compiler keeps. They grow with the source text, which the
+  10 MiB file cap bounds. On a 64-bit host they take at most 432 bytes per source byte
+  while a module resolves (the lexer alone at most 56), and a cached module keeps at
+  most 388 bytes per byte of its source until the compile returns;
 - the runtime variables that the caller supplies;
 - the line table of a source map;
 - the YAML event buffer of one frontmatter parse, whose input the 1 MiB frontmatter cap
@@ -299,7 +302,9 @@ plus the largest of those allocations; on napi, WASM and Python, add the convers
 the result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compiles
 that reach the budget: it allows each of them at most 8 MiB above the budget, plus one
 1 MiB output pass for a compile that writes output, plus 2 MiB per file for the tokens
-and syntax tree of 1 MiB of frontmatter in each file of a 24-file `@extends` chain.
+and syntax tree of 1 MiB of frontmatter in each file of a 24-file `@extends` chain. Its
+`assert_syntax_tree_peaks` measures the three syntax-tree numbers above for the densest
+syntax, two nodes for each four source bytes.
 
 At the end of a compile, the compiler checks its memory count. A failed check is a
 compiler defect: the compile returns `mds::internal` (`internal compiler error`, no
