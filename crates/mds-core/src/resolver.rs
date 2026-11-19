@@ -366,7 +366,7 @@ impl ModuleCache {
                 self.budget.seed_function_calls(self.function_call_seed);
                 let seed = self.temporaries_seed + usize::from(key == tests::TEMPORARIES_SEED_KEY);
                 if seed != 0 {
-                    self.budget.mem.charge(Part::Temp, seed).unwrap();
+                    self.budget.mem.charge(Part::Temp, Some(seed)).unwrap();
                 }
             }
         }
@@ -383,7 +383,10 @@ impl ModuleCache {
         let charged = if read_bytes == 0 {
             Ok(())
         } else {
-            self.budget.mem.charge(Part::Temp, read_bytes)
+            self.budget
+                .mem
+                .charge(Part::Temp, Some(read_bytes))
+                .map(drop)
         };
         #[cfg(test)]
         self.module_probes.push(ModuleProbe {
@@ -405,7 +408,7 @@ impl ModuleCache {
     }
 
     fn charge_kept(&mut self, n: usize) -> Result<(), MdsError> {
-        self.budget.mem.charge(Part::Buffers, n)?;
+        self.budget.mem.charge(Part::Buffers, Some(n))?;
         // The kept sum is part of buffers, which charge already checked.
         self.kept += n;
         Ok(())
@@ -1302,17 +1305,17 @@ impl ModuleCache {
         let mem = &mut self.budget.mem;
         let mark = mem.mark();
         if let Some(raw) = frontmatter {
-            let prefix_bytes = bytes(raw.len(), 2)
-                .and_then(|n| n.checked_add(9))
-                .ok_or_else(MdsError::compile_memory_exceeded)?;
-            mem.charge(Part::Temp, prefix_bytes)?;
+            mem.charge(
+                Part::Temp,
+                bytes(raw.len(), 2).and_then(|n| n.checked_add(9)),
+            )?;
         }
         let prefix = crate::frontmatter_prefix(frontmatter);
         let fm_prefix_len = prefix.as_ref().map_or(0, String::len);
         // Reserve the output's charge before optional map work can use headroom.
         // The empty body takes the prefix as-is, without a final newline reserve.
         let growth = fm_prefix_len + usize::from(!body_raw.trim_end().is_empty());
-        mem.charge(Part::Buffers, growth)?;
+        mem.charge(Part::Buffers, Some(growth))?;
         let charged_capacity = body_raw.capacity() + growth;
 
         let pending_map = builder.and_then(|(mut builder, map_origin_bytes)| {
@@ -1355,7 +1358,7 @@ impl ModuleCache {
             }
         }
         if body.capacity() > charged_capacity {
-            mem.charge(Part::Buffers, body.capacity() - charged_capacity)?;
+            mem.charge(Part::Buffers, Some(body.capacity() - charged_capacity))?;
         } else {
             mem.release_buffers(charged_capacity - body.capacity());
         }
@@ -2726,13 +2729,10 @@ fn charge_finalize(
         .and_then(|n| n.checked_add(costs.content))
         .and_then(|n| n.checked_add(builder.source_labels_bytes(costs.label_base_bytes)?));
     let mark = mem.mark();
-    if mem.charge(Part::Temp, work.unwrap_or(usize::MAX)).is_err() {
+    if mem.charge(Part::Temp, work).is_err() {
         return false;
     }
-    if mem
-        .charge(Part::Buffers, output.unwrap_or(usize::MAX))
-        .is_err()
-    {
+    if mem.charge(Part::Buffers, output).is_err() {
         mem.release_to(mark);
         return false;
     }

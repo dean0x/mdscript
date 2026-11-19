@@ -5472,7 +5472,7 @@ fn not_mds_entry_and_frontmatter_imports_keep_no_span() {
 
 fn limit_cache_headroom(cache: &mut ModuleCache, headroom: usize) {
     let prior = MAX_COMPILE_MEMORY - headroom;
-    cache.budget.mem.charge(Part::Buffers, prior).unwrap();
+    cache.budget.mem.charge(Part::Buffers, Some(prior)).unwrap();
     cache.commit_retained(prior);
 }
 
@@ -5727,7 +5727,7 @@ fn finalize_refusal_keeps_output_and_releases_map_work() {
     let mut builder = MapBuilder::new(ctx.make_origin());
     builder.push_segment(0, 0, source.len() as u32);
     let mem = &mut cache.budget.mem;
-    mem.charge(Part::Temp, 3).unwrap();
+    mem.charge(Part::Temp, Some(3)).unwrap();
     let before = *mem;
     let costs = FinalizeCosts {
         content: source.len(),

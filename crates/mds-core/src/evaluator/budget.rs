@@ -164,20 +164,23 @@ impl Default for MemBudget {
 }
 
 impl MemBudget {
+    /// Charge `n` bytes and return `n`. `None` is a count past the address
+    /// space, so it fails as a charge over the limit.
     #[inline(never)]
-    pub(crate) fn charge(&mut self, part: Part, n: usize) -> Result<(), MdsError> {
-        let total = self
-            .buffers
-            .checked_add(self.temporaries)
-            .and_then(|used| used.checked_add(n));
-        if total.is_none_or(|total| total > self.headroom) {
+    pub(crate) fn charge(&mut self, part: Part, n: Option<usize>) -> Result<usize, MdsError> {
+        let Some(n) = n.filter(|&n| {
+            self.buffers
+                .checked_add(self.temporaries)
+                .and_then(|used| used.checked_add(n))
+                .is_some_and(|total| total <= self.headroom)
+        }) else {
             return Err(MdsError::compile_memory_exceeded());
-        }
+        };
         match part {
             Part::Buffers => self.buffers += n,
             Part::Temp => self.temporaries += n,
         }
-        Ok(())
+        Ok(n)
     }
 
     pub(crate) fn mark(&self) -> usize {
