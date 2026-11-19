@@ -61,6 +61,7 @@ config:
 | `MAX_FRONTMATTER_NODES` | 200,000 YAML nodes per block, counted during parsing so alias expansion stops before the tree is built |
 | `MAX_FRONTMATTER_FLOW_DEPTH` | 1024 levels of flow-collection (`[`/`{`) nesting, checked before the parser scans (bounds libyaml's O(depth²) flow scan) |
 | `MAX_FILE_SIZE` | 10 MiB per source, including strings passed to the string APIs |
+| `MAX_OUTPUT_SIZE` | 50 MiB per evaluation output buffer. The compiler reports the output limit at the first byte that crosses it. |
 | `MAX_MODULE_COUNT` | 256; counts every distinct module besides the entry, even before its resolution completes. Binding virtual module maps accept at most 257 entries and use their own message above that bound. |
 
 Exceeding one of these returns `mds::resource_limit` (exit 3). YAML the parser
@@ -300,8 +301,8 @@ MDS provides 18 built-in functions that can be called without `@define`:
 
 | Function | Args | Description |
 |----------|------|-------------|
-| `upper(s)` | 1 | Convert string to uppercase |
-| `lower(s)` | 1 | Convert string to lowercase |
+| `upper(s)` | 1 | Convert a string to uppercase. A result above 50 MiB fails with `mds::builtin`: `upper() output exceeds maximum size of 52428800 bytes`. |
+| `lower(s)` | 1 | Convert a string to lowercase. A result above 50 MiB fails with `mds::builtin`: `lower() output exceeds maximum size of 52428800 bytes`. |
 | `trim(s)` | 1 | Strip leading/trailing whitespace |
 | `replace(s, from, to)` | 3 | Literal string replacement |
 | `split(s, sep)` | 2 | Split string into array |

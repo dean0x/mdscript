@@ -1,6 +1,7 @@
 mod frontmatter;
 mod inheritance;
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use indexmap::{IndexMap, IndexSet};
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
 use crate::evaluator::{
-    evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, push_capped, EvalBudget,
+    evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, EvalBudget,
 };
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
@@ -555,6 +556,7 @@ impl ModuleCache {
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
+            origin: OnceCell::new(),
         };
         let resolved = self.process_module(&ctx, is_md, warnings);
 
@@ -664,6 +666,7 @@ impl ModuleCache {
             source,
             base_dir: &canonical_str,
             runtime_vars: &runtime_layer(runtime_vars),
+            origin: OnceCell::new(),
         };
         let resolved = self.process_module(&ctx, false, warnings);
 
@@ -772,6 +775,7 @@ impl ModuleCache {
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
+            origin: OnceCell::new(),
         };
         let result = self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings);
 
@@ -801,6 +805,7 @@ impl ModuleCache {
             source,
             base_dir: &canonical_str,
             runtime_vars: &runtime_layer(runtime_vars),
+            origin: OnceCell::new(),
         };
         let result = self.process_module_intrinsic(&ctx, false, warnings);
         let popped = self.resolving.pop();
@@ -828,6 +833,7 @@ impl ModuleCache {
             source,
             base_dir: &canonical_str,
             runtime_vars: &runtime_layer(runtime_vars),
+            origin: OnceCell::new(),
         };
         let result = self.process_module_intrinsic_opts(&ctx, false, opts, warnings);
         let popped = self.resolving.pop();
@@ -845,9 +851,8 @@ impl ModuleCache {
     /// not reach a diagnostic (R3 / CWE-209). Scope is shared across all regions
     /// (functions defined in earlier regions are visible to later ones).
     ///
-    /// PF-004: one [`EvalBudget`] covers every region, and each region's output is
-    /// appended through the capped append, so each cap applies to the whole module
-    /// evaluation rather than to each region.
+    /// One [`EvalBudget`] and one output buffer cover all regions, so the caps
+    /// apply to the whole module evaluation.
     fn evaluate_regions_with_map(
         regions: &[(&[crate::ast::Node], &Origin)],
         scope: &mut crate::scope::Scope,
@@ -872,18 +877,17 @@ impl ModuleCache {
                 };
                 builder.switch_to_index(src_idx);
                 previous = Some((origin, src_idx));
-                // Cursor must equal accumulated output length before entering each region.
-                // evaluate_with_map_seeded maintains this invariant internally, but after
-                // each region we push the raw output and the builder's cursor is correct.
             }
 
-            let region_output = if let Some(builder) = current_map.take() {
-                // The builder's current source was switched to origin's above;
-                // evaluate_with_map_seeded derives file/source from it (issue #58).
-                let (region_out, returned_builder) =
-                    evaluate_with_map_seeded(nodes, scope, warnings, builder, budget)?;
-                current_map = Some(returned_builder);
-                region_out
+            if let Some(builder) = current_map.take() {
+                current_map = Some(evaluate_with_map_seeded(
+                    nodes,
+                    scope,
+                    warnings,
+                    builder,
+                    budget,
+                    &mut output,
+                )?);
             } else {
                 evaluate_seeded(
                     nodes,
@@ -892,12 +896,9 @@ impl ModuleCache {
                     &origin.display,
                     &origin.source,
                     budget,
-                )?
-            };
-
-            // PF-004: cumulative size guard — the same capped append as every other
-            // output buffer (#415).
-            push_capped(&mut output, &region_output)?;
+                    &mut output,
+                )?;
+            }
         }
 
         Ok((output, current_map))
@@ -959,8 +960,8 @@ impl ModuleCache {
     /// Shares setup with `process_module` but dispatches on `has_message_block` at the
     /// end: a body containing any `@message` block evaluates to
     /// [`crate::CompiledOutput::Messages`] (via `evaluate_messages_seeded`), otherwise
-    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate_seeded`, then `clean_output` +
-    /// `prepend_frontmatter`).
+    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate_seeded` or mapped evaluation,
+    /// then `finalize_markdown`).
     ///
     /// When the parsed module has an `@extends` directive the shared extends pipeline
     /// (`resolve_extends_components`) builds the effective blocks and `scope`
@@ -1070,27 +1071,13 @@ impl ModuleCache {
             )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
-
-            let body_clean = crate::clean_output(&body_raw);
-            let body_clean_len = body_clean.len();
-            let final_str = crate::prepend_frontmatter(merged_frontmatter.as_deref(), body_clean);
-            let fm_prefix_len = final_str.len() - body_clean_len;
-            let source_map =
-                map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
-            // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
-            // relativize ALL sources[] entries so no absolute path can leak into
-            // the published map.  Unconditional — never opt-in, never debug_assert.
-            self.anchor_root_for_source_map(ctx.base_dir);
-            let source_map = source_map.map(|mut sm| {
-                let root_str = self.fs.source_root();
-                let root = root_str.as_deref().map(std::path::Path::new);
-                let base = opts.source_map_base.as_deref();
-                for src in &mut sm.sources {
-                    *src = crate::source_path::relativize_source(src, base, root);
-                }
-                sm
-            });
-            return Ok((crate::CompiledOutput::Markdown(final_str), source_map));
+            return Ok(self.finalize_markdown(
+                body_raw,
+                merged_frontmatter.as_deref(),
+                map_out,
+                ctx.base_dir,
+                opts,
+            ));
         }
 
         // ── Standalone path ───────────────────────────────────────────────────
@@ -1132,46 +1119,66 @@ impl ModuleCache {
             ));
         }
 
-        let (body_raw, map_out) = if opts.source_map {
+        let mut body_raw = String::new();
+        let map_out = if opts.source_map {
             // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
-            let builder = crate::sourcemap::MapBuilder::new(Origin {
-                file: Arc::from(ctx.key),
-                display: Arc::from(ctx.file_str),
-                source: Arc::from(ctx.source),
-            });
-            let (raw, returned) = evaluate_with_map_seeded(
+            let builder = crate::sourcemap::MapBuilder::new(ctx.origin().clone());
+            let returned = evaluate_with_map_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 builder,
                 self.budget.start_module(),
+                &mut body_raw,
             )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            (raw, apply_map_degradation(returned, opts, warnings))
+            apply_map_degradation(returned, opts, warnings)
         } else {
-            (
-                evaluate_seeded(
-                    &module.body,
-                    &mut scope,
-                    warnings,
-                    ctx.file_str,
-                    ctx.source,
-                    self.budget.start_module(),
-                )?,
-                None,
-            )
+            evaluate_seeded(
+                &module.body,
+                &mut scope,
+                warnings,
+                ctx.file_str,
+                ctx.source,
+                self.budget.start_module(),
+                &mut body_raw,
+            )?;
+            None
         };
 
-        let body_clean = crate::clean_output(&body_raw);
-        let body_clean_len = body_clean.len();
-        let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
-        let fm_prefix_len = final_str.len() - body_clean_len;
-        let source_map = map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
-        // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
-        // relativize ALL sources[] entries so no absolute path can leak into
-        // the published map.  Unconditional — never opt-in, never debug_assert.
-        self.anchor_root_for_source_map(ctx.base_dir);
+        Ok(self.finalize_markdown(
+            body_raw,
+            raw_frontmatter.as_deref(),
+            map_out,
+            ctx.base_dir,
+            opts,
+        ))
+    }
+
+    fn finalize_markdown(
+        &self,
+        body_raw: String,
+        frontmatter: Option<&str>,
+        map_out: Option<crate::sourcemap::MapBuilder>,
+        base_dir: &str,
+        opts: &crate::sourcemap::CompileOptions,
+    ) -> (crate::CompiledOutput, Option<crate::sourcemap::SourceMap>) {
+        let pending_map = map_out.map(|b| b.finalize_points(&body_raw));
+        let prefix = crate::frontmatter_prefix(frontmatter);
+        let fm_prefix_len = prefix.as_ref().map_or(0, String::len);
+        let mut body = crate::clean_output_owned(body_raw, fm_prefix_len);
+        if let Some(prefix) = prefix {
+            if body.is_empty() {
+                body = prefix;
+            } else {
+                body.insert_str(0, &prefix);
+            }
+        }
+
+        let source_map = pending_map.map(|map| map.finish(&body, fm_prefix_len, None));
+        self.anchor_root_for_source_map(base_dir);
+        // Relativize every source label before the caller receives the map.
         let source_map = source_map.map(|mut sm| {
             let root_str = self.fs.source_root();
             let root = root_str.as_deref().map(std::path::Path::new);
@@ -1181,7 +1188,7 @@ impl ModuleCache {
             }
             sm
         });
-        Ok((crate::CompiledOutput::Markdown(final_str), source_map))
+        (crate::CompiledOutput::Markdown(body), source_map)
     }
 
     /// Assert the LIFO pop invariant after `process_module`.
@@ -1264,13 +1271,7 @@ impl ModuleCache {
         // `ResolvedModule::is_exported` applies).
         let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
 
-        // Build Origin once for this module — Arc::clone'd into the source-map builder
-        // below and into each EffectiveBlock (P3), so every copy shares one source text.
-        let origin = Origin {
-            file: Arc::from(ctx.key),
-            display: Arc::from(ctx.file_str),
-            source: Arc::from(ctx.source),
-        };
+        let origin = ctx.origin();
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
@@ -1278,34 +1279,36 @@ impl ModuleCache {
         // single evaluate_with_map pass to collect both the text and its segment records.
         // The module and its namespace share the fragment map for @include attribution.
         // Evaluate the body even if it is not exported, to distinguish the two include warnings.
-        let (body_raw, builder) = if self.source_map_mode && prompt_exported {
+        let mut body_raw = String::new();
+        let builder = if self.source_map_mode && prompt_exported {
             let builder = crate::sourcemap::MapBuilder::new(origin.clone());
             // evaluate_with_map derives file/source from the builder's current source
             // (issue #58).
-            let (body_raw, returned) = evaluate_with_map_seeded(
+            Some(evaluate_with_map_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 builder,
                 self.budget.start_module(),
-            )?;
-            (body_raw, Some(returned))
+                &mut body_raw,
+            )?)
         } else {
-            let body_raw = evaluate_seeded(
+            evaluate_seeded(
                 &module.body,
                 &mut scope,
                 warnings,
                 ctx.file_str,
                 ctx.source,
                 self.budget.start_module(),
+                &mut body_raw,
             )?;
-            (body_raw, None)
+            None
         };
         let (prompt_body, prompt_map) =
             prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         // Build effective_blocks first so module.body can be moved into the Arc below.
-        let effective_blocks = seed_effective_blocks(&module.body, &block_names, &origin);
+        let effective_blocks = seed_effective_blocks(&module.body, &block_names, origin);
 
         // Move module.body into Arc<[Node]> (reuses the Vec allocation, no element clones, P1).
         let effective_skeleton: Arc<[Node]> = Arc::from(module.body);
@@ -1327,7 +1330,7 @@ impl ModuleCache {
             explicit_exports,
             effective_skeleton,
             effective_blocks,
-            skeleton_origin: origin,
+            skeleton_origin: origin.clone(),
             frontmatter_values,
             is_skeleton: false,
         })
@@ -1411,6 +1414,7 @@ impl ModuleCache {
             source: base_source_ref,
             base_dir: &base_base_dir,
             runtime_vars: ctx.runtime_vars,
+            origin: OnceCell::new(),
         };
         self.resolve_frontmatter_imports(&base_fm_imports, &mut scope, &base_ctx, warnings)?;
 
@@ -1696,6 +1700,7 @@ impl ModuleCache {
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
+            origin: OnceCell::new(),
         };
         let resolved = self.process_module_skeleton(&ctx, is_md, warnings);
 
@@ -1832,12 +1837,7 @@ impl ModuleCache {
                 self.resolve_intermediate_base(ext, &own_fm_values, &module.body, ctx, warnings)?
             } else {
                 // Root base: own body is the skeleton; blocks seeded from own @block declarations.
-                // Build Origin once — Arc::clone'd into each seeded EffectiveBlock (P3).
-                let root_origin = Origin {
-                    file: Arc::from(ctx.key),
-                    display: Arc::from(ctx.file_str),
-                    source: Arc::from(ctx.source),
-                };
+                let root_origin = ctx.origin().clone();
                 // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
                 let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
                 let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
@@ -1892,28 +1892,12 @@ impl ModuleCache {
             block_names: HashSet::new(),
         };
 
-        // S7 (extended by B1): lazily build module_origin — at most one Arc::from per
-        // module, only when a @define block is encountered. Define-free modules (the
-        // common template shape) pay zero allocation; modules with @defines still
-        // satisfy the one-origin-per-module invariant for correct cross-source span
-        // attribution (PF-012). Correctness is unchanged: every FunctionDef.origin
-        // carries the same Arc<str> bytes as before — same ctx.source, same
-        // ctx.file_str. (Applies PF-012; ISS-08)
-        let mut module_origin: Option<Origin> = None;
-
         let mut block_count: usize = 0;
         let mut define_count: usize = 0;
         for node in body {
             count_module_defines(node, &mut define_count)?;
             match node {
-                Node::Define(def) => {
-                    let origin = module_origin.get_or_insert_with(|| Origin {
-                        file: Arc::from(ctx.key),
-                        display: Arc::from(ctx.file_str),
-                        source: Arc::from(ctx.source),
-                    });
-                    collect_define(def, &mut defs, scope, ctx, Some(origin))?
-                }
+                Node::Define(def) => collect_define(def, &mut defs, scope, ctx)?,
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
                 Node::Block(block) => {
@@ -2369,6 +2353,14 @@ impl ImportSite<'_> {
 }
 
 impl ModuleCtx<'_> {
+    fn origin(&self) -> &Origin {
+        self.origin.get_or_init(|| Origin {
+            file: Arc::from(self.key),
+            display: Arc::from(self.file_str),
+            source: Arc::from(self.source),
+        })
+    }
+
     fn import_site(&self, offset: usize) -> ImportSite<'_> {
         ImportSite {
             file_str: self.file_str,
@@ -2405,6 +2397,8 @@ struct ModuleCtx<'a> {
     base_dir: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
     runtime_vars: &'a Arc<VarLayer>,
+    /// Shared provenance, allocated only if this resolution needs an owned origin.
+    origin: OnceCell<Origin>,
 }
 
 /// Whether `name` is an available export of a module: every name when the module
@@ -2480,7 +2474,7 @@ fn prompt_body_and_map(
 /// - AC-PERF-03: if the segment cap was hit, degrade to `None` (a partial map
 ///   is misleading; warn and discard the builder).
 /// - AC-SEC-04: if `sourcesContent` total bytes exceed the ceiling, set
-///   `no_sources_content` so [`MapBuilder::finalize`] omits the array.
+///   `no_sources_content` so [`crate::sourcemap::PendingMap::finish`] omits the array.
 /// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
 fn apply_map_degradation(
     mut builder: crate::sourcemap::MapBuilder,
@@ -2594,7 +2588,6 @@ fn collect_define(
     defs: &mut CollectedDefs,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
-    origin: Option<&Origin>,
 ) -> Result<(), MdsError> {
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
@@ -2608,8 +2601,7 @@ fn collect_define(
     let mut func = FunctionDef::from(def);
     // Freeze the definition site before inserting this function into scope.
     func.captured = scope.capture()?;
-    // S7: stamp provenance — two Arc refcount bumps, no allocation.
-    func.origin = origin.cloned();
+    func.origin = Some(ctx.origin().clone());
     // Wrap in Arc for cheap storage and O(1) scope insertion.
     let arc = Arc::new(func);
     defs.functions.insert(def.name.clone(), Arc::clone(&arc));
@@ -3059,13 +3051,10 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
 
 // ── Template inheritance helpers ──────────────────────────────────────────────
 
-/// Serialize a deep-merged frontmatter `Mapping` into a YAML string suitable for
-/// `prepend_frontmatter`.
+/// Serialize a deep-merged frontmatter `Mapping` for `frontmatter_prefix`.
 ///
-/// Returns `Ok(None)` when `mapping` is empty (no non-reserved keys on either side — no
-/// frontmatter block should be emitted). Otherwise returns `Ok(Some(yaml_string))` where
-/// `yaml_string` is the canonical YAML representation of `mapping` with a trailing
-/// newline, ready to be wrapped in `---…---` fences by `prepend_frontmatter`.
+/// Return `Ok(None)` for an empty mapping. Otherwise return the canonical YAML
+/// representation with a final newline and no fences.
 ///
 /// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
 ///

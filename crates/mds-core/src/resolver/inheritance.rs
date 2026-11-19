@@ -104,21 +104,13 @@ pub(super) fn check_child_only_blocks(body: &[Node], ctx: &ModuleCtx<'_>) -> Res
 /// definition last came from). This ensures diagnostics attribute to the correct file
 /// (Risk #1 from the plan: origin must follow the winning override).
 ///
-/// **Perf rule:** `override_origin` is built ONCE outside the loop and `Arc::clone`d
-/// into each stamped entry — never `Arc::from(ctx.source)` inside the loop (P3).
+/// All overrides share the module's source text.
 pub(super) fn apply_block_overrides(
     parent_blocks: &IndexMap<String, EffectiveBlock>,
     body: &[Node],
     ctx: &ModuleCtx<'_>,
 ) -> Result<IndexMap<String, EffectiveBlock>, MdsError> {
     let mut blocks = parent_blocks.clone();
-
-    // Build the override origin ONCE — O(1) Arc bumps per override node.
-    let override_origin = Origin {
-        file: Arc::from(ctx.key),
-        display: Arc::from(ctx.file_str),
-        source: Arc::from(ctx.source),
-    };
 
     for node in body {
         if let Node::Block(b) = node {
@@ -137,7 +129,7 @@ pub(super) fn apply_block_overrides(
                 b.name.clone(),
                 EffectiveBlock {
                     node: Arc::new(b.clone()),
-                    origin: override_origin.clone(),
+                    origin: ctx.origin().clone(),
                 },
             );
         }

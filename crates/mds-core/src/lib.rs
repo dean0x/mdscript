@@ -941,26 +941,30 @@ fn strip_reserved_keys(raw: &str) -> Option<String> {
         filtered.push('\n');
     }
 
-    let trimmed = filtered.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(format!("{trimmed}\n"))
+    filtered.truncate(filtered.trim_end().len());
+    if filtered.is_empty() {
+        return None;
     }
+    let leading = filtered.len() - filtered.trim_start().len();
+    filtered.drain(..leading);
+    filtered.push('\n');
+    Some(filtered)
 }
 
-/// Prepend YAML frontmatter fences to a compiled body.
-///
-/// If `raw` is `None`, or after stripping reserved keys the frontmatter is empty,
-/// the body is returned unchanged.
-pub(crate) fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
-    let Some(raw) = raw else {
-        return body;
-    };
-    let Some(cleaned) = strip_reserved_keys(raw) else {
-        return body;
-    };
-    format!("---\n{cleaned}---\n{body}")
+/// Return fenced frontmatter if non-whitespace content remains after key removal.
+pub(crate) fn frontmatter_prefix(raw: Option<&str>) -> Option<String> {
+    const FENCE: &str = "---\n";
+    let cleaned = strip_reserved_keys(raw?)?;
+    let mut prefix = String::with_capacity(cleaned.len() + 2 * FENCE.len());
+    prefix.push_str(FENCE);
+    prefix.push_str(&cleaned);
+    prefix.push_str(FENCE);
+    Some(prefix)
+}
+
+/// Normalize borrowed output for formatter comparisons.
+pub(crate) fn clean_output(s: &str) -> String {
+    clean_output_owned(s.to_owned(), 0)
 }
 
 /// Normalise output whitespace using the "interior-verbatim with trailing-edge
@@ -973,28 +977,31 @@ pub(crate) fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
 ///
 /// Interior blank-line runs, leading blank lines, and mid-document whitespace-only
 /// lines all pass through **verbatim** — only the trailing edge is normalised.
+/// For a nonempty body, reserve `extra` bytes for the frontmatter prefix.
 ///
 /// **Formatter dependency**: `mds fmt` (`formatter.rs`) mirrors these exact semantics.
 /// `@message` and `@define` body content bypasses this function entirely (evaluated
 /// via `.trim()` only — see `collect_single_message` and `invoke_function` in
 /// `evaluator.rs`); the formatter marks those as raw-content regions. See
 /// `raw_content_spans` in `formatter.rs` for the authoritative region boundary.
-pub(crate) fn clean_output(s: &str) -> String {
-    // Strip \r unconditionally (Windows line endings).
-    let no_cr: std::borrow::Cow<str> = if s.as_bytes().contains(&b'\r') {
-        std::borrow::Cow::Owned(s.chars().filter(|&c| c != '\r').collect())
-    } else {
-        std::borrow::Cow::Borrowed(s)
-    };
-
-    // Trailing-edge normalisation: trim all trailing whitespace, then add one \n.
-    let trimmed = no_cr.trim_end();
-    if trimmed.is_empty() {
+pub(crate) fn clean_output_owned(mut s: String, extra: usize) -> String {
+    if s.as_bytes().contains(&b'\r') {
+        s.retain(|c| c != '\r');
+    }
+    s.truncate(s.trim_end().len());
+    if s.is_empty() {
         return String::new();
     }
-    let mut out = trimmed.to_string();
-    out.push('\n');
-    out
+    let additional = 1 + extra;
+    let final_len = s.len() + additional;
+    if s.capacity() / 2 > final_len {
+        // Do not keep a large discarded suffix in a small compiled result.
+        s.shrink_to(final_len);
+    } else {
+        s.reserve_exact(additional);
+    }
+    s.push('\n');
+    s
 }
 
 /// Compile a module from an in-memory virtual filesystem.
@@ -2194,37 +2201,72 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
+    fn assert_clean_output(input: &str, expected: &str) {
+        assert_eq!(clean_output(input), expected);
+        assert_eq!(clean_output_owned(input.to_owned(), 16), expected);
+    }
+
     #[test]
     fn clean_output_preserves_interior_blank_runs() {
-        // Interior blank-line runs pass through verbatim — no collapsing (#150/#151).
-        assert_eq!(clean_output("a\n\n\n\nb"), "a\n\n\n\nb\n");
+        assert_clean_output("a\n\n\n\nb", "a\n\n\n\nb\n");
     }
 
     #[test]
     fn clean_output_preserves_leading_newlines() {
-        // Leading blank lines are no longer stripped — interior-verbatim contract (#150/#151).
-        assert_eq!(clean_output("\n\n\nhello"), "\n\n\nhello\n");
+        assert_clean_output("\n\n\nhello", "\n\n\nhello\n");
     }
 
     #[test]
     fn clean_output_trims_trailing_whitespace() {
-        assert_eq!(clean_output("hello\n\n  \n"), "hello\n");
+        assert_clean_output("hello\n\n  \n", "hello\n");
     }
 
     #[test]
     fn clean_output_empty_input() {
-        assert_eq!(clean_output(""), "");
-        assert_eq!(clean_output("\n\n\n"), "");
+        assert_clean_output("", "");
+        assert_clean_output("\n\n\n", "");
     }
 
     #[test]
     fn clean_output_preserves_single_blank_line() {
-        assert_eq!(clean_output("a\n\nb"), "a\n\nb\n");
+        assert_clean_output("a\n\nb", "a\n\nb\n");
     }
 
     #[test]
     fn clean_output_strips_carriage_returns() {
-        assert_eq!(clean_output("hello\r\nworld\r\n"), "hello\nworld\n");
+        assert_clean_output("hello\r\nworld\r\n", "hello\nworld\n");
+    }
+
+    #[test]
+    fn whitespace_only_body_keeps_frontmatter_without_map_points() {
+        let source = "---\ntype: mds\nlabel: value\n---\n \r\n";
+        let opts = CompileOptions::default().with_source_map(true);
+        let result = compile_str_with_deps_opts(source, None, None, opts).unwrap();
+        assert_eq!(result.source_map.as_ref().unwrap().mappings, "");
+        assert_eq!(result.into_markdown().unwrap(), "---\nlabel: value\n---\n");
+    }
+
+    #[test]
+    fn crlf_body_maps_after_frontmatter() {
+        // The first value puts a CR in the first 64-byte block of the raw body.
+        // The second interpolation starts in the next block.
+        let pad = "0123456789abcdef".repeat(4);
+        let source =
+            format!("---\ntype: mds\nlabel: value\n---\n{{{{text}}}}{pad}{{{{text}}}}  \r\n\r\n");
+        let vars = HashMap::from([("text".to_owned(), Value::String("a\r\nb".to_owned()))]);
+        let opts = CompileOptions::default().with_source_map(true);
+        let result = compile_str_with_deps_opts(&source, None, Some(vars), opts).unwrap();
+        assert_eq!(
+            result.source_map.as_ref().unwrap().mappings,
+            ";;;AAIA;CAAQ,gEAAgE;CAAQ"
+        );
+        assert_eq!(
+            result.into_markdown().unwrap(),
+            concat!(
+                "---\nlabel: value\n---\na\n",
+                "b0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefa\nb\n"
+            )
+        );
     }
 
     // ── strip_reserved_keys: type: mds variants ───────────────────────────────
