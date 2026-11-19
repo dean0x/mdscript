@@ -460,8 +460,10 @@ fn assert_unique_is_charged_before_it_copies() {
         result.unwrap().into_markdown().unwrap().ends_with("\n26\n")
     };
 
-    // It fits: unique() builds its keys and its result, within its bound of twice
-    // the bytes of the array.
+    // It fits: unique() builds its keys and its result. Its charge is the larger of
+    // two sums: two array copies and 32 bytes per item, or one array copy, the key
+    // bytes and the seen table. The checks below bound the heap growth of unique(),
+    // not its charge.
     let len = 64 * 1024;
     let text = copies * len;
     let (control, baseline) = measured(len, "items");
@@ -690,6 +692,13 @@ fn assert_mapped_max_output_with_frontmatter() {
     assert_eq!(
         over.expect_err("output cap error").to_string(),
         "resource limit exceeded: output exceeds maximum size of 52428800 bytes"
+    );
+    // The control holds the 50 MiB output, so the check below reads real data.
+    assert!(peak >= 50 * MIB, "mapped corner control: {peak} B");
+    // One more output byte is refused, so its peak is at most 1 MiB above the control.
+    assert!(
+        over_peak <= peak + MIB,
+        "the refused corner grows {over_peak} B (control: {peak} B)"
     );
 }
 
