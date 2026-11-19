@@ -1731,6 +1731,9 @@ fn collect_single_message(
             )));
         }
 
+        // Count the kept role before a copy or move. A computed role stays charged
+        // as a temporary until this message mark ends.
+        ctx.budget.mem.charge(Part::Buffers, role.capacity())?;
         let Some(Value::String(role)) = role_slot.into_value() else {
             return Err(invalid_projection());
         };
@@ -3919,8 +3922,11 @@ mod tests {
             }]
         );
         let mut mem = MemBudget::default();
-        mem.charge(Part::Buffers, out[0].content.capacity())
-            .unwrap();
+        mem.charge(
+            Part::Buffers,
+            out[0].content.capacity() + out[0].role.capacity(),
+        )
+        .unwrap();
         assert_eq!(
             budget,
             EvalBudget {
