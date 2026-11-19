@@ -737,7 +737,9 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
     let source = "{{imports}}";
     let tokens = tokenize(source, "plain.md").unwrap();
     let module = parse_with_ctx(&tokens, "plain.md", source).unwrap();
-    let (mut plain, _) = build_scope_from_frontmatter(None, true, &runtime_layer(&vars)).unwrap();
+    let (mut plain, _) =
+        build_scope_from_frontmatter(None, true, &runtime_layer(&vars), &mut MemBudget::default())
+            .unwrap();
     assert_eq!(
         evaluate(
             &module.body,
@@ -763,7 +765,8 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
 fn runtime_layer_is_shared_by_module_scopes() {
     let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
     let vars = runtime_layer(&vars);
-    let (first, _) = build_scope_from_frontmatter(None, false, &vars).unwrap();
+    let (first, _) =
+        build_scope_from_frontmatter(None, false, &vars, &mut MemBudget::default()).unwrap();
     let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
     assert!(Arc::ptr_eq(
         first.get_slot("x").unwrap().root(),
@@ -5747,9 +5750,13 @@ fn final_output_charges_prefix_and_growth_before_the_reserve() {
         " ".repeat(50),
     ];
     let raw = "label: value\n";
+    // The parsed frontmatter stays charged while the module runs.
+    let spent = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
+        .unwrap()
+        .1;
     for body in cases {
         let growth = raw.len() + 8 + usize::from(!body.trim_end().is_empty());
-        let needed = body.len() + 2 * raw.len() + 9 + growth;
+        let needed = body.len() + 2 * raw.len() + 9 + growth + spent;
         let source = format!("---\n{raw}---\n{body}");
         let compile = |headroom| {
             let mut cache = virtual_cache(&[]);

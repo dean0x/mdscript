@@ -9,7 +9,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
-use crate::evaluator::budget::{bytes, Part};
+use crate::evaluator::budget::{bytes, MemBudget, Part};
 use crate::evaluator::{
     evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, EvalBudget,
 };
@@ -27,7 +27,9 @@ use crate::sourcemap::{CompileOptions, MapBuilder, SourceIndex};
 use crate::validator;
 use crate::value::Value;
 
-use frontmatter::{build_scope_from_merged_mapping, deep_merge_yaml};
+use frontmatter::{
+    build_scope_from_merged_mapping, deep_merge_yaml, parse_frontmatter_yaml_with, Allowance,
+};
 pub(crate) use frontmatter::{
     parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
     FrontmatterImport,
@@ -1150,7 +1152,8 @@ impl ModuleCache {
 
         // ── Extends branch ────────────────────────────────────────────────────
         if let Some(ext) = module.extends.clone() {
-            let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
+            let frontmatter_values =
+                parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
             let components =
                 self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
 
@@ -1215,8 +1218,12 @@ impl ModuleCache {
         }
 
         // ── Standalone path ───────────────────────────────────────────────────
-        let (mut scope, fm_imports) =
-            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+        let (mut scope, fm_imports) = build_scope_from_frontmatter(
+            module.frontmatter.as_ref(),
+            is_md,
+            ctx.runtime_vars,
+            &mut self.budget.mem,
+        )?;
 
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
@@ -1426,7 +1433,8 @@ impl ModuleCache {
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
         // Parse frontmatter YAML once for both scope building and storage.
-        let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
+        let frontmatter_values =
+            parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
 
         // Branch: child template (@extends) vs. standalone module.
         if let Some(ext) = module.extends.clone() {
@@ -1437,8 +1445,12 @@ impl ModuleCache {
         let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
 
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
-        let (mut scope, fm_imports) =
-            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+        let (mut scope, fm_imports) = build_scope_from_frontmatter(
+            module.frontmatter.as_ref(),
+            is_md,
+            ctx.runtime_vars,
+            &mut self.budget.mem,
+        )?;
 
         // Resolve frontmatter imports BEFORE body imports (per spec: frontmatter imports
         // resolve before body imports; a duplicate alias is a compile error — legacy
@@ -2014,11 +2026,16 @@ impl ModuleCache {
 
         let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
         // own_fm_values: this module's raw frontmatter (not yet merged with ancestors).
-        let own_fm_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
+        let own_fm_values =
+            parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
 
         // Build scope for @define closure capture (base functions must be available).
-        let (mut scope, fm_imports) =
-            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+        let (mut scope, fm_imports) = build_scope_from_frontmatter(
+            module.frontmatter.as_ref(),
+            is_md,
+            ctx.runtime_vars,
+            &mut self.budget.mem,
+        )?;
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
         let CollectedDefs {
@@ -2714,7 +2731,7 @@ fn count_newlines(text: &str) -> usize {
 }
 
 fn charge_finalize(
-    mem: &mut crate::evaluator::budget::MemBudget,
+    mem: &mut MemBudget,
     builder: &MapBuilder,
     body: &str,
     costs: FinalizeCosts,
@@ -2945,6 +2962,7 @@ fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
     is_md: bool,
     runtime_vars: &Arc<VarLayer>,
+    mem: &mut MemBudget,
 ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
     let mut frontmatter_vars = VarLayer::new();
     let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
@@ -2956,7 +2974,7 @@ fn build_scope_from_frontmatter(
 
     if let Some(fm) = frontmatter {
         // Parse YAML once to avoid double-parsing (bounded — #162).
-        let yaml = parse_frontmatter_yaml(&fm.raw)?;
+        let yaml = parse_frontmatter_charged(&fm.raw, mem)?;
 
         if let serde_yaml_ng::Value::Mapping(map) = yaml {
             for (key, val) in map {
@@ -3360,16 +3378,29 @@ fn serialize_merged_frontmatter(
 /// Called once per module to avoid double-parsing.
 fn parse_frontmatter_mapping(
     frontmatter: Option<&crate::ast::Frontmatter>,
+    mem: &mut MemBudget,
 ) -> Result<Option<serde_yaml_ng::Mapping>, MdsError> {
     let Some(fm) = frontmatter else {
         return Ok(None);
     };
-    let yaml = parse_frontmatter_yaml(&fm.raw)?;
+    let yaml = parse_frontmatter_charged(&fm.raw, mem)?;
     if let serde_yaml_ng::Value::Mapping(map) = yaml {
         Ok(Some(map))
     } else {
         Ok(None)
     }
+}
+
+/// Parse frontmatter inside a compile. The byte allowance is the smaller of the rest
+/// of the budget and `MAX_OUTPUT_SIZE`. The spent bytes stay charged as a temporary
+/// until the module mark releases them, so a second tree cannot reuse them.
+fn parse_frontmatter_charged(
+    raw: &str,
+    mem: &mut MemBudget,
+) -> Result<serde_yaml_ng::Value, MdsError> {
+    let (yaml, spent) = parse_frontmatter_yaml_with(raw, Allowance::in_compile(mem))?;
+    mem.charge(Part::Temp, Some(spent))?;
+    Ok(yaml)
 }
 
 /// Returns the byte count from `offset` to just before the next `\n` (or

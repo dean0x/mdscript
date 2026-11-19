@@ -972,6 +972,15 @@ impl MdsError {
         ))
     }
 
+    /// A frontmatter parse expanded past its `MAX_OUTPUT_SIZE` byte allowance.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn frontmatter_expansion_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "frontmatter YAML expands beyond maximum of {MAX_OUTPUT_SIZE} bytes"
+        ))
+    }
+
     /// Upgrade a spanless `Syntax` error with a span; no-op for other variants or if
     /// the error already carries a span (B2 — spanless syntax-error upgrades at call sites
     /// that hold the directive offset but cannot thread it into the low-level helper).

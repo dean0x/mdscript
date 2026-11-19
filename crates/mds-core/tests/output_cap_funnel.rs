@@ -13,7 +13,8 @@
 //!   `upper()`/`lower()`/`join()` message from `builtin_output_too_large` in `builtins.rs`;
 //! * `push_capped` is defined once, and every output accumulator calls it the expected
 //!   number of times with no raw append (`push_str`, `push`, `+=`, …) left in its body.
-//! * The compile-memory message appears only in its constructor.
+//! * The compile-memory message and the frontmatter allowance message each appear
+//!   only in their constructors.
 //! * The budget checks do not depend on the target architecture. The budget module
 //!   returns errors instead of panics and does not use `RefCell`.
 //!
@@ -32,11 +33,15 @@ const MESSAGE_UNANCHORED: &str = "output exceeds maximum size";
 const BUDGET_MESSAGE: &str = "\"compile memory exceeds maximum of ";
 const BUDGET_CONSTRUCTOR: &str = "fn compile_memory_exceeded(";
 
+const ALLOWANCE_MESSAGE: &str = "\"frontmatter YAML expands beyond maximum of ";
+const ALLOWANCE_CONSTRUCTOR: &str = "fn frontmatter_expansion_exceeded(";
+
 /// The file and constructors that build the messages.
 const CHOKE_POINT: &str = "error.rs";
 const MESSAGES: &[(&str, &str)] = &[
     (MESSAGE, "fn output_size_exceeded("),
     (BUDGET_MESSAGE, BUDGET_CONSTRUCTOR),
+    (ALLOWANCE_MESSAGE, ALLOWANCE_CONSTRUCTOR),
 ];
 
 const BUDGET_SOURCE: &str = "evaluator/budget.rs";
@@ -224,25 +229,33 @@ fn budget_rules_apply_to_each_source_file() {
 
 #[test]
 fn budget_gates_reject_planted_text() {
-    let literal = format!("{BUDGET_MESSAGE}209715200 bytes\"");
-    let valid = format!("{BUDGET_CONSTRUCTOR}) -> &'static str {{ {literal} }}");
-    let extra = format!("fn other() -> &'static str {{ {literal} }}");
-    for (name, raw) in [
-        ("evaluator.rs", extra.clone()),
-        (CHOKE_POINT, format!("{valid}\n{extra}")),
+    for (message, constructor, limit) in [
+        (BUDGET_MESSAGE, BUDGET_CONSTRUCTOR, "209715200"),
+        (ALLOWANCE_MESSAGE, ALLOWANCE_CONSTRUCTOR, "52428800"),
     ] {
-        assert_eq!(
+        let literal = format!("{message}{limit} bytes\"");
+        let valid = format!("{constructor}) -> &'static str {{ {literal} }}");
+        let extra = format!("fn other() -> &'static str {{ {literal} }}");
+        let at = |name: &str, raw: &str| {
             message_hits(
                 name,
-                &mask(&raw, true),
-                &mask(&raw, false),
-                BUDGET_MESSAGE,
-                BUDGET_CONSTRUCTOR,
-            ),
-            Err(format!(
-                "{name}: build `{BUDGET_MESSAGE}` only in `{BUDGET_CONSTRUCTOR}`"
-            ))
-        );
+                &mask(raw, true),
+                &mask(raw, false),
+                message,
+                constructor,
+            )
+        };
+        // Control: the literal inside its constructor passes.
+        assert_eq!(at(CHOKE_POINT, &valid), Ok(1));
+        for (name, raw) in [
+            ("resolver/frontmatter.rs", extra.clone()),
+            (CHOKE_POINT, format!("{valid}\n{extra}")),
+        ] {
+            assert_eq!(
+                at(name, &raw),
+                Err(format!("{name}: build `{message}` only in `{constructor}`"))
+            );
+        }
     }
     assert_eq!(
         check_budget_source(
