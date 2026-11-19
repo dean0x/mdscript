@@ -31,13 +31,15 @@
 //!
 //! Every failure raises [`MdsError`] (a native, catchable `markdown_script.MdsError`) with a
 //! `.code`. Codes originating in `mds-core` (e.g. `"mds::syntax"`) are defined by
-//! [`mds::MdsError`]. Three codes are **binding-only** — synthesised here:
+//! [`mds::MdsError`]. Three codes are synthesised here. Only `mds::invalid_options`
+//! is **binding-only**: the core crate also returns `mds::internal` and
+//! `mds::resource_limit`.
 //!
-//! | Code                   | Meaning                                        |
-//! |------------------------|------------------------------------------------|
-//! | `mds::internal`        | Unexpected panic caught at the Python boundary  |
-//! | `mds::invalid_options` | Malformed / type-incorrect `vars` or `modules`  |
-//! | `mds::resource_limit`  | Input exceeds an enforced size / count limit    |
+//! | Code                   | Meaning                                                                          |
+//! |------------------------|----------------------------------------------------------------------------------|
+//! | `mds::internal`        | Unexpected panic caught at the Python boundary, or a failed memory-counter check |
+//! | `mds::invalid_options` | Malformed / type-incorrect `vars` or `modules`                                   |
+//! | `mds::resource_limit`  | Input exceeds an enforced size / count limit                                     |
 //!
 //! ## Concurrency
 //!

@@ -8,15 +8,19 @@
 //!
 //! Errors thrown at the WASM boundary carry a `code` property. Codes that
 //! originate inside `mds-core` (e.g. `"mds::syntax"`) are defined by
-//! [`mds::MdsError`]. The following codes are **WASM-only** — they are
-//! synthesised here and do not exist in the core crate:
+//! [`mds::MdsError`]. The following codes are synthesised here. Only
+//! `mds::invalid_options` and `mds::filename_collision` are **binding-only**:
+//! the core crate also returns `mds::internal` and `mds::resource_limit`.
 //!
-//! | Code                      | Meaning                                          |
-//! |---------------------------|--------------------------------------------------|
-//! | `mds::internal`           | Unexpected panic caught at the WASM boundary     |
-//! | `mds::invalid_options`    | Malformed or type-incorrect options object       |
-//! | `mds::resource_limit`     | Input exceeds an enforced size limit             |
-//! | `mds::filename_collision` | `options.modules` key collides with `filename`   |
+//! | Code                      | Meaning                                                                        |
+//! |---------------------------|--------------------------------------------------------------------------------|
+//! | `mds::internal`           | Unexpected panic on a target that can unwind, or a failed memory-counter check |
+//! | `mds::invalid_options`    | Malformed or type-incorrect options object                                     |
+//! | `mds::resource_limit`     | Input exceeds an enforced size limit                                           |
+//! | `mds::filename_collision` | `options.modules` key collides with `filename`                                 |
+//!
+//! On wasm32-unknown-unknown a panic is not caught: it traps, and the JS
+//! caller gets a `RuntimeError` with no `code` (see `catch_panic`).
 //!
 //! ## Usage (JavaScript)
 //!
@@ -152,9 +156,12 @@ fn span_to_js(span: &mds::SerializedSpan) -> js_sys::Object {
     obj
 }
 
-/// Wrap a fallible closure in `catch_unwind` to prevent panics from aborting
-/// the WASM module. Panics are converted to JS `Error` values with
-/// `code = "mds::internal"`.
+/// Wrap a fallible closure in `catch_unwind`. On a target that can unwind, a
+/// panic becomes a JS `Error` value with `code = "mds::internal"`.
+///
+/// wasm32-unknown-unknown cannot unwind, whatever the workspace `panic`
+/// setting is. There a panic traps before `catch_unwind` returns: the JS
+/// caller gets a `RuntimeError` ("unreachable") that has no `code`.
 ///
 /// `AssertUnwindSafe` is required because the closure captures data that is
 /// not `UnwindSafe` by default (e.g. `String`, `HashMap`). Callers ensure
