@@ -457,6 +457,93 @@ fn assert_message_role_peak() {
     );
 }
 
+fn import_peak(count: usize) -> (Result<CompileResult, MdsError>, usize) {
+    let mut root = String::new();
+    let mut modules = HashMap::new();
+    for i in 0..count {
+        root.push_str(&format!("@import \"./part{i}.mds\" as part{i}\n"));
+        let unused = "p".repeat(MIB);
+        modules.insert(
+            format!("part{i}.mds"),
+            format!("@define unused():\n{unused}\n@end\n{{{{chunk}}}}"),
+        );
+    }
+    modules.insert("main.mds".to_owned(), root + "root");
+    // Five prompts take 197.5 MiB. Their origins take more than 5 MiB.
+    let vars = HashMap::from([(
+        "chunk".to_owned(),
+        Value::String("x".repeat(39 * MIB + MIB / 2)),
+    )]);
+    peak_growth(|| mds::compile_virtual(modules, "main.mds", Some(vars)))
+}
+
+fn assert_imported_prompts_share_one_limit() {
+    let (control, baseline) = import_peak(4);
+    assert_eq!(control.unwrap().into_markdown().unwrap(), "root\n");
+
+    let (result, peak) = import_peak(5);
+    eprintln!("retained prompt heap (B): control={baseline}, peak={peak}");
+    let error = result.expect_err("retained prompt budget").serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+}
+
+fn mapped_corner(extra: usize) -> (Result<CompileResult, MdsError>, usize) {
+    let raw = format!("label: {}\n", "a".repeat(MIB - "label: \n".len()));
+    let mut root = format!("---\n{raw}---\n");
+    let mut modules = HashMap::new();
+    for i in 0..5 {
+        root.push_str(&format!(
+            "@import \"./part{i}.mds\" as part{i}\n@include part{i}\n"
+        ));
+        let unused = "p".repeat(9 * MIB + 3 * MIB / 4);
+        modules.insert(
+            format!("part{i}.mds"),
+            format!("@define unused():\n{unused}\n@end\nx\n"),
+        );
+    }
+    modules.insert("main.mds".to_owned(), root + "{{body}}");
+    // About 49 MiB retained sources, 50 MiB output, 50 MiB sourcesContent, 3.125 MiB
+    // CR table, and about 6 MiB of root source, frontmatter, prefix and growth charges.
+    let body = "b".repeat(50 * MIB - 5 * "x\n".len() - 2 + extra) + "\rc";
+    let vars = HashMap::from([("body".to_owned(), Value::String(body))]);
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    peak_growth(|| mds::compile_virtual_with_deps_opts(modules, "main.mds", Some(vars), opts))
+}
+
+fn assert_mapped_max_output_with_frontmatter() {
+    let (control, peak) = mapped_corner(0);
+    let control = control.unwrap();
+    let sources = control
+        .source_map
+        .as_ref()
+        .unwrap()
+        .sources_content
+        .as_ref()
+        .unwrap();
+    assert_eq!(sources.len(), 6);
+    let source_bytes: usize = sources.iter().map(String::len).sum();
+    assert!((49 * MIB..=50 * MIB).contains(&source_bytes));
+    let output = control.into_markdown().unwrap();
+    assert_eq!(output.len(), 51 * MIB + 8);
+    assert!(output.starts_with("---\nlabel: a"));
+    assert!(output.ends_with("bc\n"));
+    assert!(!output.contains('\r'));
+    drop(output);
+
+    let (over, over_peak) = mapped_corner(1);
+    eprintln!("mapped corner heap (B): MAX={peak}, MAX+1={over_peak}");
+    assert_eq!(
+        over.expect_err("output cap error").to_string(),
+        "resource limit exceeded: output exceeds maximum size of 52428800 bytes"
+    );
+}
+
 #[test]
 fn compile_peak_heap_stays_within_each_bound() {
     let source = include_str!("memory_bound.rs");
@@ -505,4 +592,6 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_over_cap_lower_with_sigma_does_not_build_its_result();
     assert_value_peaks();
     assert_message_role_peak();
+    assert_mapped_max_output_with_frontmatter();
+    assert_imported_prompts_share_one_limit();
 }
